@@ -1,0 +1,7 @@
+target/
+**/target/
+chdb-core/buildlib/
+chdb-core/.git/modules/
+.git/
+*.swp
+*.swo

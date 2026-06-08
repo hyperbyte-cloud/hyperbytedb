@@ -1,0 +1,181 @@
+---
+# Grafana Alloy: ship all pod logs to Loki via the Kubernetes API (no hostPath / root).
+# Single replica avoids duplicate streams that a per-node DaemonSet would create.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: alloy-logs
+  namespace: hyperbytedb
+  labels:
+    app: alloy-logs
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: alloy-logs-hyperbytedb
+  labels:
+    app: alloy-logs
+rules:
+  - apiGroups: [""]
+    resources:
+      - nodes
+      - nodes/proxy
+      - services
+      - endpoints
+      - pods
+      - pods/log
+      - namespaces
+    verbs:
+      - get
+      - list
+      - watch
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: alloy-logs-hyperbytedb
+  labels:
+    app: alloy-logs
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: alloy-logs-hyperbytedb
+subjects:
+  - kind: ServiceAccount
+    name: alloy-logs
+    namespace: hyperbytedb
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alloy-logs-config
+  namespace: hyperbytedb
+  labels:
+    app: alloy-logs
+data:
+  config.alloy: |
+    discovery.kubernetes "pods" {
+      role = "pod"
+    }
+
+    loki.source.kubernetes "k8s" {
+      targets    = discovery.kubernetes.pods.targets
+      forward_to = [loki.write.loki.receiver]
+    }
+
+    loki.write "loki" {
+      endpoint {
+        url = "http://loki:3100/loki/api/v1/push"
+      }
+    }
+
+    // OTLP ingress from HyperbyteDB (and other apps) → Tempo.
+    otelcol.receiver.otlp "default" {
+      grpc {
+        endpoint = "0.0.0.0:4317"
+      }
+      http {
+        endpoint = "0.0.0.0:4318"
+      }
+
+      output {
+        traces = [otelcol.exporter.otlp.tempo.input]
+      }
+    }
+
+    otelcol.exporter.otlp "tempo" {
+      client {
+        endpoint = "tempo:4317"
+        tls {
+          insecure = true
+        }
+      }
+    }
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alloy-logs
+  namespace: hyperbytedb
+  labels:
+    app: alloy-logs
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alloy-logs
+  template:
+    metadata:
+      labels:
+        app: alloy-logs
+    spec:
+      serviceAccountName: alloy-logs
+      containers:
+        - name: alloy
+          image: grafana/alloy:v1.7.5
+          args:
+            - run
+            - /etc/alloy/config.alloy
+            - --server.http.listen-addr=0.0.0.0:12345
+            - --storage.path=/tmp/alloy
+          ports:
+            - containerPort: 12345
+              name: http
+            - containerPort: 4317
+              name: otlp-grpc
+            - containerPort: 4318
+              name: otlp-http
+          volumeMounts:
+            - name: config
+              mountPath: /etc/alloy
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 12345
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 12345
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+      volumes:
+        - name: config
+          configMap:
+            name: alloy-logs-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alloy-logs
+  namespace: hyperbytedb
+  labels:
+    app: alloy-logs
+spec:
+  type: ClusterIP
+  selector:
+    app: alloy-logs
+  ports:
+    - name: http
+      port: 12345
+      targetPort: 12345
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+    - name: otlp-http
+      port: 4318
+      targetPort: 4318

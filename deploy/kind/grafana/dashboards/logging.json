@@ -1,0 +1,215 @@
+{
+    "annotations": {
+      "list": [
+        {
+          "builtIn": 1,
+          "datasource": {
+            "type": "grafana",
+            "uid": "-- Grafana --"
+          },
+          "enable": true,
+          "hide": true,
+          "iconColor": "rgba(0, 211, 255, 1)",
+          "name": "Annotations & Alerts",
+          "type": "dashboard"
+        }
+      ]
+    },
+    "editable": true,
+    "fiscalYearStartMonth": 0,
+    "graphTooltip": 0,
+    "links": [],
+    "panels": [
+      {
+        "datasource": {
+          "type": "loki",
+          "uid": "P8E80F9AEF21F6940"
+        },
+        "fieldConfig": {
+          "defaults": {},
+          "overrides": []
+        },
+        "gridPos": {
+          "h": 9,
+          "w": 24,
+          "x": 0,
+          "y": 0
+        },
+        "id": 1,
+        "options": {
+          "dedupStrategy": "none",
+          "enableInfiniteScrolling": false,
+          "enableLogDetails": true,
+          "showControls": false,
+          "showTime": false,
+          "sortOrder": "Ascending",
+          "unwrappedColumns": false,
+          "wrapLogMessage": false
+        },
+        "pluginVersion": "12.4.2",
+        "targets": [
+          {
+            "datasource": {
+              "type": "loki",
+              "uid": "P8E80F9AEF21F6940"
+            },
+            "direction": "forward",
+            "editorMode": "builder",
+            "expr": "{instance=\"hyperbytedb/hyperbytedb-0:hyperbytedb\"} |= `WARN`",
+            "queryType": "range",
+            "refId": "A"
+          }
+        ],
+        "title": "[WARN] - hyperbytedb-0",
+        "type": "logs"
+      },
+      {
+        "datasource": {
+          "type": "loki",
+          "uid": "P8E80F9AEF21F6940"
+        },
+        "fieldConfig": {
+          "defaults": {},
+          "overrides": []
+        },
+        "gridPos": {
+          "h": 9,
+          "w": 24,
+          "x": 0,
+          "y": 9
+        },
+        "id": 2,
+        "options": {
+          "dedupStrategy": "none",
+          "detailsMode": "inline",
+          "enableInfiniteScrolling": false,
+          "enableLogDetails": true,
+          "showControls": false,
+          "showLabels": false,
+          "showTime": false,
+          "sortOrder": "Ascending",
+          "syntaxHighlighting": false,
+          "unwrappedColumns": false,
+          "wrapLogMessage": false
+        },
+        "pluginVersion": "12.4.2",
+        "targets": [
+          {
+            "datasource": {
+              "type": "loki",
+              "uid": "P8E80F9AEF21F6940"
+            },
+            "direction": "forward",
+            "editorMode": "builder",
+            "expr": "{instance=\"hyperbytedb/hyperbytedb-1:hyperbytedb\"} |= `WARN`",
+            "queryType": "range",
+            "refId": "A"
+          }
+        ],
+        "title": "[WARN] - hyperbytedb-1",
+        "type": "logs"
+      },
+      {
+        "datasource": {
+          "type": "loki",
+          "uid": "P8E80F9AEF21F6940"
+        },
+        "fieldConfig": {
+          "defaults": {},
+          "overrides": []
+        },
+        "gridPos": {
+          "h": 9,
+          "w": 24,
+          "x": 0,
+          "y": 18
+        },
+        "id": 3,
+        "options": {
+          "dedupStrategy": "none",
+          "enableInfiniteScrolling": false,
+          "enableLogDetails": true,
+          "showControls": false,
+          "showTime": false,
+          "sortOrder": "Ascending",
+          "unwrappedColumns": false,
+          "wrapLogMessage": false
+        },
+        "pluginVersion": "12.4.2",
+        "targets": [
+          {
+            "datasource": {
+              "type": "loki",
+              "uid": "P8E80F9AEF21F6940"
+            },
+            "direction": "forward",
+            "editorMode": "builder",
+            "expr": "{instance=\"hyperbytedb/hyperbytedb-0:hyperbytedb\"} |= `ERROR`",
+            "queryType": "range",
+            "refId": "A"
+          }
+        ],
+        "title": "[ERROR] - hyperbytedb-0",
+        "type": "logs"
+      },
+      {
+        "datasource": {
+          "type": "loki",
+          "uid": "P8E80F9AEF21F6940"
+        },
+        "fieldConfig": {
+          "defaults": {},
+          "overrides": []
+        },
+        "gridPos": {
+          "h": 9,
+          "w": 24,
+          "x": 0,
+          "y": 27
+        },
+        "id": 4,
+        "options": {
+          "dedupStrategy": "none",
+          "enableInfiniteScrolling": false,
+          "enableLogDetails": true,
+          "showControls": false,
+          "showTime": false,
+          "sortOrder": "Ascending",
+          "unwrappedColumns": false,
+          "wrapLogMessage": false
+        },
+        "pluginVersion": "12.4.2",
+        "targets": [
+          {
+            "datasource": {
+              "type": "loki",
+              "uid": "P8E80F9AEF21F6940"
+            },
+            "direction": "forward",
+            "editorMode": "builder",
+            "expr": "{instance=\"hyperbytedb/hyperbytedb-1:hyperbytedb\"} |= `ERROR`",
+            "queryType": "range",
+            "refId": "A"
+          }
+        ],
+        "title": "[ERROR] - hyperbytedb-1",
+        "type": "logs"
+      }
+    ],
+    "preload": false,
+    "schemaVersion": 42,
+    "tags": [],
+    "templating": {
+      "list": []
+    },
+    "time": {
+      "from": "now-15m",
+      "to": "now"
+    },
+    "timepicker": {},
+    "timezone": "browser",
+    "title": "Logging",
+    "uid": "adgntrg",
+    "version": 4,
+    "weekStart": ""
+  }

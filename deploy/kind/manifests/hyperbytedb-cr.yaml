@@ -1,0 +1,97 @@
+apiVersion: hyperbytedb.hyperbytedb.io/v1alpha1
+kind: HyperbytedbCluster
+metadata:
+  name: hyperbytedb
+  namespace: hyperbytedb
+spec:
+  replicas: 2
+  image: hyperbytedb:local
+  imagePullPolicy: Never
+  server:
+    port: 8086
+    maxBodySizeBytes: 26214400
+    requestTimeoutSecs: 30
+    queryTimeoutSecs: 30
+    maxConcurrentQueries: 0
+  storage:
+    volumeClaimTemplate:
+      size: 16Gi
+  flush:
+    intervalSecs: 5
+    walSizeThresholdMb: 64
+    timeBucketDuration: "1h"
+    maxPointsPerBatch: 50000
+    walBatchSize: 64
+    walBatchDelayUs: 200
+  cardinality:
+    maxTagValuesPerMeasurement: 100000
+    maxMeasurementsPerDatabase: 10000
+  cluster:
+    heartbeatIntervalSecs: 2
+    heartbeatMissThreshold: 5
+    antiEntropyEnabled: false
+    antiEntropyIntervalSecs: 60
+    replicationMaxRetries: 5
+    replicationQueueDepth: 8192
+    replicationMaxInflightBatches: 8
+    replicationMaxCoalesceBodyBytes: 8388608
+    replicateReceiverQueueDepth: 1024
+    replicationTruncateStalePeerMultiplier: 2
+    # Heartbeat RPC timeout must exceed typical flush/chDB stalls (~3s at 500k pts).
+    raftHeartbeatIntervalMs: 1000
+    raftElectionTimeoutMs: 5000
+    raftSnapshotThreshold: 1000
+    replication:
+      mode: async
+      ackTimeoutMs: 5000
+      syncQuorum:
+        minAcks: majority
+  statementSummary:
+    enabled: true
+    maxEntries: 1000
+  hintedHandoff:
+    enabled: true
+    maxHintsPerPeer: 100000
+    maxHintAgeSecs: 3600
+  rateLimit:
+    enabled: false
+    maxRequestsPerSecond: 0
+  logging:
+    level: info
+    format: json
+    detailedTrace: true
+    # Base URL is OK; hyperbytedb appends /v1/traces for OTLP HTTP export.
+    otlpEndpoint: http://alloy-logs.hyperbytedb.svc:4318
+    otlpSampleRatio: "1.0"
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "4"
+      memory: 16Gi
+  # Health-aware reverse proxy (TiProxy-style). Sits in front of the
+  # StatefulSet so rolling restarts and per-pod drains don't surface as
+  # client-visible 503s. Clients in kind talk to the proxy via the
+  # `hyperbytedb-proxy` NodePort, which is mapped to host port 8086 by
+  # `deploy/kind/kind-config.yaml`.
+  proxy:
+    enabled: true
+    image: hyperbytedb-proxy:local
+    imagePullPolicy: Never
+    replicas: 2
+    port: 8086
+    serviceType: NodePort
+    nodePort: 30086
+    healthPath: /health
+    holdTimeoutSecs: 10
+    maxRetries: 2
+    shutdownGraceSecs: 30
+    requestTimeoutSecs: 60
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: "1"
+        memory: 256Mi

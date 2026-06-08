@@ -1,0 +1,27 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: hyperbytedb
+nodes:
+  - role: control-plane
+    # NodePort services forward to the kind node; map fixed nodePorts to the host.
+    # hyperbytedb-proxy NodePort → 30086 → localhost:8086
+    extraPortMappings:
+      - containerPort: 30086
+        hostPort: 8086
+        protocol: TCP
+      - containerPort: 30090
+        hostPort: 9090
+        protocol: TCP
+      - containerPort: 30000
+        hostPort: 3000
+        protocol: TCP
+  - role: worker
+    extraMounts:
+      - hostPath: /tmp/hyperbytedb-data/worker-0
+        containerPath: /data/hyperbytedb
+        propagation: None
+  - role: worker
+    extraMounts:
+      - hostPath: /tmp/hyperbytedb-data/worker-1
+        containerPath: /data/hyperbytedb
+        propagation: None

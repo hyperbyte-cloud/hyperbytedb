@@ -1,0 +1,57 @@
+use serde::{Deserialize, Serialize};
+
+use crate::domain::database::RetentionPolicy;
+use crate::ports::metadata::ContinuousQueryDef;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MutationRequest {
+    CreateDatabase(String),
+    DropDatabase(String),
+    CreateRetentionPolicy {
+        db: String,
+        rp: RetentionPolicy,
+    },
+    DropRetentionPolicy {
+        db: String,
+        name: String,
+    },
+    CreateUser {
+        username: String,
+        password_hash: String,
+        admin: bool,
+    },
+    DropUser(String),
+    SetPassword {
+        username: String,
+        password_hash: String,
+    },
+    Delete {
+        database: String,
+        measurement: String,
+        predicate_sql: String,
+    },
+    CreateContinuousQuery {
+        database: String,
+        name: String,
+        definition: ContinuousQueryDef,
+    },
+    DropContinuousQuery {
+        database: String,
+        name: String,
+    },
+}
+
+/// Wrapper sent over the wire -- carries the sender's seq for ack tracking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MutationReplicateRequest {
+    pub seq: u64,
+    #[serde(default)]
+    pub origin_node_id: u64,
+    pub mutation: MutationRequest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MutationReplicateResponse {
+    pub ok: bool,
+    pub ack_seq: u64,
+}

@@ -1,0 +1,109 @@
+[server]
+bind_address = "0.0.0.0"
+port = 8086
+max_body_size_bytes = 26214400  # 25 MB
+request_timeout_secs = 30
+
+[storage]
+wal_dir = "./wal"
+meta_dir = "./meta"
+
+[flush]
+interval_secs = 10
+wal_size_threshold_mb = 64
+time_bucket_duration = "1h"
+max_points_per_batch = 50000
+
+[chdb]
+session_data_path = "./chdb_data"
+
+[auth]
+enabled = false
+
+[cardinality]
+max_tag_values_per_measurement = 100000
+max_measurements_per_database = 10000
+
+[cluster]
+enabled = false
+node_id = 1
+cluster_addr = "127.0.0.1:8086"
+# Deprecated: leave empty for operator-driven clusters. When set (comma-
+# separated, e.g. "host2:8086,host3:8086"), the bootstrap node will probe
+# these peers and add them as Raft learners on startup. When empty, the
+# external controller (operator) is expected to call
+# /cluster/membership/add-node as new nodes come online.
+peers = ""
+heartbeat_interval_secs = 2
+heartbeat_miss_threshold = 5
+# anti_entropy_* keys are deprecated and ignored.
+replication_log_dir = "./replication_log"
+raft_dir = "./raft"
+replication_max_retries = 5
+# Raft consensus settings (used when cluster is enabled)
+# raft_heartbeat_interval_ms = 300
+# raft_election_timeout_ms = 1000
+# raft_snapshot_threshold = 1000
+
+# ----------------------------------------------------------------------------
+# Per-node replication mode. Controls only THIS node's coordinator behavior
+# (how writes accepted by this node are replicated). Receivers always accept
+# both async (fire-and-forget) and sync (header-gated, ack-with-WAL-seq)
+# requests on the same /internal/replicate endpoint, so mixed-mode rolling
+# restarts are safe at any moment.
+#
+# Modes:
+#   "async"        Fire-and-forget HTTP fan-out (default; preserves today's
+#                  behavior). Local WAL append succeeds immediately and
+#                  replication is best-effort with hinted handoff retries.
+#   "sync_quorum"  HTTP fan-out + await W-of-N peer acks before returning to
+#                  the client. Trades latency for stronger durability.
+#
+# Omit the entire [cluster.replication] block to keep async behavior.
+# ----------------------------------------------------------------------------
+[cluster.replication]
+mode = "async"
+# Worst-case latency budget for a sync_quorum write. On timeout the coordinator
+# returns 504; the in-flight peer tasks keep running so durability still
+# ratchets forward in the background (and pushes to hinted handoff on failure).
+ack_timeout_ms = 5000
+
+[cluster.replication.sync_quorum]
+# Number of PEER acks required. The local WAL append always happens first, so
+# self-durability is implicit and the local node is never counted toward the
+# quorum. Two forms accepted:
+#   "majority"   floor(N/2) peer acks where N is the total cluster size,
+#                resolved at request time against current active_peers().
+#                For N=3 this means 1 peer ack; for N=5, 2 peer acks.
+#   <integer>    explicit peer ack count, clamped to active_peers().
+min_acks = "majority"
+
+[logging]
+level = "info"
+format = "text"
+# Detailed per-phase tracing (write, query, flush). Off by default — hot paths
+# only check one atomic when disabled. Enable for Loki/Tempo debugging.
+detailed_trace = false
+# OTLP HTTP endpoint for Tempo (async export; independent of detailed_trace).
+# OTLP HTTP collector base URL (/v1/traces is appended automatically).
+# otlp_endpoint = "http://alloy-logs.hyperbytedb.svc:4318"
+# otlp_sample_ratio = 0.1
+
+[statement_summary]
+enabled = true
+max_entries = 1000
+
+# ----------------------------------------------------------------------------
+# Retention policy enforcement loop. Periodically runs `ALTER TABLE … DELETE`
+# for rows older than each RP's `duration`. This block governs only how often
+# that scan runs — the per-policy duration is metadata stored alongside each RP.
+#
+#   enabled   When false, the loop is not spawned and expired files remain on
+#             disk until manually deleted. Defaults to `true`.
+#   interval  How often the scan runs, as a `humantime` duration string
+#             ("30s", "1m", "1h", "24h", "1d", ...). Defaults to "60s".
+#             Invalid or zero values fall back to 60s and emit a warning.
+# ----------------------------------------------------------------------------
+[retention]
+enabled = true
+interval = "60s"

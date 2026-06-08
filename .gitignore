@@ -1,0 +1,116 @@
+# ----- Rust basics -----
+/target/
+**/target/
+*.rs.bk
+Cargo.local
+Cargo.lock.bk
+!.cargo/config
+
+# Python virtual environment
+.venv/
+
+# IDE/editor/devtool files
+/.vscode/
+/.idea/
+/.history/
+*.iml
+*.swp
+*.swo
+*.bak
+*~
+.#*
+.DS_Store
+
+# Artifacts and logs
+*.log
+*.out
+*.tmp
+*.core
+
+# Build output
+/build/
+**/build/
+
+# Documentation output
+/target/doc/
+/doc/
+/site/
+
+# Rust coverage/debug tools
+/coverage/
+/htmlcov/
+*.profraw
+*.profdata
+*.gcda
+*.gcno
+*.gcov
+
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Rustfmt/Clippy caches
+rustfmt.toml.bk
+.clippy.toml.bk
+
+# Backups
+*.old
+*.orig
+
+# Test/Sandbox files
+*.snap
+*.test
+/tests/tmp/
+tests/tmp/
+tests/output/
+tests/.tmp/
+test-output/
+*.d
+
+# Local runtime data
+.env
+.env.*
+.localenv
+*.local
+*.secret
+
+# Temp + data folders frequently produced by scripts or CI
+/log/
+logs/
+tmp/
+temp/
+.cache/
+*.pid
+
+# Cargo package output
+/hyperbytedb-*.crate
+
+# Ignore Windows specific files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ----- Project specific -----
+# .server.pid might be written by load.sh test
+.server.pid
+
+# Ignore local dependency overrides
+/cargo-home/
+/.crates.toml
+/.cargo/.package-cache/
+
+# local start up folders (root-level only — avoid ignoring src/adapters/wal/)
+/meta
+/data
+/log
+/wal
+/chdb_data
+
+./hyperbytedb-operator
+.cursorrules
+.cursor/
+hyperbytedb-operator
+influx-multiplay

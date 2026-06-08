@@ -1,0 +1,9 @@
+# Pin the Rust toolchain for reproducible builds across local dev, CI, and
+# the Dockerfile. This matters because `cargo build --locked` (and the
+# `cargo fetch --locked` step in the Dockerfile) will refuse to run when a
+# newer cargo wants to upgrade the on-disk Cargo.lock format. Bumping this
+# requires regenerating Cargo.lock with the new toolchain.
+[toolchain]
+channel = "1.94"
+profile = "minimal"
+components = ["rustc", "cargo", "rust-std"]

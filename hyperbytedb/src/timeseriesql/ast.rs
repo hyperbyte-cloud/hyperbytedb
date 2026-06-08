@@ -1,0 +1,354 @@
+#[derive(Debug, Clone)]
+pub enum Statement {
+    Select(SelectStatement),
+    ShowDatabases,
+    ShowMeasurements(ShowMeasurementsStatement),
+    ShowTagKeys(ShowTagKeysStatement),
+    ShowTagValues(ShowTagValuesStatement),
+    ShowFieldKeys(ShowFieldKeysStatement),
+    ShowSeries(ShowSeriesStatement),
+    CreateDatabase(String),
+    DropDatabase(String),
+    DropMeasurement(String),
+    ShowRetentionPolicies(String),
+    ShowUsers,
+    DropUser(String),
+    CreateRetentionPolicyStmt {
+        name: String,
+        db: String,
+        duration: Option<Duration>,
+        replication: u32,
+        shard_duration: Option<Duration>,
+        is_default: bool,
+    },
+    AlterRetentionPolicyStmt {
+        name: String,
+        db: String,
+        duration: Option<Duration>,
+        replication: Option<u32>,
+        shard_duration: Option<Duration>,
+        is_default: Option<bool>,
+    },
+    DropRetentionPolicyStmt {
+        name: String,
+        db: String,
+    },
+    CreateUser {
+        username: String,
+        password: String,
+        admin: bool,
+    },
+    SetPassword {
+        username: String,
+        password: String,
+    },
+    Grant {
+        username: String,
+        database: Option<String>,
+    },
+    Revoke {
+        username: String,
+        database: Option<String>,
+    },
+    Delete(DeleteStatement),
+    CreateContinuousQuery(CreateContinuousQueryStatement),
+    ShowContinuousQueries,
+    DropContinuousQuery {
+        name: String,
+        db: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct SelectStatement {
+    pub fields: Vec<Field>,
+    pub into: Option<Measurement>,
+    pub from: Vec<MeasurementSource>,
+    pub condition: Option<Expr>,
+    pub group_by: Option<GroupBy>,
+    pub order_by: Option<OrderBy>,
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
+    pub slimit: Option<u64>,
+    pub soffset: Option<u64>,
+    pub fill: Option<FillOption>,
+    pub timezone: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum MeasurementSource {
+    Concrete(Measurement),
+    Subquery(Box<SelectStatement>),
+}
+
+#[derive(Debug, Clone)]
+pub struct ShowMeasurementsStatement {
+    pub database: Option<String>,
+    pub condition: Option<Expr>,
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ShowTagKeysStatement {
+    pub database: Option<String>,
+    pub from: Option<Measurement>,
+    pub condition: Option<Expr>,
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ShowTagValuesStatement {
+    pub database: Option<String>,
+    pub from: Option<Measurement>,
+    pub tag_key: TagKeySelector,
+    pub condition: Option<Expr>,
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub enum TagKeySelector {
+    All,
+    Eq(String),
+    Neq(String),
+    Regex(String),
+    In(Vec<String>),
+}
+
+#[derive(Debug, Clone)]
+pub struct ShowFieldKeysStatement {
+    pub database: Option<String>,
+    pub from: Option<Measurement>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ShowSeriesStatement {
+    pub database: Option<String>,
+    pub from: Option<Measurement>,
+    pub condition: Option<Expr>,
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Field {
+    pub expr: Expr,
+    pub alias: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum Expr {
+    Identifier(String),
+    Star,
+    StringLiteral(String),
+    IntegerLiteral(i64),
+    FloatLiteral(f64),
+    BooleanLiteral(bool),
+    DurationLiteral(Duration),
+    TimeLiteral(String),
+    Regex(String),
+    Call(FunctionCall),
+    BinaryExpr(Box<BinaryExpr>),
+    UnaryExpr(UnaryOp, Box<Expr>),
+    Wildcard,
+    FieldRef {
+        name: String,
+        typ: Option<FieldType>,
+    },
+    Now,
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionCall {
+    pub name: String,
+    pub args: Vec<Expr>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BinaryExpr {
+    pub left: Expr,
+    pub op: BinaryOp,
+    pub right: Expr,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Eq,
+    Neq,
+    Lt,
+    Lte,
+    Gt,
+    Gte,
+    And,
+    Or,
+    RegexMatch,
+    RegexNotMatch,
+}
+
+#[derive(Debug, Clone)]
+pub enum UnaryOp {
+    Neg,
+    Not,
+}
+
+#[derive(Debug, Clone)]
+pub struct Duration {
+    pub value: i64,
+    pub unit: DurationUnit,
+}
+
+impl Duration {
+    pub fn to_nanos(&self) -> i64 {
+        self.value
+            * match self.unit {
+                DurationUnit::Nanosecond => 1,
+                DurationUnit::Microsecond => 1_000,
+                DurationUnit::Millisecond => 1_000_000,
+                DurationUnit::Second => 1_000_000_000,
+                DurationUnit::Minute => 60 * 1_000_000_000,
+                DurationUnit::Hour => 3_600 * 1_000_000_000,
+                DurationUnit::Day => 86_400 * 1_000_000_000,
+                DurationUnit::Week => 7 * 86_400 * 1_000_000_000,
+            }
+    }
+
+    pub fn to_clickhouse_interval(&self) -> String {
+        let (val, unit) = match self.unit {
+            DurationUnit::Nanosecond => (self.value, "NANOSECOND"),
+            DurationUnit::Microsecond => (self.value, "MICROSECOND"),
+            DurationUnit::Millisecond => (self.value, "MILLISECOND"),
+            DurationUnit::Second => (self.value, "SECOND"),
+            DurationUnit::Minute => (self.value, "MINUTE"),
+            DurationUnit::Hour => (self.value, "HOUR"),
+            DurationUnit::Day => (self.value, "DAY"),
+            DurationUnit::Week => (self.value * 7, "DAY"),
+        };
+        format!("INTERVAL {val} {unit}")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DurationUnit {
+    Nanosecond,
+    Microsecond,
+    Millisecond,
+    Second,
+    Minute,
+    Hour,
+    Day,
+    Week,
+}
+
+#[derive(Debug, Clone)]
+pub enum FillOption {
+    Null,
+    None,
+    Previous,
+    Linear,
+    Value(f64),
+}
+
+#[derive(Debug, Clone)]
+pub struct GroupBy {
+    pub dimensions: Vec<Dimension>,
+}
+
+impl GroupBy {
+    pub fn time_dimension(&self) -> Option<&Dimension> {
+        self.dimensions
+            .iter()
+            .find(|d| matches!(d, Dimension::Time { .. }))
+    }
+
+    pub fn tag_dimensions(&self) -> Vec<&str> {
+        self.dimensions
+            .iter()
+            .filter_map(|d| match d {
+                Dimension::Tag(name) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum Dimension {
+    Time {
+        interval: Duration,
+        offset: Option<Duration>,
+    },
+    Tag(String),
+    Regex(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct OrderBy {
+    pub time_desc: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct Measurement {
+    pub database: Option<String>,
+    pub retention_policy: Option<String>,
+    pub name: MeasurementName,
+}
+
+impl Measurement {
+    pub fn name_str(&self) -> Option<&str> {
+        match &self.name {
+            MeasurementName::Name(n) => Some(n.as_str()),
+            MeasurementName::Regex(_) => None,
+        }
+    }
+}
+
+impl MeasurementSource {
+    pub fn name_str(&self) -> Option<&str> {
+        match self {
+            MeasurementSource::Concrete(m) => m.name_str(),
+            MeasurementSource::Subquery(_) => None,
+        }
+    }
+
+    pub fn as_concrete(&self) -> Option<&Measurement> {
+        match self {
+            MeasurementSource::Concrete(m) => Some(m),
+            MeasurementSource::Subquery(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum MeasurementName {
+    Name(String),
+    Regex(String),
+}
+
+#[derive(Debug, Clone)]
+pub enum FieldType {
+    Field,
+    Tag,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeleteStatement {
+    pub from: String,
+    pub condition: Option<Expr>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateContinuousQueryStatement {
+    pub name: String,
+    pub database: String,
+    pub query: SelectStatement,
+    pub raw_query: String,
+    pub resample_every: Option<Duration>,
+    pub resample_for: Option<Duration>,
+}

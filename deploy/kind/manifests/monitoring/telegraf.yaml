@@ -1,0 +1,108 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: telegraf-config
+  namespace: hyperbytedb
+data:
+  telegraf.conf: |
+    [global_tags]
+
+    [agent]
+      interval = "10s"
+      round_interval = true
+      metric_batch_size = 1000
+      metric_buffer_limit = 10000
+      collection_jitter = "0s"
+      flush_interval = "10s"
+      flush_jitter = "0s"
+
+    # ── Outputs ────────────────────────────────────────────────────────────────
+
+    [[outputs.influxdb]]
+      urls = ["http://hyperbytedb-proxy:8086"]
+      database = "telegraf"
+      skip_database_creation = false
+      timeout = "5s"
+
+    # ── Inputs ─────────────────────────────────────────────────────────────────
+
+    [[inputs.cpu]]
+      percpu = true
+      totalcpu = true
+      collect_cpu_time = false
+      report_active = false
+
+    [[inputs.mem]]
+
+    [[inputs.disk]]
+      ignore_fs = ["tmpfs", "devtmpfs", "devfs", "iso9660", "overlay", "aufs", "squashfs"]
+
+    [[inputs.diskio]]
+
+    [[inputs.net]]
+
+    [[inputs.netstat]]
+
+    [[inputs.system]]
+
+    [[inputs.processes]]
+
+    [[inputs.kernel]]
+
+    [[inputs.swap]]
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: telegraf
+  namespace: hyperbytedb
+  labels:
+    app: telegraf
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: telegraf
+  template:
+    metadata:
+      labels:
+        app: telegraf
+    spec:
+      containers:
+        - name: telegraf
+          image: telegraf:latest
+          env:
+            - name: HOST_PROC
+              value: /host/proc
+            - name: HOST_SYS
+              value: /host/sys
+          volumeMounts:
+            - name: config
+              mountPath: /etc/telegraf/telegraf.conf
+              subPath: telegraf.conf
+              readOnly: true
+            - name: host-proc
+              mountPath: /host/proc
+              readOnly: true
+            - name: host-sys
+              mountPath: /host/sys
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      volumes:
+        - name: config
+          configMap:
+            name: telegraf-config
+        - name: host-proc
+          hostPath:
+            path: /proc
+        - name: host-sys
+          hostPath:
+            path: /sys

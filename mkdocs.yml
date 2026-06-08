@@ -1,0 +1,127 @@
+site_name: HyperbyteDB Documentation
+site_description: Documentation for HyperbyteDB — a time-series database with InfluxDB v1 compatibility, embedded chDB MergeTree storage, and master-master clustering
+site_url: https://docs.hyperbyte.cloud
+repo_url: https://github.com/hyperbyte-cloud/hyperbytedb
+repo_name: hyperbyte-cloud/hyperbytedb
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  logo: img/logo.png
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: amber
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
+      accent: blue
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - navigation.indexes
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.action.edit
+    - toc.follow
+  icon:
+    repo: fontawesome/brands/github
+
+plugins:
+  - search
+  - minify:
+      minify_html: true
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+validation:
+  nav:
+    omitted_files: info
+  links:
+    not_found: info
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/hyperbyte-cloud/hyperbytedb
+  generator: false
+
+nav:
+  - Home: index.md
+  - User Guide:
+      - user-guide/index.md
+      - Installation: user-guide/installation.md
+      - Kubernetes operator:
+          - Overview: user-guide/operator/index.md
+          - Installation: user-guide/operator/installation.md
+          - HyperbytedbCluster: user-guide/operator/cluster.md
+          - Backup & Restore: user-guide/operator/backup-restore.md
+          - hyperbytedb-proxy: user-guide/operator/hyperbytedb-proxy.md
+      - Configuration: user-guide/configuration.md
+      - Basic operations: user-guide/basic-operations.md
+      - Authentication: user-guide/authentication.md
+      - Advanced features: user-guide/advanced-features.md
+      - Common workflows: user-guide/common-workflows.md
+      - Administration: user-guide/administration.md
+      - Troubleshooting: user-guide/troubleshooting.md
+      - API & InfluxQL Reference: user-guide/reference.md
+  - Developer Guide:
+      - developer-guide/index.md
+      - Architecture: developer-guide/architecture.md
+      - System architecture: developer-guide/system-architecture.md
+      - Development Setup: developer-guide/development-setup.md
+      - Coding Standards: developer-guide/coding-standards.md
+      - Internals:
+          - developer-guide/internals/index.md
+          - Core Modules: developer-guide/internals/core-modules.md
+          - Key Design Decisions: developer-guide/internals/key-design-decisions.md
+          - Replication design: developer-guide/internals/replication-design.md
+          - Extension Points: developer-guide/internals/extension-points.md
+      - Testing: developer-guide/testing.md
+      - Building & CI: developer-guide/building-and-ci.md
+      - Contributing: developer-guide/contributing.md
+  - Benchmarks: benchmarks.md
+  - Deep Dive Series:
+      - Clustering: deep-dive/deep-dive-clustering.md
+      - Compaction: deep-dive/deep-dive-compaction.md
+      - Read Path: deep-dive/deep-dive-read-path.md
+      - Write Path: deep-dive/deep-dive-write-path.md
+      - Self Repair: deep-dive/deep-dive-self-repair.md
+  - Glossary: glossary.md

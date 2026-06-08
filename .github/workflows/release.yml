@@ -1,0 +1,156 @@
+name: Release
+
+# Release pipeline. On every `v*` tag push we:
+#
+#   1. Build a multi-arch (linux/amd64, linux/arm64) Docker image and push it
+#      to GHCR under ghcr.io/hyperbyte-cloud/hyperbytedb. arm64 layers are
+#      built under QEMU emulation on the amd64 self-hosted runner.
+#   2. Re-use the same BuildKit cache to export the `artifacts` Dockerfile
+#      stage per platform and package:
+#        - hyperbytedb-<tag>-linux-x86_64.tar.gz   (amd64 / x64)
+#        - hyperbytedb-<tag>-linux-aarch64.tar.gz (arm64)
+#      Each tarball contains hyperbytedb + matching libchdb.so, plus a sha256.
+#   3. Publish a GitHub Release for the tag with the tarballs attached.
+#
+# Jobs run directly on the ARC runner pod (not inside a job container) so
+# QEMU/binfmt registration and Docker Buildx talk to the dind sidecar reliably.
+# Requires containerMode.type=dind on the runner scale set.
+
+on:
+  push:
+    tags: ["v*"]
+
+concurrency:
+  # Don't cancel an in-flight release if a new tag is pushed. Releases are
+  # not safe to interrupt — we'd leave half-pushed image manifests and a
+  # half-populated GitHub Release behind.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  # Canonical package; docs and operator manifests reference
+  # ghcr.io/hyperbyte-cloud/hyperbytedb. Hardcoded because github.repository
+  # is wrong when this workflow runs from a fork or a renamed root repo.
+  IMAGE_NAME: hyperbyte-cloud/hyperbytedb
+
+jobs:
+  release:
+    name: Build & publish release
+    runs-on: hyperbytedb-operator-controller
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CI dependencies
+        uses: ./.github/actions/install-ci-deps
+        with:
+          profile: k8s-runner
+
+      - name: Set up QEMU (binfmt for linux/arm64 builds)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.GHCR_USERNAME }}
+          password: ${{ secrets.GHCR_PAT }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
+
+      - name: Build and push multi-arch image (linux/amd64 + linux/arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: ..
+          file: hyperbytedb/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          # provenance=false keeps the image manifest as a simple
+          # multi-arch index (no attestation index wrapper), which is what
+          # `docker pull --platform=...` and downstream tooling expect.
+          provenance: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Package linux/x86_64 (amd64) release tarball
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          rm -rf staging-x86_64
+          docker buildx build \
+            --platform linux/amd64 \
+            --target artifacts \
+            --output type=local,dest=./staging-x86_64 \
+            --provenance=false \
+            --cache-from type=gha \
+            -f hyperbytedb/Dockerfile \
+            ..
+          NAME="hyperbytedb-${TAG}-linux-x86_64"
+          tar -C staging-x86_64 -czf "out/${NAME}.tar.gz" hyperbytedb libchdb.so
+          ( cd out && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
+          ls -lh "out/${NAME}.tar.gz" "out/${NAME}.tar.gz.sha256"
+
+      - name: Package linux/aarch64 (arm64) release tarball
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          rm -rf staging-aarch64
+          docker buildx build \
+            --platform linux/arm64 \
+            --target artifacts \
+            --output type=local,dest=./staging-aarch64 \
+            --provenance=false \
+            --cache-from type=gha \
+            -f hyperbytedb/Dockerfile \
+            ..
+          NAME="hyperbytedb-${TAG}-linux-aarch64"
+          tar -C staging-aarch64 -czf "out/${NAME}.tar.gz" hyperbytedb libchdb.so
+          ( cd out && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
+          ls -lh "out/${NAME}.tar.gz" "out/${NAME}.tar.gz.sha256"
+
+      - name: Verify release artifacts
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          for arch in x86_64 aarch64; do
+            test -s "out/hyperbytedb-${TAG}-linux-${arch}.tar.gz"
+            test -s "out/hyperbytedb-${TAG}-linux-${arch}.tar.gz.sha256"
+          done
+          ls -lh out/
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            out/hyperbytedb-${{ github.ref_name }}-linux-x86_64.tar.gz
+            out/hyperbytedb-${{ github.ref_name }}-linux-x86_64.tar.gz.sha256
+            out/hyperbytedb-${{ github.ref_name }}-linux-aarch64.tar.gz
+            out/hyperbytedb-${{ github.ref_name }}-linux-aarch64.tar.gz.sha256

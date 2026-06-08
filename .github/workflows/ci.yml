@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  doc_links:
+    name: Doc links (relative .md)
+    runs-on: hyperbytedb-operator-controller
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check relative markdown links
+        run: python3 scripts/check_doc_links.py
+
+  fmt:
+    name: Format
+    runs-on: hyperbytedb-operator-controller
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CI dependencies
+        uses: ./.github/actions/install-ci-deps
+        with:
+          profile: k8s-runner
+
+      - name: Check formatting
+        run: |
+          bash .github/scripts/run-in-rust-container.sh \
+            'rustup component add rustfmt && cargo fmt --all --check'
+
+  clippy:
+    name: Clippy
+    runs-on: hyperbytedb-operator-controller
+    needs: [fmt, doc_links]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CI dependencies
+        uses: ./.github/actions/install-ci-deps
+        with:
+          profile: k8s-runner
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: |
+          bash .github/scripts/run-in-rust-container.sh \
+            'bash .github/scripts/rust-container-setup.sh && rustup component add clippy && cargo clippy --all-targets -- -D warnings'
+
+  test:
+    name: Test
+    runs-on: hyperbytedb-operator-controller
+    needs: [fmt, doc_links]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CI dependencies
+        uses: ./.github/actions/install-ci-deps
+        with:
+          profile: k8s-runner
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run unit tests
+        run: |
+          bash .github/scripts/run-in-rust-container.sh \
+            'bash .github/scripts/rust-container-setup.sh && cargo test --lib'
+
+      - name: Run integration tests
+        run: |
+          bash .github/scripts/run-in-rust-container.sh \
+            'bash .github/scripts/rust-container-setup.sh && cargo test --test '"'"'*'"'"''
+
+  build:
+    name: Build
+    runs-on: hyperbytedb-operator-controller
+    needs: [clippy, test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CI dependencies
+        uses: ./.github/actions/install-ci-deps
+        with:
+          profile: k8s-runner
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: |
+          bash .github/scripts/run-in-rust-container.sh \
+            'bash .github/scripts/rust-container-setup.sh && cargo build --release'

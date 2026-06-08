@@ -1,0 +1,47 @@
+[package]
+name = "hyperbytedb-proxy"
+version = "0.8.0"
+edition = "2024"
+description = "Health-aware HTTP reverse proxy for hyperbytedb. Provides connection draining, request hold-and-retry across rolling restarts, and per-backend health gating"
+license = "Apache-2.0"
+
+[lib]
+name = "hyperbytedb_proxy"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hyperbytedb-proxy"
+path = "src/main.rs"
+
+[[bench]]
+name = "routing"
+harness = false
+
+[dependencies]
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "http2"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+
+# Config (env-only; no TOML on the proxy to keep it operationally simple).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
+
+anyhow = "1"
+thiserror = "2"
+futures = "0.3"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+

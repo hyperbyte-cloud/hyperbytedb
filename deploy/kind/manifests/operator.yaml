@@ -1,0 +1,115 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hyperbytedb-operator
+  namespace: hyperbytedb
+  labels:
+    app: hyperbytedb-operator
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: hyperbytedb-operator
+rules:
+- apiGroups: [""]
+  resources: [configmaps, services, persistentvolumeclaims, pods, secrets]
+  verbs: [get, list, watch, create, update, patch, delete]
+- apiGroups: [apps]
+  resources: [statefulsets, deployments]
+  verbs: [get, list, watch, create, update, patch, delete]
+- apiGroups: [autoscaling]
+  resources: [horizontalpodautoscalers]
+  verbs: [get, list, watch, create, update, patch, delete]
+- apiGroups: [batch]
+  resources: [cronjobs, jobs]
+  verbs: [get, list, watch, create, update, patch, delete]
+- apiGroups: [policy]
+  resources: [poddisruptionbudgets]
+  verbs: [get, list, watch, create, update, patch, delete]
+- apiGroups: [hyperbytedb.hyperbytedb.io]
+  resources: [hyperbytedbclusters, hyperbytedbbackups, hyperbytedbrestores]
+  verbs: [get, list, watch, create, update, patch, delete]
+- apiGroups: [hyperbytedb.hyperbytedb.io]
+  resources: [hyperbytedbclusters/status, hyperbytedbbackups/status, hyperbytedbrestores/status]
+  verbs: [get, update, patch]
+- apiGroups: [hyperbytedb.hyperbytedb.io]
+  resources: [hyperbytedbclusters/finalizers, hyperbytedbbackups/finalizers, hyperbytedbrestores/finalizers]
+  verbs: [update]
+- apiGroups: [coordination.k8s.io]
+  resources: [leases]
+  verbs: [get, list, watch, create, update, patch, delete]
+- apiGroups: [""]
+  resources: [events]
+  verbs: [create, patch]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: hyperbytedb-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: hyperbytedb-operator
+subjects:
+- kind: ServiceAccount
+  name: hyperbytedb-operator
+  namespace: hyperbytedb
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hyperbytedb-operator
+  namespace: hyperbytedb
+  labels:
+    app: hyperbytedb-operator
+    app.kubernetes.io/name: hyperbytedb-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hyperbytedb-operator
+  template:
+    metadata:
+      labels:
+        app: hyperbytedb-operator
+        app.kubernetes.io/name: hyperbytedb-operator
+    spec:
+      serviceAccountName: hyperbytedb-operator
+      terminationGracePeriodSeconds: 10
+      containers:
+      - name: manager
+        image: hyperbytedb-operator:local
+        imagePullPolicy: Never
+        command: ["/manager"]
+        args:
+        - --leader-elect
+        - --health-probe-bind-address=:8081
+        env:
+        - name: ENABLE_WEBHOOKS
+          value: "false"
+        ports:
+        - containerPort: 8081
+          name: health
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          limits:
+            cpu: 500m
+            memory: 128Mi
+          requests:
+            cpu: 10m
+            memory: 64Mi
