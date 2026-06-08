@@ -9,7 +9,7 @@ name: Release
 #      stage per platform and package:
 #        - hyperbytedb-<tag>-linux-x86_64.tar.gz   (amd64 / x64)
 #        - hyperbytedb-<tag>-linux-aarch64.tar.gz (arm64)
-#      Each tarball contains hyperbytedb + matching libchdb.so, plus a sha256.
+#      Each tarball contains hyperbytedb, hyperbytedb-cli, and matching libchdb.so, plus a sha256.
 #   3. Publish a GitHub Release for the tag with the tarballs attached.
 #
 # Jobs run directly on the ARC runner pod (not inside a job container) so
@@ -107,7 +107,7 @@ jobs:
             -f hyperbytedb/Dockerfile \
             ..
           NAME="hyperbytedb-${TAG}-linux-x86_64"
-          tar -C staging-x86_64 -czf "out/${NAME}.tar.gz" hyperbytedb libchdb.so
+          tar -C staging-x86_64 -czf "out/${NAME}.tar.gz" hyperbytedb hyperbytedb-cli libchdb.so
           ( cd out && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
           ls -lh "out/${NAME}.tar.gz" "out/${NAME}.tar.gz.sha256"
 
@@ -126,7 +126,7 @@ jobs:
             -f hyperbytedb/Dockerfile \
             ..
           NAME="hyperbytedb-${TAG}-linux-aarch64"
-          tar -C staging-aarch64 -czf "out/${NAME}.tar.gz" hyperbytedb libchdb.so
+          tar -C staging-aarch64 -czf "out/${NAME}.tar.gz" hyperbytedb hyperbytedb-cli libchdb.so
           ( cd out && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
           ls -lh "out/${NAME}.tar.gz" "out/${NAME}.tar.gz.sha256"
 

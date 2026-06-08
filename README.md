@@ -47,6 +47,15 @@ This starts:
 
 Open Grafana at http://localhost:3000 (`admin` / `admin`) to validate metrics, logs, and traces end-to-end.
 
+### CLI client
+
+`hyperbytedb-cli` provides an interactive TimeseriesQL shell, batch queries, and write/import over the HTTP API (InfluxDB v1 `influx`-compatible). See [docs/user-guide/cli.md](docs/user-guide/cli.md).
+
+```bash
+cargo build --release -p hyperbytedb-cli
+./target/release/hyperbytedb-cli -host http://localhost:8086 -execute 'SHOW DATABASES'
+```
+
 ### Manual Build
 
 1. **Prerequisites**: Rust (latest stable), libchdb
