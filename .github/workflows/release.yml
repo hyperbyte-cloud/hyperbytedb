@@ -28,6 +28,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  CHDB_RUST_REPO: https://github.com/hyperbyte-cloud/chdb-rust.git
+  CHDB_RUST_REF: feat_arrow_insert
   REGISTRY: ghcr.io
   # Canonical package; docs and operator manifests reference
   # ghcr.io/hyperbyte-cloud/hyperbytedb. Hardcoded because github.repository
@@ -43,6 +45,9 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+
+      - name: Checkout chdb-rust
+        run: bash .github/scripts/checkout-chdb-rust.sh
 
       - name: Install CI dependencies
         uses: ./.github/actions/install-ci-deps
