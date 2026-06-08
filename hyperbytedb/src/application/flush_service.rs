@@ -6,9 +6,9 @@ use tokio::sync::watch;
 
 use crate::adapters::cluster::replication_log::ReplicationLog;
 use crate::application::system_trace;
-use crate::domain::point_coalesce::coalesce_points_and_origins;
 use crate::domain::cluster::membership::SharedMembership;
 use crate::domain::point::Point;
+use crate::domain::point_coalesce::coalesce_points_and_origins;
 use crate::error::HyperbytedbError;
 use crate::ports::flush::FlushPort;
 use crate::ports::points_sink::PointsSinkPort;

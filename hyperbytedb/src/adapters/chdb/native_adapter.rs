@@ -1648,8 +1648,7 @@ mod tests {
         ];
         let ddl = build_create_table_sql("`db_rp_cpu`", &field_phys);
         assert!(
-            ddl.find("usage_idle").unwrap()
-                < ddl.find("usage_system").unwrap()
+            ddl.find("usage_idle").unwrap() < ddl.find("usage_system").unwrap()
                 && ddl.find("usage_system").unwrap() < ddl.find("usage_user").unwrap(),
             "DDL must sort field columns by physical name, got: {ddl}"
         );

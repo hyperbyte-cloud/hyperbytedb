@@ -1843,7 +1843,10 @@ mod tests {
             "tag filter should join series table, got: {sql}"
         );
         assert!(sql.contains("avg(\"usage_idle\")"), "got: {sql}");
-        assert!(sql.contains("toStartOfInterval(time, INTERVAL 2 SECOND)"), "got: {sql}");
+        assert!(
+            sql.contains("toStartOfInterval(time, INTERVAL 2 SECOND)"),
+            "got: {sql}"
+        );
     }
 
     #[test]

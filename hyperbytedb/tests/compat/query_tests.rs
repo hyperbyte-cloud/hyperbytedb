@@ -954,7 +954,11 @@ async fn partial_line_writes_coalesce_before_query() {
         )
         .await
         .unwrap();
-    assert!(resp.results[0].error.is_none(), "{:?}", resp.results[0].error);
+    assert!(
+        resp.results[0].error.is_none(),
+        "{:?}",
+        resp.results[0].error
+    );
     let series = &resp.results[0].series.as_ref().unwrap()[0];
     let row = &series.values[0];
     let cols: Vec<&str> = series.columns.iter().map(|s| s.as_str()).collect();
