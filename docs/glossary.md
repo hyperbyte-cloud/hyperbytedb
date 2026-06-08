@@ -20,7 +20,7 @@ Shared terminology used across HyperbyteDB documentation.
 | **Flush** | Background process that reads WAL entries and writes them into chDB MergeTree tables via `ChdbNativeAdapter`. Runs every `flush.interval_secs`. |
 | **Hexagonal Architecture** | Design pattern where business logic depends only on abstract port traits, with concrete adapters plugged in at the composition root. Also called ports and adapters. |
 | **Hinted Handoff** | Mechanism that stores writes destined for unreachable peers in a local queue and replays them when the peer recovers. |
-| **InfluxQL** | Query language compatible with InfluxDB 1.x. Supports SELECT with aggregates/transforms, SHOW commands, DDL, DELETE, and continuous queries. |
+| **TimeseriesQLesQL** | Query language compatible with InfluxDB 1.x. Supports SELECT with aggregates/transforms, SHOW commands, DDL, DELETE, and continuous queries. |
 | **Line Protocol** | InfluxDB's text-based wire format for writing time-series data: `measurement,tag=val field=val timestamp`. |
 | **Master-Master Replication** | Clustering model where every node independently accepts writes and replicates them to all peers asynchronously. |
 | **Measurement** | Analogous to a table in a relational database. Contains a set of tag keys and field keys. |
@@ -36,7 +36,7 @@ Shared terminology used across HyperbyteDB documentation.
 | **Retention Policy (RP)** | Configuration that controls how long data is kept. Each database has one or more RPs. The default RP is `autogen` with infinite duration. |
 | **RocksDB** | Embedded key-value store. Used for the WAL (durable write log), metadata store, replication log, and Raft state. |
 | **Series** | A unique combination of measurement name and tag set. Each series has its own time-ordered sequence of field values. |
-| **Statement Summary** | Ring buffer tracking recently executed InfluxQL statements with query digest, latency, and error status. Exposed via `GET /api/v1/statements`. |
+| **Statement Summary** | Ring buffer tracking recently executed TimeseriesQL statements with query digest, latency, and error status. Exposed via `GET /api/v1/statements`. |
 | **Tag** | A key-value pair in a data point used for indexing and grouping. Tags are always strings. Stored in metadata for SHOW TAG queries. |
 | **Tombstone** | A metadata record created by DELETE statements. Marks data for exclusion at query time. |
 | **WAL (Write-Ahead Log)** | Durable, ordered log where incoming writes are persisted before the client receives a response. Data in the WAL is flushed to chDB by the background flush service. |

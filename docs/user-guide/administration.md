@@ -95,7 +95,7 @@ See [Configuration](configuration.md#logging) for all logging keys.
 
 ### Statement summary
 
-When `statement_summary.enabled = true`, recently executed InfluxQL statements are available at `GET /api/v1/statements`. Each entry includes the normalized query text, digest, execution time, and error status. Useful for correlating slow queries with Tempo traces and Loki logs.
+When `statement_summary.enabled = true`, recently executed TimeseriesQL statements are available at `GET /api/v1/statements`. Each entry includes the normalized query text, digest, execution time, and error status. Useful for correlating slow queries with Tempo traces and Loki logs.
 
 ### Health endpoint
 

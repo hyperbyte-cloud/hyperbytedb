@@ -135,7 +135,7 @@ hyperbytedb/
 │   ├── ports/              # Trait definitions
 │   ├── adapters/           # RocksDB, chDB, HTTP, cluster
 │   ├── application/        # Business logic services
-│   └── timeseriesql/       # InfluxQL parser and translator
+│   └── timeseriesql/       # TimeseriesQL parser and translator
 ├── tests/
 │   ├── integration.rs      # Auth, metrics, backup, layout
 │   ├── raft_integration.rs # Multi-node cluster

@@ -34,8 +34,8 @@ HTTP server settings.
 | `port` | integer | `8086` | HTTP listen port |
 | `max_body_size_bytes` | integer | `26214400` | Maximum request body size (25 MB) |
 | `request_timeout_secs` | integer | `30` | HTTP request timeout |
-| `query_timeout_secs` | integer | `30` | InfluxQL query execution timeout |
-| `max_concurrent_queries` | integer | `0` | Max concurrent InfluxQL executions; `0` = unlimited (bounded by work-stealing / resources). Use with single chDB session. |
+| `query_timeout_secs` | integer | `30` | TimeseriesQL query execution timeout |
+| `max_concurrent_queries` | integer | `0` | Max concurrent TimeseriesQL executions; `0` = unlimited (bounded by work-stealing / resources). Use with single chDB session. |
 | `tls_enabled` | boolean | `false` | Enable HTTPS with TLS |
 | `tls_cert_path` | string | `""` | Path to PEM certificate file |
 | `tls_key_path` | string | `""` | Path to PEM private key file |

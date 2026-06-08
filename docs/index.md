@@ -16,7 +16,7 @@ For operators and application developers deploying HyperbyteDB.
 | [Common workflows](user-guide/common-workflows.md) | InfluxDB migration, Telegraf, Grafana, monitoring |
 | [Administration](user-guide/administration.md) | Metrics, logs, traces, backup, cluster ops |
 | [Troubleshooting](user-guide/troubleshooting.md) | Common problems |
-| [API reference](user-guide/reference.md) | HTTP endpoints and InfluxQL compatibility |
+| [API reference](user-guide/reference.md) | HTTP endpoints and TimeseriesQL compatibility |
 | [Kubernetes operator](user-guide/operator/index.md) | Helm install, CRDs, backups |
 
 Start with the [user guide index](user-guide/index.md) for a recommended reading order.

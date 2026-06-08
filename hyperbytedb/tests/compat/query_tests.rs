@@ -924,3 +924,63 @@ async fn multiple_aggregates_have_distinct_columns() {
         series.columns
     );
 }
+
+#[tokio::test]
+#[ignore] // Requires chDB
+async fn partial_line_writes_coalesce_before_query() {
+    let ctx = TestContext::new().unwrap();
+    ctx.metadata.create_database("testdb").await.unwrap();
+    // Simulate Telegraf / columnar partial lines: same series-instant, disjoint fields.
+    let ts = 1_780_922_276_152_000_000i64;
+    ctx.write_and_flush(
+        "testdb",
+        &format!(
+            "cpu,cpu=cpu-total,host=d2ddee27a9f4 usage_idle=95.0 {ts}\n\
+             cpu,cpu=cpu-total,host=d2ddee27a9f4 usage_user=4.0 {ts}\n\
+             cpu,cpu=cpu-total,host=d2ddee27a9f4 usage_system=1.0 {ts}"
+        ),
+    )
+    .await
+    .unwrap();
+
+    let resp = ctx
+        .query(
+            "testdb",
+            &format!(
+                "SELECT mean(\"usage_idle\") AS \"Usage Idle\", mean(\"usage_user\") AS \"Usage User\", mean(\"usage_system\") AS \"Usage System\" \
+                 FROM cpu WHERE \"host\" =~ /^(d2ddee27a9f4)$/ AND \"cpu\" = 'cpu-total' \
+                 AND time >= {ts} AND time <= {ts} GROUP BY time(2s), \"host\" fill(null)"
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(
+        resp.results[0].error.is_none(),
+        "{:?}",
+        resp.results[0].error
+    );
+    let series = &resp.results[0].series.as_ref().unwrap()[0];
+    let row = &series.values[0];
+    let cols: Vec<&str> = series.columns.iter().map(|s| s.as_str()).collect();
+    let idle = row[cols.iter().position(|c| *c == "Usage Idle").unwrap()]
+        .as_f64()
+        .unwrap();
+    let user = row[cols.iter().position(|c| *c == "Usage User").unwrap()]
+        .as_f64()
+        .unwrap();
+    let system = row[cols.iter().position(|c| *c == "Usage System").unwrap()]
+        .as_f64()
+        .unwrap();
+    assert!(
+        (idle - 95.0).abs() < 0.01,
+        "usage_idle should survive partial-line coalesce, got {idle}"
+    );
+    assert!(
+        (user - 4.0).abs() < 0.01,
+        "usage_user should survive partial-line coalesce, got {user}"
+    );
+    assert!(
+        (system - 1.0).abs() < 0.01,
+        "usage_system should survive partial-line coalesce, got {system}"
+    );
+}

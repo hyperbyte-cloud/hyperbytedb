@@ -1,6 +1,6 @@
 # Basic operations
 
-Create databases, ingest line protocol data, and query with InfluxQL.
+Create databases, ingest line protocol data, and query with TimeseriesQL.
 
 
 ## Creating a Database
@@ -100,7 +100,7 @@ gzip -c data.txt | curl -sS -XPOST 'http://localhost:8086/write?db=mydb' \
 
 ## Querying Data
 
-HyperbyteDB supports InfluxQL queries via the `/query` endpoint.
+HyperbyteDB supports TimeseriesQL queries via the `/query` endpoint.
 
 > **Important:** Data must be flushed from the WAL into chDB MergeTree tables before it becomes queryable. The default flush interval is 10 seconds. Wait briefly after writing before querying.
 
@@ -306,4 +306,4 @@ DROP MEASUREMENT "cpu"
 ## See Also
 
 - [Advanced features](advanced-features.md) — Clustering, continuous queries, TLS, auth
-- [API & InfluxQL Reference](reference.md) — Complete syntax reference
+- [API & TimeseriesQL Reference](reference.md) — Complete syntax reference

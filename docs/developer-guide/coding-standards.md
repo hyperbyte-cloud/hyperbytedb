@@ -147,7 +147,7 @@ Key architectural invariants enforced during review:
 2. **Domain purity** — `domain/` types have no I/O dependencies.
 3. **Config documentation** — New config keys must appear in `docs/user-guide/configuration.md` and `config.toml.example`.
 4. **WAL ordering** — Flush must not drop acknowledged writes.
-5. **Identifier quoting** — InfluxQL-to-ClickHouse translation must quote/escape user input.
+5. **Identifier quoting** — TimeseriesQL-to-ClickHouse translation must quote/escape user input.
 
 See [Contributing](contributing.md) for the full review rubric.
 

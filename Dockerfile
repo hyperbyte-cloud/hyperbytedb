@@ -43,10 +43,14 @@ COPY hyperbytedb/hyperbytedb-cli/Cargo.toml hyperbytedb-cli/
 RUN mkdir -p hyperbytedb-cli/src && echo "fn main(){}" > hyperbytedb-cli/src/main.rs && echo "" > hyperbytedb-cli/src/lib.rs
 # Create stub files so cargo can parse [[bench]] entries
 RUN mkdir -p hyperbytedb/benches hyperbytedb/benches/support \
+    hyperbytedb-proxy/benches hyperbytedb-proxy/benches/support \
     && echo "fn main(){}" > hyperbytedb/benches/ingestion_columnar.rs \
     && echo "fn main(){}" > hyperbytedb/benches/ingestion_line_protocol.rs \
     && echo "fn main(){}" > hyperbytedb/benches/query_fixed_dataset.rs \
-    && echo "" > hyperbytedb/benches/support/mod.rs
+    && echo "fn main(){}" > hyperbytedb/benches/flush_service.rs \
+    && echo "" > hyperbytedb/benches/support/mod.rs \
+    && echo "fn main(){}" > hyperbytedb-proxy/benches/routing.rs \
+    && echo "" > hyperbytedb-proxy/benches/support/mod.rs
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     cargo fetch --locked

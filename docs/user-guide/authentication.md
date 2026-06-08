@@ -13,7 +13,7 @@ When authentication is **enabled**, these routes require a successful check usin
 | Route | Notes |
 |-------|--------|
 | `POST /write` | Line protocol, MessagePack, or columnar bodies |
-| `GET` / `POST /query` | InfluxQL |
+| `GET` / `POST /query` | TimeseriesQL |
 
 These layers run after optional **rate limiting** (if `[rate_limit]` is enabled): a client may get **429** before auth runs.
 
@@ -70,11 +70,11 @@ The server examines sources in this order; the first successful extraction wins.
 enabled = true
 ```
 
-Then create users with InfluxQL (via `/query` over HTTP, or a client that supports the same). First session may need a bootstrap path if you lock `/query` immediately—typical flow is: enable auth, create admin user in same deployment step, or use a side channel for the first `CREATE USER`.
+Then create users with TimeseriesQL (via `/query` over HTTP, or a client that supports the same). First session may need a bootstrap path if you lock `/query` immediately—typical flow is: enable auth, create admin user in same deployment step, or use a side channel for the first `CREATE USER`.
 
 ---
 
-## User management (InfluxQL)
+## User management (TimeseriesQL)
 
 Run through `/query` (or `POST` with form `q=...`).
 

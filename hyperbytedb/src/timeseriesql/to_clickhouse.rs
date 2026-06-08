@@ -362,28 +362,58 @@ fn query_references_tag(stmt: &SelectStatement, m: &ColumnMapping) -> bool {
         .is_some_and(|c| expr_references_tag(c, m))
 }
 
-/// Build the FROM source. When `series` is set and the query references a tag,
-/// wrap the fact table in an inline view that re-attaches the tag columns from
-/// the dimension table. `ANY LEFT JOIN` takes at most one matching dimension row
-/// (so pre-merge duplicate `ReplacingMergeTree` series rows can't fan out fact
-/// rows) and preserves fact rows whose series row is briefly missing. Tag columns
-/// are exposed under their physical names, so the rest of the translator — which
-/// already references tags by physical name — is unchanged.
+/// Build a query-time view that merges sparse partial rows sharing
+/// `(series_id, time)` — the read-path counterpart to ingest coalescing.
+/// Without this, `ReplacingMergeTree(ingest_seq)` keeps only the highest-seq
+/// whole row, dropping fields from other partial writes.
+pub fn build_coalesced_fact_view(fact_table: &str, mapping: &ColumnMapping) -> String {
+    let mut field_cols: Vec<&String> = mapping.field_names.iter().collect();
+    field_cols.sort();
+    let field_aggs: Vec<String> = field_cols
+        .iter()
+        .map(|f| {
+            let q = quote_identifier(f);
+            format!("argMaxIf({q}, `ingest_seq`, isNotNull({q})) AS {q}")
+        })
+        .collect();
+    let select_fields = if field_aggs.is_empty() {
+        String::new()
+    } else {
+        format!(", {}", field_aggs.join(", "))
+    };
+    format!(
+        "(SELECT `series_id`, `time`{select_fields} FROM {fact_table} GROUP BY `series_id`, `time`)"
+    )
+}
+
+/// Build the FROM source. When `mapping` is present the fact table is wrapped in
+/// a coalesced view so partial-field rows merge before aggregation. When `series`
+/// is set and the query references a tag, the coalesced fact table is wrapped in
+/// an inline view that re-attaches the tag columns from the dimension table.
+/// `ANY LEFT JOIN` takes at most one matching dimension row (so pre-merge duplicate
+/// `ReplacingMergeTree` series rows can't fan out fact rows) and preserves fact
+/// rows whose series row is briefly missing. Tag columns are exposed under their
+/// physical names, so the rest of the translator — which already references tags
+/// by physical name — is unchanged.
 fn build_from_source(
     fact_table: &str,
     series: Option<SeriesJoin<'_>>,
     mapping: Option<&ColumnMapping>,
     stmt: &SelectStatement,
 ) -> String {
+    let fact = match mapping {
+        Some(m) => build_coalesced_fact_view(fact_table, m),
+        None => fact_table.to_string(),
+    };
     let (Some(sj), Some(m)) = (series, mapping) else {
-        return fact_table.to_string();
+        return fact;
     };
     if !sj.force && !query_references_tag(stmt, m) {
-        return fact_table.to_string();
+        return fact;
     }
     let mut tag_cols: Vec<String> = m.tag_keys.iter().map(|t| m.tag_column_name(t)).collect();
     if tag_cols.is_empty() {
-        return fact_table.to_string();
+        return fact;
     }
     tag_cols.sort();
     let projected = tag_cols
@@ -393,7 +423,6 @@ fn build_from_source(
         .join(", ");
     format!(
         "(SELECT t.*, {projected} FROM {fact} AS t ANY LEFT JOIN {series} AS s ON t.`series_id` = s.`series_id`)",
-        fact = fact_table,
         series = sj.table,
     )
 }
@@ -1764,14 +1793,60 @@ mod tests {
 
     #[test]
     fn series_field_only_query_has_no_join() {
-        // No tag referenced → query the fact table directly (fast path).
+        // No tag referenced → coalesced fact view, no series dimension join.
         let stmt = parse_select(r#"SELECT mean("usage_idle") FROM cpu WHERE time > 0"#);
         let sql = translate_series(&stmt, &cpu_mapping());
         assert!(
             !sql.contains("JOIN") && !sql.contains("_series"),
             "field-only query should not join the series table, got: {sql}"
         );
+        assert!(
+            sql.contains("argMaxIf(\"usage_idle\", `ingest_seq`, isNotNull(\"usage_idle\"))"),
+            "field-only query should coalesce partial rows, got: {sql}"
+        );
         assert!(sql.contains("FROM `mydb_autogen_cpu`"), "got: {sql}");
+    }
+
+    #[test]
+    fn telegraf_cpu_multi_field_query_coalesces_partial_rows() {
+        let stmt = parse_select(
+            r#"SELECT mean("usage_guest") AS "Usage Guest", mean("usage_idle") AS "Usage Idle", mean("usage_user") AS "Usage User" FROM "cpu" WHERE "host" =~ /^(d2ddee27a9f4)$/ AND "cpu" = 'cpu-total' AND time >= 1780922276152ms and time <= 1780925876152ms GROUP BY time(2s), "host" fill(null)"#,
+        );
+        let mut map = ColumnMapping::default();
+        map.tag_keys.insert("host".into());
+        map.tag_keys.insert("cpu".into());
+        for f in [
+            "usage_guest",
+            "usage_idle",
+            "usage_user",
+            "usage_system",
+            "usage_iowait",
+        ] {
+            map.field_names.insert(f.into());
+        }
+        let sql = translate_native_table(
+            &stmt,
+            TEST_TABLE,
+            Some(&map),
+            Some(SeriesJoin {
+                table: SERIES_TABLE,
+                force: false,
+            }),
+        )
+        .unwrap();
+        assert!(
+            sql.contains("argMaxIf(\"usage_idle\", `ingest_seq`, isNotNull(\"usage_idle\"))"),
+            "expected coalesced fact view, got: {sql}"
+        );
+        assert!(
+            sql.contains("ANY LEFT JOIN `mydb_autogen_cpu_series` AS s"),
+            "tag filter should join series table, got: {sql}"
+        );
+        assert!(sql.contains("avg(\"usage_idle\")"), "got: {sql}");
+        assert!(
+            sql.contains("toStartOfInterval(time, INTERVAL 2 SECOND)"),
+            "got: {sql}"
+        );
     }
 
     #[test]

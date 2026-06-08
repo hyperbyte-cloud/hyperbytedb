@@ -1,4 +1,4 @@
-//! Fixed-dataset InfluxQL query benchmarks (`cargo bench --bench query_fixed_dataset`).
+//! Fixed-dataset TimeseriesQL query benchmarks (`cargo bench --bench query_fixed_dataset`).
 //!
 //! Dataset profile via `BENCH_DATASET`:
 //!   - `small`  (default) — 10k points, 10 hosts, `cpu`
