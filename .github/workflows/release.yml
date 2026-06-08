@@ -20,6 +20,10 @@ on:
   push:
     tags: ["v*"]
 
+permissions:
+  contents: write   # GitHub Release upload
+  packages: write   # GHCR image push
+
 concurrency:
   # Don't cancel an in-flight release if a new tag is pushed. Releases are
   # not safe to interrupt — we'd leave half-pushed image manifests and a
@@ -40,9 +44,6 @@ jobs:
   release:
     name: Build & publish release
     runs-on: hyperbytedb-operator-controller
-    permissions:
-      contents: write
-      packages: write
     steps:
       - uses: actions/checkout@v4
 
@@ -62,11 +63,24 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GitHub Container Registry
+      # GHCR package was originally published with a PAT (scripts/docker-upload.sh).
+      # Until the package is linked to this repo for Actions access, set the
+      # repository variable GHCR_AUTH=pat and configure GHCR_USERNAME / GHCR_PAT
+      # org secrets (PAT needs write:packages). Otherwise GITHUB_TOKEN is used.
+      - name: Log in to GitHub Container Registry (PAT)
+        if: vars.GHCR_AUTH == 'pat'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
+          username: ${{ secrets.GHCR_USERNAME }}
+          password: ${{ secrets.GHCR_PAT }}
+
+      - name: Log in to GitHub Container Registry (GITHUB_TOKEN)
+        if: vars.GHCR_AUTH != 'pat'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract Docker metadata
