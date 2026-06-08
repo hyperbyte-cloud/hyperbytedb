@@ -342,10 +342,10 @@ impl ChdbNativeAdapter {
             }
             if attached.contains(&series)
                 && let Some(schema) = series_writers.get_mut(&key)
-                    && !schema.materialized
-                {
-                    schema.materialized = true;
-                }
+                && !schema.materialized
+            {
+                schema.materialized = true;
+            }
         }
         Ok(synced)
     }

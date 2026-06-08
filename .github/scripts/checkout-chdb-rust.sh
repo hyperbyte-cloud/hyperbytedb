@@ -23,3 +23,19 @@ else
 fi
 
 echo "chdb-rust HEAD: $(git -C "${DEST}" rev-parse --short HEAD)"
+
+if [[ ! -f "${DEST}/Cargo.toml" ]]; then
+  echo "error: ${DEST}/Cargo.toml not found after checkout" >&2
+  exit 1
+fi
+
+# Verify the path dependency from the main crate resolves on the host.
+CRATE_MANIFEST="${GITHUB_WORKSPACE}/hyperbytedb/Cargo.toml"
+if [[ -f "${CRATE_MANIFEST}" ]]; then
+  RESOLVED="$(python3 -c "import os; print(os.path.normpath(os.path.join(os.path.dirname('${CRATE_MANIFEST}'), '../../chdb-rust')))")"
+  if [[ ! -f "${RESOLVED}/Cargo.toml" ]]; then
+    echo "error: path dependency does not resolve (${RESOLVED})" >&2
+    exit 1
+  fi
+  echo "path dependency resolves to: ${RESOLVED}"
+fi

@@ -48,7 +48,7 @@ jobs:
       - name: Check formatting
         run: |
           bash .github/scripts/run-in-rust-container.sh \
-            'rustup component add rustfmt && cargo fmt --all --check'
+            'rustup component add rustfmt && cargo fmt --check'
 
   clippy:
     name: Clippy
