@@ -10,4 +10,4 @@ Technical deep dives into the HyperbyteDB implementation for engineers working o
 
 3. **[Replication design](replication-design.md)** — Write-replication wire format (`/internal/replicate`), `sync_quorum`, hinted handoff (`CFh1`), flow control, and how this ties to self-repair.
 
-4. **[Extension Points](extension-points.md)** — Step-by-step guides for adding new InfluxQL statements, storage backends, background services, and HTTP endpoints.
+4. **[Extension Points](extension-points.md)** — Step-by-step guides for adding new TimeseriesQL statements, storage backends, background services, and HTTP endpoints.

@@ -67,6 +67,7 @@ impl PointsSinkPort for NoopPointsSink {
 pub struct TestContext {
     pub wal: Arc<dyn WalPort>,
     pub metadata: Arc<dyn MetadataPort>,
+    pub query_port: Arc<dyn QueryPort>,
     pub query_service: QueryServiceImpl,
     pub ingestion: IngestionServiceImpl,
     pub flush_service: Arc<FlushServiceImpl>,
@@ -97,7 +98,7 @@ impl TestContext {
         let points_sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(shared));
 
         let query_service = QueryServiceImpl::new(
-            query_port,
+            query_port.clone(),
             metadata.clone(),
             wal.clone(),
             30,
@@ -111,6 +112,7 @@ impl TestContext {
         Ok(Self {
             wal,
             metadata,
+            query_port,
             query_service,
             ingestion,
             flush_service,
@@ -137,7 +139,7 @@ impl TestContext {
         let points_sink: Arc<dyn PointsSinkPort> = Arc::new(NoopPointsSink);
 
         let query_service = QueryServiceImpl::new(
-            query_port,
+            query_port.clone(),
             metadata.clone(),
             wal.clone(),
             30,
@@ -151,6 +153,7 @@ impl TestContext {
         Ok(Self {
             wal,
             metadata,
+            query_port,
             query_service,
             ingestion,
             flush_service,
@@ -176,7 +179,7 @@ impl TestContext {
         Ok(())
     }
 
-    /// Execute an InfluxQL query and return the response.
+    /// Execute an TimeseriesQL query and return the response.
     pub async fn query(&self, db: &str, q: &str) -> Result<QueryResponse, HyperbytedbError> {
         self.query_service.execute_query(db, q, None, None).await
     }

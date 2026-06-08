@@ -107,9 +107,9 @@ HyperbyteDB is configured via `config.toml` or environment variables. Environmen
 
 **Write path**: Line protocol → parse → RocksDB WAL → background flush → chDB `INSERT` into MergeTree tables
 
-**Query path**: InfluxQL → transpile to ClickHouse SQL → chDB `SELECT` from native tables
+**Query path**: TimeseriesQL → transpile to ClickHouse SQL → chDB `SELECT` from native tables
 
-## Supported InfluxQL
+## Supported TimeseriesQL
 
 - **SELECT** with aggregates: `mean`, `median`, `count`, `sum`, `min`, `max`, `first`, `last`, `percentile`, `spread`, `stddev`, `mode`, `distinct`
 - **Transforms**: `derivative`, `non_negative_derivative`, `difference`, `moving_average`, `cumulative_sum`, `elapsed`

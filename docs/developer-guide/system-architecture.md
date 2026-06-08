@@ -242,7 +242,7 @@ For an exhaustive treatment of every step, see [Deep Dive: Read Path](../deep-di
  ┌────────────────────────────────────────────────────────────────┐
  │ query_service.rs: execute_query()                              │
  │  1. tokio::time::timeout wraps entire execution                │
- │  2. Parse InfluxQL string → Vec<Statement>                     │
+ │  2. Parse TimeseriesQL string → Vec<Statement>                     │
  │  3. For each statement, dispatch:                              │
  │     ┌─────────────────────────────────────────────┐            │
  │     │ SHOW DATABASES  → metadata.list_databases() │            │
@@ -590,7 +590,7 @@ The translator (`src/timeseriesql/to_clickhouse.rs`) converts a TimeseriesQL `Se
 
 ### Function mapping
 
-| InfluxQL | ClickHouse |
+| TimeseriesQL | ClickHouse |
 |----------|------------|
 | `MEAN(f)` | `avg(f)` |
 | `MEDIAN(f)` | `median(f)` |
@@ -610,7 +610,7 @@ The translator (`src/timeseriesql/to_clickhouse.rs`) converts a TimeseriesQL `Se
 
 Transforms use ClickHouse window functions:
 
-| InfluxQL | ClickHouse |
+| TimeseriesQL | ClickHouse |
 |----------|------------|
 | `DERIVATIVE(f, 1s)` | `(f - lagInFrame(f, 1) OVER (ORDER BY __time)) / nullIf(dateDiff('second', lagInFrame(__time, 1) OVER ..., __time), 0) * scale` |
 | `NON_NEGATIVE_DERIVATIVE(...)` | Same as above, wrapped in `greatest(..., 0)` |
@@ -622,11 +622,11 @@ Transforms use ClickHouse window functions:
 ### Time bucket translation
 
 ```sql
--- InfluxQL: GROUP BY time(5m)
+-- TimeseriesQL: GROUP BY time(5m)
 -- ClickHouse:
 toStartOfInterval(time, INTERVAL 5 MINUTE) AS __time
 
--- InfluxQL: GROUP BY time(1h, 15m)  -- offset
+-- TimeseriesQL: GROUP BY time(1h, 15m)  -- offset
 -- ClickHouse:
 toStartOfInterval(time - INTERVAL 15 MINUTE, INTERVAL 1 HOUR) + INTERVAL 15 MINUTE AS __time
 ```
@@ -833,7 +833,7 @@ All internal errors are represented by the `HyperbytedbError` enum:
 | `RetentionPolicyNotFound(name)` | 404 | Reference to non-existent RP |
 | `FieldTypeConflict{field, measurement, got, expected}` | 400 | Write sends wrong type for existing field |
 | `LineProtocolParse{line, reason}` | 400 | Malformed line protocol |
-| `QueryParse(msg)` | 400 | Invalid InfluxQL syntax |
+| `QueryParse(msg)` | 400 | Invalid TimeseriesQL syntax |
 | `AuthFailed` | 401 | Bad credentials |
 | `DatabaseRequired` | 400 | `/write` without `db` parameter |
 | `MissingParameter(name)` | 400 | `/query` without `q` parameter |
@@ -990,7 +990,7 @@ HyperbyteDB is built on **Tokio** with a multi-threaded runtime (`#[tokio::main]
 
 ## 24. Statement Summary
 
-The `StatementSummary` service tracks recently executed InfluxQL statements for debugging and observability. When enabled (`statement_summary.enabled = true`), it records the normalized query text, digest, execution time, and error status for up to `max_entries` (default 1,000) recent statements in a bounded ring buffer. Results are exposed via `GET /api/v1/statements`.
+The `StatementSummary` service tracks recently executed TimeseriesQL statements for debugging and observability. When enabled (`statement_summary.enabled = true`), it records the normalized query text, digest, execution time, and error status for up to `max_entries` (default 1,000) recent statements in a bounded ring buffer. Results are exposed via `GET /api/v1/statements`.
 
 ---
 

@@ -102,7 +102,7 @@ nav:
       - Common workflows: user-guide/common-workflows.md
       - Administration: user-guide/administration.md
       - Troubleshooting: user-guide/troubleshooting.md
-      - API & InfluxQL Reference: user-guide/reference.md
+      - API & TimeseriesQL Reference: user-guide/reference.md
   - Developer Guide:
       - developer-guide/index.md
       - Architecture: developer-guide/architecture.md

@@ -5,6 +5,7 @@ pub mod continuous_query;
 pub mod database;
 pub mod measurement;
 pub mod point;
+pub mod point_coalesce;
 pub mod query_result;
 pub mod series;
 pub mod user;

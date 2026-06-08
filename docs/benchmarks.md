@@ -4,7 +4,7 @@ HyperbyteDB ships four **default** Criterion benchmark suites, plus one for the 
 
 1. **Line protocol ingestion** — parse → metadata → WAL
 2. **Columnar MessagePack ingestion** — decode → metadata → WAL (enabled by default via `columnar-ingest`)
-3. **Fixed-dataset queries** — InfluxQL parse and execute against seeded chDB tables
+3. **Fixed-dataset queries** — TimeseriesQL parse and execute against seeded chDB tables
 4. **Flush service** — WAL → chDB flush, incremental tick, and drain
 5. **Proxy routing** (`hyperbytedb-proxy`) — backend pick and drain-response detection
 
@@ -28,7 +28,7 @@ For HTTP load testing against a live server, use [`scripts/load.sh`](../scripts/
 |----------|---------|-------|
 | [`benches/ingestion_line_protocol.rs`](../hyperbytedb/benches/ingestion_line_protocol.rs) | `cargo bench --bench ingestion_line_protocol` | Line protocol ingest path |
 | [`benches/ingestion_columnar.rs`](../hyperbytedb/benches/ingestion_columnar.rs) | `cargo bench --bench ingestion_columnar` | Columnar msgpack ingest path |
-| [`benches/query_fixed_dataset.rs`](../hyperbytedb/benches/query_fixed_dataset.rs) | `cargo bench --bench query_fixed_dataset` | InfluxQL queries on fixed datasets |
+| [`benches/query_fixed_dataset.rs`](../hyperbytedb/benches/query_fixed_dataset.rs) | `cargo bench --bench query_fixed_dataset` | TimeseriesQL queries on fixed datasets |
 | [`benches/flush_service.rs`](../hyperbytedb/benches/flush_service.rs) | `cargo bench --bench flush_service` | WAL → chDB flush path |
 | [`hyperbytedb-proxy/benches/routing.rs`](../hyperbytedb-proxy/benches/routing.rs) | `cargo bench -p hyperbytedb-proxy --bench routing` | Backend routing hot path |
 | [`scripts/load.sh`](../scripts/load.sh) | k6 HTTP soak | End-to-end write + optional all Criterion benches |
@@ -120,7 +120,7 @@ See [Columnar MessagePack write format](#columnar-messagepack-write-format-v1) b
 
 ## Fixed-dataset queries (`query_fixed_dataset`)
 
-Seeds data via line protocol ingest + flush, then benchmarks InfluxQL execution through `QueryServiceImpl` (parse → translate → chDB → JSON response).
+Seeds data via line protocol ingest + flush, then benchmarks TimeseriesQL execution through `QueryServiceImpl` (parse → translate → chDB → JSON response).
 
 ```bash
 cargo bench --bench query_fixed_dataset

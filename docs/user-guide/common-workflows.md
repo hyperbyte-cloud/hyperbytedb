@@ -209,4 +209,4 @@ END
 
 - [Administration](administration.md) — Backup procedures, cluster operations, compaction tuning
 - [Troubleshooting](troubleshooting.md) — Common problems and fixes
-- [API & InfluxQL Reference](reference.md) — Full syntax reference
+- [API & TimeseriesQL Reference](reference.md) — Full syntax reference

@@ -6,6 +6,7 @@ use tokio::sync::watch;
 
 use crate::adapters::cluster::replication_log::ReplicationLog;
 use crate::application::system_trace;
+use crate::domain::point_coalesce::coalesce_points_and_origins;
 use crate::domain::cluster::membership::SharedMembership;
 use crate::domain::point::Point;
 use crate::error::HyperbytedbError;
@@ -43,6 +44,9 @@ pub struct FlushServiceImpl {
     heartbeat_miss_threshold: u64,
     truncate_stale_peer_multiplier: u64,
     sink: Arc<dyn PointsSinkPort>,
+    /// When true (default), merge partial-field writes sharing a series-instant
+    /// before insert. Set `HYPERBYTEDB_DISABLE_COALESCE=1` to skip.
+    coalesce: bool,
 }
 
 struct FlushWork {
@@ -83,6 +87,7 @@ impl FlushServiceImpl {
             heartbeat_miss_threshold: 0,
             truncate_stale_peer_multiplier: 0,
             sink,
+            coalesce: std::env::var("HYPERBYTEDB_DISABLE_COALESCE").is_err(),
         }
     }
 
@@ -356,6 +361,22 @@ impl FlushServiceImpl {
             let measurement_count = by_meas.len();
             let mut work_items: Vec<FlushWork> = Vec::new();
             for ((db, rp, measurement), (mut points, mut origins)) in by_meas {
+                // Telegraf / columnar writers often emit several lines that share
+                // the same tag set and timestamp but carry disjoint field sets.
+                // Coalesce over the full measurement batch *before* splitting into
+                // max_points_per_batch chunks so partial rows are never separated.
+                if self.coalesce {
+                    let coalesced_start = std::time::Instant::now();
+                    if let Some((merged_points, merged_origins)) =
+                        coalesce_points_and_origins(&points, &origins)
+                    {
+                        points = merged_points;
+                        origins = merged_origins;
+                    }
+                    histogram!("hyperbytedb_flush_coalesce_points_seconds")
+                        .record(coalesced_start.elapsed().as_secs_f64());
+                    system_trace::record_phase("coalesce_us", coalesced_start.elapsed());
+                }
                 // No Rust-side sort: chDB re-sorts every inserted block by the
                 // table's ORDER BY (tags, time) key, so a time-only pre-sort here
                 // is redundant work. Slice points/origins into

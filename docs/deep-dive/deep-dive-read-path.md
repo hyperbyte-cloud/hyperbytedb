@@ -232,4 +232,4 @@ When enabled, `StatementSummary` records normalized query text and timing for `G
 
 - [Architecture](../developer-guide/architecture.md) — hexagonal overview
 - [Write path](deep-dive-write-path.md) — how data reaches MergeTree tables
-- [API & InfluxQL Reference](../user-guide/reference.md) — HTTP endpoints and syntax
+- [API & TimeseriesQL Reference](../user-guide/reference.md) — HTTP endpoints and syntax

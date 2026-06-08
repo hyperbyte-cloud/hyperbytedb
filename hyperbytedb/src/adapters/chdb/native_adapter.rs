@@ -31,7 +31,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use arrow::array::{
@@ -198,12 +197,6 @@ pub struct ChdbNativeAdapter {
     /// serialization + re-parsing and is several times faster. Set
     /// `HYPERBYTEDB_DISABLE_ARROW_INSERT=1` to fall back to the SQL path.
     use_arrow: bool,
-    /// When true (default), coalesce points sharing a `(timestamp, tags)`
-    /// series-instant (merging partial-field writes, à la Telegraf). This is an
-    /// O(n×tags) scan per flush; for fixed-schema workloads that never emit
-    /// partial writes it is pure overhead, since `ReplacingMergeTree(ingest_seq)`
-    /// already dedups whole rows. Set `HYPERBYTEDB_DISABLE_COALESCE=1` to skip it.
-    coalesce: bool,
 }
 
 impl ChdbNativeAdapter {
@@ -213,7 +206,6 @@ impl ChdbNativeAdapter {
 
     pub fn with_metadata(session: SharedSession, metadata: Option<Arc<dyn MetadataPort>>) -> Self {
         let use_arrow = std::env::var("HYPERBYTEDB_DISABLE_ARROW_INSERT").is_err();
-        let coalesce = std::env::var("HYPERBYTEDB_DISABLE_COALESCE").is_err();
         Self {
             session,
             metadata,
@@ -222,19 +214,12 @@ impl ChdbNativeAdapter {
             known_series: Arc::new(RwLock::new(HashMap::new())),
             ddl_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             use_arrow,
-            coalesce,
         }
     }
 
     /// Override the insert path (Arrow vs SQL `VALUES`). Defaults to Arrow.
     pub fn with_arrow_inserts(mut self, enabled: bool) -> Self {
         self.use_arrow = enabled;
-        self
-    }
-
-    /// Override series-instant coalescing. Defaults to enabled.
-    pub fn with_coalesce(mut self, enabled: bool) -> Self {
-        self.coalesce = enabled;
         self
     }
 
@@ -488,10 +473,13 @@ impl ChdbNativeAdapter {
                 .await?;
             tag_phys.push((k.clone(), phys, kind));
         }
-        let field_phys: Vec<(String, String, u8)> = field_types
+        let mut field_phys: Vec<(String, String, u8)> = field_types
             .iter()
             .map(|(k, d)| (k.clone(), field_column_name(k), *d))
             .collect();
+        // Must match [`build_create_table_sql`]: DDL emits field columns sorted by
+        // physical name, and Arrow `INSERT … SELECT *` maps batch columns by position.
+        field_phys.sort_by(|a, b| a.1.cmp(&b.1));
 
         // Nothing to do if both caches already know every required column. We
         // optimistically check first to avoid taking the DDL mutex on the
@@ -814,27 +802,8 @@ impl PointsSinkPort for ChdbNativeAdapter {
             .record(ensure_start.elapsed().as_secs_f64());
         system_trace::record_phase("ensure_table_us", ensure_start.elapsed());
 
-        // Telegraf (and other writers) often emit several line-protocol lines that
-        // share the same measurement, tag set, and timestamp but carry disjoint
-        // field sets (`system` → load averages, uptime, uptime_format, …).
-        // InfluxDB merges those into one logical point. Without coalescing,
-        // ReplacingMergeTree keeps only the row with the highest `ingest_seq`,
-        // dropping every field from the other lines. The common case (no shared
-        // series-instant) short-circuits to `None` and we use the inputs as-is.
-        let coalesced_start = std::time::Instant::now();
-        let merged = if self.coalesce {
-            coalesce_points_and_origins(points, origins)
-        } else {
-            None
-        };
-        let (points, origins): (&[Point], &[u64]) = match &merged {
-            Some((p, o)) => (p, o),
-            None => (points, origins),
-        };
-        histogram!("hyperbytedb_flush_sink_coalesce_points_seconds")
-            .record(coalesced_start.elapsed().as_secs_f64());
-        system_trace::record_phase("coalesce_us", coalesced_start.elapsed());
-
+        // Partial-line coalescing runs in the flush service over the full
+        // measurement batch (before max_points_per_batch splitting).
         // Deterministic series id per (post-coalesce) point. Register any
         // brand-new series into the dimension table + metadata before inserting
         // the fact rows, so tag-resolving queries always find the series row.
@@ -1366,94 +1335,6 @@ fn build_series_insert_sql(ensured: &EnsuredTable, new_series: &[(u64, &Point)])
     sql
 }
 
-/// Plan how points sharing the same `(timestamp, tags)` series-instant merge.
-///
-/// Returns `None` in the overwhelmingly common case where every point has a
-/// unique `(timestamp, tags)` — callers then use their inputs unchanged with
-/// zero allocation and zero tag-map clones. When duplicates exist, returns one
-/// group of input indices per output row (first-seen order); the caller merges
-/// fields left→right so the last write wins. Whole-row duplicates are otherwise
-/// collapsed by `ReplacingMergeTree(ingest_seq)`.
-///
-/// O(n) hashing in the common path. The previous implementation cloned every
-/// point's tag `BTreeMap` into a `BTreeMap`-keyed map and did O(log n) full
-/// tag-map comparisons per point — the dominant flush cost for high-cardinality
-/// series that never actually merge.
-fn coalesce_plan(points: &[Point]) -> Option<Vec<Vec<u32>>> {
-    let mut groups: Vec<Vec<u32>> = Vec::with_capacity(points.len());
-    // Cheap (timestamp, tags) hash -> indices into `groups`. Hash collisions
-    // are resolved by confirming exact equality against each candidate group.
-    let mut buckets: HashMap<u64, Vec<u32>> = HashMap::with_capacity(points.len());
-
-    for (i, p) in points.iter().enumerate() {
-        let h = series_instant_hash(p);
-        let bucket = buckets.entry(h).or_default();
-        let existing = bucket
-            .iter()
-            .copied()
-            .find(|&g| same_series_instant(&points[groups[g as usize][0] as usize], p));
-        match existing {
-            Some(g) => groups[g as usize].push(i as u32),
-            None => {
-                let g = groups.len() as u32;
-                groups.push(vec![i as u32]);
-                bucket.push(g);
-            }
-        }
-    }
-
-    if groups.len() == points.len() {
-        None
-    } else {
-        Some(groups)
-    }
-}
-
-/// Merge one group of points sharing a series-instant into a single point,
-/// unioning fields with last-write-wins.
-fn merge_point_group(points: &[Point], group: &[u32]) -> Point {
-    let mut base = points[group[0] as usize].clone();
-    for &idx in &group[1..] {
-        for (fk, fv) in &points[idx as usize].fields {
-            base.fields.insert(fk.clone(), fv.clone());
-        }
-    }
-    base
-}
-
-fn series_instant_hash(p: &Point) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    p.timestamp.hash(&mut h);
-    for (k, v) in &p.tags {
-        k.hash(&mut h);
-        v.hash(&mut h);
-    }
-    h.finish()
-}
-
-fn same_series_instant(a: &Point, b: &Point) -> bool {
-    a.timestamp == b.timestamp && a.tags == b.tags
-}
-
-/// Apply [`coalesce_plan`] to a `(points, origins)` pair, keeping them parallel.
-///
-/// In the common case (no `(timestamp, tags)` collisions) returns `None` and the
-/// caller uses its inputs unchanged. When partial-line merges happen, each
-/// merged row inherits the `origin_node_id` of its last contributor (consistent
-/// with last-write-wins field merge).
-fn coalesce_points_and_origins(
-    points: &[Point],
-    origins: &[u64],
-) -> Option<(Vec<Point>, Vec<u64>)> {
-    let groups = coalesce_plan(points)?;
-    let merged_points = groups
-        .iter()
-        .map(|g| merge_point_group(points, g))
-        .collect();
-    let merged_origins = groups.iter().map(|g| origins[g[0] as usize]).collect();
-    Some((merged_points, merged_origins))
-}
-
 /// Quote a string for ClickHouse: wrap in single quotes; escape `\` and `'`.
 fn append_quoted_string(out: &mut String, s: &str) {
     out.push('\'');
@@ -1512,6 +1393,7 @@ fn append_float(out: &mut String, f: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::Float64Array;
     use std::collections::BTreeMap;
 
     fn make_point(ts: i64, tags: &[(&str, &str)], fields: &[(&str, FieldValue)]) -> Point {
@@ -1758,6 +1640,67 @@ mod tests {
     }
 
     #[test]
+    fn create_table_and_record_batch_field_columns_share_sort_order() {
+        let field_phys = vec![
+            ("usage_user".to_string(), "usage_user".to_string(), 0u8),
+            ("usage_idle".to_string(), "usage_idle".to_string(), 0u8),
+            ("usage_system".to_string(), "usage_system".to_string(), 0u8),
+        ];
+        let ddl = build_create_table_sql("`db_rp_cpu`", &field_phys);
+        assert!(
+            ddl.find("usage_idle").unwrap()
+                < ddl.find("usage_system").unwrap()
+                && ddl.find("usage_system").unwrap() < ddl.find("usage_user").unwrap(),
+            "DDL must sort field columns by physical name, got: {ddl}"
+        );
+
+        let mut sorted = field_phys.clone();
+        sorted.sort_by(|a, b| a.1.cmp(&b.1));
+        let ensured = EnsuredTable {
+            table: "`db_rp_cpu`".to_string(),
+            series_table: "`db_rp_cpu_series`".to_string(),
+            tag_phys: vec![],
+            field_phys: sorted,
+        };
+        let ts = 1_780_922_276_152_000_000i64;
+        let tags = &[("host", "h1")];
+        let p = make_point(
+            ts,
+            tags,
+            &[
+                ("usage_idle", FieldValue::Float(95.0)),
+                ("usage_user", FieldValue::Float(4.0)),
+                ("usage_system", FieldValue::Float(1.0)),
+            ],
+        );
+        let sid = series_id_for_point(&p);
+        let (batch, _, _) = build_record_batch(&ensured, &[0], 1, &[p], &[sid]).unwrap();
+        let schema = batch.schema();
+        let idle_idx = schema.index_of("usage_idle").unwrap();
+        let system_idx = schema.index_of("usage_system").unwrap();
+        let user_idx = schema.index_of("usage_user").unwrap();
+        assert!(idle_idx < system_idx && system_idx < user_idx);
+        let idle_col = batch
+            .column(idle_idx)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let user_col = batch
+            .column(user_idx)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let system_col = batch
+            .column(system_idx)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(idle_col.value(0), 95.0);
+        assert_eq!(user_col.value(0), 4.0);
+        assert_eq!(system_col.value(0), 1.0);
+    }
+
+    #[test]
     fn insert_sql_renders_values_and_tracks_time_window() {
         let ensured = test_ensured();
         let p1 = make_point(
@@ -1817,40 +1760,6 @@ mod tests {
         assert!(sql.contains("(`series_id`, `host`)"));
         assert!(sql.contains(&format!("({}, 'a')", id1)));
         assert!(sql.contains(&format!("({}, 'b')", id2)));
-    }
-
-    #[test]
-    fn coalesce_merges_partial_lines_same_series_and_time() {
-        let ts = 1_778_437_451_000_000_000i64;
-        let tags = &[("host", "h1")];
-        let p1 = make_point(ts, tags, &[("load1", FieldValue::Float(2.92))]);
-        let p2 = make_point(ts, tags, &[("uptime", FieldValue::UInteger(13761777))]);
-        let p3 = make_point(
-            ts,
-            tags,
-            &[("uptime_format", FieldValue::String("159 days".into()))],
-        );
-        let pts = [p1, p2, p3];
-        let groups = coalesce_plan(&pts).expect("partial lines should merge");
-        assert_eq!(groups.len(), 1);
-        let merged = merge_point_group(&pts, &groups[0]);
-        assert_eq!(merged.fields.len(), 3);
-        assert_eq!(merged.fields.get("load1"), Some(&FieldValue::Float(2.92)));
-        assert_eq!(
-            merged.fields.get("uptime"),
-            Some(&FieldValue::UInteger(13761777))
-        );
-    }
-
-    #[test]
-    fn coalesce_returns_none_when_nothing_merges() {
-        let ts = 1_778_437_451_000_000_000i64;
-        // Same timestamp, distinct series -> no merge.
-        let p1 = make_point(ts, &[("host", "h1")], &[("v", FieldValue::Float(1.0))]);
-        let p2 = make_point(ts, &[("host", "h2")], &[("v", FieldValue::Float(2.0))]);
-        // Same series, distinct timestamp -> no merge.
-        let p3 = make_point(ts + 1, &[("host", "h1")], &[("v", FieldValue::Float(3.0))]);
-        assert!(coalesce_plan(&[p1, p2, p3]).is_none());
     }
 
     #[test]
