@@ -160,8 +160,9 @@ impl BackendPool {
             // Probe all backends concurrently so a slow one can't starve the
             // others. We don't await joinset completion explicitly — each
             // probe self-contains its work.
-            for backend in snap.iter().cloned() {
+            for backend in snap.iter() {
                 let pool = Arc::clone(&pool);
+                let backend = Arc::clone(backend);
                 tokio::spawn(async move {
                     pool.probe_one(&backend).await;
                 });

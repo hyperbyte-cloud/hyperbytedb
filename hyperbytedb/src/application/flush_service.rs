@@ -21,6 +21,10 @@ const MAX_BATCH_POINTS: usize = 500_000;
 /// Beyond this limit we truncate anyway to prevent unbounded WAL growth.
 const MAX_WAL_RETENTION_ENTRIES: u64 = 500_000;
 
+type MeasurementBatchKey = (String, String, String);
+type MeasurementBatch = (Vec<Point>, Vec<u64>);
+type MeasurementBatchMap = BTreeMap<MeasurementBatchKey, MeasurementBatch>;
+
 pub struct FlushServiceImpl {
     wal: Arc<dyn WalPort>,
     last_flushed: Arc<Mutex<u64>>,
@@ -316,8 +320,7 @@ impl FlushServiceImpl {
             // per-row (parallel to points) rather than being part of the key,
             // so rows from different cluster nodes land in ONE insert per
             // measurement instead of fanning out one insert per origin.
-            let mut by_meas: BTreeMap<(String, String, String), (Vec<Point>, Vec<u64>)> =
-                BTreeMap::new();
+            let mut by_meas: MeasurementBatchMap = BTreeMap::new();
             let mut chunk_point_count = 0usize;
 
             for (seq, entry) in entries {

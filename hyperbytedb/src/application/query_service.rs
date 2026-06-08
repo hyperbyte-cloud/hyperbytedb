@@ -23,6 +23,9 @@ use crate::timeseriesql::to_clickhouse;
 /// Max `(database, measurement)` entries in the query-side column mapping cache.
 const COLUMN_MAPPING_CACHE_MAX: usize = 4096;
 
+type ColumnMappingCacheEntry = (u64, ColumnMapping);
+type ColumnMappingCache = HashMap<(String, String), ColumnMappingCacheEntry>;
+
 #[derive(Clone)]
 pub struct QueryServiceImpl {
     query_port: Arc<dyn QueryPort>,
@@ -32,7 +35,7 @@ pub struct QueryServiceImpl {
     /// Native MergeTree sink: `DROP TABLE` when measurements / databases are dropped.
     points_sink: Arc<dyn crate::ports::points_sink::PointsSinkPort>,
     /// `(db, measurement)` → (schema fingerprint, mapping) for TimeseriesQL translation.
-    column_mapping_cache: Arc<RwLock<HashMap<(String, String), (u64, ColumnMapping)>>>,
+    column_mapping_cache: Arc<RwLock<ColumnMappingCache>>,
     /// When set, `SELECT ... INTO` writes replicate to peers after local WAL append.
     replication_port: Option<Arc<dyn ReplicationPort>>,
     node_id: u64,

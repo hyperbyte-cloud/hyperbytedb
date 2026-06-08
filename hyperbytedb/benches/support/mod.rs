@@ -1,5 +1,7 @@
 //! Shared helpers for Criterion benchmarks (dataset seeding, query harness).
 
+#![allow(dead_code)]
+
 use std::fmt::Write as _;
 use std::sync::Arc;
 

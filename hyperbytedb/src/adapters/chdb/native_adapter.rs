@@ -250,9 +250,7 @@ impl ChdbNativeAdapter {
         };
 
         let databases = meta.list_databases().await?;
-        let mut fact_writers = self.schemas.write();
-        let mut series_writers = self.series_schemas.write();
-        let mut warmed = 0usize;
+        let mut pending: Vec<(TableKey, TableSchema, TableSchema)> = Vec::new();
 
         for db in databases {
             let measurements = meta.list_measurements(&db.name).await?;
@@ -277,11 +275,17 @@ impl ChdbNativeAdapter {
                         rp: rp.name.clone(),
                         measurement: meas_name.clone(),
                     };
-                    fact_writers.insert(key.clone(), fact_schema.clone());
-                    series_writers.insert(key, series_schema.clone());
-                    warmed += 1;
+                    pending.push((key, fact_schema.clone(), series_schema.clone()));
                 }
             }
+        }
+
+        let warmed = pending.len();
+        let mut fact_writers = self.schemas.write();
+        let mut series_writers = self.series_schemas.write();
+        for (key, fact_schema, series_schema) in pending {
+            fact_writers.insert(key.clone(), fact_schema);
+            series_writers.insert(key, series_schema);
         }
 
         Ok(warmed)
@@ -1446,10 +1450,7 @@ fn coalesce_points_and_origins(
         .iter()
         .map(|g| merge_point_group(points, g))
         .collect();
-    let merged_origins = groups
-        .iter()
-        .map(|g| origins[*g.last().expect("group is non-empty") as usize])
-        .collect();
+    let merged_origins = groups.iter().map(|g| origins[g[0] as usize]).collect();
     Some((merged_points, merged_origins))
 }
 
@@ -1702,7 +1703,7 @@ mod tests {
         assert!(!series.materialized);
         // Fields land on the fact schema, tags on the series schema.
         assert_eq!(fact.columns.get("value"), Some(&ColumnKind::Field(0)));
-        assert!(fact.columns.get("host").is_none());
+        assert!(!fact.columns.contains_key("host"));
         assert_eq!(
             series.columns.get("host"),
             Some(&ColumnKind::TagLowCardinality)

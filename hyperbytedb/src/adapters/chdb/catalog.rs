@@ -172,10 +172,15 @@ fn repair_atomic_default_symlink(session_path: &Path) -> Result<(), HyperbytedbE
 
 fn write_default_database_sql(session_path: &Path, uuid: &str) -> Result<(), HyperbytedbError> {
     let default_sql = session_path.join("metadata/default.sql");
-    fs::create_dir_all(default_sql.parent().expect("metadata parent")).map_err(|e| {
+    let Some(parent) = default_sql.parent() else {
+        return Err(HyperbytedbError::Chdb(
+            "default.sql path has no parent directory".to_string(),
+        ));
+    };
+    fs::create_dir_all(parent).map_err(|e| {
         HyperbytedbError::Chdb(format!(
             "failed to create chDB metadata dir {}: {e}",
-            default_sql.parent().unwrap().display()
+            parent.display()
         ))
     })?;
     let statement = format!("ATTACH DATABASE default ENGINE=Atomic UUID '{uuid}'\n");
