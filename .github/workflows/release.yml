@@ -83,8 +83,11 @@ jobs:
       - name: Build and push multi-arch image (linux/amd64 + linux/arm64)
         uses: docker/build-push-action@v6
         with:
+          # Parent context holds hyperbytedb/ (this checkout) + chdb-rust/.
+          # Dockerfile lives at the repo root, not hyperbytedb/Dockerfile — that
+          # path is only valid when building from a monorepo parent locally.
           context: ..
-          file: hyperbytedb/Dockerfile
+          file: Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
           # provenance=false keeps the image manifest as a simple
@@ -109,7 +112,7 @@ jobs:
             --output type=local,dest=./staging-x86_64 \
             --provenance=false \
             --cache-from type=gha \
-            -f hyperbytedb/Dockerfile \
+            -f Dockerfile \
             ..
           NAME="hyperbytedb-${TAG}-linux-x86_64"
           tar -C staging-x86_64 -czf "out/${NAME}.tar.gz" hyperbytedb hyperbytedb-cli libchdb.so
@@ -128,7 +131,7 @@ jobs:
             --output type=local,dest=./staging-aarch64 \
             --provenance=false \
             --cache-from type=gha \
-            -f hyperbytedb/Dockerfile \
+            -f Dockerfile \
             ..
           NAME="hyperbytedb-${TAG}-linux-aarch64"
           tar -C staging-aarch64 -czf "out/${NAME}.tar.gz" hyperbytedb hyperbytedb-cli libchdb.so
