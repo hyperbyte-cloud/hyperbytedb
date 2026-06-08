@@ -1,5 +1,5 @@
 [workspace]
-members = ["hyperbytedb", "hyperbytedb-proxy"]
+members = ["hyperbytedb", "hyperbytedb-proxy", "hyperbytedb-cli"]
 resolver = "2"
 
 [profile.release]

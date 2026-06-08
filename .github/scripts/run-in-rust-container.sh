@@ -14,6 +14,9 @@ fi
 command=$1
 RUST_IMAGE="${RUST_IMAGE:-rust:bookworm}"
 WORKSPACE="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
+# chdb-rust is checked out as a sibling of GITHUB_WORKSPACE (see checkout-chdb-rust.sh).
+# Mount the parent directory so path = "../../chdb-rust" resolves inside the container.
+WORKSPACE_PARENT="$(dirname "${WORKSPACE}")"
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "docker is required but was not found on PATH." >&2
@@ -23,7 +26,7 @@ fi
 
 docker_args=(
   --rm
-  -v "${WORKSPACE}:${WORKSPACE}"
+  -v "${WORKSPACE_PARENT}:${WORKSPACE_PARENT}"
   -w "${WORKSPACE}"
   -e "CARGO_TERM_COLOR=${CARGO_TERM_COLOR:-always}"
   -e "RUSTFLAGS=${RUSTFLAGS:-}"

@@ -108,9 +108,9 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         ),
     }
 
-    if let Err(e) = catalog::prepare_cold_start_metadata(std::path::Path::new(
-        &config.chdb.session_data_path,
-    )) {
+    if let Err(e) =
+        catalog::prepare_cold_start_metadata(std::path::Path::new(&config.chdb.session_data_path))
+    {
         tracing::warn!(
             error = %e,
             "failed to prepare chDB metadata before session open"

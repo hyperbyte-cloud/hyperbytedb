@@ -9,7 +9,7 @@ name: Release
 #      stage per platform and package:
 #        - hyperbytedb-<tag>-linux-x86_64.tar.gz   (amd64 / x64)
 #        - hyperbytedb-<tag>-linux-aarch64.tar.gz (arm64)
-#      Each tarball contains hyperbytedb + matching libchdb.so, plus a sha256.
+#      Each tarball contains hyperbytedb, hyperbytedb-cli, and matching libchdb.so, plus a sha256.
 #   3. Publish a GitHub Release for the tag with the tarballs attached.
 #
 # Jobs run directly on the ARC runner pod (not inside a job container) so
@@ -28,6 +28,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  CHDB_RUST_REPO: https://github.com/hyperbyte-cloud/chdb-rust.git
+  CHDB_RUST_REF: feat_arrow_insert
   REGISTRY: ghcr.io
   # Canonical package; docs and operator manifests reference
   # ghcr.io/hyperbyte-cloud/hyperbytedb. Hardcoded because github.repository
@@ -43,6 +45,9 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+
+      - name: Checkout chdb-rust
+        run: bash .github/scripts/checkout-chdb-rust.sh
 
       - name: Install CI dependencies
         uses: ./.github/actions/install-ci-deps
@@ -107,7 +112,7 @@ jobs:
             -f hyperbytedb/Dockerfile \
             ..
           NAME="hyperbytedb-${TAG}-linux-x86_64"
-          tar -C staging-x86_64 -czf "out/${NAME}.tar.gz" hyperbytedb libchdb.so
+          tar -C staging-x86_64 -czf "out/${NAME}.tar.gz" hyperbytedb hyperbytedb-cli libchdb.so
           ( cd out && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
           ls -lh "out/${NAME}.tar.gz" "out/${NAME}.tar.gz.sha256"
 
@@ -126,7 +131,7 @@ jobs:
             -f hyperbytedb/Dockerfile \
             ..
           NAME="hyperbytedb-${TAG}-linux-aarch64"
-          tar -C staging-aarch64 -czf "out/${NAME}.tar.gz" hyperbytedb libchdb.so
+          tar -C staging-aarch64 -czf "out/${NAME}.tar.gz" hyperbytedb hyperbytedb-cli libchdb.so
           ( cd out && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
           ls -lh "out/${NAME}.tar.gz" "out/${NAME}.tar.gz.sha256"
 

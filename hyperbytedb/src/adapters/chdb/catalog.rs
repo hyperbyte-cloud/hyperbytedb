@@ -37,7 +37,9 @@ pub async fn persist_default_database_metadata(
         let sql = "SELECT uuid FROM system.databases WHERE name = 'default' FORMAT TabSeparated";
         let result = session.0.execute(
             sql,
-            Some(&[chdb_rust::arg::Arg::OutputFormat(OutputFormat::TabSeparated)]),
+            Some(&[chdb_rust::arg::Arg::OutputFormat(
+                OutputFormat::TabSeparated,
+            )]),
         );
         match result {
             Ok(qr) => qr
@@ -74,7 +76,10 @@ pub async fn reload_persisted_tables(session: &SharedSession) -> Result<usize, H
     let mut attached = 0usize;
 
     for entry in fs::read_dir(&meta_dir).map_err(|e| {
-        HyperbytedbError::Chdb(format!("failed to read chDB metadata dir {}: {e}", meta_dir.display()))
+        HyperbytedbError::Chdb(format!(
+            "failed to read chDB metadata dir {}: {e}",
+            meta_dir.display()
+        ))
     })? {
         let entry = entry.map_err(|e| {
             HyperbytedbError::Chdb(format!(
@@ -167,13 +172,17 @@ fn repair_atomic_default_symlink(session_path: &Path) -> Result<(), HyperbytedbE
 
 fn write_default_database_sql(session_path: &Path, uuid: &str) -> Result<(), HyperbytedbError> {
     let default_sql = session_path.join("metadata/default.sql");
-    fs::create_dir_all(default_sql.parent().expect("metadata parent"))
-        .map_err(|e| {
-            HyperbytedbError::Chdb(format!(
-                "failed to create chDB metadata dir {}: {e}",
-                default_sql.parent().unwrap().display()
-            ))
-        })?;
+    let Some(parent) = default_sql.parent() else {
+        return Err(HyperbytedbError::Chdb(
+            "default.sql path has no parent directory".to_string(),
+        ));
+    };
+    fs::create_dir_all(parent).map_err(|e| {
+        HyperbytedbError::Chdb(format!(
+            "failed to create chDB metadata dir {}: {e}",
+            parent.display()
+        ))
+    })?;
     let statement = format!("ATTACH DATABASE default ENGINE=Atomic UUID '{uuid}'\n");
     fs::write(&default_sql, statement).map_err(|e| {
         HyperbytedbError::Chdb(format!(
@@ -224,13 +233,18 @@ async fn list_default_tables(session: &SharedSession) -> Result<HashSet<String>,
         .collect())
 }
 
-async fn query_tab_separated(session: &SharedSession, sql: &str) -> Result<String, HyperbytedbError> {
+async fn query_tab_separated(
+    session: &SharedSession,
+    sql: &str,
+) -> Result<String, HyperbytedbError> {
     let session = session.get()?;
     let sql = format!("{sql} FORMAT TabSeparated");
     tokio::task::spawn_blocking(move || {
         let result = session.0.execute(
             &sql,
-            Some(&[chdb_rust::arg::Arg::OutputFormat(OutputFormat::TabSeparated)]),
+            Some(&[chdb_rust::arg::Arg::OutputFormat(
+                OutputFormat::TabSeparated,
+            )]),
         );
         match result {
             Ok(qr) => qr
@@ -267,13 +281,15 @@ mod tests {
         let path = store_path_for_uuid(tmp.path(), "722d7b65-10de-4d87-80a0-62f649fe492d");
         assert_eq!(
             path,
-            tmp.path().join("store/722/722d7b65-10de-4d87-80a0-62f649fe492d")
+            tmp.path()
+                .join("store/722/722d7b65-10de-4d87-80a0-62f649fe492d")
         );
     }
 
     #[test]
     fn parses_default_database_uuid() {
-        let sql = "ATTACH DATABASE default ENGINE=Atomic UUID '722d7b65-10de-4d87-80a0-62f649fe492d'\n";
+        let sql =
+            "ATTACH DATABASE default ENGINE=Atomic UUID '722d7b65-10de-4d87-80a0-62f649fe492d'\n";
         assert_eq!(
             parse_default_database_uuid(sql),
             Some("722d7b65-10de-4d87-80a0-62f649fe492d")

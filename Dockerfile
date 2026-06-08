@@ -39,6 +39,8 @@ RUN rustup show active-toolchain
 COPY hyperbytedb/Cargo.toml hyperbytedb/Cargo.lock ./
 COPY hyperbytedb/hyperbytedb/Cargo.toml hyperbytedb/
 COPY hyperbytedb/hyperbytedb-proxy/Cargo.toml hyperbytedb-proxy/
+COPY hyperbytedb/hyperbytedb-cli/Cargo.toml hyperbytedb-cli/
+RUN mkdir -p hyperbytedb-cli/src && echo "fn main(){}" > hyperbytedb-cli/src/main.rs && echo "" > hyperbytedb-cli/src/lib.rs
 # Create stub files so cargo can parse [[bench]] entries
 RUN mkdir -p hyperbytedb/benches hyperbytedb/benches/support \
     && echo "fn main(){}" > hyperbytedb/benches/ingestion_columnar.rs \
@@ -53,17 +55,21 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 COPY hyperbytedb/hyperbytedb/src/ hyperbytedb/src/
 COPY hyperbytedb/hyperbytedb/tests/ hyperbytedb/tests/
 COPY hyperbytedb/hyperbytedb/benches/ hyperbytedb/benches/
+COPY hyperbytedb/hyperbytedb-cli/src/ hyperbytedb-cli/src/
+COPY hyperbytedb/hyperbytedb-cli/tests/ hyperbytedb-cli/tests/
 # target/ is a cache mount — artifacts are not in the image layer unless copied out.
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/build/hyperbytedb/target \
-    cargo build --release --locked -p hyperbytedb --bin hyperbytedb \
+    cargo build --release --locked -p hyperbytedb --bin hyperbytedb -p hyperbytedb-cli --bin hyperbytedb-cli \
     && mkdir -p /artifacts \
-    && cp /build/hyperbytedb/target/release/hyperbytedb /artifacts/
+    && cp /build/hyperbytedb/target/release/hyperbytedb /artifacts/ \
+    && cp /build/hyperbytedb/target/release/hyperbytedb-cli /artifacts/
 
 # Flat export target for release tarballs (see .github/workflows/release.yml).
 FROM scratch AS artifacts
 COPY --from=builder /artifacts/hyperbytedb /hyperbytedb
+COPY --from=builder /artifacts/hyperbytedb-cli /hyperbytedb-cli
 COPY --from=builder /usr/local/lib/libchdb.so /libchdb.so
 
 # ---------------------------------------------------------------------------
@@ -78,6 +84,7 @@ COPY --from=builder /usr/local/include/chdb.h /usr/local/include/chdb.h
 RUN ldconfig
 
 COPY --from=builder /artifacts/hyperbytedb /usr/local/bin/hyperbytedb
+COPY --from=builder /artifacts/hyperbytedb-cli /usr/local/bin/hyperbytedb-cli
 
 RUN mkdir -p /var/lib/hyperbytedb/wal /var/lib/hyperbytedb/meta \
              /var/lib/hyperbytedb/chdb /var/lib/hyperbytedb/raft

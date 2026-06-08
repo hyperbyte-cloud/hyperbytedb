@@ -96,6 +96,7 @@ nav:
           - hyperbytedb-proxy: user-guide/operator/hyperbytedb-proxy.md
       - Configuration: user-guide/configuration.md
       - Basic operations: user-guide/basic-operations.md
+      - CLI (hyperbytedb-cli): user-guide/cli.md
       - Authentication: user-guide/authentication.md
       - Advanced features: user-guide/advanced-features.md
       - Common workflows: user-guide/common-workflows.md

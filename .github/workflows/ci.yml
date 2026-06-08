@@ -14,6 +14,8 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: "-D warnings"
+  CHDB_RUST_REPO: https://github.com/hyperbyte-cloud/chdb-rust.git
+  CHDB_RUST_REF: feat_arrow_insert
 
 jobs:
   doc_links:
@@ -35,6 +37,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Checkout chdb-rust
+        run: bash .github/scripts/checkout-chdb-rust.sh
+
       - name: Install CI dependencies
         uses: ./.github/actions/install-ci-deps
         with:
@@ -43,7 +48,7 @@ jobs:
       - name: Check formatting
         run: |
           bash .github/scripts/run-in-rust-container.sh \
-            'rustup component add rustfmt && cargo fmt --all --check'
+            'rustup component add rustfmt && cargo fmt --check'
 
   clippy:
     name: Clippy
@@ -51,6 +56,9 @@ jobs:
     needs: [fmt, doc_links]
     steps:
       - uses: actions/checkout@v4
+
+      - name: Checkout chdb-rust
+        run: bash .github/scripts/checkout-chdb-rust.sh
 
       - name: Install CI dependencies
         uses: ./.github/actions/install-ci-deps
@@ -70,6 +78,9 @@ jobs:
     needs: [fmt, doc_links]
     steps:
       - uses: actions/checkout@v4
+
+      - name: Checkout chdb-rust
+        run: bash .github/scripts/checkout-chdb-rust.sh
 
       - name: Install CI dependencies
         uses: ./.github/actions/install-ci-deps
@@ -94,6 +105,9 @@ jobs:
     needs: [clippy, test]
     steps:
       - uses: actions/checkout@v4
+
+      - name: Checkout chdb-rust
+        run: bash .github/scripts/checkout-chdb-rust.sh
 
       - name: Install CI dependencies
         uses: ./.github/actions/install-ci-deps

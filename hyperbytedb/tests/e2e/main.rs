@@ -9,11 +9,10 @@ use hyperbytedb::application::backup::{backup, restore};
 use hyperbytedb::ports::metadata::MetadataPort;
 use serial_test::serial;
 
-use support::{files_under, query_row_count, E2eFixture};
+use support::{E2eFixture, files_under, query_row_count};
 
 const DB: &str = "e2edb";
-const WRITE_LINES: &str =
-    "cpu,host=a value=1.0 1000000000\ncpu,host=a value=2.0 2000000000";
+const WRITE_LINES: &str = "cpu,host=a value=1.0 1000000000\ncpu,host=a value=2.0 2000000000";
 
 #[tokio::test]
 #[serial(chdb)]
@@ -80,7 +79,8 @@ async fn backup_restore_roundtrip() {
     );
 
     let config = server.config().clone();
-    let default_sql = std::path::Path::new(&config.chdb.session_data_path).join("metadata/default.sql");
+    let default_sql =
+        std::path::Path::new(&config.chdb.session_data_path).join("metadata/default.sql");
     assert!(
         default_sql.exists(),
         "chDB session should persist metadata/default.sql after first table flush: {}",
@@ -88,7 +88,8 @@ async fn backup_restore_roundtrip() {
     );
     let fixture = server.stop().await;
 
-    let metadata = RocksDbMetadata::open(&config.storage.meta_dir).expect("open meta before backup");
+    let metadata =
+        RocksDbMetadata::open(&config.storage.meta_dir).expect("open meta before backup");
     assert!(
         metadata
             .get_database(DB)
@@ -115,7 +116,10 @@ async fn backup_restore_roundtrip() {
         backup_path.join("manifest.json").exists(),
         "backup should contain manifest.json"
     );
-    assert!(backup_path.join("wal").exists(), "backup should contain wal/");
+    assert!(
+        backup_path.join("wal").exists(),
+        "backup should contain wal/"
+    );
     assert!(
         backup_path.join("meta").exists(),
         "backup should contain meta/"
