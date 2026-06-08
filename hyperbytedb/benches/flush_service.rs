@@ -13,9 +13,7 @@ use std::sync::{Arc, OnceLock};
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group};
 use hyperbytedb::application::flush_service::FlushServiceImpl;
-use support::{
-    DatasetProfile, FlushBenchEnv, ingest_points, seed_wal_only, setup_flush,
-};
+use support::{DatasetProfile, FlushBenchEnv, ingest_points, seed_wal_only, setup_flush};
 
 const INCREMENTAL_BATCH: u64 = 1000;
 
@@ -94,9 +92,7 @@ fn bench_flush_drain(c: &mut Criterion) {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         if !enabled {
-            eprintln!(
-                "skipping flush_drain_large (set BENCH_FLUSH_DRAIN_LARGE=1 to enable)"
-            );
+            eprintln!("skipping flush_drain_large (set BENCH_FLUSH_DRAIN_LARGE=1 to enable)");
             return;
         }
     }
@@ -122,7 +118,12 @@ fn bench_flush_drain(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_flush_full, bench_flush_incremental, bench_flush_drain);
+criterion_group!(
+    benches,
+    bench_flush_full,
+    bench_flush_incremental,
+    bench_flush_drain
+);
 
 unsafe extern "C" {
     fn _exit(status: i32) -> !;

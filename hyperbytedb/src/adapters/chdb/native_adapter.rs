@@ -35,19 +35,19 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, DictionaryArray, Float64Builder, Int64Builder, Int32Array, RecordBatch, StringArray,
+    ArrayRef, DictionaryArray, Float64Builder, Int32Array, Int64Builder, RecordBatch, StringArray,
     StringBuilder, TimestampNanosecondArray, UInt8Builder, UInt64Array, UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use async_trait::async_trait;
 use chdb_rust::arg::Arg;
-use chdb_rust::arrow_insert::{insert_record_batch_direct, InsertOptions};
+use chdb_rust::arrow_insert::{InsertOptions, insert_record_batch_direct};
 use chdb_rust::format::OutputFormat;
 use metrics::histogram;
 use parking_lot::RwLock;
 
-use crate::adapters::chdb::session::{SharedSession, SyncSession};
 use crate::adapters::chdb::catalog;
+use crate::adapters::chdb::session::{SharedSession, SyncSession};
 use crate::application::system_trace;
 use crate::domain::chdb_naming::{
     field_column_name, quote_backticks, quoted_series_table_name, quoted_table_name,
@@ -292,7 +292,8 @@ impl ChdbNativeAdapter {
     pub async fn sync_materialized_from_engine(&self) -> Result<usize, HyperbytedbError> {
         let session = self.session.get()?;
         let raw = tokio::task::spawn_blocking(move || {
-            let sql = "SELECT name FROM system.tables WHERE database = 'default' FORMAT TabSeparated";
+            let sql =
+                "SELECT name FROM system.tables WHERE database = 'default' FORMAT TabSeparated";
             let result = session.0.execute(
                 sql,
                 Some(&[chdb_rust::arg::Arg::OutputFormat(
@@ -328,16 +329,14 @@ impl ChdbNativeAdapter {
             let fact = unquoted_table_name(&key.db, &key.rp, &key.measurement);
             let series = unquoted_series_table_name(&key.db, &key.rp, &key.measurement);
             if attached.contains(&fact)
-                && fact_writers
-                    .get_mut(&key)
-                    .is_some_and(|schema| {
-                        if !schema.materialized {
-                            schema.materialized = true;
-                            true
-                        } else {
-                            false
-                        }
-                    })
+                && fact_writers.get_mut(&key).is_some_and(|schema| {
+                    if !schema.materialized {
+                        schema.materialized = true;
+                        true
+                    } else {
+                        false
+                    }
+                })
             {
                 synced += 1;
             }
@@ -1114,10 +1113,11 @@ fn build_series_tag_column(
             }
 
             let dictionary_values = StringArray::from(dict_values);
-            let dict = DictionaryArray::try_new(Int32Array::from(keys), Arc::new(dictionary_values))
-                .map_err(|e| {
-                    HyperbytedbError::Internal(format!("build dictionary tag column: {e}"))
-                })?;
+            let dict =
+                DictionaryArray::try_new(Int32Array::from(keys), Arc::new(dictionary_values))
+                    .map_err(|e| {
+                        HyperbytedbError::Internal(format!("build dictionary tag column: {e}"))
+                    })?;
             Ok(Arc::new(dict))
         }
         ColumnKind::TagString | ColumnKind::Field(_) => {
@@ -1565,8 +1565,14 @@ mod tests {
 
         let batch = build_series_record_batch(&ensured, &new_series).expect("batch");
         assert_eq!(batch.num_rows(), 2);
-        assert_eq!(batch.schema().field(1).data_type(), &tag_arrow_type(ColumnKind::TagLowCardinality));
-        assert_eq!(batch.schema().field(2).data_type(), &tag_arrow_type(ColumnKind::TagString));
+        assert_eq!(
+            batch.schema().field(1).data_type(),
+            &tag_arrow_type(ColumnKind::TagLowCardinality)
+        );
+        assert_eq!(
+            batch.schema().field(2).data_type(),
+            &tag_arrow_type(ColumnKind::TagString)
+        );
         assert!(matches!(
             batch.column(1).data_type(),
             DataType::Dictionary(_, _)

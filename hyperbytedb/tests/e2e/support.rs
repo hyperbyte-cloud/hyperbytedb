@@ -74,7 +74,11 @@ impl E2eFixture {
         let bin = hyperbytedb_bin();
 
         let mut child = Command::new(&bin)
-            .args(["--config", config_path.to_str().expect("config path"), "serve"])
+            .args([
+                "--config",
+                config_path.to_str().expect("config path"),
+                "serve",
+            ])
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -228,10 +232,7 @@ impl E2eServer {
             .expect("query request");
         let status = resp.status();
         let body = resp.text().await.expect("query body");
-        assert!(
-            status.is_success(),
-            "query failed: {status} body={body}"
-        );
+        assert!(status.is_success(), "query failed: {status} body={body}");
         serde_json::from_str(&body).expect("query json")
     }
 
