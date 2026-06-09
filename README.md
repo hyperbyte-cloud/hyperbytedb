@@ -6,7 +6,12 @@
       </td>
     </tr>
   </table>
+<p align="center">
+  <a href="https://docs.hyperbyte.cloud">Documentation</a> · <a href="https://hyperbyte.cloud/hyperbytedb">Website</a>
+</p>
 </div>
+
+
 
 HyperbyteDB is a time-series database written in Rust that provides InfluxDB v1 API compatibility, uses embedded ClickHouse (chDB) for queries and native MergeTree storage, and RocksDB for WAL/metadata. It supports master-master clustering for replication.
 
