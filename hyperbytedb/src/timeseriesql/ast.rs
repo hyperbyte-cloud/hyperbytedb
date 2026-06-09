@@ -279,10 +279,11 @@ impl GroupBy {
 
     /// Whether GROUP BY references any tag dimension, including `*` (all tags).
     pub fn references_tags(&self) -> bool {
-        self.dimensions.iter().any(|d| match d {
-            Dimension::AllTags | Dimension::Regex(_) => true,
-            Dimension::Tag(_name) => true,
-            _ => false,
+        self.dimensions.iter().any(|d| {
+            matches!(
+                d,
+                Dimension::AllTags | Dimension::Regex(_) | Dimension::Tag(_)
+            )
         })
     }
 
