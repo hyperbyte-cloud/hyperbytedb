@@ -281,7 +281,7 @@ impl GroupBy {
     pub fn references_tags(&self) -> bool {
         self.dimensions.iter().any(|d| match d {
             Dimension::AllTags | Dimension::Regex(_) => true,
-            Dimension::Tag(name) => true,
+            Dimension::Tag(_name) => true,
             _ => false,
         })
     }
@@ -315,7 +315,12 @@ impl GroupBy {
             }
         }
 
-        (Self { dimensions: expanded_dims }, resolved_tags)
+        (
+            Self {
+                dimensions: expanded_dims,
+            },
+            resolved_tags,
+        )
     }
 }
 

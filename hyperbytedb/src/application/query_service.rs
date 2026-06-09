@@ -1368,8 +1368,7 @@ async fn execute_measurement_query(
 ) -> Result<Vec<SeriesResult>, HyperbytedbError> {
     let column_mapping = svc.column_mapping_for(db, measurement).await?;
     let tag_keys = tag_keys_from_mapping(column_mapping.as_ref());
-    let (effective_stmt, resolved_group_by_tags) =
-        select_with_expanded_group_by(stmt, &tag_keys);
+    let (effective_stmt, resolved_group_by_tags) = select_with_expanded_group_by(stmt, &tag_keys);
 
     // Tombstone predicates (spliced into WHERE below) may reference tag columns,
     // which only exist on the series-rejoin inline view — so force the join when
@@ -1399,7 +1398,9 @@ async fn execute_measurement_query(
     )
 }
 
-fn tag_keys_from_mapping(mapping: Option<&crate::domain::column_mapping::ColumnMapping>) -> Vec<String> {
+fn tag_keys_from_mapping(
+    mapping: Option<&crate::domain::column_mapping::ColumnMapping>,
+) -> Vec<String> {
     let mut keys: Vec<String> = mapping
         .map(|m| m.tag_keys.iter().cloned().collect())
         .unwrap_or_default();
