@@ -14,6 +14,7 @@ Shared terminology used across HyperbyteDB documentation.
 | **Column Family (CF)** | A RocksDB concept. HyperbyteDB uses separate column families for WAL entries (`wal`), WAL metadata (`wal_meta`), general metadata (`metadata`), and replication state. |
 | **Composition Root** | `bootstrap.rs` — the single location where all adapters and services are wired together using dependency injection via `Arc<dyn Trait>`. |
 | **Continuous Query (CQ)** | A named query that runs automatically on a schedule, typically used for downsampling raw data into summary measurements. |
+| **Materialized View (MV)** | A TimeseriesQL downsampling definition backed by ClickHouse `MATERIALIZED VIEW` objects. Updates incrementally on each source flush. |
 | **Drain** | Graceful node removal procedure: stop accepting writes, flush WAL, wait for replication acks, notify peers, shut down. |
 | **Field** | A key-value pair in a data point that holds the actual measured value. Fields are not indexed. Field types are enforced after first write (Float, Integer, UInteger, String, Boolean). |
 | **Figment** | Configuration loading library used by HyperbyteDB. Merges defaults, TOML config file, and environment variables. |

@@ -6,6 +6,7 @@ pub mod flush_service;
 pub mod ingest_metadata;
 pub mod ingestion_service;
 pub mod line_protocol;
+pub mod materialized_view_service;
 pub mod msgpack_ingest;
 pub mod peer_ingestion_service;
 pub mod peer_query_service;

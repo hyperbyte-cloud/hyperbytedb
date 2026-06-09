@@ -748,6 +748,91 @@ impl ChdbNativeAdapter {
         }
         Ok(base + novel.len())
     }
+
+    /// Create fact + `_series` tables for `meta` when they do not yet exist.
+    pub async fn ensure_measurement_schema_impl(
+        &self,
+        db: &str,
+        rp: &str,
+        meta: &MeasurementMeta,
+    ) -> Result<(), HyperbytedbError> {
+        let key = TableKey {
+            db: db.to_string(),
+            rp: rp.to_string(),
+            measurement: meta.name.clone(),
+        };
+        let table = quoted_table_name(db, rp, &meta.name);
+        let series_table = quoted_series_table_name(db, rp, &meta.name);
+
+        let field_name_set: HashSet<&str> = meta.field_types.keys().map(String::as_str).collect();
+        let tag_phys: Vec<(String, String, ColumnKind)> = meta
+            .tag_keys
+            .iter()
+            .map(|k| {
+                (
+                    k.clone(),
+                    tag_column_name(k, &field_name_set),
+                    ColumnKind::TagLowCardinality,
+                )
+            })
+            .collect();
+        let mut field_phys: Vec<(String, String, u8)> = meta
+            .field_types
+            .iter()
+            .map(|(k, d)| (k.clone(), field_column_name(k), *d))
+            .collect();
+        field_phys.sort_by(|a, b| a.1.cmp(&b.1));
+
+        let cached = { self.schemas.read().get(&key).cloned() }.unwrap_or_default();
+        let series_cached = { self.series_schemas.read().get(&key).cloned() }.unwrap_or_default();
+
+        if cached.materialized && series_cached.materialized {
+            return Ok(());
+        }
+
+        let ddl_lock = self.ddl_mutex(&key).await;
+        let _guard = ddl_lock.lock().await;
+
+        let cached = { self.schemas.read().get(&key).cloned() }.unwrap_or_default();
+        let series_cached = { self.series_schemas.read().get(&key).cloned() }.unwrap_or_default();
+
+        if !cached.materialized {
+            let sql = build_create_table_sql(&table, &field_phys);
+            tracing::info!(table = %meta.name, "creating chDB native fact table for MV destination");
+            self.execute(sql).await?;
+        }
+        if !series_cached.materialized {
+            let sql = build_create_series_table_sql(&series_table, &tag_phys);
+            tracing::info!(table = %meta.name, "creating chDB native series table for MV destination");
+            self.execute(sql).await?;
+        }
+
+        {
+            let mut writers = self.schemas.write();
+            let entry = writers.entry(key.clone()).or_default();
+            for (_, phys, d) in &field_phys {
+                entry.columns.insert(phys.clone(), ColumnKind::Field(*d));
+            }
+            entry.materialized = true;
+        }
+        {
+            let mut writers = self.series_schemas.write();
+            let entry = writers.entry(key).or_default();
+            for (_, phys, kind) in &tag_phys {
+                entry.columns.insert(phys.clone(), *kind);
+            }
+            entry.materialized = true;
+        }
+
+        if let Err(e) = catalog::persist_default_database_metadata(&self.session).await {
+            tracing::warn!(
+                error = %e,
+                "failed to persist chDB default database metadata after MV destination DDL"
+            );
+        }
+
+        Ok(())
+    }
 }
 
 struct EnsuredTable {
@@ -871,6 +956,15 @@ impl PointsSinkPort for ChdbNativeAdapter {
             max_time,
             row_count,
         })
+    }
+
+    async fn ensure_measurement_schema(
+        &self,
+        db: &str,
+        rp: &str,
+        meta: &MeasurementMeta,
+    ) -> Result<(), HyperbytedbError> {
+        self.ensure_measurement_schema_impl(db, rp, meta).await
     }
 
     async fn drop_measurement(

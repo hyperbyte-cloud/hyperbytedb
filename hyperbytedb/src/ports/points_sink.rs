@@ -17,6 +17,7 @@ use async_trait::async_trait;
 
 use crate::domain::point::Point;
 use crate::error::HyperbytedbError;
+use crate::ports::metadata::MeasurementMeta;
 
 /// Result of a successful [`PointsSinkPort::write_points`] call.
 /// The flush service uses these for logging / metrics; nothing in the
@@ -61,6 +62,19 @@ pub trait PointsSinkPort: Send + Sync {
         measurement: &str,
     ) -> Result<(), HyperbytedbError> {
         let _ = (db, rp, measurement);
+        Ok(())
+    }
+
+    /// Ensure backing fact + `_series` tables exist for `meta` without inserting
+    /// data. The default is a no-op for adapters that create tables lazily on
+    /// first write.
+    async fn ensure_measurement_schema(
+        &self,
+        db: &str,
+        rp: &str,
+        meta: &MeasurementMeta,
+    ) -> Result<(), HyperbytedbError> {
+        let _ = (db, rp, meta);
         Ok(())
     }
 }

@@ -7,6 +7,7 @@ use openraft::error::ForwardToLeader;
 
 use crate::adapters::cluster::raft::HyperbytedbRaft;
 use crate::adapters::cluster::raft::types::{ClusterRequest, ClusterResponse};
+use crate::application::materialized_view_service::def_from_statement;
 use crate::domain::cluster::types::MutationRequest;
 use crate::domain::database::RetentionPolicy;
 use crate::domain::query_result::{QueryResponse, StatementResult};
@@ -57,7 +58,7 @@ impl PeerQueryService {
 
     async fn replicate_mutation(&self, req: MutationRequest) -> Result<(), HyperbytedbError> {
         if let Some(raft) = self.raft.get() {
-            let cluster_req = ClusterRequest::SchemaMutation(req);
+            let cluster_req = ClusterRequest::SchemaMutation(Box::new(req));
             self.client_write_with_forward(raft, cluster_req).await
         } else {
             self.replication_port.clone().replicate_mutation(req);
@@ -172,6 +173,25 @@ async fn forward_client_write(
     }
 }
 
+fn extract_mv_source_rp(mv: &crate::timeseriesql::ast::CreateMaterializedViewStatement) -> String {
+    mv.query
+        .from
+        .first()
+        .and_then(|s| match s {
+            crate::timeseriesql::ast::MeasurementSource::Concrete(m) => m.retention_policy.clone(),
+            _ => None,
+        })
+        .unwrap_or_else(|| "autogen".to_string())
+}
+
+fn extract_mv_dest_rp(mv: &crate::timeseriesql::ast::CreateMaterializedViewStatement) -> String {
+    mv.query
+        .into
+        .as_ref()
+        .and_then(|m| m.retention_policy.clone())
+        .unwrap_or_else(|| "autogen".to_string())
+}
+
 fn is_cluster_mutation(stmt: &Statement) -> bool {
     matches!(
         stmt,
@@ -180,6 +200,8 @@ fn is_cluster_mutation(stmt: &Statement) -> bool {
             | Statement::Delete(_)
             | Statement::CreateContinuousQuery(_)
             | Statement::DropContinuousQuery { .. }
+            | Statement::CreateMaterializedView(_)
+            | Statement::DropMaterializedView { .. }
             | Statement::CreateRetentionPolicyStmt { .. }
             | Statement::DropRetentionPolicyStmt { .. }
             | Statement::CreateUser { .. }
@@ -356,6 +378,68 @@ impl QueryService for PeerQueryService {
                         let target_db = if cq_db.is_empty() { db } else { cq_db };
                         if let Err(e) = self
                             .replicate_mutation(MutationRequest::DropContinuousQuery {
+                                database: target_db.to_string(),
+                                name: name.clone(),
+                            })
+                            .await
+                        {
+                            result.error = Some(e.to_string());
+                        }
+                    }
+                    result
+                }
+                Statement::CreateMaterializedView(ref mv) => {
+                    let resp = self.inner.execute_query(db, query, epoch, caller).await;
+                    let mut result = match resp {
+                        Ok(r) => r.results.into_iter().next().unwrap_or(StatementResult {
+                            statement_id,
+                            series: Some(vec![]),
+                            error: None,
+                        }),
+                        Err(e) => StatementResult {
+                            statement_id,
+                            series: None,
+                            error: Some(e.to_string()),
+                        },
+                    };
+                    if result.error.is_none() {
+                        let source_rp = extract_mv_source_rp(mv);
+                        let dest_rp = extract_mv_dest_rp(mv);
+                        if let Ok(def) = def_from_statement(mv, &source_rp, &dest_rp)
+                            && let Err(e) = self
+                                .replicate_mutation(MutationRequest::CreateMaterializedView {
+                                    database: mv.database.clone(),
+                                    name: mv.name.clone(),
+                                    definition: def,
+                                })
+                                .await
+                        {
+                            result.error = Some(e.to_string());
+                        }
+                    }
+                    result
+                }
+                Statement::DropMaterializedView {
+                    ref name,
+                    db: ref mv_db,
+                } => {
+                    let resp = self.inner.execute_query(db, query, epoch, caller).await;
+                    let mut result = match resp {
+                        Ok(r) => r.results.into_iter().next().unwrap_or(StatementResult {
+                            statement_id,
+                            series: Some(vec![]),
+                            error: None,
+                        }),
+                        Err(e) => StatementResult {
+                            statement_id,
+                            series: None,
+                            error: Some(e.to_string()),
+                        },
+                    };
+                    if result.error.is_none() {
+                        let target_db = if mv_db.is_empty() { db } else { mv_db };
+                        if let Err(e) = self
+                            .replicate_mutation(MutationRequest::DropMaterializedView {
                                 database: target_db.to_string(),
                                 name: name.clone(),
                             })

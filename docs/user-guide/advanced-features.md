@@ -94,6 +94,50 @@ CQ definitions are stored in metadata and survive restarts. The background sched
 
 ---
 
+## Materialized Views
+
+Materialized views downsample data incrementally using ClickHouse `MATERIALIZED VIEW` objects. Each new flush to the source measurement triggers aggregation into the destination measurement — no background scheduler.
+
+### Create a materialized view
+
+```sql
+CREATE MATERIALIZED VIEW "mv_cpu_1h" ON "mydb"
+AS SELECT mean("usage_idle") INTO "cpu_1h" FROM "cpu" GROUP BY time(1h), *
+```
+
+Requirements (same as `SELECT INTO` / continuous queries):
+
+- `INTO` destination measurement is required
+- `GROUP BY time(<interval>)` is required
+- Single concrete source measurement (no regex `FROM` in v1)
+
+On `CREATE`, HyperbyteDB:
+
+1. Registers the destination measurement in metadata
+2. Creates destination MergeTree tables in chDB
+3. Installs fact and series ClickHouse materialized views
+4. Backfills historical data from the source
+
+### Manage materialized views
+
+```sql
+SHOW MATERIALIZED VIEWS
+DROP MATERIALIZED VIEW "mv_cpu_1h" ON "mydb"
+```
+
+`DROP MATERIALIZED VIEW` removes the ClickHouse MV objects and metadata. The destination measurement and its data are kept.
+
+### Continuous queries vs materialized views
+
+| | Continuous Query | Materialized View |
+|--|------------------|-------------------|
+| Trigger | 10s scheduler | Each flush to source |
+| Latency | Up to resample interval | Near real-time |
+| Backfill | Re-scans window each run | One-time on CREATE; then incremental |
+| Engine | WAL writeback | ClickHouse MV |
+
+---
+
 ### User authentication
 
 Enable `[auth] enabled = true` to require credentials on `/write` and `/query`. How credentials are sent, which HTTP paths stay public, and when **admin** is required for cluster/internal APIs are all covered in **[Authentication](authentication.md)**.

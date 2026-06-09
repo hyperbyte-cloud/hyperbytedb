@@ -6,6 +6,7 @@ use crate::domain::database::{Database, RetentionPolicy};
 use crate::error::HyperbytedbError;
 
 pub use crate::domain::continuous_query::ContinuousQueryDef;
+pub use crate::domain::materialized_view::MaterializedViewDef;
 pub use crate::domain::measurement::MeasurementMeta;
 pub use crate::domain::user::StoredUser;
 
@@ -243,4 +244,25 @@ pub trait MetadataPort: Send + Sync {
         &self,
     ) -> Result<Vec<ContinuousQueryDef>, HyperbytedbError>;
     async fn drop_continuous_query(&self, db: &str, name: &str) -> Result<(), HyperbytedbError>;
+
+    // Materialized view management
+    async fn store_materialized_view(
+        &self,
+        db: &str,
+        name: &str,
+        definition: &MaterializedViewDef,
+    ) -> Result<(), HyperbytedbError>;
+    async fn get_materialized_view(
+        &self,
+        db: &str,
+        name: &str,
+    ) -> Result<Option<MaterializedViewDef>, HyperbytedbError>;
+    async fn list_materialized_views(
+        &self,
+        db: &str,
+    ) -> Result<Vec<MaterializedViewDef>, HyperbytedbError>;
+    async fn list_all_materialized_views(
+        &self,
+    ) -> Result<Vec<MaterializedViewDef>, HyperbytedbError>;
+    async fn drop_materialized_view(&self, db: &str, name: &str) -> Result<(), HyperbytedbError>;
 }

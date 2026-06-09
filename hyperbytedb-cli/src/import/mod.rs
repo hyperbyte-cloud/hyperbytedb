@@ -82,9 +82,7 @@ pub async fn run_import(client: &HyperbytedbClient, opts: &ImportOptions) -> Res
                 };
                 let resp = client.query(trimmed, &qopts).await?;
                 if resp.has_errors() {
-                    return Err(CliError::Import(
-                        resp.first_error().unwrap_or("DDL failed").to_string(),
-                    ));
+                    return Err(CliError::Import(resp.format_errors()));
                 }
             }
             Section::Dml => {

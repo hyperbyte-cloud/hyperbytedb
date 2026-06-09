@@ -10,7 +10,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::domain::database::{Database, RetentionPolicy};
 use crate::domain::point::FieldValue;
 use crate::error::HyperbytedbError;
-use crate::ports::metadata::{ContinuousQueryDef, MeasurementMeta, MetadataPort, StoredUser};
+use crate::ports::metadata::{
+    ContinuousQueryDef, MaterializedViewDef, MeasurementMeta, MetadataPort, StoredUser,
+};
 
 const META_CF: &str = "metadata";
 
@@ -147,6 +149,8 @@ pub struct RocksDbMetadata {
     tombstone_cache: RwLock<HashMap<String, Vec<(String, String)>>>,
     /// CQ list cache: all continuous queries, invalidated on CQ DDL.
     cq_cache: RwLock<Option<Vec<ContinuousQueryDef>>>,
+    /// MV list cache: all materialized views, invalidated on MV DDL.
+    mv_cache: RwLock<Option<Vec<MaterializedViewDef>>>,
 }
 
 impl RocksDbMetadata {
@@ -229,6 +233,7 @@ impl RocksDbMetadata {
             meas_list_cache: RwLock::new(HashMap::new()),
             tombstone_cache: RwLock::new(HashMap::new()),
             cq_cache: RwLock::new(None),
+            mv_cache: RwLock::new(None),
         })
     }
 }
@@ -1430,6 +1435,118 @@ impl MetadataPort for RocksDbMetadata {
             .delete_cf(&cf, key.as_bytes())
             .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
         *self.cq_cache.write() = None;
+        Ok(())
+    }
+
+    async fn store_materialized_view(
+        &self,
+        db: &str,
+        name: &str,
+        definition: &MaterializedViewDef,
+    ) -> Result<(), HyperbytedbError> {
+        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
+            HyperbytedbError::Metadata("metadata column family not found".to_string())
+        })?;
+        let key = format!("mv:{}:{}", db, name);
+        let value = serde_json::to_vec(definition)
+            .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+        self.db
+            .put_cf(&cf, key.as_bytes(), value)
+            .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+        *self.mv_cache.write() = None;
+        Ok(())
+    }
+
+    async fn get_materialized_view(
+        &self,
+        db: &str,
+        name: &str,
+    ) -> Result<Option<MaterializedViewDef>, HyperbytedbError> {
+        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
+            HyperbytedbError::Metadata("metadata column family not found".to_string())
+        })?;
+        let key = format!("mv:{}:{}", db, name);
+        match self.db.get_cf(&cf, key.as_bytes()) {
+            Ok(Some(v)) => {
+                let def: MaterializedViewDef = serde_json::from_slice(&v)
+                    .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+                Ok(Some(def))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(HyperbytedbError::Metadata(e.to_string())),
+        }
+    }
+
+    async fn list_materialized_views(
+        &self,
+        db: &str,
+    ) -> Result<Vec<MaterializedViewDef>, HyperbytedbError> {
+        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
+            HyperbytedbError::Metadata("metadata column family not found".to_string())
+        })?;
+        let prefix = format!("mv:{}:", db);
+        let prefix_bytes = prefix.as_bytes();
+        let iter = self.db.iterator_cf_opt(
+            &cf,
+            rocksdb::ReadOptions::default(),
+            IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward),
+        );
+        let mut results = Vec::new();
+        for item in iter {
+            let (key, value) = item.map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+            if !key.starts_with(prefix_bytes) {
+                break;
+            }
+            let def: MaterializedViewDef = serde_json::from_slice(&value)
+                .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+            results.push(def);
+        }
+        Ok(results)
+    }
+
+    async fn list_all_materialized_views(
+        &self,
+    ) -> Result<Vec<MaterializedViewDef>, HyperbytedbError> {
+        {
+            let cache = self.mv_cache.read();
+            if let Some(ref entries) = *cache {
+                return Ok(entries.clone());
+            }
+        }
+
+        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
+            HyperbytedbError::Metadata("metadata column family not found".to_string())
+        })?;
+        let prefix = b"mv:";
+        let iter = self.db.iterator_cf_opt(
+            &cf,
+            rocksdb::ReadOptions::default(),
+            IteratorMode::From(prefix, rocksdb::Direction::Forward),
+        );
+        let mut results = Vec::new();
+        for item in iter {
+            let (key, value) = item.map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            let def: MaterializedViewDef = serde_json::from_slice(&value)
+                .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+            results.push(def);
+        }
+
+        *self.mv_cache.write() = Some(results.clone());
+        Ok(results)
+    }
+
+    async fn drop_materialized_view(&self, db: &str, name: &str) -> Result<(), HyperbytedbError> {
+        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
+            HyperbytedbError::Metadata("metadata column family not found".to_string())
+        })?;
+        let key = format!("mv:{}:{}", db, name);
+        self.db
+            .delete_cf(&cf, key.as_bytes())
+            .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+        *self.mv_cache.write() = None;
         Ok(())
     }
 }

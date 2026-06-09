@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::domain::database::RetentionPolicy;
-use crate::ports::metadata::ContinuousQueryDef;
+use crate::ports::metadata::{ContinuousQueryDef, MaterializedViewDef};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MutationRequest {
@@ -36,6 +36,15 @@ pub enum MutationRequest {
         definition: ContinuousQueryDef,
     },
     DropContinuousQuery {
+        database: String,
+        name: String,
+    },
+    CreateMaterializedView {
+        database: String,
+        name: String,
+        definition: MaterializedViewDef,
+    },
+    DropMaterializedView {
         database: String,
         name: String,
     },

@@ -925,6 +925,15 @@ fn parse_show(input: &str, tokens: &[&str]) -> Result<Statement, HyperbytedbErro
                 ))
             }
         }
+        "MATERIALIZED" => {
+            if tokens.len() >= 3 && tokens[2] == "VIEWS" {
+                Ok(Statement::ShowMaterializedViews)
+            } else {
+                Err(HyperbytedbError::QueryParse(
+                    "expected MATERIALIZED VIEWS".to_string(),
+                ))
+            }
+        }
         _ => Err(HyperbytedbError::QueryParse(format!(
             "unexpected token after SHOW: {}",
             tokens[1]
@@ -990,6 +999,15 @@ fn parse_create(input: &str, tokens: &[&str]) -> Result<Statement, HyperbytedbEr
                 ))
             }
         }
+        "MATERIALIZED" => {
+            if tokens.len() >= 4 && tokens[2] == "VIEW" {
+                parse_create_materialized_view(input)
+            } else {
+                Err(HyperbytedbError::QueryParse(
+                    "expected MATERIALIZED VIEW".to_string(),
+                ))
+            }
+        }
         _ => Err(HyperbytedbError::QueryParse(format!(
             "unsupported CREATE target: {}",
             tokens[1]
@@ -1031,6 +1049,15 @@ fn parse_drop(input: &str, tokens: &[&str]) -> Result<Statement, HyperbytedbErro
             } else {
                 Err(HyperbytedbError::QueryParse(
                     "expected CONTINUOUS QUERY".to_string(),
+                ))
+            }
+        }
+        "MATERIALIZED" => {
+            if tokens.len() >= 4 && tokens[2] == "VIEW" {
+                parse_drop_materialized_view(input)
+            } else {
+                Err(HyperbytedbError::QueryParse(
+                    "expected MATERIALIZED VIEW".to_string(),
                 ))
             }
         }
@@ -1420,6 +1447,72 @@ fn parse_create_continuous_query(input: &str) -> Result<Statement, HyperbytedbEr
     ))
 }
 
+fn parse_create_materialized_view(input: &str) -> Result<Statement, HyperbytedbError> {
+    let upper = input.to_uppercase();
+
+    let view_pos = upper
+        .find("VIEW")
+        .ok_or_else(|| HyperbytedbError::QueryParse("expected VIEW".to_string()))?;
+    let after_view = input[view_pos + 4..].trim();
+    let name = after_view
+        .split_whitespace()
+        .next()
+        .map(unquote)
+        .unwrap_or_default();
+
+    let db = extract_db_from_on(input).unwrap_or_default();
+    if name.is_empty() || db.is_empty() {
+        return Err(HyperbytedbError::QueryParse(
+            "CREATE MATERIALIZED VIEW requires name and ON database".to_string(),
+        ));
+    }
+
+    let as_pos = upper
+        .find(" AS ")
+        .ok_or_else(|| HyperbytedbError::QueryParse("MV requires AS <select>".to_string()))?;
+    let inner_query = input[as_pos + 4..].trim();
+    let stmt = parse_statement(inner_query)?;
+    let select_stmt = match stmt {
+        Statement::Select(s) => s,
+        _ => {
+            return Err(HyperbytedbError::QueryParse(
+                "MV body must be a SELECT statement".to_string(),
+            ));
+        }
+    };
+
+    crate::timeseriesql::to_clickhouse::validate_select_into(&select_stmt)?;
+
+    Ok(Statement::CreateMaterializedView(
+        CreateMaterializedViewStatement {
+            name,
+            database: db,
+            query: select_stmt,
+            raw_query: inner_query.to_string(),
+        },
+    ))
+}
+
+fn parse_drop_materialized_view(input: &str) -> Result<Statement, HyperbytedbError> {
+    let upper = input.to_uppercase();
+    let view_pos = upper
+        .find("VIEW")
+        .ok_or_else(|| HyperbytedbError::QueryParse("expected VIEW".to_string()))?;
+    let after_view = input[view_pos + 4..].trim();
+    let name = after_view
+        .split_whitespace()
+        .next()
+        .map(unquote)
+        .unwrap_or_default();
+    let db = extract_db_from_on(input).unwrap_or_default();
+    if name.is_empty() || db.is_empty() {
+        return Err(HyperbytedbError::QueryParse(
+            "DROP MATERIALIZED VIEW requires name and ON database".to_string(),
+        ));
+    }
+    Ok(Statement::DropMaterializedView { name, db })
+}
+
 fn parse_drop_continuous_query(input: &str) -> Result<Statement, HyperbytedbError> {
     let upper = input.to_uppercase();
     let cq_pos = upper
@@ -1685,6 +1778,45 @@ mod tests {
                 assert_eq!(db, "mydb");
             }
             _ => panic!("expected DROP CONTINUOUS QUERY"),
+        }
+    }
+
+    #[test]
+    fn test_parse_create_materialized_view() {
+        let q = r#"CREATE MATERIALIZED VIEW "mv_5m" ON "mydb" AS SELECT mean("value") INTO "cpu_5m" FROM "cpu" GROUP BY time(5m), *"#;
+        let stmts = parse_query(q).unwrap();
+        match &stmts[0] {
+            Statement::CreateMaterializedView(mv) => {
+                assert_eq!(mv.name, "mv_5m");
+                assert_eq!(mv.database, "mydb");
+                assert!(mv.query.into.is_some());
+                assert!(mv.query.group_by.is_some());
+            }
+            _ => panic!("expected CREATE MATERIALIZED VIEW"),
+        }
+    }
+
+    #[test]
+    fn test_parse_create_materialized_view_requires_group_by_time() {
+        let q = r#"CREATE MATERIALIZED VIEW "mv" ON "mydb" AS SELECT mean("value") INTO "cpu_5m" FROM "cpu""#;
+        assert!(parse_query(q).is_err());
+    }
+
+    #[test]
+    fn test_parse_show_materialized_views() {
+        let stmts = parse_query("SHOW MATERIALIZED VIEWS").unwrap();
+        assert!(matches!(stmts[0], Statement::ShowMaterializedViews));
+    }
+
+    #[test]
+    fn test_parse_drop_materialized_view() {
+        let stmts = parse_query(r#"DROP MATERIALIZED VIEW "mv_5m" ON "mydb""#).unwrap();
+        match &stmts[0] {
+            Statement::DropMaterializedView { name, db } => {
+                assert_eq!(name, "mv_5m");
+                assert_eq!(db, "mydb");
+            }
+            _ => panic!("expected DROP MATERIALIZED VIEW"),
         }
     }
 

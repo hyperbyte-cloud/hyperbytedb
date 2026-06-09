@@ -230,6 +230,110 @@ async fn ping_returns_version_header() {
 }
 
 #[tokio::test]
+async fn materialized_view_via_execute() {
+    with_server(|server| async move {
+        let conn = client_config(&server.url);
+        let client = HyperbytedbClient::new(&conn).expect("client");
+
+        client
+            .query(
+                "CREATE DATABASE mvcli",
+                &QueryOptions {
+                    db: None,
+                    epoch: None,
+                    pretty: false,
+                    chunked: false,
+                    format: OutputFormat::Json,
+                    params: None,
+                },
+            )
+            .await
+            .expect("create db");
+
+        client
+            .write(
+                b"cpu,host=a value=10 1700000000000000000\ncpu,host=a value=20 1700000060000000000",
+                &WriteOptions {
+                    db: "mvcli".to_string(),
+                    rp: None,
+                    precision: None,
+                    gzip: false,
+                },
+            )
+            .await
+            .expect("write");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let resp = client
+                .query(
+                    "SHOW MEASUREMENTS",
+                    &QueryOptions {
+                        db: Some("mvcli".to_string()),
+                        epoch: None,
+                        pretty: false,
+                        chunked: false,
+                        format: OutputFormat::Json,
+                        params: None,
+                    },
+                )
+                .await
+                .expect("show measurements");
+            if resp.results.iter().any(|r| {
+                r.series.as_ref().is_some_and(|s| {
+                    s.iter().any(|ser| {
+                        ser.values.iter().any(|row| {
+                            row.first()
+                                .and_then(|v| v.as_str())
+                                .is_some_and(|n| n == "cpu")
+                        })
+                    })
+                })
+            }) {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("timed out waiting for cpu measurement");
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+
+        let session = Session::new(conn);
+        repl::execute_query(
+            &session,
+            &client,
+            r#"CREATE MATERIALIZED VIEW "mv_5m" ON "mvcli" AS SELECT mean("value") INTO "cpu_5m" FROM "cpu" GROUP BY time(5m), *"#,
+        )
+        .await
+        .expect("create mv");
+
+        repl::execute_query(&session, &client, "SHOW MATERIALIZED VIEWS")
+            .await
+            .expect("show mvs");
+
+        let err = repl::execute_query(
+            &session,
+            &client,
+            r#"CREATE MATERIALIZED VIEW "mv_5m" ON "mvcli" AS SELECT mean("value") INTO "cpu_5m" FROM "cpu" GROUP BY time(5m), *"#,
+        )
+        .await
+        .expect_err("duplicate mv should fail");
+        let err_msg = err.to_string();
+        assert!(
+            !err_msg.contains(r#"{"error""#),
+            "error should be parsed, got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("already exists") || err_msg.contains("query error"),
+            "expected readable duplicate MV error, got: {err_msg}"
+        );
+
+        server.stop().await;
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn subprocess_execute_show_databases() {
     with_server(|server| async move {
         let bin = env!("CARGO_BIN_EXE_hyperbytedb-cli");

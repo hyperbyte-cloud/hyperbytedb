@@ -99,6 +99,11 @@ jobs:
           bash .github/scripts/run-in-rust-container.sh \
             'bash .github/scripts/rust-container-setup.sh && cargo test --test '"'"'*'"'"''
 
+      - name: Run hyperbytedb-cli tests
+        run: |
+          bash .github/scripts/run-in-rust-container.sh \
+            'bash .github/scripts/rust-container-setup.sh && cargo test -p hyperbytedb-cli'
+
   build:
     name: Build
     runs-on: hyperbytedb-operator-controller
@@ -116,7 +121,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build release binary
+      - name: Build release binaries
         run: |
           bash .github/scripts/run-in-rust-container.sh \
-            'bash .github/scripts/rust-container-setup.sh && cargo build --release'
+            'bash .github/scripts/rust-container-setup.sh && \
+             cargo build --release -p hyperbytedb --bin hyperbytedb -p hyperbytedb-cli --bin hyperbytedb-cli && \
+             test -x target/release/hyperbytedb && \
+             test -x target/release/hyperbytedb-cli'

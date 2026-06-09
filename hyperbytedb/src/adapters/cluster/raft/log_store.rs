@@ -825,7 +825,7 @@ impl RaftStore {
             }
             ClusterRequest::SchemaMutation(mutation) => {
                 if let Some(ref metadata) = self.metadata {
-                    match apply_schema_mutation(metadata, mutation).await {
+                    match apply_schema_mutation(metadata, *mutation).await {
                         Ok(()) => ClusterResponse::success(),
                         Err(e) => ClusterResponse::error(e.to_string()),
                     }

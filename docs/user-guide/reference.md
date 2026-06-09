@@ -264,6 +264,11 @@ CREATE CONTINUOUS QUERY "<name>" ON "<db>"
   [RESAMPLE EVERY <interval> FOR <interval>]
   BEGIN <select_into_statement> END
 DROP CONTINUOUS QUERY "<name>" ON "<db>"
+
+CREATE MATERIALIZED VIEW "<name>" ON "<db>"
+  AS <select_into_statement>
+DROP MATERIALIZED VIEW "<name>" ON "<db>"
+SHOW MATERIALIZED VIEWS
 ```
 
 ### DELETE

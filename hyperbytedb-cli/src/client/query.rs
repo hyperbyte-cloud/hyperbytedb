@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::error::{CliError, Result};
+use crate::error::{CliError, Result, parse_json_error};
 use crate::session::OutputFormat;
 
 use super::HyperbytedbClient;
@@ -152,8 +152,10 @@ impl HyperbytedbClient {
             });
         }
 
-        serde_json::from_str(&body)
-            .map_err(|e| CliError::Query(format!("invalid JSON: {e}: {body}")))
+        serde_json::from_str(&body).map_err(|e| {
+            let detail = parse_json_error(&body);
+            CliError::Query(format!("invalid JSON ({e}): {detail}"))
+        })
     }
 
     pub async fn query_raw(&self, q: &str, opts: &QueryOptions) -> Result<String> {
@@ -197,5 +199,65 @@ impl QueryResponse {
 
     pub fn first_error(&self) -> Option<&str> {
         self.results.iter().find_map(|r| r.error.as_deref())
+    }
+
+    /// Format all per-statement errors into a single human-readable message.
+    pub fn format_errors(&self) -> String {
+        let errors: Vec<String> = self
+            .results
+            .iter()
+            .filter_map(|r| {
+                let err = r.error.as_deref()?;
+                if self.results.len() > 1 {
+                    Some(format!("statement {}: {err}", r.statement_id))
+                } else {
+                    Some(err.to_string())
+                }
+            })
+            .collect();
+        if errors.is_empty() {
+            "query failed".to_string()
+        } else {
+            errors.join("; ")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_errors_single_statement() {
+        let resp = QueryResponse {
+            results: vec![StatementResult {
+                statement_id: 1,
+                series: None,
+                error: Some("syntax error".to_string()),
+            }],
+        };
+        assert_eq!(resp.format_errors(), "syntax error");
+    }
+
+    #[test]
+    fn format_errors_multiple_statements() {
+        let resp = QueryResponse {
+            results: vec![
+                StatementResult {
+                    statement_id: 0,
+                    series: None,
+                    error: Some("first".to_string()),
+                },
+                StatementResult {
+                    statement_id: 1,
+                    series: None,
+                    error: Some("second".to_string()),
+                },
+            ],
+        };
+        assert_eq!(
+            resp.format_errors(),
+            "statement 0: first; statement 1: second"
+        );
     }
 }
