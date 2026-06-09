@@ -276,6 +276,53 @@ impl GroupBy {
             })
             .collect()
     }
+
+    /// Whether GROUP BY references any tag dimension, including `*` (all tags).
+    pub fn references_tags(&self) -> bool {
+        self.dimensions.iter().any(|d| {
+            matches!(
+                d,
+                Dimension::AllTags | Dimension::Regex(_) | Dimension::Tag(_)
+            )
+        })
+    }
+
+    /// Expand InfluxQL `GROUP BY *` into explicit tag keys for SQL translation.
+    pub fn expand_all_tags(&self, tag_keys: &[String]) -> (Self, Vec<String>) {
+        let mut expanded_dims = Vec::new();
+        let mut resolved_tags = Vec::new();
+        let mut sorted_keys = tag_keys.to_vec();
+        sorted_keys.sort();
+
+        for d in &self.dimensions {
+            match d {
+                Dimension::AllTags => {
+                    for key in &sorted_keys {
+                        expanded_dims.push(Dimension::Tag(key.clone()));
+                        resolved_tags.push(key.clone());
+                    }
+                }
+                Dimension::Tag(name) if name == "*" => {
+                    for key in &sorted_keys {
+                        expanded_dims.push(Dimension::Tag(key.clone()));
+                        resolved_tags.push(key.clone());
+                    }
+                }
+                Dimension::Tag(name) => {
+                    expanded_dims.push(d.clone());
+                    resolved_tags.push(name.clone());
+                }
+                other => expanded_dims.push(other.clone()),
+            }
+        }
+
+        (
+            Self {
+                dimensions: expanded_dims,
+            },
+            resolved_tags,
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -285,6 +332,8 @@ pub enum Dimension {
         offset: Option<Duration>,
     },
     Tag(String),
+    /// InfluxQL `GROUP BY *` — all tag keys on the source measurement.
+    AllTags,
     Regex(String),
 }
 

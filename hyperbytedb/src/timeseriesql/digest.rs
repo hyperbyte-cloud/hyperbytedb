@@ -223,6 +223,9 @@ fn normalize_select(out: &mut String, sel: &SelectStatement) {
                 Dimension::Tag(name) => {
                     write!(out, "{}", name.to_lowercase()).ok();
                 }
+                Dimension::AllTags => {
+                    out.push('*');
+                }
                 Dimension::Regex(r) => {
                     write!(out, "/{}/", r).ok();
                 }
