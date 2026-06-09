@@ -307,9 +307,10 @@ async fn materialized_view_via_execute() {
         .await
         .expect("create mv");
 
-        repl::execute_query(&session, &client, "SHOW MATERIALIZED VIEWS")
+        let show = repl::execute_query(&session, &client, "SHOW MATERIALIZED VIEWS")
             .await
             .expect("show mvs");
+        let _ = show;
 
         let err = repl::execute_query(
             &session,
