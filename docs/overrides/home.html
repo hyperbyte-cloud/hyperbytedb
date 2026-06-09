@@ -1,0 +1,243 @@
+{% extends "main.html" %}
+
+<!-- Inject landing page custom styling directly into the header styles block -->
+{% block extrahead %}
+  {{ super() }}
+  <style>
+    /* Content Area Layout Overrides */
+    .md-main__inner { margin-top: 0; margin-bottom: 0; max-width: 100%; }
+    .md-content { margin-bottom: 0; }
+    .md-content__inner { padding-top: 0; margin-top: 0; }
+    .md-content__inner h1, .md-content__inner h2, .md-content__inner hr { display: none; }
+    
+    /* Hero Section */
+    .hdbx-container { background: var(--md-default-bg-color, #f5f5f5); padding: 4rem 1rem; width: 100%; }
+    .hdbx-hero { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2.5rem; text-align: center; }
+    .hdbx-hero__image img { width: 220px; height: auto; max-width: 100%; filter: drop-shadow(0px 10px 20px rgba(0,0,0,0.15)); }
+    .hdbx-hero__content { max-width: 640px; }
+    .hdbx-hero__content h1 { font-size: 2.6rem; font-weight: 800; line-height: 1.15; color: var(--md-default-fg-color); margin-top: 0; margin-bottom: 0.75rem; letter-spacing: -0.03em; }
+    .hdbx-hero__content p { font-size: 1.25rem; line-height: 1.5; color: var(--md-default-fg-color--light); margin-bottom: 2rem; }
+    .hdbx-hero__actions { display: flex; flex-wrap: wrap; gap: 1rem; justify-content: center; }
+    
+    /* General Section Grid Rules */
+    .hdbx-section { padding: 4.5rem 1rem; max-width: 61rem; margin: 0 auto; }
+    .hdbx-section h2 { font-size: 2rem; font-weight: 700; text-align: center; margin-top: 0; margin-bottom: 0.5rem; letter-spacing: -0.02em; color: var(--md-default-fg-color); }
+    .hdbx-section__lead { font-size: 1.15rem; color: var(--md-default-fg-color--light); text-align: center; max-width: 680px; margin: 0 auto 3rem; line-height: 1.5; }
+    .hdbx-divider { border: 0; border-top: 1px solid var(--md-default-fg-color--lightest); margin: 0;  max-width: 100%;}
+    
+    /* Responsive Features Matrix Grid */
+    .hdbx-features { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 2rem; }
+    .hdbx-feature h3 { font-size: 1.2rem; font-weight: 600; margin-top: 0; margin-bottom: 0.5rem; display: flex; align-items: center; gap: 0.6rem; color: var(--md-default-fg-color); }
+    .hdbx-feature svg { width: 24px; height: 24px; fill: var(--md-accent-fg-color); flex-shrink: 0; }
+    .hdbx-feature p { font-size: 0.95rem; line-height: 1.6; color: var(--md-default-fg-color--light); margin: 0; }
+    
+    /* Code Quickstart Blocks */
+    .hdbx-quickstart { border-radius: 8px; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.08); max-width: 720px; margin: 0 auto; }
+    .hdbx-quickstart pre { margin: 0 !important; padding: 1.25rem !important; background-color: var(--md-code-bg-color) !important; font-size: 0.9rem !important; }
+    .hdbx-image-text { text-align: center; margin-top: 1.5rem; font-size: 0.95rem; color: var(--md-default-fg-color--light); }
+    .hdbx-image-text code { background-color: var(--md-code-bg-color); padding: 0.2rem 0.4rem; border-radius: 4px; }
+
+    /* Interactive Documentation Cards */
+    .hdbx-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1.25rem; }
+    .hdbx-card { display: block; padding: 1.5rem; border: 1px solid var(--md-default-fg-color--lightest); border-radius: 8px; text-decoration: none !important; transition: all 0.2s ease; background: var(--md-default-bg-color); }
+    .hdbx-card:hover { border-color: var(--md-accent-fg-color); transform: translateY(-2px); box-shadow: 0 6px 16px rgba(0,0,0,0.06); }
+    .hdbx-card h3 { font-size: 1.15rem; font-weight: 600; margin-top: 0; margin-bottom: 0.5rem; color: var(--md-primary-fg-color); transition: color 0.2s; }
+    .hdbx-card:hover h3 { color: var(--md-accent-fg-color); }
+    .hdbx-card p { font-size: 0.9rem; line-height: 1.5; color: var(--md-default-fg-color--light); margin: 0; }
+
+    /* Tablet and Desktop Layout adjustments */
+    @media screen and (min-width: 45em) {
+      .hdbx-hero { flex-direction: row; text-align: left; max-width: 52rem; margin: 0 auto; }
+      .hdbx-hero__actions { justify-content: flex-start; }
+      .hdbx-hero__image img { width: 240px; }
+    }
+
+
+
+
+    /* Replicating Ghost's Layout Engine (kg-header-card Framework) */
+.hdbx-container { 
+  padding: 6rem 1.5rem; /* Matches default wide kg-card padding specs */
+  width: 100%; 
+  display: flex;
+  justify-content: center;
+}
+
+/* Replicating Ghost's .kg-header-card-text container block */
+.hdbx-hero-text-engine {
+  background-color: #000;
+  padding: 144px 250px;
+  box-shadow: 0 0 1rem 0 rgba(0, 0, 0, 0.1);
+  text-align: center;
+  max-width: 60rem;
+  border-color: #e0e0e0;
+  border-width: 2px;
+  border-style: solid;
+}
+
+/* Header styling parameters */
+.hdbx-hero-text-engine .hdbx-hero-logo {
+  display: block;
+  width: min(100%, 28rem);
+  height: auto;
+  margin: 0 auto 1rem;
+}
+
+/* Paragraph spacing framework */
+.hdbx-hero-text-engine p { 
+  font-size: 1.3rem; 
+  line-height: 1.45; 
+  letter-spacing: -0.01em;
+  color: #fff; 
+}
+
+/* Mobile responsive scalers */
+@media screen and (max-width: 45em) {
+  .hdbx-container { padding: 4rem 1rem; }
+  .hdbx-hero-text-engine .hdbx-hero-logo { width: min(100%, 20rem); }
+  .hdbx-hero-text-engine p { font-size: 1.1rem; }
+}
+  </style>
+{% endblock %}
+
+<!-- Strip standard sidebars gracefully using theme attributes -->
+{% block site_meta %}
+  {{ super() }}
+{% endblock %}
+
+{% block tabs %}
+  {{ super() }}
+
+  <!-- Top Hero Block Container -->
+  <section class="hdbx-container">
+    <div class="hdbx-hero-text-engine">
+      <img
+        class="hdbx-hero-logo"
+        src="{{ 'img/hyperbytedb_white.png' | url }}"
+        alt="HyperbyteDB"
+        draggable="false"
+      >
+      <p>The modern drop-in replacement for InfluxDB 1.x <br>
+        IOT & Telemetry - Observerability - Real Time Data </p>
+    </div>
+  </section>
+
+  <hr class="hdbx-divider">
+
+
+  <!-- Features Section Layout -->
+  <section class="hdbx-section">
+    <h2>Everything you would expect</h2>
+    <p class="hdbx-section__lead">
+      A production-ready time-series database with InfluxDB compatibility and modern storage.
+    </p>
+    <div class="hdbx-features">
+      <div class="hdbx-feature">
+        <h3>
+          {% include ".icons/material/chart-timeline-variant.svg" %}
+          InfluxDB v1 compatible
+        </h3>
+        <p>Line protocol and HTTP API for Telegraf, Grafana, and other 1.x clients — migrate without rewriting integrations.</p>
+      </div>
+      <div class="hdbx-feature">
+        <h3>
+          {% include ".icons/material/database.svg" %}
+          Embedded chDB engine
+        </h3>
+        <p>ClickHouse in-process for fast analytics queries over columnar MergeTree storage.</p>
+      </div>
+      <div class="hdbx-feature">
+        <h3>
+          {% include ".icons/material/server-network.svg" %}
+          Active-active clustering
+        </h3>
+        <p>Raft for schema consensus with async or sync-quorum replication — every node accepts writes.</p>
+      </div>
+      <div class="hdbx-feature">
+        <h3>
+          {% include ".icons/material/code-braces.svg" %}
+          TimeseriesQL
+        </h3>
+        <p>Purpose-built time-series analytics with an interactive CLI shell and batch query support.</p>
+      </div>
+      <div class="hdbx-feature">
+        <h3>
+          {% include ".icons/material/shield-check.svg" %}
+          Durable by design
+        </h3>
+        <p>RocksDB write-ahead log and metadata store keep your data safe through restarts and failures.</p>
+      </div>
+      <div class="hdbx-feature">
+        <h3>
+          {% include ".icons/material/chart-line.svg" %}
+          Built-in observability
+        </h3>
+        <p>Prometheus metrics, structured logs, and OTLP trace export out of the box.</p>
+      </div>
+    </div>
+  </section>
+
+  <hr class="hdbx-divider">
+
+  <!-- Interactive Quick Start Panel -->
+  <section class="hdbx-section">
+    <h2>Quick start</h2>
+    <p class="hdbx-section__lead">Write and query data with the familiar InfluxDB v1 HTTP API.</p>
+    <div class="hdbx-quickstart">
+<pre><code>
+docker run -d \
+  --name hyperbytedb \
+  -p 8086:8086 \
+  ghcr.io/hyperbyte-cloud/hyperbytedb:latest
+
+docker exec -it hyperbytedb \
+  hyperbytedb-cli create database mydb
+
+docker exec -it hyperbytedb \
+  hyperbytedb-cli write -database mydb \
+  --data-binary 'cpu,host=srv01 value=42'
+
+  docker exec -it hyperbytedb \
+  hyperbytedb-cli query -database mydb \
+  --data-urlencode 'q=SELECT * FROM cpu'
+</code></pre>
+    </div>
+  </section>
+
+  <hr class="hdbx-divider">
+
+  <!-- Documentation Index Blocks Routing Matrix -->
+  <section class="hdbx-section">
+    <h2>Explore the documentation</h2>
+    <p class="hdbx-section__lead">Guides for operators, application developers, and contributors.</p>
+    <div class="hdbx-cards">
+      <a class="hdbx-card" href="{{ 'user-guide/' | url }}">
+        <h3>User guide</h3>
+        <p>Install, configure, operate, and troubleshoot HyperbyteDB in production.</p>
+      </a>
+      <a class="hdbx-card" href="{{ 'user-guide/operator/' | url }}">
+        <h3>Kubernetes operator</h3>
+        <p>Deploy clusters with Helm, CRDs, backups, and hyperbytedb-proxy.</p>
+      </a>
+      <a class="hdbx-card" href="{{ 'developer-guide/' | url }}">
+        <h3>Developer guide</h3>
+        <p>Architecture, internals, testing, and contribution workflow.</p>
+      </a>
+      <a class="hdbx-card" href="{{ 'deep-dive/deep-dive-write-path/' | url }}">
+        <h3>Deep dives</h3>
+        <p>Write path, read path, clustering, compaction, and self-repair.</p>
+      </a>
+      <a class="hdbx-card" href="{{ 'user-guide/reference/' | url }}">
+        <h3>API reference</h3>
+        <p>HTTP endpoints and TimeseriesQL compatibility matrix.</p>
+      </a>
+      <a class="hdbx-card" href="{{ 'benchmarks/' | url }}">
+        <h3>Benchmarks</h3>
+        <p>Criterion ingestion benchmarks and performance notes.</p>
+      </a>
+    </div>
+  </section>
+{% endblock %}
+
+<!-- Keeping core content active ensures full global search index registration -->
+{% block content %}{{ super() }}{% endblock %}

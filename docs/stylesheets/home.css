@@ -1,0 +1,203 @@
+/* Landing page layout — inspired by Material for MkDocs homepage */
+
+.hdbx-container {
+  padding-top: 0;
+}
+
+.hdbx-hero {
+  margin: 0 2.8rem;
+  color: var(--md-primary-bg-color);
+}
+
+.hdbx-hero h1 {
+  margin-bottom: 0.5rem;
+  color: currentColor;
+  font-weight: 700;
+  font-size: clamp(1.75rem, 4vw, 2.75rem);
+  line-height: 1.15;
+}
+
+.hdbx-hero p {
+  margin-bottom: 1.25rem;
+  font-size: 1.125rem;
+  line-height: 1.6;
+  opacity: 0.95;
+}
+
+.hdbx-hero__image img {
+  width: 100%;
+  max-width: 17rem;
+  height: auto;
+  filter: drop-shadow(0 8px 24px rgba(0, 0, 0, 0.15));
+}
+
+.hdbx-hero .md-button {
+  margin-top: 0.5rem;
+  margin-right: 0.5rem;
+  color: var(--md-primary-bg-color);
+}
+
+.hdbx-hero .md-button--primary {
+  background-color: var(--md-primary-bg-color);
+  color: var(--md-primary-fg-color);
+  border-color: var(--md-primary-bg-color);
+}
+
+.hdbx-hero .md-button:focus,
+.hdbx-hero .md-button:hover {
+  background-color: var(--md-accent-fg-color);
+  color: var(--md-default-bg-color);
+  border-color: var(--md-accent-fg-color);
+}
+
+@media screen and (min-width: 60em) {
+  .hdbx-hero {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 2rem;
+    min-height: 22rem;
+    padding: 2rem 0 3rem;
+  }
+
+  .hdbx-hero__content {
+    max-width: 28rem;
+  }
+
+  .hdbx-hero__image {
+    flex-shrink: 0;
+    order: 1;
+    padding-right: 1rem;
+  }
+}
+
+@media screen and (max-width: 59.99em) {
+  .hdbx-hero {
+    padding: 2rem 0 2.5rem;
+    text-align: center;
+  }
+
+  .hdbx-hero__image {
+    margin-bottom: 1.5rem;
+  }
+}
+
+.hdbx-section {
+  max-width: 61rem;
+  margin: 0 auto;
+  padding: 2.5rem 1.2rem;
+}
+
+.hdbx-section h2 {
+  text-align: center;
+  font-weight: 300;
+  font-size: 1.75rem;
+  margin-bottom: 0.25rem;
+}
+
+.hdbx-section > p.hdbx-section__lead {
+  text-align: center;
+  color: var(--md-default-fg-color--light);
+  margin-bottom: 2rem;
+  font-size: 1.05rem;
+}
+
+.hdbx-features {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+  gap: 1rem;
+}
+
+.hdbx-feature {
+  padding: 1.25rem 1rem;
+  border-radius: 0.25rem;
+  transition: background-color 0.15s ease;
+}
+
+.hdbx-feature:hover {
+  background-color: var(--md-accent-fg-color--transparent);
+}
+
+.hdbx-feature h3 {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0 0 0.5rem;
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+
+.hdbx-feature h3 .twemoji {
+  width: 1.5rem;
+  height: 1.5rem;
+  flex-shrink: 0;
+}
+
+.hdbx-feature p {
+  margin: 0;
+  font-size: 0.95rem;
+  line-height: 1.6;
+  color: var(--md-default-fg-color--light);
+}
+
+.hdbx-divider {
+  border: 0;
+  border-bottom: 1px solid var(--md-default-fg-color--lightest);
+  margin: 0 auto;
+  max-width: 61rem;
+}
+
+.hdbx-quickstart {
+  background: var(--md-code-bg-color);
+  border-radius: 0.25rem;
+  padding: 1.25rem 1.5rem;
+  overflow-x: auto;
+}
+
+.hdbx-quickstart pre {
+  margin: 0;
+}
+
+.hdbx-quickstart code {
+  font-size: 0.85rem;
+}
+
+.hdbx-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: 1rem;
+}
+
+.hdbx-card {
+  display: block;
+  padding: 1.25rem;
+  border: 1px solid var(--md-default-fg-color--lightest);
+  border-radius: 0.25rem;
+  text-decoration: none;
+  color: inherit;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.hdbx-card:hover {
+  border-color: var(--md-accent-fg-color);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+}
+
+.hdbx-card h3 {
+  margin: 0 0 0.35rem;
+  font-size: 1.05rem;
+  color: var(--md-accent-fg-color);
+}
+
+.hdbx-card p {
+  margin: 0;
+  font-size: 0.9rem;
+  color: var(--md-default-fg-color--light);
+}
+
+.hdbx-image {
+  width: 100%;
+  max-width: 20rem;
+  margin: 0 auto;
+  display: block;
+}
