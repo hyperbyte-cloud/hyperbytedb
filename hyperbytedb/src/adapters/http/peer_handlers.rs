@@ -499,6 +499,18 @@ async fn apply_mutation(
         MutationRequest::DropContinuousQuery { database, name } => {
             metadata.drop_continuous_query(&database, &name).await
         }
+        MutationRequest::CreateMaterializedView {
+            database,
+            name,
+            definition,
+        } => {
+            metadata
+                .store_materialized_view(&database, &name, &definition)
+                .await
+        }
+        MutationRequest::DropMaterializedView { database, name } => {
+            metadata.drop_materialized_view(&database, &name).await
+        }
     }
 }
 
@@ -539,6 +551,15 @@ async fn build_metadata_snapshot(
             entries.push(MetadataEntry {
                 key: format!("cq:{}:{}", db.name, cq.name),
                 value: serde_json::to_vec(&cq)
+                    .map_err(|e| crate::error::HyperbytedbError::Metadata(e.to_string()))?,
+            });
+        }
+
+        let mvs = metadata.list_materialized_views(&db.name).await?;
+        for mv in mvs {
+            entries.push(MetadataEntry {
+                key: format!("mv:{}:{}", db.name, mv.name),
+                value: serde_json::to_vec(&mv)
                     .map_err(|e| crate::error::HyperbytedbError::Metadata(e.to_string()))?,
             });
         }

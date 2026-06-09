@@ -6,6 +6,7 @@ use parking_lot::RwLock;
 use regex::Regex;
 
 use crate::application::line_protocol::encode_points_to_line_protocol;
+use crate::application::materialized_view_service::MaterializedViewService;
 use crate::application::replication_dispatch::dispatch_outbound_replication;
 use crate::application::system_trace::{self, PhaseTimer};
 use crate::config::ReplicationConfig;
@@ -40,6 +41,7 @@ pub struct QueryServiceImpl {
     replication_port: Option<Arc<dyn ReplicationPort>>,
     node_id: u64,
     replication_config: ReplicationConfig,
+    mv_service: Arc<MaterializedViewService>,
 }
 
 impl QueryServiceImpl {
@@ -50,6 +52,11 @@ impl QueryServiceImpl {
         query_timeout_secs: u64,
         points_sink: Arc<dyn crate::ports::points_sink::PointsSinkPort>,
     ) -> Self {
+        let mv_service = Arc::new(MaterializedViewService::new(
+            metadata.clone(),
+            query_port.clone(),
+            points_sink.clone(),
+        ));
         Self {
             query_port,
             metadata,
@@ -60,6 +67,7 @@ impl QueryServiceImpl {
             replication_port: None,
             node_id: 0,
             replication_config: ReplicationConfig::default(),
+            mv_service,
         }
     }
 
@@ -143,7 +151,8 @@ fn check_authorization(
         | Statement::ShowSeries(_)
         | Statement::ShowRetentionPolicies(_)
         | Statement::ShowUsers
-        | Statement::ShowContinuousQueries => {
+        | Statement::ShowContinuousQueries
+        | Statement::ShowMaterializedViews => {
             if !db.is_empty() && !user.can_read(db) {
                 return Err(HyperbytedbError::Forbidden(format!(
                     "not authorized to read from database '{db}'"
@@ -174,7 +183,8 @@ fn is_mutating_statement(stmt: &Statement) -> bool {
         | Statement::ShowSeries(_)
         | Statement::ShowRetentionPolicies(_)
         | Statement::ShowUsers
-        | Statement::ShowContinuousQueries => false,
+        | Statement::ShowContinuousQueries
+        | Statement::ShowMaterializedViews => false,
         Statement::CreateDatabase(_)
         | Statement::DropDatabase(_)
         | Statement::DropMeasurement(_)
@@ -188,7 +198,9 @@ fn is_mutating_statement(stmt: &Statement) -> bool {
         | Statement::Revoke { .. }
         | Statement::Delete(_)
         | Statement::CreateContinuousQuery(_)
-        | Statement::DropContinuousQuery { .. } => true,
+        | Statement::DropContinuousQuery { .. }
+        | Statement::CreateMaterializedView(_)
+        | Statement::DropMaterializedView { .. } => true,
     }
 }
 
@@ -478,6 +490,13 @@ async fn execute_statement(
                 }
                 pairs
             };
+            if let Err(e) = svc.mv_service.drop_all_in_database(name).await {
+                tracing::warn!(
+                    db = name,
+                    error = %e,
+                    "failed to cascade-drop materialized views for database"
+                );
+            }
             svc.metadata.drop_database(name).await?;
             for (rp, m) in &to_drop {
                 if let Err(e) = svc.points_sink.drop_measurement(name, rp, m).await {
@@ -676,6 +695,14 @@ async fn execute_statement(
             })
         }
         Statement::DropMeasurement(name) => {
+            if let Err(e) = svc.mv_service.drop_for_source_measurement(db, name).await {
+                tracing::warn!(
+                    db = db,
+                    measurement = name,
+                    error = %e,
+                    "failed to cascade-drop materialized views for source measurement"
+                );
+            }
             let rp = svc
                 .metadata
                 .get_default_rp(db)
@@ -803,6 +830,63 @@ async fn execute_statement(
         Statement::DropContinuousQuery { name, db: cq_db } => {
             let target_db = if cq_db.is_empty() { db } else { cq_db };
             svc.metadata.drop_continuous_query(target_db, name).await?;
+            Ok(StatementResult {
+                statement_id,
+                series: Some(vec![]),
+                error: None,
+            })
+        }
+        Statement::CreateMaterializedView(mv) => {
+            svc.mv_service.create(mv).await?;
+            Ok(StatementResult {
+                statement_id,
+                series: Some(vec![]),
+                error: None,
+            })
+        }
+        Statement::ShowMaterializedViews => {
+            let dbs = svc.metadata.list_databases().await?;
+            let mut all_mvs = Vec::new();
+            for db_entry in &dbs {
+                let mvs = svc.metadata.list_materialized_views(&db_entry.name).await?;
+                all_mvs.extend(mvs);
+            }
+
+            let columns = vec![
+                "name".to_string(),
+                "database".to_string(),
+                "query".to_string(),
+                "source_measurement".to_string(),
+                "dest_measurement".to_string(),
+            ];
+            let values: Vec<Vec<serde_json::Value>> = all_mvs
+                .iter()
+                .map(|mv| {
+                    vec![
+                        serde_json::Value::String(mv.name.clone()),
+                        serde_json::Value::String(mv.database.clone()),
+                        serde_json::Value::String(mv.query_text.clone()),
+                        serde_json::Value::String(mv.source_measurement.clone()),
+                        serde_json::Value::String(mv.dest_measurement.clone()),
+                    ]
+                })
+                .collect();
+
+            Ok(StatementResult {
+                statement_id,
+                series: Some(vec![SeriesResult {
+                    name: "materialized_views".to_string(),
+                    tags: None,
+                    columns,
+                    values,
+                    partial: None,
+                }]),
+                error: None,
+            })
+        }
+        Statement::DropMaterializedView { name, db: mv_db } => {
+            let target_db = if mv_db.is_empty() { db } else { mv_db };
+            svc.mv_service.drop_mv(target_db, name).await?;
             Ok(StatementResult {
                 statement_id,
                 series: Some(vec![]),

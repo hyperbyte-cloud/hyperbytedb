@@ -79,6 +79,32 @@ pub fn quoted_series_table_name(db: &str, rp: &str, measurement: &str) -> String
     quote_backticks(&unquoted_series_table_name(db, rp, measurement))
 }
 
+/// Unquoted ClickHouse object name for a fact-table materialized view:
+/// `<db>_<rp>_<mv_name>_mv`.
+#[must_use]
+pub fn unquoted_fact_mv_name(db: &str, rp: &str, mv_name: &str) -> String {
+    format!("{}_mv", unquoted_table_name(db, rp, mv_name))
+}
+
+/// Backtick-quoted fact MV object name.
+#[must_use]
+pub fn quoted_fact_mv_name(db: &str, rp: &str, mv_name: &str) -> String {
+    quote_backticks(&unquoted_fact_mv_name(db, rp, mv_name))
+}
+
+/// Unquoted ClickHouse object name for a series-dimension MV:
+/// `<db>_<rp>_<mv_name>_series_mv`.
+#[must_use]
+pub fn unquoted_series_mv_name(db: &str, rp: &str, mv_name: &str) -> String {
+    format!("{}_series_mv", unquoted_table_name(db, rp, mv_name))
+}
+
+/// Backtick-quoted series MV object name.
+#[must_use]
+pub fn quoted_series_mv_name(db: &str, rp: &str, mv_name: &str) -> String {
+    quote_backticks(&unquoted_series_mv_name(db, rp, mv_name))
+}
+
 /// Resolve the physical column name for a tag key, taking field-name
 /// collisions into account (tag wins the prefix `__tag__`). Mirrors
 /// the Parquet writer's behaviour exactly so logical identifiers

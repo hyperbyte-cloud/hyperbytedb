@@ -184,6 +184,11 @@ fn print_help() {
   history                  Show history hint
   exit, quit               Exit the shell
 
+DDL examples (sent to /query):
+  CREATE MATERIALIZED VIEW "mv_5m" ON "db"
+    AS SELECT mean("value") INTO "cpu_5m" FROM "cpu" GROUP BY time(5m), *
+  SHOW MATERIALIZED VIEWS
+
 Any other input is sent as TimeseriesQL to /query."#
     );
 }

@@ -1,7 +1,7 @@
 use axum::http::{Response, header};
 use uuid::Uuid;
 
-const VERSION: &str = "HyperbyteDB-0.8.0";
+const VERSION: &str = "HyperbyteDB-0.8.2";
 const BUILD: &str = "OSS";
 const REQUEST_ID_HEADER: &str = "Request-Id";
 const X_REQUEST_ID_HEADER: &str = "X-Request-Id";

@@ -57,6 +57,12 @@ pub enum Statement {
         name: String,
         db: String,
     },
+    CreateMaterializedView(CreateMaterializedViewStatement),
+    ShowMaterializedViews,
+    DropMaterializedView {
+        name: String,
+        db: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -351,4 +357,12 @@ pub struct CreateContinuousQueryStatement {
     pub raw_query: String,
     pub resample_every: Option<Duration>,
     pub resample_for: Option<Duration>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateMaterializedViewStatement {
+    pub name: String,
+    pub database: String,
+    pub query: SelectStatement,
+    pub raw_query: String,
 }

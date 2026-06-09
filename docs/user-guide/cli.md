@@ -13,7 +13,7 @@ Backup and restore remain **server-local** operations on the `hyperbytedb` binar
 Each `v*` GitHub Release ships `hyperbytedb-cli` alongside `hyperbytedb` and `libchdb.so`:
 
 ```bash
-tar -xzf hyperbytedb-v0.8.0-linux-x86_64.tar.gz
+tar -xzf hyperbytedb-vx.x.x-linux-x86_64.tar.gz
 ./hyperbytedb-cli -host http://localhost:8086 ping
 ```
 
@@ -43,7 +43,7 @@ hyperbytedb-cli -host http://localhost:8086
 ```
 
 ```
-Connected to http://localhost:8086 (HyperbyteDB-0.8.0)
+Connected to http://localhost:8086 (HyperbyteDB-x.x.x)
 hyperbytedb> CREATE DATABASE telemetry
 hyperbytedb> USE telemetry
 telemetry> SHOW MEASUREMENTS
@@ -180,6 +180,7 @@ All schema and admin operations use TimeseriesQL in the REPL or `-execute`:
 - `SHOW MEASUREMENTS`, `SHOW TAG KEYS/VALUES`, `SHOW FIELD KEYS`, `SHOW SERIES`
 - `SELECT`, `DELETE`, `DROP MEASUREMENT`
 - `CREATE/DROP/SHOW CONTINUOUS QUERY`
+- `CREATE/DROP/SHOW MATERIALIZED VIEW`
 
 See [API & TimeseriesQL Reference](reference.md) for full syntax.
 

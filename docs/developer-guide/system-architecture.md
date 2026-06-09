@@ -380,6 +380,7 @@ Columns mirror the measurement schema registered in metadata:
 | `user:{username}` | `StoredUser` | Auth credentials |
 | `tombstone:{db}:{meas}:{uuid}` | predicate + timestamp | DELETE tombstones |
 | `cq:{db}:{name}` | `ContinuousQueryDef` | Continuous query definitions |
+| `mv:{db}:{name}` | `MaterializedViewDef` | Materialized view definitions |
 
 ---
 
@@ -482,7 +483,7 @@ The parser examines the first keyword (case-insensitive) and dispatches:
 |-------------|---------|
 | `SELECT` | `parse_select()` |
 | `SHOW` | `parse_show()` → further dispatch by second/third token |
-| `CREATE` | `parse_create()` → `CREATE DATABASE`, `CREATE RETENTION POLICY`, `CREATE USER`, `CREATE CONTINUOUS QUERY` |
+| `CREATE` | `parse_create()` → `CREATE DATABASE`, `CREATE RETENTION POLICY`, `CREATE USER`, `CREATE CONTINUOUS QUERY`, `CREATE MATERIALIZED VIEW` |
 | `DROP` | `parse_drop()` → `DROP DATABASE`, `DROP MEASUREMENT`, etc. |
 | `DELETE` | `parse_delete()` |
 | `ALTER` | `parse_alter()` |
@@ -760,6 +761,8 @@ HyperbyteDB uses **master-master (peer-to-peer) replication** for data writes, w
 | DROP USER | `/internal/replicate-mutation` | All peers |
 | CREATE CONTINUOUS QUERY | `/internal/replicate-mutation` | All peers |
 | DROP CONTINUOUS QUERY | `/internal/replicate-mutation` | All peers |
+| CREATE MATERIALIZED VIEW | `/internal/replicate-mutation` | All peers (DDL reconciled on startup) |
+| DROP MATERIALIZED VIEW | `/internal/replicate-mutation` | All peers |
 | CREATE RETENTION POLICY | `/internal/replicate-mutation` | All peers |
 
 ### Replication protocol

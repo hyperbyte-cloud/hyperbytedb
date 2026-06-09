@@ -3,6 +3,7 @@ pub mod cluster;
 pub mod column_mapping;
 pub mod continuous_query;
 pub mod database;
+pub mod materialized_view;
 pub mod measurement;
 pub mod point;
 pub mod point_coalesce;

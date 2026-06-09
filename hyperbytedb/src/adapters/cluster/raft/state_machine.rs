@@ -60,5 +60,17 @@ pub async fn apply_schema_mutation(
         MutationRequest::DropContinuousQuery { database, name } => {
             metadata.drop_continuous_query(&database, &name).await
         }
+        MutationRequest::CreateMaterializedView {
+            database,
+            name,
+            definition,
+        } => {
+            metadata
+                .store_materialized_view(&database, &name, &definition)
+                .await
+        }
+        MutationRequest::DropMaterializedView { database, name } => {
+            metadata.drop_materialized_view(&database, &name).await
+        }
     }
 }

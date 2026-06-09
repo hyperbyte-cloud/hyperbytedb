@@ -297,6 +297,84 @@ pub fn translate_select_into(
     Ok(format!("INSERT INTO {}\n{}", dest_table, select_sql))
 }
 
+/// ClickHouse `SELECT` body for a fact-table materialized view. Groups by
+/// `series_id` and the time bucket (not tag columns) and emits the system
+/// columns required by the destination fact table schema.
+pub fn translate_materialized_view_select(
+    stmt: &SelectStatement,
+    source_fact: &str,
+    mapping: &ColumnMapping,
+) -> Result<String, HyperbytedbError> {
+    validate_select_into(stmt)?;
+    let gb = stmt
+        .group_by
+        .as_ref()
+        .ok_or_else(|| HyperbytedbError::QueryParse("MV requires GROUP BY".to_string()))?;
+    let Some(Dimension::Time { interval, offset }) = gb.time_dimension() else {
+        return Err(HyperbytedbError::QueryParse(
+            "MV requires GROUP BY time(...)".to_string(),
+        ));
+    };
+    let time_bucket = time_bucket_expr(interval, offset.as_ref());
+
+    let field_strs: Vec<String> = stmt
+        .fields
+        .iter()
+        .map(|f| translate_field(f, false, 0.0, stmt.group_by.as_ref(), Some(mapping)))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut select_parts = vec![
+        format!("{time_bucket} AS time"),
+        "any(origin_node_id) AS origin_node_id".to_string(),
+        "max(ingest_seq) AS ingest_seq".to_string(),
+        "series_id".to_string(),
+    ];
+    select_parts.extend(field_strs);
+
+    let mut out = String::new();
+    write!(out, "SELECT {}", select_parts.join(", "))?;
+    write!(out, "\nFROM {source_fact}")?;
+
+    if let Some(ref cond) = stmt.condition {
+        write!(out, "\nWHERE ")?;
+        translate_expr(cond, &mut out, true, Some(mapping))?;
+    }
+
+    // GROUP BY the `time` alias — ClickHouse rejects grouping on the raw `time`
+    // column expression when the SELECT output column is also named `time`.
+    write!(out, "\nGROUP BY series_id, time")?;
+    Ok(out)
+}
+
+/// `INSERT INTO <dest> SELECT ...` for one-time MV backfill of historical data.
+pub fn translate_materialized_view_backfill(
+    stmt: &SelectStatement,
+    dest_table: &str,
+    source_fact: &str,
+    mapping: &ColumnMapping,
+) -> Result<String, HyperbytedbError> {
+    let select_sql = translate_materialized_view_select(stmt, source_fact, mapping)?;
+    Ok(format!("INSERT INTO {dest_table}\n{select_sql}"))
+}
+
+/// Full `CREATE MATERIALIZED VIEW ... TO ... AS SELECT ...` DDL for the fact MV.
+pub fn build_create_fact_materialized_view(
+    mv_name: &str,
+    dest_table: &str,
+    select_sql: &str,
+) -> String {
+    format!("CREATE MATERIALIZED VIEW {mv_name} TO {dest_table} AS\n{select_sql}")
+}
+
+/// Full `CREATE MATERIALIZED VIEW ... TO ... AS SELECT * FROM ...` for series sync.
+pub fn build_create_series_materialized_view(
+    mv_name: &str,
+    dest_series: &str,
+    source_series: &str,
+) -> String {
+    format!("CREATE MATERIALIZED VIEW {mv_name} TO {dest_series} AS\nSELECT * FROM {source_series}")
+}
+
 /// Like [`translate_select_into`], targeting a native MergeTree table source.
 /// `series` lets a tag-grouped continuous query resolve tags from the source
 /// measurement's dimension table.
@@ -477,6 +555,15 @@ fn translate_field(
         Some(a) => format!("{} AS {}", sql, quote_identifier(&a)),
         None => sql,
     })
+}
+
+/// Output column name for a SELECT field (explicit alias or Influx-style default).
+#[must_use]
+pub fn select_output_field_name(field: &Field) -> Option<String> {
+    field
+        .alias
+        .clone()
+        .or_else(|| default_field_alias(&field.expr))
 }
 
 /// Generate a default column alias matching InfluxDB conventions.
@@ -1757,6 +1844,23 @@ mod tests {
         let q = r#"SELECT mean("value") INTO "cpu_1h" FROM "cpu""#;
         let stmt = parse_select(q);
         assert!(translate_select_into(&stmt, "`dest`", "`source`", None).is_err());
+    }
+
+    #[test]
+    fn test_translate_materialized_view_select() {
+        let q = r#"SELECT mean("value") INTO "cpu_5m" FROM "cpu" GROUP BY time(5m), *"#;
+        let stmt = parse_select(q);
+        let map = cpu_mapping();
+        let sql = translate_materialized_view_select(&stmt, "`mydb_autogen_cpu`", &map).unwrap();
+        assert!(sql.starts_with("SELECT "));
+        assert!(sql.contains("toStartOfInterval(time, INTERVAL 5 MINUTE) AS time"));
+        assert!(sql.contains("any(origin_node_id) AS origin_node_id"));
+        assert!(sql.contains("max(ingest_seq) AS ingest_seq"));
+        assert!(sql.contains("series_id"));
+        assert!(sql.contains("avg(\"value\")"));
+        assert!(sql.contains("FROM `mydb_autogen_cpu`"));
+        assert!(sql.contains("GROUP BY series_id, time"));
+        assert!(!sql.contains("INSERT INTO"));
     }
 
     #[test]

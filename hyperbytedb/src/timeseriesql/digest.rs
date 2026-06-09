@@ -15,15 +15,18 @@ pub fn stmt_type(stmt: &Statement) -> &'static str {
         Statement::ShowRetentionPolicies(_) => "SHOW",
         Statement::ShowUsers => "SHOW",
         Statement::ShowContinuousQueries => "SHOW",
+        Statement::ShowMaterializedViews => "SHOW",
         Statement::CreateDatabase(_) => "CREATE",
         Statement::CreateRetentionPolicyStmt { .. } => "CREATE",
         Statement::CreateUser { .. } => "CREATE",
         Statement::CreateContinuousQuery(_) => "CREATE",
+        Statement::CreateMaterializedView(_) => "CREATE",
         Statement::DropDatabase(_) => "DROP",
         Statement::DropMeasurement(_) => "DROP",
         Statement::DropUser(_) => "DROP",
         Statement::DropRetentionPolicyStmt { .. } => "DROP",
         Statement::DropContinuousQuery { .. } => "DROP",
+        Statement::DropMaterializedView { .. } => "DROP",
         Statement::AlterRetentionPolicyStmt { .. } => "ALTER",
         Statement::Delete(_) => "DELETE",
         Statement::SetPassword { .. } => "SET",
@@ -109,6 +112,7 @@ fn normalize_statement(stmt: &Statement) -> String {
         }
         Statement::ShowUsers => out.push_str("show users"),
         Statement::ShowContinuousQueries => out.push_str("show continuous queries"),
+        Statement::ShowMaterializedViews => out.push_str("show materialized views"),
         Statement::CreateDatabase(_) => out.push_str("create database ?"),
         Statement::DropDatabase(_) => out.push_str("drop database ?"),
         Statement::DropMeasurement(_) => out.push_str("drop measurement ?"),
@@ -158,6 +162,24 @@ fn normalize_statement(stmt: &Statement) -> String {
             write!(
                 out,
                 "drop continuous query {} on {}",
+                name.to_lowercase(),
+                db.to_lowercase()
+            )
+            .ok();
+        }
+        Statement::CreateMaterializedView(mv) => {
+            write!(
+                out,
+                "create materialized view {} on {}",
+                mv.name.to_lowercase(),
+                mv.database.to_lowercase()
+            )
+            .ok();
+        }
+        Statement::DropMaterializedView { name, db } => {
+            write!(
+                out,
+                "drop materialized view {} on {}",
                 name.to_lowercase(),
                 db.to_lowercase()
             )

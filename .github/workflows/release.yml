@@ -159,8 +159,12 @@ jobs:
           set -euo pipefail
           mkdir -p out
           for arch in x86_64 aarch64; do
-            test -s "out/hyperbytedb-${TAG}-linux-${arch}.tar.gz"
+            tarball="out/hyperbytedb-${TAG}-linux-${arch}.tar.gz"
+            test -s "${tarball}"
             test -s "out/hyperbytedb-${TAG}-linux-${arch}.tar.gz.sha256"
+            tar -tzf "${tarball}" | grep -qx hyperbytedb
+            tar -tzf "${tarball}" | grep -qx hyperbytedb-cli
+            tar -tzf "${tarball}" | grep -qx libchdb.so
           done
           ls -lh out/
 

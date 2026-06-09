@@ -313,6 +313,17 @@ impl SyncClient {
                     .store_continuous_query(db, &cq.name, &cq)
                     .await?;
             }
+        } else if entry.key.starts_with("mv:") {
+            let parts: Vec<&str> = entry.key.splitn(3, ':').collect();
+            if parts.len() == 3 {
+                let db = parts[1];
+                let mv: crate::ports::metadata::MaterializedViewDef =
+                    serde_json::from_slice(&entry.value)
+                        .map_err(|e| HyperbytedbError::Metadata(format!("parse mv: {e}")))?;
+                self.metadata
+                    .store_materialized_view(db, &mv.name, &mv)
+                    .await?;
+            }
         }
 
         Ok(())

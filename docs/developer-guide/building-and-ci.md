@@ -20,7 +20,8 @@ HyperbyteDB uses Cargo as its sole build system. There is no `build.rs`, `Makefi
 
 | Name | Source | Description |
 |------|--------|-------------|
-| `hyperbytedb` | `src/main.rs` (implicit) | Main database server |
+| `hyperbytedb` | `hyperbytedb/src/main.rs` (implicit) | Main database server |
+| `hyperbytedb-cli` | `hyperbytedb-cli/src/main.rs` | Interactive CLI client (REPL, query, write, import) |
 
 ### Features
 
@@ -32,8 +33,9 @@ HyperbyteDB uses Cargo as its sole build system. There is no `build.rs`, `Makefi
 
 ```bash
 cargo build                              # Debug build (all binaries)
-cargo build --release                    # Release build
+cargo build --release                    # Release build (all workspace binaries)
 cargo build --release --bin hyperbytedb     # Release build, main binary only
+cargo build --release -p hyperbytedb-cli   # CLI only
 cargo build --no-default-features        # Without columnar ingest
 ```
 
@@ -49,8 +51,8 @@ Triggers on `push` and `pull_request` to `main`. Uses concurrency groups with ca
 
 1. **Format** — `cargo fmt --all --check`
 2. **Clippy** (depends on Format) — `cargo clippy --all-targets -- -D warnings`
-3. **Test** (depends on Format) — `cargo test --lib` + `cargo test --test '*'`
-4. **Build** (depends on Clippy + Test) — `cargo build --release`
+3. **Test** (depends on Format) — `cargo test --lib` + `cargo test --test '*'` + `cargo test -p hyperbytedb-cli`
+4. **Build** (depends on Clippy + Test) — `cargo build --release` for `hyperbytedb` and `hyperbytedb-cli`
 
 All jobs with Rust compilation install:
 - System packages: `clang`, `llvm-dev`, `libclang-dev`, `pkg-config`, `libssl-dev`
@@ -88,7 +90,7 @@ Triggers on `push` to `main`, version tags (`v*`), and pull requests.
 **Runtime stage** (Debian bookworm-slim):
 1. Install runtime dependencies: `ca-certificates`, `libstdc++6`, `curl`.
 2. Copy `libchdb.so` and `chdb.h` from builder.
-3. Copy the `hyperbytedb` binary and `libchdb.so`.
+3. Copy the `hyperbytedb` and `hyperbytedb-cli` binaries and `libchdb.so`.
 4. Create data directories under `/var/lib/hyperbytedb/`.
 5. Set environment defaults for data paths.
 6. `ENTRYPOINT ["hyperbytedb"]`, `CMD ["serve"]`.
@@ -114,7 +116,7 @@ docker run -d -p 8086:8086 hyperbytedb:dev
 2. Update `version` in `Cargo.toml`.
 3. Tag the commit: `git tag vX.Y.Z` (must match `version` in `Cargo.toml`).
 4. Push the tag: `git push origin vX.Y.Z`.
-5. The container workflow automatically builds and pushes the Docker image with semver tags.
+5. The release workflow (`release.yml`) builds and pushes the multi-arch Docker image, packages `hyperbytedb` + `hyperbytedb-cli` + `libchdb.so` tarballs per platform, and publishes a GitHub Release.
 
 ---
 

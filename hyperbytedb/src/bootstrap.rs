@@ -168,6 +168,25 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
     }
     let points_sink: Arc<dyn PointsSinkPort> = Arc::new(native_sink);
 
+    let mv_service = Arc::new(
+        crate::application::materialized_view_service::MaterializedViewService::new(
+            metadata.clone(),
+            chdb.clone(),
+            points_sink.clone(),
+        ),
+    );
+    match mv_service.reconcile_all().await {
+        Ok(n) if n > 0 => tracing::info!(
+            reconciled = n,
+            "reconciled materialized view DDL from metadata"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(
+            error = %e,
+            "failed to reconcile materialized views from metadata"
+        ),
+    }
+
     let auth: Arc<dyn crate::ports::auth::AuthPort> =
         Arc::new(MetadataAuthAdapter::new(metadata.clone()));
 

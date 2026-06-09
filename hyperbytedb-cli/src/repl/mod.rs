@@ -101,9 +101,7 @@ pub async fn execute_query(session: &Session, client: &HyperbytedbClient, q: &st
 
         let resp = client.query(stmt, &opts).await?;
         if resp.has_errors() {
-            return Err(CliError::Query(
-                resp.first_error().unwrap_or("query failed").to_string(),
-            ));
+            return Err(CliError::Query(resp.format_errors()));
         }
         let out = format_response(&resp, session.format, session.pretty);
         print!("{out}");

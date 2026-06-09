@@ -9,7 +9,7 @@ use crate::domain::cluster::types::MutationRequest;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClusterRequest {
     SetNodeState { node_id: u64, state: NodeState },
-    SchemaMutation(MutationRequest),
+    SchemaMutation(Box<MutationRequest>),
 }
 
 /// Response returned after a ClusterRequest is committed and applied.
