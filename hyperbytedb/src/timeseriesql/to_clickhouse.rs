@@ -346,7 +346,7 @@ fn query_references_tag(stmt: &SelectStatement, m: &ColumnMapping) -> bool {
     if stmt
         .group_by
         .as_ref()
-        .is_some_and(|gb| !gb.tag_dimensions().is_empty())
+        .is_some_and(|gb| gb.references_tags())
     {
         return true;
     }
@@ -1863,6 +1863,20 @@ mod tests {
         );
         // The tag predicate resolves against the joined view's tag column.
         assert!(sql.contains("\"host\" = 'h1'"), "got: {sql}");
+    }
+
+    #[test]
+    fn series_group_by_all_tags_expands_to_measurement_tags() {
+        let mut stmt = parse_select(r#"SELECT mean("usage_idle") FROM cpu GROUP BY time(5m), *"#);
+        let gb = stmt.group_by.as_ref().unwrap().clone();
+        let (expanded_gb, tags) = gb.expand_all_tags(&["host".to_string(), "region".to_string()]);
+        stmt.group_by = Some(expanded_gb);
+        assert_eq!(tags, vec!["host", "region"]);
+        let sql = translate_series(&stmt, &cpu_mapping());
+        assert!(sql.contains("ANY LEFT JOIN"), "got: {sql}");
+        assert!(sql.contains("\"host\""), "got: {sql}");
+        assert!(sql.contains("\"region\""), "got: {sql}");
+        assert!(!sql.contains("`*`"), "got: {sql}");
     }
 
     #[test]

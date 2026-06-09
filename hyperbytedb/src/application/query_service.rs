@@ -591,14 +591,19 @@ async fn execute_statement(
                         table: &sub_series_table,
                         force: false,
                     });
+                    let sub_tag_keys = tag_keys_from_mapping(sub_mapping.as_ref());
+                    let (sub_stmt_expanded, _) =
+                        select_with_expanded_group_by(sub_stmt, &sub_tag_keys);
+                    let (select_stmt_expanded, resolved_group_by_tags) =
+                        select_with_expanded_group_by(select_stmt, &sub_tag_keys);
                     let sub_sql = to_clickhouse::translate_native_table(
-                        sub_stmt,
+                        &sub_stmt_expanded,
                         &table,
                         sub_mapping.as_ref(),
                         sub_series_join,
                     )?;
                     let outer_sql = to_clickhouse::translate_with_source(
-                        select_stmt,
+                        &select_stmt_expanded,
                         &format!("({})", sub_sql),
                     )?;
                     let raw = svc.query_port.execute_sql(&outer_sql).await?;
@@ -606,7 +611,7 @@ async fn execute_statement(
                         &raw,
                         sub_source,
                         epoch,
-                        &group_by_tags,
+                        &resolved_group_by_tags,
                         drop_fill_null_buckets(select_stmt),
                     )?
                 }
@@ -1359,9 +1364,12 @@ async fn execute_measurement_query(
     _time_min: Option<i64>,
     _time_max: Option<i64>,
     epoch: Option<&str>,
-    group_by_tags: &[String],
+    _group_by_tags: &[String],
 ) -> Result<Vec<SeriesResult>, HyperbytedbError> {
     let column_mapping = svc.column_mapping_for(db, measurement).await?;
+    let tag_keys = tag_keys_from_mapping(column_mapping.as_ref());
+    let (effective_stmt, resolved_group_by_tags) =
+        select_with_expanded_group_by(stmt, &tag_keys);
 
     // Tombstone predicates (spliced into WHERE below) may reference tag columns,
     // which only exist on the series-rejoin inline view — so force the join when
@@ -1374,17 +1382,42 @@ async fn execute_measurement_query(
         table: &series_table,
         force: !tombstones.is_empty(),
     });
-    let mut sql =
-        to_clickhouse::translate_native_table(stmt, &table, column_mapping.as_ref(), series_join)?;
+    let mut sql = to_clickhouse::translate_native_table(
+        &effective_stmt,
+        &table,
+        column_mapping.as_ref(),
+        series_join,
+    )?;
     sql = inject_tombstone_predicates(sql, &tombstones);
     let raw = svc.query_port.execute_sql(&sql).await?;
     parse_json_each_row_to_series(
         &raw,
         measurement,
         epoch,
-        group_by_tags,
+        &resolved_group_by_tags,
         drop_fill_null_buckets(stmt),
     )
+}
+
+fn tag_keys_from_mapping(mapping: Option<&crate::domain::column_mapping::ColumnMapping>) -> Vec<String> {
+    let mut keys: Vec<String> = mapping
+        .map(|m| m.tag_keys.iter().cloned().collect())
+        .unwrap_or_default();
+    keys.sort();
+    keys
+}
+
+fn select_with_expanded_group_by(
+    stmt: &crate::timeseriesql::ast::SelectStatement,
+    tag_keys: &[String],
+) -> (crate::timeseriesql::ast::SelectStatement, Vec<String>) {
+    let Some(ref gb) = stmt.group_by else {
+        return (stmt.clone(), Vec::new());
+    };
+    let (expanded_gb, resolved_tags) = gb.expand_all_tags(tag_keys);
+    let mut effective = stmt.clone();
+    effective.group_by = Some(expanded_gb);
+    (effective, resolved_tags)
 }
 
 fn regex_pattern_matches(pattern: &str) -> Box<dyn Fn(&str) -> bool + '_> {

@@ -753,6 +753,8 @@ fn parse_group_by_clause(input: &str) -> Result<(GroupBy, Option<FillOption>), H
             };
 
             dimensions.push(Dimension::Time { interval, offset });
+        } else if part == "*" {
+            dimensions.push(Dimension::AllTags);
         } else if part.starts_with('/') && part.ends_with('/') {
             dimensions.push(Dimension::Regex(part[1..part.len() - 1].to_string()));
         } else {
@@ -1767,5 +1769,23 @@ mod tests {
     fn test_parse_select_into_requires_group_by_time() {
         let q = r#"SELECT mean("value") INTO "cpu_1h" FROM "cpu""#;
         assert!(crate::timeseriesql::parse(q).is_err());
+    }
+
+    #[test]
+    fn test_parse_group_by_all_tags() {
+        let stmts = parse_query(r#"SELECT mean("value") FROM cpu GROUP BY time(5m), *"#).unwrap();
+        match &stmts[0] {
+            Statement::Select(s) => {
+                let gb = s.group_by.as_ref().unwrap();
+                assert!(gb.references_tags());
+                assert!(gb.tag_dimensions().is_empty());
+                assert!(
+                    gb.dimensions
+                        .iter()
+                        .any(|d| matches!(d, Dimension::AllTags))
+                );
+            }
+            _ => panic!("expected SELECT"),
+        }
     }
 }
