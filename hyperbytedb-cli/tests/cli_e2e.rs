@@ -2,13 +2,26 @@
 //!
 //! libchdb allows one session per process; tests run serially.
 
-use std::process::Command;
+use std::process::{Command, Output};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::Mutex;
 
 static SERVER_LOCK: Mutex<()> = Mutex::const_new(());
+
+fn assert_cli_success(output: &Output, label: &str) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "{label} failed: stderr={stderr} stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains("Usage: hyperbytedb-cli"),
+        "{label} printed help instead of executing: stdout={stdout}"
+    );
+}
 
 use hyperbytedb::adapters::http::router::build_router;
 use hyperbytedb::bootstrap::build_services;
@@ -350,11 +363,7 @@ async fn subprocess_execute_show_databases() {
             .output()
             .expect("spawn cli");
 
-        assert!(
-            output.status.success(),
-            "stderr={}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        assert_cli_success(&output, "execute SHOW DATABASES");
 
         server.stop().await;
     })
@@ -370,11 +379,7 @@ async fn subprocess_write_data_binary_and_query() {
             .args(["-host", &server.url, "create", "database", "mydb"])
             .output()
             .expect("spawn cli");
-        assert!(
-            create.status.success(),
-            "create database failed: stderr={}",
-            String::from_utf8_lossy(&create.stderr)
-        );
+        assert_cli_success(&create, "create database");
 
         let write = Command::new(bin)
             .args([
@@ -388,11 +393,7 @@ async fn subprocess_write_data_binary_and_query() {
             ])
             .output()
             .expect("spawn cli");
-        assert!(
-            write.status.success(),
-            "write --data-binary failed: stderr={}",
-            String::from_utf8_lossy(&write.stderr)
-        );
+        assert_cli_success(&write, "write --data-binary");
 
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         let query_out = loop {
@@ -408,11 +409,7 @@ async fn subprocess_write_data_binary_and_query() {
                 ])
                 .output()
                 .expect("spawn cli");
-            assert!(
-                query.status.success(),
-                "query --data-urlencode failed: stderr={}",
-                String::from_utf8_lossy(&query.stderr)
-            );
+            assert_cli_success(&query, "query --data-urlencode");
             let stdout = String::from_utf8_lossy(&query.stdout).into_owned();
             if stdout.contains("cpu") {
                 break stdout;
@@ -440,11 +437,7 @@ async fn subprocess_create_database() {
             .output()
             .expect("spawn cli");
 
-        assert!(
-            create.status.success(),
-            "create database failed: stderr={}",
-            String::from_utf8_lossy(&create.stderr)
-        );
+        assert_cli_success(&create, "create database");
 
         let show = Command::new(bin)
             .args([
@@ -458,11 +451,7 @@ async fn subprocess_create_database() {
             .output()
             .expect("spawn cli");
 
-        assert!(
-            show.status.success(),
-            "show databases failed: stderr={}",
-            String::from_utf8_lossy(&show.stderr)
-        );
+        assert_cli_success(&show, "execute SHOW DATABASES");
         assert!(
             String::from_utf8_lossy(&show.stdout).contains("mydb"),
             "stdout={}",

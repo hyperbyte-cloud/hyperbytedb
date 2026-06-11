@@ -7,6 +7,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 use hyperbytedb_cli::{
     CliError, ConnectionConfig, HyperbytedbClient, Session,
+    args::normalize_influx_style_args,
     client::{PingInfo, WriteOptions},
     config::{ConnectionConfig as Cfg, resolve_host},
     export::{self, ExportOptions},
@@ -216,7 +217,7 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> hyperbytedb_cli::error::Result<()> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(normalize_influx_style_args(std::env::args()));
 
     if cli.show_version {
         println!("hyperbytedb-cli {}", env!("CARGO_PKG_VERSION"));
