@@ -360,3 +360,47 @@ async fn subprocess_execute_show_databases() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn subprocess_create_database() {
+    with_server(|server| async move {
+        let bin = env!("CARGO_BIN_EXE_hyperbytedb-cli");
+
+        let create = Command::new(bin)
+            .args(["-host", &server.url, "create", "database", "mydb"])
+            .output()
+            .expect("spawn cli");
+
+        assert!(
+            create.status.success(),
+            "create database failed: stderr={}",
+            String::from_utf8_lossy(&create.stderr)
+        );
+
+        let show = Command::new(bin)
+            .args([
+                "-host",
+                &server.url,
+                "-execute",
+                "SHOW DATABASES",
+                "-format",
+                "column",
+            ])
+            .output()
+            .expect("spawn cli");
+
+        assert!(
+            show.status.success(),
+            "show databases failed: stderr={}",
+            String::from_utf8_lossy(&show.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&show.stdout).contains("mydb"),
+            "stdout={}",
+            String::from_utf8_lossy(&show.stdout)
+        );
+
+        server.stop().await;
+    })
+    .await;
+}

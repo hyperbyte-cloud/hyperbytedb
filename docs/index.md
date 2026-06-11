@@ -17,13 +17,11 @@ docker run -d \
 docker exec -it hyperbytedb \
   hyperbytedb-cli create database mydb
 
-docker exec -it hyperbytedb \
-  hyperbytedb-cli write -database mydb \
-  --data-binary 'cpu,host=srv01 value=42'
+docker exec -it hyperbytedb sh -c \
+  "echo 'cpu,host=srv01 value=42' | hyperbytedb-cli write -database mydb"
 
-  docker exec -it hyperbytedb \
-  hyperbytedb-cli query -database mydb \
-  --data-urlencode 'q=SELECT * FROM cpu'
+docker exec -it hyperbytedb \
+  hyperbytedb-cli -database mydb -execute 'SELECT * FROM cpu'
 ```
 
 ## User guide

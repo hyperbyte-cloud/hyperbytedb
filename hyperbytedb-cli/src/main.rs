@@ -162,6 +162,20 @@ enum Commands {
         #[command(subcommand)]
         action: ClusterAction,
     },
+    /// Schema administration (InfluxDB v1-compatible shortcuts)
+    Create {
+        #[command(subcommand)]
+        target: CreateTarget,
+    },
+}
+
+#[derive(Subcommand)]
+enum CreateTarget {
+    /// Create a new database
+    Database {
+        /// Database name
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -377,6 +391,13 @@ async fn run_subcommand(
                 }
                 println!("{}", client.cluster_drain().await?);
                 Ok(())
+            }
+        },
+        Commands::Create { target } => match target {
+            CreateTarget::Database { name } => {
+                let session = Session::new(conn.clone());
+                let q = format!("CREATE DATABASE {name}");
+                repl::execute_query(&session, &client, &q).await
             }
         },
     }

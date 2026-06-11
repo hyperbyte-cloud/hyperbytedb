@@ -156,6 +156,7 @@ Any other input is TimeseriesQL. Semicolon-separated statements run in sequence.
 
 | Subcommand | Description |
 |------------|-------------|
+| `create database <name>` | Create a database (InfluxDB v1-compatible shortcut) |
 | `write` | Line protocol from stdin or `--file` |
 | `import` | Influx-compatible DDL+DML import (`--path`, `--compressed`, `--pps`) |
 | `export` | Logical export to DDL+DML + line protocol |
@@ -172,9 +173,9 @@ Any other input is TimeseriesQL. Semicolon-separated statements run in sequence.
 
 ## TimeseriesQL via CLI
 
-All schema and admin operations use TimeseriesQL in the REPL or `-execute`:
+Schema shortcuts and TimeseriesQL in the REPL or `-execute`:
 
-- `CREATE/DROP DATABASE`
+- `create database <name>` or `CREATE/DROP DATABASE`
 - `CREATE/ALTER/DROP RETENTION POLICY`
 - `CREATE/DROP USER`, `SET PASSWORD`, `SHOW USERS`, `GRANT`/`REVOKE`
 - `SHOW MEASUREMENTS`, `SHOW TAG KEYS/VALUES`, `SHOW FIELD KEYS`, `SHOW SERIES`
