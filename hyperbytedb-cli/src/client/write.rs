@@ -37,7 +37,8 @@ impl HyperbytedbClient {
             body.to_vec()
         };
 
-        let query = serde_urlencoded::to_string(&pairs).map_err(|e| CliError::Write(e.to_string()))?;
+        let query =
+            serde_urlencoded::to_string(&pairs).map_err(|e| CliError::Write(e.to_string()))?;
         let mut headers = vec![];
         if opts.gzip {
             headers.push(("Content-Encoding".to_string(), "gzip".to_string()));

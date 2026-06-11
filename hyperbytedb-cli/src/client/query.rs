@@ -82,7 +82,13 @@ impl HyperbytedbClient {
             .collect();
 
         let resp = self
-            .request("POST", "/query", "", &header_refs, Some(encoded.into_bytes()))
+            .request(
+                "POST",
+                "/query",
+                "",
+                &header_refs,
+                Some(encoded.into_bytes()),
+            )
             .await?;
         self.parse_query_response(resp, opts.format).await
     }

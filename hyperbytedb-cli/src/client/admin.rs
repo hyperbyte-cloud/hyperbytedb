@@ -17,9 +17,7 @@ impl HyperbytedbClient {
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-        let resp = self
-            .request("GET", "/ping", "", &header_refs, None)
-            .await?;
+        let resp = self.request("GET", "/ping", "", &header_refs, None).await?;
         if resp.status != 204 && !(200..300).contains(&resp.status) {
             let body = String::from_utf8_lossy(&resp.body);
             return Err(CliError::from_status(
