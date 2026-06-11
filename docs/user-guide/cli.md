@@ -79,6 +79,7 @@ hyperbytedb-cli query -host http://localhost:8086 -database telemetry \
 
 ```bash
 hyperbytedb-cli import -host http://localhost:8086 -path backup.txt
+hyperbytedb-cli -import -path backup.txt -host http://localhost:8086
 hyperbytedb-cli export -host http://localhost:8086 -database telemetry -out dump.txt
 ```
 
@@ -92,6 +93,8 @@ hyperbytedb-cli export -host http://localhost:8086 -database telemetry -out dump
 |------|-------------|
 | `-host`, `-H` | Server URL or hostname (default `http://localhost:8086`) |
 | `-port` | Port when host is not a full URL |
+| `-socket` | Unix domain socket (alternative to `-host`) |
+| `-url-prefix` | Path prefix after host (InfluxDB v1-compatible) |
 | `-database`, `-d` | Default database |
 | `-username`, `-u` | Username |
 | `-password`, `-p` | Password (empty prompts interactively) |
@@ -102,7 +105,16 @@ hyperbytedb-cli export -host http://localhost:8086 -database telemetry -out dump
 | `-format`, `-f` | `column`, `json`, or `csv` |
 | `--precision` / `--epoch` | Timestamp format for query results |
 | `--pretty` | Pretty-print JSON |
-| `-v`, `--verbose` | Verbose output |
+| `-v`, `--verbose` | Verbose HTTP request tracing (stderr) |
+| `-type` | Query language (`influxql` only; default `influxql`) |
+| `-consistency` | Write consistency (`any`, `one`, `quorum`, `all`) |
+| `-params` | Bind parameters JSON for queries |
+| `-import` | Import mode (requires `-path`) |
+| `-path` | Import file path (with `-import`) |
+| `-compressed` | Import file is gzip-compressed |
+| `-pps` | Import throttle (points per second; `0` = unlimited) |
+
+Global flags work before or after subcommands (e.g. `hyperbytedb-cli query -host URL ...`).
 
 ### Environment variables
 
@@ -168,6 +180,7 @@ Any other input is TimeseriesQL. Semicolon-separated statements run in sequence.
 | Subcommand | Description |
 |------------|-------------|
 | `create database <name>` | Create a database (InfluxDB v1-compatible shortcut) |
+| `drop database <name>` | Drop a database |
 | `write` | Line protocol from stdin, `--file`, or `--data-binary` |
 | `query` | Run TimeseriesQL via `--data-urlencode` (`q=...` or plain query) |
 | `import` | Influx-compatible DDL+DML import (`--path`, `--compressed`, `--pps`) |
@@ -187,7 +200,7 @@ Any other input is TimeseriesQL. Semicolon-separated statements run in sequence.
 
 Schema shortcuts and TimeseriesQL in the REPL or `-execute`:
 
-- `create database <name>` or `CREATE/DROP DATABASE`
+- `create database <name>`, `drop database <name>`, or `CREATE/DROP DATABASE`
 - `CREATE/ALTER/DROP RETENTION POLICY`
 - `CREATE/DROP USER`, `SET PASSWORD`, `SHOW USERS`, `GRANT`/`REVOKE`
 - `SHOW MEASUREMENTS`, `SHOW TAG KEYS/VALUES`, `SHOW FIELD KEYS`, `SHOW SERIES`
@@ -205,8 +218,12 @@ See [API & TimeseriesQL Reference](reference.md) for full syntax.
 |---------|--------|
 | Interactive REPL | Supported |
 | `-execute` batch mode | Supported |
-| `use`, `connect`, `insert`, `format` | Supported |
+| Global flags after subcommands | Supported |
+| `-import -path` top-level import | Supported |
+| `use`, `connect`, `insert`, `format`, `consistency` | Supported |
 | Line protocol write/import | Supported |
+| `-consistency`, `-url-prefix`, `-socket`, `-params` | Supported |
+| `-verbose` HTTP tracing | Supported |
 | Config profiles (`~/.config/hyperbytedb/config.toml`) | Supported (extension) |
 | `SHOW STATS`, `SHOW DIAGNOSTICS`, `SHOW SHARDS` | Not supported — use `metrics` subcommand |
 | `SHOW QUERIES`, `KILL QUERY` | Not supported |

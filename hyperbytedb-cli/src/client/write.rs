@@ -8,17 +8,20 @@ pub struct WriteOptions {
     pub rp: Option<String>,
     pub precision: Option<String>,
     pub gzip: bool,
+    pub consistency: Option<String>,
 }
 
 impl HyperbytedbClient {
     pub async fn write(&self, body: &[u8], opts: &WriteOptions) -> Result<()> {
-        let url = format!("{}/write", self.base_url());
         let mut pairs: Vec<(&str, String)> = vec![("db", opts.db.clone())];
         if let Some(ref rp) = opts.rp {
             pairs.push(("rp", rp.clone()));
         }
         if let Some(ref precision) = opts.precision {
             pairs.push(("precision", precision.clone()));
+        }
+        if let Some(ref consistency) = opts.consistency {
+            pairs.push(("consistency", consistency.clone()));
         }
         self.credentials.apply_query_auth(&mut pairs);
 
@@ -34,21 +37,29 @@ impl HyperbytedbClient {
             body.to_vec()
         };
 
-        let mut req = self.http.post(&url).query(&pairs).body(payload);
+        let query = serde_urlencoded::to_string(&pairs).map_err(|e| CliError::Write(e.to_string()))?;
+        let mut headers = vec![];
         if opts.gzip {
-            req = req.header("Content-Encoding", "gzip");
+            headers.push(("Content-Encoding".to_string(), "gzip".to_string()));
         }
-        req = self.credentials.apply_basic_auth(req);
+        for (k, v) in self.auth_headers() {
+            headers.push((k, v));
+        }
+        let header_refs: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
 
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| CliError::Connection(e.to_string()))?;
-        let status = resp.status();
-        if status.is_success() {
+        let resp = self
+            .request("POST", "/write", &query, &header_refs, Some(payload))
+            .await?;
+        if (200..300).contains(&resp.status) {
             return Ok(());
         }
-        let body = resp.text().await.unwrap_or_default();
-        Err(CliError::from_status(status, &body))
+        let body = String::from_utf8_lossy(&resp.body);
+        Err(CliError::from_status(
+            reqwest::StatusCode::from_u16(resp.status).unwrap_or(reqwest::StatusCode::BAD_REQUEST),
+            &body,
+        ))
     }
 }

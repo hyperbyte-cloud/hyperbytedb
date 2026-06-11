@@ -34,6 +34,18 @@ impl Credentials {
             pairs.push(("p", p.clone()));
         }
     }
+
+    pub fn authorization_header(&self) -> Option<(String, String)> {
+        if let (Some(u), Some(p)) = (&self.username, &self.password) {
+            use base64::Engine as _;
+            let token = base64::engine::general_purpose::STANDARD.encode(format!("{u}:{p}"));
+            Some(("Authorization".to_string(), format!("Basic {token}")))
+        } else if let Some(u) = &self.username {
+            Some(("Authorization".to_string(), format!("Token {u}:")))
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -49,6 +61,8 @@ mod tests {
             password: Some("secret".to_string()),
             ssl: false,
             unsafe_ssl: false,
+            url_prefix: None,
+            socket: None,
         };
         let creds = Credentials::from_config(&cfg);
         assert!(creds.is_some());

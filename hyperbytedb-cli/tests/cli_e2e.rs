@@ -112,6 +112,8 @@ fn client_config(url: &str) -> ConnectionConfig {
         password: None,
         ssl: false,
         unsafe_ssl: false,
+        url_prefix: None,
+        socket: None,
     }
 }
 
@@ -129,7 +131,7 @@ where
 async fn execute_show_databases() {
     with_server(|server| async move {
         let conn = client_config(&server.url);
-        let client = HyperbytedbClient::new(&conn).expect("client");
+        let client = HyperbytedbClient::new(&conn, false).expect("client");
 
         client
             .query(
@@ -139,6 +141,7 @@ async fn execute_show_databases() {
                     epoch: None,
                     pretty: false,
                     chunked: false,
+                    chunk_size: None,
                     format: OutputFormat::Json,
                     params: None,
                 },
@@ -160,7 +163,7 @@ async fn execute_show_databases() {
 async fn write_and_query_roundtrip() {
     with_server(|server| async move {
         let conn = client_config(&server.url);
-        let client = HyperbytedbClient::new(&conn).expect("client");
+        let client = HyperbytedbClient::new(&conn, false).expect("client");
 
         client
             .query(
@@ -170,6 +173,7 @@ async fn write_and_query_roundtrip() {
                     epoch: None,
                     pretty: false,
                     chunked: false,
+                    chunk_size: None,
                     format: OutputFormat::Json,
                     params: None,
                 },
@@ -185,6 +189,7 @@ async fn write_and_query_roundtrip() {
                     rp: None,
                     precision: None,
                     gzip: false,
+                    consistency: None,
                 },
             )
             .await
@@ -200,6 +205,7 @@ async fn write_and_query_roundtrip() {
                         epoch: None,
                         pretty: false,
                         chunked: false,
+                        chunk_size: None,
                         format: OutputFormat::Json,
                         params: None,
                     },
@@ -234,7 +240,7 @@ async fn write_and_query_roundtrip() {
 #[tokio::test]
 async fn ping_returns_version_header() {
     with_server(|server| async move {
-        let client = HyperbytedbClient::new(&client_config(&server.url)).expect("client");
+        let client = HyperbytedbClient::new(&client_config(&server.url), false).expect("client");
         let ping = client.ping().await.expect("ping");
         assert!(ping.version.is_some());
         server.stop().await;
@@ -246,7 +252,7 @@ async fn ping_returns_version_header() {
 async fn materialized_view_via_execute() {
     with_server(|server| async move {
         let conn = client_config(&server.url);
-        let client = HyperbytedbClient::new(&conn).expect("client");
+        let client = HyperbytedbClient::new(&conn, false).expect("client");
 
         client
             .query(
@@ -256,6 +262,7 @@ async fn materialized_view_via_execute() {
                     epoch: None,
                     pretty: false,
                     chunked: false,
+                    chunk_size: None,
                     format: OutputFormat::Json,
                     params: None,
                 },
@@ -271,6 +278,7 @@ async fn materialized_view_via_execute() {
                     rp: None,
                     precision: None,
                     gzip: false,
+                    consistency: None,
                 },
             )
             .await
@@ -286,6 +294,7 @@ async fn materialized_view_via_execute() {
                         epoch: None,
                         pretty: false,
                         chunked: false,
+                        chunk_size: None,
                         format: OutputFormat::Json,
                         params: None,
                     },
@@ -421,6 +430,53 @@ async fn subprocess_write_data_binary_and_query() {
         };
 
         assert!(query_out.contains("cpu"), "stdout={query_out}");
+
+        server.stop().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn subprocess_global_flags_after_subcommand() {
+    with_server(|server| async move {
+        let bin = env!("CARGO_BIN_EXE_hyperbytedb-cli");
+
+        let output = Command::new(bin)
+            .args([
+                "query",
+                "-host",
+                &server.url,
+                "-database",
+                "mydb",
+                "--data-urlencode",
+                "q=SHOW DATABASES",
+            ])
+            .output()
+            .expect("spawn cli");
+
+        assert_cli_success(&output, "query with global -host after subcommand");
+
+        server.stop().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn subprocess_drop_database() {
+    with_server(|server| async move {
+        let bin = env!("CARGO_BIN_EXE_hyperbytedb-cli");
+
+        let create = Command::new(bin)
+            .args(["-host", &server.url, "create", "database", "dropme"])
+            .output()
+            .expect("spawn cli");
+        assert_cli_success(&create, "create database");
+
+        let drop = Command::new(bin)
+            .args(["-host", &server.url, "drop", "database", "dropme"])
+            .output()
+            .expect("spawn cli");
+        assert_cli_success(&drop, "drop database");
 
         server.stop().await;
     })

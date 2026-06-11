@@ -33,6 +33,7 @@ pub struct QueryOptions {
     pub epoch: Option<String>,
     pub pretty: bool,
     pub chunked: bool,
+    pub chunk_size: Option<usize>,
     pub format: OutputFormat,
     pub params: Option<String>,
 }
@@ -48,7 +49,50 @@ impl HyperbytedbClient {
     }
 
     async fn query_get(&self, q: &str, opts: &QueryOptions) -> Result<QueryResponse> {
-        let url = format!("{}/query", self.base_url());
+        let query = self.build_query_string(q, opts)?;
+        let mut headers = self.accept_header(opts.format);
+        for (k, v) in self.auth_headers() {
+            headers.push((k, v));
+        }
+        let header_refs: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let resp = self
+            .request("GET", "/query", &query, &header_refs, None)
+            .await?;
+        self.parse_query_response(resp, opts.format).await
+    }
+
+    async fn query_post(&self, q: &str, opts: &QueryOptions) -> Result<QueryResponse> {
+        let body_pairs = self.build_body_pairs(q, opts)?;
+        let encoded =
+            serde_urlencoded::to_string(&body_pairs).map_err(|e| CliError::Query(e.to_string()))?;
+        let mut headers = vec![(
+            "Content-Type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        )];
+        headers.extend(self.accept_header(opts.format));
+        for (k, v) in self.auth_headers() {
+            headers.push((k, v));
+        }
+        let header_refs: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        let resp = self
+            .request("POST", "/query", "", &header_refs, Some(encoded.into_bytes()))
+            .await?;
+        self.parse_query_response(resp, opts.format).await
+    }
+
+    fn build_query_string(&self, q: &str, opts: &QueryOptions) -> Result<String> {
+        let pairs = self.build_body_pairs(q, opts)?;
+        serde_urlencoded::to_string(&pairs).map_err(|e| CliError::Query(e.to_string()))
+    }
+
+    fn build_body_pairs(&self, q: &str, opts: &QueryOptions) -> Result<Vec<(&str, String)>> {
         let mut pairs: Vec<(&str, String)> = vec![("q", q.to_string())];
         if let Some(ref db) = opts.db {
             pairs.push(("db", db.clone()));
@@ -62,87 +106,39 @@ impl HyperbytedbClient {
         if opts.chunked {
             pairs.push(("chunked", "true".to_string()));
         }
+        if let Some(size) = opts.chunk_size {
+            pairs.push(("chunk_size", size.to_string()));
+        }
         if let Some(ref params) = opts.params {
             pairs.push(("params", params.clone()));
         }
         self.credentials.apply_query_auth(&mut pairs);
-
-        let mut req = self.http.get(&url).query(&pairs);
-        req = self.credentials.apply_basic_auth(req);
-        req = self.apply_accept(req, opts.format);
-
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| CliError::Connection(e.to_string()))?;
-        self.parse_query_response(resp, opts.format).await
+        Ok(pairs)
     }
 
-    async fn query_post(&self, q: &str, opts: &QueryOptions) -> Result<QueryResponse> {
-        let url = format!("{}/query", self.base_url());
-        let mut body = vec![("q", q.to_string())];
-        if let Some(ref db) = opts.db {
-            body.push(("db", db.clone()));
-        }
-        if let Some(ref epoch) = opts.epoch {
-            body.push(("epoch", epoch.clone()));
-        }
-        if opts.pretty {
-            body.push(("pretty", "true".to_string()));
-        }
-        if opts.chunked {
-            body.push(("chunked", "true".to_string()));
-        }
-        if let Some(ref params) = opts.params {
-            body.push(("params", params.clone()));
-        }
-
-        let encoded =
-            serde_urlencoded::to_string(&body).map_err(|e| CliError::Query(e.to_string()))?;
-
-        let mut req = self
-            .http
-            .post(&url)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(encoded);
-        req = self.credentials.apply_basic_auth(req);
-        req = self.apply_accept(req, opts.format);
-
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| CliError::Connection(e.to_string()))?;
-        self.parse_query_response(resp, opts.format).await
-    }
-
-    fn apply_accept(
-        &self,
-        req: reqwest::RequestBuilder,
-        format: OutputFormat,
-    ) -> reqwest::RequestBuilder {
+    fn accept_header(&self, format: OutputFormat) -> Vec<(String, String)> {
         match format {
-            OutputFormat::Csv => req.header("Accept", "text/csv"),
-            _ => req,
+            OutputFormat::Csv => vec![("Accept".to_string(), "text/csv".to_string())],
+            _ => vec![],
         }
     }
 
     async fn parse_query_response(
         &self,
-        resp: reqwest::Response,
+        resp: super::RawResponse,
         format: OutputFormat,
     ) -> Result<QueryResponse> {
-        let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| CliError::Connection(e.to_string()))?;
-
-        if !status.is_success() {
-            return Err(CliError::from_status(status, &body));
+        if !(200..300).contains(&resp.status) {
+            let body = String::from_utf8_lossy(&resp.body);
+            return Err(CliError::from_status(
+                reqwest::StatusCode::from_u16(resp.status)
+                    .unwrap_or(reqwest::StatusCode::BAD_REQUEST),
+                &body,
+            ));
         }
 
+        let body = String::from_utf8_lossy(&resp.body);
         if format == OutputFormat::Csv {
-            // Wrap CSV in a synthetic response for uniform handling
             return Ok(QueryResponse {
                 results: vec![StatementResult {
                     statement_id: 1,
@@ -159,36 +155,28 @@ impl HyperbytedbClient {
     }
 
     pub async fn query_raw(&self, q: &str, opts: &QueryOptions) -> Result<String> {
-        let url = format!("{}/query", self.base_url());
-        let mut pairs: Vec<(&str, String)> = vec![("q", q.to_string())];
-        if let Some(ref db) = opts.db {
-            pairs.push(("db", db.clone()));
+        let query = self.build_query_string(q, opts)?;
+        let mut headers = self.accept_header(opts.format);
+        for (k, v) in self.auth_headers() {
+            headers.push((k, v));
         }
-        if let Some(ref epoch) = opts.epoch {
-            pairs.push(("epoch", epoch.clone()));
-        }
-        if opts.pretty {
-            pairs.push(("pretty", "true".to_string()));
-        }
-        self.credentials.apply_query_auth(&mut pairs);
+        let header_refs: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
 
-        let mut req = self.http.get(&url).query(&pairs);
-        req = self.credentials.apply_basic_auth(req);
-        req = self.apply_accept(req, opts.format);
-
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| CliError::Connection(e.to_string()))?;
-        let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| CliError::Connection(e.to_string()))?;
-        if !status.is_success() {
-            return Err(CliError::from_status(status, &body));
+        let resp = self
+            .request("GET", "/query", &query, &header_refs, None)
+            .await?;
+        if !(200..300).contains(&resp.status) {
+            let body = String::from_utf8_lossy(&resp.body);
+            return Err(CliError::from_status(
+                reqwest::StatusCode::from_u16(resp.status)
+                    .unwrap_or(reqwest::StatusCode::BAD_REQUEST),
+                &body,
+            ));
         }
-        Ok(body)
+        Ok(String::from_utf8_lossy(&resp.body).into_owned())
     }
 }
 
@@ -201,7 +189,6 @@ impl QueryResponse {
         self.results.iter().find_map(|r| r.error.as_deref())
     }
 
-    /// Format all per-statement errors into a single human-readable message.
     pub fn format_errors(&self) -> String {
         let errors: Vec<String> = self
             .results

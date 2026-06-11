@@ -30,7 +30,7 @@ pub async fn handle_meta(
     }
     if lower == "auth" {
         prompt_auth(session)?;
-        *client = HyperbytedbClient::new(&session.connection)?;
+        *client = HyperbytedbClient::new(&session.connection, session.verbose)?;
         return Ok(MetaAction::Continue);
     }
     if lower == "pretty" {
@@ -113,6 +113,11 @@ pub async fn handle_meta(
         println!("precision: {}", parts[1]);
         return Ok(MetaAction::Continue);
     }
+    if parts.len() >= 2 && parts[0].eq_ignore_ascii_case("consistency") {
+        session.consistency = Some(parts[1].to_string());
+        println!("consistency: {}", parts[1]);
+        return Ok(MetaAction::Continue);
+    }
     if parts.len() >= 2 && parts[0].eq_ignore_ascii_case("insert") {
         let lp = if parts[1].eq_ignore_ascii_case("into") && parts.len() >= 4 {
             let rp = parts[2].to_string();
@@ -130,6 +135,7 @@ pub async fn handle_meta(
             rp: lp.0,
             precision: session.epoch.clone(),
             gzip: false,
+            consistency: session.consistency.clone(),
         };
         client.write(lp.1.as_bytes(), &wopts).await?;
         println!("ok");
@@ -152,6 +158,7 @@ pub fn is_meta_command(line: &str) -> bool {
         || lower.starts_with("auth")
         || lower.starts_with("format ")
         || lower.starts_with("precision ")
+        || lower.starts_with("consistency ")
         || lower.starts_with("insert ")
         || lower == "settings"
         || lower == "pretty"
@@ -176,6 +183,7 @@ fn print_help() {
   insert into <rp> ...     Write to a specific retention policy
   format json|csv|column   Set output format
   precision <unit>         Set timestamp precision (epoch param)
+  consistency <level>      Set write consistency (any, one, quorum, all)
   pretty                   Toggle JSON pretty-print
   chunked                  Toggle chunked query responses
   chunk size <n>           Set chunk size
@@ -216,6 +224,10 @@ fn print_settings(session: &Session) {
     println!("chunked:    {}", session.chunked);
     println!("chunk size: {}", session.chunk_size);
     println!("timing:     {}", session.timing);
+    println!(
+        "consistency:{}",
+        session.consistency.as_deref().unwrap_or("(none)")
+    );
     println!(
         "server:     {}",
         session.server_version.as_deref().unwrap_or("(unknown)")

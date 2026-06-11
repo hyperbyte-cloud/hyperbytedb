@@ -72,6 +72,7 @@ pub async fn run_export(client: &HyperbytedbClient, opts: &ExportOptions) -> Res
         epoch: None,
         pretty: false,
         chunked: false,
+        chunk_size: None,
         format: OutputFormat::Json,
         params: None,
     };
@@ -143,6 +144,7 @@ async fn list_measurements(client: &HyperbytedbClient, db: &str) -> Result<Vec<S
         epoch: None,
         pretty: false,
         chunked: false,
+        chunk_size: None,
         format: OutputFormat::Json,
         params: None,
     };

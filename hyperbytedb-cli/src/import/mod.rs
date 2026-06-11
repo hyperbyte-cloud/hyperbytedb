@@ -77,6 +77,7 @@ pub async fn run_import(client: &HyperbytedbClient, opts: &ImportOptions) -> Res
                     epoch: None,
                     pretty: false,
                     chunked: false,
+                    chunk_size: None,
                     format: OutputFormat::Json,
                     params: None,
                 };
@@ -127,6 +128,7 @@ async fn flush_batch(
         rp: rp.clone(),
         precision: precision.clone(),
         gzip: false,
+        consistency: None,
     };
     client.write(batch.as_bytes(), &wopts).await
 }
