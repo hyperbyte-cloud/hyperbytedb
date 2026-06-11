@@ -362,6 +362,75 @@ async fn subprocess_execute_show_databases() {
 }
 
 #[tokio::test]
+async fn subprocess_write_data_binary_and_query() {
+    with_server(|server| async move {
+        let bin = env!("CARGO_BIN_EXE_hyperbytedb-cli");
+
+        let create = Command::new(bin)
+            .args(["-host", &server.url, "create", "database", "mydb"])
+            .output()
+            .expect("spawn cli");
+        assert!(
+            create.status.success(),
+            "create database failed: stderr={}",
+            String::from_utf8_lossy(&create.stderr)
+        );
+
+        let write = Command::new(bin)
+            .args([
+                "-host",
+                &server.url,
+                "write",
+                "-database",
+                "mydb",
+                "--data-binary",
+                "cpu,host=srv01 value=42",
+            ])
+            .output()
+            .expect("spawn cli");
+        assert!(
+            write.status.success(),
+            "write --data-binary failed: stderr={}",
+            String::from_utf8_lossy(&write.stderr)
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let query_out = loop {
+            let query = Command::new(bin)
+                .args([
+                    "-host",
+                    &server.url,
+                    "query",
+                    "-database",
+                    "mydb",
+                    "--data-urlencode",
+                    "q=SHOW MEASUREMENTS",
+                ])
+                .output()
+                .expect("spawn cli");
+            assert!(
+                query.status.success(),
+                "query --data-urlencode failed: stderr={}",
+                String::from_utf8_lossy(&query.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&query.stdout).into_owned();
+            if stdout.contains("cpu") {
+                break stdout;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("timed out waiting for measurement cpu; stdout={stdout}");
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        };
+
+        assert!(query_out.contains("cpu"), "stdout={query_out}");
+
+        server.stop().await;
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn subprocess_create_database() {
     with_server(|server| async move {
         let bin = env!("CARGO_BIN_EXE_hyperbytedb-cli");

@@ -62,6 +62,17 @@ Exit code is non-zero on connection, auth, or query errors (stdout = data, stder
 
 ```bash
 echo 'cpu,host=a usage=1' | hyperbytedb-cli write -host http://localhost:8086 -database telemetry
+
+# Or inline (InfluxDB v1-compatible)
+hyperbytedb-cli write -host http://localhost:8086 -database telemetry \
+  --data-binary 'cpu,host=a usage=1'
+```
+
+### Query (batch)
+
+```bash
+hyperbytedb-cli query -host http://localhost:8086 -database telemetry \
+  --data-urlencode 'q=SELECT * FROM cpu LIMIT 10'
 ```
 
 ### Import / export
@@ -157,7 +168,8 @@ Any other input is TimeseriesQL. Semicolon-separated statements run in sequence.
 | Subcommand | Description |
 |------------|-------------|
 | `create database <name>` | Create a database (InfluxDB v1-compatible shortcut) |
-| `write` | Line protocol from stdin or `--file` |
+| `write` | Line protocol from stdin, `--file`, or `--data-binary` |
+| `query` | Run TimeseriesQL via `--data-urlencode` (`q=...` or plain query) |
 | `import` | Influx-compatible DDL+DML import (`--path`, `--compressed`, `--pps`) |
 | `export` | Logical export to DDL+DML + line protocol |
 | `ping` | Liveness + server version |

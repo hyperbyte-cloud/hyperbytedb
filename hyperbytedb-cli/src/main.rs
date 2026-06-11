@@ -105,12 +105,15 @@ struct Cli {
     command: Option<Commands>,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum Commands {
-    /// Write line protocol from stdin or a file
+    /// Write line protocol from stdin, a file, or --data-binary
     Write {
         #[arg(short = 'f', long = "file")]
         file: Option<PathBuf>,
+        /// Line protocol payload (InfluxDB v1-compatible)
+        #[arg(long = "data-binary")]
+        data_binary: Option<String>,
         #[arg(short = 'd', long = "database")]
         database: Option<String>,
         #[arg(long = "rp")]
@@ -119,6 +122,14 @@ enum Commands {
         precision: Option<String>,
         #[arg(long = "gzip")]
         gzip: bool,
+    },
+    /// Run a TimeseriesQL query and exit (InfluxDB v1-compatible)
+    Query {
+        #[arg(short = 'd', long = "database")]
+        database: Option<String>,
+        /// Query string (curl-style `q=SELECT ...` or plain TimeseriesQL)
+        #[arg(long = "data-urlencode", required = true)]
+        data_urlencode: String,
     },
     /// Import DDL+DML file (Influx-compatible format)
     Import {
@@ -169,7 +180,7 @@ enum Commands {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum CreateTarget {
     /// Create a new database
     Database {
@@ -178,7 +189,7 @@ enum CreateTarget {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum ClusterAction {
     /// List cluster nodes
     Nodes,
@@ -224,8 +235,8 @@ async fn run() -> hyperbytedb_cli::error::Result<()> {
 
     let conn = build_connection(&cli)?;
 
-    if let Some(cmd) = cli.command {
-        return run_subcommand(&conn, cmd).await;
+    if let Some(cmd) = cli.command.clone() {
+        return run_subcommand(&cli, &conn, cmd).await;
     }
 
     if let Some(ref q) = cli.execute {
@@ -282,6 +293,7 @@ fn build_session(cli: &Cli, conn: ConnectionConfig) -> Session {
 }
 
 async fn run_subcommand(
+    cli: &Cli,
     conn: &ConnectionConfig,
     cmd: Commands,
 ) -> hyperbytedb_cli::error::Result<()> {
@@ -290,6 +302,7 @@ async fn run_subcommand(
     match cmd {
         Commands::Write {
             file,
+            data_binary,
             database,
             rp,
             precision,
@@ -298,7 +311,14 @@ async fn run_subcommand(
             let db = database
                 .or_else(|| conn.database.clone())
                 .ok_or_else(|| CliError::Other("--database is required".to_string()))?;
-            let body = if let Some(path) = file {
+            if data_binary.is_some() && file.is_some() {
+                return Err(CliError::Other(
+                    "cannot use both --data-binary and --file".to_string(),
+                ));
+            }
+            let body = if let Some(data) = data_binary {
+                data.into_bytes()
+            } else if let Some(path) = file {
                 std::fs::read(&path)
                     .map_err(|e| CliError::Write(format!("read {}: {e}", path.display())))?
             } else {
@@ -315,6 +335,17 @@ async fn run_subcommand(
                 gzip,
             };
             client.write(&body, &wopts).await
+        }
+        Commands::Query {
+            database,
+            data_urlencode,
+        } => {
+            let mut session = build_session(cli, conn.clone());
+            if let Some(db) = database.or_else(|| conn.database.clone()) {
+                session.database = Some(db);
+            }
+            let q = parse_data_urlencode_query(&data_urlencode);
+            repl::execute_query(&session, &client, q).await
         }
         Commands::Import {
             path,
@@ -416,4 +447,9 @@ fn print_ping(info: &PingInfo) {
 fn prompt_password() -> hyperbytedb_cli::error::Result<String> {
     eprint!("password: ");
     rpassword::read_password().map_err(|e| CliError::Other(e.to_string()))
+}
+
+/// Parse curl-style `--data-urlencode 'q=SELECT ...'` (optional `q=` prefix).
+fn parse_data_urlencode_query(value: &str) -> &str {
+    value.strip_prefix("q=").unwrap_or(value)
 }
