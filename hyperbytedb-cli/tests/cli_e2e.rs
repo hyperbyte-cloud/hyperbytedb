@@ -1,14 +1,27 @@
 //! End-to-end tests: in-process HyperbyteDB server + hyperbytedb-cli library/subprocess.
 //!
-//! libchdb allows one session per process; tests run serially.
+//! libchdb allows one session per process; tests run serially via `#[serial(chdb)]`.
+//! Subprocess CLI invocations must not block the Tokio runtime (that would freeze the
+//! in-process HTTP server they talk to).
 
 use std::process::{Command, Output};
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyperbytedb::application::flush_service::FlushServiceImpl;
+use serial_test::serial;
 use tokio::sync::Mutex;
 
 static SERVER_LOCK: Mutex<()> = Mutex::const_new(());
+
+async fn run_cli(args: &[&str]) -> Output {
+    let bin = env!("CARGO_BIN_EXE_hyperbytedb-cli").to_string();
+    let args: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+    tokio::task::spawn_blocking(move || Command::new(bin).args(args).output())
+        .await
+        .expect("spawn_blocking cli")
+        .expect("spawn cli")
+}
 
 fn assert_cli_success(output: &Output, label: &str) {
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -37,6 +50,7 @@ use tokio::sync::watch;
 struct TestServer {
     url: String,
     _tmpdir: tempfile::TempDir,
+    flush_service: Arc<FlushServiceImpl>,
     shutdown_tx: watch::Sender<bool>,
     http_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     http_handle: tokio::task::JoinHandle<()>,
@@ -63,8 +77,11 @@ async fn start_server() -> TestServer {
     let app = build_router(Arc::new(boot.app_state));
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let flush_for_task = flush.clone();
     let flush_handle = tokio::spawn(async move {
-        flush.run(Duration::from_secs(1), shutdown_rx).await;
+        flush_for_task
+            .run(Duration::from_secs(1), shutdown_rx)
+            .await;
     });
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -86,6 +103,7 @@ async fn start_server() -> TestServer {
     TestServer {
         url,
         _tmpdir: tmpdir,
+        flush_service: flush,
         shutdown_tx,
         http_shutdown_tx: Some(http_shutdown_tx),
         http_handle,
@@ -94,13 +112,20 @@ async fn start_server() -> TestServer {
 }
 
 impl TestServer {
+    async fn flush(&self) {
+        self.flush_service
+            .flush()
+            .await
+            .expect("manual flush in e2e test");
+    }
+
     async fn stop(self) {
         let _ = self.shutdown_tx.send(true);
+        let _ = self.flush_handle.await;
         if let Some(tx) = self.http_shutdown_tx {
             let _ = tx.send(());
         }
         let _ = self.http_handle.await;
-        let _ = self.flush_handle.await;
     }
 }
 
@@ -128,6 +153,7 @@ where
 }
 
 #[tokio::test]
+#[serial(chdb)]
 async fn execute_show_databases() {
     with_server(|server| async move {
         let conn = client_config(&server.url);
@@ -160,6 +186,7 @@ async fn execute_show_databases() {
 }
 
 #[tokio::test]
+#[serial(chdb)]
 async fn write_and_query_roundtrip() {
     with_server(|server| async move {
         let conn = client_config(&server.url);
@@ -195,42 +222,35 @@ async fn write_and_query_roundtrip() {
             .await
             .expect("write");
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            let resp = client
-                .query(
-                    "SHOW MEASUREMENTS",
-                    &QueryOptions {
-                        db: Some("metrics".to_string()),
-                        epoch: None,
-                        pretty: false,
-                        chunked: false,
-                        chunk_size: None,
-                        format: OutputFormat::Json,
-                        params: None,
-                    },
-                )
-                .await
-                .expect("show measurements");
-            let has_cpu = resp.results.iter().any(|r| {
-                r.series.as_ref().is_some_and(|s| {
-                    s.iter().any(|ser| {
-                        ser.values.iter().any(|row| {
-                            row.first()
-                                .and_then(|v| v.as_str())
-                                .is_some_and(|n| n == "cpu")
-                        })
+        server.flush().await;
+
+        let resp = client
+            .query(
+                "SHOW MEASUREMENTS",
+                &QueryOptions {
+                    db: Some("metrics".to_string()),
+                    epoch: None,
+                    pretty: false,
+                    chunked: false,
+                    chunk_size: None,
+                    format: OutputFormat::Json,
+                    params: None,
+                },
+            )
+            .await
+            .expect("show measurements");
+        let has_cpu = resp.results.iter().any(|r| {
+            r.series.as_ref().is_some_and(|s| {
+                s.iter().any(|ser| {
+                    ser.values.iter().any(|row| {
+                        row.first()
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|n| n == "cpu")
                     })
                 })
-            });
-            if has_cpu {
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                panic!("timed out waiting for measurement cpu");
-            }
-            tokio::time::sleep(Duration::from_millis(300)).await;
-        }
+            })
+        });
+        assert!(has_cpu, "expected measurement cpu after flush");
 
         server.stop().await;
     })
@@ -238,6 +258,7 @@ async fn write_and_query_roundtrip() {
 }
 
 #[tokio::test]
+#[serial(chdb)]
 async fn ping_returns_version_header() {
     with_server(|server| async move {
         let client = HyperbytedbClient::new(&client_config(&server.url), false).expect("client");
@@ -249,6 +270,7 @@ async fn ping_returns_version_header() {
 }
 
 #[tokio::test]
+#[serial(chdb)]
 async fn materialized_view_via_execute() {
     with_server(|server| async move {
         let conn = client_config(&server.url);
@@ -284,24 +306,25 @@ async fn materialized_view_via_execute() {
             .await
             .expect("write");
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            let resp = client
-                .query(
-                    "SHOW MEASUREMENTS",
-                    &QueryOptions {
-                        db: Some("mvcli".to_string()),
-                        epoch: None,
-                        pretty: false,
-                        chunked: false,
-                        chunk_size: None,
-                        format: OutputFormat::Json,
-                        params: None,
-                    },
-                )
-                .await
-                .expect("show measurements");
-            if resp.results.iter().any(|r| {
+        server.flush().await;
+
+        let resp = client
+            .query(
+                "SHOW MEASUREMENTS",
+                &QueryOptions {
+                    db: Some("mvcli".to_string()),
+                    epoch: None,
+                    pretty: false,
+                    chunked: false,
+                    chunk_size: None,
+                    format: OutputFormat::Json,
+                    params: None,
+                },
+            )
+            .await
+            .expect("show measurements");
+        assert!(
+            resp.results.iter().any(|r| {
                 r.series.as_ref().is_some_and(|s| {
                     s.iter().any(|ser| {
                         ser.values.iter().any(|row| {
@@ -311,14 +334,9 @@ async fn materialized_view_via_execute() {
                         })
                     })
                 })
-            }) {
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                panic!("timed out waiting for cpu measurement");
-            }
-            tokio::time::sleep(Duration::from_millis(300)).await;
-        }
+            }),
+            "expected measurement cpu after flush"
+        );
 
         let session = Session::new(conn);
         repl::execute_query(
@@ -356,21 +374,18 @@ async fn materialized_view_via_execute() {
 }
 
 #[tokio::test]
+#[serial(chdb)]
 async fn subprocess_execute_show_databases() {
     with_server(|server| async move {
-        let bin = env!("CARGO_BIN_EXE_hyperbytedb-cli");
-
-        let output = Command::new(bin)
-            .args([
-                "-host",
-                &server.url,
-                "-execute",
-                "SHOW DATABASES",
-                "-format",
-                "column",
-            ])
-            .output()
-            .expect("spawn cli");
+        let output = run_cli(&[
+            "-host",
+            &server.url,
+            "-execute",
+            "SHOW DATABASES",
+            "-format",
+            "column",
+        ])
+        .await;
 
         assert_cli_success(&output, "execute SHOW DATABASES");
 
@@ -380,56 +395,39 @@ async fn subprocess_execute_show_databases() {
 }
 
 #[tokio::test]
+#[serial(chdb)]
 async fn subprocess_write_data_binary_and_query() {
     with_server(|server| async move {
-        let bin = env!("CARGO_BIN_EXE_hyperbytedb-cli");
-
-        let create = Command::new(bin)
-            .args(["-host", &server.url, "create", "database", "mydb"])
-            .output()
-            .expect("spawn cli");
+        let create = run_cli(&["-host", &server.url, "create", "database", "mydb"]).await;
         assert_cli_success(&create, "create database");
 
-        let write = Command::new(bin)
-            .args([
-                "-host",
-                &server.url,
-                "write",
-                "-database",
-                "mydb",
-                "--data-binary",
-                "cpu,host=srv01 value=42",
-            ])
-            .output()
-            .expect("spawn cli");
+        let write = run_cli(&[
+            "-host",
+            &server.url,
+            "write",
+            "-database",
+            "mydb",
+            "--data-binary",
+            "cpu,host=srv01 value=42",
+        ])
+        .await;
         assert_cli_success(&write, "write --data-binary");
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        let query_out = loop {
-            let query = Command::new(bin)
-                .args([
-                    "-host",
-                    &server.url,
-                    "query",
-                    "-database",
-                    "mydb",
-                    "--data-urlencode",
-                    "q=SHOW MEASUREMENTS",
-                ])
-                .output()
-                .expect("spawn cli");
-            assert_cli_success(&query, "query --data-urlencode");
-            let stdout = String::from_utf8_lossy(&query.stdout).into_owned();
-            if stdout.contains("cpu") {
-                break stdout;
-            }
-            if std::time::Instant::now() >= deadline {
-                panic!("timed out waiting for measurement cpu; stdout={stdout}");
-            }
-            tokio::time::sleep(Duration::from_millis(300)).await;
-        };
+        server.flush().await;
 
-        assert!(query_out.contains("cpu"), "stdout={query_out}");
+        let query = run_cli(&[
+            "-host",
+            &server.url,
+            "query",
+            "-database",
+            "mydb",
+            "--data-urlencode",
+            "q=SHOW MEASUREMENTS",
+        ])
+        .await;
+        assert_cli_success(&query, "query --data-urlencode");
+        let stdout = String::from_utf8_lossy(&query.stdout);
+        assert!(stdout.contains("cpu"), "stdout={stdout}");
 
         server.stop().await;
     })
@@ -437,22 +435,19 @@ async fn subprocess_write_data_binary_and_query() {
 }
 
 #[tokio::test]
+#[serial(chdb)]
 async fn subprocess_global_flags_after_subcommand() {
     with_server(|server| async move {
-        let bin = env!("CARGO_BIN_EXE_hyperbytedb-cli");
-
-        let output = Command::new(bin)
-            .args([
-                "query",
-                "-host",
-                &server.url,
-                "-database",
-                "mydb",
-                "--data-urlencode",
-                "q=SHOW DATABASES",
-            ])
-            .output()
-            .expect("spawn cli");
+        let output = run_cli(&[
+            "query",
+            "-host",
+            &server.url,
+            "-database",
+            "mydb",
+            "--data-urlencode",
+            "q=SHOW DATABASES",
+        ])
+        .await;
 
         assert_cli_success(&output, "query with global -host after subcommand");
 
@@ -462,20 +457,13 @@ async fn subprocess_global_flags_after_subcommand() {
 }
 
 #[tokio::test]
+#[serial(chdb)]
 async fn subprocess_drop_database() {
     with_server(|server| async move {
-        let bin = env!("CARGO_BIN_EXE_hyperbytedb-cli");
-
-        let create = Command::new(bin)
-            .args(["-host", &server.url, "create", "database", "dropme"])
-            .output()
-            .expect("spawn cli");
+        let create = run_cli(&["-host", &server.url, "create", "database", "dropme"]).await;
         assert_cli_success(&create, "create database");
 
-        let drop = Command::new(bin)
-            .args(["-host", &server.url, "drop", "database", "dropme"])
-            .output()
-            .expect("spawn cli");
+        let drop = run_cli(&["-host", &server.url, "drop", "database", "dropme"]).await;
         assert_cli_success(&drop, "drop database");
 
         server.stop().await;
@@ -484,28 +472,21 @@ async fn subprocess_drop_database() {
 }
 
 #[tokio::test]
+#[serial(chdb)]
 async fn subprocess_create_database() {
     with_server(|server| async move {
-        let bin = env!("CARGO_BIN_EXE_hyperbytedb-cli");
-
-        let create = Command::new(bin)
-            .args(["-host", &server.url, "create", "database", "mydb"])
-            .output()
-            .expect("spawn cli");
-
+        let create = run_cli(&["-host", &server.url, "create", "database", "mydb"]).await;
         assert_cli_success(&create, "create database");
 
-        let show = Command::new(bin)
-            .args([
-                "-host",
-                &server.url,
-                "-execute",
-                "SHOW DATABASES",
-                "-format",
-                "column",
-            ])
-            .output()
-            .expect("spawn cli");
+        let show = run_cli(&[
+            "-host",
+            &server.url,
+            "-execute",
+            "SHOW DATABASES",
+            "-format",
+            "column",
+        ])
+        .await;
 
         assert_cli_success(&show, "execute SHOW DATABASES");
         assert!(

@@ -146,7 +146,7 @@ struct Cli {
 enum Commands {
     /// Write line protocol from stdin, a file, or --data-binary
     Write {
-        #[arg(short = 'f', long = "file")]
+        #[arg(long = "file")]
         file: Option<PathBuf>,
         /// Line protocol payload (InfluxDB v1-compatible)
         #[arg(long = "data-binary")]
