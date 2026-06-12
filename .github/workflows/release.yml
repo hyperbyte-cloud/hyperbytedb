@@ -26,8 +26,9 @@ name: Release
 # Requires containerMode.type=dind on the runner scale set.
 
 on:
-  branch:
   push:
+    branches:
+      - main
     tags: ["v*"]
 
 permissions:
