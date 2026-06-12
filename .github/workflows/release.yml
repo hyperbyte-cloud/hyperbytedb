@@ -140,8 +140,9 @@ jobs:
         run: |
           set -euo pipefail
           for arch in amd64 arm64; do
-            test -x "release-staging/${arch}/hyperbytedb"
-            test -x "release-staging/${arch}/hyperbytedb-cli"
+            chmod +x "release-staging/${arch}/hyperbytedb" "release-staging/${arch}/hyperbytedb-cli"
+            test -f "release-staging/${arch}/hyperbytedb"
+            test -f "release-staging/${arch}/hyperbytedb-cli"
             test -s "release-staging/${arch}/libchdb.so"
           done
           ls -lh release-staging/*/*
@@ -216,6 +217,9 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          for arch in amd64 arm64; do
+            chmod +x "release-staging/${arch}/hyperbytedb" "release-staging/${arch}/hyperbytedb-cli"
+          done
           mkdir -p out
           declare -A ARCHES=( [amd64]=x86_64 [arm64]=aarch64 )
           for src in "${!ARCHES[@]}"; do
