@@ -31,6 +31,8 @@ pub struct ConnectionConfig {
     pub password: Option<String>,
     pub ssl: bool,
     pub unsafe_ssl: bool,
+    pub url_prefix: Option<String>,
+    pub socket: Option<PathBuf>,
 }
 
 impl Default for ConnectionConfig {
@@ -42,6 +44,8 @@ impl Default for ConnectionConfig {
             password: None,
             ssl: false,
             unsafe_ssl: false,
+            url_prefix: None,
+            socket: None,
         }
     }
 }
@@ -98,11 +102,31 @@ impl ConnectionConfig {
     }
 
     pub fn base_url(&self) -> String {
+        if self.socket.is_some() {
+            return String::new();
+        }
         let mut url = self.host.trim_end_matches('/').to_string();
         if self.ssl && !url.starts_with("https://") {
             url = url.replacen("http://", "https://", 1);
         }
         url
+    }
+
+    pub fn api_path(&self, path: &str) -> String {
+        let path = if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("/{path}")
+        };
+        let Some(prefix) = self
+            .url_prefix
+            .as_ref()
+            .map(|p| p.trim().trim_matches('/'))
+            .filter(|p| !p.is_empty())
+        else {
+            return path;
+        };
+        format!("/{prefix}{path}")
     }
 }
 
@@ -188,5 +212,14 @@ mod tests {
             resolve_host(Some("https://db.example.com:443"), None, false),
             "https://db.example.com:443"
         );
+    }
+
+    #[test]
+    fn api_path_with_prefix() {
+        let cfg = ConnectionConfig {
+            url_prefix: Some("/api/v1".to_string()),
+            ..ConnectionConfig::default()
+        };
+        assert_eq!(cfg.api_path("/query"), "/api/v1/query");
     }
 }

@@ -38,6 +38,8 @@ pub struct Session {
     pub chunk_size: usize,
     pub timing: bool,
     pub verbose: bool,
+    pub consistency: Option<String>,
+    pub query_params: Option<String>,
     pub server_version: Option<String>,
 }
 
@@ -55,6 +57,8 @@ impl Session {
             chunk_size: 10_000,
             timing: false,
             verbose: false,
+            consistency: None,
+            query_params: None,
             server_version: None,
         }
     }

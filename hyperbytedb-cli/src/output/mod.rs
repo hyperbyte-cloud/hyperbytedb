@@ -8,7 +8,12 @@ pub fn format_response(response: &QueryResponse, format: OutputFormat, pretty: b
     match format {
         OutputFormat::Json => format_json(response, pretty),
         OutputFormat::Column => format_column(response),
-        OutputFormat::Csv => String::new(), // CSV handled via raw response path
+        OutputFormat::Csv => {
+            // CSV is streamed straight from the raw HTTP body (see `query_raw`) and
+            // must never reach this formatter. Catch any future miswiring in debug.
+            debug_assert!(false, "CSV must be rendered via the raw response path");
+            String::new()
+        }
     }
 }
 
@@ -50,6 +55,11 @@ pub fn format_column(response: &QueryResponse) -> String {
                 table.add_row(row.iter().map(value_cell));
             }
             out.push_str(&format!("{table}\n"));
+            if series.partial == Some(true) {
+                out.push_str(
+                    "(partial results: response was truncated — increase chunk size or narrow the query)\n",
+                );
+            }
         }
     }
     out

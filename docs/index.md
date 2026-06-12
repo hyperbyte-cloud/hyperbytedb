@@ -21,7 +21,7 @@ docker exec -it hyperbytedb \
   hyperbytedb-cli write -database mydb \
   --data-binary 'cpu,host=srv01 value=42'
 
-  docker exec -it hyperbytedb \
+docker exec -it hyperbytedb \
   hyperbytedb-cli query -database mydb \
   --data-urlencode 'q=SELECT * FROM cpu'
 ```

@@ -14,24 +14,15 @@ impl Credentials {
         }
     }
 
-    pub fn is_some(&self) -> bool {
-        self.username.is_some()
-    }
-
-    pub fn apply_basic_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    pub fn authorization_header(&self) -> Option<(String, String)> {
         if let (Some(u), Some(p)) = (&self.username, &self.password) {
-            req.basic_auth(u, Some(p))
-        } else if let Some(u) = &self.username {
-            req.header("Authorization", format!("Token {u}:"))
+            use base64::Engine as _;
+            let token = base64::engine::general_purpose::STANDARD.encode(format!("{u}:{p}"));
+            Some(("Authorization".to_string(), format!("Basic {token}")))
         } else {
-            req
-        }
-    }
-
-    pub fn apply_query_auth(&self, pairs: &mut Vec<(&str, String)>) {
-        if let (Some(u), Some(p)) = (&self.username, &self.password) {
-            pairs.push(("u", u.clone()));
-            pairs.push(("p", p.clone()));
+            self.username
+                .as_ref()
+                .map(|u| ("Authorization".to_string(), format!("Token {u}:")))
         }
     }
 }
@@ -49,8 +40,11 @@ mod tests {
             password: Some("secret".to_string()),
             ssl: false,
             unsafe_ssl: false,
+            url_prefix: None,
+            socket: None,
         };
         let creds = Credentials::from_config(&cfg);
-        assert!(creds.is_some());
+        assert_eq!(creds.username.as_deref(), Some("admin"));
+        assert_eq!(creds.password.as_deref(), Some("secret"));
     }
 }

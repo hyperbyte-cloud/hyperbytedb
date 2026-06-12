@@ -7,6 +7,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 use hyperbytedb_cli::{
     CliError, ConnectionConfig, HyperbytedbClient, Session,
+    args::{decode_data_urlencode_query, normalize_influx_style_args},
     client::{PingInfo, WriteOptions},
     config::{ConnectionConfig as Cfg, resolve_host},
     export::{self, ExportOptions},
@@ -43,74 +44,113 @@ impl From<FormatArg> for OutputFormat {
 )]
 struct Cli {
     /// Server host URL or hostname
-    #[arg(short = 'H', long = "host")]
+    #[arg(short = 'H', long = "host", global = true)]
     host: Option<String>,
 
     /// Server port (when host is not a full URL)
-    #[arg(long = "port")]
+    #[arg(long = "port", global = true)]
     port: Option<u16>,
 
     /// Default database
-    #[arg(short = 'd', long = "database")]
+    #[arg(short = 'd', long = "database", global = true)]
     database: Option<String>,
 
     /// Username
-    #[arg(short = 'u', long = "username")]
+    #[arg(short = 'u', long = "username", global = true)]
     username: Option<String>,
 
     /// Password (empty prompts interactively)
-    #[arg(short = 'p', long = "password")]
+    #[arg(short = 'p', long = "password", global = true)]
     password: Option<String>,
 
     /// Use HTTPS
-    #[arg(long = "ssl")]
+    #[arg(long = "ssl", global = true)]
     ssl: bool,
 
     /// Skip TLS certificate verification
-    #[arg(long = "unsafeSsl")]
+    #[arg(long = "unsafeSsl", global = true)]
     unsafe_ssl: bool,
 
+    /// Path to add after host (InfluxDB v1 `-url-prefix`)
+    #[arg(long = "url-prefix", global = true)]
+    url_prefix: Option<String>,
+
+    /// Unix domain socket (InfluxDB v1 `-socket`)
+    #[arg(long = "socket", global = true)]
+    socket: Option<PathBuf>,
+
     /// Config profile name from ~/.config/hyperbytedb/config.toml
-    #[arg(long = "profile")]
+    #[arg(long = "profile", global = true)]
     profile: Option<String>,
 
     /// Execute TimeseriesQL and exit (batch mode)
-    #[arg(short = 'e', long = "execute")]
+    #[arg(short = 'e', long = "execute", global = true)]
     execute: Option<String>,
 
     /// Output format
-    #[arg(short = 'f', long = "format", value_enum)]
+    #[arg(short = 'f', long = "format", value_enum, global = true)]
     format: Option<FormatArg>,
 
     /// Timestamp precision / epoch param for queries
-    #[arg(long = "precision")]
+    #[arg(long = "precision", global = true)]
     precision: Option<String>,
 
-    #[arg(long = "epoch")]
+    #[arg(long = "epoch", global = true)]
     epoch: Option<String>,
 
     /// Pretty-print JSON output
-    #[arg(long = "pretty")]
+    #[arg(long = "pretty", global = true)]
     pretty: bool,
 
     /// Verbose HTTP tracing
-    #[arg(short = 'v', long = "verbose")]
+    #[arg(short = 'v', long = "verbose", global = true)]
     verbose: bool,
 
+    /// Query language (only influxql is supported)
+    #[arg(long = "type", default_value = "influxql", global = true)]
+    query_type: String,
+
+    /// Write consistency level (InfluxDB v1: any, one, quorum, all)
+    #[arg(long = "consistency", global = true)]
+    consistency: Option<String>,
+
+    /// Bind parameters JSON for queries (`-execute` / REPL)
+    #[arg(long = "params", global = true)]
+    query_params: Option<String>,
+
+    /// Import a database export file (InfluxDB v1 `-import`)
+    #[arg(long = "import", global = true)]
+    import_mode: bool,
+
+    /// Path to import file (use with `-import`)
+    #[arg(long = "path", global = true)]
+    import_path: Option<String>,
+
+    /// Import file is gzip-compressed
+    #[arg(long = "compressed", global = true)]
+    import_compressed: bool,
+
+    /// Import throttle (points per second; 0 = unlimited)
+    #[arg(long = "pps", global = true)]
+    import_pps: Option<u64>,
+
     /// Print CLI and server version, then exit
-    #[arg(long = "version")]
+    #[arg(long = "version", global = true)]
     show_version: bool,
 
     #[command(subcommand)]
     command: Option<Commands>,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum Commands {
-    /// Write line protocol from stdin or a file
+    /// Write line protocol from stdin, a file, or --data-binary
     Write {
-        #[arg(short = 'f', long = "file")]
+        #[arg(long = "file")]
         file: Option<PathBuf>,
+        /// Line protocol payload (InfluxDB v1-compatible)
+        #[arg(long = "data-binary")]
+        data_binary: Option<String>,
         #[arg(short = 'd', long = "database")]
         database: Option<String>,
         #[arg(long = "rp")]
@@ -119,6 +159,14 @@ enum Commands {
         precision: Option<String>,
         #[arg(long = "gzip")]
         gzip: bool,
+    },
+    /// Run a TimeseriesQL query and exit (InfluxDB v1-compatible)
+    Query {
+        #[arg(short = 'd', long = "database")]
+        database: Option<String>,
+        /// Query string (curl-style `q=SELECT ...` or plain TimeseriesQL)
+        #[arg(long = "data-urlencode", required = true)]
+        data_urlencode: String,
     },
     /// Import DDL+DML file (Influx-compatible format)
     Import {
@@ -162,9 +210,37 @@ enum Commands {
         #[command(subcommand)]
         action: ClusterAction,
     },
+    /// Schema administration (InfluxDB v1-compatible shortcuts)
+    Create {
+        #[command(subcommand)]
+        target: CreateTarget,
+    },
+    /// Schema administration (InfluxDB v1-compatible shortcuts)
+    Drop {
+        #[command(subcommand)]
+        target: DropTarget,
+    },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
+enum CreateTarget {
+    /// Create a new database
+    Database {
+        /// Database name
+        name: String,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum DropTarget {
+    /// Drop a database
+    Database {
+        /// Database name
+        name: String,
+    },
+}
+
+#[derive(Subcommand, Clone)]
 enum ClusterAction {
     /// List cluster nodes
     Nodes,
@@ -191,12 +267,18 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> hyperbytedb_cli::error::Result<()> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(normalize_influx_style_args(std::env::args()));
+
+    if cli.query_type.eq_ignore_ascii_case("flux") {
+        return Err(CliError::Other(
+            "Flux is not supported; use -type influxql (default)".to_string(),
+        ));
+    }
 
     if cli.show_version {
         println!("hyperbytedb-cli {}", env!("CARGO_PKG_VERSION"));
         let conn = build_connection(&cli)?;
-        let client = HyperbytedbClient::new(&conn)?;
+        let client = HyperbytedbClient::new(&conn, cli.verbose)?;
         match client.ping().await {
             Ok(ping) => {
                 if let Some(v) = ping.version {
@@ -210,13 +292,28 @@ async fn run() -> hyperbytedb_cli::error::Result<()> {
 
     let conn = build_connection(&cli)?;
 
-    if let Some(cmd) = cli.command {
-        return run_subcommand(&conn, cmd).await;
+    if cli.import_mode {
+        let path = cli
+            .import_path
+            .clone()
+            .ok_or_else(|| CliError::Other("-import requires -path".to_string()))?;
+        let client = HyperbytedbClient::new(&conn, cli.verbose)?;
+        let opts = ImportOptions {
+            path,
+            compressed: cli.import_compressed,
+            pps: cli.import_pps.unwrap_or(0),
+            precision: cli.precision.clone(),
+        };
+        return import::run_import(&client, &opts).await.map(|_| ());
+    }
+
+    if let Some(cmd) = cli.command.clone() {
+        return run_subcommand(&cli, &conn, cmd).await;
     }
 
     if let Some(ref q) = cli.execute {
         let session = build_session(&cli, conn);
-        let client = HyperbytedbClient::new(&session.connection)?;
+        let client = HyperbytedbClient::new(&session.connection, session.verbose)?;
         return repl::execute_query(&session, &client, q).await;
     }
 
@@ -227,7 +324,9 @@ async fn run() -> hyperbytedb_cli::error::Result<()> {
 fn build_connection(cli: &Cli) -> hyperbytedb_cli::error::Result<ConnectionConfig> {
     let mut conn = Cfg::load(cli.profile.as_deref())?;
 
-    if let Some(ref h) = cli.host {
+    if cli.socket.is_some() {
+        conn.socket = cli.socket.clone();
+    } else if let Some(ref h) = cli.host {
         conn.host = resolve_host(Some(h), cli.port, cli.ssl || conn.ssl);
     } else if cli.port.is_some() {
         conn.host = resolve_host(None, cli.port, cli.ssl || conn.ssl);
@@ -252,6 +351,9 @@ fn build_connection(cli: &Cli) -> hyperbytedb_cli::error::Result<ConnectionConfi
             conn.password = Some(pw.clone());
         }
     }
+    if cli.url_prefix.is_some() {
+        conn.url_prefix = cli.url_prefix.clone();
+    }
 
     Ok(conn)
 }
@@ -264,18 +366,22 @@ fn build_session(cli: &Cli, conn: ConnectionConfig) -> Session {
     session.epoch = cli.epoch.clone().or_else(|| cli.precision.clone());
     session.pretty = cli.pretty;
     session.verbose = cli.verbose;
+    session.consistency = cli.consistency.clone();
+    session.query_params = cli.query_params.clone();
     session
 }
 
 async fn run_subcommand(
+    cli: &Cli,
     conn: &ConnectionConfig,
     cmd: Commands,
 ) -> hyperbytedb_cli::error::Result<()> {
-    let client = HyperbytedbClient::new(conn)?;
+    let client = HyperbytedbClient::new(conn, cli.verbose)?;
 
     match cmd {
         Commands::Write {
             file,
+            data_binary,
             database,
             rp,
             precision,
@@ -284,7 +390,14 @@ async fn run_subcommand(
             let db = database
                 .or_else(|| conn.database.clone())
                 .ok_or_else(|| CliError::Other("--database is required".to_string()))?;
-            let body = if let Some(path) = file {
+            if data_binary.is_some() && file.is_some() {
+                return Err(CliError::Other(
+                    "cannot use both --data-binary and --file".to_string(),
+                ));
+            }
+            let body = if let Some(data) = data_binary {
+                data.into_bytes()
+            } else if let Some(path) = file {
                 std::fs::read(&path)
                     .map_err(|e| CliError::Write(format!("read {}: {e}", path.display())))?
             } else {
@@ -299,8 +412,20 @@ async fn run_subcommand(
                 rp,
                 precision,
                 gzip,
+                consistency: cli.consistency.clone(),
             };
             client.write(&body, &wopts).await
+        }
+        Commands::Query {
+            database,
+            data_urlencode,
+        } => {
+            let mut session = build_session(cli, conn.clone());
+            if let Some(db) = database.or_else(|| conn.database.clone()) {
+                session.database = Some(db);
+            }
+            let q = decode_data_urlencode_query(&data_urlencode)?;
+            repl::execute_query(&session, &client, &q).await
         }
         Commands::Import {
             path,
@@ -377,6 +502,20 @@ async fn run_subcommand(
                 }
                 println!("{}", client.cluster_drain().await?);
                 Ok(())
+            }
+        },
+        Commands::Create { target } => match target {
+            CreateTarget::Database { name } => {
+                let session = build_session(cli, conn.clone());
+                let q = format!("CREATE DATABASE {name}");
+                repl::execute_query(&session, &client, &q).await
+            }
+        },
+        Commands::Drop { target } => match target {
+            DropTarget::Database { name } => {
+                let session = build_session(cli, conn.clone());
+                let q = format!("DROP DATABASE {name}");
+                repl::execute_query(&session, &client, &q).await
             }
         },
     }

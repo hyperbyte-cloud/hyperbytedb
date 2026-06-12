@@ -14,7 +14,7 @@ use crate::session::Session;
 use meta::{MetaAction, handle_meta, is_meta_command};
 
 pub async fn run_repl(mut session: Session) -> Result<()> {
-    let mut client = HyperbytedbClient::new(&session.connection)?;
+    let mut client = HyperbytedbClient::new(&session.connection, session.verbose)?;
 
     match client.ping().await {
         Ok(ping) => {
@@ -89,8 +89,13 @@ pub async fn execute_query(session: &Session, client: &HyperbytedbClient, q: &st
             epoch: session.epoch.clone(),
             pretty: session.pretty,
             chunked: session.chunked,
+            chunk_size: if session.chunked {
+                Some(session.chunk_size)
+            } else {
+                None
+            },
             format: session.format,
-            params: None,
+            params: session.query_params.clone(),
         };
 
         if session.format == crate::session::OutputFormat::Csv {
