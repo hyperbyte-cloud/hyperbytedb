@@ -1,9 +1,12 @@
 use crate::client::{HyperbytedbClient, WriteOptions};
 use crate::config::resolve_host;
 use crate::error::{CliError, Result};
-use crate::repl::complete::CompletionCache;
+use crate::repl::complete::{
+    CompletionCache, clear_measurements_cache, refresh_measurements_cache,
+};
 use crate::session::{OutputFormat, Session};
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 
 pub enum MetaAction {
     Continue,
@@ -86,11 +89,10 @@ pub async fn handle_meta(
             "Using database {}",
             session.database.as_deref().unwrap_or("")
         );
-        if let Some(db) = session.effective_database() {
-            let mut guard = cache.write().unwrap_or_else(|e| e.into_inner());
-            if let Err(e) = guard.refresh_measurements(client, db).await {
-                eprintln!("warning: could not refresh measurement names for tab completion: {e}");
-            }
+        if let Some(db) = session.effective_database()
+            && let Err(e) = refresh_measurements_cache(cache, client, db).await
+        {
+            eprintln!("warning: could not refresh measurement names for tab completion: {e}");
         }
         return Ok(MetaAction::Continue);
     }
@@ -98,10 +100,7 @@ pub async fn handle_meta(
         match parts[1].to_ascii_lowercase().as_str() {
             "database" | "db" => {
                 session.clear_database();
-                cache
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clear_measurements();
+                clear_measurements_cache(cache);
                 println!("database cleared");
             }
             "retention" | "rp" | "retention policy" => {

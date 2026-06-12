@@ -1,9 +1,10 @@
 mod complete;
 mod meta;
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Instant;
 
+use parking_lot::RwLock;
 use rustyline::Config;
 use rustyline::Editor;
 use rustyline::error::ReadlineError;
@@ -14,7 +15,7 @@ use crate::error::{CliError, Result};
 use crate::output::format_response;
 use crate::session::Session;
 
-use complete::{CliHelper, CompletionCache};
+use complete::{CliHelper, CompletionCache, refresh_databases_cache, refresh_measurements_cache};
 use meta::{MetaAction, handle_meta, is_meta_command};
 
 pub async fn run_repl(mut session: Session) -> Result<()> {
@@ -37,16 +38,13 @@ pub async fn run_repl(mut session: Session) -> Result<()> {
 
     let history_path = history_file_path();
     let cache = Arc::new(RwLock::new(CompletionCache::default()));
+    if let Err(e) = refresh_databases_cache(&cache, &client).await {
+        eprintln!("warning: could not load database names for tab completion: {e}");
+    }
+    if let Some(db) = session.effective_database()
+        && let Err(e) = refresh_measurements_cache(&cache, &client, db).await
     {
-        let mut guard = cache.write().unwrap_or_else(|e| e.into_inner());
-        if let Err(e) = guard.refresh_databases(&client).await {
-            eprintln!("warning: could not load database names for tab completion: {e}");
-        }
-        if let Some(db) = session.effective_database() {
-            if let Err(e) = guard.refresh_measurements(&client, db).await {
-                eprintln!("warning: could not load measurement names for tab completion: {e}");
-            }
-        }
+        eprintln!("warning: could not load measurement names for tab completion: {e}");
     }
 
     let config = Config::builder().build();

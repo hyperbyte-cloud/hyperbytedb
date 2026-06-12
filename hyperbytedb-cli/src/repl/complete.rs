@@ -1,5 +1,6 @@
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
+use parking_lot::RwLock;
 use rustyline::completion::{Completer, Pair};
 use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
@@ -77,54 +78,71 @@ pub struct CompletionCache {
 }
 
 impl CompletionCache {
-    pub async fn refresh_databases(
-        &mut self,
-        client: &HyperbytedbClient,
-    ) -> crate::error::Result<()> {
-        let resp = client
-            .query(
-                "SHOW DATABASES",
-                &QueryOptions {
-                    db: None,
-                    epoch: None,
-                    pretty: false,
-                    chunked: false,
-                    chunk_size: None,
-                    format: OutputFormat::Json,
-                    params: None,
-                },
-            )
-            .await?;
-        self.databases = first_column_values(&resp);
-        Ok(())
-    }
-
-    pub async fn refresh_measurements(
-        &mut self,
-        client: &HyperbytedbClient,
-        db: &str,
-    ) -> crate::error::Result<()> {
-        let resp = client
-            .query(
-                "SHOW MEASUREMENTS",
-                &QueryOptions {
-                    db: Some(db.to_string()),
-                    epoch: None,
-                    pretty: false,
-                    chunked: false,
-                    chunk_size: None,
-                    format: OutputFormat::Json,
-                    params: None,
-                },
-            )
-            .await?;
-        self.measurements = first_column_values(&resp);
-        Ok(())
-    }
-
     pub fn clear_measurements(&mut self) {
         self.measurements.clear();
     }
+}
+
+pub async fn refresh_databases_cache(
+    cache: &Arc<RwLock<CompletionCache>>,
+    client: &HyperbytedbClient,
+) -> crate::error::Result<()> {
+    let databases = fetch_databases(client).await?;
+    cache.write().databases = databases;
+    Ok(())
+}
+
+pub async fn refresh_measurements_cache(
+    cache: &Arc<RwLock<CompletionCache>>,
+    client: &HyperbytedbClient,
+    db: &str,
+) -> crate::error::Result<()> {
+    let measurements = fetch_measurements(client, db).await?;
+    cache.write().measurements = measurements;
+    Ok(())
+}
+
+pub fn clear_measurements_cache(cache: &Arc<RwLock<CompletionCache>>) {
+    cache.write().clear_measurements();
+}
+
+async fn fetch_databases(client: &HyperbytedbClient) -> crate::error::Result<Vec<String>> {
+    let resp = client
+        .query(
+            "SHOW DATABASES",
+            &QueryOptions {
+                db: None,
+                epoch: None,
+                pretty: false,
+                chunked: false,
+                chunk_size: None,
+                format: OutputFormat::Json,
+                params: None,
+            },
+        )
+        .await?;
+    Ok(first_column_values(&resp))
+}
+
+async fn fetch_measurements(
+    client: &HyperbytedbClient,
+    db: &str,
+) -> crate::error::Result<Vec<String>> {
+    let resp = client
+        .query(
+            "SHOW MEASUREMENTS",
+            &QueryOptions {
+                db: Some(db.to_string()),
+                epoch: None,
+                pretty: false,
+                chunked: false,
+                chunk_size: None,
+                format: OutputFormat::Json,
+                params: None,
+            },
+        )
+        .await?;
+    Ok(first_column_values(&resp))
 }
 
 pub struct CliHelper {
@@ -153,7 +171,7 @@ impl Completer for CliHelper {
         pos: usize,
         _ctx: &Context<'_>,
     ) -> RustyResult<(usize, Vec<Pair>)> {
-        let cache = self.cache.read().unwrap_or_else(|e| e.into_inner());
+        let cache = self.cache.read();
         Ok(complete_line(line, pos, &cache))
     }
 }

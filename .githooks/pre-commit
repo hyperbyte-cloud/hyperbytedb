@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Run rustfmt and clippy before each commit (same checks as CI).
+#
+# Install once per clone:
+#   sh scripts/install-git-hooks.sh
+#
+# Bypass for a single commit:
+#   git commit --no-verify
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "${REPO_ROOT}"
+
+if [[ -f "${HOME}/.cargo/env" ]]; then
+  # shellcheck disable=SC1091
+  source "${HOME}/.cargo/env"
+fi
+
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "pre-commit: cargo not found on PATH (install Rust or source ~/.cargo/env)" >&2
+  exit 1
+fi
+
+CHDB_RUST_PATH="$(dirname "${REPO_ROOT}")/chdb-rust"
+if [[ ! -f "${CHDB_RUST_PATH}/Cargo.toml" ]]; then
+  echo "pre-commit: checking out chdb-rust dependency..."
+  bash "${REPO_ROOT}/scripts/checkout-chdb-rust.sh"
+fi
+
+rustup component add rustfmt clippy >/dev/null 2>&1 || true
+
+echo "pre-commit: cargo fmt --check"
+if ! cargo fmt --check; then
+  echo "pre-commit: formatting failed; run 'cargo fmt' and restage" >&2
+  exit 1
+fi
+
+echo "pre-commit: cargo clippy --all-targets -- -D warnings"
+if ! cargo clippy --all-targets -- -D warnings; then
+  echo "pre-commit: clippy failed; fix warnings before committing" >&2
+  exit 1
+fi
