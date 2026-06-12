@@ -47,6 +47,7 @@ use parking_lot::RwLock;
 
 use crate::adapters::chdb::catalog;
 use crate::adapters::chdb::session::{SharedSession, SyncSession};
+use crate::application::ingest_metadata::backfill_tag_metadata;
 use crate::application::system_trace;
 use crate::domain::chdb_naming::{
     field_column_name, quote_backticks, quoted_series_table_name, quoted_table_name,
@@ -654,6 +655,21 @@ impl ChdbNativeAdapter {
                 .await
             {
                 tracing::warn!(error = %e, "failed to persist series metadata; re-registers after restart");
+            } else {
+                let mut tag_pairs: Vec<(String, String)> = Vec::new();
+                for (_, p) in &new_series {
+                    for (k, v) in &p.tags {
+                        tag_pairs.push((k.clone(), v.clone()));
+                    }
+                }
+                if let Err(e) =
+                    backfill_tag_metadata(meta, &key.db, &key.measurement, tag_pairs).await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        "failed to backfill tag metadata from flushed series"
+                    );
+                }
             }
         }
 

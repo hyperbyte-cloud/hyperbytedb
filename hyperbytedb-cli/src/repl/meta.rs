@@ -1,7 +1,9 @@
 use crate::client::{HyperbytedbClient, WriteOptions};
 use crate::config::resolve_host;
 use crate::error::{CliError, Result};
+use crate::repl::complete::CompletionCache;
 use crate::session::{OutputFormat, Session};
+use std::sync::{Arc, RwLock};
 
 pub enum MetaAction {
     Continue,
@@ -13,6 +15,7 @@ pub async fn handle_meta(
     session: &mut Session,
     client: &mut HyperbytedbClient,
     line: &str,
+    cache: &Arc<RwLock<CompletionCache>>,
 ) -> Result<MetaAction> {
     let lower = line.to_ascii_lowercase();
     let parts: Vec<&str> = line.split_whitespace().collect();
@@ -83,12 +86,22 @@ pub async fn handle_meta(
             "Using database {}",
             session.database.as_deref().unwrap_or("")
         );
+        if let Some(db) = session.effective_database() {
+            let mut guard = cache.write().unwrap_or_else(|e| e.into_inner());
+            if let Err(e) = guard.refresh_measurements(client, db).await {
+                eprintln!("warning: could not refresh measurement names for tab completion: {e}");
+            }
+        }
         return Ok(MetaAction::Continue);
     }
     if parts.len() >= 2 && parts[0].eq_ignore_ascii_case("clear") {
         match parts[1].to_ascii_lowercase().as_str() {
             "database" | "db" => {
                 session.clear_database();
+                cache
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear_measurements();
                 println!("database cleared");
             }
             "retention" | "rp" | "retention policy" => {
@@ -191,6 +204,9 @@ fn print_help() {
   timing                   Toggle query duration display
   history                  Show history hint
   exit, quit               Exit the shell
+
+Press Tab to autocomplete meta-commands and TimeseriesQL keywords.
+Database and measurement names are suggested when available.
 
 DDL examples (sent to /query):
   CREATE MATERIALIZED VIEW "mv_5m" ON "db"

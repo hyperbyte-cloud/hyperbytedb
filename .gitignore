@@ -114,3 +114,4 @@ Desktop.ini
 .cursor/
 hyperbytedb-operator
 influx-multiplay
+chdb-rust

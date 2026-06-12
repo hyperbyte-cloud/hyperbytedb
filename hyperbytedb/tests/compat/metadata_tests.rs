@@ -272,6 +272,84 @@ async fn show_tag_values_response_shape() {
 }
 
 #[tokio::test]
+async fn show_tag_values_visible_after_steady_state_ingest() {
+    let ctx = TestContext::new_no_chdb().unwrap();
+    ctx.metadata.create_database("testdb").await.unwrap();
+    ctx.ingestion
+        .ingest(
+            "testdb",
+            None,
+            None,
+            b"cpu,host=server01 value=1.0 1000000000",
+            WritePayloadFormat::LineProtocol,
+        )
+        .await
+        .unwrap();
+    ctx.ingestion
+        .ingest(
+            "testdb",
+            None,
+            None,
+            b"cpu,host=server02 value=2.0 2000000000",
+            WritePayloadFormat::LineProtocol,
+        )
+        .await
+        .unwrap();
+
+    let resp = ctx
+        .query("testdb", "SHOW TAG VALUES FROM cpu WITH KEY = \"host\"")
+        .await
+        .unwrap();
+    assert!(resp.results[0].error.is_none());
+    let values: Vec<&str> = resp.results[0].series.as_ref().unwrap()[0]
+        .values
+        .iter()
+        .filter_map(|row| row.get(1).and_then(|v| v.as_str()))
+        .collect();
+    assert!(values.contains(&"server01"));
+    assert!(values.contains(&"server02"));
+}
+
+#[tokio::test]
+async fn show_tag_keys_not_cleared_by_tagless_batch() {
+    let ctx = TestContext::new_no_chdb().unwrap();
+    ctx.metadata.create_database("testdb").await.unwrap();
+    ctx.ingestion
+        .ingest(
+            "testdb",
+            None,
+            None,
+            b"cpu,host=server01 value=1.0 1000000000",
+            WritePayloadFormat::LineProtocol,
+        )
+        .await
+        .unwrap();
+    ctx.ingestion
+        .ingest(
+            "testdb",
+            None,
+            None,
+            b"cpu value=2.0 2000000000",
+            WritePayloadFormat::LineProtocol,
+        )
+        .await
+        .unwrap();
+
+    let resp = ctx.query("testdb", "SHOW TAG KEYS FROM cpu").await.unwrap();
+    assert!(resp.results[0].error.is_none());
+    let keys: Vec<&str> = resp.results[0].series.as_ref().unwrap()[0]
+        .values
+        .iter()
+        .filter_map(|row| row.first().and_then(|v| v.as_str()))
+        .collect();
+    assert!(
+        keys.contains(&"host"),
+        "tag keys should survive a tag-less batch: {:?}",
+        keys
+    );
+}
+
+#[tokio::test]
 async fn show_tag_values_from_specific_measurement() {
     let ctx = TestContext::new_no_chdb().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();

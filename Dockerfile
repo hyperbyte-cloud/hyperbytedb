@@ -4,7 +4,7 @@ FROM debian:bookworm-slim AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates build-essential pkg-config \
     clang llvm-dev libclang-dev \
-    pkg-config libssl-dev \
+    pkg-config libssl-dev git \
     && rm -rf /var/lib/apt/lists/*
 
 # Install rustup itself, but not a toolchain — the actual rustc/cargo version
@@ -26,9 +26,11 @@ RUN curl -sL https://lib.chdb.io | bash
 #   docker build -f hyperbytedb/Dockerfile <parent>
 WORKDIR /build
 
-# chdb-rust path dependency. Copied to /build/chdb-rust so `../../chdb-rust`
-# from /build/hyperbytedb/hyperbytedb resolves correctly.
-COPY chdb-rust /build/chdb-rust
+# chdb-rust path dependency (`../../chdb-rust` from hyperbytedb/hyperbytedb).
+# Clone during the image build so `docker compose up` works without a local checkout.
+ARG CHDB_RUST_REPO=https://github.com/hyperbyte-cloud/chdb-rust.git
+ARG CHDB_RUST_REF=feat_arrow_insert
+RUN git clone --depth 1 --branch "${CHDB_RUST_REF}" "${CHDB_RUST_REPO}" /build/chdb-rust
 
 # Pinned toolchain spec must be in place before any cargo invocation so
 # rustup auto-installs the right version on first use.
