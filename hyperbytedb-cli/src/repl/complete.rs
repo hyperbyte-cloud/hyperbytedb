@@ -29,15 +29,7 @@ const META_COMMANDS: &[&str] = &[
 ];
 
 const SQL_VERBS: &[&str] = &[
-    "ALTER",
-    "CREATE",
-    "DELETE",
-    "DROP",
-    "EXPLAIN",
-    "GRANT",
-    "REVOKE",
-    "SELECT",
-    "SHOW",
+    "ALTER", "CREATE", "DELETE", "DROP", "EXPLAIN", "GRANT", "REVOKE", "SELECT", "SHOW",
 ];
 
 const FORMAT_VALUES: &[&str] = &["column", "csv", "json"];
@@ -73,26 +65,9 @@ const DROP_OBJECTS: &[&str] = &[
     "RETENTION",
     "USER",
 ];
-const SELECT_KEYWORDS: &[&str] = &[
-    "FROM",
-    "GROUP",
-    "INTO",
-    "LIMIT",
-    "ORDER",
-    "SELECT",
-    "WHERE",
-];
+const SELECT_KEYWORDS: &[&str] = &["FROM", "GROUP", "INTO", "LIMIT", "ORDER", "SELECT", "WHERE"];
 const SQL_KEYWORDS: &[&str] = &[
-    "AS",
-    "BY",
-    "FROM",
-    "GROUP",
-    "INTO",
-    "LIMIT",
-    "ON",
-    "ORDER",
-    "WHERE",
-    "WITH",
+    "AS", "BY", "FROM", "GROUP", "INTO", "LIMIT", "ON", "ORDER", "WHERE", "WITH",
 ];
 
 #[derive(Default)]
@@ -102,7 +77,10 @@ pub struct CompletionCache {
 }
 
 impl CompletionCache {
-    pub async fn refresh_databases(&mut self, client: &HyperbytedbClient) -> crate::error::Result<()> {
+    pub async fn refresh_databases(
+        &mut self,
+        client: &HyperbytedbClient,
+    ) -> crate::error::Result<()> {
         let resp = client
             .query(
                 "SHOW DATABASES",
@@ -212,7 +190,11 @@ fn parse_context(line: &str, pos: usize) -> (usize, Vec<String>, String) {
 fn complete_first_word(word: &str) -> Vec<Pair> {
     let mut out = filter_prefix(META_COMMANDS, word, false);
     out.extend(filter_prefix(SQL_VERBS, word, true));
-    out.sort_by(|a, b| a.display.to_ascii_lowercase().cmp(&b.display.to_ascii_lowercase()));
+    out.sort_by(|a, b| {
+        a.display
+            .to_ascii_lowercase()
+            .cmp(&b.display.to_ascii_lowercase())
+    });
     out
 }
 
@@ -280,7 +262,8 @@ fn complete_show(rest: &[String], word: &str, cache: &CompletionCache) -> Vec<Pa
         return filter_prefix(&["KEYS"], word, true);
     }
     if rest.len() == 1
-        && (rest[0].eq_ignore_ascii_case("CONTINUOUS") || rest[0].eq_ignore_ascii_case("MATERIALIZED"))
+        && (rest[0].eq_ignore_ascii_case("CONTINUOUS")
+            || rest[0].eq_ignore_ascii_case("MATERIALIZED"))
     {
         return filter_prefix(&["QUERIES", "VIEWS"], word, true);
     }
@@ -303,7 +286,9 @@ fn complete_create(rest: &[String], word: &str) -> Vec<Pair> {
     if rest.len() == 1 && rest[0].eq_ignore_ascii_case("MATERIALIZED") {
         return filter_prefix(&["VIEW"], word, true);
     }
-    if rest.len() >= 2 && rest[0].eq_ignore_ascii_case("RETENTION") && rest[1].eq_ignore_ascii_case("POLICY")
+    if rest.len() >= 2
+        && rest[0].eq_ignore_ascii_case("RETENTION")
+        && rest[1].eq_ignore_ascii_case("POLICY")
     {
         return filter_prefix(&["ON"], word, true);
     }
@@ -338,7 +323,10 @@ fn complete_from_context(rest: &[String], word: &str, cache: &CompletionCache) -
 }
 
 fn complete_name_context(rest: &[String], word: &str, cache: &CompletionCache) -> Vec<Pair> {
-    if rest.last().is_some_and(|t| t.eq_ignore_ascii_case("FROM") || t.eq_ignore_ascii_case("ON")) {
+    if rest
+        .last()
+        .is_some_and(|t| t.eq_ignore_ascii_case("FROM") || t.eq_ignore_ascii_case("ON"))
+    {
         return filter_owned(&cache.measurements, word);
     }
     filter_prefix(SHOW_MODIFIERS, word, true)

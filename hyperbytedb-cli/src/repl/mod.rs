@@ -4,9 +4,9 @@ mod meta;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+use rustyline::Config;
 use rustyline::Editor;
 use rustyline::error::ReadlineError;
-use rustyline::Config;
 
 use crate::client::{HyperbytedbClient, QueryOptions};
 use crate::config::history_file_path;
