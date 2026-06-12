@@ -3,6 +3,7 @@ members = ["hyperbytedb", "hyperbytedb-proxy", "hyperbytedb-cli"]
 resolver = "2"
 
 [profile.release]
+debug = 0
 lto = "thin"
 codegen-units = 1
 strip = "symbols"

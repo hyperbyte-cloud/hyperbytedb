@@ -113,29 +113,3 @@ jobs:
              cargo test -p hyperbytedb-cli && \
              sccache --show-stats'
 
-  build:
-    name: Build
-    runs-on: hyperbytedb-operator-controller
-    needs: [clippy, test]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Checkout chdb-rust
-        run: bash .github/scripts/checkout-chdb-rust.sh
-
-      - name: Install CI dependencies
-        uses: ./.github/actions/install-ci-deps
-        with:
-          profile: k8s-runner
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build release binaries
-        run: |
-          bash .github/scripts/run-in-rust-container.sh \
-            'bash .github/scripts/rust-container-setup.sh && \
-             sccache --zero-stats && \
-             cargo build --release -p hyperbytedb --bin hyperbytedb -p hyperbytedb-cli --bin hyperbytedb-cli && \
-             sccache --show-stats && \
-             test -x target/release/hyperbytedb && \
-             test -x target/release/hyperbytedb-cli'

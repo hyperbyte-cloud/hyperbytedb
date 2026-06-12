@@ -18,9 +18,9 @@ WORKSPACE="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
 # Mount the parent directory so path = "../../chdb-rust" resolves inside the container.
 WORKSPACE_PARENT="$(dirname "${WORKSPACE}")"
 
+# ARC runner pods use dind; GitHub-hosted runners have Docker on the host.
 if ! command -v docker >/dev/null 2>&1; then
   echo "docker is required but was not found on PATH." >&2
-  echo "Configure the ARC runner scale set with containerMode.type=dind." >&2
   exit 1
 fi
 
@@ -32,6 +32,15 @@ docker_args=(
   -e "RUSTFLAGS=${RUSTFLAGS:-}"
   -e "CARGO_INCREMENTAL=${CARGO_INCREMENTAL:-0}"
 )
+
+# Optional emulated platform (e.g. linux/arm64). Used by the release pipeline to
+# build aarch64 binaries on the amd64 runner via QEMU/binfmt. Requires
+# docker/setup-qemu-action to have registered binfmt handlers first. sccache keys
+# objects by target triple, so emulated arm64 builds share the same node-local
+# SCCACHE_DIR as the native amd64 builds without collisions.
+if [ -n "${RUST_PLATFORM:-}" ]; then
+  docker_args+=(--platform "${RUST_PLATFORM}")
+fi
 
 if [ -n "${CARGO_HOME:-}" ]; then
   docker_args+=(-e "CARGO_HOME=${CARGO_HOME}" -v "${CARGO_HOME}:${CARGO_HOME}")
@@ -59,3 +68,20 @@ if [ -n "${RUNNER_TOOL_CACHE:-}" ]; then
 fi
 
 docker run "${docker_args[@]}" "$RUST_IMAGE" bash -ec "$command"
+
+# Docker runs as root by default. Files written into bind-mounted workspace paths
+# are owned by root on the host, which breaks post-job steps (rust-cache save,
+# actions/cache hashFiles, etc.) on GitHub-hosted runners.
+if command -v sudo >/dev/null 2>&1; then
+  chown_cmd=(sudo chown -R "$(id -u):$(id -g)")
+else
+  chown_cmd=(chown -R "$(id -u):$(id -g)")
+fi
+for path in target release-staging; do
+  if [ -e "${WORKSPACE}/${path}" ]; then
+    "${chown_cmd[@]}" "${WORKSPACE}/${path}"
+  fi
+done
+if [ -n "${SCCACHE_DIR:-}" ] && [ -d "${SCCACHE_DIR}" ]; then
+  "${chown_cmd[@]}" "${SCCACHE_DIR}"
+fi
