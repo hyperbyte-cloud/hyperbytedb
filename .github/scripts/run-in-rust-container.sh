@@ -68,3 +68,20 @@ if [ -n "${RUNNER_TOOL_CACHE:-}" ]; then
 fi
 
 docker run "${docker_args[@]}" "$RUST_IMAGE" bash -ec "$command"
+
+# Docker runs as root by default. Files written into bind-mounted workspace paths
+# are owned by root on the host, which breaks post-job steps (rust-cache save,
+# actions/cache hashFiles, etc.) on GitHub-hosted runners.
+if command -v sudo >/dev/null 2>&1; then
+  chown_cmd=(sudo chown -R "$(id -u):$(id -g)")
+else
+  chown_cmd=(chown -R "$(id -u):$(id -g)")
+fi
+for path in target release-staging; do
+  if [ -e "${WORKSPACE}/${path}" ]; then
+    "${chown_cmd[@]}" "${WORKSPACE}/${path}"
+  fi
+done
+if [ -n "${SCCACHE_DIR:-}" ] && [ -d "${SCCACHE_DIR}" ]; then
+  "${chown_cmd[@]}" "${SCCACHE_DIR}"
+fi
