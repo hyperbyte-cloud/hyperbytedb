@@ -14,8 +14,6 @@ name: Release
 
 on:
   push:
-    branches:
-      - feat_release_optimisation
     tags: ["v*"]
   workflow_dispatch:
 
