@@ -111,3 +111,4 @@ EXPOSE 8086
 
 ENTRYPOINT ["hyperbytedb"]
 CMD ["serve"]
+
