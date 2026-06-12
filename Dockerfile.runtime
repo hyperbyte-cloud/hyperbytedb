@@ -2,10 +2,9 @@
 #
 # Release runtime image assembled from PREBUILT binaries — it performs no
 # compilation. The release workflow (.github/workflows/release.yml) compiles
-# hyperbytedb / hyperbytedb-cli for each architecture through the warm
-# node-local sccache (the same cache CI uses), drops the results into a
-# per-arch staging tree, and points this Dockerfile at that tree as its build
-# context:
+# hyperbytedb / hyperbytedb-cli per architecture in parallel on GitHub-hosted
+# runners, uploads staging artifacts, and points this Dockerfile at the merged
+# tree as its build context:
 #
 #   release-staging/
 #     amd64/{hyperbytedb, hyperbytedb-cli, libchdb.so}

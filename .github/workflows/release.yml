@@ -1,95 +1,65 @@
 name: Release
 
-# Release pipeline. On every `v*` tag push we:
+# Release pipeline on GitHub-hosted runners. On every `v*` tag push we:
 #
-#   1. Compile hyperbytedb + hyperbytedb-cli for linux/amd64 (native) and
-#      linux/arm64 (emulated under QEMU) by running cargo inside rust:bookworm
-#      via run-in-rust-container.sh — exactly how CI compiles. This bind-mounts
-#      the node-local sccache hostPath (/opt/sccache), so the release shares the
-#      same warm compilation cache as the CI jobs and only recompiles crates
-#      whose inputs changed. The previous pipeline compiled inside the Dockerfile
-#      with a BuildKit cache mount, which is never exported across the ephemeral
-#      ARC runner pods — so every release recompiled both arches from scratch,
-#      arm64 fully emulated. That cold double-build is what took ~1 hour.
-#   2. Assemble a multi-arch (linux/amd64, linux/arm64) Docker image from those
-#      PREBUILT binaries (Dockerfile.runtime does no compilation) and push it to
-#      GHCR under ghcr.io/hyperbyte-cloud/hyperbytedb.
-#   3. Package the prebuilt binaries + matching libchdb.so straight from the
-#      staging tree (plain tar, no second buildx export):
-#        - hyperbytedb-<tag>-linux-x86_64.tar.gz   (amd64 / x64)
-#        - hyperbytedb-<tag>-linux-aarch64.tar.gz (arm64)
-#      Each tarball contains hyperbytedb, hyperbytedb-cli, and libchdb.so, plus a sha256.
-#   4. Publish a GitHub Release for the tag with the tarballs attached.
+#   1. build-amd64 / build-arm64 (parallel) — compile hyperbytedb + hyperbytedb-cli
+#      inside rust:bookworm via run-in-rust-container.sh (same path as CI). Each
+#      job uploads its per-arch staging tree as a workflow artifact.
+#   2. publish — assemble the multi-arch Docker image from those prebuilt binaries
+#      (Dockerfile.runtime does no compilation), push to GHCR, package tarballs,
+#      and create the GitHub Release.
 #
-# Jobs run directly on the ARC runner pod (not inside a job container) so
-# QEMU/binfmt registration and Docker Buildx talk to the dind sidecar reliably.
-# Requires containerMode.type=dind on the runner scale set.
+# Compilation caches use GitHub Actions cache (sccache + Swatinem/rust-cache) instead
+# of the self-hosted runner hostPath used by CI.
 
 on:
   push:
-    branches:
-      - feat_release_optimisation
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write   # GitHub Release upload
   packages: write   # GHCR image push
 
 concurrency:
-  # Don't cancel an in-flight release if a new tag is pushed. Releases are
-  # not safe to interrupt — we'd leave half-pushed image manifests and a
-  # half-populated GitHub Release behind.
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
-  # sccache requires incremental compilation to be disabled.
   CARGO_INCREMENTAL: 0
-  # Match the CI build job exactly (same flags => same sccache cache keys), so
-  # the amd64 release compile reuses the objects the CI `build` job already
-  # populated in the node-local /opt/sccache.
   RUSTFLAGS: "-D warnings"
   RUSTC_WRAPPER: sccache
-  SCCACHE_DIR: /opt/sccache
-  SCCACHE_CACHE_SIZE: 20G
+  SCCACHE_DIR: ${{ github.workspace }}/.cache/sccache
+  SCCACHE_CACHE_SIZE: 10G
   CHDB_RUST_REPO: https://github.com/hyperbyte-cloud/chdb-rust.git
   CHDB_RUST_REF: feat_arrow_insert
   REGISTRY: ghcr.io
-  # Canonical package; docs and operator manifests reference
-  # ghcr.io/hyperbyte-cloud/hyperbytedb. Hardcoded because github.repository
-  # is wrong when this workflow runs from a fork or a renamed root repo.
   IMAGE_NAME: hyperbyte-cloud/hyperbytedb
 
 jobs:
-  release:
-    name: Build & publish release
-    runs-on: hyperbytedb-operator-controller
+  build-amd64:
+    name: Build linux/amd64
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Checkout chdb-rust
         run: bash .github/scripts/checkout-chdb-rust.sh
 
-      - name: Install CI dependencies
-        uses: ./.github/actions/install-ci-deps
+      - name: Restore sccache
+        uses: actions/cache@v4
         with:
-          profile: k8s-runner
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-release-amd64-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            sccache-release-amd64-
 
-      - name: Set up QEMU (binfmt for linux/arm64 builds)
-        uses: docker/setup-qemu-action@v3
+      - uses: Swatinem/rust-cache@v2
         with:
-          platforms: arm64
+          shared-key: release-amd64
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      # --- Compile through the warm node-local sccache (shared with CI) -------
-      # Binaries + the arch-matched libchdb.so are dropped into a per-arch
-      # staging tree that Dockerfile.runtime and the tarball steps consume:
-      #   release-staging/{amd64,arm64}/{hyperbytedb,hyperbytedb-cli,libchdb.so}
-
-      - name: Build linux/amd64 binaries
+      - name: Compile release binaries
         run: |
           rm -rf release-staging/amd64
           bash .github/scripts/run-in-rust-container.sh \
@@ -100,10 +70,41 @@ jobs:
              mkdir -p release-staging/amd64 && \
              cp target/release/hyperbytedb target/release/hyperbytedb-cli /usr/local/lib/libchdb.so release-staging/amd64/'
 
-      - name: Build linux/arm64 binaries (emulated, warm sccache)
+      - name: Upload amd64 staging artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-staging-amd64
+          path: release-staging/amd64/
+          if-no-files-found: error
+
+  build-arm64:
+    name: Build linux/arm64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout chdb-rust
+        run: bash .github/scripts/checkout-chdb-rust.sh
+
+      - name: Set up QEMU (binfmt for linux/arm64)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Restore sccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-release-arm64-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            sccache-release-arm64-
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-arm64
+
+      - name: Compile release binaries (emulated)
         env:
-          # Run the rust container under QEMU. sccache keys objects by target
-          # triple, so arm64 objects coexist with amd64 in the same cache dir.
           RUST_PLATFORM: linux/arm64
         run: |
           rm -rf release-staging/arm64
@@ -116,10 +117,49 @@ jobs:
              mkdir -p release-staging/arm64 && \
              cp target/arm64/release/hyperbytedb target/arm64/release/hyperbytedb-cli /usr/local/lib/libchdb.so release-staging/arm64/'
 
-      # GHCR package was originally published with a PAT (scripts/docker-upload.sh).
-      # Until the package is linked to this repo for Actions access, set the
-      # repository variable GHCR_AUTH=pat and configure GHCR_USERNAME / GHCR_PAT
-      # org secrets (PAT needs write:packages). Otherwise GITHUB_TOKEN is used.
+      - name: Upload arm64 staging artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-staging-arm64
+          path: release-staging/arm64/
+          if-no-files-found: error
+
+  publish-image:
+    name: Publish container image
+    runs-on: ubuntu-latest
+    needs: [build-amd64, build-arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download prebuilt binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: release-staging-amd64
+          path: release-staging/amd64
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-staging-arm64
+          path: release-staging/arm64
+
+      - name: Verify staging layout
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            test -x "release-staging/${arch}/hyperbytedb"
+            test -x "release-staging/${arch}/hyperbytedb-cli"
+            test -s "release-staging/${arch}/libchdb.so"
+          done
+          ls -lh release-staging/*/*
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Log in to GitHub Container Registry (PAT)
         if: vars.GHCR_AUTH == 'pat'
         uses: docker/login-action@v3
@@ -147,24 +187,35 @@ jobs:
             type=sha,prefix=
             type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
 
-      - name: Build and push multi-arch image from prebuilt binaries
+      - name: Build and push multi-arch image
         uses: docker/build-push-action@v6
         with:
-          # Context is the per-arch staging tree built above. Dockerfile.runtime
-          # picks the right subdir via $TARGETARCH and does no compilation, so
-          # the only work under QEMU is the trivial debian apt layer.
           context: release-staging
           file: Dockerfile.runtime
           platforms: linux/amd64,linux/arm64
           push: true
-          # provenance=false keeps the image manifest as a simple
-          # multi-arch index (no attestation index wrapper), which is what
-          # `docker pull --platform=...` and downstream tooling expect.
           provenance: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  publish-release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build-amd64, build-arm64, publish-image]
+    if: github.ref_type == 'tag'
+    steps:
+      - name: Download prebuilt binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: release-staging-amd64
+          path: release-staging/amd64
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-staging-arm64
+          path: release-staging/arm64
 
       - name: Package release tarballs
         env:
@@ -172,7 +223,6 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p out
-          # staging arch dir -> released arch name
           declare -A ARCHES=( [amd64]=x86_64 [arm64]=aarch64 )
           for src in "${!ARCHES[@]}"; do
             dst="${ARCHES[$src]}"
@@ -192,9 +242,6 @@ jobs:
             tarball="out/hyperbytedb-${TAG}-linux-${arch}.tar.gz"
             test -s "${tarball}"
             test -s "out/hyperbytedb-${TAG}-linux-${arch}.tar.gz.sha256"
-            # Capture the listing once and match with here-strings. Piping tar
-            # into `grep -q` makes grep close the pipe on first match, killing
-            # tar with SIGPIPE (141) which `pipefail` would surface as a failure.
             listing="$(tar -tzf "${tarball}")"
             for entry in hyperbytedb hyperbytedb-cli libchdb.so; do
               grep -qx "${entry}" <<<"${listing}"

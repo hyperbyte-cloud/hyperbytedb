@@ -18,9 +18,9 @@ WORKSPACE="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
 # Mount the parent directory so path = "../../chdb-rust" resolves inside the container.
 WORKSPACE_PARENT="$(dirname "${WORKSPACE}")"
 
+# ARC runner pods use dind; GitHub-hosted runners have Docker on the host.
 if ! command -v docker >/dev/null 2>&1; then
   echo "docker is required but was not found on PATH." >&2
-  echo "Configure the ARC runner scale set with containerMode.type=dind." >&2
   exit 1
 fi
 
