@@ -2,9 +2,9 @@ name: Release
 
 # Release pipeline on GitHub-hosted runners. On every `v*` tag push we:
 #
-#   1. build-amd64 / build-arm64 (parallel) — compile hyperbytedb + hyperbytedb-cli
-#      inside rust:bookworm via run-in-rust-container.sh (same path as CI). Each
-#      job uploads its per-arch staging tree as a workflow artifact.
+#   1. build-amd64 / build-arm64 (parallel) — compile on native GitHub-hosted runners
+#      (ubuntu-latest + ubuntu-24.04-arm). Each job uploads its per-arch staging
+#      tree as a workflow artifact. arm64 is not emulated under QEMU.
 #   2. publish — assemble the multi-arch Docker image from those prebuilt binaries
 #      (Dockerfile.runtime does no compilation), push to GHCR, package tarballs,
 #      and create the GitHub Release.
@@ -81,17 +81,12 @@ jobs:
 
   build-arm64:
     name: Build linux/arm64
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
       - name: Checkout chdb-rust
         run: bash .github/scripts/checkout-chdb-rust.sh
-
-      - name: Set up QEMU (binfmt for linux/arm64)
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
 
       - name: Restore sccache
         uses: actions/cache@v4
@@ -105,19 +100,16 @@ jobs:
         with:
           shared-key: release-arm64
 
-      - name: Compile release binaries (emulated)
-        env:
-          RUST_PLATFORM: linux/arm64
+      - name: Compile release binaries
         run: |
           rm -rf release-staging/arm64
           bash .github/scripts/run-in-rust-container.sh \
-            'export CARGO_TARGET_DIR=target/arm64 && \
-             bash .github/scripts/rust-container-setup.sh && \
+            'bash .github/scripts/rust-container-setup.sh && \
              sccache --zero-stats && \
              cargo build --release --locked -p hyperbytedb --bin hyperbytedb -p hyperbytedb-cli --bin hyperbytedb-cli && \
              sccache --show-stats && \
              mkdir -p release-staging/arm64 && \
-             cp target/arm64/release/hyperbytedb target/arm64/release/hyperbytedb-cli /usr/local/lib/libchdb.so release-staging/arm64/'
+             cp target/release/hyperbytedb target/release/hyperbytedb-cli /usr/local/lib/libchdb.so release-staging/arm64/'
 
       - name: Upload arm64 staging artifact
         uses: actions/upload-artifact@v4
