@@ -16,12 +16,24 @@ pub struct RawResponse {
     pub build: Option<String>,
 }
 
+pub struct HttpRequest<'a> {
+    pub method: &'a str,
+    pub base: &'a str,
+    pub path: &'a str,
+    pub query: &'a str,
+    pub headers: &'a [(&'a str, &'a str)],
+    pub body: Option<Vec<u8>>,
+    pub verbose: bool,
+}
+
+type UnixClient = Client<hyperlocal::UnixConnector, Full<Bytes>>;
+
 pub enum HttpBackend {
     Reqwest(reqwest::Client),
     #[cfg(unix)]
     Unix {
         socket: std::path::PathBuf,
-        client: Client<hyperlocal::UnixConnector, Full<Bytes>>,
+        client: Box<UnixClient>,
     },
 }
 
@@ -36,7 +48,7 @@ impl HttpBackend {
                 let client = Client::builder(TokioExecutor::new()).build(hyperlocal::UnixConnector);
                 return Ok(Self::Unix {
                     socket: socket.clone(),
-                    client,
+                    client: Box::new(client),
                 });
             }
             #[cfg(not(unix))]
@@ -62,41 +74,37 @@ impl HttpBackend {
         ))
     }
 
-    pub async fn request(
-        &self,
-        method: &str,
-        base: &str,
-        path: &str,
-        query: &str,
-        headers: &[(&str, &str)],
-        body: Option<Vec<u8>>,
-        verbose: bool,
-    ) -> Result<RawResponse> {
-        let path_and_query = if query.is_empty() {
-            path.to_string()
+    pub async fn request(&self, req: HttpRequest<'_>) -> Result<RawResponse> {
+        let path_and_query = if req.query.is_empty() {
+            req.path.to_string()
         } else {
-            format!("{path}?{query}")
+            format!("{}?{}", req.path, req.query)
         };
 
-        if verbose {
-            eprintln!("[verbose] {method} {path_and_query}");
+        if req.verbose {
+            eprintln!("[verbose] {} {path_and_query}", req.method);
         }
 
         match self {
             Self::Reqwest(client) => {
-                let url = format!("{base}{path_and_query}");
-                let mut req = match method {
+                let url = format!("{}{path_and_query}", req.base);
+                let mut http_req = match req.method {
                     "GET" => client.get(&url),
                     "POST" => client.post(&url),
-                    _ => return Err(CliError::Other(format!("unsupported method {method}"))),
+                    _ => {
+                        return Err(CliError::Other(format!(
+                            "unsupported method {}",
+                            req.method
+                        )));
+                    }
                 };
-                for (k, v) in headers {
-                    req = req.header(*k, *v);
+                for (k, v) in req.headers {
+                    http_req = http_req.header(*k, *v);
                 }
-                if let Some(body) = body {
-                    req = req.body(body);
+                if let Some(body) = req.body {
+                    http_req = http_req.body(body);
                 }
-                let resp = req
+                let resp = http_req
                     .send()
                     .await
                     .map_err(|e| CliError::Connection(e.to_string()))?;
@@ -126,16 +134,16 @@ impl HttpBackend {
             #[cfg(unix)]
             Self::Unix { socket, client } => {
                 let uri: hyper::Uri = Uri::new(socket, &path_and_query).into();
-                let payload = Full::new(Bytes::from(body.unwrap_or_default()));
-                let mut builder = Request::builder().method(method).uri(uri);
-                for (k, v) in headers {
+                let payload = Full::new(Bytes::from(req.body.unwrap_or_default()));
+                let mut builder = Request::builder().method(req.method).uri(uri);
+                for (k, v) in req.headers {
                     builder = builder.header(*k, *v);
                 }
-                let req = builder
+                let hyper_req = builder
                     .body(payload)
                     .map_err(|e| CliError::Connection(e.to_string()))?;
                 let resp = client
-                    .request(req)
+                    .request(hyper_req)
                     .await
                     .map_err(|e| CliError::Connection(e.to_string()))?;
                 let status = resp.status().as_u16();

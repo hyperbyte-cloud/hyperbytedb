@@ -6,7 +6,7 @@ mod write;
 
 pub use admin::PingInfo;
 pub use auth::Credentials;
-pub use http_transport::{HttpBackend, RawResponse};
+pub use http_transport::{HttpBackend, HttpRequest, RawResponse};
 pub use query::{QueryOptions, QueryResponse, SeriesResult, StatementResult};
 pub use write::WriteOptions;
 
@@ -34,11 +34,6 @@ impl HyperbytedbClient {
         })
     }
 
-    pub fn with_credentials(mut self, username: Option<String>, password: Option<String>) -> Self {
-        self.credentials = Credentials { username, password };
-        self
-    }
-
     pub fn base_url(&self) -> &str {
         &self.base
     }
@@ -63,15 +58,15 @@ impl HyperbytedbClient {
     ) -> Result<RawResponse> {
         self.backend
             .as_ref()
-            .request(
+            .request(HttpRequest {
                 method,
-                &self.base,
-                &self.api_path(path),
+                base: &self.base,
+                path: &self.api_path(path),
                 query,
                 headers,
                 body,
-                self.verbose,
-            )
+                verbose: self.verbose,
+            })
             .await
     }
 

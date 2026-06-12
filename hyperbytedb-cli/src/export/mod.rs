@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Write;
 
@@ -91,10 +92,11 @@ pub async fn run_export(client: &HyperbytedbClient, opts: &ExportOptions) -> Res
     }
 
     let measurements = list_measurements(client, &opts.database).await?;
+    let tag_keys = list_tag_keys(client, &opts.database).await?;
+    let time_filter = build_time_filter(&opts.start, &opts.end);
     let mut point_count = 0u64;
 
     for m in measurements {
-        let time_filter = build_time_filter(&opts.start, &opts.end);
         let q = if time_filter.is_empty() {
             format!(r#"SELECT * FROM "{m}""#)
         } else {
@@ -105,10 +107,12 @@ pub async fn run_export(client: &HyperbytedbClient, opts: &ExportOptions) -> Res
         if resp.has_errors() {
             continue;
         }
+        let empty = HashSet::new();
+        let measurement_tags = tag_keys.get(&m).unwrap_or(&empty);
         for result in &resp.results {
             if let Some(ref series_list) = result.series {
                 for series in series_list {
-                    let lines = series_to_line_protocol(series);
+                    let lines = series_to_line_protocol(series, measurement_tags);
                     for line in lines {
                         writeln!(writer, "{line}").map_err(|e| CliError::Export(e.to_string()))?;
                         point_count += 1;
@@ -164,6 +168,40 @@ async fn list_measurements(client: &HyperbytedbClient, db: &str) -> Result<Vec<S
     Ok(out)
 }
 
+/// Build a `measurement -> {tag keys}` map from `SHOW TAG KEYS`, so export can
+/// classify columns as tags vs. fields from the actual schema rather than guessing.
+async fn list_tag_keys(
+    client: &HyperbytedbClient,
+    db: &str,
+) -> Result<HashMap<String, HashSet<String>>> {
+    let qopts = QueryOptions {
+        db: Some(db.to_string()),
+        epoch: None,
+        pretty: false,
+        chunked: false,
+        chunk_size: None,
+        format: OutputFormat::Json,
+        params: None,
+    };
+    let resp = client
+        .query(&format!(r#"SHOW TAG KEYS ON "{db}""#), &qopts)
+        .await?;
+    let mut out: HashMap<String, HashSet<String>> = HashMap::new();
+    for result in &resp.results {
+        if let Some(ref series) = result.series {
+            for s in series {
+                let keys = out.entry(s.name.clone()).or_default();
+                for row in &s.values {
+                    if let Some(Value::String(key)) = row.first() {
+                        keys.insert(key.clone());
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn emit_retention_policies(
     writer: &mut ExportWriter,
     resp: &crate::client::QueryResponse,
@@ -200,21 +238,23 @@ fn build_time_filter(start: &Option<String>, end: &Option<String>) -> String {
     parts.join(" AND ")
 }
 
-fn series_to_line_protocol(series: &SeriesResult) -> Vec<String> {
+fn series_to_line_protocol(series: &SeriesResult, tag_keys: &HashSet<String>) -> Vec<String> {
     let mut lines = Vec::new();
     let time_idx = series.columns.iter().position(|c| c == "time");
+    let is_tag = |c: &str| c != "time" && tag_keys.contains(c.strip_prefix("tag_").unwrap_or(c));
+
     let tag_cols: Vec<(usize, &String)> = series
         .columns
         .iter()
         .enumerate()
-        .filter(|(_, c)| c.starts_with("tag_") || is_tag_column(c))
+        .filter(|(_, c)| is_tag(c))
         .collect();
 
     let field_cols: Vec<(usize, &String)> = series
         .columns
         .iter()
         .enumerate()
-        .filter(|(_, c)| *c != "time" && !c.starts_with("tag_") && !is_tag_column(c))
+        .filter(|(_, c)| *c != "time" && !is_tag(c))
         .collect();
 
     for row in &series.values {
@@ -251,10 +291,6 @@ fn series_to_line_protocol(series: &SeriesResult) -> Vec<String> {
         lines.push(line);
     }
     lines
-}
-
-fn is_tag_column(col: &str) -> bool {
-    matches!(col, "host" | "region" | "dc" | "rack")
 }
 
 fn json_to_lp_value(v: &Value) -> String {

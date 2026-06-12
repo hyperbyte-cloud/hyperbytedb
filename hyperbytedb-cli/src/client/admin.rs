@@ -1,5 +1,3 @@
-use serde_json::Value;
-
 use crate::error::{CliError, Result};
 
 use super::HyperbytedbClient;
@@ -96,10 +94,5 @@ impl HyperbytedbClient {
             ));
         }
         Ok(String::from_utf8_lossy(&resp.body).into_owned())
-    }
-
-    pub async fn get_json(&self, path: &str) -> Result<Value> {
-        let text = self.get_text(path).await?;
-        serde_json::from_str(&text).map_err(|e| CliError::Other(format!("invalid JSON: {e}")))
     }
 }

@@ -118,7 +118,9 @@ impl HyperbytedbClient {
         if let Some(ref params) = opts.params {
             pairs.push(("params", params.clone()));
         }
-        self.credentials.apply_query_auth(&mut pairs);
+        // Credentials are sent via the Authorization header (see `auth_headers`),
+        // never as `u`/`p` query params, to keep them out of URLs, access logs,
+        // and verbose request tracing.
         Ok(pairs)
     }
 
@@ -182,7 +184,17 @@ impl HyperbytedbClient {
                 &body,
             ));
         }
-        Ok(String::from_utf8_lossy(&resp.body).into_owned())
+        let text = String::from_utf8_lossy(&resp.body).into_owned();
+        // A 200 response can still carry a per-statement error in a JSON body even
+        // when CSV was requested. Detect it so CSV behaves like the JSON/column
+        // paths (non-zero exit) instead of printing an error body as if it were data.
+        if text.trim_start().starts_with('{')
+            && let Ok(parsed) = serde_json::from_str::<QueryResponse>(&text)
+            && parsed.has_errors()
+        {
+            return Err(CliError::Query(parsed.format_errors()));
+        }
+        Ok(text)
     }
 }
 

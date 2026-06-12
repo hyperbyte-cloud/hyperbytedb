@@ -61,12 +61,12 @@ pub async fn run_import(client: &HyperbytedbClient, opts: &ImportOptions) -> Res
             continue;
         }
 
-        if let Some(db) = trimmed.strip_prefix("# CONTEXT-DATABASE:") {
-            context_db = Some(db.trim().to_string());
-            continue;
-        }
-        if let Some(rp) = trimmed.strip_prefix("# CONTEXT-RETENTION-POLICY:") {
-            context_rp = Some(rp.trim().to_string());
+        if let Some((kind, value)) = parse_section_headers(trimmed) {
+            match kind {
+                "database" => context_db = Some(value.to_string()),
+                "rp" => context_rp = Some(value.to_string()),
+                _ => {}
+            }
             continue;
         }
 

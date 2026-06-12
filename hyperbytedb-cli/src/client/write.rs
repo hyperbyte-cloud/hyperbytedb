@@ -23,7 +23,8 @@ impl HyperbytedbClient {
         if let Some(ref consistency) = opts.consistency {
             pairs.push(("consistency", consistency.clone()));
         }
-        self.credentials.apply_query_auth(&mut pairs);
+        // Credentials travel in the Authorization header (see `auth_headers`),
+        // not as `u`/`p` query params, to avoid leaking them into URLs and logs.
 
         let payload = if opts.gzip {
             use flate2::Compression;
