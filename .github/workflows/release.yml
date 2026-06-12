@@ -190,9 +190,13 @@ jobs:
             tarball="out/hyperbytedb-${TAG}-linux-${arch}.tar.gz"
             test -s "${tarball}"
             test -s "out/hyperbytedb-${TAG}-linux-${arch}.tar.gz.sha256"
-            tar -tzf "${tarball}" | grep -qx hyperbytedb
-            tar -tzf "${tarball}" | grep -qx hyperbytedb-cli
-            tar -tzf "${tarball}" | grep -qx libchdb.so
+            # Capture the listing once and match with here-strings. Piping tar
+            # into `grep -q` makes grep close the pipe on first match, killing
+            # tar with SIGPIPE (141) which `pipefail` would surface as a failure.
+            listing="$(tar -tzf "${tarball}")"
+            for entry in hyperbytedb hyperbytedb-cli libchdb.so; do
+              grep -qx "${entry}" <<<"${listing}"
+            done
           done
           ls -lh out/
 
