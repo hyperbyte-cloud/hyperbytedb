@@ -12,8 +12,17 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # sccache requires incremental compilation to be disabled.
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: "-D warnings"
+  # Compilation caching via sccache, backed by a node-local hostPath mounted at
+  # /opt/sccache. The dir persists across the ephemeral ARC runner pods, so each
+  # job only recompiles crates whose inputs changed. run-in-rust-container.sh
+  # bind-mounts SCCACHE_DIR into the rust container and forwards these vars.
+  RUSTC_WRAPPER: sccache
+  SCCACHE_DIR: /opt/sccache
+  # Cap on-disk cache size to protect host storage.
+  SCCACHE_CACHE_SIZE: 20G
   CHDB_RUST_REPO: https://github.com/hyperbyte-cloud/chdb-rust.git
   CHDB_RUST_REF: feat_arrow_insert
 
@@ -48,7 +57,7 @@ jobs:
       - name: Check formatting
         run: |
           bash .github/scripts/run-in-rust-container.sh \
-            'rustup component add rustfmt && cargo fmt --check'
+            'rustup component add rustfmt && RUSTC_WRAPPER= cargo fmt --check'
 
   clippy:
     name: Clippy
@@ -70,12 +79,15 @@ jobs:
       - name: Clippy
         run: |
           bash .github/scripts/run-in-rust-container.sh \
-            'bash .github/scripts/rust-container-setup.sh && rustup component add clippy && cargo clippy --all-targets -- -D warnings'
+            'bash .github/scripts/rust-container-setup.sh && rustup component add clippy && sccache --zero-stats && cargo build --all-targets && cargo clippy --all-targets --no-deps -- -D warnings && sccache --show-stats'
 
   test:
     name: Test
     runs-on: hyperbytedb-operator-controller
-    needs: [fmt, doc_links]
+    # Run after Clippy so node-local sccache and rust-cache are warm. When Test
+    # started in parallel with Clippy it always saw 0% sccache hits because
+    # Clippy had not finished writing the cache yet (and rust-cache had not saved).
+    needs: [clippy]
     steps:
       - uses: actions/checkout@v4
 
@@ -89,20 +101,17 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Run unit tests
+      # Single container session: one rust-container-setup, shared target/ and
+      # sccache across all test suites (avoids three cold docker runs).
+      - name: Run tests
         run: |
           bash .github/scripts/run-in-rust-container.sh \
-            'bash .github/scripts/rust-container-setup.sh && cargo test --lib'
-
-      - name: Run integration tests
-        run: |
-          bash .github/scripts/run-in-rust-container.sh \
-            'bash .github/scripts/rust-container-setup.sh && cargo test --test '"'"'*'"'"''
-
-      - name: Run hyperbytedb-cli tests
-        run: |
-          bash .github/scripts/run-in-rust-container.sh \
-            'bash .github/scripts/rust-container-setup.sh && cargo test -p hyperbytedb-cli'
+            'bash .github/scripts/rust-container-setup.sh && \
+             sccache --zero-stats && \
+             cargo test --lib && \
+             cargo test --test '"'"'*'"'"' && \
+             cargo test -p hyperbytedb-cli && \
+             sccache --show-stats'
 
   build:
     name: Build
@@ -125,6 +134,8 @@ jobs:
         run: |
           bash .github/scripts/run-in-rust-container.sh \
             'bash .github/scripts/rust-container-setup.sh && \
+             sccache --zero-stats && \
              cargo build --release -p hyperbytedb --bin hyperbytedb -p hyperbytedb-cli --bin hyperbytedb-cli && \
+             sccache --show-stats && \
              test -x target/release/hyperbytedb && \
              test -x target/release/hyperbytedb-cli'

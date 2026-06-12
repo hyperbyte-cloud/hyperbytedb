@@ -37,6 +37,23 @@ if [ -n "${CARGO_HOME:-}" ]; then
   docker_args+=(-e "CARGO_HOME=${CARGO_HOME}" -v "${CARGO_HOME}:${CARGO_HOME}")
 fi
 
+# sccache compilation cache. SCCACHE_DIR is a node-local hostPath that persists
+# across ephemeral runner pods; bind-mount it into the container and forward the
+# sccache settings so cargo's RUSTC_WRAPPER finds a warm cache.
+#
+# NOTE: `docker run -v` resolves the source path on the *dind daemon's*
+# filesystem, so the dind sidecar (not just the runner pod) must expose
+# /opt/sccache as a hostPath for the cache to actually persist on the node.
+if [ -n "${SCCACHE_DIR:-}" ]; then
+  mkdir -p "${SCCACHE_DIR}" 2>/dev/null || true
+  docker_args+=(
+    -v "${SCCACHE_DIR}:${SCCACHE_DIR}"
+    -e "SCCACHE_DIR=${SCCACHE_DIR}"
+    -e "RUSTC_WRAPPER=${RUSTC_WRAPPER:-sccache}"
+    -e "SCCACHE_CACHE_SIZE=${SCCACHE_CACHE_SIZE:-20G}"
+  )
+fi
+
 if [ -n "${RUNNER_TOOL_CACHE:-}" ]; then
   docker_args+=(-v "${RUNNER_TOOL_CACHE}:${RUNNER_TOOL_CACHE}" -e "RUNNER_TOOL_CACHE=${RUNNER_TOOL_CACHE}")
 fi
