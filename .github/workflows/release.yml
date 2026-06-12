@@ -26,6 +26,7 @@ name: Release
 # Requires containerMode.type=dind on the runner scale set.
 
 on:
+  branch:
   push:
     tags: ["v*"]
 
