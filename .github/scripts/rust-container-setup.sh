@@ -15,3 +15,34 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
   pkg-config
 
 curl -sSL https://lib.chdb.io | bash
+
+# Install sccache so cargo's RUSTC_WRAPPER works inside the container. The
+# compiled-object cache lives in the bind-mounted SCCACHE_DIR (see
+# run-in-rust-container.sh), so only the static binary is fetched here.
+install_sccache() {
+  if command -v sccache >/dev/null 2>&1; then
+    sccache --version
+    return 0
+  fi
+
+  local version="v0.8.2"
+  local target
+  case "$(uname -m)" in
+    x86_64) target="x86_64-unknown-linux-musl" ;;
+    aarch64 | arm64) target="aarch64-unknown-linux-musl" ;;
+    *)
+      echo "Unsupported architecture for sccache: $(uname -m)" >&2
+      exit 1
+      ;;
+  esac
+
+  local pkg="sccache-${version}-${target}"
+  curl -fsSL "https://github.com/mozilla/sccache/releases/download/${version}/${pkg}.tar.gz" \
+    | tar -xz -C /tmp
+  install -m 0755 "/tmp/${pkg}/sccache" /usr/local/bin/sccache
+  rm -rf "/tmp/${pkg}"
+  sccache --version
+}
+
+install_sccache
+mkdir -p "${SCCACHE_DIR:-/opt/sccache}"
