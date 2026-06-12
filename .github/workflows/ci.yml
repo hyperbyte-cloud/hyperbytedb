@@ -79,12 +79,15 @@ jobs:
       - name: Clippy
         run: |
           bash .github/scripts/run-in-rust-container.sh \
-            'bash .github/scripts/rust-container-setup.sh && rustup component add clippy && sccache --zero-stats && cargo clippy --all-targets -- -D warnings && sccache --show-stats'
+            'bash .github/scripts/rust-container-setup.sh && rustup component add clippy && sccache --zero-stats && cargo build --all-targets && cargo clippy --all-targets --no-deps -- -D warnings && sccache --show-stats'
 
   test:
     name: Test
     runs-on: hyperbytedb-operator-controller
-    needs: [fmt, doc_links]
+    # Run after Clippy so node-local sccache and rust-cache are warm. When Test
+    # started in parallel with Clippy it always saw 0% sccache hits because
+    # Clippy had not finished writing the cache yet (and rust-cache had not saved).
+    needs: [clippy]
     steps:
       - uses: actions/checkout@v4
 
@@ -98,20 +101,17 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Run unit tests
+      # Single container session: one rust-container-setup, shared target/ and
+      # sccache across all test suites (avoids three cold docker runs).
+      - name: Run tests
         run: |
           bash .github/scripts/run-in-rust-container.sh \
-            'bash .github/scripts/rust-container-setup.sh && sccache --zero-stats && cargo test --lib && sccache --show-stats'
-
-      - name: Run integration tests
-        run: |
-          bash .github/scripts/run-in-rust-container.sh \
-            'bash .github/scripts/rust-container-setup.sh && cargo test --test '"'"'*'"'"' && sccache --show-stats'
-
-      - name: Run hyperbytedb-cli tests
-        run: |
-          bash .github/scripts/run-in-rust-container.sh \
-            'bash .github/scripts/rust-container-setup.sh && cargo test -p hyperbytedb-cli && sccache --show-stats'
+            'bash .github/scripts/rust-container-setup.sh && \
+             sccache --zero-stats && \
+             cargo test --lib && \
+             cargo test --test '"'"'*'"'"' && \
+             cargo test -p hyperbytedb-cli && \
+             sccache --show-stats'
 
   build:
     name: Build
