@@ -28,7 +28,7 @@ name: Release
 on:
   push:
     branches:
-      - main
+      - feat_release_optimisation
     tags: ["v*"]
 
 permissions:
