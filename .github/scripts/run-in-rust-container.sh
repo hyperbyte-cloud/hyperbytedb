@@ -33,6 +33,15 @@ docker_args=(
   -e "CARGO_INCREMENTAL=${CARGO_INCREMENTAL:-0}"
 )
 
+# Optional emulated platform (e.g. linux/arm64). Used by the release pipeline to
+# build aarch64 binaries on the amd64 runner via QEMU/binfmt. Requires
+# docker/setup-qemu-action to have registered binfmt handlers first. sccache keys
+# objects by target triple, so emulated arm64 builds share the same node-local
+# SCCACHE_DIR as the native amd64 builds without collisions.
+if [ -n "${RUST_PLATFORM:-}" ]; then
+  docker_args+=(--platform "${RUST_PLATFORM}")
+fi
+
 if [ -n "${CARGO_HOME:-}" ]; then
   docker_args+=(-e "CARGO_HOME=${CARGO_HOME}" -v "${CARGO_HOME}:${CARGO_HOME}")
 fi

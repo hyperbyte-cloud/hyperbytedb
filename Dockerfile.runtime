@@ -1,0 +1,54 @@
+# syntax=docker/dockerfile:1
+#
+# Release runtime image assembled from PREBUILT binaries — it performs no
+# compilation. The release workflow (.github/workflows/release.yml) compiles
+# hyperbytedb / hyperbytedb-cli for each architecture through the warm
+# node-local sccache (the same cache CI uses), drops the results into a
+# per-arch staging tree, and points this Dockerfile at that tree as its build
+# context:
+#
+#   release-staging/
+#     amd64/{hyperbytedb, hyperbytedb-cli, libchdb.so}
+#     arm64/{hyperbytedb, hyperbytedb-cli, libchdb.so}
+#
+# A single multi-platform `docker buildx build` then selects the right per-arch
+# directory via the BuildKit-provided $TARGETARCH (amd64 / arm64), so the only
+# work done under QEMU emulation is the trivial apt layer below — never a Rust
+# compile. For building the image from source (local / kind) use ./Dockerfile.
+FROM debian:bookworm-slim
+
+# Set automatically by buildx per target platform: "amd64" or "arm64". Selects
+# which staging subdirectory to copy from.
+ARG TARGETARCH
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libstdc++6 curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY ${TARGETARCH}/libchdb.so /usr/local/lib/libchdb.so
+RUN ldconfig
+
+COPY ${TARGETARCH}/hyperbytedb /usr/local/bin/hyperbytedb
+COPY ${TARGETARCH}/hyperbytedb-cli /usr/local/bin/hyperbytedb-cli
+
+RUN mkdir -p /var/lib/hyperbytedb/wal /var/lib/hyperbytedb/meta \
+             /var/lib/hyperbytedb/chdb /var/lib/hyperbytedb/raft
+
+ENV HYPERBYTEDB__STORAGE__WAL_DIR=/var/lib/hyperbytedb/wal \
+    HYPERBYTEDB__STORAGE__META_DIR=/var/lib/hyperbytedb/meta \
+    HYPERBYTEDB__CHDB__SESSION_DATA_PATH=/var/lib/hyperbytedb/chdb \
+    HYPERBYTEDB__CLUSTER__RAFT_DIR=/var/lib/hyperbytedb/raft \
+    HYPERBYTEDB__LOGGING__LEVEL=info
+
+# Cap glibc's per-thread heap arenas. Without this, glibc creates up to
+# ~8×CPU arenas of 64 MiB each — we observed 22 of them resident in
+# production, contributing ~200–300 MiB of fragmented anonymous RSS
+# that the application never asked for. `2` is the conventional
+# server-side Rust+Tokio setting: enough to avoid the single-arena
+# contention pathology, small enough that fragmentation stays bounded.
+ENV MALLOC_ARENA_MAX=2
+
+EXPOSE 8086
+
+ENTRYPOINT ["hyperbytedb"]
+CMD ["serve"]
