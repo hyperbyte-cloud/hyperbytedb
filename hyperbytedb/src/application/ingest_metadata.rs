@@ -116,6 +116,69 @@ impl IngestSchemaCache {
     }
 }
 
+/// Merge tag keys from durable metadata with those seen in the current batch.
+async fn merged_tag_keys(
+    metadata: &Arc<dyn MetadataPort>,
+    db: &str,
+    measurement: &str,
+    batch_tag_keys: &BTreeSet<String>,
+) -> Result<BTreeSet<String>, HyperbytedbError> {
+    let mut tag_keys = batch_tag_keys.clone();
+    if let Some(existing) = metadata.get_measurement(db, measurement).await? {
+        for k in &existing.tag_keys {
+            tag_keys.insert(k.clone());
+        }
+    }
+    Ok(tag_keys)
+}
+
+/// Ensure SHOW TAG KEYS/VALUES indexes reflect tags observed on written points.
+/// Merges with existing measurement metadata rather than replacing tag keys.
+pub async fn backfill_tag_metadata(
+    metadata: &Arc<dyn MetadataPort>,
+    db: &str,
+    measurement: &str,
+    tags: impl IntoIterator<Item = (String, String)>,
+) -> Result<(), HyperbytedbError> {
+    let mut tag_keys: BTreeSet<String> = BTreeSet::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut tag_batch: Vec<(String, String)> = Vec::new();
+    for (k, v) in tags {
+        tag_keys.insert(k.clone());
+        if seen.insert((k.clone(), v.clone())) {
+            tag_batch.push((k, v));
+        }
+    }
+    if tag_keys.is_empty() {
+        return Ok(());
+    }
+
+    let mut meas_updates: Vec<MeasurementMeta> = Vec::new();
+    if let Some(mut existing) = metadata.get_measurement(db, measurement).await? {
+        let before_len = existing.tag_keys.len();
+        for k in &tag_keys {
+            if !existing.tag_keys.contains(k) {
+                existing.tag_keys.push(k.clone());
+            }
+        }
+        existing.tag_keys.sort();
+        if existing.tag_keys.len() != before_len {
+            meas_updates.push(existing);
+        }
+    } else {
+        meas_updates.push(MeasurementMeta {
+            name: measurement.to_string(),
+            field_types: HashMap::new(),
+            tag_keys: tag_keys.into_iter().collect(),
+        });
+    }
+
+    let tag_entries = vec![(measurement.to_string(), tag_batch)];
+    metadata
+        .register_metadata_batch(db, &meas_updates, &tag_entries)
+        .await
+}
+
 /// Fast-path metadata preparation for columnar batches.
 ///
 /// Works directly from the wire format without expanding to `Vec<Point>`,
@@ -158,7 +221,6 @@ pub async fn prepare_columnar_metadata(
                 }
             })
             .collect();
-        sc.mark_tags(&novel_hashes);
 
         if !novel_hashes.is_empty() {
             let tag_batch: Vec<(String, String)> = batch
@@ -171,14 +233,10 @@ pub async fn prepare_columnar_metadata(
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
             if !tag_batch.is_empty() {
-                let meta = metadata.clone();
-                let db_owned = db.to_string();
-                let meas = batch.measurement.clone();
-                tokio::spawn(async move {
-                    let _ = meta
-                        .register_metadata_batch(&db_owned, &[], &[(meas, tag_batch)])
-                        .await;
-                });
+                metadata
+                    .register_metadata_batch(db, &[], &[(batch.measurement.clone(), tag_batch)])
+                    .await?;
+                sc.mark_tags(&novel_hashes);
             }
         }
         metrics::counter!("hyperbytedb_ingest_schema_cache_hits_total").increment(1);
@@ -234,7 +292,10 @@ pub async fn prepare_columnar_metadata(
     let metas = vec![MeasurementMeta {
         name: batch.measurement.clone(),
         field_types: field_types.clone(),
-        tag_keys: tag_keys.iter().cloned().collect(),
+        tag_keys: merged_tag_keys(metadata, db, &batch.measurement, &tag_keys)
+            .await?
+            .into_iter()
+            .collect(),
     }];
 
     let tag_batch: Vec<(String, String)> = batch
@@ -251,7 +312,8 @@ pub async fn prepare_columnar_metadata(
     metadata.register_metadata_batch(db, &metas, &tags).await?;
 
     if let Some(sc) = schema_cache {
-        sc.mark_schema(db, &batch.measurement, &field_types, &tag_keys);
+        let merged = merged_tag_keys(metadata, db, &batch.measurement, &tag_keys).await?;
+        sc.mark_schema(db, &batch.measurement, &field_types, &merged);
         let novel_hashes: Vec<(u64,)> = batch
             .tags
             .iter()
@@ -303,9 +365,10 @@ pub async fn prepare_batch_metadata(
                 return Ok(());
             }
 
-            // Schema hit but novel tag values — update cache immediately and
-            // fire-and-forget the RocksDB persistence.  Tag values are only
-            // needed for SHOW TAG VALUES queries, not write correctness.
+            // Schema hit but novel tag values — persist before updating the cache.
+            // Tag values are only needed for SHOW TAG VALUES queries, not write
+            // correctness, but import-style bulk loads query metadata immediately
+            // after the write returns.
             let novel_hashes: Vec<(u64,)> = points
                 .iter()
                 .flat_map(|p| {
@@ -319,9 +382,8 @@ pub async fn prepare_batch_metadata(
                     })
                 })
                 .collect();
-            sc.mark_tags(&novel_hashes);
 
-            // Collect only truly novel tag values for async persistence
+            // Collect only truly novel tag values for persistence
             let novel_set: HashSet<u64> = novel_hashes.iter().map(|(h,)| *h).collect();
             let mut tag_batch_for_bg: Vec<(String, Vec<(String, String)>)> = Vec::new();
             for meas_name in measurements.keys() {
@@ -340,13 +402,10 @@ pub async fn prepare_batch_metadata(
                 }
             }
             if !tag_batch_for_bg.is_empty() {
-                let meta = metadata.clone();
-                let db_owned = db.to_string();
-                tokio::spawn(async move {
-                    let _ = meta
-                        .register_metadata_batch(&db_owned, &[], &tag_batch_for_bg)
-                        .await;
-                });
+                metadata
+                    .register_metadata_batch(db, &[], &tag_batch_for_bg)
+                    .await?;
+                sc.mark_tags(&novel_hashes);
             }
             metrics::counter!("hyperbytedb_ingest_schema_cache_hits_total").increment(1);
             return Ok(());
@@ -417,10 +476,11 @@ pub async fn prepare_batch_metadata(
     let mut all_tags: Vec<(String, Vec<(String, String)>)> = Vec::with_capacity(measurements.len());
 
     for (meas_name, (field_types, _tag_keys)) in &measurements {
+        let merged = merged_tag_keys(metadata, db, meas_name, &measurements[meas_name].1).await?;
         all_metas.push(MeasurementMeta {
             name: meas_name.clone(),
             field_types: field_types.clone(),
-            tag_keys: measurements[meas_name].1.iter().cloned().collect(),
+            tag_keys: merged.into_iter().collect(),
         });
 
         let mut seen: HashSet<(String, String)> = HashSet::new();
@@ -443,7 +503,8 @@ pub async fn prepare_batch_metadata(
 
     if let Some(sc) = schema_cache {
         for (name, (fields, tags)) in &measurements {
-            sc.mark_schema(db, name, fields, tags);
+            let merged = merged_tag_keys(metadata, db, name, tags).await?;
+            sc.mark_schema(db, name, fields, &merged);
         }
         let novel_hashes: Vec<(u64,)> = points
             .iter()

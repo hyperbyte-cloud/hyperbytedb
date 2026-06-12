@@ -1,8 +1,12 @@
+mod complete;
 mod meta;
 
+use std::sync::Arc;
 use std::time::Instant;
 
-use rustyline::DefaultEditor;
+use parking_lot::RwLock;
+use rustyline::Config;
+use rustyline::Editor;
 use rustyline::error::ReadlineError;
 
 use crate::client::{HyperbytedbClient, QueryOptions};
@@ -11,6 +15,7 @@ use crate::error::{CliError, Result};
 use crate::output::format_response;
 use crate::session::Session;
 
+use complete::{CliHelper, CompletionCache, refresh_databases_cache, refresh_measurements_cache};
 use meta::{MetaAction, handle_meta, is_meta_command};
 
 pub async fn run_repl(mut session: Session) -> Result<()> {
@@ -32,7 +37,19 @@ pub async fn run_repl(mut session: Session) -> Result<()> {
     }
 
     let history_path = history_file_path();
-    let mut rl = DefaultEditor::new().map_err(|e| CliError::Other(e.to_string()))?;
+    let cache = Arc::new(RwLock::new(CompletionCache::default()));
+    if let Err(e) = refresh_databases_cache(&cache, &client).await {
+        eprintln!("warning: could not load database names for tab completion: {e}");
+    }
+    if let Some(db) = session.effective_database()
+        && let Err(e) = refresh_measurements_cache(&cache, &client, db).await
+    {
+        eprintln!("warning: could not load measurement names for tab completion: {e}");
+    }
+
+    let config = Config::builder().build();
+    let mut rl = Editor::with_config(config).map_err(|e| CliError::Other(e.to_string()))?;
+    rl.set_helper(Some(CliHelper::new(cache.clone())));
     let _ = rl.load_history(&history_path);
 
     loop {
@@ -52,7 +69,7 @@ pub async fn run_repl(mut session: Session) -> Result<()> {
                 let _ = rl.add_history_entry(trimmed);
 
                 if is_meta_command(trimmed) {
-                    match handle_meta(&mut session, &mut client, trimmed).await? {
+                    match handle_meta(&mut session, &mut client, trimmed, &cache).await? {
                         MetaAction::Exit => break,
                         MetaAction::Continue | MetaAction::Executed => continue,
                     }
