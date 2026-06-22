@@ -426,7 +426,7 @@ impl PeerClient {
             }
         };
 
-        tracing::info!(peer_id = peer_id, "draining hinted handoff queue");
+        tracing::debug!(peer_id = peer_id, "draining hinted handoff queue");
         let mut total_replayed = 0u64;
 
         loop {
@@ -479,7 +479,7 @@ impl PeerClient {
         }
 
         if total_replayed > 0 {
-            tracing::info!(
+            tracing::debug!(
                 peer_id = peer_id,
                 replayed = total_replayed,
                 "hinted handoff drain complete"

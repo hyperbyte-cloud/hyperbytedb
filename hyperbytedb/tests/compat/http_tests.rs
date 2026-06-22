@@ -16,6 +16,7 @@ use hyperbytedb::adapters::metadata::rocksdb_meta::RocksDbMetadata;
 use hyperbytedb::adapters::wal::rocksdb_wal::RocksDbWal;
 use hyperbytedb::application::flush_service::FlushServiceImpl;
 use hyperbytedb::application::ingestion_service::IngestionServiceImpl;
+use hyperbytedb::application::materialized_view_service::MaterializedViewService;
 use hyperbytedb::application::query_service::QueryServiceImpl;
 use hyperbytedb::domain::point::Point;
 use hyperbytedb::error::HyperbytedbError;
@@ -90,7 +91,13 @@ impl HttpTestContext {
             points_sink.clone(),
         ));
 
-        let flush = Arc::new(FlushServiceImpl::new(wal.clone(), 0, points_sink));
+        let flush = Arc::new(FlushServiceImpl::new(wal.clone(), 0, points_sink.clone()));
+
+        let mv_service = Arc::new(MaterializedViewService::new(
+            metadata.clone(),
+            query_port.clone(),
+            points_sink.clone(),
+        ));
 
         let state = Arc::new(AppState {
             ingestion,
@@ -98,6 +105,8 @@ impl HttpTestContext {
             query_port,
             metadata: metadata.clone() as Arc<dyn MetadataPort>,
             wal: wal.clone(),
+            points_sink,
+            mv_service,
             auth: Arc::new(hyperbytedb::adapters::auth::MetadataAuthAdapter::new(
                 metadata,
             )),

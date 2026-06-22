@@ -13,19 +13,20 @@ use crate::adapters::cluster::peer_client::PeerClient;
 use crate::adapters::cluster::raft::HyperbytedbRaft;
 use crate::adapters::cluster::replication_log::ReplicationLog;
 use crate::application::cluster::drain::DrainService;
+use crate::application::materialized_view_service::MaterializedViewService;
 use crate::application::replication_apply::ReplicationApplyQueue;
 use crate::application::statement_summary::StatementSummary;
 use crate::domain::cluster::membership::SharedMembership;
 use crate::ports::{
-    auth::AuthPort, ingestion::IngestionPort, metadata::MetadataPort, query::QueryPort,
-    wal::WalPort,
+    auth::AuthPort, ingestion::IngestionPort, metadata::MetadataPort, points_sink::PointsSinkPort,
+    query::QueryPort, wal::WalPort,
 };
 
 pub use crate::ports::query::QueryService;
 
 use super::{
-    auth_middleware, cluster, metrics, middleware as http_middleware, peer_handlers, ping, query,
-    raft_handlers, statements, write,
+    auth_middleware, chdb, cluster, metrics, middleware as http_middleware, peer_handlers, ping,
+    query, raft_handlers, statements, write,
 };
 
 pub struct AppState {
@@ -35,6 +36,7 @@ pub struct AppState {
     pub query_port: Arc<dyn QueryPort>,
     pub metadata: Arc<dyn MetadataPort>,
     pub wal: Arc<dyn WalPort>,
+    pub points_sink: Arc<dyn PointsSinkPort>,
     pub auth: Arc<dyn AuthPort>,
     pub peer_client: Option<Arc<PeerClient>>,
     pub membership: Option<SharedMembership>,
@@ -44,6 +46,7 @@ pub struct AppState {
     pub auth_enabled: bool,
     pub prometheus_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     pub statement_summary: Option<Arc<StatementSummary>>,
+    pub mv_service: Arc<MaterializedViewService>,
     /// Applies `/internal/replicate` payloads off the HTTP thread (bounded).
     pub replication_apply: Option<Arc<ReplicationApplyQueue>>,
     pub chdb_session_data_path: String,
@@ -96,6 +99,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/statements",
             get(statements::handle_list).delete(statements::handle_reset),
+        )
+        .route(
+            "/api/v1/chdb",
+            post(chdb::handle_chdb).layer(axum::middleware::from_fn_with_state(
+                auth_state.clone(),
+                auth_middleware::auth_layer,
+            )),
         );
 
     if state.peer_client.is_some() {

@@ -10,13 +10,17 @@ use crate::application::materialized_view_service::MaterializedViewService;
 use crate::application::replication_dispatch::dispatch_outbound_replication;
 use crate::application::system_trace::{self, PhaseTimer};
 use crate::config::ReplicationConfig;
-use crate::domain::chdb_naming::{quoted_series_table_name, quoted_table_name};
+use crate::domain::chdb_naming::{
+    quote_backticks, quoted_series_table_name, quoted_table_name, unquoted_series_table_name,
+};
 use crate::domain::column_mapping::{ColumnMapping, measurement_meta_fingerprint};
+use crate::domain::continuous_query::ContinuousQueryDef;
+use crate::domain::cq_schedule::{coverage_window, should_run};
 use crate::domain::database::Precision;
 use crate::domain::query_result::{QueryResponse, SeriesResult, StatementResult};
 use crate::error::HyperbytedbError;
 use crate::ports::metadata::MetadataPort;
-use crate::ports::query::{QueryPort, QueryService};
+use crate::ports::query::{CqRunResult, QueryPort, QueryService};
 use crate::ports::replication::{OutboundReplicationBatch, ReplicationPort};
 use crate::timeseriesql::ast::*;
 use crate::timeseriesql::to_clickhouse;
@@ -114,9 +118,71 @@ impl QueryServiceImpl {
         self.replication_config = replication_config;
         self
     }
+
+    /// Execute one InfluxDB v1-style continuous query run at `now`.
+    pub async fn execute_continuous_query(
+        &self,
+        cq: &mut ContinuousQueryDef,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<CqRunResult, HyperbytedbError> {
+        use metrics::{counter, histogram};
+        use std::time::Instant;
+
+        cq.normalize()?;
+        if !should_run(now, cq) {
+            return Err(HyperbytedbError::QueryParse(
+                "continuous query is not due at this time".to_string(),
+            ));
+        }
+
+        let started = Instant::now();
+        let window = coverage_window(now, cq);
+        let start_nanos = window.start.timestamp_nanos_opt().unwrap_or(0);
+        let end_nanos = window.end.timestamp_nanos_opt().unwrap_or(0);
+
+        let stmts = crate::timeseriesql::parse(&cq.query_text)?;
+        let select_stmt = match stmts.into_iter().next() {
+            Some(Statement::Select(s)) => s,
+            _ => {
+                return Err(HyperbytedbError::QueryParse(
+                    "continuous query body must be a SELECT statement".to_string(),
+                ));
+            }
+        };
+
+        let prepared =
+            to_clickhouse::prepare_cq_select(&select_stmt, start_nanos, end_nanos, !cq.is_advanced);
+
+        tracing::debug!(
+            cq = %cq.name,
+            db = %cq.database,
+            window_start = %window.start,
+            window_end = %window.end,
+            "executing continuous query"
+        );
+
+        let points_written = execute_select_into(self, &cq.database, &prepared, None).await?;
+
+        cq.last_run_at = Some(now.to_rfc3339());
+        self.metadata
+            .store_continuous_query(&cq.database, &cq.name, cq)
+            .await?;
+
+        let duration_ms = started.elapsed().as_millis() as u64;
+        counter!("hyperbytedb_cq_executions_total").increment(1);
+        histogram!("hyperbytedb_cq_duration_ms").record(duration_ms as f64);
+        histogram!("hyperbytedb_cq_window_secs")
+            .record((end_nanos - start_nanos) as f64 / 1_000_000_000.0);
+
+        Ok(CqRunResult {
+            window,
+            points_written,
+            duration_ms,
+        })
+    }
 }
 
-fn check_authorization(
+pub(crate) fn check_authorization(
     user: &crate::domain::user::StoredUser,
     db: &str,
     stmt: &Statement,
@@ -188,6 +254,7 @@ fn is_mutating_statement(stmt: &Statement) -> bool {
         Statement::CreateDatabase(_)
         | Statement::DropDatabase(_)
         | Statement::DropMeasurement(_)
+        | Statement::DropSeries(_)
         | Statement::DropUser(_)
         | Statement::CreateRetentionPolicyStmt { .. }
         | Statement::AlterRetentionPolicyStmt { .. }
@@ -211,6 +278,7 @@ impl QueryService for QueryServiceImpl {
         db: &str,
         query: &str,
         epoch: Option<&str>,
+        retention_policy: Option<&str>,
         caller: Option<&crate::domain::user::StoredUser>,
     ) -> Result<QueryResponse, HyperbytedbError> {
         let timeout = std::time::Duration::from_secs(self.query_timeout_secs);
@@ -233,6 +301,7 @@ impl QueryService for QueryServiceImpl {
             let svc = Arc::new(self.clone());
             let db_arc = Arc::<str>::from(db);
             let epoch_arc = epoch.map(Arc::<str>::from);
+            let rp_arc = retention_policy.map(Arc::<str>::from);
 
             let mut results = Vec::with_capacity(stmt_count);
             let mut i = 0usize;
@@ -244,6 +313,7 @@ impl QueryService for QueryServiceImpl {
                         db_arc.as_ref(),
                         &stmts[i],
                         epoch_arc.as_deref(),
+                        rp_arc.as_deref(),
                         statement_id,
                     )
                     .await?;
@@ -259,6 +329,7 @@ impl QueryService for QueryServiceImpl {
                         let svc = Arc::clone(&svc);
                         let db_arc = Arc::clone(&db_arc);
                         let epoch_arc = epoch_arc.clone();
+                        let rp_arc = rp_arc.clone();
                         let stmt = &stmts[j];
 
                         async move {
@@ -267,6 +338,7 @@ impl QueryService for QueryServiceImpl {
                                 db_arc.as_ref(),
                                 stmt,
                                 epoch_arc.as_deref(),
+                                rp_arc.as_deref(),
                                 statement_id,
                             )
                             .await
@@ -287,6 +359,14 @@ impl QueryService for QueryServiceImpl {
             Err(_) => Err(HyperbytedbError::QueryTimeout),
         }
     }
+
+    async fn execute_continuous_query(
+        &self,
+        cq: &mut ContinuousQueryDef,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<CqRunResult, HyperbytedbError> {
+        QueryServiceImpl::execute_continuous_query(self, cq, now).await
+    }
 }
 
 async fn execute_statement(
@@ -294,6 +374,7 @@ async fn execute_statement(
     db: &str,
     stmt: &Statement,
     epoch: Option<&str>,
+    query_rp: Option<&str>,
     statement_id: u32,
 ) -> Result<StatementResult, HyperbytedbError> {
     match stmt {
@@ -325,7 +406,9 @@ async fn execute_statement(
                     error: Some("database is required".to_string()),
                 });
             }
-            let names = svc.metadata.list_measurements(db).await?;
+            let rp = resolve_retention_policy_for_select(svc.metadata.as_ref(), db, None, query_rp)
+                .await;
+            let names = list_measurements_for_rp(svc, db, &rp).await?;
             let columns = vec!["name".to_string()];
             let values: Vec<Vec<serde_json::Value>> = names
                 .iter()
@@ -346,7 +429,26 @@ async fn execute_statement(
         Statement::ShowTagKeys(s) => {
             let db = s.database.as_deref().unwrap_or(db);
             let measurement = s.from.as_ref().and_then(|m| m.name_str());
-            let keys = svc.metadata.list_tag_keys(db, measurement).await?;
+            let keys = if let Some(m) = s.from.as_ref() {
+                if let Some(name) = m.name_str() {
+                    if m.retention_policy.is_some() {
+                        let query_db = m.database.as_deref().unwrap_or(db);
+                        let rp = resolve_retention_policy(
+                            svc.metadata.as_ref(),
+                            query_db,
+                            m.retention_policy.as_deref(),
+                        )
+                        .await;
+                        tag_keys_for_measurement(svc, query_db, &rp, name).await?
+                    } else {
+                        svc.metadata.list_tag_keys(db, Some(name)).await?
+                    }
+                } else {
+                    svc.metadata.list_tag_keys(db, measurement).await?
+                }
+            } else {
+                svc.metadata.list_tag_keys(db, measurement).await?
+            };
             let columns = vec!["tagKey".to_string()];
             let values: Vec<Vec<serde_json::Value>> = keys
                 .iter()
@@ -368,7 +470,22 @@ async fn execute_statement(
             let db = s.database.as_deref().unwrap_or(db);
             let measurement = s.from.as_ref().and_then(|m| m.name_str());
 
-            let all_tag_keys = svc.metadata.list_tag_keys(db, measurement).await?;
+            let all_tag_keys = if let (Some(m), Some(name)) = (s.from.as_ref(), measurement) {
+                if m.retention_policy.is_some() {
+                    let query_db = m.database.as_deref().unwrap_or(db);
+                    let rp = resolve_retention_policy(
+                        svc.metadata.as_ref(),
+                        query_db,
+                        m.retention_policy.as_deref(),
+                    )
+                    .await;
+                    tag_keys_for_measurement(svc, query_db, &rp, name).await?
+                } else {
+                    svc.metadata.list_tag_keys(db, Some(name)).await?
+                }
+            } else {
+                svc.metadata.list_tag_keys(db, measurement).await?
+            };
 
             let matching_keys: Vec<String> = match &s.tag_key {
                 TagKeySelector::All => all_tag_keys,
@@ -392,10 +509,26 @@ async fn execute_statement(
 
             let mut all_values = Vec::new();
             for tag_key in &matching_keys {
-                let values_list = svc
-                    .metadata
-                    .list_tag_values(db, tag_key, measurement)
-                    .await?;
+                let values_list = if let (Some(m), Some(name)) = (s.from.as_ref(), measurement) {
+                    if m.retention_policy.is_some() {
+                        let query_db = m.database.as_deref().unwrap_or(db);
+                        let rp = resolve_retention_policy(
+                            svc.metadata.as_ref(),
+                            query_db,
+                            m.retention_policy.as_deref(),
+                        )
+                        .await;
+                        tag_values_for_measurement(svc, query_db, &rp, name, tag_key).await?
+                    } else {
+                        svc.metadata
+                            .list_tag_values(db, tag_key, Some(name))
+                            .await?
+                    }
+                } else {
+                    svc.metadata
+                        .list_tag_values(db, tag_key, measurement)
+                        .await?
+                };
                 for v in values_list {
                     all_values.push(vec![
                         serde_json::Value::String(tag_key.clone()),
@@ -459,8 +592,8 @@ async fn execute_statement(
                 error: None,
             })
         }
-        Statement::CreateDatabase(name) => {
-            svc.metadata.create_database(name).await?;
+        Statement::CreateDatabase(stmt) => {
+            svc.metadata.create_database_with(stmt).await?;
             Ok(StatementResult {
                 statement_id,
                 series: Some(vec![]),
@@ -523,135 +656,9 @@ async fn execute_statement(
                     error: Some("database is required".to_string()),
                 });
             }
-            let rp = svc
-                .metadata
-                .get_default_rp(db)
-                .await
-                .unwrap_or_else(|_| "autogen".to_string());
 
-            let source = select_stmt.from.first().ok_or_else(|| {
-                HyperbytedbError::QueryParse("SELECT requires FROM clause".to_string())
-            })?;
-
-            let group_by_tags: Vec<String> = select_stmt
-                .group_by
-                .as_ref()
-                .map(|gb| {
-                    gb.tag_dimensions()
-                        .into_iter()
-                        .map(|s| s.to_string())
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            let (time_min, time_max) =
-                to_clickhouse::extract_time_bounds(select_stmt.condition.as_ref());
-
-            let mut all_series = match source {
-                MeasurementSource::Concrete(m) => match &m.name {
-                    MeasurementName::Regex(pattern) => {
-                        let measurements = svc.metadata.list_measurements(db).await?;
-                        let matching: Vec<_> = {
-                            let re = regex_pattern_matches(pattern);
-                            measurements.into_iter().filter(|m| re(m)).collect()
-                        };
-                        let futs: Vec<_> = matching
-                            .iter()
-                            .map(|meas_name| {
-                                execute_measurement_query(
-                                    svc,
-                                    db,
-                                    &rp,
-                                    meas_name,
-                                    select_stmt,
-                                    time_min,
-                                    time_max,
-                                    epoch,
-                                    &group_by_tags,
-                                )
-                            })
-                            .collect();
-                        let results = futures::future::join_all(futs).await;
-                        let mut combined = Vec::new();
-                        for result in results {
-                            combined.append(&mut result?);
-                        }
-                        combined
-                    }
-                    MeasurementName::Name(name) => {
-                        execute_measurement_query(
-                            svc,
-                            db,
-                            &rp,
-                            name,
-                            select_stmt,
-                            time_min,
-                            time_max,
-                            epoch,
-                            &group_by_tags,
-                        )
-                        .await?
-                    }
-                },
-                MeasurementSource::Subquery(sub_stmt) => {
-                    let sub_source = sub_stmt
-                        .from
-                        .first()
-                        .and_then(|s| s.name_str())
-                        .ok_or_else(|| {
-                            HyperbytedbError::QueryParse(
-                                "subquery requires measurement".to_string(),
-                            )
-                        })?;
-                    let sub_mapping = svc.column_mapping_for(db, sub_source).await?;
-                    let table = quoted_table_name(db, &rp, sub_source);
-                    let sub_series_table = quoted_series_table_name(db, &rp, sub_source);
-                    let sub_series_join = sub_mapping.as_ref().map(|_| to_clickhouse::SeriesJoin {
-                        table: &sub_series_table,
-                        force: false,
-                    });
-                    let sub_tag_keys = tag_keys_from_mapping(sub_mapping.as_ref());
-                    let (sub_stmt_expanded, _) =
-                        select_with_expanded_group_by(sub_stmt, &sub_tag_keys);
-                    let (select_stmt_expanded, resolved_group_by_tags) =
-                        select_with_expanded_group_by(select_stmt, &sub_tag_keys);
-                    let sub_sql = to_clickhouse::translate_native_table(
-                        &sub_stmt_expanded,
-                        &table,
-                        sub_mapping.as_ref(),
-                        sub_series_join,
-                    )?;
-                    let outer_sql = to_clickhouse::translate_with_source(
-                        &select_stmt_expanded,
-                        &format!("({})", sub_sql),
-                    )?;
-                    let raw = svc.query_port.execute_sql(&outer_sql).await?;
-                    parse_json_each_row_to_series(
-                        &raw,
-                        sub_source,
-                        epoch,
-                        &resolved_group_by_tags,
-                        drop_fill_null_buckets(select_stmt),
-                    )?
-                }
-            };
-
-            // Apply SLIMIT/SOFFSET (series-level pagination)
-            if select_stmt.slimit.is_some() || select_stmt.soffset.is_some() {
-                let soffset = select_stmt.soffset.unwrap_or(0) as usize;
-                let slimit = select_stmt.slimit.unwrap_or(u64::MAX) as usize;
-                let len = all_series.len();
-                let start = soffset.min(len);
-                let end = (start + slimit).min(len);
-                all_series = all_series[start..end].to_vec();
-            }
-
-            // Handle INTO clause: write results back as a new measurement
-            if let Some(ref into_target) = select_stmt.into
-                && let MeasurementName::Name(ref target_name) = into_target.name
-            {
-                let into_db = into_target.database.as_deref().unwrap_or(db);
-                let count = write_series_as_points(svc, into_db, target_name, &all_series).await?;
+            if select_stmt.into.is_some() {
+                let count = execute_select_into(svc, db, select_stmt, epoch).await?;
                 return Ok(StatementResult {
                     statement_id,
                     series: Some(vec![SeriesResult {
@@ -668,6 +675,53 @@ async fn execute_statement(
                 });
             }
 
+            let group_by_tags: Vec<String> = select_stmt
+                .group_by
+                .as_ref()
+                .map(|gb| {
+                    gb.tag_dimensions()
+                        .into_iter()
+                        .map(|s| s.to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let (time_min, time_max) =
+                to_clickhouse::extract_time_bounds(select_stmt.condition.as_ref());
+
+            if select_stmt.from.is_empty() {
+                return Err(HyperbytedbError::QueryParse(
+                    "SELECT requires FROM clause".to_string(),
+                ));
+            }
+
+            let mut all_series = Vec::new();
+            for source in &select_stmt.from {
+                let mut series = execute_select_from_source(
+                    svc,
+                    db,
+                    select_stmt,
+                    source,
+                    time_min,
+                    time_max,
+                    epoch,
+                    &group_by_tags,
+                    query_rp,
+                )
+                .await?;
+                all_series.append(&mut series);
+            }
+
+            // Apply SLIMIT/SOFFSET (series-level pagination)
+            if select_stmt.slimit.is_some() || select_stmt.soffset.is_some() {
+                let soffset = select_stmt.soffset.unwrap_or(0) as usize;
+                let slimit = select_stmt.slimit.unwrap_or(u64::MAX) as usize;
+                let len = all_series.len();
+                let start = soffset.min(len);
+                let end = (start + slimit).min(len);
+                all_series = all_series[start..end].to_vec();
+            }
+
             Ok(StatementResult {
                 statement_id,
                 series: Some(all_series),
@@ -675,18 +729,44 @@ async fn execute_statement(
             })
         }
         Statement::ShowSeries(s) => {
-            let db = s.database.as_deref().unwrap_or(db);
-            let measurements = svc.metadata.list_measurements(db).await?;
+            use crate::domain::series::SeriesKey;
+
+            let query_db = s.database.as_deref().unwrap_or(db);
+            if query_db.is_empty() {
+                return Ok(StatementResult {
+                    statement_id,
+                    series: Some(vec![]),
+                    error: Some("database is required".to_string()),
+                });
+            }
+
+            let measurements: Vec<String> = if let Some(ref from) = s.from {
+                if let Some(name) = from.name_str() {
+                    vec![name.to_string()]
+                } else {
+                    svc.metadata.list_measurements(query_db).await?
+                }
+            } else {
+                svc.metadata.list_measurements(query_db).await?
+            };
+
+            let rps = svc
+                .metadata
+                .list_retention_policies(query_db)
+                .await
+                .unwrap_or_default();
+
             let mut values = Vec::new();
-            for m in &measurements {
-                if let Some(meta) = svc.metadata.get_measurement(db, m).await? {
-                    values.push(vec![serde_json::Value::String(format!(
-                        "{},{}",
-                        m,
-                        meta.tag_keys.join(",")
-                    ))]);
+            for rp in &rps {
+                for meas in &measurements {
+                    let series = svc.metadata.list_series(query_db, &rp.name, meas).await?;
+                    for (_, tags) in series {
+                        let key = SeriesKey::new(meas, &tags);
+                        values.push(vec![serde_json::Value::String(key.to_canonical())]);
+                    }
                 }
             }
+
             Ok(StatementResult {
                 statement_id,
                 series: Some(vec![SeriesResult {
@@ -729,19 +809,14 @@ async fn execute_statement(
             })
         }
         Statement::Delete(del) => {
-            // Convert the WHERE condition to SQL for tombstone storage, resolving
-            // tag identifiers to physical column names so the predicate matches
-            // the tag columns exposed by the series-rejoin inline view at query
-            // time (the fact table itself no longer stores tag columns).
-            let del_mapping = svc.column_mapping_for(db, &del.from).await?;
             let predicate_sql = if let Some(ref cond) = del.condition {
-                let mut sql = String::new();
-                to_clickhouse::translate_condition_with_mapping(
+                crate::application::predicate_sql::build_predicate_sql(
+                    &svc.metadata,
+                    db,
+                    &del.from,
                     cond,
-                    del_mapping.as_ref(),
-                    &mut sql,
-                )?;
-                sql
+                )
+                .await?
             } else {
                 String::new()
             };
@@ -750,7 +825,7 @@ async fn execute_statement(
                 .store_tombstone(db, &del.from, &predicate_sql)
                 .await?;
 
-            tracing::info!(
+            tracing::debug!(
                 db = db,
                 measurement = %del.from,
                 predicate = %predicate_sql,
@@ -764,26 +839,15 @@ async fn execute_statement(
             })
         }
         Statement::CreateContinuousQuery(cq) => {
-            use crate::ports::metadata::ContinuousQueryDef;
-
-            let resample_every_secs = cq
-                .resample_every
-                .as_ref()
-                .map(|d| (d.to_nanos() / 1_000_000_000) as u64);
-            let resample_for_secs = cq
-                .resample_for
-                .as_ref()
-                .map(|d| (d.to_nanos() / 1_000_000_000) as u64);
-
-            let query_text = cq.raw_query.clone();
-
-            let def = ContinuousQueryDef {
-                name: cq.name.clone(),
-                database: cq.database.clone(),
-                query_text,
-                resample_every_secs,
-                resample_for_secs,
-                created_at: chrono::Utc::now().to_rfc3339(),
+            let def = match ContinuousQueryDef::from_create(cq) {
+                Ok(def) => def,
+                Err(e) => {
+                    return Ok(StatementResult {
+                        statement_id,
+                        series: None,
+                        error: Some(e.to_string()),
+                    });
+                }
             };
 
             svc.metadata
@@ -798,37 +862,34 @@ async fn execute_statement(
         }
         Statement::ShowContinuousQueries => {
             let dbs = svc.metadata.list_databases().await?;
-            let mut all_cqs = Vec::new();
+            let mut all_series = Vec::new();
             for db_entry in &dbs {
                 let cqs = svc.metadata.list_continuous_queries(&db_entry.name).await?;
-                all_cqs.extend(cqs);
-            }
-
-            let columns = vec![
-                "name".to_string(),
-                "database".to_string(),
-                "query".to_string(),
-            ];
-            let values: Vec<Vec<serde_json::Value>> = all_cqs
-                .iter()
-                .map(|cq| {
-                    vec![
-                        serde_json::Value::String(cq.name.clone()),
-                        serde_json::Value::String(cq.database.clone()),
-                        serde_json::Value::String(cq.query_text.clone()),
-                    ]
-                })
-                .collect();
-
-            Ok(StatementResult {
-                statement_id,
-                series: Some(vec![SeriesResult {
-                    name: "continuous_queries".to_string(),
+                if cqs.is_empty() {
+                    continue;
+                }
+                let columns = vec!["name".to_string(), "query".to_string()];
+                let values: Vec<Vec<serde_json::Value>> = cqs
+                    .iter()
+                    .map(|cq| {
+                        vec![
+                            serde_json::Value::String(cq.name.clone()),
+                            serde_json::Value::String(reconstruct_cq_text(cq)),
+                        ]
+                    })
+                    .collect();
+                all_series.push(SeriesResult {
+                    name: db_entry.name.clone(),
                     tags: None,
                     columns,
                     values,
                     partial: None,
-                }]),
+                });
+            }
+
+            Ok(StatementResult {
+                statement_id,
+                series: Some(all_series),
                 error: None,
             })
         }
@@ -911,11 +972,10 @@ async fn execute_statement(
             let values: Vec<Vec<serde_json::Value>> = rps
                 .iter()
                 .map(|rp| {
-                    let dur_str = match rp.duration {
-                        Some(d) => format!("{}s", d.as_secs()),
-                        None => "0s".to_string(),
-                    };
-                    let sgd_str = format!("{}s", rp.shard_group_duration.as_secs());
+                    let dur_str = crate::domain::database::format_influx_duration(rp.duration);
+                    let sgd_str = crate::domain::database::format_influx_duration(Some(
+                        rp.shard_group_duration,
+                    ));
                     vec![
                         serde_json::Value::String(rp.name.clone()),
                         serde_json::Value::String(dur_str),
@@ -976,7 +1036,9 @@ async fn execute_statement(
             let shard_dur = shard_duration
                 .as_ref()
                 .map(|d| std::time::Duration::from_nanos(d.to_nanos() as u64))
-                .unwrap_or(std::time::Duration::from_secs(7 * 24 * 3600));
+                .unwrap_or_else(|| {
+                    crate::domain::database::derive_shard_group_duration(std_duration)
+                });
             let rp = crate::domain::database::RetentionPolicy {
                 name: name.clone(),
                 duration: std_duration,
@@ -1038,11 +1100,73 @@ async fn execute_statement(
                 error: None,
             })
         }
-        Statement::AlterRetentionPolicyStmt { .. } => Ok(StatementResult {
-            statement_id,
-            series: Some(vec![]),
-            error: None,
-        }),
+        Statement::AlterRetentionPolicyStmt {
+            name,
+            db: rp_db,
+            duration,
+            replication,
+            shard_duration,
+            is_default,
+        } => {
+            let target_db = if rp_db.is_empty() { db } else { rp_db.as_str() };
+            let change = RetentionPolicyChange {
+                duration: duration.as_ref().map(|d| {
+                    if d.value == 0 && d.unit == DurationUnit::Second {
+                        None
+                    } else {
+                        Some(d.clone())
+                    }
+                }),
+                replication: *replication,
+                shard_duration: shard_duration.clone(),
+                is_default: *is_default,
+            };
+            svc.metadata
+                .alter_retention_policy(target_db, name, &change)
+                .await?;
+            Ok(StatementResult {
+                statement_id,
+                series: Some(vec![]),
+                error: None,
+            })
+        }
+        Statement::DropSeries(s) => {
+            let target_db = s.database.as_deref().unwrap_or(db);
+            let measurement = s.from.as_ref().and_then(|n| match n {
+                MeasurementName::Name(n) => Some(n.clone()),
+                MeasurementName::Regex(_) => None,
+            });
+            let rp = svc.metadata.get_default_rp(target_db).await?;
+            let predicate_sql = if let Some(ref cond) = s.condition {
+                let meas = measurement.as_deref().unwrap_or("");
+                crate::application::predicate_sql::build_predicate_sql(
+                    &svc.metadata,
+                    target_db,
+                    meas,
+                    cond,
+                )
+                .await?
+            } else {
+                String::new()
+            };
+            if measurement.is_some() || !predicate_sql.is_empty() {
+                if let Some(ref meas) = measurement
+                    && !predicate_sql.is_empty()
+                {
+                    svc.metadata
+                        .store_tombstone(target_db, meas, &predicate_sql)
+                        .await?;
+                }
+                svc.metadata
+                    .delete_series_matching(target_db, &rp, measurement.as_deref(), &predicate_sql)
+                    .await?;
+            }
+            Ok(StatementResult {
+                statement_id,
+                series: Some(vec![]),
+                error: None,
+            })
+        }
         Statement::Grant { username, database } => {
             match database {
                 Some(db) => {
@@ -1102,31 +1226,6 @@ fn chdb_sanitize_non_json_number_tokens(line: &str) -> String {
         .to_string()
 }
 
-/// `fill(null)` with `GROUP BY time`: omit buckets where every value column is NULL
-/// (Influx shows nulls; we drop those rows from the JSON series so clients do not plot 0).
-#[inline]
-fn drop_fill_null_buckets(stmt: &SelectStatement) -> bool {
-    matches!(stmt.fill, Some(FillOption::Null))
-        && stmt
-            .group_by
-            .as_ref()
-            .and_then(|gb| gb.time_dimension())
-            .is_some()
-}
-
-fn series_omit_all_null_value_rows(series: &mut [SeriesResult]) {
-    for sr in series.iter_mut() {
-        let Some(time_idx) = sr.columns.iter().position(|c| c == "time") else {
-            continue;
-        };
-        sr.values.retain(|row| {
-            row.iter()
-                .enumerate()
-                .any(|(i, v)| i != time_idx && !v.is_null())
-        });
-    }
-}
-
 /// Parse one JSON object line from a JSONEachRow (or similar) chDB/ClickHouse result.
 fn parse_chdb_json_line(line: &str) -> Result<serde_json::Value, HyperbytedbError> {
     let mut parse_buf: Vec<u8> = line.as_bytes().to_vec();
@@ -1150,7 +1249,6 @@ fn parse_json_each_row_to_series(
     measurement: &str,
     epoch: Option<&str>,
     group_by_tags: &[String],
-    omit_all_null_buckets: bool,
 ) -> Result<Vec<SeriesResult>, HyperbytedbError> {
     if raw.trim().is_empty() {
         return Ok(vec![]);
@@ -1212,16 +1310,13 @@ fn parse_json_each_row_to_series(
             .iter()
             .map(|r| row_to_values(r, &col_pairs, time_idx, epoch))
             .collect();
-        let mut out = vec![SeriesResult {
+        let out = vec![SeriesResult {
             name: measurement.to_string(),
             tags: None,
             columns,
             values,
             partial: None,
         }];
-        if omit_all_null_buckets {
-            series_omit_all_null_value_rows(&mut out);
-        }
         return Ok(out);
     }
 
@@ -1246,7 +1341,7 @@ fn parse_json_each_row_to_series(
         series_map.entry(tag_kv).or_default().push(row_values);
     }
 
-    let mut result: Vec<SeriesResult> = series_map
+    let result: Vec<SeriesResult> = series_map
         .into_iter()
         .map(|(tag_kv, values)| {
             let tags: HashMap<String, String> = tag_kv.into_iter().collect();
@@ -1259,10 +1354,6 @@ fn parse_json_each_row_to_series(
             }
         })
         .collect();
-
-    if omit_all_null_buckets {
-        series_omit_all_null_value_rows(&mut result);
-    }
 
     Ok(result)
 }
@@ -1439,14 +1530,139 @@ fn inject_tombstone_predicates(sql: String, tombstones: &[(String, String)]) -> 
 
 /// Execute TimeseriesQL for a single measurement against the backing MergeTree table.
 #[allow(clippy::too_many_arguments)]
+async fn execute_select_from_source(
+    svc: &QueryServiceImpl,
+    db: &str,
+    select_stmt: &SelectStatement,
+    source: &MeasurementSource,
+    time_min: Option<i64>,
+    time_max: Option<i64>,
+    epoch: Option<&str>,
+    group_by_tags: &[String],
+    query_rp: Option<&str>,
+) -> Result<Vec<SeriesResult>, HyperbytedbError> {
+    match source {
+        MeasurementSource::Concrete(m) => match &m.name {
+            MeasurementName::Regex(pattern) => {
+                let query_db = m.database.as_deref().unwrap_or(db);
+                let rp = resolve_retention_policy_for_select(
+                    svc.metadata.as_ref(),
+                    query_db,
+                    m.retention_policy.as_deref(),
+                    query_rp,
+                )
+                .await;
+                let measurements = svc.metadata.list_measurements(query_db).await?;
+                let matching: Vec<_> = {
+                    let re = regex_pattern_matches(pattern);
+                    measurements.into_iter().filter(|m| re(m)).collect()
+                };
+                let futs: Vec<_> = matching
+                    .iter()
+                    .map(|meas_name| {
+                        execute_measurement_query(
+                            svc,
+                            query_db,
+                            &rp,
+                            meas_name,
+                            select_stmt,
+                            time_min,
+                            time_max,
+                            epoch,
+                            group_by_tags,
+                        )
+                    })
+                    .collect();
+                let results = futures::future::join_all(futs).await;
+                let mut combined = Vec::new();
+                for result in results {
+                    combined.append(&mut result?);
+                }
+                Ok(combined)
+            }
+            MeasurementName::Name(name) => {
+                let query_db = m.database.as_deref().unwrap_or(db);
+                let rp = resolve_retention_policy_for_select(
+                    svc.metadata.as_ref(),
+                    query_db,
+                    m.retention_policy.as_deref(),
+                    query_rp,
+                )
+                .await;
+                execute_measurement_query(
+                    svc,
+                    query_db,
+                    &rp,
+                    name,
+                    select_stmt,
+                    time_min,
+                    time_max,
+                    epoch,
+                    group_by_tags,
+                )
+                .await
+            }
+        },
+        MeasurementSource::Subquery(sub_stmt) => {
+            let sub_meas = sub_stmt
+                .from
+                .first()
+                .and_then(|s| match s {
+                    MeasurementSource::Concrete(m) => Some(m),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    HyperbytedbError::QueryParse("subquery requires measurement".to_string())
+                })?;
+            let sub_source = sub_meas.name_str().ok_or_else(|| {
+                HyperbytedbError::QueryParse("subquery requires measurement".to_string())
+            })?;
+            let query_db = sub_meas.database.as_deref().unwrap_or(db);
+            let rp = resolve_retention_policy_for_select(
+                svc.metadata.as_ref(),
+                query_db,
+                sub_meas.retention_policy.as_deref(),
+                query_rp,
+            )
+            .await;
+            let sub_mapping = svc.column_mapping_for(query_db, sub_source).await?;
+            let table = quoted_table_name(query_db, &rp, sub_source);
+            let sub_series_table = quoted_series_table_name(query_db, &rp, sub_source);
+            let sub_series_join = sub_mapping.as_ref().map(|_| to_clickhouse::SeriesJoin {
+                table: &sub_series_table,
+                force: false,
+            });
+            let sub_tag_keys = tag_keys_from_mapping(sub_mapping.as_ref());
+            let (sub_stmt_expanded, _) = select_with_expanded_group_by(sub_stmt, &sub_tag_keys);
+            let (select_stmt_expanded, resolved_group_by_tags) =
+                select_with_expanded_group_by(select_stmt, &sub_tag_keys);
+            let sub_sql = to_clickhouse::translate_native_table(
+                &sub_stmt_expanded,
+                &table,
+                sub_mapping.as_ref(),
+                sub_series_join,
+                Some((time_min, time_max)),
+            )?;
+            let outer_sql = to_clickhouse::translate_with_source(
+                &select_stmt_expanded,
+                &format!("({sub_sql})"),
+            )?;
+            let raw = svc.query_port.execute_sql(&outer_sql).await?;
+            parse_json_each_row_to_series(&raw, sub_source, epoch, &resolved_group_by_tags)
+        }
+    }
+}
+
+/// Execute TimeseriesQL for a single measurement against the backing MergeTree table.
+#[allow(clippy::too_many_arguments)]
 async fn execute_measurement_query(
     svc: &QueryServiceImpl,
     db: &str,
     rp: &str,
     measurement: &str,
     stmt: &SelectStatement,
-    _time_min: Option<i64>,
-    _time_max: Option<i64>,
+    time_min: Option<i64>,
+    time_max: Option<i64>,
     epoch: Option<&str>,
     _group_by_tags: &[String],
 ) -> Result<Vec<SeriesResult>, HyperbytedbError> {
@@ -1470,16 +1686,11 @@ async fn execute_measurement_query(
         &table,
         column_mapping.as_ref(),
         series_join,
+        Some((time_min, time_max)),
     )?;
     sql = inject_tombstone_predicates(sql, &tombstones);
     let raw = svc.query_port.execute_sql(&sql).await?;
-    parse_json_each_row_to_series(
-        &raw,
-        measurement,
-        epoch,
-        &resolved_group_by_tags,
-        drop_fill_null_buckets(stmt),
-    )
+    parse_json_each_row_to_series(&raw, measurement, epoch, &resolved_group_by_tags)
 }
 
 fn tag_keys_from_mapping(
@@ -1517,9 +1728,177 @@ fn regex_pattern_matches(pattern: &str) -> Box<dyn Fn(&str) -> bool + '_> {
     }
 }
 
+async fn resolve_retention_policy(
+    metadata: &dyn MetadataPort,
+    db: &str,
+    retention_policy: Option<&str>,
+) -> String {
+    resolve_retention_policy_for_select(metadata, db, retention_policy, None).await
+}
+
+/// Resolve the retention policy for a SELECT. Measurement qualification in the
+/// FROM clause wins over the HTTP/CLI `rp` parameter (InfluxDB semantics).
+async fn resolve_retention_policy_for_select(
+    metadata: &dyn MetadataPort,
+    db: &str,
+    measurement_rp: Option<&str>,
+    query_rp: Option<&str>,
+) -> String {
+    if let Some(rp) = measurement_rp.filter(|s| !s.is_empty()) {
+        return normalize_rp_name(metadata, db, rp).await;
+    }
+    if let Some(rp) = query_rp.filter(|s| !s.is_empty()) {
+        return normalize_rp_name(metadata, db, rp).await;
+    }
+    metadata
+        .get_default_rp(db)
+        .await
+        .unwrap_or_else(|_| "autogen".to_string())
+}
+
+/// Map InfluxDB's conventional default RP name to this database's default.
+async fn normalize_rp_name(metadata: &dyn MetadataPort, db: &str, rp: &str) -> String {
+    if rp == "default"
+        && let Ok(default) = metadata.get_default_rp(db).await
+    {
+        return default;
+    }
+    rp.to_string()
+}
+
+async fn list_measurements_for_rp(
+    svc: &QueryServiceImpl,
+    db: &str,
+    rp: &str,
+) -> Result<Vec<String>, HyperbytedbError> {
+    use crate::domain::chdb_naming::unquoted_table_name;
+
+    let all = svc.metadata.list_measurements(db).await?;
+    let mut names = Vec::new();
+    for measurement in all {
+        let table = unquoted_table_name(db, rp, &measurement);
+        let sql = format!(
+            "SELECT count() FROM system.tables WHERE database = 'default' AND name = '{table}' FORMAT TabSeparated"
+        );
+        if svc.query_port.execute_sql(&sql).await?.trim() == "1" {
+            names.push(measurement);
+        }
+    }
+    Ok(names)
+}
+
+async fn tag_keys_for_measurement(
+    svc: &QueryServiceImpl,
+    db: &str,
+    rp: &str,
+    measurement: &str,
+) -> Result<Vec<String>, HyperbytedbError> {
+    let series = svc.metadata.list_series(db, rp, measurement).await?;
+    if !series.is_empty() {
+        let mut keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (_, tags) in series {
+            keys.extend(tags.keys().cloned());
+        }
+        let mut result: Vec<_> = keys.into_iter().collect();
+        result.sort();
+        return Ok(result);
+    }
+
+    tag_keys_from_series_table(svc, db, rp, measurement).await
+}
+
+async fn tag_keys_from_series_table(
+    svc: &QueryServiceImpl,
+    db: &str,
+    rp: &str,
+    measurement: &str,
+) -> Result<Vec<String>, HyperbytedbError> {
+    let mapping = svc.column_mapping_for(db, measurement).await?;
+    let Some(mapping) = mapping else {
+        return Ok(Vec::new());
+    };
+
+    let phys_cols = series_table_columns(svc, db, rp, measurement).await?;
+    let mut keys: Vec<String> = mapping
+        .tag_keys
+        .iter()
+        .filter(|logical| phys_cols.contains(&mapping.tag_column_name(logical)))
+        .cloned()
+        .collect();
+    keys.sort();
+    Ok(keys)
+}
+
+async fn tag_values_for_measurement(
+    svc: &QueryServiceImpl,
+    db: &str,
+    rp: &str,
+    measurement: &str,
+    tag_key: &str,
+) -> Result<Vec<String>, HyperbytedbError> {
+    let series = svc.metadata.list_series(db, rp, measurement).await?;
+    if !series.is_empty() {
+        let mut values: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (_, tags) in series {
+            if let Some(v) = tags.get(tag_key) {
+                values.insert(v.clone());
+            }
+        }
+        let mut result: Vec<_> = values.into_iter().collect();
+        result.sort();
+        return Ok(result);
+    }
+
+    let mapping = svc.column_mapping_for(db, measurement).await?;
+    let Some(mapping) = mapping else {
+        return Ok(Vec::new());
+    };
+    let phys = mapping.tag_column_name(tag_key);
+    if !series_table_columns(svc, db, rp, measurement)
+        .await?
+        .contains(&phys)
+    {
+        return Ok(Vec::new());
+    }
+
+    let series_table = quoted_series_table_name(db, rp, measurement);
+    let phys_col = quote_backticks(&phys);
+    let sql = format!(
+        "SELECT DISTINCT {phys_col} FROM {series_table} WHERE {phys_col} != '' ORDER BY {phys_col} FORMAT TabSeparated"
+    );
+    let raw = svc.query_port.execute_sql(&sql).await?;
+    Ok(raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+async fn series_table_columns(
+    svc: &QueryServiceImpl,
+    db: &str,
+    rp: &str,
+    measurement: &str,
+) -> Result<std::collections::HashSet<String>, HyperbytedbError> {
+    let table = unquoted_series_table_name(db, rp, measurement);
+    let sql = format!(
+        "SELECT name FROM system.columns WHERE table = '{}' AND name != 'series_id' FORMAT TabSeparated",
+        table.replace('\'', "''")
+    );
+    let raw = svc.query_port.execute_sql(&sql).await?;
+    Ok(raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
 async fn write_series_as_points(
     svc: &QueryServiceImpl,
     db: &str,
+    rp: &str,
     measurement: &str,
     series: &[SeriesResult],
 ) -> Result<u64, HyperbytedbError> {
@@ -1603,14 +1982,10 @@ async fn write_series_as_points(
             name: measurement.to_string(),
             field_types,
             tag_keys: tag_keys.into_iter().collect(),
+            ..Default::default()
         };
         svc.metadata.register_measurement(db, &meta).await?;
 
-        let rp = svc
-            .metadata
-            .get_default_rp(db)
-            .await
-            .unwrap_or_else(|_| "autogen".to_string());
         let replication_body = if svc.replication_port.is_some() {
             Some(encode_points_to_line_protocol(
                 &all_points,
@@ -1621,7 +1996,7 @@ async fn write_series_as_points(
         };
         let entry = WalEntry {
             database: db.to_string(),
-            retention_policy: rp.clone(),
+            retention_policy: rp.to_string(),
             points: all_points,
             origin_node_id: svc.node_id,
         };
@@ -1636,7 +2011,7 @@ async fn write_series_as_points(
                 &svc.replication_config,
                 OutboundReplicationBatch {
                     database: db.to_string(),
-                    retention_policy: rp,
+                    retention_policy: rp.to_string(),
                     precision: Some("ns".to_string()),
                     body,
                     wal_seq,
@@ -1647,4 +2022,108 @@ async fn write_series_as_points(
     }
 
     Ok(total_count)
+}
+
+/// Run `SELECT ... INTO ...` and return the number of points written.
+async fn execute_select_into(
+    svc: &QueryServiceImpl,
+    db: &str,
+    select_stmt: &SelectStatement,
+    epoch: Option<&str>,
+) -> Result<u64, HyperbytedbError> {
+    let into_target = select_stmt.into.as_ref().ok_or_else(|| {
+        HyperbytedbError::QueryParse("SELECT INTO requires INTO clause".to_string())
+    })?;
+    let MeasurementName::Name(target_name) = &into_target.name else {
+        return Err(HyperbytedbError::QueryParse(
+            "SELECT INTO does not support regex destination measurements".to_string(),
+        ));
+    };
+
+    let source = select_stmt
+        .from
+        .first()
+        .ok_or_else(|| HyperbytedbError::QueryParse("SELECT requires FROM clause".to_string()))?;
+
+    let (source_db, source_rp, source_name) = match source {
+        MeasurementSource::Concrete(m) => {
+            let MeasurementName::Name(name) = &m.name else {
+                return Err(HyperbytedbError::QueryParse(
+                    "SELECT INTO does not support regex source measurements".to_string(),
+                ));
+            };
+            let query_db = m.database.as_deref().unwrap_or(db);
+            let rp = resolve_retention_policy(
+                svc.metadata.as_ref(),
+                query_db,
+                m.retention_policy.as_deref(),
+            )
+            .await;
+            (query_db.to_string(), rp, name.clone())
+        }
+        MeasurementSource::Subquery(_) => {
+            return Err(HyperbytedbError::QueryParse(
+                "SELECT INTO does not support subquery sources".to_string(),
+            ));
+        }
+    };
+
+    let into_db = into_target.database.as_deref().unwrap_or(db);
+    let dest_rp = resolve_retention_policy(
+        svc.metadata.as_ref(),
+        into_db,
+        into_target.retention_policy.as_deref(),
+    )
+    .await;
+
+    let group_by_tags: Vec<String> = select_stmt
+        .group_by
+        .as_ref()
+        .map(|gb| {
+            gb.tag_dimensions()
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let (time_min, time_max) = to_clickhouse::extract_time_bounds(select_stmt.condition.as_ref());
+
+    let all_series = execute_measurement_query(
+        svc,
+        &source_db,
+        &source_rp,
+        &source_name,
+        select_stmt,
+        time_min,
+        time_max,
+        epoch,
+        &group_by_tags,
+    )
+    .await?;
+
+    write_series_as_points(svc, into_db, &dest_rp, target_name, &all_series).await
+}
+
+fn reconstruct_cq_text(cq: &ContinuousQueryDef) -> String {
+    let mut out = format!(
+        r#"CREATE CONTINUOUS QUERY "{}" ON "{}""#,
+        cq.name, cq.database
+    );
+    if cq.resample_every_secs.is_some() || cq.resample_for_secs.is_some() {
+        out.push_str(" RESAMPLE");
+        if let Some(every) = cq.resample_every_secs {
+            out.push_str(&format!(" EVERY {}s", every));
+        }
+        if let Some(for_secs) = cq.resample_for_secs {
+            out.push_str(&format!(" FOR {}s", for_secs));
+        }
+    }
+    out.push_str(" BEGIN ");
+    out.push_str(&cq.query_text);
+    if !cq.query_text.trim().ends_with(';') {
+        out.push(' ');
+    }
+    out.push_str("END");
+    out
 }

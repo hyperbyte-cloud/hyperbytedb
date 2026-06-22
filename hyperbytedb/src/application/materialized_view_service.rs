@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::domain::chdb_naming::{
@@ -53,7 +52,7 @@ impl MaterializedViewService {
             )));
         }
 
-        self.materialize_ddl(mv).await?;
+        self.materialize_ddl(mv, true).await?;
 
         let (source_db, source_rp_opt, source_measurement) =
             extract_source(&mv.query, &mv.database)?;
@@ -119,12 +118,7 @@ impl MaterializedViewService {
 
         let fact_mv = quoted_fact_mv_name(db, &def.dest_rp, name);
         let series_mv = quoted_series_mv_name(db, &def.dest_rp, name);
-        self.query_port
-            .execute_sql(&format!("DROP VIEW IF EXISTS {fact_mv}"))
-            .await?;
-        self.query_port
-            .execute_sql(&format!("DROP VIEW IF EXISTS {series_mv}"))
-            .await?;
+        self.drop_ch_mv_objects(&fact_mv, &series_mv).await?;
 
         self.metadata.drop_materialized_view(db, name).await?;
 
@@ -183,6 +177,68 @@ impl MaterializedViewService {
         Ok(reconciled)
     }
 
+    /// Ensure ClickHouse MV objects exist for a metadata definition already stored
+    /// locally (cluster replication / metadata sync path).
+    pub async fn reconcile_from_definition(
+        &self,
+        def: &MaterializedViewDef,
+    ) -> Result<(), HyperbytedbError> {
+        let _ = self.reconcile_one(def).await?;
+        Ok(())
+    }
+
+    /// Idempotent apply of a Raft-replicated materialized view definition.
+    pub async fn apply_replicated_definition(
+        &self,
+        definition: &MaterializedViewDef,
+    ) -> Result<(), HyperbytedbError> {
+        if self
+            .metadata
+            .get_materialized_view(&definition.database, &definition.name)
+            .await?
+            .is_some()
+        {
+            return self.reconcile_from_definition(definition).await;
+        }
+
+        let stmt = CreateMaterializedViewStatement {
+            name: definition.name.clone(),
+            database: definition.database.clone(),
+            query: parse_mv_select(&definition.query_text)?,
+            raw_query: definition.query_text.clone(),
+        };
+        self.create(&stmt).await?;
+        Ok(())
+    }
+
+    /// Idempotent drop of a replicated materialized view (metadata + chDB objects).
+    pub async fn apply_replicated_drop(
+        &self,
+        db: &str,
+        name: &str,
+    ) -> Result<(), HyperbytedbError> {
+        if self
+            .metadata
+            .get_materialized_view(db, name)
+            .await?
+            .is_some()
+        {
+            self.drop_mv(db, name).await
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Drop ClickHouse MV objects for a definition without touching metadata.
+    pub async fn drop_ch_objects_for_def(
+        &self,
+        def: &MaterializedViewDef,
+    ) -> Result<(), HyperbytedbError> {
+        let fact_mv = quoted_fact_mv_name(&def.database, &def.dest_rp, &def.name);
+        let series_mv = quoted_series_mv_name(&def.database, &def.dest_rp, &def.name);
+        self.drop_ch_mv_objects(&fact_mv, &series_mv).await
+    }
+
     async fn reconcile_one(&self, def: &MaterializedViewDef) -> Result<bool, HyperbytedbError> {
         let exists_sql = format!(
             "SELECT count() FROM system.tables WHERE database = 'default' AND name = '{}' FORMAT TabSeparated",
@@ -199,7 +255,7 @@ impl MaterializedViewService {
             query: parse_mv_select(&def.query_text)?,
             raw_query: def.query_text.clone(),
         };
-        self.materialize_ddl(&stmt).await?;
+        self.materialize_ddl(&stmt, false).await?;
         tracing::info!(
             mv = %def.name,
             db = %def.database,
@@ -211,6 +267,7 @@ impl MaterializedViewService {
     async fn materialize_ddl(
         &self,
         mv: &CreateMaterializedViewStatement,
+        reset_destination: bool,
     ) -> Result<(), HyperbytedbError> {
         let (source_db, source_rp, source_measurement) = extract_source(&mv.query, &mv.database)?;
         let (dest_db, dest_rp, dest_measurement) = extract_dest(&mv.query, &mv.database)?;
@@ -227,16 +284,6 @@ impl MaterializedViewService {
             })?;
 
         let dest_meta = dest_measurement_meta(&mv.query, &source_meta)?;
-        if self
-            .metadata
-            .get_measurement(&dest_db, &dest_measurement)
-            .await?
-            .is_none()
-        {
-            self.metadata
-                .register_measurement(&dest_db, &dest_meta)
-                .await?;
-        }
 
         let dest_rp = match dest_rp {
             Some(rp) => rp,
@@ -255,12 +302,49 @@ impl MaterializedViewService {
                 .unwrap_or_else(|_| "autogen".to_string()),
         };
 
+        if reset_destination {
+            // Failed CREATE retries often leave destination tables in a non-default
+            // retention policy with a stale field layout (DROP MEASUREMENT only
+            // removes the default RP). Clear orphans before re-creating schema.
+            if let Err(e) = self
+                .points_sink
+                .drop_measurement(&dest_db, &dest_rp, &dest_measurement)
+                .await
+            {
+                tracing::warn!(
+                    db = %dest_db,
+                    rp = %dest_rp,
+                    measurement = %dest_measurement,
+                    error = %e,
+                    "failed to drop stale MV destination before recreate"
+                );
+            }
+            self.metadata
+                .delete_measurement(&dest_db, &dest_measurement)
+                .await?;
+        }
+
+        self.metadata
+            .register_measurement(&dest_db, &dest_meta)
+            .await?;
+
         self.points_sink
             .ensure_measurement_schema(&dest_db, &dest_rp, &dest_meta)
             .await?;
 
         let source_mapping =
             crate::domain::column_mapping::ColumnMapping::from_measurement_meta(&source_meta);
+
+        let mut tag_keys: Vec<String> = source_meta.tag_keys.to_vec();
+        tag_keys.sort();
+        let (effective_query, _grouped_tag_keys) = if let Some(ref gb) = mv.query.group_by {
+            let (expanded_gb, resolved) = gb.expand_all_tags(&tag_keys);
+            let mut q = mv.query.clone();
+            q.group_by = Some(expanded_gb);
+            (q, resolved)
+        } else {
+            (mv.query.clone(), Vec::new())
+        };
 
         let source_fact = quoted_table_name(&source_db, &source_rp, &source_measurement);
         let source_series = quoted_series_table_name(&source_db, &source_rp, &source_measurement);
@@ -270,9 +354,16 @@ impl MaterializedViewService {
         let fact_mv_quoted = quoted_fact_mv_name(&mv.database, &dest_rp, &mv.name);
         let series_mv_quoted = quoted_series_mv_name(&mv.database, &dest_rp, &mv.name);
 
+        // A prior failed CREATE may have installed ClickHouse MV objects without
+        // recording metadata. Drop orphans so retries succeed.
+        self.drop_ch_mv_objects(&fact_mv_quoted, &series_mv_quoted)
+            .await?;
+
         let select_sql = to_clickhouse::translate_materialized_view_select(
-            &mv.query,
+            &effective_query,
             &source_fact,
+            &source_series,
+            &dest_measurement,
             &source_mapping,
         )?;
 
@@ -280,20 +371,42 @@ impl MaterializedViewService {
             build_create_fact_materialized_view(&fact_mv_quoted, &dest_fact, &select_sql);
         self.query_port.execute_sql(&create_fact_mv).await?;
 
+        let series_select = to_clickhouse::translate_materialized_view_series_select(
+            &effective_query,
+            &source_series,
+            &dest_measurement,
+            &source_mapping,
+        )?;
         let create_series_mv =
-            build_create_series_materialized_view(&series_mv_quoted, &dest_series, &source_series);
+            build_create_series_materialized_view(&series_mv_quoted, &dest_series, &series_select);
         self.query_port.execute_sql(&create_series_mv).await?;
 
         let backfill_fact = to_clickhouse::translate_materialized_view_backfill(
-            &mv.query,
+            &effective_query,
             &dest_fact,
             &source_fact,
+            &source_series,
+            &dest_measurement,
             &source_mapping,
         )?;
         self.query_port.execute_sql(&backfill_fact).await?;
 
-        let backfill_series = format!("INSERT INTO {dest_series} SELECT * FROM {source_series}");
+        let backfill_series = format!("INSERT INTO {dest_series}\n{series_select}");
         self.query_port.execute_sql(&backfill_series).await?;
+        Ok(())
+    }
+
+    async fn drop_ch_mv_objects(
+        &self,
+        fact_mv: &str,
+        series_mv: &str,
+    ) -> Result<(), HyperbytedbError> {
+        self.query_port
+            .execute_sql(&format!("DROP VIEW IF EXISTS {fact_mv}"))
+            .await?;
+        self.query_port
+            .execute_sql(&format!("DROP VIEW IF EXISTS {series_mv}"))
+            .await?;
         Ok(())
     }
 }
@@ -378,17 +491,8 @@ fn dest_measurement_meta(
     stmt: &crate::timeseriesql::ast::SelectStatement,
     source_meta: &MeasurementMeta,
 ) -> Result<MeasurementMeta, HyperbytedbError> {
-    let mut field_types = HashMap::new();
-    for field in &stmt.fields {
-        let name = crate::timeseriesql::to_clickhouse::select_output_field_name(field).ok_or_else(
-            || {
-                HyperbytedbError::QueryParse(
-                    "materialized view field requires a name or alias".to_string(),
-                )
-            },
-        )?;
-        field_types.insert(name, 0u8);
-    }
+    let (field_types, field_rollups, mean_fields) =
+        crate::domain::rollup::field_rollups_from_mv_select(&stmt.fields)?;
 
     let into = stmt.into.as_ref().ok_or_else(|| {
         HyperbytedbError::QueryParse("materialized view requires SELECT INTO".to_string())
@@ -399,9 +503,25 @@ fn dest_measurement_meta(
         ));
     };
 
+    let mut tag_keys: Vec<String> = Vec::new();
+    if let Some(ref gb) = stmt.group_by {
+        let source_keys: Vec<String> = source_meta.tag_keys.to_vec();
+        let (expanded_gb, resolved) = gb.expand_all_tags(&source_keys);
+        let _ = expanded_gb;
+        for key in resolved {
+            if source_meta.tag_keys.contains(&key) {
+                tag_keys.push(key);
+            }
+        }
+        tag_keys.sort();
+        tag_keys.dedup();
+    }
+
     Ok(MeasurementMeta {
         name: dest_name.clone(),
         field_types,
-        tag_keys: source_meta.tag_keys.clone(),
+        tag_keys,
+        field_rollups,
+        mean_fields,
     })
 }

@@ -43,7 +43,7 @@ pub async fn run_hinted_handoff_watcher(
                         .unwrap_or(true);
 
                     if *state == NodeState::Active && was_disconnected {
-                        tracing::info!(
+                        tracing::debug!(
                             peer_id = node_id,
                             "peer became active, draining hinted handoff queue"
                         );
@@ -56,7 +56,7 @@ pub async fn run_hinted_handoff_watcher(
                         let trigger_url = format!("http://{}/internal/sync/trigger", peer_addr);
                         match sync_client.post(&trigger_url).send().await {
                             Ok(resp) if resp.status().is_success() => {
-                                tracing::info!(
+                                tracing::debug!(
                                     peer_id = node_id,
                                     "triggered WAL catch-up on reconnected peer"
                                 );

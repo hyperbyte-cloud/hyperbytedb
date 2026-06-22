@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 #[derive(Debug, Clone)]
 pub enum Statement {
     Select(SelectStatement),
@@ -7,9 +9,10 @@ pub enum Statement {
     ShowTagValues(ShowTagValuesStatement),
     ShowFieldKeys(ShowFieldKeysStatement),
     ShowSeries(ShowSeriesStatement),
-    CreateDatabase(String),
+    CreateDatabase(CreateDatabaseStatement),
     DropDatabase(String),
     DropMeasurement(String),
+    DropSeries(DropSeriesStatement),
     ShowRetentionPolicies(String),
     ShowUsers,
     DropUser(String),
@@ -85,6 +88,31 @@ pub struct SelectStatement {
 pub enum MeasurementSource {
     Concrete(Measurement),
     Subquery(Box<SelectStatement>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateDatabaseStatement {
+    pub name: String,
+    pub duration: Option<Duration>,
+    pub replication: Option<u32>,
+    pub shard_duration: Option<Duration>,
+    pub rp_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DropSeriesStatement {
+    pub database: Option<String>,
+    pub from: Option<MeasurementName>,
+    pub condition: Option<Expr>,
+}
+
+/// Partial update for ALTER RETENTION POLICY.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RetentionPolicyChange {
+    pub duration: Option<Option<Duration>>,
+    pub replication: Option<u32>,
+    pub shard_duration: Option<Duration>,
+    pub is_default: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -204,7 +232,7 @@ pub enum UnaryOp {
     Not,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Duration {
     pub value: i64,
     pub unit: DurationUnit,
@@ -240,7 +268,7 @@ impl Duration {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum DurationUnit {
     Nanosecond,
     Microsecond,

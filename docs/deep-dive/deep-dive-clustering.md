@@ -492,7 +492,7 @@ Step 5: Set node state to Leaving
 
 **Step 2 -- Flush WAL:** `flush_service.drain()` repeatedly calls `flush()` until no WAL entries remain. This ensures all ingested data is persisted in native MergeTree tables.
 
-**Step 3 -- Wait for acks:** Polls `replication_log.get_wal_ack(peer_id)` and `get_mutation_ack(peer_id)` for each active peer. Waits until all peers have acked up to the local WAL and mutation sequence numbers. Times out after 60 seconds with a warning.
+**Step 3 -- Wait for acks:** Polls `replication_log.get_wal_ack(peer_id)` and `get_mutation_ack(peer_id)` for each active peer. Waits until all peers have acked up to the local WAL and mutation sequence numbers. Times out after 90 seconds with a warning.
 
 **Step 4 -- Notify peers:** Sends `POST /internal/membership/leave` to all active peers so they remove this node from their membership.
 

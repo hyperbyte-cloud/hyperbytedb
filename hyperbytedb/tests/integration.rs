@@ -15,10 +15,23 @@ use hyperbytedb::adapters::metadata::rocksdb_meta::RocksDbMetadata;
 use hyperbytedb::adapters::wal::rocksdb_wal::RocksDbWal;
 use hyperbytedb::application::flush_service::FlushServiceImpl;
 use hyperbytedb::application::ingestion_service::IngestionServiceImpl;
+use hyperbytedb::application::materialized_view_service::MaterializedViewService;
 use hyperbytedb::application::query_service::QueryServiceImpl;
 use hyperbytedb::ports::metadata::MetadataPort;
 use hyperbytedb::ports::points_sink::PointsSinkPort;
 use serial_test::serial;
+
+fn test_mv_service(
+    metadata: &Arc<dyn MetadataPort>,
+    chdb: &Arc<ChdbQueryAdapter>,
+    points_sink: &Arc<dyn PointsSinkPort>,
+) -> Arc<MaterializedViewService> {
+    Arc::new(MaterializedViewService::new(
+        metadata.clone(),
+        chdb.clone(),
+        points_sink.clone(),
+    ))
+}
 
 fn setup(dir: &tempfile::TempDir) -> (Arc<AppState>, Arc<FlushServiceImpl>) {
     let wal_dir = dir.path().join("wal");
@@ -32,7 +45,7 @@ fn setup(dir: &tempfile::TempDir) -> (Arc<AppState>, Arc<FlushServiceImpl>) {
     let wal = Arc::new(RocksDbWal::open(&wal_dir).unwrap());
     let metadata = Arc::new(RocksDbMetadata::open(&meta_dir).unwrap());
 
-    let shared = SharedSession::new_eager(chdb_dir.to_str().unwrap()).unwrap();
+    let shared = SharedSession::new_eager(chdb_dir.to_str().unwrap(), 1).unwrap();
     let chdb = Arc::new(ChdbQueryAdapter::from_shared(shared.clone(), 0));
     let points_sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(shared));
 
@@ -49,7 +62,7 @@ fn setup(dir: &tempfile::TempDir) -> (Arc<AppState>, Arc<FlushServiceImpl>) {
             points_sink.clone(),
         ));
 
-    let flush_service = Arc::new(FlushServiceImpl::new(wal.clone(), 0, points_sink));
+    let flush_service = Arc::new(FlushServiceImpl::new(wal.clone(), 0, points_sink.clone()));
 
     let chdb_path_str = chdb_dir.to_str().unwrap().to_string();
     let app_state = Arc::new(AppState {
@@ -58,6 +71,12 @@ fn setup(dir: &tempfile::TempDir) -> (Arc<AppState>, Arc<FlushServiceImpl>) {
         query_port: chdb.clone(),
         metadata: metadata.clone(),
         wal: wal.clone(),
+        points_sink: points_sink.clone(),
+        mv_service: test_mv_service(
+            &(metadata.clone() as Arc<dyn MetadataPort>),
+            &chdb,
+            &points_sink,
+        ),
         auth: Arc::new(hyperbytedb::adapters::auth::MetadataAuthAdapter::new(
             metadata.clone(),
         )),
@@ -104,7 +123,7 @@ async fn test_auth_blocks_unauthenticated() {
 
     let wal = Arc::new(RocksDbWal::open(&wal_dir).unwrap());
     let metadata = Arc::new(RocksDbMetadata::open(&meta_dir).unwrap());
-    let shared = SharedSession::new_eager(chdb_dir.to_str().unwrap()).unwrap();
+    let shared = SharedSession::new_eager(chdb_dir.to_str().unwrap(), 1).unwrap();
     let chdb = Arc::new(ChdbQueryAdapter::from_shared(shared.clone(), 0));
     let sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(shared));
 
@@ -127,7 +146,7 @@ async fn test_auth_blocks_unauthenticated() {
             sink.clone(),
         ));
 
-    let _flush = FlushServiceImpl::new(wal.clone(), 0, sink);
+    let _flush = FlushServiceImpl::new(wal.clone(), 0, sink.clone());
 
     let app_state = Arc::new(AppState {
         ingestion: ingestion_service,
@@ -135,6 +154,8 @@ async fn test_auth_blocks_unauthenticated() {
         query_port: chdb.clone(),
         metadata: metadata.clone(),
         wal: wal.clone(),
+        points_sink: sink.clone(),
+        mv_service: test_mv_service(&(metadata.clone() as Arc<dyn MetadataPort>), &chdb, &sink),
         auth: Arc::new(hyperbytedb::adapters::auth::MetadataAuthAdapter::new(
             metadata.clone(),
         )),
@@ -207,7 +228,7 @@ async fn test_cardinality_limit() {
 
     let wal = Arc::new(RocksDbWal::open(&wal_dir).unwrap());
     let metadata = Arc::new(RocksDbMetadata::open(&meta_dir).unwrap());
-    let shared = SharedSession::new_eager(chdb_dir.to_str().unwrap()).unwrap();
+    let shared = SharedSession::new_eager(chdb_dir.to_str().unwrap(), 1).unwrap();
     let chdb = Arc::new(ChdbQueryAdapter::from_shared(shared.clone(), 0));
     let sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(shared));
 
@@ -223,7 +244,7 @@ async fn test_cardinality_limit() {
             sink.clone(),
         ));
 
-    let _flush = FlushServiceImpl::new(wal.clone(), 0, sink);
+    let _flush = FlushServiceImpl::new(wal.clone(), 0, sink.clone());
 
     let app_state = Arc::new(AppState {
         ingestion: ingestion_service,
@@ -231,6 +252,8 @@ async fn test_cardinality_limit() {
         query_port: chdb.clone(),
         metadata: metadata.clone(),
         wal: wal.clone(),
+        points_sink: sink.clone(),
+        mv_service: test_mv_service(&(metadata.clone() as Arc<dyn MetadataPort>), &chdb, &sink),
         auth: Arc::new(hyperbytedb::adapters::auth::MetadataAuthAdapter::new(
             metadata.clone(),
         )),
@@ -346,7 +369,7 @@ async fn test_metrics_endpoint() {
 
     let wal = Arc::new(RocksDbWal::open(&wal_dir).unwrap());
     let metadata = Arc::new(RocksDbMetadata::open(&meta_dir).unwrap());
-    let shared = SharedSession::new_eager(chdb_dir.to_str().unwrap()).unwrap();
+    let shared = SharedSession::new_eager(chdb_dir.to_str().unwrap(), 1).unwrap();
     let chdb = Arc::new(ChdbQueryAdapter::from_shared(shared.clone(), 0));
     let sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(shared));
 
@@ -370,7 +393,7 @@ async fn test_metrics_endpoint() {
             sink.clone(),
         ));
 
-    let _flush = FlushServiceImpl::new(wal.clone(), 0, sink);
+    let _flush = FlushServiceImpl::new(wal.clone(), 0, sink.clone());
 
     let app_state = Arc::new(AppState {
         ingestion: ingestion_service,
@@ -378,6 +401,8 @@ async fn test_metrics_endpoint() {
         query_port: chdb.clone(),
         metadata: metadata.clone(),
         wal: wal.clone(),
+        points_sink: sink.clone(),
+        mv_service: test_mv_service(&(metadata.clone() as Arc<dyn MetadataPort>), &chdb, &sink),
         auth: Arc::new(hyperbytedb::adapters::auth::MetadataAuthAdapter::new(
             metadata.clone(),
         )),

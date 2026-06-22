@@ -1,4 +1,5 @@
 pub mod auth_middleware;
+pub mod chdb;
 pub mod cluster;
 pub mod error;
 pub mod metrics;

@@ -70,6 +70,7 @@ pub async fn run_export(client: &HyperbytedbClient, opts: &ExportOptions) -> Res
 
     let qopts = QueryOptions {
         db: Some(opts.database.clone()),
+        retention_policy: None,
         epoch: None,
         pretty: false,
         chunked: false,
@@ -145,6 +146,7 @@ pub async fn run_export(client: &HyperbytedbClient, opts: &ExportOptions) -> Res
 async fn list_measurements(client: &HyperbytedbClient, db: &str) -> Result<Vec<String>> {
     let qopts = QueryOptions {
         db: Some(db.to_string()),
+        retention_policy: None,
         epoch: None,
         pretty: false,
         chunked: false,
@@ -176,6 +178,7 @@ async fn list_tag_keys(
 ) -> Result<HashMap<String, HashSet<String>>> {
     let qopts = QueryOptions {
         db: Some(db.to_string()),
+        retention_policy: None,
         epoch: None,
         pretty: false,
         chunked: false,

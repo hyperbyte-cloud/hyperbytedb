@@ -96,6 +96,7 @@ fn bench_metadata(c: &mut Criterion) {
             rt.block_on(prepare_batch_metadata(
                 &meta_port,
                 "benchdb",
+                "autogen",
                 &points,
                 limits,
                 Some(&cache),
@@ -131,6 +132,7 @@ fn bench_wal(c: &mut Criterion) {
             rt.block_on(prepare_batch_metadata(
                 &meta_port,
                 "benchdb",
+                "autogen",
                 &points,
                 limits,
                 Some(&cache),
@@ -221,6 +223,7 @@ fn bench_metadata_concurrent(c: &mut Criterion) {
                                 prepare_batch_metadata(
                                     &meta_port,
                                     "benchdb",
+                                    "autogen",
                                     &points,
                                     limits,
                                     Some(cache.as_ref()),
@@ -278,6 +281,7 @@ fn bench_wal_concurrent(c: &mut Criterion) {
                                 prepare_batch_metadata(
                                     &meta_port,
                                     "benchdb",
+                                    "autogen",
                                     &points,
                                     limits,
                                     Some(cache.as_ref()),
@@ -351,6 +355,7 @@ fn bench_wal_batched_concurrent(c: &mut Criterion) {
                                 prepare_batch_metadata(
                                     &meta_port,
                                     "benchdb",
+                                    "autogen",
                                     &points,
                                     limits,
                                     Some(cache.as_ref()),

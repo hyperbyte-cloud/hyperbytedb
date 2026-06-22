@@ -45,6 +45,13 @@ pub struct ServerConfig {
 pub struct StorageConfig {
     pub wal_dir: String,
     pub meta_dir: String,
+    /// Durable WAL value encoding: `bincode` (default) or `arrow_ipc`.
+    #[serde(default = "default_wal_format")]
+    pub wal_format: String,
+}
+
+fn default_wal_format() -> String {
+    "bincode".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -61,6 +68,15 @@ pub struct FlushConfig {
     /// WAL group-commit: max microseconds to wait for more entries before flushing.
     #[serde(default = "default_wal_batch_delay_us")]
     pub wal_batch_delay_us: u64,
+    /// When true, keep chDB-ready Arrow batches in an in-memory WAL cache for
+    /// zero-copy flush. Requires ingest to supply prepared slots via
+    /// [`WalAppendBundle`].
+    #[serde(default = "default_arrow_wal_enabled")]
+    pub arrow_wal_enabled: bool,
+}
+
+fn default_arrow_wal_enabled() -> bool {
+    true
 }
 
 fn default_max_points_per_batch() -> usize {
@@ -78,13 +94,12 @@ fn default_wal_batch_delay_us() -> u64 {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChdbConfig {
     pub session_data_path: String,
-    /// Deprecated. libchdb is a process-global singleton — only one connection
-    /// per process — so a session pool can never deliver real isolation; the
-    /// losers race on `chdb_connect` and fail with "Connection failed".
-    /// Parallelism now comes from sharing the single session across many
-    /// `spawn_blocking` workers and capping concurrency with
-    /// `server.max_concurrent_queries`. Field retained for back-compat;
-    /// any value other than `1` produces a warning at startup and is ignored.
+    /// Number of chDB connections opened to the same `session_data_path`.
+    /// Each connection has its own `ChdbClient` mutex, so flush inserts and
+    /// concurrent queries overlap when `pool_size > 1`. A second connection
+    /// to a *different* path still fails (process-global singleton per path).
+    /// Clamped to 1..=32. For best overlap, set `server.max_concurrent_queries`
+    /// ≥ `pool_size`.
     pub pool_size: usize,
 }
 
@@ -379,7 +394,7 @@ fn default_retention_enabled() -> bool {
 }
 
 fn default_retention_interval() -> String {
-    "60s".to_string()
+    "12h".to_string()
 }
 
 impl Default for RetentionConfig {
@@ -411,9 +426,7 @@ impl RetentionConfig {
 }
 
 fn default_chdb_pool_size() -> usize {
-    // Always 1: see `ChdbConfig::pool_size` doc comment. Multi-session pools
-    // race on libchdb's global engine and the losers fail at `chdb_connect`.
-    1
+    crate::adapters::chdb::connection_pool::DEFAULT_POOL_SIZE
 }
 
 impl HyperbytedbConfig {
@@ -446,6 +459,7 @@ impl HyperbytedbConfig {
             storage: StorageConfig {
                 wal_dir: "./wal".to_string(),
                 meta_dir: "./meta".to_string(),
+                wal_format: default_wal_format(),
             },
             flush: FlushConfig {
                 interval_secs: 10,
@@ -454,6 +468,7 @@ impl HyperbytedbConfig {
                 max_points_per_batch: default_max_points_per_batch(),
                 wal_batch_size: default_wal_batch_size(),
                 wal_batch_delay_us: default_wal_batch_delay_us(),
+                arrow_wal_enabled: default_arrow_wal_enabled(),
             },
             chdb: ChdbConfig {
                 session_data_path: "./chdb_data".to_string(),

@@ -26,6 +26,8 @@ pub struct QueryParams {
     pub chunked: Option<bool>,
     #[serde(default)]
     pub params: Option<String>,
+    #[serde(default)]
+    pub rp: Option<String>,
 }
 
 pub async fn handle_query_get(
@@ -68,6 +70,7 @@ fn merge_form_body(query: QueryParams, body: &[u8]) -> QueryParams {
         pretty: form.pretty.or(query.pretty),
         chunked: form.chunked.or(query.chunked),
         params: form.params.or(query.params),
+        rp: form.rp.filter(|s| !s.is_empty()).or(query.rp),
     }
 }
 
@@ -176,7 +179,12 @@ async fn handle_query_impl(
 
         let metrics_start = std::time::Instant::now();
         let mut exec_pt = PhaseTimer::start();
-        let result = state.query.execute_query(db, &q, epoch, caller).await.map_err(|e| {
+        let rp = params.rp.as_deref().filter(|s| !s.is_empty());
+        let result = state
+            .query
+            .execute_query(db, &q, epoch, rp, caller)
+            .await
+            .map_err(|e| {
             tracing::error!(query = %q, db = db, error = %e, "query execution failed");
             counter!("hyperbytedb_query_errors_total", "db" => db.to_string(), "stmt_type" => stmt_type_label, "stmt_normalized" => normalized_query.to_string(), "stmt_digest" => digest_hex.to_string()).increment(1);
             e

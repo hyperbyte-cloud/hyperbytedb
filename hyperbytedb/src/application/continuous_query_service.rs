@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tokio::sync::watch;
 
 use crate::adapters::cluster::raft::HyperbytedbRaft;
+use crate::domain::cq_schedule::should_run;
 use crate::error::HyperbytedbError;
 use crate::ports::metadata::MetadataPort;
 use crate::ports::query::QueryService;
@@ -86,41 +87,32 @@ impl ContinuousQueryService {
 
         let now = chrono::Utc::now();
 
-        for cq in &cqs {
-            let interval_secs = cq.resample_every_secs.unwrap_or(60);
-            let created = chrono::DateTime::parse_from_rfc3339(&cq.created_at)
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .unwrap_or(now);
-
-            let elapsed = (now - created).num_seconds().max(0) as u64;
-            if !elapsed.is_multiple_of(interval_secs) && elapsed > interval_secs {
-                // Skip: not aligned to the resample interval.
-                // In practice this is a best-effort scheduler — real CQ scheduling
-                // should track last_run timestamps, but this is sufficient for the
-                // current phase.
+        for mut cq in cqs {
+            if let Err(e) = cq.normalize() {
+                tracing::warn!(cq = %cq.name, error = %e, "failed to normalize continuous query");
+                counter!("hyperbytedb_cq_errors_total").increment(1);
                 continue;
             }
 
-            tracing::info!(
-                cq = %cq.name,
-                db = %cq.database,
-                "executing continuous query"
-            );
+            if !should_run(now, &cq) {
+                continue;
+            }
 
-            let result = self
+            match self
                 .query_service
-                .execute_query(&cq.database, &cq.query_text, None, None)
-                .await;
-
-            match result {
-                Ok(resp) => {
-                    counter!("hyperbytedb_cq_executions_total").increment(1);
-                    for r in &resp.results {
-                        if let Some(ref err) = r.error {
-                            tracing::warn!(cq = %cq.name, error = %err, "CQ statement error");
-                            counter!("hyperbytedb_cq_errors_total").increment(1);
-                        }
-                    }
+                .execute_continuous_query(&mut cq, now)
+                .await
+            {
+                Ok(result) => {
+                    tracing::debug!(
+                        cq = %cq.name,
+                        db = %cq.database,
+                        points_written = result.points_written,
+                        duration_ms = result.duration_ms,
+                        window_start = %result.window.start,
+                        window_end = %result.window.end,
+                        "continuous query completed"
+                    );
                 }
                 Err(e) => {
                     tracing::warn!(cq = %cq.name, error = %e, "CQ execution failed");

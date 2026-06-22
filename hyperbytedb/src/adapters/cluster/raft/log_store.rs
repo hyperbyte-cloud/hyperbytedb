@@ -18,12 +18,14 @@ use rocksdb::{
     BoundColumnFamily, ColumnFamilyDescriptor, DB, Direction, IteratorMode, Options, WriteBatch,
 };
 
+use crate::application::materialized_view_service::MaterializedViewService;
 use crate::domain::cluster::membership::{NodeInfo, NodeState, SharedMembership};
 use crate::ports::metadata::MetadataPort;
 
 use super::TypeConfig;
-use super::state_machine::{StateMachineData, apply_schema_mutation};
+use super::state_machine::StateMachineData;
 use super::types::{ClusterRequest, ClusterResponse};
+use crate::application::schema_mutation_apply;
 
 const CF_META: &str = "meta";
 const CF_LOGS: &str = "logs";
@@ -89,6 +91,7 @@ pub struct RaftStore {
     // Runtime-only state (not persisted in Raft storage).
     shared_membership: SharedMembership,
     metadata: Option<Arc<dyn MetadataPort>>,
+    mv_service: Option<Arc<MaterializedViewService>>,
 }
 
 impl RaftStore {
@@ -160,6 +163,7 @@ impl RaftStore {
             sm,
             shared_membership,
             metadata: None,
+            mv_service: None,
         })
     }
 
@@ -250,6 +254,11 @@ impl RaftStore {
 
     pub fn with_metadata(mut self, metadata: Arc<dyn MetadataPort>) -> Self {
         self.metadata = Some(metadata);
+        self
+    }
+
+    pub fn with_mv_service(mut self, mv_service: Arc<MaterializedViewService>) -> Self {
+        self.mv_service = Some(mv_service);
         self
     }
 
@@ -441,6 +450,7 @@ impl RaftStorage<TypeConfig> for RaftStore {
             sm: self.sm.clone(),
             shared_membership: self.shared_membership.clone(),
             metadata: self.metadata.clone(),
+            mv_service: self.mv_service.clone(),
         }
     }
 
@@ -604,6 +614,7 @@ impl RaftStorage<TypeConfig> for RaftStore {
             sm: self.sm.clone(),
             shared_membership: self.shared_membership.clone(),
             metadata: self.metadata.clone(),
+            mv_service: self.mv_service.clone(),
         }
     }
 
@@ -825,7 +836,13 @@ impl RaftStore {
             }
             ClusterRequest::SchemaMutation(mutation) => {
                 if let Some(ref metadata) = self.metadata {
-                    match apply_schema_mutation(metadata, *mutation).await {
+                    match schema_mutation_apply::apply_schema_mutation(
+                        metadata,
+                        self.mv_service.as_deref(),
+                        *mutation,
+                    )
+                    .await
+                    {
                         Ok(()) => ClusterResponse::success(),
                         Err(e) => ClusterResponse::error(e.to_string()),
                     }

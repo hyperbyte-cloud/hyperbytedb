@@ -74,6 +74,7 @@ pub async fn run_import(client: &HyperbytedbClient, opts: &ImportOptions) -> Res
             Section::Ddl => {
                 let qopts = QueryOptions {
                     db: None,
+                    retention_policy: None,
                     epoch: None,
                     pretty: false,
                     chunked: false,

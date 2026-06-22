@@ -112,6 +112,7 @@ async fn fetch_databases(client: &HyperbytedbClient) -> crate::error::Result<Vec
             "SHOW DATABASES",
             &QueryOptions {
                 db: None,
+                retention_policy: None,
                 epoch: None,
                 pretty: false,
                 chunked: false,
@@ -133,6 +134,7 @@ async fn fetch_measurements(
             "SHOW MEASUREMENTS",
             &QueryOptions {
                 db: Some(db.to_string()),
+                retention_policy: None,
                 epoch: None,
                 pretty: false,
                 chunked: false,

@@ -780,7 +780,7 @@ async fn epoch_s_returns_unix_seconds() {
 
     let resp = ctx
         .query_service
-        .execute_query("testdb", "SELECT * FROM cpu", Some("s"), None)
+        .execute_query("testdb", "SELECT * FROM cpu", Some("s"), None, None)
         .await
         .unwrap();
 
@@ -810,7 +810,7 @@ async fn epoch_ms_returns_unix_millis() {
 
     let resp = ctx
         .query_service
-        .execute_query("testdb", "SELECT * FROM cpu", Some("ms"), None)
+        .execute_query("testdb", "SELECT * FROM cpu", Some("ms"), None, None)
         .await
         .unwrap();
 
@@ -835,7 +835,7 @@ async fn epoch_ns_returns_unix_nanos() {
 
     let resp = ctx
         .query_service
-        .execute_query("testdb", "SELECT * FROM cpu", Some("ns"), None)
+        .execute_query("testdb", "SELECT * FROM cpu", Some("ns"), None, None)
         .await
         .unwrap();
 
@@ -860,7 +860,7 @@ async fn no_epoch_returns_rfc3339() {
 
     let resp = ctx
         .query_service
-        .execute_query("testdb", "SELECT * FROM cpu", None, None)
+        .execute_query("testdb", "SELECT * FROM cpu", None, None, None)
         .await
         .unwrap();
 
@@ -927,6 +927,76 @@ async fn multiple_aggregates_have_distinct_columns() {
 
 #[tokio::test]
 #[ignore] // Requires chDB
+async fn fill_null_with_group_by_tag_does_not_split_into_phantom_series() {
+    // Grafana-style query: regex host filter + aliased means + GROUP BY time, tag
+    // + fill(null) over a wide range. WITH FILL must fill the *per-tag* series, not
+    // emit gap rows with an empty tag value (which produced a phantom all-NULL
+    // series and surfaced as "no data" in Grafana).
+    let ctx = TestContext::new().unwrap();
+    ctx.metadata.create_database("testdb").await.unwrap();
+
+    // WHERE range: time >= 1781683756774ms AND time <= 1781687356774ms (1h window).
+    // Write sparse points (with gaps) so WITH FILL must synthesise gap buckets.
+    let min_ms = 1_781_683_756_774i64;
+    let mut lp = String::new();
+    for i in 0..5 {
+        let ts_ns = (min_ms + 100_000 * i) * 1_000_000; // 100s apart
+        lp.push_str(&format!(
+            "system,host=telegraf-7c974c458c-44fqq load1={}.0,load5={}.0,load15={}.0 {}\n",
+            i + 1,
+            i + 2,
+            i + 3,
+            ts_ns
+        ));
+    }
+    ctx.write_and_flush("testdb", &lp).await.unwrap();
+
+    let q = r#"SELECT mean("load1") AS "Load (short)", mean("load5") AS "Load (medium)", mean("load15") AS "Load (long)" FROM "system" WHERE "host" =~ /^(telegraf-7c974c458c-44fqq)$/ AND time >= 1781683756774ms and time <= 1781687356774ms GROUP BY time(10s), "host" fill(null) ORDER BY time ASC"#;
+    let resp = ctx.query("testdb", q).await.unwrap();
+    assert!(
+        resp.results[0].error.is_none(),
+        "{:?}",
+        resp.results[0].error
+    );
+
+    let series = resp.results[0]
+        .series
+        .as_ref()
+        .expect("expected series back, got none");
+    // Exactly one series — the real host — not a real series plus a phantom
+    // empty-tag fill series.
+    assert_eq!(
+        series.len(),
+        1,
+        "expected exactly one series (no phantom empty-tag series), got {}: {:?}",
+        series.len(),
+        series.iter().map(|s| &s.tags).collect::<Vec<_>>()
+    );
+    let s = &series[0];
+    assert_eq!(
+        s.tags
+            .as_ref()
+            .and_then(|t| t.get("host"))
+            .map(String::as_str),
+        Some("telegraf-7c974c458c-44fqq"),
+        "the single series must carry the real host tag, got tags: {:?}",
+        s.tags
+    );
+    // Wide range filled: many buckets, but only the 5 written points are non-null.
+    assert!(
+        s.values.len() > 100,
+        "fill(null) should produce a filled bucket grid, got {} rows",
+        s.values.len()
+    );
+    let non_null = s
+        .values
+        .iter()
+        .filter(|row| row.iter().skip(1).any(|v| !v.is_null()))
+        .count();
+    assert_eq!(non_null, 5, "exactly the 5 written points carry data");
+}
+
+#[tokio::test]
 async fn partial_line_writes_coalesce_before_query() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();

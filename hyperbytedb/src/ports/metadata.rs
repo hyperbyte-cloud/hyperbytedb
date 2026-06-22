@@ -14,6 +14,23 @@ pub use crate::domain::user::StoredUser;
 pub trait MetadataPort: Send + Sync {
     // Database operations
     async fn create_database(&self, name: &str) -> Result<(), HyperbytedbError>;
+    async fn create_database_with(
+        &self,
+        stmt: &crate::timeseriesql::ast::CreateDatabaseStatement,
+    ) -> Result<(), HyperbytedbError>;
+    async fn alter_retention_policy(
+        &self,
+        db: &str,
+        name: &str,
+        change: &crate::timeseriesql::ast::RetentionPolicyChange,
+    ) -> Result<(), HyperbytedbError>;
+    async fn delete_series_matching(
+        &self,
+        db: &str,
+        rp: &str,
+        measurement: Option<&str>,
+        predicate_sql: &str,
+    ) -> Result<usize, HyperbytedbError>;
     async fn drop_database(&self, name: &str) -> Result<(), HyperbytedbError>;
     async fn list_databases(&self) -> Result<Vec<Database>, HyperbytedbError>;
     async fn get_database(&self, name: &str) -> Result<Option<Database>, HyperbytedbError>;
@@ -153,6 +170,28 @@ pub trait MetadataPort: Send + Sync {
     ) -> Result<Vec<(u64, BTreeMap<String, String>)>, HyperbytedbError> {
         let _ = (db, rp, measurement);
         Ok(Vec::new())
+    }
+
+    /// Just the `series_id`s for `(db, rp, measurement)`, without decoding tags.
+    ///
+    /// Used to warm the dedup caches at startup. At high cardinality the tag
+    /// maps returned by [`Self::list_series`] dominate both time and transient
+    /// memory (one `BTreeMap<String, String>` per series, deserialized from
+    /// JSON only to be discarded), so the warm path must avoid them. The
+    /// default derives from `list_series`; adapters should override with a
+    /// key-only scan.
+    async fn list_series_ids(
+        &self,
+        db: &str,
+        rp: &str,
+        measurement: &str,
+    ) -> Result<Vec<u64>, HyperbytedbError> {
+        Ok(self
+            .list_series(db, rp, measurement)
+            .await?
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect())
     }
 
     /// Resolve a single `series_id` to its tag set.

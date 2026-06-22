@@ -1,5 +1,14 @@
 #![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
 
+// jemalloc returns freed heap to the OS via background purging, unlike the
+// default glibc malloc which pins RSS at the process's allocation peak. The
+// startup series-cache warm and cold WAL→chDB replay allocate (and free) a
+// large transient working set at high cardinality; under glibc that peak
+// stayed resident for the life of the pod. See `bootstrap::build_services`.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use clap::{Parser, Subcommand};
 
 use hyperbytedb::application::backup::{backup, restore};

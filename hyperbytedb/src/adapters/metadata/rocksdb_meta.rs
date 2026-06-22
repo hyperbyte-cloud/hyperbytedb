@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 use rocksdb::{BlockBasedOptions, Cache, ColumnFamilyDescriptor, IteratorMode, Options};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -244,8 +244,16 @@ impl MetadataPort for RocksDbMetadata {
         let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
             HyperbytedbError::Metadata("metadata column family not found".to_string())
         })?;
-        let db = Database::new(name);
         let key = db_key(name);
+        if self
+            .db
+            .get_cf(&cf, &key)
+            .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let db = Database::new(name);
         let value = serde_json::to_vec(&DbValue {
             database: db.clone(),
         })
@@ -255,6 +263,178 @@ impl MetadataPort for RocksDbMetadata {
             .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
         self.db_cache.write().insert(name.to_string(), db);
         Ok(())
+    }
+
+    async fn create_database_with(
+        &self,
+        stmt: &crate::timeseriesql::ast::CreateDatabaseStatement,
+    ) -> Result<(), HyperbytedbError> {
+        use crate::domain::database::retention_policy_from_create;
+
+        let existing = self.get_database(&stmt.name).await?;
+        if existing.is_none() {
+            self.create_database(&stmt.name).await?;
+        }
+
+        let Some(rp) = retention_policy_from_create(stmt) else {
+            return Ok(());
+        };
+
+        let rp_name = rp.name.clone();
+
+        if let Some(ref db) = existing
+            && let Some(existing_rp) = db.retention_policies.iter().find(|r| r.name == rp_name)
+        {
+            if existing_rp.duration != rp.duration
+                || existing_rp.shard_group_duration != rp.shard_group_duration
+                || existing_rp.replication_factor != rp.replication_factor
+            {
+                return Err(HyperbytedbError::QueryParse(format!(
+                    "database {} already exists with different retention policy settings",
+                    stmt.name
+                )));
+            }
+            return Ok(());
+        }
+
+        let mut db_obj = self
+            .get_database(&stmt.name)
+            .await?
+            .ok_or_else(|| HyperbytedbError::DatabaseNotFound(stmt.name.clone()))?;
+
+        db_obj.retention_policies.retain(|r| r.name != rp_name);
+        db_obj.retention_policies.push(rp);
+        db_obj.default_rp = rp_name.clone();
+        for r in &mut db_obj.retention_policies {
+            r.is_default = r.name == db_obj.default_rp;
+        }
+
+        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
+            HyperbytedbError::Metadata("metadata column family not found".to_string())
+        })?;
+        let key = db_key(&stmt.name);
+        let value = serde_json::to_vec(&DbValue {
+            database: db_obj.clone(),
+        })
+        .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+        self.db
+            .put_cf(&cf, key, value)
+            .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+        self.db_cache.write().insert(stmt.name.clone(), db_obj);
+        Ok(())
+    }
+
+    async fn alter_retention_policy(
+        &self,
+        db: &str,
+        name: &str,
+        change: &crate::timeseriesql::ast::RetentionPolicyChange,
+    ) -> Result<(), HyperbytedbError> {
+        use crate::timeseriesql::ast::DurationUnit;
+
+        let mut db_obj = self
+            .get_database(db)
+            .await?
+            .ok_or_else(|| HyperbytedbError::DatabaseNotFound(db.to_string()))?;
+
+        let rp = db_obj
+            .retention_policies
+            .iter_mut()
+            .find(|r| r.name == name)
+            .ok_or_else(|| {
+                HyperbytedbError::QueryParse(format!("retention policy {name} not found"))
+            })?;
+
+        if let Some(d_opt) = &change.duration {
+            rp.duration = match d_opt {
+                None => None,
+                Some(dur) if dur.value == 0 && dur.unit == DurationUnit::Second => None,
+                Some(dur) => Some(std::time::Duration::from_nanos(dur.to_nanos() as u64)),
+            };
+        }
+        if let Some(rep) = change.replication {
+            rp.replication_factor = rep;
+        }
+        if let Some(sd) = &change.shard_duration {
+            rp.shard_group_duration = std::time::Duration::from_nanos(sd.to_nanos() as u64);
+        }
+        if change.is_default == Some(true) {
+            db_obj.default_rp = name.to_string();
+            for r in &mut db_obj.retention_policies {
+                r.is_default = r.name == name;
+            }
+        }
+
+        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
+            HyperbytedbError::Metadata("metadata column family not found".to_string())
+        })?;
+        let key = db_key(db);
+        let value = serde_json::to_vec(&DbValue {
+            database: db_obj.clone(),
+        })
+        .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+        self.db
+            .put_cf(&cf, key, value)
+            .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+        self.db_cache.write().insert(db.to_string(), db_obj);
+        Ok(())
+    }
+
+    async fn delete_series_matching(
+        &self,
+        db: &str,
+        rp: &str,
+        measurement: Option<&str>,
+        _predicate_sql: &str,
+    ) -> Result<usize, HyperbytedbError> {
+        let rdb = self.db.clone();
+        let db_s = db.to_string();
+        let rp_s = rp.to_string();
+        let meas_filter = measurement.map(str::to_string);
+        let removed = tokio::task::spawn_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".to_string())
+            })?;
+            let prefix = if let Some(ref m) = meas_filter {
+                format!("series:{db_s}:{rp_s}:{m}:")
+            } else {
+                format!("series:{db_s}:{rp_s}:")
+            };
+            let pbytes = prefix.as_bytes();
+            let iter = rdb.iterator_cf_opt(
+                &cf,
+                rocksdb::ReadOptions::default(),
+                rocksdb::IteratorMode::From(pbytes, rocksdb::Direction::Forward),
+            );
+            let mut keys_to_delete = Vec::new();
+            for item in iter {
+                let (key, _) = item.map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+                if !key.starts_with(pbytes) {
+                    break;
+                }
+                keys_to_delete.push(key.to_vec());
+            }
+            let count = keys_to_delete.len();
+            for key in keys_to_delete {
+                rdb.delete_cf(&cf, key)
+                    .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+            }
+            Ok::<usize, HyperbytedbError>(count)
+        })
+        .await
+        .map_err(|e| HyperbytedbError::Metadata(format!("metadata task panicked: {e}")))??;
+
+        {
+            let mut cache = self.series_known.write();
+            cache.retain(|k| {
+                if let Some(ref m) = measurement {
+                    !k.starts_with(&format!("series:{db}:{rp}:{m}:"))
+                } else {
+                    !k.starts_with(&format!("series:{db}:{rp}:"))
+                }
+            });
+        }
+        Ok(removed)
     }
 
     async fn drop_database(&self, name: &str) -> Result<(), HyperbytedbError> {
@@ -452,6 +632,8 @@ impl MetadataPort for RocksDbMetadata {
             if let Some(existing) = cache.get(&cache_key)
                 && existing.field_types == measurement.field_types
                 && existing.tag_keys == measurement.tag_keys
+                && existing.field_rollups == measurement.field_rollups
+                && existing.mean_fields == measurement.mean_fields
             {
                 return Ok(());
             }
@@ -571,7 +753,7 @@ impl MetadataPort for RocksDbMetadata {
 
         for (name, got) in fields {
             if let Some(&expected) = meta.field_types.get(name)
-                && *got != expected
+                && !crate::domain::field_type::field_types_compatible(expected, *got)
             {
                 return Err(HyperbytedbError::FieldTypeConflict {
                     field: name.clone(),
@@ -837,6 +1019,48 @@ impl MetadataPort for RocksDbMetadata {
         .map_err(|e| HyperbytedbError::Metadata(format!("metadata task panicked: {e}")))?
     }
 
+    /// Key-only variant of [`Self::list_series`]: parses the `series_id` out of
+    /// each storage key and never touches the value, so the per-series tag map
+    /// is neither read nor deserialized. This is what makes the startup warm
+    /// cheap at high cardinality (no `BTreeMap` per series).
+    async fn list_series_ids(
+        &self,
+        db: &str,
+        rp: &str,
+        measurement: &str,
+    ) -> Result<Vec<u64>, HyperbytedbError> {
+        let rdb = self.db.clone();
+        let prefix = series_prefix(db, rp, measurement);
+        tokio::task::spawn_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".to_string())
+            })?;
+            let pbytes = prefix.as_bytes();
+            let iter = rdb.iterator_cf_opt(
+                &cf,
+                rocksdb::ReadOptions::default(),
+                IteratorMode::From(pbytes, rocksdb::Direction::Forward),
+            );
+            let mut out = Vec::new();
+            for item in iter {
+                let (key, _) = item.map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+                if !key.starts_with(pbytes) {
+                    break;
+                }
+                let Ok(s) = std::str::from_utf8(&key) else {
+                    continue;
+                };
+                let Ok(id) = u64::from_str_radix(&s[prefix.len()..], 16) else {
+                    continue;
+                };
+                out.push(id);
+            }
+            Ok::<Vec<u64>, HyperbytedbError>(out)
+        })
+        .await
+        .map_err(|e| HyperbytedbError::Metadata(format!("metadata task panicked: {e}")))?
+    }
+
     async fn warm_series(&self) -> Result<usize, HyperbytedbError> {
         let rdb = self.db.clone();
         let keys = tokio::task::spawn_blocking(move || {
@@ -949,16 +1173,41 @@ impl MetadataPort for RocksDbMetadata {
             let meas_cache = self.meas_cache.read();
             for m in measurements {
                 let cache_key = format!("{}:{}", db, m.name);
+                let merged = match meas_cache.get(&cache_key) {
+                    Some(existing) => {
+                        let mut meta = m.clone();
+                        meta.field_types = crate::domain::field_type::merge_field_type_map(
+                            &existing.field_types,
+                            &m.field_types,
+                        );
+                        meta.tag_keys = {
+                            let mut keys: BTreeSet<String> =
+                                existing.tag_keys.iter().cloned().collect();
+                            keys.extend(m.tag_keys.iter().cloned());
+                            keys.into_iter().collect()
+                        };
+                        if meta.field_rollups.is_empty() {
+                            meta.field_rollups = existing.field_rollups.clone();
+                        }
+                        if meta.mean_fields.is_empty() {
+                            meta.mean_fields = existing.mean_fields.clone();
+                        }
+                        meta
+                    }
+                    None => m.clone(),
+                };
                 let needs_write = !matches!(
                     meas_cache.get(&cache_key),
                     Some(existing)
-                        if existing.field_types == m.field_types
-                            && existing.tag_keys == m.tag_keys
+                        if existing.field_types == merged.field_types
+                            && existing.tag_keys == merged.tag_keys
+                            && existing.field_rollups == merged.field_rollups
+                            && existing.mean_fields == merged.mean_fields
                 );
                 if needs_write {
-                    let value = serde_json::to_vec(m)
+                    let value = serde_json::to_vec(&merged)
                         .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-                    meas_updates.push((cache_key, value, m.clone()));
+                    meas_updates.push((cache_key, value, merged));
                 }
             }
         }

@@ -17,7 +17,7 @@ pub async fn run_heartbeat_logger(
                 let m = membership.read().await;
                 let active_peers = m.active_peers(self_id).len();
                 let total_nodes = m.nodes.len();
-                tracing::info!(
+                tracing::debug!(
                     node_addr = %node_addr,
                     active_peers = active_peers,
                     total_nodes = total_nodes,

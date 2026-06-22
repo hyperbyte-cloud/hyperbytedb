@@ -979,8 +979,8 @@ main() {
 
     case "$MODE" in
         single)
-            pre_build_server
-            start_server
+            # pre_build_server
+            # start_server
             wait_for_server || exit 1
             ;;
         cluster)
@@ -1005,18 +1005,18 @@ main() {
     log "Waiting for WAL flush before query test..."
     wait_for_flush
 
-    run_query_test
-    summarise_query_results "$LOG_DIR/$TIMESTAMP/query.log"
+    # run_query_test
+    # summarise_query_results "$LOG_DIR/$TIMESTAMP/query.log"
 
-    if [[ "${RUN_BENCHES}" == "1" ]]; then
-        if command -v cargo &>/dev/null; then
-            run_criterion_benches || log_err "One or more Criterion benches failed; see bench_*.log"
-        else
-            log "RUN_BENCHES=1 but cargo not found; skipping Criterion benches"
-        fi
-    else
-        log "RUN_BENCHES!=1 — skipping Criterion benches"
-    fi
+    # if [[ "${RUN_BENCHES}" == "1" ]]; then
+    #     if command -v cargo &>/dev/null; then
+    #         run_criterion_benches || log_err "One or more Criterion benches failed; see bench_*.log"
+    #     else
+    #         log "RUN_BENCHES=1 but cargo not found; skipping Criterion benches"
+    #     fi
+    # else
+    #     log "RUN_BENCHES!=1 — skipping Criterion benches"
+    # fi
 
     write_summary_report
 

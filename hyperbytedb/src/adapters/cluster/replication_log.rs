@@ -411,7 +411,10 @@ mod tests {
         assert_eq!(log.last_mutation_seq(), 0);
 
         let seq1 = log
-            .append_mutation(&MutationRequest::CreateDatabase("db1".into()))
+            .append_mutation(&MutationRequest::CreateDatabase {
+                name: "db1".into(),
+                rp: None,
+            })
             .unwrap();
         assert_eq!(seq1, 1);
         assert_eq!(log.last_mutation_seq(), 1);
@@ -439,12 +442,21 @@ mod tests {
     #[test]
     fn test_truncate_mutations() {
         let log = tmp_log();
-        log.append_mutation(&MutationRequest::CreateDatabase("a".into()))
-            .unwrap();
-        log.append_mutation(&MutationRequest::CreateDatabase("b".into()))
-            .unwrap();
-        log.append_mutation(&MutationRequest::CreateDatabase("c".into()))
-            .unwrap();
+        log.append_mutation(&MutationRequest::CreateDatabase {
+            name: "a".into(),
+            rp: None,
+        })
+        .unwrap();
+        log.append_mutation(&MutationRequest::CreateDatabase {
+            name: "b".into(),
+            rp: None,
+        })
+        .unwrap();
+        log.append_mutation(&MutationRequest::CreateDatabase {
+            name: "c".into(),
+            rp: None,
+        })
+        .unwrap();
 
         log.truncate_mutations_before(3).unwrap();
 

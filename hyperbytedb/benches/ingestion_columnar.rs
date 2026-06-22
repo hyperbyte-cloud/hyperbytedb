@@ -117,6 +117,7 @@ fn bench_metadata(c: &mut Criterion) {
             rt.block_on(prepare_batch_metadata(
                 &meta_port,
                 "benchdb",
+                "autogen",
                 &points,
                 limits,
                 Some(&cache),
@@ -153,6 +154,7 @@ fn bench_wal(c: &mut Criterion) {
             rt.block_on(prepare_batch_metadata(
                 &meta_port,
                 "benchdb",
+                "autogen",
                 &points,
                 limits,
                 Some(&cache),

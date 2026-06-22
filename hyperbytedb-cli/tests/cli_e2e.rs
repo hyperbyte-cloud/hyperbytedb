@@ -164,6 +164,7 @@ async fn execute_show_databases() {
                 "CREATE DATABASE testdb",
                 &QueryOptions {
                     db: None,
+                    retention_policy: None,
                     epoch: None,
                     pretty: false,
                     chunked: false,
@@ -197,6 +198,7 @@ async fn write_and_query_roundtrip() {
                 "CREATE DATABASE metrics",
                 &QueryOptions {
                     db: None,
+                    retention_policy: None,
                     epoch: None,
                     pretty: false,
                     chunked: false,
@@ -229,6 +231,7 @@ async fn write_and_query_roundtrip() {
                 "SHOW MEASUREMENTS",
                 &QueryOptions {
                     db: Some("metrics".to_string()),
+                    retention_policy: None,
                     epoch: None,
                     pretty: false,
                     chunked: false,
@@ -281,6 +284,7 @@ async fn materialized_view_via_execute() {
                 "CREATE DATABASE mvcli",
                 &QueryOptions {
                     db: None,
+                    retention_policy: None,
                     epoch: None,
                     pretty: false,
                     chunked: false,
@@ -313,6 +317,7 @@ async fn materialized_view_via_execute() {
                 "SHOW MEASUREMENTS",
                 &QueryOptions {
                     db: Some("mvcli".to_string()),
+                    retention_policy: None,
                     epoch: None,
                     pretty: false,
                     chunked: false,

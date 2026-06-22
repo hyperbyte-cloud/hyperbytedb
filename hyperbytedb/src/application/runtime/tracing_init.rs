@@ -1,4 +1,11 @@
 //! Tracing subscriber setup: stderr logs + optional OTLP export for Tempo.
+//!
+//! **Log level conventions** (default filter: `[logging].level`, usually `info`):
+//! - `info` — process lifecycle, service start/stop, cluster sync/drain completion,
+//!   membership changes, operator-visible milestones
+//! - `debug` — per-flush/per-batch/per-sync-step detail, heartbeats, DDL, CQ runs,
+//!   and [`crate::application::system_trace`] phase lines when `detailed_trace` is on
+//! - `warn` / `error` — recoverable and fatal failures
 
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
@@ -127,7 +134,9 @@ pub fn init_tracing(logging: &LoggingConfig) -> anyhow::Result<Option<OtelGuard>
         .map_err(|e| anyhow::anyhow!("tracing subscriber: {e}"))?;
 
     if logging.detailed_trace {
-        tracing::info!("detailed system tracing enabled (logs + spans when OTLP is configured)");
+        tracing::info!(
+            "detailed system tracing enabled (debug-level phase logs; enable RUST_LOG=debug or logging.level=debug to view)"
+        );
     }
 
     Ok(None)

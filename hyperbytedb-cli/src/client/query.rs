@@ -30,6 +30,7 @@ pub struct SeriesResult {
 #[derive(Debug, Clone)]
 pub struct QueryOptions {
     pub db: Option<String>,
+    pub retention_policy: Option<String>,
     pub epoch: Option<String>,
     pub pretty: bool,
     pub chunked: bool,
@@ -102,6 +103,9 @@ impl HyperbytedbClient {
         let mut pairs: Vec<(&str, String)> = vec![("q", q.to_string())];
         if let Some(ref db) = opts.db {
             pairs.push(("db", db.clone()));
+        }
+        if let Some(ref rp) = opts.retention_policy {
+            pairs.push(("rp", rp.clone()));
         }
         if let Some(ref epoch) = opts.epoch {
             pairs.push(("epoch", epoch.clone()));

@@ -7,15 +7,20 @@ request_timeout_secs = 30
 [storage]
 wal_dir = "./wal"
 meta_dir = "./meta"
+# Durable WAL encoding: "bincode" (default) or "arrow_ipc"
+wal_format = "bincode"
 
 [flush]
 interval_secs = 10
 wal_size_threshold_mb = 64
 time_bucket_duration = "1h"
 max_points_per_batch = 50000
+# Keep chDB-ready Arrow batches in RAM for zero-copy flush (default true)
+arrow_wal_enabled = true
 
 [chdb]
 session_data_path = "./chdb_data"
+pool_size = 4  # same-path chDB connections for parallel flush inserts and queries
 
 [auth]
 enabled = false

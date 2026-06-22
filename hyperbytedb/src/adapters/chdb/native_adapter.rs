@@ -39,20 +39,21 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use async_trait::async_trait;
-use chdb_rust::arg::Arg;
 use chdb_rust::arrow_insert::{InsertOptions, insert_record_batch_direct};
 use chdb_rust::format::OutputFormat;
-use metrics::histogram;
+use metrics::{counter, histogram};
 use parking_lot::RwLock;
 
 use crate::adapters::chdb::catalog;
-use crate::adapters::chdb::session::{SharedSession, SyncSession};
+use crate::adapters::chdb::connection_pool::ChdbConnectionPool;
+use crate::adapters::chdb::session::{SharedSession, execute_connection};
 use crate::application::ingest_metadata::backfill_tag_metadata;
 use crate::application::system_trace;
 use crate::domain::chdb_naming::{
     field_column_name, quote_backticks, quoted_series_table_name, quoted_table_name,
     tag_column_name, unquoted_series_table_name, unquoted_table_name,
 };
+use crate::domain::field_type::{merge_field_type_map, widen_field_disc};
 use crate::domain::measurement::MeasurementMeta;
 use crate::domain::point::{FieldValue, Point};
 use crate::domain::series::series_id_for_point;
@@ -224,6 +225,13 @@ impl ChdbNativeAdapter {
         self
     }
 
+    /// Re-warm schema caches from metadata (e.g. after peer metadata sync).
+    pub async fn refresh_schemas_from_metadata(&self) -> Result<usize, HyperbytedbError> {
+        let warmed = self.warm_schemas_from_metadata().await?;
+        let _ = self.sync_materialized_from_engine().await?;
+        Ok(warmed)
+    }
+
     /// Pre-populate the schema cache from RocksDB measurement metadata so a
     /// restart does not treat known tables as empty (skipping `ALTER` / type
     /// upgrades) or re-resolve column kinds from scratch on every table.
@@ -280,22 +288,20 @@ impl ChdbNativeAdapter {
     /// Mark schema-cache entries as materialized when the engine catalog already
     /// contains the corresponding fact / series tables (e.g. after backup restore).
     pub async fn sync_materialized_from_engine(&self) -> Result<usize, HyperbytedbError> {
-        let session = self.session.get()?;
+        let pool = self.session.pool()?;
         let raw = tokio::task::spawn_blocking(move || {
-            let sql =
-                "SELECT name FROM system.tables WHERE database = 'default' FORMAT TabSeparated";
-            let result = session.0.execute(
-                sql,
-                Some(&[chdb_rust::arg::Arg::OutputFormat(
-                    chdb_rust::format::OutputFormat::TabSeparated,
-                )]),
-            );
-            match result {
-                Ok(qr) => qr
-                    .data_utf8()
-                    .map_err(|e| HyperbytedbError::Chdb(e.to_string())),
-                Err(e) => Err(HyperbytedbError::Chdb(e.to_string())),
-            }
+            pool.with_connection(|conn| {
+                let sql =
+                    "SELECT name FROM system.tables WHERE database = 'default' FORMAT TabSeparated";
+                let result =
+                    execute_connection(conn, sql, chdb_rust::format::OutputFormat::TabSeparated);
+                match result {
+                    Ok(qr) => qr
+                        .data_utf8()
+                        .map_err(|e| HyperbytedbError::Chdb(e.to_string())),
+                    Err(e) => Err(HyperbytedbError::Chdb(e.to_string())),
+                }
+            })
         })
         .await
         .map_err(|e| {
@@ -353,7 +359,10 @@ impl ChdbNativeAdapter {
             let measurements = meta.list_measurements(&db.name).await?;
             for meas_name in &measurements {
                 for rp in &db.retention_policies {
-                    let series = meta.list_series(&db.name, &rp.name, meas_name).await?;
+                    // IDs only — decoding each series' tag map here would cost
+                    // a `BTreeMap` allocation per series and dominate startup
+                    // memory/time at high cardinality. The warm only needs IDs.
+                    let series = meta.list_series_ids(&db.name, &rp.name, meas_name).await?;
                     if series.is_empty() {
                         continue;
                     }
@@ -362,7 +371,7 @@ impl ChdbNativeAdapter {
                         rp: rp.name.clone(),
                         measurement: meas_name.clone(),
                     };
-                    let ids: HashSet<u64> = series.into_iter().map(|(id, _)| id).collect();
+                    let ids: HashSet<u64> = series.into_iter().collect();
                     warmed += ids.len();
                     self.known_series.write().insert(key, ids);
                 }
@@ -393,11 +402,60 @@ impl ChdbNativeAdapter {
             .clone()
     }
 
+    /// Load fact-table field columns from the engine catalog (`DESCRIBE TABLE`).
+    async fn engine_field_columns(
+        &self,
+        table: &str,
+    ) -> Result<HashMap<String, u8>, HyperbytedbError> {
+        let pool = self.session.pool()?;
+        let table = table.to_string();
+        let raw = tokio::task::spawn_blocking(move || {
+            pool.with_connection(|conn| {
+                let sql = format!("DESCRIBE TABLE {table}");
+                let result =
+                    execute_connection(conn, &sql, chdb_rust::format::OutputFormat::TabSeparated);
+                match result {
+                    Ok(qr) => qr
+                        .data_utf8()
+                        .map_err(|e| HyperbytedbError::Chdb(e.to_string())),
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if msg.contains("doesn't exist")
+                            || msg.contains("UNKNOWN_TABLE")
+                            || (msg.contains("Table") && msg.contains("not exist"))
+                        {
+                            Ok(String::new())
+                        } else {
+                            Err(HyperbytedbError::Chdb(msg))
+                        }
+                    }
+                }
+            })
+        })
+        .await
+        .map_err(|e| HyperbytedbError::Internal(format!("chDB describe join error: {e}")))??;
+
+        let skip = ["time", "origin_node_id", "ingest_seq", "series_id"];
+        let mut out = HashMap::new();
+        for line in raw.lines().filter(|l| !l.is_empty()) {
+            let mut parts = line.split('\t');
+            let name = parts.next().unwrap_or("").trim();
+            let ty = parts.next().unwrap_or("").trim();
+            if skip.contains(&name) {
+                continue;
+            }
+            if let Some(disc) = ch_type_to_field_disc(ty) {
+                out.insert(name.to_string(), disc);
+            }
+        }
+        Ok(out)
+    }
+
     /// Run a `chdb` statement on the shared session via
     /// `spawn_blocking`. Used for both DDL and `INSERT` paths.
     async fn execute(&self, sql: String) -> Result<(), HyperbytedbError> {
-        let session = self.session.get()?;
-        tokio::task::spawn_blocking(move || run_sync(&session, &sql))
+        let pool = self.session.pool()?;
+        tokio::task::spawn_blocking(move || run_sync(&pool, &sql))
             .await
             .map_err(|e| HyperbytedbError::Internal(format!("chDB DDL join error: {e}")))?
     }
@@ -432,11 +490,8 @@ impl ChdbNativeAdapter {
                 let new_disc = v.type_discriminant();
                 match field_types.get_mut(k) {
                     Some(existing) => {
-                        // Mirror parquet_writer: Int64 + Float64 in the
-                        // same batch widens to Float64 so we never
-                        // narrow lossily.
-                        if (*existing == 0 && new_disc == 1) || (*existing == 1 && new_disc == 0) {
-                            *existing = 0;
+                        if let Some(w) = widen_field_disc(*existing, new_disc) {
+                            *existing = w;
                         }
                     }
                     None => {
@@ -446,16 +501,41 @@ impl ChdbNativeAdapter {
             }
         }
 
-        // Collision-aware physical column names. Tag wins the
-        // `__tag__` prefix when a tag key matches a field name, same
-        // as the Parquet path.
-        let field_name_set: HashSet<&str> = field_types.keys().map(String::as_str).collect();
+        if let Some(meta) = &self.metadata
+            && let Some(meas_meta) = meta.get_measurement(&key.db, &key.measurement).await?
+        {
+            field_types = merge_field_type_map(&meas_meta.field_types, &field_types);
+            for k in &meas_meta.tag_keys {
+                tag_keys.insert(k.clone());
+            }
+        }
 
         // Snapshot pre-existing schemas first (enables flush fast path without
         // scanning all tag values when both tables are materialized). The fact
         // schema holds only field columns; the series schema holds tag columns.
         let cached = { self.schemas.read().get(key).cloned() }.unwrap_or_default();
         let series_cached = { self.series_schemas.read().get(key).cloned() }.unwrap_or_default();
+
+        // Union cached/materialized chDB columns so sparse batches still pad to
+        // the full on-disk table width after restart (metadata may be partial).
+        for (phys, kind) in &cached.columns {
+            if let ColumnKind::Field(d) = kind {
+                merge_cached_field_column(&mut field_types, phys, *d);
+            }
+        }
+        // Always probe the engine when the table may already exist (e.g. evolved
+        // Telegraf `netstat` with 75 columns but sparse metadata). Relying only
+        // on `cached.materialized` misses tables not yet in the in-memory cache.
+        if let Ok(engine_cols) = self.engine_field_columns(&table).await {
+            for (phys, d) in engine_cols {
+                merge_cached_field_column(&mut field_types, &phys, d);
+            }
+        }
+
+        // Collision-aware physical column names. Tag wins the
+        // `__tag__` prefix when a tag key matches a field name, same
+        // as the Parquet path.
+        let field_name_set: HashSet<&str> = field_types.keys().map(String::as_str).collect();
 
         // Tag kinds are resolved against the SERIES cache, since tag columns now
         // live on the `_series` table.
@@ -519,12 +599,18 @@ impl ChdbNativeAdapter {
         // table (materialized) or a warmed-from-metadata entry; a cold CREATE
         // already includes every field, so no redundant ADD COLUMN.
         let create_fact = if !cached.materialized {
-            Some(build_create_table_sql(&table, &field_phys))
+            Some(build_create_table_sql(&table, &field_phys, None))
         } else {
             None
         };
         let mut fact_alters = if cached.materialized || !cached.columns.is_empty() {
-            build_alter_add_field_columns(&table, &cached, &field_phys)
+            let mut alters = build_alter_add_field_columns(&table, &cached, &field_phys);
+            alters.extend(build_alter_reconcile_field_widening(
+                &table,
+                &cached,
+                &field_phys,
+            ));
+            alters
         } else {
             Vec::new()
         };
@@ -547,16 +633,16 @@ impl ChdbNativeAdapter {
         }
 
         if let Some(sql) = create_fact {
-            tracing::info!(table = %table_unquoted, "creating chDB native fact table");
+            tracing::debug!(table = %table_unquoted, "creating chDB native fact table");
             self.execute(sql).await?;
         }
         if let Some(sql) = create_series {
-            tracing::info!(table = %table_unquoted, "creating chDB native series table");
+            tracing::debug!(table = %table_unquoted, "creating chDB native series table");
             self.execute(sql).await?;
         }
         fact_alters.append(&mut series_alters);
         for stmt in fact_alters {
-            tracing::info!(table = %table_unquoted, alter = %stmt, "altering chDB native table");
+            tracing::debug!(table = %table_unquoted, alter = %stmt, "altering chDB native table");
             self.execute(stmt).await?;
         }
 
@@ -619,16 +705,18 @@ impl ChdbNativeAdapter {
 
         if self.use_arrow {
             let batch = build_series_record_batch(ensured, &new_series)?;
-            let session = self.session.get()?;
+            let pool = self.session.pool()?;
             let series_table = ensured.series_table.clone();
             tokio::task::spawn_blocking(move || {
-                insert_record_batch_direct(
-                    session.0.connection(),
-                    &series_table,
-                    batch,
-                    InsertOptions::default_bulk(),
-                )
-                .map_err(|e| HyperbytedbError::Chdb(e.to_string()))
+                pool.with_connection(|conn| {
+                    insert_record_batch_direct(
+                        conn,
+                        &series_table,
+                        batch,
+                        InsertOptions::default_bulk(),
+                    )
+                    .map_err(|e| HyperbytedbError::Chdb(e.to_string()))
+                })
             })
             .await
             .map_err(|e| {
@@ -813,13 +901,13 @@ impl ChdbNativeAdapter {
         let series_cached = { self.series_schemas.read().get(&key).cloned() }.unwrap_or_default();
 
         if !cached.materialized {
-            let sql = build_create_table_sql(&table, &field_phys);
-            tracing::info!(table = %meta.name, "creating chDB native fact table for MV destination");
+            let sql = build_create_table_sql(&table, &field_phys, summing_columns_from_meta(meta));
+            tracing::debug!(table = %meta.name, "creating chDB native fact table for MV destination");
             self.execute(sql).await?;
         }
         if !series_cached.materialized {
             let sql = build_create_series_table_sql(&series_table, &tag_phys);
-            tracing::info!(table = %meta.name, "creating chDB native series table for MV destination");
+            tracing::debug!(table = %meta.name, "creating chDB native series table for MV destination");
             self.execute(sql).await?;
         }
 
@@ -847,6 +935,151 @@ impl ChdbNativeAdapter {
             );
         }
 
+        Ok(())
+    }
+
+    /// Build a prepared WAL slot from points grouped by measurement (ingest-time Arrow path).
+    pub async fn build_prepared_wal_slot(
+        &self,
+        db: &str,
+        rp: &str,
+        origin_node_id: u64,
+        points: &[Point],
+    ) -> Result<crate::domain::prepared_wal::PreparedWalSlot, HyperbytedbError> {
+        use std::collections::BTreeMap;
+
+        use crate::domain::point_coalesce::coalesce_points_within_measurements;
+        use crate::domain::prepared_wal::PreparedWalSlot;
+
+        if points.is_empty() {
+            return Ok(PreparedWalSlot {
+                database: db.to_string(),
+                retention_policy: rp.to_string(),
+                origin_node_id,
+                measurements: Vec::new(),
+            });
+        }
+
+        let coalesced_points = coalesce_points_within_measurements(points);
+
+        let mut by_meas: BTreeMap<String, Vec<Point>> = BTreeMap::new();
+        for p in coalesced_points {
+            by_meas.entry(p.measurement.clone()).or_default().push(p);
+        }
+
+        let mut measurements = Vec::with_capacity(by_meas.len());
+        for (measurement, meas_points) in by_meas {
+            let key = TableKey {
+                db: db.to_string(),
+                rp: rp.to_string(),
+                measurement: measurement.clone(),
+            };
+            measurements.push(
+                self.prepare_measurement_batch(&key, origin_node_id, &meas_points, 0)
+                    .await?,
+            );
+        }
+
+        Ok(PreparedWalSlot {
+            database: db.to_string(),
+            retention_policy: rp.to_string(),
+            origin_node_id,
+            measurements,
+        })
+    }
+
+    async fn prepare_measurement_batch(
+        &self,
+        key: &TableKey,
+        origin_node_id: u64,
+        points: &[Point],
+        ingest_seq_base: u64,
+    ) -> Result<crate::domain::prepared_wal::PreparedMeasurementBatch, HyperbytedbError> {
+        use std::sync::Arc;
+
+        use crate::domain::prepared_wal::PreparedMeasurementBatch;
+
+        let ensured = self.ensure_table(key, points).await?;
+        let origins = vec![origin_node_id; points.len()];
+        let sids: Vec<u64> = points.iter().map(series_id_for_point).collect();
+        let new_series_batch = self
+            .build_new_series_batch(key, &ensured, points, &sids)
+            .await?;
+
+        let (batch, min_time, max_time) =
+            build_record_batch(&ensured, &origins, ingest_seq_base, points, &sids)?;
+
+        Ok(PreparedMeasurementBatch {
+            measurement: key.measurement.clone(),
+            table_name: ensured.table.clone(),
+            series_table_name: ensured.series_table.clone(),
+            batch: Arc::new(batch),
+            row_count: points.len(),
+            min_time,
+            max_time,
+            new_series_batch,
+        })
+    }
+
+    async fn build_new_series_batch(
+        &self,
+        key: &TableKey,
+        ensured: &EnsuredTable,
+        points: &[Point],
+        sids: &[u64],
+    ) -> Result<Option<Arc<RecordBatch>>, HyperbytedbError> {
+        let mut seen: HashSet<u64> = HashSet::new();
+        let mut new_series: Vec<(u64, &Point)> = Vec::new();
+        for (i, &sid) in sids.iter().enumerate() {
+            if self.series_known(key, sid) || !seen.insert(sid) {
+                continue;
+            }
+            new_series.push((sid, &points[i]));
+        }
+        if new_series.is_empty() {
+            return Ok(None);
+        }
+        if !self.use_arrow {
+            return Ok(None);
+        }
+        let batch = build_series_record_batch(ensured, &new_series)?;
+        Ok(Some(Arc::new(batch)))
+    }
+
+    async fn insert_prepared_series(
+        &self,
+        key: &TableKey,
+        ensured: &EnsuredTable,
+        series_batch: &RecordBatch,
+    ) -> Result<(), HyperbytedbError> {
+        let pool = self.session.pool()?;
+        let series_table = ensured.series_table.clone();
+        let batch = series_batch.clone();
+        tokio::task::spawn_blocking(move || {
+            pool.with_connection(|conn| {
+                insert_record_batch_direct(
+                    conn,
+                    &series_table,
+                    batch,
+                    InsertOptions::default_bulk(),
+                )
+                .map_err(|e| HyperbytedbError::Chdb(e.to_string()))
+            })
+        })
+        .await
+        .map_err(|e| HyperbytedbError::Internal(format!("chDB series insert join error: {e}")))??;
+
+        if series_batch.num_rows() > 0 {
+            let sid_col = series_batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| HyperbytedbError::Internal("series batch sid col".into()))?;
+            let ids: Vec<u64> = (0..series_batch.num_rows())
+                .map(|i| sid_col.value(i))
+                .collect();
+            self.mark_series(key, ids.iter().copied());
+        }
         Ok(())
     }
 }
@@ -926,17 +1159,14 @@ impl PointsSinkPort for ChdbNativeAdapter {
                 .record(build_start.elapsed().as_secs_f64());
             system_trace::record_phase("build_batch_us", build_start.elapsed());
 
-            let session = self.session.get()?;
+            let pool = self.session.pool()?;
             let table = ensured.table.clone();
             let insert_start = std::time::Instant::now();
             tokio::task::spawn_blocking(move || {
-                insert_record_batch_direct(
-                    session.0.connection(),
-                    &table,
-                    batch,
-                    InsertOptions::default_bulk(),
-                )
-                .map_err(|e| HyperbytedbError::Chdb(e.to_string()))
+                pool.with_connection(|conn| {
+                    insert_record_batch_direct(conn, &table, batch, InsertOptions::default_bulk())
+                        .map_err(|e| HyperbytedbError::Chdb(e.to_string()))
+                })
             })
             .await
             .map_err(|e| {
@@ -974,6 +1204,85 @@ impl PointsSinkPort for ChdbNativeAdapter {
         })
     }
 
+    async fn write_prepared_batch(
+        &self,
+        db: &str,
+        rp: &str,
+        batch: &crate::domain::prepared_wal::PreparedMeasurementBatch,
+    ) -> Result<WriteAck, HyperbytedbError> {
+        if batch.row_count == 0 {
+            return Ok(WriteAck {
+                min_time: 0,
+                max_time: 0,
+                row_count: 0,
+            });
+        }
+        system_trace::record_bool("use_arrow", self.use_arrow);
+        system_trace::record_bool("prepared_path", true);
+        counter!("hyperbytedb_flush_sink_writes_total", "path" => "prepared").increment(1);
+
+        let key = TableKey {
+            db: db.to_string(),
+            rp: rp.to_string(),
+            measurement: batch.measurement.clone(),
+        };
+
+        if let Some(ref series_batch) = batch.new_series_batch {
+            let ensured = EnsuredTable {
+                table: batch.table_name.clone(),
+                series_table: batch.series_table_name.clone(),
+                tag_phys: Vec::new(),
+                field_phys: Vec::new(),
+            };
+            self.insert_prepared_series(&key, &ensured, series_batch)
+                .await?;
+        }
+
+        if !self.use_arrow {
+            return Err(HyperbytedbError::Internal(
+                "prepared batch path requires Arrow inserts".into(),
+            ));
+        }
+
+        // Re-align legacy sparse prepared batches (pre-coalesce WAL entries)
+        // to the current metadata-driven table schema before insert.
+        let ensured = self.ensure_table(&key, &[]).await?;
+        let padded = pad_record_batch_to_ensured(&batch.batch, &ensured)?;
+
+        let pool = self.session.pool()?;
+        let table = batch.table_name.clone();
+        let fact = Arc::new(padded);
+        let insert_start = std::time::Instant::now();
+        tokio::task::spawn_blocking(move || {
+            let batch = (*fact).clone();
+            pool.with_connection(|conn| {
+                insert_record_batch_direct(conn, &table, batch, InsertOptions::default_bulk())
+                    .map_err(|e| HyperbytedbError::Chdb(e.to_string()))
+            })
+        })
+        .await
+        .map_err(|e| HyperbytedbError::Internal(format!("chDB prepared insert join: {e}")))??;
+        histogram!("hyperbytedb_flush_sink_chdb_insert_seconds", "path" => "prepared")
+            .record(insert_start.elapsed().as_secs_f64());
+
+        Ok(WriteAck {
+            min_time: batch.min_time,
+            max_time: batch.max_time,
+            row_count: batch.row_count,
+        })
+    }
+
+    async fn build_prepared_wal_slot(
+        &self,
+        db: &str,
+        rp: &str,
+        origin_node_id: u64,
+        points: &[Point],
+    ) -> Result<crate::domain::prepared_wal::PreparedWalSlot, HyperbytedbError> {
+        self.build_prepared_wal_slot(db, rp, origin_node_id, points)
+            .await
+    }
+
     async fn ensure_measurement_schema(
         &self,
         db: &str,
@@ -981,6 +1290,11 @@ impl PointsSinkPort for ChdbNativeAdapter {
         meta: &MeasurementMeta,
     ) -> Result<(), HyperbytedbError> {
         self.ensure_measurement_schema_impl(db, rp, meta).await
+    }
+
+    async fn refresh_schema_cache(&self) -> Result<(), HyperbytedbError> {
+        self.refresh_schemas_from_metadata().await?;
+        Ok(())
     }
 
     async fn drop_measurement(
@@ -1007,20 +1321,26 @@ impl PointsSinkPort for ChdbNativeAdapter {
     }
 }
 
-fn run_sync(session: &SyncSession, sql: &str) -> Result<(), HyperbytedbError> {
-    session
-        .0
-        .execute(sql, Some(&[Arg::OutputFormat(OutputFormat::JSONEachRow)]))
-        .map(|_| ())
-        .map_err(|e| HyperbytedbError::Chdb(e.to_string()))
+fn run_sync(pool: &ChdbConnectionPool, sql: &str) -> Result<(), HyperbytedbError> {
+    pool.with_connection(|conn| {
+        execute_connection(conn, sql, OutputFormat::JSONEachRow)
+            .map(|_| ())
+            .map_err(|e| HyperbytedbError::Chdb(e.to_string()))
+    })
 }
 
 /// Build the FACT table DDL. Tags no longer live here — every row carries a
 /// single `series_id UInt64` that keys the `_series` dimension table. The sort
-/// key is `(series_id, time)`, so `ReplacingMergeTree(ingest_seq)` still dedups
-/// per series-instant (series_id is a hash of the tag set), but the key is one
-/// integer wide regardless of tag count.
-fn build_create_table_sql(table: &str, field_phys: &[(String, String, u8)]) -> String {
+/// key is `(series_id, time)`.
+///
+/// Raw measurements use `ReplacingMergeTree(ingest_seq)`. MV / rollup destinations
+/// with additive partial aggregates use `SummingMergeTree` on rollup sum columns
+/// so incremental flush partials merge correctly on disk.
+fn build_create_table_sql(
+    table: &str,
+    field_phys: &[(String, String, u8)],
+    summing_columns: Option<Vec<String>>,
+) -> String {
     let mut sql = String::new();
     sql.push_str("CREATE TABLE IF NOT EXISTS ");
     sql.push_str(table);
@@ -1037,10 +1357,30 @@ fn build_create_table_sql(table: &str, field_phys: &[(String, String, u8)]) -> S
         sql.push(' ');
         sql.push_str(ColumnKind::Field(*disc).ch_column_type());
     }
-    sql.push_str("\n) ENGINE = ReplacingMergeTree(`ingest_seq`)\n");
+    if let Some(cols) = summing_columns.filter(|c| !c.is_empty()) {
+        let col_list = cols
+            .iter()
+            .map(|c| quote_backticks(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        sql.push_str(&format!("\n) ENGINE = SummingMergeTree(({col_list}))\n"));
+    } else {
+        sql.push_str("\n) ENGINE = ReplacingMergeTree(`ingest_seq`)\n");
+    }
     sql.push_str("PARTITION BY toDate(`time`)\n");
     sql.push_str("ORDER BY (`series_id`, `time`)");
     sql
+}
+
+fn summing_columns_from_meta(meta: &MeasurementMeta) -> Option<Vec<String>> {
+    let names = crate::domain::rollup::summing_field_names(meta);
+    if names.is_empty() {
+        return None;
+    }
+    let mut cols: Vec<String> = names.iter().map(|n| field_column_name(n)).collect();
+    cols.sort();
+    cols.dedup();
+    Some(cols)
 }
 
 /// Build the SERIES (tag dimension) table DDL: `series_id` plus one column per
@@ -1066,6 +1406,63 @@ fn build_create_series_table_sql(
     sql.push_str("\n) ENGINE = ReplacingMergeTree()\n");
     sql.push_str("ORDER BY (`series_id`)");
     sql
+}
+
+/// Emit `ALTER TABLE ... MODIFY COLUMN` when cached field types are narrower
+/// than the metadata/batch union (e.g. Int64 → UInt64).
+fn build_alter_reconcile_field_widening(
+    table: &str,
+    cached: &TableSchema,
+    field_phys: &[(String, String, u8)],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for (_, phys, disc) in field_phys {
+        if let Some(ColumnKind::Field(cached_disc)) = cached.columns.get(phys)
+            && *cached_disc != *disc
+            && widen_field_disc(*cached_disc, *disc) == Some(*disc)
+        {
+            out.push(format!(
+                "ALTER TABLE {} MODIFY COLUMN {} {}",
+                table,
+                quote_backticks(phys),
+                ColumnKind::Field(*disc).ch_column_type()
+            ));
+        }
+    }
+    out
+}
+
+fn merge_cached_field_column(field_types: &mut HashMap<String, u8>, phys: &str, d: u8) {
+    let logical = field_types
+        .keys()
+        .find(|k| field_column_name(k) == phys)
+        .cloned()
+        .unwrap_or_else(|| phys.to_string());
+    match field_types.get_mut(&logical) {
+        Some(existing) => {
+            if let Some(w) = widen_field_disc(*existing, d) {
+                *existing = w;
+            }
+        }
+        None => {
+            field_types.insert(logical, d);
+        }
+    }
+}
+
+fn ch_type_to_field_disc(ch_type: &str) -> Option<u8> {
+    let t = ch_type
+        .trim()
+        .trim_start_matches("Nullable(")
+        .trim_end_matches(')');
+    match t {
+        "Float64" => Some(0),
+        "Int64" => Some(1),
+        "UInt64" => Some(2),
+        "String" => Some(3),
+        "UInt8" => Some(4),
+        _ => None,
+    }
 }
 
 /// Emit `ALTER TABLE ... ADD COLUMN` for any FIELD column on the fact table not
@@ -1156,6 +1553,42 @@ fn field_arrow_type(disc: u8) -> DataType {
     }
 }
 
+/// Pad a prepared fact batch to include every column in `ensured`, adding NULL
+/// arrays for fields absent from legacy sparse WAL entries.
+fn pad_record_batch_to_ensured(
+    batch: &RecordBatch,
+    ensured: &EnsuredTable,
+) -> Result<RecordBatch, HyperbytedbError> {
+    use arrow::array::new_null_array;
+
+    let n = batch.num_rows();
+    let schema = batch.schema();
+    let fixed = ["time", "origin_node_id", "ingest_seq", "series_id"];
+
+    let mut fields: Vec<Field> = Vec::with_capacity(fixed.len() + ensured.field_phys.len());
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(fields.capacity());
+
+    for name in fixed {
+        let idx = schema.index_of(name).map_err(|e| {
+            HyperbytedbError::Internal(format!("prepared batch missing {name}: {e}"))
+        })?;
+        fields.push(schema.field(idx).clone());
+        columns.push(batch.column(idx).clone());
+    }
+
+    for (_, phys, disc) in &ensured.field_phys {
+        fields.push(Field::new(phys, field_arrow_type(*disc), true));
+        columns.push(if let Ok(idx) = schema.index_of(phys) {
+            batch.column(idx).clone()
+        } else {
+            new_null_array(&field_arrow_type(*disc), n)
+        });
+    }
+
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|e| HyperbytedbError::Internal(format!("pad prepared RecordBatch: {e}")))
+}
+
 /// Arrow logical type for a tag column, aligned with [`ColumnKind::ch_column_type`].
 fn tag_arrow_type(kind: ColumnKind) -> DataType {
     match kind {
@@ -1222,6 +1655,9 @@ fn build_field_column(points: &[Point], logical: &str, disc: u8) -> ArrayRef {
             for p in points {
                 match p.fields.get(logical) {
                     Some(FieldValue::Integer(v)) => b.append_value(*v),
+                    Some(FieldValue::UInteger(v)) if *v <= i64::MAX as u64 => {
+                        b.append_value(*v as i64)
+                    }
                     Some(FieldValue::Float(v)) => b.append_value(*v as i64),
                     _ => b.append_null(),
                 }
@@ -1233,6 +1669,7 @@ fn build_field_column(points: &[Point], logical: &str, disc: u8) -> ArrayRef {
             for p in points {
                 match p.fields.get(logical) {
                     Some(FieldValue::UInteger(v)) => b.append_value(*v),
+                    Some(FieldValue::Integer(v)) if *v >= 0 => b.append_value(*v as u64),
                     _ => b.append_null(),
                 }
             }
@@ -1481,6 +1918,13 @@ fn append_field_value(out: &mut String, v: &FieldValue, expected_disc: u8) {
         // (we widen across the batch in `ensure_table`).
         (FieldValue::Integer(i), 0) => append_float(out, *i as f64),
         (FieldValue::Float(f), 1) => append_float(out, *f),
+        // Integer ↔ unsigned widening at insert time.
+        (FieldValue::Integer(i), 2) if *i >= 0 => {
+            let _ = write!(out, "{}", *i as u64);
+        }
+        (FieldValue::UInteger(u), 1) if *u <= i64::MAX as u64 => {
+            let _ = write!(out, "{}", *u as i64);
+        }
         // Cross-type collisions outside what ensure_table widens are
         // surfaced as NULL rather than a hard error so an at-least-once
         // WAL replay never panics; field_type validation upstream
@@ -1585,9 +2029,42 @@ mod tests {
     }
 
     #[test]
+    fn create_table_sql_uses_summing_merge_tree_for_rollups() {
+        use std::collections::HashMap;
+
+        let meta = MeasurementMeta {
+            name: "server_stats_1m".to_string(),
+            field_types: HashMap::from([("players".to_string(), 0), ("cpu".to_string(), 0)]),
+            tag_keys: vec!["host".to_string()],
+            field_rollups: HashMap::from([
+                (
+                    "players".to_string(),
+                    crate::domain::rollup::RollupCombine::Sum,
+                ),
+                ("cpu".to_string(), crate::domain::rollup::RollupCombine::Sum),
+            ]),
+            ..Default::default()
+        };
+        let field_phys: Vec<(String, String, u8)> = meta
+            .field_types
+            .iter()
+            .map(|(k, d)| (k.clone(), field_column_name(k), *d))
+            .collect();
+        let sql = build_create_table_sql(
+            "`db_rp_server_stats_1m`",
+            &field_phys,
+            summing_columns_from_meta(&meta),
+        );
+        assert!(
+            sql.contains("ENGINE = SummingMergeTree((`cpu`, `players`))"),
+            "rollup dest should sum partial aggregates on disk, got: {sql}"
+        );
+    }
+
+    #[test]
     fn create_table_sql_layout() {
         let fields = vec![("usage".to_string(), "usage".to_string(), 0u8)];
-        let sql = build_create_table_sql("`db_rp_m`", &fields);
+        let sql = build_create_table_sql("`db_rp_m`", &fields, None);
         assert!(sql.contains("CREATE TABLE IF NOT EXISTS `db_rp_m`"));
         assert!(sql.contains("`time` DateTime64(9, 'UTC')"));
         assert!(sql.contains("`origin_node_id` UInt64"));
@@ -1604,7 +2081,11 @@ mod tests {
 
     #[test]
     fn create_table_sql_always_orders_by_series_id_and_time() {
-        let sql = build_create_table_sql("`db_rp_m`", &[("v".to_string(), "v".to_string(), 0u8)]);
+        let sql = build_create_table_sql(
+            "`db_rp_m`",
+            &[("v".to_string(), "v".to_string(), 0u8)],
+            None,
+        );
         assert!(sql.contains("ORDER BY (`series_id`, `time`)"));
     }
 
@@ -1686,6 +2167,7 @@ mod tests {
             name: "cpu".to_string(),
             field_types: fields,
             tag_keys: vec!["host".to_string(), "region".to_string()],
+            ..Default::default()
         };
         let mut tag_kinds = HashMap::new();
         tag_kinds.insert("host".to_string(), ColumnKind::TagLowCardinality);
@@ -1701,6 +2183,19 @@ mod tests {
             Some(&ColumnKind::TagLowCardinality)
         );
         assert_eq!(series.columns.get("region"), Some(&ColumnKind::TagString));
+    }
+
+    #[test]
+    fn alter_reconcile_widens_int_to_uint() {
+        let cached = TableSchema {
+            columns: HashMap::from([("uptime".to_string(), ColumnKind::Field(1))]),
+            materialized: true,
+        };
+        let field_phys = vec![("uptime".to_string(), "uptime".to_string(), 2u8)];
+        let alters = build_alter_reconcile_field_widening("`t`", &cached, &field_phys);
+        assert_eq!(alters.len(), 1);
+        assert!(alters[0].contains("MODIFY COLUMN"));
+        assert!(alters[0].contains("UInt64"));
     }
 
     #[test]
@@ -1756,7 +2251,7 @@ mod tests {
             ("usage_idle".to_string(), "usage_idle".to_string(), 0u8),
             ("usage_system".to_string(), "usage_system".to_string(), 0u8),
         ];
-        let ddl = build_create_table_sql("`db_rp_cpu`", &field_phys);
+        let ddl = build_create_table_sql("`db_rp_cpu`", &field_phys, None);
         assert!(
             ddl.find("usage_idle").unwrap() < ddl.find("usage_system").unwrap()
                 && ddl.find("usage_system").unwrap() < ddl.find("usage_user").unwrap(),

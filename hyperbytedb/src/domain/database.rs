@@ -35,9 +35,138 @@ impl RetentionPolicy {
         Self {
             name: "autogen".to_string(),
             duration: None,
-            shard_group_duration: Duration::from_secs(7 * 24 * 3600),
+            shard_group_duration: derive_shard_group_duration(None),
             replication_factor: 1,
             is_default: true,
+        }
+    }
+}
+
+/// Derive shard group duration from retention policy duration (InfluxDB 1.x rules).
+#[must_use]
+pub fn derive_shard_group_duration(duration: Option<Duration>) -> Duration {
+    const H: u64 = 3600;
+    const D: u64 = 86_400;
+    const MO: u64 = 180 * D;
+    match duration {
+        None => Duration::from_secs(7 * D),
+        Some(d) => {
+            let secs = d.as_secs();
+            if secs < 2 * D {
+                Duration::from_secs(H)
+            } else if secs < MO {
+                Duration::from_secs(D)
+            } else {
+                Duration::from_secs(7 * D)
+            }
+        }
+    }
+}
+
+/// Build a domain retention policy from CREATE DATABASE … WITH options.
+#[must_use]
+pub fn retention_policy_from_create(
+    stmt: &crate::timeseriesql::ast::CreateDatabaseStatement,
+) -> Option<RetentionPolicy> {
+    use crate::timeseriesql::ast::DurationUnit;
+
+    let has_with = stmt.duration.is_some()
+        || stmt.replication.is_some()
+        || stmt.shard_duration.is_some()
+        || stmt.rp_name.is_some();
+    if !has_with {
+        return None;
+    }
+
+    let rp_name = stmt
+        .rp_name
+        .clone()
+        .unwrap_or_else(|| "autogen".to_string());
+    let std_duration = match &stmt.duration {
+        None => None,
+        Some(d) if d.value == 0 && d.unit == DurationUnit::Second => None,
+        Some(d) => Some(Duration::from_nanos(d.to_nanos() as u64)),
+    };
+    let std_shard = stmt
+        .shard_duration
+        .as_ref()
+        .map(|d| Duration::from_nanos(d.to_nanos() as u64))
+        .unwrap_or_else(|| derive_shard_group_duration(std_duration));
+    let replication = stmt.replication.unwrap_or(1);
+
+    Some(RetentionPolicy {
+        name: rp_name,
+        duration: std_duration,
+        shard_group_duration: std_shard,
+        replication_factor: replication,
+        is_default: true,
+    })
+}
+
+/// Reconstruct CREATE DATABASE … WITH from a replicated retention policy.
+#[must_use]
+pub fn create_database_statement_from_rp(
+    name: String,
+    rp: &RetentionPolicy,
+) -> crate::timeseriesql::ast::CreateDatabaseStatement {
+    use crate::timeseriesql::ast::{
+        CreateDatabaseStatement, Duration as AstDuration, DurationUnit,
+    };
+    use crate::timeseriesql::lexer::nanos_to_ast_duration;
+
+    fn ast_duration_from_std(d: Duration) -> AstDuration {
+        nanos_to_ast_duration(d.as_nanos() as i64)
+    }
+
+    CreateDatabaseStatement {
+        name,
+        duration: match rp.duration {
+            None => Some(AstDuration {
+                value: 0,
+                unit: DurationUnit::Second,
+            }),
+            Some(d) => Some(ast_duration_from_std(d)),
+        },
+        replication: Some(rp.replication_factor),
+        shard_duration: Some(ast_duration_from_std(rp.shard_group_duration)),
+        rp_name: Some(rp.name.clone()),
+    }
+}
+
+/// Format a duration for SHOW RETENTION POLICIES (Go-style: `168h0m0s`, `0s`).
+#[must_use]
+pub fn format_influx_duration(d: Option<Duration>) -> String {
+    match d {
+        None => "0s".to_string(),
+        Some(dur) => {
+            let mut secs = dur.as_secs();
+            let weeks = secs / (7 * 86_400);
+            secs %= 7 * 86_400;
+            let days = secs / 86_400;
+            secs %= 86_400;
+            let hours = secs / 3600;
+            secs %= 3600;
+            let minutes = secs / 60;
+            secs %= 60;
+            let mut out = String::new();
+            if weeks > 0 {
+                out.push_str(&format!("{weeks}w"));
+            }
+            if days > 0 {
+                out.push_str(&format!("{days}d"));
+            }
+            if hours > 0 {
+                out.push_str(&format!("{hours}h"));
+            }
+            if minutes > 0 {
+                out.push_str(&format!("{minutes}m"));
+            }
+            out.push_str(&format!("{secs}s"));
+            if out.is_empty() {
+                "0s".to_string()
+            } else {
+                out
+            }
         }
     }
 }

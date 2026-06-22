@@ -2,10 +2,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::database::RetentionPolicy;
 use crate::ports::metadata::{ContinuousQueryDef, MaterializedViewDef};
+use crate::timeseriesql::ast::RetentionPolicyChange;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MutationRequest {
-    CreateDatabase(String),
+    CreateDatabase {
+        name: String,
+        rp: Option<RetentionPolicy>,
+    },
     DropDatabase(String),
     CreateRetentionPolicy {
         db: String,
@@ -47,6 +51,16 @@ pub enum MutationRequest {
     DropMaterializedView {
         database: String,
         name: String,
+    },
+    AlterRetentionPolicy {
+        db: String,
+        name: String,
+        change: RetentionPolicyChange,
+    },
+    DropSeries {
+        database: String,
+        measurement: Option<String>,
+        predicate_sql: String,
     },
 }
 

@@ -1,3 +1,4 @@
+pub mod arrow_ingest;
 pub mod backup;
 pub mod cluster;
 pub mod columnar_msgpack;
@@ -10,10 +11,13 @@ pub mod materialized_view_service;
 pub mod msgpack_ingest;
 pub mod peer_ingestion_service;
 pub mod peer_query_service;
+pub mod predicate_sql;
 pub mod query_service;
 pub mod replication_apply;
 pub mod replication_dispatch;
 pub mod retention_service;
 pub mod runtime;
+pub mod schema_mutation_apply;
 pub mod statement_summary;
 pub mod system_trace;
+pub mod wal_append;

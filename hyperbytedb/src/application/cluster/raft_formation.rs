@@ -117,7 +117,7 @@ pub async fn run_raft_cluster_formation(
                 let node = openraft::BasicNode::new(peer_addr.clone());
                 match raft.add_learner(peer_id, node, false).await {
                     Ok(_) => {
-                        tracing::info!(
+                        tracing::debug!(
                             peer_id = peer_id,
                             peer_addr = %peer_addr,
                             attempt = attempt,
@@ -147,7 +147,7 @@ pub async fn run_raft_cluster_formation(
                     break;
                 }
                 Err(e) => {
-                    tracing::info!(
+                    tracing::debug!(
                         error = %e,
                         attempt = attempt,
                         discovered = ?discovered_ids,
@@ -156,7 +156,7 @@ pub async fn run_raft_cluster_formation(
                 }
             }
         } else {
-            tracing::info!(
+            tracing::debug!(
                 attempt = attempt,
                 discovered = discovered_ids.len(),
                 expected = expected_size,

@@ -47,13 +47,13 @@ impl DrainService {
         {
             let mut m = self.membership.write().await;
             m.set_state(self.node_id, NodeState::Draining);
-            tracing::info!("node state set to Draining, rejecting new writes");
+            tracing::debug!("node state set to Draining, rejecting new writes");
         }
 
-        tracing::info!("flushing all WAL entries to chDB");
+        tracing::debug!("flushing all WAL entries to chDB");
         self.flush_service.drain().await?;
 
-        tracing::info!("waiting for peer replication acknowledgments");
+        tracing::debug!("waiting for peer replication acknowledgments");
         self.wait_for_replication_acks().await?;
 
         self.notify_peers_leave().await;
@@ -62,7 +62,7 @@ impl DrainService {
             let mut m = self.membership.write().await;
             m.set_state(self.node_id, NodeState::Leaving);
             gauge!("hyperbytedb_cluster_node_state").set(5.0); // Leaving
-            tracing::info!("node state set to Leaving");
+            tracing::debug!("node state set to Leaving");
         }
 
         tracing::info!("drain procedure complete");
@@ -73,7 +73,8 @@ impl DrainService {
         let local_wal_seq = self.wal.last_sequence().await?;
         let local_mutation_seq = self.replication_log.last_mutation_seq();
 
-        let max_wait = Duration::from_secs(60);
+        // Must stay in sync with the operator preStop poll window (drainAckWaitSecs).
+        let max_wait = Duration::from_secs(90);
         let start = std::time::Instant::now();
 
         loop {
@@ -109,7 +110,7 @@ impl DrainService {
             }
 
             if all_acked {
-                tracing::info!("all peers acknowledged replication");
+                tracing::debug!("all peers acknowledged replication");
                 break;
             }
 
@@ -147,7 +148,7 @@ impl DrainService {
             let url = format!("http://{}/internal/membership/leave", peer_addr);
             match client.post(&url).json(&leave_req).send().await {
                 Ok(resp) if resp.status().is_success() => {
-                    tracing::info!(peer = %peer_addr, "notified peer of leave");
+                    tracing::debug!(peer = %peer_addr, "notified peer of leave");
                 }
                 Ok(resp) => {
                     tracing::warn!(

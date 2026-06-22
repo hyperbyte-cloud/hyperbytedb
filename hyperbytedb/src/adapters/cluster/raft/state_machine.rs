@@ -4,6 +4,7 @@ use openraft::{LogId, StoredMembership};
 
 use crate::domain::cluster::membership::ClusterMembership;
 use crate::domain::cluster::types::MutationRequest;
+use crate::domain::database::RetentionPolicy;
 use crate::ports::metadata::MetadataPort;
 
 /// Snapshot-serializable state machine data.
@@ -14,63 +15,25 @@ pub struct StateMachineData {
     pub cluster_membership: ClusterMembership,
 }
 
-/// Apply a schema mutation to the local metadata store.
+/// Apply CREATE DATABASE locally (idempotent, honors WITH retention policy on peers).
+pub async fn apply_create_database(
+    metadata: &Arc<dyn MetadataPort>,
+    name: &str,
+    rp: Option<RetentionPolicy>,
+) -> Result<(), crate::error::HyperbytedbError> {
+    if let Some(rp) = rp {
+        let stmt =
+            crate::domain::database::create_database_statement_from_rp(name.to_string(), &rp);
+        metadata.create_database_with(&stmt).await
+    } else {
+        metadata.create_database(name).await
+    }
+}
+
+/// Apply a schema mutation to the local metadata store (metadata-only fallback).
 pub async fn apply_schema_mutation(
     metadata: &Arc<dyn MetadataPort>,
     mutation: MutationRequest,
 ) -> Result<(), crate::error::HyperbytedbError> {
-    match mutation {
-        MutationRequest::CreateDatabase(name) => metadata.create_database(&name).await,
-        MutationRequest::DropDatabase(name) => metadata.drop_database(&name).await,
-        MutationRequest::CreateRetentionPolicy { db, rp } => {
-            metadata.create_retention_policy(&db, rp).await
-        }
-        MutationRequest::DropRetentionPolicy { db, name } => {
-            metadata.drop_retention_policy(&db, &name).await
-        }
-        MutationRequest::CreateUser {
-            username,
-            password_hash,
-            admin,
-        } => metadata.create_user(&username, &password_hash, admin).await,
-        MutationRequest::DropUser(username) => metadata.drop_user(&username).await,
-        MutationRequest::SetPassword {
-            username,
-            password_hash,
-        } => metadata.create_user(&username, &password_hash, false).await,
-        MutationRequest::Delete {
-            database,
-            measurement,
-            predicate_sql,
-        } => {
-            metadata
-                .store_tombstone(&database, &measurement, &predicate_sql)
-                .await?;
-            Ok(())
-        }
-        MutationRequest::CreateContinuousQuery {
-            database,
-            name,
-            definition,
-        } => {
-            metadata
-                .store_continuous_query(&database, &name, &definition)
-                .await
-        }
-        MutationRequest::DropContinuousQuery { database, name } => {
-            metadata.drop_continuous_query(&database, &name).await
-        }
-        MutationRequest::CreateMaterializedView {
-            database,
-            name,
-            definition,
-        } => {
-            metadata
-                .store_materialized_view(&database, &name, &definition)
-                .await
-        }
-        MutationRequest::DropMaterializedView { database, name } => {
-            metadata.drop_materialized_view(&database, &name).await
-        }
-    }
+    crate::application::schema_mutation_apply::apply_schema_mutation(metadata, None, mutation).await
 }

@@ -10,6 +10,7 @@ use crate::domain::cluster::membership::{
     ClusterMembership, NodeInfo, NodeState, SharedMembership,
 };
 use crate::ports::metadata::MetadataPort;
+use crate::ports::points_sink::PointsSinkPort;
 use crate::ports::wal::WalPort;
 
 pub struct ClusterBootstrap {
@@ -95,6 +96,7 @@ impl ClusterBootstrap {
         config: &ClusterConfig,
         metadata: &Arc<dyn MetadataPort>,
         wal: &Arc<dyn WalPort>,
+        points_sink: Option<Arc<dyn PointsSinkPort>>,
     ) -> anyhow::Result<()> {
         {
             let mut m = self.membership.write().await;
@@ -104,12 +106,13 @@ impl ClusterBootstrap {
 
         tracing::info!("startup phase: syncing with cluster before accepting traffic");
 
-        let sync_client = SyncClient::new(
+        let sync_client = SyncClient::with_points_sink(
             config.node_id,
             config.cluster_addr.clone(),
             self.membership.clone(),
             metadata.clone(),
             wal.clone(),
+            points_sink,
             self.peer_addrs.clone(),
         );
 
@@ -175,7 +178,7 @@ impl ClusterBootstrap {
                     break;
                 }
                 Ok(false) => {
-                    tracing::info!(
+                    tracing::debug!(
                         attempt = attempt,
                         "no sync needed (first node or already current)"
                     );
@@ -231,6 +234,7 @@ impl ClusterBootstrap {
         &self,
         config: &ClusterConfig,
         metadata: Arc<dyn MetadataPort>,
+        mv_service: Arc<crate::application::materialized_view_service::MaterializedViewService>,
     ) -> Option<HyperbytedbRaft> {
         use crate::adapters::cluster::raft::log_store::RaftStore;
         use crate::adapters::cluster::raft::network::Network;
@@ -238,7 +242,7 @@ impl ClusterBootstrap {
         use openraft::storage::Adaptor;
 
         let raft_store = match RaftStore::open(&config.raft_dir, self.membership.clone()) {
-            Ok(store) => store.with_metadata(metadata),
+            Ok(store) => store.with_metadata(metadata).with_mv_service(mv_service),
             Err(e) => {
                 tracing::error!(error = %e, "failed to open raft store");
                 return None;

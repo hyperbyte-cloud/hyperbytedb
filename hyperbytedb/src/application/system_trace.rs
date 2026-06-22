@@ -4,7 +4,10 @@
 //! call [`Instant::now`], allocate spans, or emit log lines. Every entry point
 //! checks a single relaxed atomic first (inlined).
 //!
-//! Enable via `[logging].detailed_trace = true` or `HYPERBYTEDB__LOGGING__DETAILED_TRACE=true`.
+//! When enabled, phase summary lines are emitted at **debug** level so the
+//! default `info` filter stays quiet under write load. Enable via
+//! `[logging].detailed_trace = true` or `HYPERBYTEDB__LOGGING__DETAILED_TRACE=true`,
+//! and set `logging.level=debug` (or `RUST_LOG=debug`) to see the lines.
 //!
 //! ```logql
 //! {namespace="hyperbytedb"} | json | system_trace="true"
@@ -331,7 +334,7 @@ pub fn log_wal_batch(
     if !is_enabled() {
         return;
     }
-    tracing::info!(
+    tracing::debug!(
         system_trace = true,
         write_path = true,
         event = "wal_batch",
@@ -375,7 +378,7 @@ pub fn finish_span(span: &tracing::Span, start: Option<Instant>, message: &'stat
     }
     let total_us = start.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
     span.record("total_us", total_us);
-    tracing::info!(
+    tracing::debug!(
         parent: span,
         system_trace = true,
         total_us = total_us,

@@ -42,7 +42,13 @@ COPY hyperbytedb/Cargo.toml hyperbytedb/Cargo.lock ./
 COPY hyperbytedb/hyperbytedb/Cargo.toml hyperbytedb/
 COPY hyperbytedb/hyperbytedb-proxy/Cargo.toml hyperbytedb-proxy/
 COPY hyperbytedb/hyperbytedb-cli/Cargo.toml hyperbytedb-cli/
-RUN mkdir -p hyperbytedb-cli/src && echo "fn main(){}" > hyperbytedb-cli/src/main.rs && echo "" > hyperbytedb-cli/src/lib.rs
+RUN mkdir -p hyperbytedb/src hyperbytedb-cli/src hyperbytedb-proxy/src \
+    && echo "fn main(){}" > hyperbytedb/src/main.rs \
+    && echo "" > hyperbytedb/src/lib.rs \
+    && echo "fn main(){}" > hyperbytedb-cli/src/main.rs \
+    && echo "" > hyperbytedb-cli/src/lib.rs \
+    && echo "fn main(){}" > hyperbytedb-proxy/src/main.rs \
+    && echo "" > hyperbytedb-proxy/src/lib.rs
 # Create stub files so cargo can parse [[bench]] entries
 RUN mkdir -p hyperbytedb/benches hyperbytedb/benches/support \
     hyperbytedb-proxy/benches hyperbytedb-proxy/benches/support \

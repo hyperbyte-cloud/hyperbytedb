@@ -2,11 +2,14 @@
 //!
 //! Uses the project's internal APIs directly (not HTTP) plus HTTP-level tests.
 
+mod combination_tests;
 mod concurrent_tests;
+mod cq_tests;
 mod ddl_tests;
 mod error_tests;
 mod http_tests;
 mod metadata_tests;
+mod prepared_wal_tests;
 mod query_tests;
 mod write_tests;
 
@@ -37,7 +40,10 @@ struct MockQueryPort;
 
 #[async_trait]
 impl QueryPort for MockQueryPort {
-    async fn execute_sql(&self, _sql: &str) -> Result<String, HyperbytedbError> {
+    async fn execute_sql(&self, sql: &str) -> Result<String, HyperbytedbError> {
+        if sql.contains("system.tables") {
+            return Ok("1".to_string());
+        }
         Ok(String::new())
     }
 }
@@ -92,10 +98,13 @@ impl TestContext {
         let wal = Arc::new(RocksDbWal::open(wal_path)?);
         let metadata = Arc::new(RocksDbMetadata::open(meta_path)?);
 
-        let shared = SharedSession::new_eager(chdb_path.to_str().unwrap())?;
+        let shared = SharedSession::new_eager(chdb_path.to_str().unwrap(), 1)?;
         let query_port: Arc<dyn QueryPort> =
             Arc::new(ChdbQueryAdapter::from_shared(shared.clone(), 0));
-        let points_sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(shared));
+        let points_sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::with_metadata(
+            shared.clone(),
+            Some(metadata.clone()),
+        ));
 
         let query_service = QueryServiceImpl::new(
             query_port.clone(),
@@ -181,6 +190,19 @@ impl TestContext {
 
     /// Execute an TimeseriesQL query and return the response.
     pub async fn query(&self, db: &str, q: &str) -> Result<QueryResponse, HyperbytedbError> {
-        self.query_service.execute_query(db, q, None, None).await
+        self.query_service
+            .execute_query(db, q, None, None, None)
+            .await
+    }
+
+    pub async fn query_with_rp(
+        &self,
+        db: &str,
+        q: &str,
+        rp: Option<&str>,
+    ) -> Result<QueryResponse, HyperbytedbError> {
+        self.query_service
+            .execute_query(db, q, None, rp, None)
+            .await
     }
 }
