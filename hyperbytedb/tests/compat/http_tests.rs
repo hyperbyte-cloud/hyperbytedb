@@ -28,8 +28,12 @@ struct MockQueryPort;
 
 #[async_trait]
 impl QueryPort for MockQueryPort {
-    async fn execute_sql(&self, _sql: &str) -> Result<String, HyperbytedbError> {
-        Ok(String::new())
+    async fn execute_sql(&self, sql: &str) -> Result<String, HyperbytedbError> {
+        if sql.contains("FROM system.tables") {
+            Ok("1".into())
+        } else {
+            Ok(String::new())
+        }
     }
 }
 
