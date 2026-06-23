@@ -1,6 +1,7 @@
 //! Continuous query scheduling and execution (InfluxDB v1 parity).
 
 use chrono::{TimeZone, Utc};
+use serial_test::serial;
 
 use hyperbytedb::domain::continuous_query::ContinuousQueryDef;
 use hyperbytedb::domain::cq_schedule::{coverage_window, should_run};
@@ -69,6 +70,7 @@ async fn create_cq_rejects_for_shorter_than_group_by() {
 }
 
 #[tokio::test]
+#[serial(chdb)]
 async fn basic_cq_downsamples_bus_data_at_8am() {
     let ctx = match TestContext::new() {
         Ok(ctx) => ctx,
@@ -179,6 +181,7 @@ async fn basic_cq_downsamples_bus_data_at_8am() {
 }
 
 #[tokio::test]
+#[serial(chdb)]
 async fn advanced_every_cq_recomputes_current_hour_bucket() {
     let ctx = match TestContext::new() {
         Ok(ctx) => ctx,
@@ -322,6 +325,7 @@ fn prepare_cq_select_strips_user_time_and_injects_window() {
 }
 
 #[tokio::test]
+#[serial(chdb)]
 async fn cq_into_retention_policy_writes_and_queries_isolated_table() {
     let ctx = match TestContext::new() {
         Ok(ctx) => ctx,
@@ -488,6 +492,7 @@ async fn cq_into_retention_policy_writes_and_queries_isolated_table() {
 }
 
 #[tokio::test]
+#[serial(chdb)]
 async fn select_qualified_rp_overrides_http_default_rp() {
     let ctx = match TestContext::new() {
         Ok(c) => c,

@@ -5,6 +5,7 @@
 
 use hyperbytedb::domain::point::FieldValue;
 use hyperbytedb::ports::ingestion::{IngestionPort, WritePayloadFormat};
+use serial_test::serial;
 
 use super::TestContext;
 
@@ -541,7 +542,7 @@ async fn write_to_specific_retention_policy() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn create_db_write_flush_query_select_star() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();

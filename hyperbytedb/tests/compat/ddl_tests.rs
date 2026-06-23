@@ -6,6 +6,7 @@
 
 use hyperbytedb::error::HyperbytedbError;
 use hyperbytedb::ports::ingestion::{IngestionPort, WritePayloadFormat};
+use serial_test::serial;
 
 use super::TestContext;
 
@@ -409,6 +410,7 @@ async fn drop_continuous_query() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(chdb)]
 async fn create_and_query_materialized_view() {
     let ctx = match TestContext::new() {
         Ok(c) => c,
@@ -471,6 +473,7 @@ async fn create_and_query_materialized_view() {
 }
 
 #[tokio::test]
+#[serial(chdb)]
 async fn materialized_view_sum_survives_multiple_flushes() {
     let ctx = match TestContext::new() {
         Ok(c) => c,
@@ -514,7 +517,11 @@ async fn materialized_view_sum_survives_multiple_flushes() {
         Some(&hyperbytedb::domain::rollup::RollupCombine::Sum)
     );
 
-    ctx.write_and_flush("mvdb", &format!("metrics,host=h1 value=5 {t}"))
+    // Second flush lands a distinct point in the *same* minute bucket (t + 1s),
+    // so it accumulates with the first flush rather than overwriting it (reusing
+    // the same (series, timestamp) would be an InfluxDB last-write-wins overwrite).
+    let t2 = t + 1_000_000_000;
+    ctx.write_and_flush("mvdb", &format!("metrics,host=h1 value=5 {t2}"))
         .await
         .unwrap();
 
@@ -530,13 +537,14 @@ async fn materialized_view_sum_survives_multiple_flushes() {
         "query dest failed: {:?}",
         dest_resp.results[0].error
     );
+    // The aggregate is the last column (a `GROUP BY time` result prepends `time`).
     let dest_sum: f64 = dest_resp.results[0]
         .series
         .as_ref()
         .unwrap()
         .first()
         .and_then(|s| s.values.first())
-        .and_then(|row| row.first())
+        .and_then(|row| row.last())
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
 
@@ -544,7 +552,7 @@ async fn materialized_view_sum_survives_multiple_flushes() {
         .query(
             "mvdb",
             &format!(
-                r#"SELECT sum("value") FROM "metrics" WHERE time = {t} GROUP BY time(1m), "host""#
+                r#"SELECT sum("value") FROM "metrics" WHERE time >= {t} AND time <= {t2} GROUP BY time(1m), "host""#
             ),
         )
         .await
@@ -555,7 +563,7 @@ async fn materialized_view_sum_survives_multiple_flushes() {
         .as_ref()
         .unwrap()
         .iter()
-        .filter_map(|s| s.values.first()?.first()?.as_f64())
+        .filter_map(|s| s.values.first()?.last()?.as_f64())
         .sum();
 
     assert!(
@@ -569,6 +577,7 @@ async fn materialized_view_sum_survives_multiple_flushes() {
 }
 
 #[tokio::test]
+#[serial(chdb)]
 async fn materialized_view_dest_uses_summing_merge_tree() {
     let ctx = match TestContext::new() {
         Ok(c) => c,
@@ -615,6 +624,7 @@ async fn materialized_view_dest_uses_summing_merge_tree() {
 }
 
 #[tokio::test]
+#[serial(chdb)]
 async fn materialized_view_sum_matches_raw_after_many_single_point_flushes() {
     let ctx = match TestContext::new() {
         Ok(c) => c,
@@ -646,8 +656,11 @@ async fn materialized_view_sum_matches_raw_after_many_single_point_flushes() {
         create_resp.results[0].error
     );
 
+    // Second batch lands distinct points in the same minute bucket (t + 1s) so
+    // they accumulate with the first batch instead of overwriting it.
+    let t2 = t + 1_000_000_000;
     for (host, value) in [("h1", 5), ("h2", 5), ("h3", 5), ("h4", 5), ("h5", 5)] {
-        ctx.write_and_flush("mvdb", &format!("metrics,host={host} value={value} {t}"))
+        ctx.write_and_flush("mvdb", &format!("metrics,host={host} value={value} {t2}"))
             .await
             .unwrap();
     }
@@ -677,7 +690,7 @@ async fn materialized_view_sum_matches_raw_after_many_single_point_flushes() {
     let raw_resp = ctx
         .query(
             "mvdb",
-            &format!(r#"SELECT sum("value") FROM "metrics" WHERE time = {t}"#),
+            &format!(r#"SELECT sum("value") FROM "metrics" WHERE time >= {t} AND time <= {t2}"#),
         )
         .await
         .unwrap();
@@ -688,7 +701,7 @@ async fn materialized_view_sum_matches_raw_after_many_single_point_flushes() {
         .unwrap()
         .first()
         .and_then(|s| s.values.first())
-        .and_then(|row| row.first())
+        .and_then(|row| row.last())
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
 
@@ -703,6 +716,7 @@ async fn materialized_view_sum_matches_raw_after_many_single_point_flushes() {
 }
 
 #[tokio::test]
+#[serial(chdb)]
 async fn materialized_view_mean_survives_multiple_flushes() {
     let ctx = match TestContext::new() {
         Ok(c) => c,
@@ -760,13 +774,14 @@ async fn materialized_view_mean_survives_multiple_flushes() {
         "query dest failed: {:?}",
         dest_resp.results[0].error
     );
+    // The aggregate is the last column (`GROUP BY time` prepends a `time` column).
     let dest_mean: f64 = dest_resp.results[0]
         .series
         .as_ref()
         .unwrap()
         .first()
         .and_then(|s| s.values.first())
-        .and_then(|row| row.first())
+        .and_then(|row| row.last())
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
 
@@ -784,7 +799,7 @@ async fn materialized_view_mean_survives_multiple_flushes() {
         .unwrap()
         .first()
         .and_then(|s| s.values.first())
-        .and_then(|row| row.first())
+        .and_then(|row| row.last())
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
 
@@ -799,6 +814,7 @@ async fn materialized_view_mean_survives_multiple_flushes() {
 }
 
 #[tokio::test]
+#[serial(chdb)]
 async fn materialized_view_sum_dedupes_duplicate_source_rows() {
     let ctx = match TestContext::new() {
         Ok(c) => c,

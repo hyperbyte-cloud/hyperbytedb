@@ -7,6 +7,7 @@ use hyperbytedb::adapters::chdb::session::SharedSession;
 use hyperbytedb::adapters::metadata::rocksdb_meta::RocksDbMetadata;
 use hyperbytedb::application::line_protocol::parse_line_body_to_points;
 use hyperbytedb::ports::metadata::MetadataPort;
+use serial_test::serial;
 
 fn telegraf_like_batch() -> Vec<u8> {
     let ts = 1_780_922_276_152_000_000i64;
@@ -26,6 +27,7 @@ fn telegraf_like_batch() -> Vec<u8> {
 }
 
 #[tokio::test]
+#[serial(chdb)]
 async fn build_prepared_wal_slot_keeps_all_measurements_in_telegraf_batch() {
     let tmpdir = tempfile::tempdir().unwrap();
     let meta_path = tmpdir.path().join("meta");

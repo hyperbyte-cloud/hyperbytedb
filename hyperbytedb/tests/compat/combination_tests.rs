@@ -5,13 +5,12 @@
 //! generated SQL can't catch. Every test writes deterministic data and asserts on
 //! concrete values, column sets, series splitting, and gap-fill behaviour.
 //!
-//! All tests require chDB and are marked `#[ignore]`. Run serially (chDB is a
-//! global instance):
-//!   LD_LIBRARY_PATH=/usr/local/lib \
-//!     cargo test -p hyperbytedb --test compat combination -- --ignored --test-threads=1
+//! All tests require chDB, which exposes one process-global server, so they are
+//! marked `#[serial(chdb)]` to keep concurrent chDB sessions from colliding.
 
 use hyperbytedb::adapters::http::router::QueryService;
 use hyperbytedb::domain::query_result::{QueryResponse, SeriesResult};
+use serial_test::serial;
 
 use super::TestContext;
 
@@ -58,7 +57,7 @@ fn tag(s: &SeriesResult, key: &str) -> String {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore]
+#[serial(chdb)]
 async fn raw_multi_field_select_includes_time_and_is_sorted() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("db").await.unwrap();
@@ -92,7 +91,7 @@ async fn raw_multi_field_select_includes_time_and_is_sorted() {
 }
 
 #[tokio::test]
-#[ignore]
+#[serial(chdb)]
 async fn raw_select_with_tag_filter_and_time_range() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("db").await.unwrap();
@@ -131,7 +130,7 @@ async fn raw_select_with_tag_filter_and_time_range() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore]
+#[serial(chdb)]
 async fn multiple_aggregates_group_by_time_with_aliases() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("db").await.unwrap();
@@ -167,7 +166,7 @@ async fn multiple_aggregates_group_by_time_with_aliases() {
 }
 
 #[tokio::test]
-#[ignore]
+#[serial(chdb)]
 async fn arithmetic_on_aggregate_with_alias() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("db").await.unwrap();
@@ -188,7 +187,7 @@ async fn arithmetic_on_aggregate_with_alias() {
 }
 
 #[tokio::test]
-#[ignore]
+#[serial(chdb)]
 async fn selectors_first_last_group_by_time() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("db").await.unwrap();
@@ -209,7 +208,7 @@ async fn selectors_first_last_group_by_time() {
 }
 
 #[tokio::test]
-#[ignore]
+#[serial(chdb)]
 async fn percentile_and_spread_group_by_time() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("db").await.unwrap();
@@ -237,7 +236,7 @@ async fn percentile_and_spread_group_by_time() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore]
+#[serial(chdb)]
 async fn group_by_tag_only_splits_series() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("db").await.unwrap();
@@ -276,7 +275,7 @@ async fn group_by_tag_only_splits_series() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore]
+#[serial(chdb)]
 async fn grafana_multi_host_regex_groupby_time_tag_fill_null() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("db").await.unwrap();
@@ -327,7 +326,7 @@ async fn grafana_multi_host_regex_groupby_time_tag_fill_null() {
 }
 
 #[tokio::test]
-#[ignore]
+#[serial(chdb)]
 async fn regex_not_match_excludes_host() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("db").await.unwrap();
@@ -355,7 +354,7 @@ async fn regex_not_match_excludes_host() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore]
+#[serial(chdb)]
 async fn fill_zero_fills_gaps_with_zero() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("db").await.unwrap();
@@ -381,7 +380,7 @@ async fn fill_zero_fills_gaps_with_zero() {
 }
 
 #[tokio::test]
-#[ignore]
+#[serial(chdb)]
 async fn fill_null_leaves_gaps_null_not_zero() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("db").await.unwrap();
@@ -407,7 +406,7 @@ async fn fill_null_leaves_gaps_null_not_zero() {
 }
 
 #[tokio::test]
-#[ignore]
+#[serial(chdb)]
 async fn fill_previous_carries_last_value_forward() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("db").await.unwrap();
@@ -434,7 +433,7 @@ async fn fill_previous_carries_last_value_forward() {
 }
 
 #[tokio::test]
-#[ignore]
+#[serial(chdb)]
 async fn fill_none_omits_gap_buckets() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("db").await.unwrap();
@@ -462,7 +461,7 @@ async fn fill_none_omits_gap_buckets() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore]
+#[serial(chdb)]
 async fn difference_of_mean_group_by_time() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("db").await.unwrap();
@@ -490,7 +489,7 @@ async fn difference_of_mean_group_by_time() {
 }
 
 #[tokio::test]
-#[ignore]
+#[serial(chdb)]
 async fn cumulative_sum_group_by_time() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("db").await.unwrap();
@@ -518,7 +517,7 @@ async fn cumulative_sum_group_by_time() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore]
+#[serial(chdb)]
 async fn order_by_time_desc_with_limit() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("db").await.unwrap();
@@ -547,7 +546,7 @@ async fn order_by_time_desc_with_limit() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore]
+#[serial(chdb)]
 async fn where_or_across_tags_then_aggregate() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("db").await.unwrap();
@@ -577,7 +576,7 @@ async fn where_or_across_tags_then_aggregate() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore]
+#[serial(chdb)]
 async fn epoch_ms_with_group_by_time_returns_bucket_millis() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("db").await.unwrap();
@@ -607,7 +606,7 @@ async fn epoch_ms_with_group_by_time_returns_bucket_millis() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore]
+#[serial(chdb)]
 async fn multiple_statements_return_multiple_results() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("db").await.unwrap();
@@ -636,7 +635,7 @@ async fn multiple_statements_return_multiple_results() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore]
+#[serial(chdb)]
 async fn select_star_projects_time_field_and_keeps_one_series() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("db").await.unwrap();
@@ -661,7 +660,7 @@ async fn select_star_projects_time_field_and_keeps_one_series() {
 /// For data 10@1s and 30@3s grouped by time(1s): InfluxDB yields 20 at the 2s
 /// gap; we currently yield 10 (carry-forward).
 #[tokio::test]
-#[ignore]
+#[serial(chdb)]
 async fn fill_linear_is_currently_carry_forward_known_limitation() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("db").await.unwrap();
@@ -695,6 +694,7 @@ async fn fill_linear_is_currently_carry_forward_known_limitation() {
 /// The full Telegraf `system` line mixes floats, ints and a string field. A
 /// freshly-created table must store every field, not just the string one.
 #[tokio::test]
+#[serial(chdb)]
 async fn mixed_type_system_measurement_stores_all_fields() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("db").await.unwrap();
@@ -726,6 +726,7 @@ async fn mixed_type_system_measurement_stores_all_fields() {
 /// NAME. Previously it mapped by position, scattering values into wrong-typed
 /// columns (numerics silently became NULL while the string field "worked").
 #[tokio::test]
+#[serial(chdb)]
 async fn schema_evolution_keeps_columns_aligned_by_name() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("db").await.unwrap();
@@ -767,6 +768,7 @@ async fn schema_evolution_keeps_columns_aligned_by_name() {
 /// Telegraf sends `system` as three partial lines per interval; they must coalesce
 /// so load and uptime fields are queryable together.
 #[tokio::test]
+#[serial(chdb)]
 async fn telegraf_system_partial_lines_coalesce() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("db").await.unwrap();
@@ -795,6 +797,7 @@ async fn telegraf_system_partial_lines_coalesce() {
 
 /// Integer then unsigned for the same field widens to UInt64 without rejecting.
 #[tokio::test]
+#[serial(chdb)]
 async fn uptime_integer_then_unsigned_widens() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("db").await.unwrap();
@@ -825,6 +828,7 @@ async fn uptime_integer_then_unsigned_widens() {
 /// A sparse first write (string only) followed by a full write must not hit
 /// column-count mismatch on flush.
 #[tokio::test]
+#[serial(chdb)]
 async fn partial_then_full_system_write_no_column_mismatch() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("db").await.unwrap();
@@ -862,7 +866,7 @@ async fn partial_then_full_system_write_no_column_mismatch() {
 
 /// Data written across many separate flushes is fully visible — no gaps.
 #[tokio::test]
-#[ignore]
+#[serial(chdb)]
 async fn data_across_multiple_flushes_has_no_gaps() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("db").await.unwrap();
@@ -902,7 +906,7 @@ async fn data_across_multiple_flushes_has_no_gaps() {
 /// (not yet flushed) is invisible until a flush. Pins the boundary so a future
 /// WAL-merging read path updates this deliberately.
 #[tokio::test]
-#[ignore]
+#[serial(chdb)]
 async fn unflushed_data_is_not_visible_until_flush() {
     use hyperbytedb::ports::ingestion::{IngestionPort, WritePayloadFormat};
     let ctx = TestContext::new().unwrap();
@@ -946,7 +950,7 @@ async fn unflushed_data_is_not_visible_until_flush() {
 /// `used_percent` is misaligned under positional insert. The Grafana-shaped query
 /// must return the real values, not garbage from a neighbouring column.
 #[tokio::test]
-#[ignore]
+#[serial(chdb)]
 async fn swap_used_percent_survives_schema_evolution() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("db").await.unwrap();

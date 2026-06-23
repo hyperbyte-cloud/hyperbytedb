@@ -3,9 +3,11 @@
 //! Verifies that SELECT queries return results matching the InfluxDB v1 JSON
 //! response format: `{ "results": [{ "statement_id": 0, "series": [...] }] }`.
 //!
-//! Most SELECT tests require chDB and are marked `#[ignore]`.
+//! Most SELECT tests require chDB and are marked `#[serial(chdb)]` (chDB exposes
+//! one process-global server, so concurrent sessions must be serialized).
 
 use hyperbytedb::adapters::http::router::QueryService;
+use serial_test::serial;
 
 use super::TestContext;
 
@@ -14,7 +16,7 @@ use super::TestContext;
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn response_has_correct_top_level_shape() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -35,7 +37,7 @@ async fn response_has_correct_top_level_shape() {
 }
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn series_result_has_name_columns_values() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -68,7 +70,7 @@ async fn series_result_has_name_columns_values() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn select_star_from_measurement() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -91,7 +93,7 @@ async fn select_star_from_measurement() {
 }
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn select_specific_fields() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -123,7 +125,7 @@ async fn select_specific_fields() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn aggregate_mean() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -152,7 +154,7 @@ async fn aggregate_mean() {
 }
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn aggregate_count() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -176,7 +178,7 @@ async fn aggregate_count() {
 }
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn aggregate_sum_min_max() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -210,7 +212,7 @@ async fn aggregate_sum_min_max() {
 }
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn aggregate_first_last() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -233,7 +235,7 @@ async fn aggregate_first_last() {
 }
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn aggregate_median() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -262,7 +264,7 @@ async fn aggregate_median() {
 }
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn aggregate_spread() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -295,7 +297,7 @@ async fn aggregate_spread() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn group_by_time() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -323,7 +325,7 @@ async fn group_by_time() {
 }
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn group_by_time_and_tag() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -363,7 +365,7 @@ async fn group_by_time_and_tag() {
 }
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn group_by_tag_only() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -390,7 +392,7 @@ async fn group_by_tag_only() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn fill_null() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -409,7 +411,7 @@ async fn fill_null() {
 }
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn fill_none() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -428,7 +430,7 @@ async fn fill_none() {
 }
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn fill_zero() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -447,7 +449,7 @@ async fn fill_zero() {
 }
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn fill_previous() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -466,7 +468,7 @@ async fn fill_previous() {
 }
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn fill_linear() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -496,7 +498,7 @@ async fn fill_linear() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn where_time_range() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -524,7 +526,7 @@ async fn where_time_range() {
 }
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn where_tag_condition() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -549,7 +551,7 @@ async fn where_tag_condition() {
 }
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn where_tag_regex() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -578,7 +580,7 @@ async fn where_tag_regex() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn regex_measurement_matching() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -605,7 +607,7 @@ async fn regex_measurement_matching() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn arithmetic_expression() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -635,7 +637,7 @@ async fn arithmetic_expression() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn nested_aggregate_non_negative_derivative() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -665,7 +667,7 @@ async fn nested_aggregate_non_negative_derivative() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn limit_offset() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -689,7 +691,7 @@ async fn limit_offset() {
 }
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn limit_only() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -718,7 +720,7 @@ async fn limit_only() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn order_by_time_desc() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -743,7 +745,7 @@ async fn order_by_time_desc() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn subquery() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -770,7 +772,7 @@ async fn subquery() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn epoch_s_returns_unix_seconds() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -800,7 +802,7 @@ async fn epoch_s_returns_unix_seconds() {
 }
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn epoch_ms_returns_unix_millis() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -825,7 +827,7 @@ async fn epoch_ms_returns_unix_millis() {
 }
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn epoch_ns_returns_unix_nanos() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -850,7 +852,7 @@ async fn epoch_ns_returns_unix_nanos() {
 }
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn no_epoch_returns_rfc3339() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -885,7 +887,7 @@ async fn no_epoch_returns_rfc3339() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn multiple_aggregates_have_distinct_columns() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -926,7 +928,7 @@ async fn multiple_aggregates_have_distinct_columns() {
 }
 
 #[tokio::test]
-#[ignore] // Requires chDB
+#[serial(chdb)]
 async fn fill_null_with_group_by_tag_does_not_split_into_phantom_series() {
     // Grafana-style query: regex host filter + aliased means + GROUP BY time, tag
     // + fill(null) over a wide range. WITH FILL must fill the *per-tag* series, not
@@ -997,6 +999,7 @@ async fn fill_null_with_group_by_tag_does_not_split_into_phantom_series() {
 }
 
 #[tokio::test]
+#[serial(chdb)]
 async fn partial_line_writes_coalesce_before_query() {
     let ctx = TestContext::new().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();

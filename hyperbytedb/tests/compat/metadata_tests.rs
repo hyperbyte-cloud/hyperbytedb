@@ -5,6 +5,7 @@
 //! SHOW RETENTION POLICIES, and SHOW CONTINUOUS QUERIES.
 
 use hyperbytedb::ports::ingestion::{IngestionPort, WritePayloadFormat};
+use serial_test::serial;
 
 use super::TestContext;
 
@@ -151,6 +152,7 @@ async fn show_measurements_empty_database() {
 }
 
 #[tokio::test]
+#[serial(chdb)]
 async fn show_measurements_filters_by_retention_policy() {
     let ctx = match TestContext::new() {
         Ok(c) => c,
