@@ -19,5 +19,4 @@ pub mod retention_service;
 pub mod runtime;
 pub mod schema_mutation_apply;
 pub mod statement_summary;
-pub mod system_trace;
 pub mod wal_append;

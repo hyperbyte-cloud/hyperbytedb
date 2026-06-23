@@ -1,8 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-mod tracing_init;
-
 use crate::adapters::http::router::build_router;
 use crate::application::cluster::heartbeat;
 use crate::application::cluster::hinted_handoff;
@@ -16,8 +14,6 @@ use crate::domain::cluster::membership::NodeState;
 use crate::ports::metadata::MetadataPort;
 use crate::ports::points_sink::PointsSinkPort;
 use crate::ports::wal::WalPort;
-
-pub use tracing_init::{OtelGuard, init_tracing};
 
 pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
     let bootstrapped = build_services(&config).await?;

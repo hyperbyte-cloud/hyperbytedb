@@ -111,19 +111,18 @@ async fn wait_for_shutdown_signal() {
 }
 
 fn init_tracing() {
-    use tracing_subscriber::EnvFilter;
-    use tracing_subscriber::fmt;
-    use tracing_subscriber::prelude::*;
-
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,hyperbytedb_proxy=debug,tower_http=info"));
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new("info,hyperbytedb_proxy=debug,tower_http=info")
+    });
     let json = std::env::var("LOG_FORMAT")
         .map(|v| v == "json")
         .unwrap_or(false);
-    let registry = tracing_subscriber::registry().with(filter);
     if json {
-        registry.with(fmt::layer().json()).init();
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .json()
+            .init();
     } else {
-        registry.with(fmt::layer()).init();
+        tracing_subscriber::fmt().with_env_filter(filter).init();
     }
 }

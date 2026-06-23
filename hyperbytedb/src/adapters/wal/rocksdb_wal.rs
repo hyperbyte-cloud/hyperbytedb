@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::adapters::wal::arrow_cache::WalArrowCache;
 use crate::adapters::wal::wal_ipc;
-use crate::application::system_trace;
 use crate::domain::point::Point;
 use crate::domain::prepared_wal::PreparedWalSlot;
 use crate::error::HyperbytedbError;
@@ -297,6 +296,22 @@ impl RocksDbWal {
         &self,
         bundles: Vec<WalAppendBundle>,
     ) -> Result<Vec<u64>, HyperbytedbError> {
+        let pre_encoded = vec![None; bundles.len()];
+        self.append_bundle_batch_sync_encoded(bundles, pre_encoded)
+    }
+
+    /// Like [`Self::append_bundle_batch_sync`] but with durable WAL values
+    /// pre-encoded off the writer thread — one `Option<Vec<u8>>` per bundle,
+    /// parallel to `bundles`. `None` entries are encoded inline as before.
+    ///
+    /// Moving the (bincode) serialization onto the parallel request tasks keeps
+    /// the single group-commit writer from becoming a per-point serialization
+    /// bottleneck under high ingest concurrency.
+    pub fn append_bundle_batch_sync_encoded(
+        &self,
+        bundles: Vec<WalAppendBundle>,
+        pre_encoded: Vec<Option<Vec<u8>>>,
+    ) -> Result<Vec<u64>, HyperbytedbError> {
         write_bundle_batch(
             &self.db,
             &self.seq,
@@ -304,6 +319,7 @@ impl RocksDbWal {
             self.wal_format,
             self.arrow_wal_enabled,
             bundles,
+            pre_encoded,
         )
     }
 }
@@ -315,6 +331,7 @@ fn write_bundle_batch(
     wal_format: WalFormat,
     arrow_wal_enabled: bool,
     mut bundles: Vec<WalAppendBundle>,
+    mut pre_encoded: Vec<Option<Vec<u8>>>,
 ) -> Result<Vec<u64>, HyperbytedbError> {
     if bundles.is_empty() {
         return Ok(Vec::new());
@@ -336,7 +353,12 @@ fn write_bundle_batch(
             slot.patch_all_ingest_seqs(wal_seq)?;
         }
 
-        let value = wal_ipc::encode_wal_value(wal_format, bundle.prepared.as_ref(), &bundle.entry)?;
+        // Prefer bytes serialized off the writer thread; fall back to encoding
+        // inline (e.g. ArrowIpc, whose payload depends on the assigned seq).
+        let value = match pre_encoded.get_mut(i).and_then(|slot| slot.take()) {
+            Some(bytes) => bytes,
+            None => wal_ipc::encode_wal_value(wal_format, bundle.prepared.as_ref(), &bundle.entry)?,
+        };
         wb.put_cf(&wal_cf, u64_to_be_bytes(wal_seq), value);
         seqs.push(wal_seq);
         prepared_slots.push(bundle.prepared.take());
@@ -367,7 +389,6 @@ impl WalPort for RocksDbWal {
     }
 
     async fn append_bundle(&self, bundle: WalAppendBundle) -> Result<u64, HyperbytedbError> {
-        let point_count = bundle.entry.points.len();
         let db = Arc::clone(&self.db);
         let seq = Arc::clone(&self.seq);
         let arrow_cache = Arc::clone(&self.arrow_cache);
@@ -382,6 +403,7 @@ impl WalPort for RocksDbWal {
                 wal_format,
                 arrow_wal_enabled,
                 vec![bundle],
+                vec![None],
             )
         })
         .await
@@ -390,7 +412,6 @@ impl WalPort for RocksDbWal {
         match result {
             Ok(seqs) => {
                 let seq = *seqs.first().unwrap_or(&0);
-                system_trace::log_wal_append(seq, point_count, 0, 0);
                 Ok(seq)
             }
             Err(e) => Err(e),

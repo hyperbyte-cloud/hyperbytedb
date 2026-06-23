@@ -11,7 +11,6 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 use crate::application::ingest_metadata::{
     IngestCardinalityLimits, IngestSchemaCache, prepare_batch_metadata,
 };
-use crate::application::system_trace;
 use crate::application::wal_append::append_points_with_prepared;
 use crate::error::HyperbytedbError;
 use crate::ports::points_sink::PointsSinkPort;
@@ -185,9 +184,6 @@ async fn apply_batch(
     schema_cache: &IngestSchemaCache,
 ) -> Result<u64, HyperbytedbError> {
     let metrics_start = std::time::Instant::now();
-    let trace_start = system_trace::start_timer();
-    let span = system_trace::replicate_apply_span(database, origin_node_id, body.len());
-    let _guard = span.enter();
 
     if body.is_empty() {
         return wal.last_sequence().await;
@@ -196,11 +192,9 @@ async fn apply_batch(
     let t0 = std::time::Instant::now();
     let points = parse_line_body_to_points(body, precision)?;
     histogram!("hyperbytedb_replication_apply_parse_seconds").record(t0.elapsed().as_secs_f64());
-    system_trace::record_phase("parse_us", t0.elapsed());
     if points.is_empty() {
         return wal.last_sequence().await;
     }
-    system_trace::record_u64("point_count", points.len() as u64);
 
     let t1 = std::time::Instant::now();
     if let Err(e) = prepare_batch_metadata(
@@ -230,11 +224,9 @@ async fn apply_batch(
             );
         }
         counter!("hyperbytedb_replication_apply_errors_total").increment(1);
-        system_trace::finish_span(&span, trace_start, "replicate apply failed");
         return Err(e);
     }
     histogram!("hyperbytedb_replication_apply_metadata_seconds").record(t1.elapsed().as_secs_f64());
-    system_trace::record_phase("metadata_register_us", t1.elapsed());
 
     let t2 = std::time::Instant::now();
     let result = append_points_with_prepared(
@@ -247,19 +239,15 @@ async fn apply_batch(
     )
     .await;
     histogram!("hyperbytedb_replication_apply_wal_seconds").record(t2.elapsed().as_secs_f64());
-    system_trace::record_phase("wal_append_us", t2.elapsed());
 
     histogram!("hyperbytedb_replication_apply_seconds")
         .record(metrics_start.elapsed().as_secs_f64());
     match &result {
-        Ok(seq) => {
-            system_trace::record_u64("wal_seq", *seq);
+        Ok(_) => {
             counter!("hyperbytedb_replication_apply_total").increment(1);
-            system_trace::finish_span(&span, trace_start, "replicate apply complete");
         }
         Err(_) => {
             counter!("hyperbytedb_replication_apply_errors_total").increment(1);
-            system_trace::finish_span(&span, trace_start, "replicate apply failed");
         }
     }
     result

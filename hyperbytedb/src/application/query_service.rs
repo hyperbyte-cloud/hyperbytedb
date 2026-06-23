@@ -8,7 +8,6 @@ use regex::Regex;
 use crate::application::line_protocol::encode_points_to_line_protocol;
 use crate::application::materialized_view_service::MaterializedViewService;
 use crate::application::replication_dispatch::dispatch_outbound_replication;
-use crate::application::system_trace::{self, PhaseTimer};
 use crate::config::ReplicationConfig;
 use crate::domain::chdb_naming::{
     quote_backticks, quoted_series_table_name, quoted_table_name, unquoted_series_table_name,
@@ -284,20 +283,15 @@ impl QueryService for QueryServiceImpl {
         let timeout = std::time::Duration::from_secs(self.query_timeout_secs);
         let caller_owned = caller.cloned();
         let fut = async {
-            let mut pt = PhaseTimer::start();
             let stmts = crate::timeseriesql::parse(query)?;
-            pt.record_phase("parse_us");
+            let stmt_count = stmts.len();
 
             if let Some(ref user) = caller_owned {
                 for stmt in &stmts {
                     check_authorization(user, db, stmt)?;
                 }
             }
-            pt.record_phase("authorize_us");
 
-            let stmt_count = stmts.len();
-            let _exec_span = system_trace::query_execute_span(db, stmt_count);
-            let _exec_guard = _exec_span.enter();
             let svc = Arc::new(self.clone());
             let db_arc = Arc::<str>::from(db);
             let epoch_arc = epoch.map(Arc::<str>::from);
@@ -350,7 +344,6 @@ impl QueryService for QueryServiceImpl {
                 }
             }
 
-            pt.record_phase_final("statement_us");
             Ok(QueryResponse { results })
         };
 

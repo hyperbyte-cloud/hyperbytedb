@@ -48,7 +48,6 @@ use crate::adapters::chdb::catalog;
 use crate::adapters::chdb::connection_pool::ChdbConnectionPool;
 use crate::adapters::chdb::session::{SharedSession, execute_connection};
 use crate::application::ingest_metadata::backfill_tag_metadata;
-use crate::application::system_trace;
 use crate::domain::chdb_naming::{
     field_column_name, quote_backticks, quoted_series_table_name, quoted_table_name,
     tag_column_name, unquoted_series_table_name, unquoted_table_name,
@@ -1120,11 +1119,6 @@ impl PointsSinkPort for ChdbNativeAdapter {
             points.len(),
             "origins must be parallel to points"
         );
-        let trace_start = system_trace::start_timer();
-        let span = system_trace::sink_write_span(db, rp, measurement, points.len());
-        let _guard = span.enter();
-        system_trace::record_bool("use_arrow", self.use_arrow);
-
         let key = TableKey {
             db: db.to_string(),
             rp: rp.to_string(),
@@ -1134,18 +1128,15 @@ impl PointsSinkPort for ChdbNativeAdapter {
         let ensured = self.ensure_table(&key, points).await?;
         histogram!("hyperbytedb_flush_sink_ensure_table_seconds")
             .record(ensure_start.elapsed().as_secs_f64());
-        system_trace::record_phase("ensure_table_us", ensure_start.elapsed());
 
         // Partial-line coalescing runs in the flush service over the full
         // measurement batch (before max_points_per_batch splitting).
         // Deterministic series id per (post-coalesce) point. Register any
         // brand-new series into the dimension table + metadata before inserting
         // the fact rows, so tag-resolving queries always find the series row.
-        let register_series_start = std::time::Instant::now();
         let sids: Vec<u64> = points.iter().map(series_id_for_point).collect();
         self.register_new_series(&key, &ensured, points, &sids)
             .await?;
-        system_trace::record_phase("register_series_us", register_series_start.elapsed());
 
         let row_count = points.len();
         let (min_time, max_time) = if self.use_arrow {
@@ -1157,7 +1148,6 @@ impl PointsSinkPort for ChdbNativeAdapter {
                 build_record_batch(&ensured, origins, ingest_seq_base, points, &sids)?;
             histogram!("hyperbytedb_flush_sink_build_insert_sql_seconds")
                 .record(build_start.elapsed().as_secs_f64());
-            system_trace::record_phase("build_batch_us", build_start.elapsed());
 
             let pool = self.session.pool()?;
             let table = ensured.table.clone();
@@ -1174,7 +1164,6 @@ impl PointsSinkPort for ChdbNativeAdapter {
             })??;
             histogram!("hyperbytedb_flush_sink_chdb_insert_seconds")
                 .record(insert_start.elapsed().as_secs_f64());
-            system_trace::record_phase("chdb_insert_us", insert_start.elapsed());
             (min_time, max_time)
         } else {
             // Legacy SQL VALUES path (HYPERBYTEDB_DISABLE_ARROW_INSERT=1).
@@ -1183,19 +1172,13 @@ impl PointsSinkPort for ChdbNativeAdapter {
                 build_insert_sql(&ensured, origins, ingest_seq_base, points, &sids)?;
             histogram!("hyperbytedb_flush_sink_build_insert_sql_seconds")
                 .record(build_insert_start.elapsed().as_secs_f64());
-            system_trace::record_phase("build_batch_us", build_insert_start.elapsed());
 
             let insert_start = std::time::Instant::now();
             self.execute(sql).await?;
             histogram!("hyperbytedb_flush_sink_chdb_insert_seconds")
                 .record(insert_start.elapsed().as_secs_f64());
-            system_trace::record_phase("chdb_insert_us", insert_start.elapsed());
             (min_time, max_time)
         };
-
-        system_trace::record_i64("min_time", min_time);
-        system_trace::record_i64("max_time", max_time);
-        system_trace::finish_span(&span, trace_start, "sink write complete");
 
         Ok(WriteAck {
             min_time,
@@ -1217,8 +1200,6 @@ impl PointsSinkPort for ChdbNativeAdapter {
                 row_count: 0,
             });
         }
-        system_trace::record_bool("use_arrow", self.use_arrow);
-        system_trace::record_bool("prepared_path", true);
         counter!("hyperbytedb_flush_sink_writes_total", "path" => "prepared").increment(1);
 
         let key = TableKey {

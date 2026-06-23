@@ -5,9 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
-use tracing::Instrument;
 
-use crate::application::system_trace::{self, PhaseTimer};
 use crate::error::HyperbytedbError;
 use metrics::{counter, histogram};
 
@@ -157,16 +155,10 @@ async fn handle_query_impl(
 
     let db = params.db.as_deref().unwrap_or("");
     let stmt_type_label = extract_stmt_type(&q);
-    let span = system_trace::client_query_span(db, q.len(), stmt_type_label);
-    let total_start = system_trace::start_timer();
-
-    let mut query_ok = false;
-    let outcome = async {
-        let mut bind_pt = PhaseTimer::start();
+    async {
         if let Some(ref params_json) = params.params {
             q = substitute_bind_params(&q, params_json)?;
         }
-        bind_pt.record_phase_final("bind_us");
 
         let epoch = params.epoch.as_deref();
         let pretty = params.pretty.unwrap_or(false);
@@ -178,7 +170,6 @@ async fn handle_query_impl(
         };
 
         let metrics_start = std::time::Instant::now();
-        let mut exec_pt = PhaseTimer::start();
         let rp = params.rp.as_deref().filter(|s| !s.is_empty());
         let result = state
             .query
@@ -189,7 +180,6 @@ async fn handle_query_impl(
             counter!("hyperbytedb_query_errors_total", "db" => db.to_string(), "stmt_type" => stmt_type_label, "stmt_normalized" => normalized_query.to_string(), "stmt_digest" => digest_hex.to_string()).increment(1);
             e
         })?;
-        exec_pt.record_phase_final("execute_us");
         let elapsed = metrics_start.elapsed();
 
         counter!("hyperbytedb_query_requests_total", "db" => db.to_string(), "stmt_type" => stmt_type_label, "stmt_normalized" => normalized_query.to_string(), "stmt_digest" => digest_hex.to_string()).increment(1);
@@ -207,7 +197,6 @@ async fn handle_query_impl(
             );
         }
 
-        let mut format_pt = PhaseTimer::start();
         let response = if wants_csv(&headers) {
             let csv = result_to_csv(&result);
             (StatusCode::OK, [("Content-Type", "text/csv")], csv).into_response()
@@ -251,24 +240,7 @@ async fn handle_query_impl(
             };
             (StatusCode::OK, [("Content-Type", "application/json")], json).into_response()
         };
-        format_pt.record_phase_final("format_us");
-        query_ok = true;
         Ok(response)
     }
-    .instrument(span.clone())
-    .await;
-
-    match &outcome {
-        Ok(_) if query_ok => {
-            system_trace::finish_span(&span, total_start, "client query complete");
-        }
-        Ok(_) => {
-            system_trace::finish_span(&span, total_start, "client query rejected");
-        }
-        Err(_) => {
-            system_trace::finish_span(&span, total_start, "client query failed");
-        }
-    }
-
-    outcome
+    .await
 }

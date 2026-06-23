@@ -98,7 +98,7 @@ The included `docker-compose.yml` ships Grafana with pre-provisioned datasources
 - **HyperbyteDB** (InfluxDB v1 API) for Telegraf host metrics
 - **Prometheus** for `/metrics`
 - **Loki** for container logs (via Alloy)
-- **Tempo** for OTLP traces (HyperbyteDB exports with `detailed_trace` enabled)
+- **Tempo** for traces
 
 Grafana is accessible at `http://localhost:3000` with login `admin`/`admin`. Use **Explore** to correlate logs (`{container=~".*hyperbytedb.*"}`) and traces (`service.name=hyperbytedb`).
 

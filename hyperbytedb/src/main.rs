@@ -12,7 +12,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use clap::{Parser, Subcommand};
 
 use hyperbytedb::application::backup::{backup, restore};
-use hyperbytedb::application::runtime::{init_tracing, serve};
+use hyperbytedb::application::runtime::serve;
 use hyperbytedb::config::HyperbytedbConfig;
 
 #[derive(Parser)]
@@ -49,8 +49,6 @@ enum Commands {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let config = HyperbytedbConfig::load(Some(&cli.config))?;
-
-    let _otel_guard = init_tracing(&config.logging)?;
 
     match cli.command {
         Commands::Serve => serve(config).await,

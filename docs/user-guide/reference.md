@@ -10,7 +10,7 @@ All endpoints return InfluxDB v1-compatible response headers:
 
 | Header | Value |
 |--------|-------|
-| `X-Influxdb-Version` | `HyperbyteDB-0.6.0` |
+| `X-Influxdb-Version` | `HyperbyteDB-0.8.2` |
 | `X-Influxdb-Build` | `OSS` |
 | `Request-Id` | UUID per request |
 | `X-Request-Id` | Same UUID |
@@ -82,9 +82,10 @@ Returns JSON health status:
 
 Prometheus-format metrics. See [Administration](administration.md#monitoring) for the full metric catalog.
 
-### GET /api/v1/statements
+### GET/DELETE /api/v1/statements
 
-Returns recently executed statement summaries (when `statement_summary.enabled = true`).
+- **GET** — Returns recently executed statement summaries (when `statement_summary.enabled = true`).
+- **DELETE** — Resets the statement summary ring buffer.
 
 ### Cluster-only endpoints (subset)
 
@@ -127,6 +128,19 @@ The following apply when the corresponding features are compiled in and enabled.
 | `/cluster/raft/client-write` | POST | Client write through Raft |
 | `/cluster/leader` | GET | Current Raft leader |
 | `/cluster/membership/add-node` | POST | Operator-style add node |
+| `/cluster/membership/remove-node` | POST | Operator-style remove node |
+
+### POST /api/v1/chdb
+
+Execute raw ClickHouse SQL against the embedded chDB engine. **Admin-only** when auth is enabled.
+
+**Query parameters:**
+
+| Parameter | Required | Default | Description |
+|-----------|----------|---------|-------------|
+| `db` | Yes | — | Target database name |
+
+**Body:** Raw ClickHouse SQL as `application/x-www-form-urlencoded` with key `q`.
 
 ### GET /health/ready
 

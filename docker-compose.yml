@@ -22,9 +22,6 @@ services:
       # ── Logging / observability ──
       HYPERBYTEDB__LOGGING__LEVEL: "info"
       HYPERBYTEDB__LOGGING__FORMAT: "json"
-      HYPERBYTEDB__LOGGING__DETAILED_TRACE: "true"
-      HYPERBYTEDB__LOGGING__OTLP_ENDPOINT: "http://alloy:4318"
-      HYPERBYTEDB__LOGGING__OTLP_SAMPLE_RATIO: "1.0"
       HYPERBYTEDB__STATEMENT_SUMMARY__ENABLED: "true"
     networks:
       - hyperbytedb-net

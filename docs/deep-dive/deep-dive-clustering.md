@@ -290,7 +290,7 @@ Raft messages are exchanged via HTTP:
 | `POST /internal/raft/append` | AppendEntries RPC |
 | `POST /internal/raft/vote` | RequestVote RPC |
 | `POST /internal/raft/snapshot` | InstallSnapshot RPC |
-| `POST /internal/raft/membership` | Membership change |
+| `POST /cluster/raft/change-membership` | Membership change |
 
 ### Configuration
 

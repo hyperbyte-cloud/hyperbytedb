@@ -277,7 +277,7 @@ ALTER RETENTION POLICY "30_days" ON "mydb" DURATION 60d DEFAULT
 SHOW RETENTION POLICIES ON "mydb"
 ```
 
-A background service runs every 60 seconds and issues `ALTER TABLE … DELETE` for rows outside each retention policy's duration window.
+A background service runs every 12 hours (by default) and issues `ALTER TABLE … DELETE` for rows outside each retention policy's duration window.
 
 ---
 

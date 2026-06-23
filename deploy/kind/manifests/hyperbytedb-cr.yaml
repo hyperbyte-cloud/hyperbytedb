@@ -66,10 +66,6 @@ spec:
   logging:
     level: info
     format: json
-    detailedTrace: false
-    # Base URL is OK; hyperbytedb appends /v1/traces for OTLP HTTP export.
-    otlpEndpoint: http://alloy-logs.hyperbytedb.svc:4318
-    otlpSampleRatio: "1.0"
   resources:
     requests:
       cpu: "2"

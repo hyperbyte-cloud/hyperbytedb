@@ -12,13 +12,15 @@ use metrics::histogram;
 use tokio::sync::oneshot;
 
 use crate::adapters::wal::rocksdb_wal::RocksDbWal;
-use crate::application::system_trace;
 use crate::domain::prepared_wal::PreparedWalSlot;
 use crate::error::HyperbytedbError;
-use crate::ports::wal::{WalAppendBundle, WalEntry, WalPort};
+use crate::ports::wal::{WalAppendBundle, WalEntry, WalFormat, WalPort};
 
 struct BatchRequest {
     bundle: WalAppendBundle,
+    /// Durable WAL value serialized off the writer thread (bincode format).
+    /// `None` => the writer encodes inline (e.g. ArrowIpc).
+    pre_encoded: Option<Vec<u8>>,
     enqueued_at: Instant,
     tx: oneshot::Sender<Result<u64, HyperbytedbError>>,
 }
@@ -86,36 +88,23 @@ impl BatchingWal {
                 .record(coalesce_elapsed.as_secs_f64());
             histogram!("hyperbytedb_wal_batcher_batch_size").record(batch.len() as f64);
 
-            let queue_wait_us = t_first.duration_since(batch[0].enqueued_at).as_micros() as u64;
             let batch_len = batch.len();
             let mut bundles = Vec::with_capacity(batch_len);
+            let mut pre_encoded = Vec::with_capacity(batch_len);
             let mut responses =
                 Vec::<(Instant, oneshot::Sender<Result<u64, HyperbytedbError>>)>::with_capacity(
                     batch_len,
                 );
             for req in batch.drain(..) {
                 bundles.push(req.bundle);
+                pre_encoded.push(req.pre_encoded);
                 responses.push((req.enqueued_at, req.tx));
             }
-            let result = wal.append_bundle_batch_sync(bundles);
+            let result = wal.append_bundle_batch_sync_encoded(bundles, pre_encoded);
 
             let t_write_end = Instant::now();
             let write_elapsed = t_write_end.duration_since(t_coalesce_end);
             histogram!("hyperbytedb_wal_batcher_write_seconds").record(write_elapsed.as_secs_f64());
-
-            match &result {
-                Ok(seqs) if !seqs.is_empty() => {
-                    system_trace::log_wal_batch(
-                        batch_len,
-                        queue_wait_us,
-                        coalesce_elapsed.as_micros() as u64,
-                        write_elapsed.as_micros() as u64,
-                        seqs[0],
-                        *seqs.last().unwrap_or(&seqs[0]),
-                    );
-                }
-                _ => {}
-            }
 
             let now = Instant::now();
             match result {
@@ -139,9 +128,24 @@ impl BatchingWal {
     }
 
     async fn enqueue(&self, bundle: WalAppendBundle) -> Result<u64, HyperbytedbError> {
+        // Serialize the durable WAL value here — on the parallel request task —
+        // rather than on the single group-commit writer thread. For the bincode
+        // format the bytes are independent of the sequence number assigned at
+        // commit time, so this is safe and moves the per-point serialization
+        // cost off the writer (the measured ingest bottleneck). ArrowIpc still
+        // encodes inline because its payload is patched with the assigned seq.
+        let pre_encoded = if self.inner.wal_format() == WalFormat::Bincode {
+            Some(
+                bincode::serialize(&bundle.entry)
+                    .map_err(|e| HyperbytedbError::Wal(e.to_string()))?,
+            )
+        } else {
+            None
+        };
         let (tx, rx) = oneshot::channel();
         let mut req = BatchRequest {
             bundle,
+            pre_encoded,
             enqueued_at: Instant::now(),
             tx,
         };

@@ -325,29 +325,6 @@ impl ClusterConfig {
 pub struct LoggingConfig {
     pub level: String,
     pub format: String,
-    /// Per-phase performance tracing (write, query, flush, replication). Off by
-    /// default: hot paths only check a single atomic when disabled.
-    #[serde(
-        default = "default_detailed_trace",
-        alias = "write_path_trace",
-        alias = "writePathTrace"
-    )]
-    pub detailed_trace: bool,
-    /// OTLP HTTP endpoint for Tempo (independent of [`detailed_trace`]). When set,
-    /// spans are exported asynchronously; tune [`otlp_sample_ratio`] for load.
-    #[serde(default, alias = "otlpEndpoint")]
-    pub otlp_endpoint: Option<String>,
-    /// Fraction of traces exported to OTLP (0.0–1.0). Default 1.0.
-    #[serde(default = "default_otlp_sample_ratio")]
-    pub otlp_sample_ratio: f64,
-}
-
-fn default_detailed_trace() -> bool {
-    false
-}
-
-fn default_otlp_sample_ratio() -> f64 {
-    1.0
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -382,7 +359,7 @@ pub struct RetentionConfig {
 
     /// How often retention enforcement scans run, expressed as a
     /// `humantime` duration string ("1m", "1h", "24h", "30s", ...).
-    /// Defaults to `"60s"`, matching the previous hardcoded behaviour.
+    /// Defaults to `"12h"`.
     /// Values that fail to parse fall back to the default and emit a
     /// warning at startup.
     #[serde(default = "default_retention_interval")]
@@ -506,9 +483,6 @@ impl HyperbytedbConfig {
             logging: LoggingConfig {
                 level: "info".to_string(),
                 format: "text".to_string(),
-                detailed_trace: default_detailed_trace(),
-                otlp_endpoint: None,
-                otlp_sample_ratio: default_otlp_sample_ratio(),
             },
             statement_summary: StatementSummaryConfig {
                 enabled: true,

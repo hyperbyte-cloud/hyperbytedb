@@ -4,7 +4,6 @@ use async_trait::async_trait;
 use chdb_rust::format::OutputFormat;
 
 use crate::adapters::chdb::session::{SharedSession, execute_connection};
-use crate::application::system_trace::{self, PhaseTimer};
 use crate::error::HyperbytedbError;
 use crate::ports::query::QueryPort;
 
@@ -80,25 +79,18 @@ impl QueryPort for ChdbQueryAdapter {
     }
 
     async fn execute_sql(&self, sql: &str) -> Result<String, HyperbytedbError> {
-        let span = system_trace::chdb_sql_span(sql.len());
-        let _guard = span.enter();
-        let total_start = system_trace::start_timer();
-
-        let mut sem_pt = PhaseTimer::start();
         let _permit = match self.concurrency_limit {
             Some(ref sem) => Some(Arc::clone(sem).acquire_owned().await.map_err(|_| {
                 HyperbytedbError::Internal("chDB concurrency semaphore closed".into())
             })?),
             None => None,
         };
-        sem_pt.record_phase_final("semaphore_wait_us");
 
         tracing::debug!(sql = sql, "executing chDB query");
 
         let pool = self.session.pool()?;
         let sql_owned = sql.to_string();
 
-        let mut exec_pt = PhaseTimer::start();
         let result = tokio::task::spawn_blocking(move || {
             pool.with_connection(|conn| {
                 let qr = execute_connection(conn, &sql_owned, OutputFormat::JSONEachRow);
@@ -126,11 +118,8 @@ impl QueryPort for ChdbQueryAdapter {
         })
         .await
         .map_err(|e| HyperbytedbError::Internal(format!("chDB task join error: {e}")))??;
-        exec_pt.record_phase_final("chdb_execute_us");
-        system_trace::record_usize("result_bytes", result.len());
 
         tracing::debug!(result_len = result.len(), "chDB query completed");
-        system_trace::finish_span(&span, total_start, "chdb sql complete");
         Ok(result)
     }
 }

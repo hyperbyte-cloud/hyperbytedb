@@ -151,11 +151,6 @@ Per-node coordinator replication behavior. If the whole block is omitted, mode i
 |-----|------|---------|-------------|
 | `level` | string | `"info"` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
 | `format` | string | `"text"` | Output format: `"text"` or `"json"` (structured, for Loki and similar) |
-| `detailed_trace` | boolean | `false` | Per-phase tracing spans on write, query, and flush hot paths |
-| `otlp_endpoint` | string | *unset* | OTLP HTTP collector URL (e.g. `http://alloy:4318`); `/v1/traces` is appended automatically |
-| `otlp_sample_ratio` | float | `1.0` | Fraction of traces exported to OTLP (`0.0`–`1.0`) |
-
-Set `format = "json"` and `detailed_trace = true` for rich local debugging. Pair with `otlp_endpoint` to export traces to Tempo. The Docker Compose stack enables all three by default.
 
 ---
 
@@ -202,7 +197,7 @@ Controls the background retention enforcement loop. Per-policy `duration` values
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | boolean | `true` | When `false`, expired rows are not deleted automatically |
-| `interval` | string | `"60s"` | How often retention scans run (`humantime` duration, e.g. `1m`, `1h`) |
+| `interval` | string | `"12h"` | How often retention scans run (`humantime` duration, e.g. `1m`, `1h`) |
 
 ---
 
@@ -267,9 +262,6 @@ max_measurements_per_database = 10000
 [logging]
 level = "info"
 format = "json"
-detailed_trace = true
-otlp_endpoint = "http://alloy:4318"
-otlp_sample_ratio = 0.1
 ```
 
 ## Example: Environment Variable Overrides
@@ -283,8 +275,6 @@ export HYPERBYTEDB__CHDB__SESSION_DATA_PATH=/var/lib/hyperbytedb/chdb
 export HYPERBYTEDB__SERVER__MAX_CONCURRENT_QUERIES=32
 export HYPERBYTEDB__LOGGING__LEVEL=debug
 export HYPERBYTEDB__LOGGING__FORMAT=json
-export HYPERBYTEDB__LOGGING__DETAILED_TRACE=true
-export HYPERBYTEDB__LOGGING__OTLP_ENDPOINT=http://alloy:4318
 export HYPERBYTEDB__RETENTION__INTERVAL=5m
 ```
 

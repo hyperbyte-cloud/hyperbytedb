@@ -1,0 +1,92 @@
+services:
+  hyperbytedb:
+    image: ghcr.io/hyperbyte-cloud/hyperbytedb:latest
+    container_name: hyperbytedb
+    ports:
+      - "8086:8086"
+    volumes:
+      - hyperbytedb-data:/var/lib/hyperbytedb
+    environment:
+      HYPERBYTEDB__SERVER__BIND_ADDRESS: "0.0.0.0"
+      HYPERBYTEDB__SERVER__PORT: "8086"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8086/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+
+  telegraf:
+    image: telegraf:latest
+    container_name: telegraf
+    depends_on:
+      hyperbytedb:
+        condition: service_healthy
+    volumes:
+      - ./telegraf.conf:/etc/telegraf/telegraf.conf:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+    environment:
+      HOST_PROC: /host/proc
+      HOST_SYS: /host/sys
+
+  loki:
+    image: grafana/loki:2.9.8
+    container_name: loki
+    command: -config.file=/etc/loki/loki.yaml
+    volumes:
+      - ./loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+    ports:
+      - "3100:3100"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3100/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=30d"
+    depends_on:
+      hyperbytedb:
+        condition: service_healthy
+
+  grafana:
+    image: grafana/grafana:12.4.3
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/provisioning/datasources/datasources.getting-started.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    depends_on:
+      hyperbytedb:
+        condition: service_healthy
+      prometheus:
+        condition: service_started
+      loki:
+        condition: service_started
+
+volumes:
+  hyperbytedb-data:
+  prometheus-data:
+  grafana-data:
+  loki-data:

@@ -86,13 +86,6 @@ min_acks = "majority"
 [logging]
 level = "info"
 format = "text"
-# Detailed per-phase tracing (write, query, flush). Off by default — hot paths
-# only check one atomic when disabled. Enable for Loki/Tempo debugging.
-detailed_trace = false
-# OTLP HTTP endpoint for Tempo (async export; independent of detailed_trace).
-# OTLP HTTP collector base URL (/v1/traces is appended automatically).
-# otlp_endpoint = "http://alloy-logs.hyperbytedb.svc:4318"
-# otlp_sample_ratio = 0.1
 
 [statement_summary]
 enabled = true
@@ -106,9 +99,9 @@ max_entries = 1000
 #   enabled   When false, the loop is not spawned and expired files remain on
 #             disk until manually deleted. Defaults to `true`.
 #   interval  How often the scan runs, as a `humantime` duration string
-#             ("30s", "1m", "1h", "24h", "1d", ...). Defaults to "60s".
+#             ("30s", "1m", "1h", "24h", "1d", ...). Defaults to "12h".
 #             Invalid or zero values fall back to 60s and emit a warning.
 # ----------------------------------------------------------------------------
 [retention]
 enabled = true
-interval = "60s"
+interval = "12h"

@@ -637,7 +637,7 @@ The internal alias `__time` avoids collision with the raw `time` column. It's re
 
 ## 14. Retention Enforcement
 
-The `RetentionService` runs every 60 seconds:
+The `RetentionService` runs on a configurable interval (default 12 hours):
 
 1. Lists all databases from metadata.
 2. For each database, iterates retention policies.

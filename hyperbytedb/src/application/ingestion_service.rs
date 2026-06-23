@@ -9,7 +9,6 @@ use crate::application::ingest_metadata::{
 };
 use crate::application::line_protocol::parse_line_body_to_points;
 use crate::application::msgpack_ingest::parse_msgpack_body_to_points;
-use crate::application::system_trace;
 use crate::application::wal_append::append_points_with_prepared;
 use crate::domain::point::Point;
 use crate::error::HyperbytedbError;
@@ -101,7 +100,6 @@ impl IngestionPort for IngestionServiceImpl {
 
         let t1 = std::time::Instant::now();
         histogram!("hyperbytedb_ingest_metadata_lookup_seconds").record((t1 - t0).as_secs_f64());
-        system_trace::record_phase("metadata_lookup_us", t1 - t0);
 
         #[cfg(feature = "columnar-ingest")]
         if matches!(format, WritePayloadFormat::ColumnarMsgpack) {
@@ -112,7 +110,6 @@ impl IngestionPort for IngestionServiceImpl {
 
             let t2 = std::time::Instant::now();
             histogram!("hyperbytedb_ingest_parse_seconds").record((t2 - t1).as_secs_f64());
-            system_trace::record_phase("parse_us", t2 - t1);
 
             prepare_columnar_metadata(
                 &self.metadata,
@@ -126,18 +123,14 @@ impl IngestionPort for IngestionServiceImpl {
             let t3 = std::time::Instant::now();
             histogram!("hyperbytedb_ingest_metadata_register_seconds")
                 .record((t3 - t2).as_secs_f64());
-            system_trace::record_phase("metadata_register_us", t3 - t2);
 
             let point_count = wire.values.len() as u64;
-            system_trace::record_u64("point_count", point_count);
             let points =
                 crate::application::columnar_msgpack::columnar_batch_to_points(&wire, precision)?;
-            let wal_seq = self.append_points(db, &retention_policy, points, 0).await?;
+            self.append_points(db, &retention_policy, points, 0).await?;
 
             let t4 = std::time::Instant::now();
             histogram!("hyperbytedb_ingest_wal_append_seconds").record((t4 - t3).as_secs_f64());
-            system_trace::record_phase("wal_append_us", t4 - t3);
-            system_trace::record_u64("wal_seq", wal_seq);
 
             counter!("hyperbytedb_ingestion_points_total", "db" => db.to_string())
                 .increment(point_count);
@@ -160,7 +153,6 @@ impl IngestionPort for IngestionServiceImpl {
 
         let t2 = std::time::Instant::now();
         histogram!("hyperbytedb_ingest_parse_seconds").record((t2 - t1).as_secs_f64());
-        system_trace::record_phase("parse_us", t2 - t1);
 
         prepare_batch_metadata(
             &self.metadata,
@@ -174,16 +166,12 @@ impl IngestionPort for IngestionServiceImpl {
 
         let t3 = std::time::Instant::now();
         histogram!("hyperbytedb_ingest_metadata_register_seconds").record((t3 - t2).as_secs_f64());
-        system_trace::record_phase("metadata_register_us", t3 - t2);
 
         let point_count = points.len() as u64;
-        system_trace::record_u64("point_count", point_count);
-        let wal_seq = self.append_points(db, &retention_policy, points, 0).await?;
+        self.append_points(db, &retention_policy, points, 0).await?;
 
         let t4 = std::time::Instant::now();
         histogram!("hyperbytedb_ingest_wal_append_seconds").record((t4 - t3).as_secs_f64());
-        system_trace::record_phase("wal_append_us", t4 - t3);
-        system_trace::record_u64("wal_seq", wal_seq);
 
         counter!("hyperbytedb_ingestion_points_total", "db" => db.to_string())
             .increment(point_count);

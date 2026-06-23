@@ -4,9 +4,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
-use tracing::Instrument;
 
-use crate::application::system_trace::{self, PhaseTimer};
 use crate::error::HyperbytedbError;
 use crate::ports::ingestion::WritePayloadFormat;
 use metrics::{counter, histogram};
@@ -38,7 +36,6 @@ pub async fn handle_write(
     Query(params): Query<WriteParams>,
     body: axum::body::Bytes,
 ) -> Result<Response, HyperbytedbError> {
-    let mut cluster_pt = PhaseTimer::start();
     // Reject writes if this node is draining or syncing
     if let Some(ref membership) = state.membership {
         let m = membership.read().await;
@@ -79,24 +76,15 @@ pub async fn handle_write(
 
     let ct_norm = normalized_content_type(&headers);
     let write_format = write_payload_format_from_headers(&ct_norm);
-    let format_label = write_format_label(write_format);
-    let span = system_trace::client_write_span(&db, format_label, body.len());
-    cluster_pt.record_phase_final("cluster_check_us");
-
-    let total_start = system_trace::start_timer();
     let db_owned = db.clone();
     let rp = params.rp.clone();
     let precision = params.precision.clone();
     let auth_user = auth_user.map(|u| u.0);
-    let mut write_succeeded = false;
 
-    let outcome = async {
-        let mut auth_pt = PhaseTimer::start();
+    async {
         if let Some(ref user) = auth_user
             && !user.user.can_write(&db_owned)
         {
-            auth_pt.record_phase_final("auth_us");
-            system_trace::record_bool("auth_denied", true);
             return Ok((
                 StatusCode::FORBIDDEN,
                 format!(
@@ -106,13 +94,9 @@ pub async fn handle_write(
             )
                 .into_response());
         }
-        auth_pt.record_phase_final("auth_us");
 
-        let mut gzip_pt = PhaseTimer::start();
         let decompressed = maybe_decompress_gzip(&headers, &body)?;
         let payload: &[u8] = decompressed.as_deref().unwrap_or(&body);
-        gzip_pt.record_phase_final("gzip_us");
-        system_trace::record_usize("payload_bytes", payload.len());
         histogram!("hyperbytedb_write_payload_bytes").record(payload.len() as f64);
 
         #[cfg(not(feature = "columnar-ingest"))]
@@ -124,7 +108,6 @@ pub async fn handle_write(
                 .into_response());
         }
 
-        let mut ingest_pt = PhaseTimer::start();
         let result = state
             .ingestion
             .ingest(
@@ -135,15 +118,9 @@ pub async fn handle_write(
                 write_format,
             )
             .await;
-        ingest_pt.record_phase_final("ingest_us");
-
-        if let Some(start) = total_start {
-            histogram!("hyperbytedb_write_duration_seconds").record(start.elapsed().as_secs_f64());
-        }
 
         match result {
             Ok(()) => {
-                write_succeeded = true;
                 counter!("hyperbytedb_write_requests_total").increment(1);
                 Ok(StatusCode::NO_CONTENT.into_response())
             }
@@ -154,34 +131,7 @@ pub async fn handle_write(
             }
         }
     }
-    .instrument(span.clone())
-    .await;
-
-    match &outcome {
-        Ok(_) if write_succeeded => {
-            system_trace::record_bool("ok", true);
-            system_trace::finish_span(&span, total_start, "client write complete");
-        }
-        Ok(_) => {
-            system_trace::record_bool("ok", false);
-            system_trace::finish_span(&span, total_start, "client write rejected");
-        }
-        Err(_) => {
-            system_trace::record_bool("ok", false);
-            system_trace::finish_span(&span, total_start, "client write failed");
-        }
-    }
-
-    outcome
-}
-
-fn write_format_label(format: WritePayloadFormat) -> &'static str {
-    match format {
-        WritePayloadFormat::LineProtocol => "line_protocol",
-        WritePayloadFormat::Msgpack => "msgpack",
-        #[cfg(feature = "columnar-ingest")]
-        WritePayloadFormat::ColumnarMsgpack => "columnar_msgpack",
-    }
+    .await
 }
 
 fn normalized_content_type(headers: &HeaderMap) -> String {
