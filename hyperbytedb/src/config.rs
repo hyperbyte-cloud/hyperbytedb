@@ -563,10 +563,10 @@ mod retention_config_tests {
     use std::time::Duration;
 
     #[test]
-    fn defaults_to_60s_enabled() {
+    fn default_is_12h_enabled() {
         let r = RetentionConfig::default();
         assert!(r.enabled);
-        assert_eq!(r.interval_duration(), Duration::from_secs(60));
+        assert_eq!(r.interval_duration(), Duration::from_secs(12 * 3600));
     }
 
     #[test]
@@ -625,6 +625,6 @@ mod retention_config_tests {
     fn deserializes_disabled() {
         let r: RetentionConfig = serde_json::from_str(r#"{"enabled":false}"#).expect("parse");
         assert!(!r.enabled);
-        assert_eq!(r.interval, "60s");
+        assert_eq!(r.interval, "12h");
     }
 }

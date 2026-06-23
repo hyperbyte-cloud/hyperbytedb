@@ -27,7 +27,7 @@ spec:
       size: 5Gi
   retention:
     enabled: true
-    interval: 60s
+    interval: 12h
   resources:
     requests:
       cpu: 250m
@@ -66,7 +66,7 @@ spec:
     sessionDataPath: /var/lib/hyperbytedb/chdb
   retention:
     enabled: true
-    interval: 60s
+    interval: 12h
   logging:
     level: info
     format: json

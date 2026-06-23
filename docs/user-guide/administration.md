@@ -70,7 +70,6 @@ Environment variable equivalents:
 ```bash
 HYPERBYTEDB__LOGGING__LEVEL=info
 HYPERBYTEDB__LOGGING__FORMAT=json
-HYPERBYTEDB__LOGGING__DETAILED_TRACE=true
 ```
 
 ### Statement summary
@@ -175,7 +174,7 @@ HyperbyteDB runs several background services as Tokio tasks:
 | Service | Interval | Purpose |
 |---------|----------|---------|
 | Flush | `flush.interval_secs` (10s) | WAL → chDB MergeTree |
-| Retention | `retention.interval` (60s) | `ALTER TABLE … DELETE` for expired rows |
+| Retention | `retention.interval` (12h) | `ALTER TABLE … DELETE` for expired rows |
 | Continuous Query | 10s (fixed) | Execute CQ schedules |
 | Heartbeat | `heartbeat_interval_secs` (2s, cluster) | Peer liveness detection |
 | Leader sync monitor | 30s (cluster) | Compare peer manifests and trigger sync when needed |

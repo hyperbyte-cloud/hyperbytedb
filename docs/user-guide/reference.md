@@ -10,7 +10,7 @@ All endpoints return InfluxDB v1-compatible response headers:
 
 | Header | Value |
 |--------|-------|
-| `X-Influxdb-Version` | `HyperbyteDB-0.8.2` |
+| `X-Influxdb-Version` | `HyperbyteDB-0.8.3` |
 | `X-Influxdb-Build` | `OSS` |
 | `Request-Id` | UUID per request |
 | `X-Request-Id` | Same UUID |

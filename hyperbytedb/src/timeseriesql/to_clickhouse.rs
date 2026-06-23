@@ -2314,8 +2314,8 @@ mod tests {
         .unwrap();
         assert!(sql.starts_with("SELECT "));
         assert!(sql.contains("toStartOfInterval(t.time, INTERVAL 5 MINUTE) AS time"));
-        assert!(sql.contains("any(origin_node_id) AS origin_node_id"));
-        assert!(sql.contains("max(ingest_seq) AS ingest_seq"));
+        assert!(sql.contains("any(t.`_mv_src_origin_node_id`) AS origin_node_id"));
+        assert!(sql.contains("max(t.`_mv_src_ingest_seq`) AS ingest_seq"));
         assert!(sql.contains("sipHash64("));
         assert!(sql.contains("sum(\"value\") AS \"sum_value\""));
         assert!(sql.contains("count(\"value\") AS \"count_value\""));

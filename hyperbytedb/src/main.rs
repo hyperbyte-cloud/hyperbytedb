@@ -50,6 +50,24 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let config = HyperbytedbConfig::load(Some(&cli.config))?;
 
+    let filter = match tracing_subscriber::EnvFilter::try_from_default_env() {
+        Ok(f) => f,
+        Err(_) => tracing_subscriber::EnvFilter::new(&config.logging.level),
+    };
+
+    if config.logging.format == "json" {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .json()
+            .try_init()
+            .map_err(|e| anyhow::anyhow!("failed to set logging subscriber: {e}"))?;
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .try_init()
+            .map_err(|e| anyhow::anyhow!("failed to set logging subscriber: {e}"))?;
+    }
+
     match cli.command {
         Commands::Serve => serve(config).await,
         Commands::Backup { output } => backup(config, &output).await,
