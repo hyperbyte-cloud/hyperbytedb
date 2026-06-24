@@ -1,5 +1,7 @@
 pub mod ast;
+pub mod ddl_parser;
 pub mod digest;
+pub mod lexer;
 pub mod parser;
 pub mod to_clickhouse;
 

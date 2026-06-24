@@ -27,7 +27,7 @@ spec:
       size: 5Gi
   retention:
     enabled: true
-    interval: 60s
+    interval: 12h
   resources:
     requests:
       cpu: 250m
@@ -66,7 +66,7 @@ spec:
     sessionDataPath: /var/lib/hyperbytedb/chdb
   retention:
     enabled: true
-    interval: 60s
+    interval: 12h
   logging:
     level: info
     format: json
@@ -132,8 +132,6 @@ spec:
   logging:
     level: info
     format: json
-    otlpEndpoint: http://alloy-logs:4318
-    otlpSampleRatio: "0.1"
   cardinality:
     maxTagValuesPerMeasurement: 100000
     maxMeasurementsPerDatabase: 10000
@@ -312,7 +310,7 @@ HyperbyteDB stores WAL, metadata, Raft state, and chDB session data on the per-r
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `sessionDataPath` | string | | chDB session data directory (embedded MergeTree storage) |
-| `poolSize` | int32 | `1` | **Ignored.** libchdb is a process-global singleton; use `server.maxConcurrentQueries` instead |
+| `poolSize` | int32 | `1` | Number of chDB connections to the same session data path. Clamped to 1–32. Set `server.maxConcurrentQueries` ≥ `poolSize` for best overlap. |
 
 ### `auth`
 
@@ -327,9 +325,7 @@ HyperbyteDB stores WAL, metadata, Raft state, and chDB session data on the per-r
 |-------|------|---------|-------------|
 | `level` | string | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
 | `format` | string | `text` | Log format: `text` or `json` |
-| `detailedTrace` | bool | `false` | Per-phase performance tracing (write, query, flush, replication) |
-| `otlpEndpoint` | string | | OTLP HTTP base URL for trace export (e.g. `http://alloy-logs:4318`); HyperbyteDB appends `/v1/traces` |
-| `otlpSampleRatio` | string | `1.0` | Fraction of traces exported to OTLP (`0.0`–`1.0`) |
+
 
 ### `cardinality`
 
@@ -365,7 +361,7 @@ HyperbyteDB stores WAL, metadata, Raft state, and chDB session data on the per-r
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | `true` | Run the background retention enforcement loop |
-| `interval` | string | `60s` | How often retention scans run (humantime duration) |
+| `interval` | string | `12h` | How often retention scans run (humantime duration) |
 
 ### `cluster`
 

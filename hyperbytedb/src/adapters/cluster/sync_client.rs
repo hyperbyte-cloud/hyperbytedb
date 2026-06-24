@@ -1,13 +1,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::application::ingest_metadata::{IngestCardinalityLimits, prepare_batch_metadata};
+use crate::application::wal_append::append_points_with_prepared;
 use crate::domain::cluster::membership::{NodeState, SharedMembership};
 use crate::domain::cluster::sync::{
     JoinRequest, JoinResponse, MetadataSnapshot, SyncManifest, WalSyncResponse,
 };
 use crate::error::HyperbytedbError;
 use crate::ports::metadata::MetadataPort;
-use crate::ports::wal::{WalEntry, WalPort};
+use crate::ports::points_sink::PointsSinkPort;
+use crate::ports::wal::WalPort;
 
 pub struct SyncClient {
     node_id: u64,
@@ -15,6 +18,7 @@ pub struct SyncClient {
     membership: SharedMembership,
     metadata: Arc<dyn MetadataPort>,
     wal: Arc<dyn WalPort>,
+    points_sink: Option<Arc<dyn PointsSinkPort>>,
     client: reqwest::Client,
     /// Static peer addresses from config, used as fallback when the
     /// membership has no active peers yet (Raft hasn't formed).
@@ -30,6 +34,26 @@ impl SyncClient {
         wal: Arc<dyn WalPort>,
         fallback_peer_addrs: Vec<String>,
     ) -> Self {
+        Self::with_points_sink(
+            node_id,
+            node_addr,
+            membership,
+            metadata,
+            wal,
+            None,
+            fallback_peer_addrs,
+        )
+    }
+
+    pub fn with_points_sink(
+        node_id: u64,
+        node_addr: String,
+        membership: SharedMembership,
+        metadata: Arc<dyn MetadataPort>,
+        wal: Arc<dyn WalPort>,
+        points_sink: Option<Arc<dyn PointsSinkPort>>,
+        fallback_peer_addrs: Vec<String>,
+    ) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(300))
             .build()
@@ -41,6 +65,7 @@ impl SyncClient {
             membership,
             metadata,
             wal,
+            points_sink,
             client,
             fallback_peer_addrs,
         }
@@ -58,14 +83,14 @@ impl SyncClient {
             }
         };
 
-        tracing::info!(peer = %peer_addr, "starting reconnect sync");
+        tracing::debug!(peer = %peer_addr, "starting reconnect sync");
 
         let manifest = self.get_manifest(&peer_addr).await?;
         let local_wal_seq = self.wal.last_sequence().await?;
         let remote_wal_seq = manifest.wal_last_seq;
 
         let gap = remote_wal_seq.saturating_sub(local_wal_seq);
-        tracing::info!(
+        tracing::debug!(
             local_wal_seq = local_wal_seq,
             remote_wal_seq = remote_wal_seq,
             gap = gap,
@@ -75,13 +100,15 @@ impl SyncClient {
         const SMALL_GAP_THRESHOLD: u64 = 10_000;
 
         if gap == 0 {
-            tracing::info!("no WAL gap, node is current");
+            tracing::debug!("no WAL gap, node is current");
         } else if gap <= SMALL_GAP_THRESHOLD {
-            tracing::info!(
+            tracing::debug!(
                 gap = gap,
                 "small gap detected, performing WAL catch-up (staying Active)"
             );
-            self.wal_catchup(&peer_addr, local_wal_seq).await?;
+            let applied = self.wal_catchup(&peer_addr, local_wal_seq).await?;
+            let local_after = self.wal.last_sequence().await?;
+            verify_catchup_progress(local_wal_seq, remote_wal_seq, applied, local_after)?;
         } else {
             {
                 let mut m = self.membership.write().await;
@@ -95,7 +122,9 @@ impl SyncClient {
             self.sync_metadata(&peer_addr).await?;
 
             let updated_wal_seq = self.wal.last_sequence().await?;
-            self.wal_catchup(&peer_addr, updated_wal_seq).await?;
+            let applied = self.wal_catchup(&peer_addr, updated_wal_seq).await?;
+            let local_after = self.wal.last_sequence().await?;
+            verify_catchup_progress(updated_wal_seq, remote_wal_seq, applied, local_after)?;
 
             {
                 let mut m = self.membership.write().await;
@@ -122,13 +151,13 @@ impl SyncClient {
         tracing::info!(peer = %peer_addr, "starting node join and sync");
 
         if let Err(e) = self.send_join_request(&peer_addr).await {
-            tracing::info!(error = %e, "join request failed (raft leader may add us separately), continuing sync");
+            tracing::debug!(error = %e, "join request failed (raft leader may add us separately), continuing sync");
         }
 
         let manifest = self.get_manifest(&peer_addr).await?;
         let local_wal_seq = self.wal.last_sequence().await?;
 
-        tracing::info!(
+        tracing::debug!(
             databases = manifest.databases.len(),
             local_wal_seq = local_wal_seq,
             remote_wal_seq = manifest.wal_last_seq,
@@ -140,7 +169,9 @@ impl SyncClient {
         // Pull all WAL entries this node is missing, starting from our local
         // sequence. Using the remote watermark would skip the entire history on
         // a new node (cursor starts at remote+1).
-        self.wal_catchup(&peer_addr, local_wal_seq).await?;
+        let applied = self.wal_catchup(&peer_addr, local_wal_seq).await?;
+        let local_after = self.wal.last_sequence().await?;
+        verify_catchup_progress(local_wal_seq, manifest.wal_last_seq, applied, local_after)?;
 
         let mut m = self.membership.write().await;
         m.set_state(self.node_id, NodeState::Active);
@@ -163,7 +194,7 @@ impl SyncClient {
             if let Ok(resp) = self.client.get(&url).send().await
                 && resp.status().is_success()
             {
-                tracing::info!(peer = %addr, "using fallback peer for sync");
+                tracing::debug!(peer = %addr, "using fallback peer for sync");
                 return Some(addr.clone());
             }
         }
@@ -201,7 +232,7 @@ impl SyncClient {
         *m = join_resp.membership;
         m.set_state(self.node_id, NodeState::Syncing);
 
-        tracing::info!(
+        tracing::debug!(
             assigned_id = join_resp.assigned_node_id,
             membership_version = m.version,
             "joined cluster, syncing"
@@ -247,7 +278,7 @@ impl SyncClient {
             .await
             .map_err(|e| HyperbytedbError::SyncFailed(format!("parse metadata snapshot: {e}")))?;
 
-        tracing::info!(
+        tracing::debug!(
             entries = snapshot.entries.len(),
             "importing metadata snapshot"
         );
@@ -256,7 +287,16 @@ impl SyncClient {
             self.import_metadata_entry(entry).await?;
         }
 
-        tracing::info!("metadata sync complete");
+        if let Some(sink) = &self.points_sink
+            && let Err(e) = sink.refresh_schema_cache().await
+        {
+            tracing::warn!(
+                error = %e,
+                "failed to refresh chDB schema cache after metadata sync"
+            );
+        }
+
+        tracing::debug!("metadata sync complete");
         Ok(())
     }
 
@@ -329,7 +369,7 @@ impl SyncClient {
         Ok(())
     }
 
-    async fn wal_catchup(&self, peer_addr: &str, from_seq: u64) -> Result<(), HyperbytedbError> {
+    async fn wal_catchup(&self, peer_addr: &str, from_seq: u64) -> Result<u64, HyperbytedbError> {
         let mut cursor = from_seq;
         let mut total_entries = 0u64;
 
@@ -361,19 +401,13 @@ impl SyncClient {
 
             let batch_count = wal_resp.entries.len();
             for entry in &wal_resp.entries {
-                let wal_entry = WalEntry {
-                    database: entry.database.clone(),
-                    retention_policy: entry.retention_policy.clone(),
-                    points: entry.points.clone(),
-                    origin_node_id: entry.origin_node_id,
-                };
-                self.wal.append(wal_entry).await?;
+                self.append_catchup_entry(entry).await?;
             }
 
             cursor = wal_resp.last_seq;
             total_entries += batch_count as u64;
 
-            tracing::info!(
+            tracing::debug!(
                 entries = batch_count,
                 cursor = cursor,
                 "WAL catch-up batch applied"
@@ -381,6 +415,78 @@ impl SyncClient {
         }
 
         tracing::info!(total_entries = total_entries, "WAL catch-up complete");
+        Ok(total_entries)
+    }
+
+    async fn append_catchup_entry(
+        &self,
+        entry: &crate::domain::cluster::sync::WalSyncEntry,
+    ) -> Result<(), HyperbytedbError> {
+        if entry.points.is_empty() {
+            return Ok(());
+        }
+
+        prepare_batch_metadata(
+            &self.metadata,
+            &entry.database,
+            &entry.retention_policy,
+            &entry.points,
+            IngestCardinalityLimits::default(),
+            None,
+        )
+        .await?;
+
+        append_points_with_prepared(
+            self.wal.as_ref(),
+            self.points_sink.as_ref(),
+            &entry.database,
+            &entry.retention_policy,
+            entry.points.clone(),
+            entry.origin_node_id,
+        )
+        .await?;
         Ok(())
+    }
+}
+
+/// Fail closed when the peer advertises a higher WAL watermark but returns no
+/// readable entries — usually because the leader truncated past the gap.
+fn verify_catchup_progress(
+    local_seq_before: u64,
+    remote_wal_seq: u64,
+    entries_applied: u64,
+    local_seq_after: u64,
+) -> Result<(), HyperbytedbError> {
+    if remote_wal_seq <= local_seq_before {
+        return Ok(());
+    }
+    if entries_applied == 0 && local_seq_after <= local_seq_before {
+        return Err(HyperbytedbError::SyncFailed(format!(
+            "peer reports wal_last_seq={remote_wal_seq} but returned no WAL entries from seq {}",
+            local_seq_before + 1
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::verify_catchup_progress;
+    use crate::error::HyperbytedbError;
+
+    #[test]
+    fn verify_catchup_progress_ok_when_caught_up() {
+        verify_catchup_progress(5, 5, 0, 5).unwrap();
+    }
+
+    #[test]
+    fn verify_catchup_progress_ok_when_entries_applied() {
+        verify_catchup_progress(0, 4, 2, 2).unwrap();
+    }
+
+    #[test]
+    fn verify_catchup_progress_err_when_gap_unreadable() {
+        let err = verify_catchup_progress(0, 2, 0, 0).unwrap_err();
+        assert!(matches!(err, HyperbytedbError::SyncFailed(_)));
     }
 }

@@ -103,6 +103,7 @@ pub async fn execute_query(session: &Session, client: &HyperbytedbClient, q: &st
     for stmt in statements {
         let opts = QueryOptions {
             db: session.effective_database().map(|s| s.to_string()),
+            retention_policy: session.retention_policy.clone(),
             epoch: session.epoch.clone(),
             pretty: session.pretty,
             chunked: session.chunked,

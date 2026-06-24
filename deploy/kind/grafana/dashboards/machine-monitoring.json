@@ -43,7 +43,7 @@
     {
       "datasource": {
         "type": "influxdb",
-        "uid": "${ds}"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -91,7 +91,7 @@
         "y": 1
       },
       "id": 1,
-      "interval": "1s",
+      "interval": "10s",
       "maxDataPoints": 100,
       "options": {
         "minVizHeight": 75,
@@ -115,7 +115,7 @@
           "groupBy": [
             {
               "params": [
-                "$interval"
+                "10s"
               ],
               "type": "time"
             },
@@ -129,7 +129,7 @@
           "measurement": "cpu",
           "orderByTime": "ASC",
           "policy": "default",
-          "query": "SELECT mean(\"usage_idle\") * -1 + 100 FROM \"cpu\" WHERE \"host\" =~ /^$server$/ AND \"cpu\" = 'cpu-total' AND $timeFilter GROUP BY time($interval) fill(null)",
+          "query": "SELECT mean(\"usage_idle\") * -1 + 100 FROM \"cpu\" WHERE \"host\" =~ /^$server$/ AND \"cpu\" = 'cpu-total' AND $timeFilter GROUP BY time(10s) fill(null)",
           "rawQuery": true,
           "refId": "A",
           "resultFormat": "time_series",
@@ -175,7 +175,7 @@
     {
       "datasource": {
         "type": "influxdb",
-        "uid": "${ds}"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -223,7 +223,7 @@
         "y": 1
       },
       "id": 2,
-      "interval": "1s",
+      "interval": "10s",
       "maxDataPoints": 100,
       "options": {
         "minVizHeight": 75,
@@ -247,7 +247,7 @@
           "groupBy": [
             {
               "params": [
-                "$interval"
+                "10s"
               ],
               "type": "time"
             },
@@ -261,7 +261,7 @@
           "measurement": "mem",
           "orderByTime": "ASC",
           "policy": "default",
-          "query": "SELECT mean(\"used_percent\") FROM \"mem\" WHERE \"host\" =~ /^$server$/ AND $timeFilter GROUP BY time($interval) fill(null)",
+          "query": "SELECT mean(\"used_percent\") FROM \"mem\" WHERE \"host\" =~ /^$server$/ AND $timeFilter GROUP BY time(10s) fill(null)",
           "rawQuery": true,
           "refId": "A",
           "resultFormat": "time_series",
@@ -295,7 +295,7 @@
     {
       "datasource": {
         "type": "influxdb",
-        "uid": "${ds}"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -343,7 +343,7 @@
         "y": 1
       },
       "id": 3,
-      "interval": "1s",
+      "interval": "10s",
       "maxDataPoints": 100,
       "options": {
         "minVizHeight": 75,
@@ -367,7 +367,7 @@
           "groupBy": [
             {
               "params": [
-                "$interval"
+                "10s"
               ],
               "type": "time"
             },
@@ -413,7 +413,7 @@
     {
       "datasource": {
         "type": "influxdb",
-        "uid": "${ds}"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -484,7 +484,7 @@
           "groupBy": [
             {
               "params": [
-                "$interval"
+                "10s"
               ],
               "type": "time"
             },
@@ -545,7 +545,7 @@
     {
       "datasource": {
         "type": "influxdb",
-        "uid": "${ds}"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -653,7 +653,7 @@
         "y": 7
       },
       "id": 5,
-      "interval": "1s",
+      "interval": "10s",
       "options": {
         "alertThreshold": true,
         "legend": {
@@ -681,7 +681,7 @@
           "groupBy": [
             {
               "params": [
-                "$interval"
+                "10s"
               ],
               "type": "time"
             },
@@ -701,7 +701,7 @@
           "measurement": "cpu",
           "orderByTime": "ASC",
           "policy": "default",
-          "query": "SELECT mean(\"usage_guest\") AS \"Usage Guest\", mean(\"usage_guest_nice\") AS \"Usage Guest Nice\", mean(\"usage_idle\") AS \"Usage Idle\", mean(\"usage_iowait\") AS \"Usage IO Wait\", mean(\"usage_irq\") AS \"Usage IRQ\", mean(\"usage_nice\") AS \"Usage Nice\", mean(\"usage_softirq\") AS \"Usage Soft IRQ\", mean(\"usage_steal\") AS \"Usage Steal\", mean(\"usage_system\") AS \"Usage System\", mean(\"usage_user\") AS \"Usage User\" FROM \"cpu\" WHERE \"host\" =~ /^$server$/ AND \"cpu\" = 'cpu-total' AND $timeFilter GROUP BY time($interval), \"host\" fill(null)",
+          "query": "SELECT mean(\"usage_guest\") AS \"Usage Guest\", mean(\"usage_guest_nice\") AS \"Usage Guest Nice\", mean(\"usage_idle\") AS \"Usage Idle\", mean(\"usage_iowait\") AS \"Usage IO Wait\", mean(\"usage_irq\") AS \"Usage IRQ\", mean(\"usage_nice\") AS \"Usage Nice\", mean(\"usage_softirq\") AS \"Usage Soft IRQ\", mean(\"usage_steal\") AS \"Usage Steal\", mean(\"usage_system\") AS \"Usage System\", mean(\"usage_user\") AS \"Usage User\" FROM \"cpu\" WHERE \"host\" =~ /^$server$/ AND \"cpu\" = 'cpu-total' AND $timeFilter GROUP BY time(10s), \"host\" fill(null)",
           "rawQuery": true,
           "refId": "A",
           "resultFormat": "time_series",
@@ -908,7 +908,7 @@
     {
       "datasource": {
         "type": "influxdb",
-        "uid": "${ds}"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -1016,7 +1016,7 @@
         "y": 7
       },
       "id": 6,
-      "interval": "1s",
+      "interval": "10s",
       "options": {
         "alertThreshold": true,
         "legend": {
@@ -1137,7 +1137,7 @@
     {
       "datasource": {
         "type": "influxdb",
-        "uid": "${ds}"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -1285,7 +1285,7 @@
         "y": 16
       },
       "id": 7,
-      "interval": "1s",
+      "interval": "10s",
       "options": {
         "alertThreshold": true,
         "legend": {
@@ -1313,7 +1313,7 @@
           "groupBy": [
             {
               "params": [
-                "$interval"
+                "10s"
               ],
               "type": "time"
             },
@@ -1478,7 +1478,7 @@
     {
       "datasource": {
         "type": "influxdb",
-        "uid": "${ds}"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -1586,7 +1586,7 @@
         "y": 16
       },
       "id": 8,
-      "interval": "1s",
+      "interval": "10s",
       "options": {
         "alertThreshold": true,
         "legend": {
@@ -1613,7 +1613,7 @@
           "groupBy": [
             {
               "params": [
-                "$interval"
+                "10s"
               ],
               "type": "time"
             },
@@ -1794,1510 +1794,12 @@
       "type": "timeseries"
     },
     {
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${ds}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "stepAfter",
-            "lineWidth": 2,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "showValues": false,
-            "spanNulls": true,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "links": [],
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          },
-          "unit": "none"
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byValue",
-              "options": {
-                "op": "gte",
-                "reducer": "allIsZero",
-                "value": 0
-              }
-            },
-            "properties": [
-              {
-                "id": "custom.hideFrom",
-                "value": {
-                  "legend": true,
-                  "tooltip": true,
-                  "viz": false
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byValue",
-              "options": {
-                "op": "gte",
-                "reducer": "allIsNull",
-                "value": 0
-              }
-            },
-            "properties": [
-              {
-                "id": "custom.hideFrom",
-                "value": {
-                  "legend": true,
-                  "tooltip": true,
-                  "viz": false
-                }
-              }
-            ]
-          }
-        ]
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 24,
-        "x": 0,
-        "y": 25
-      },
-      "id": 22,
-      "interval": "1s",
-      "options": {
-        "alertThreshold": true,
-        "legend": {
-          "calcs": [
-            "mean",
-            "lastNotNull",
-            "max"
-          ],
-          "displayMode": "table",
-          "placement": "right",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "pluginVersion": "12.4.3",
-      "targets": [
-        {
-          "alias": "Threads: $tag_process_name",
-          "dsType": "influxdb",
-          "groupBy": [
-            {
-              "params": [
-                "$interval"
-              ],
-              "type": "time"
-            },
-            {
-              "params": [
-                "process_name"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "pidfile"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "null"
-              ],
-              "type": "fill"
-            }
-          ],
-          "hide": true,
-          "measurement": "procstat",
-          "orderByTime": "ASC",
-          "policy": "default",
-          "query": " SELECT mean(\"num_threads\") FROM \"procstat\" WHERE \"host\" =~ /^$server$/ AND $timeFilter GROUP BY \"process_name\",time($interval),host fill(null)",
-          "rawQuery": true,
-          "refId": "B",
-          "resultFormat": "time_series",
-          "select": [
-            [
-              {
-                "params": [
-                  "pid"
-                ],
-                "type": "field"
-              }
-            ]
-          ],
-          "tags": [
-            {
-              "key": "host",
-              "operator": "=~",
-              "value": "/^$server$/"
-            }
-          ]
-        },
-        {
-          "alias": "CPU Time User: $tag_process_name",
-          "dsType": "influxdb",
-          "groupBy": [
-            {
-              "params": [
-                "$interval"
-              ],
-              "type": "time"
-            },
-            {
-              "params": [
-                "process_name"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "pidfile"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "null"
-              ],
-              "type": "fill"
-            }
-          ],
-          "hide": true,
-          "measurement": "procstat",
-          "orderByTime": "ASC",
-          "policy": "default",
-          "query": " SELECT mean(\"cpu_time_user\") FROM \"procstat\" WHERE \"host\" =~ /^$server$/ AND $timeFilter GROUP BY \"process_name\",time($interval),host fill(null)",
-          "rawQuery": true,
-          "refId": "A",
-          "resultFormat": "time_series",
-          "select": [
-            [
-              {
-                "params": [
-                  "pid"
-                ],
-                "type": "field"
-              }
-            ]
-          ],
-          "tags": [
-            {
-              "key": "host",
-              "operator": "=~",
-              "value": "/^$server$/"
-            }
-          ]
-        },
-        {
-          "alias": "CPU Time System $tag_process_name",
-          "dsType": "influxdb",
-          "groupBy": [
-            {
-              "params": [
-                "$interval"
-              ],
-              "type": "time"
-            },
-            {
-              "params": [
-                "process_name"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "pidfile"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "null"
-              ],
-              "type": "fill"
-            }
-          ],
-          "hide": true,
-          "measurement": "procstat",
-          "orderByTime": "ASC",
-          "policy": "default",
-          "query": " SELECT mean(\"cpu_time_system\") FROM \"procstat\" WHERE \"host\" =~ /^$server$/ AND $timeFilter GROUP BY \"process_name\",time($interval),host fill(null)",
-          "rawQuery": true,
-          "refId": "C",
-          "resultFormat": "time_series",
-          "select": [
-            [
-              {
-                "params": [
-                  "pid"
-                ],
-                "type": "field"
-              }
-            ]
-          ],
-          "tags": [
-            {
-              "key": "host",
-              "operator": "=~",
-              "value": "/^$server$/"
-            }
-          ]
-        },
-        {
-          "alias": "CPU Time Soft IRQ: $tag_process_name",
-          "dsType": "influxdb",
-          "groupBy": [
-            {
-              "params": [
-                "$interval"
-              ],
-              "type": "time"
-            },
-            {
-              "params": [
-                "process_name"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "pidfile"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "null"
-              ],
-              "type": "fill"
-            }
-          ],
-          "hide": true,
-          "measurement": "procstat",
-          "orderByTime": "ASC",
-          "policy": "default",
-          "query": " SELECT mean(\"cpu_time_soft_irq\") FROM \"procstat\" WHERE \"host\" =~ /^$server$/ AND $timeFilter GROUP BY \"process_name\",time($interval),host fill(null)",
-          "rawQuery": true,
-          "refId": "D",
-          "resultFormat": "time_series",
-          "select": [
-            [
-              {
-                "params": [
-                  "pid"
-                ],
-                "type": "field"
-              }
-            ]
-          ],
-          "tags": [
-            {
-              "key": "host",
-              "operator": "=~",
-              "value": "/^$server$/"
-            }
-          ]
-        },
-        {
-          "alias": "CPU Time Idle: $tag_process_name",
-          "dsType": "influxdb",
-          "groupBy": [
-            {
-              "params": [
-                "$interval"
-              ],
-              "type": "time"
-            },
-            {
-              "params": [
-                "process_name"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "pidfile"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "null"
-              ],
-              "type": "fill"
-            }
-          ],
-          "hide": true,
-          "measurement": "procstat",
-          "orderByTime": "ASC",
-          "policy": "default",
-          "query": " SELECT mean(\"cpu_time_idle\") FROM \"procstat\" WHERE \"host\" =~ /^$server$/ AND $timeFilter GROUP BY \"process_name\",time($interval),host fill(null)",
-          "rawQuery": true,
-          "refId": "E",
-          "resultFormat": "time_series",
-          "select": [
-            [
-              {
-                "params": [
-                  "pid"
-                ],
-                "type": "field"
-              }
-            ]
-          ],
-          "tags": [
-            {
-              "key": "host",
-              "operator": "=~",
-              "value": "/^$server$/"
-            }
-          ]
-        },
-        {
-          "alias": "CPU Time IOwait: $tag_process_name",
-          "dsType": "influxdb",
-          "groupBy": [
-            {
-              "params": [
-                "$interval"
-              ],
-              "type": "time"
-            },
-            {
-              "params": [
-                "process_name"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "pidfile"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "null"
-              ],
-              "type": "fill"
-            }
-          ],
-          "hide": true,
-          "measurement": "procstat",
-          "orderByTime": "ASC",
-          "policy": "default",
-          "query": " SELECT mean(\"cpu_time_iowait\") FROM \"procstat\" WHERE \"host\" =~ /^$server$/ AND $timeFilter GROUP BY \"process_name\",time($interval),host fill(null)",
-          "rawQuery": true,
-          "refId": "F",
-          "resultFormat": "time_series",
-          "select": [
-            [
-              {
-                "params": [
-                  "pid"
-                ],
-                "type": "field"
-              }
-            ]
-          ],
-          "tags": [
-            {
-              "key": "host",
-              "operator": "=~",
-              "value": "/^$server$/"
-            }
-          ]
-        },
-        {
-          "alias": "CPU Usage: $tag_process_name",
-          "dsType": "influxdb",
-          "groupBy": [
-            {
-              "params": [
-                "$interval"
-              ],
-              "type": "time"
-            },
-            {
-              "params": [
-                "process_name"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "pidfile"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "null"
-              ],
-              "type": "fill"
-            }
-          ],
-          "measurement": "procstat",
-          "orderByTime": "ASC",
-          "policy": "default",
-          "query": " SELECT mean(\"cpu_usage\") FROM \"procstat\" WHERE \"host\" =~ /^$server$/ AND $timeFilter GROUP BY \"process_name\",time($interval),host fill(null)",
-          "rawQuery": true,
-          "refId": "G",
-          "resultFormat": "time_series",
-          "select": [
-            [
-              {
-                "params": [
-                  "pid"
-                ],
-                "type": "field"
-              }
-            ]
-          ],
-          "tags": [
-            {
-              "key": "host",
-              "operator": "=~",
-              "value": "/^$server$/"
-            }
-          ]
-        },
-        {
-          "alias": "CPU Time IRQ: $tag_process_name",
-          "dsType": "influxdb",
-          "groupBy": [
-            {
-              "params": [
-                "$interval"
-              ],
-              "type": "time"
-            },
-            {
-              "params": [
-                "process_name"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "pidfile"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "null"
-              ],
-              "type": "fill"
-            }
-          ],
-          "hide": true,
-          "measurement": "procstat",
-          "orderByTime": "ASC",
-          "policy": "default",
-          "query": " SELECT mean(\"cpu_time_irq\") FROM \"procstat\" WHERE \"host\" =~ /^$server$/ AND $timeFilter GROUP BY \"process_name\",time($interval),host fill(null)",
-          "rawQuery": true,
-          "refId": "H",
-          "resultFormat": "time_series",
-          "select": [
-            [
-              {
-                "params": [
-                  "pid"
-                ],
-                "type": "field"
-              }
-            ]
-          ],
-          "tags": [
-            {
-              "key": "host",
-              "operator": "=~",
-              "value": "/^$server$/"
-            }
-          ]
-        },
-        {
-          "alias": "CPU Time Quest: $tag_process_name",
-          "dsType": "influxdb",
-          "groupBy": [
-            {
-              "params": [
-                "$interval"
-              ],
-              "type": "time"
-            },
-            {
-              "params": [
-                "process_name"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "pidfile"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "null"
-              ],
-              "type": "fill"
-            }
-          ],
-          "hide": true,
-          "measurement": "procstat",
-          "orderByTime": "ASC",
-          "policy": "default",
-          "query": " SELECT mean(\"cpu_time_guest\") FROM \"procstat\" WHERE \"host\" =~ /^$server$/ AND $timeFilter GROUP BY \"process_name\",time($interval),host fill(null)",
-          "rawQuery": true,
-          "refId": "I",
-          "resultFormat": "time_series",
-          "select": [
-            [
-              {
-                "params": [
-                  "pid"
-                ],
-                "type": "field"
-              }
-            ]
-          ],
-          "tags": [
-            {
-              "key": "host",
-              "operator": "=~",
-              "value": "/^$server$/"
-            }
-          ]
-        },
-        {
-          "alias": "CPU Time Nice: $tag_process_name",
-          "dsType": "influxdb",
-          "groupBy": [
-            {
-              "params": [
-                "$interval"
-              ],
-              "type": "time"
-            },
-            {
-              "params": [
-                "process_name"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "pidfile"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "null"
-              ],
-              "type": "fill"
-            }
-          ],
-          "hide": true,
-          "measurement": "procstat",
-          "orderByTime": "ASC",
-          "policy": "default",
-          "query": " SELECT mean(\"cpu_time_nice\") FROM \"procstat\" WHERE \"host\" =~ /^$server$/ AND $timeFilter GROUP BY \"process_name\",time($interval),host fill(null)",
-          "rawQuery": true,
-          "refId": "J",
-          "resultFormat": "time_series",
-          "select": [
-            [
-              {
-                "params": [
-                  "pid"
-                ],
-                "type": "field"
-              }
-            ]
-          ],
-          "tags": [
-            {
-              "key": "host",
-              "operator": "=~",
-              "value": "/^$server$/"
-            }
-          ]
-        },
-        {
-          "alias": "CPU Time Steal: $tag_process_name",
-          "dsType": "influxdb",
-          "groupBy": [
-            {
-              "params": [
-                "$interval"
-              ],
-              "type": "time"
-            },
-            {
-              "params": [
-                "process_name"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "pidfile"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "null"
-              ],
-              "type": "fill"
-            }
-          ],
-          "hide": true,
-          "measurement": "procstat",
-          "orderByTime": "ASC",
-          "policy": "default",
-          "query": " SELECT mean(\"cpu_time_steal\") FROM \"procstat\" WHERE \"host\" =~ /^$server$/ AND $timeFilter GROUP BY \"process_name\",time($interval),host fill(null)",
-          "rawQuery": true,
-          "refId": "K",
-          "resultFormat": "time_series",
-          "select": [
-            [
-              {
-                "params": [
-                  "pid"
-                ],
-                "type": "field"
-              }
-            ]
-          ],
-          "tags": [
-            {
-              "key": "host",
-              "operator": "=~",
-              "value": "/^$server$/"
-            }
-          ]
-        },
-        {
-          "alias": "CPU Time Stolen: $tag_process_name",
-          "dsType": "influxdb",
-          "groupBy": [
-            {
-              "params": [
-                "$interval"
-              ],
-              "type": "time"
-            },
-            {
-              "params": [
-                "process_name"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "pidfile"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "null"
-              ],
-              "type": "fill"
-            }
-          ],
-          "hide": true,
-          "measurement": "procstat",
-          "orderByTime": "ASC",
-          "policy": "default",
-          "query": " SELECT mean(\"cpu_time_stolen\") FROM \"procstat\" WHERE \"host\" =~ /^$server$/ AND $timeFilter GROUP BY \"process_name\",time($interval),host fill(null)",
-          "rawQuery": true,
-          "refId": "L",
-          "resultFormat": "time_series",
-          "select": [
-            [
-              {
-                "params": [
-                  "pid"
-                ],
-                "type": "field"
-              }
-            ]
-          ],
-          "tags": [
-            {
-              "key": "host",
-              "operator": "=~",
-              "value": "/^$server$/"
-            }
-          ]
-        },
-        {
-          "alias": "CPU Time Guest Nice: $tag_process_name",
-          "dsType": "influxdb",
-          "groupBy": [
-            {
-              "params": [
-                "$interval"
-              ],
-              "type": "time"
-            },
-            {
-              "params": [
-                "process_name"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "pidfile"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "null"
-              ],
-              "type": "fill"
-            }
-          ],
-          "hide": true,
-          "measurement": "procstat",
-          "orderByTime": "ASC",
-          "policy": "default",
-          "query": " SELECT mean(\"cpu_time_guest_nice\") FROM \"procstat\" WHERE \"host\" =~ /^$server$/ AND $timeFilter GROUP BY \"process_name\",time($interval),host fill(null)",
-          "rawQuery": true,
-          "refId": "M",
-          "resultFormat": "time_series",
-          "select": [
-            [
-              {
-                "params": [
-                  "pid"
-                ],
-                "type": "field"
-              }
-            ]
-          ],
-          "tags": [
-            {
-              "key": "host",
-              "operator": "=~",
-              "value": "/^$server$/"
-            }
-          ]
-        }
-      ],
-      "title": "Processes Stat Info",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${ds}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "stepAfter",
-            "lineWidth": 2,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "showValues": false,
-            "spanNulls": true,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "links": [],
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          },
-          "unit": "decbytes"
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byValue",
-              "options": {
-                "op": "gte",
-                "reducer": "allIsZero",
-                "value": 0
-              }
-            },
-            "properties": [
-              {
-                "id": "custom.hideFrom",
-                "value": {
-                  "legend": true,
-                  "tooltip": true,
-                  "viz": false
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byValue",
-              "options": {
-                "op": "gte",
-                "reducer": "allIsNull",
-                "value": 0
-              }
-            },
-            "properties": [
-              {
-                "id": "custom.hideFrom",
-                "value": {
-                  "legend": true,
-                  "tooltip": true,
-                  "viz": false
-                }
-              }
-            ]
-          }
-        ]
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 24,
-        "x": 0,
-        "y": 33
-      },
-      "id": 23,
-      "interval": "1s",
-      "options": {
-        "alertThreshold": true,
-        "legend": {
-          "calcs": [
-            "lastNotNull",
-            "max",
-            "min"
-          ],
-          "displayMode": "table",
-          "placement": "right",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "pluginVersion": "12.4.0",
-      "targets": [
-        {
-          "alias": "Memory VMS: $tag_process_name",
-          "dsType": "influxdb",
-          "groupBy": [
-            {
-              "params": [
-                "$interval"
-              ],
-              "type": "time"
-            },
-            {
-              "params": [
-                "process_name"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "pidfile"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "null"
-              ],
-              "type": "fill"
-            }
-          ],
-          "measurement": "procstat",
-          "orderByTime": "ASC",
-          "policy": "default",
-          "query": " SELECT mean(\"memory_vms\") FROM \"procstat\" WHERE \"host\" =~ /^$server$/ AND $timeFilter GROUP BY \"process_name\",time($interval) fill(null)",
-          "rawQuery": true,
-          "refId": "B",
-          "resultFormat": "time_series",
-          "select": [
-            [
-              {
-                "params": [
-                  "pid"
-                ],
-                "type": "field"
-              }
-            ]
-          ],
-          "tags": [
-            {
-              "key": "host",
-              "operator": "=~",
-              "value": "/^$server$/"
-            }
-          ]
-        },
-        {
-          "alias": "Memory RSS: $tag_process_name",
-          "dsType": "influxdb",
-          "groupBy": [
-            {
-              "params": [
-                "$interval"
-              ],
-              "type": "time"
-            },
-            {
-              "params": [
-                "process_name"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "pidfile"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "null"
-              ],
-              "type": "fill"
-            }
-          ],
-          "measurement": "procstat",
-          "orderByTime": "ASC",
-          "policy": "default",
-          "query": " SELECT mean(\"memory_rss\") FROM \"procstat\" WHERE \"host\" =~ /^$server$/ AND $timeFilter GROUP BY \"process_name\",time($interval) fill(null)",
-          "rawQuery": true,
-          "refId": "A",
-          "resultFormat": "time_series",
-          "select": [
-            [
-              {
-                "params": [
-                  "pid"
-                ],
-                "type": "field"
-              }
-            ]
-          ],
-          "tags": [
-            {
-              "key": "host",
-              "operator": "=~",
-              "value": "/^$server$/"
-            }
-          ]
-        },
-        {
-          "alias": "Memory SWAP: $tag_process_name",
-          "dsType": "influxdb",
-          "groupBy": [
-            {
-              "params": [
-                "$interval"
-              ],
-              "type": "time"
-            },
-            {
-              "params": [
-                "process_name"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "pidfile"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "null"
-              ],
-              "type": "fill"
-            }
-          ],
-          "measurement": "procstat",
-          "orderByTime": "ASC",
-          "policy": "default",
-          "query": " SELECT mean(\"memory_swap\") FROM \"procstat\" WHERE \"host\" =~ /^$server$/ AND $timeFilter GROUP BY \"process_name\",time($interval) fill(null)",
-          "rawQuery": true,
-          "refId": "C",
-          "resultFormat": "time_series",
-          "select": [
-            [
-              {
-                "params": [
-                  "pid"
-                ],
-                "type": "field"
-              }
-            ]
-          ],
-          "tags": [
-            {
-              "key": "host",
-              "operator": "=~",
-              "value": "/^$server$/"
-            }
-          ]
-        }
-      ],
-      "title": "Processes Stat Info Memory",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${ds}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "stepAfter",
-            "lineWidth": 2,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "showValues": false,
-            "spanNulls": true,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "links": [],
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          },
-          "unit": "bytes"
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byValue",
-              "options": {
-                "op": "gte",
-                "reducer": "allIsZero",
-                "value": 0
-              }
-            },
-            "properties": [
-              {
-                "id": "custom.hideFrom",
-                "value": {
-                  "legend": true,
-                  "tooltip": true,
-                  "viz": false
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byValue",
-              "options": {
-                "op": "gte",
-                "reducer": "allIsNull",
-                "value": 0
-              }
-            },
-            "properties": [
-              {
-                "id": "custom.hideFrom",
-                "value": {
-                  "legend": true,
-                  "tooltip": true,
-                  "viz": false
-                }
-              }
-            ]
-          }
-        ]
-      },
-      "gridPos": {
-        "h": 7,
-        "w": 24,
-        "x": 0,
-        "y": 41
-      },
-      "id": 24,
-      "interval": "1s",
-      "options": {
-        "alertThreshold": true,
-        "legend": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "displayMode": "table",
-          "placement": "right",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "pluginVersion": "12.4.0",
-      "targets": [
-        {
-          "alias": "Write Count: $tag_process_name",
-          "dsType": "influxdb",
-          "groupBy": [
-            {
-              "params": [
-                "$interval"
-              ],
-              "type": "time"
-            },
-            {
-              "params": [
-                "process_name"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "pidfile"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "null"
-              ],
-              "type": "fill"
-            }
-          ],
-          "measurement": "procstat",
-          "orderByTime": "ASC",
-          "policy": "default",
-          "query": " SELECT mean(\"write_count\") FROM \"procstat\" WHERE \"host\" =~ /^$server$/ AND $timeFilter GROUP BY \"process_name\",time($interval) fill(null)",
-          "rawQuery": true,
-          "refId": "B",
-          "resultFormat": "time_series",
-          "select": [
-            [
-              {
-                "params": [
-                  "pid"
-                ],
-                "type": "field"
-              }
-            ]
-          ],
-          "tags": [
-            {
-              "key": "host",
-              "operator": "=~",
-              "value": "/^$server$/"
-            }
-          ]
-        },
-        {
-          "alias": "Write Bytes: $tag_process_name",
-          "dsType": "influxdb",
-          "groupBy": [
-            {
-              "params": [
-                "$interval"
-              ],
-              "type": "time"
-            },
-            {
-              "params": [
-                "process_name"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "pidfile"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "null"
-              ],
-              "type": "fill"
-            }
-          ],
-          "measurement": "procstat",
-          "orderByTime": "ASC",
-          "policy": "default",
-          "query": " SELECT mean(\"write_bytes\") FROM \"procstat\" WHERE \"host\" =~ /^$server$/ AND $timeFilter GROUP BY \"process_name\",time($interval) fill(null)",
-          "rawQuery": true,
-          "refId": "A",
-          "resultFormat": "time_series",
-          "select": [
-            [
-              {
-                "params": [
-                  "pid"
-                ],
-                "type": "field"
-              }
-            ]
-          ],
-          "tags": [
-            {
-              "key": "host",
-              "operator": "=~",
-              "value": "/^$server$/"
-            }
-          ]
-        },
-        {
-          "alias": "Read Bytes: $tag_process_name",
-          "dsType": "influxdb",
-          "groupBy": [
-            {
-              "params": [
-                "$interval"
-              ],
-              "type": "time"
-            },
-            {
-              "params": [
-                "process_name"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "pidfile"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "null"
-              ],
-              "type": "fill"
-            }
-          ],
-          "measurement": "procstat",
-          "orderByTime": "ASC",
-          "policy": "default",
-          "query": " SELECT mean(\"read_bytes\") FROM \"procstat\" WHERE \"host\" =~ /^$server$/ AND $timeFilter GROUP BY \"process_name\",time($interval) fill(null)",
-          "rawQuery": true,
-          "refId": "C",
-          "resultFormat": "time_series",
-          "select": [
-            [
-              {
-                "params": [
-                  "pid"
-                ],
-                "type": "field"
-              }
-            ]
-          ],
-          "tags": [
-            {
-              "key": "host",
-              "operator": "=~",
-              "value": "/^$server$/"
-            }
-          ]
-        },
-        {
-          "alias": "Read Count: $tag_process_name",
-          "dsType": "influxdb",
-          "groupBy": [
-            {
-              "params": [
-                "$interval"
-              ],
-              "type": "time"
-            },
-            {
-              "params": [
-                "process_name"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "pidfile"
-              ],
-              "type": "tag"
-            },
-            {
-              "params": [
-                "null"
-              ],
-              "type": "fill"
-            }
-          ],
-          "measurement": "procstat",
-          "orderByTime": "ASC",
-          "policy": "default",
-          "query": " SELECT mean(\"read_count\") FROM \"procstat\" WHERE \"host\" =~ /^$server$/ AND $timeFilter GROUP BY \"process_name\",time($interval) fill(null)",
-          "rawQuery": true,
-          "refId": "D",
-          "resultFormat": "time_series",
-          "select": [
-            [
-              {
-                "params": [
-                  "pid"
-                ],
-                "type": "field"
-              }
-            ]
-          ],
-          "tags": [
-            {
-              "key": "host",
-              "operator": "=~",
-              "value": "/^$server$/"
-            }
-          ]
-        }
-      ],
-      "title": "Processes Stat Info Disk Usage",
-      "type": "timeseries"
-    },
-    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 48
+        "y": 25
       },
       "id": 35,
       "panels": [],
@@ -3307,7 +1809,7 @@
     {
       "datasource": {
         "type": "influxdb",
-        "uid": "${ds}"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -3371,7 +1873,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 49
+        "y": 26
       },
       "id": 17,
       "interval": "10s",
@@ -3393,19 +1895,19 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0",
+      "pluginVersion": "12.4.3",
       "targets": [
         {
           "alias": "$tag_host - $tag_name: $col",
           "datasource": {
             "type": "influxdb",
-            "uid": "${ds}"
+            "uid": "${datasource}"
           },
           "dsType": "influxdb",
           "groupBy": [
             {
               "params": [
-                "$interval"
+                "10s"
               ],
               "type": "time"
             },
@@ -3425,7 +1927,7 @@
           "measurement": "diskio",
           "orderByTime": "ASC",
           "policy": "default",
-          "query": "SELECT non_negative_derivative(mean(\"reads\"), 1s) AS \"Reads\", non_negative_derivative(mean(\"writes\"), 1s) AS \"Writes\" FROM \"diskio\" WHERE (\"host\" =~ /^$server$/) AND $timeFilter GROUP BY time($interval), \"host\", \"name\" fill(null)",
+          "query": "SELECT non_negative_derivative(mean(\"reads\"), 1s) AS \"Reads\", non_negative_derivative(mean(\"writes\"), 1s) AS \"Writes\" FROM \"diskio\" WHERE (\"host\" =~ /^$server$/) AND $timeFilter GROUP BY time(10s), \"host\", \"name\" fill(null)",
           "rawQuery": true,
           "refId": "A",
           "resultFormat": "time_series",
@@ -3494,7 +1996,7 @@
     {
       "datasource": {
         "type": "influxdb",
-        "uid": "${ds}"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -3558,10 +2060,10 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 49
+        "y": 26
       },
       "id": 38,
-      "interval": "1s",
+      "interval": "10s",
       "options": {
         "alertThreshold": true,
         "legend": {
@@ -3581,19 +2083,19 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0",
+      "pluginVersion": "12.4.3",
       "targets": [
         {
           "alias": "$tag_host - $tag_name: $col",
           "datasource": {
             "type": "influxdb",
-            "uid": "${ds}"
+            "uid": "${datasource}"
           },
           "dsType": "influxdb",
           "groupBy": [
             {
               "params": [
-                "$interval"
+                "10s"
               ],
               "type": "time"
             },
@@ -3613,7 +2115,7 @@
           "measurement": "diskio",
           "orderByTime": "ASC",
           "policy": "default",
-          "query": "SELECT non_negative_derivative(last(\"weighted_io_time\"), 1ms) as \"iops_in_progress\" from \"diskio\" WHERE   (\"host\" =~ /^$server$/) AND $timeFilter GROUP BY time($interval), \"host\", \"name\" fill(null)",
+          "query": "SELECT non_negative_derivative(last(\"weighted_io_time\"), 1ms) as \"iops_in_progress\" from \"diskio\" WHERE   (\"host\" =~ /^$server$/) AND $timeFilter GROUP BY time(10s), \"host\", \"name\" fill(null)",
           "rawQuery": true,
           "refId": "A",
           "resultFormat": "time_series",
@@ -3682,7 +2184,7 @@
     {
       "datasource": {
         "type": "influxdb",
-        "uid": "${ds}"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -3737,7 +2239,8 @@
                 "value": 80
               }
             ]
-          }
+          },
+          "unit": "bytes"
         },
         "overrides": []
       },
@@ -3745,10 +2248,10 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 56
+        "y": 33
       },
       "id": 18,
-      "interval": "1s",
+      "interval": "10s",
       "options": {
         "alertThreshold": true,
         "legend": {
@@ -3763,19 +2266,19 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0",
+      "pluginVersion": "12.4.3",
       "targets": [
         {
           "alias": "$tag_host- $tag_name: $col",
           "datasource": {
             "type": "influxdb",
-            "uid": "${ds}"
+            "uid": "${datasource}"
           },
           "dsType": "influxdb",
           "groupBy": [
             {
               "params": [
-                "$interval"
+                "10s"
               ],
               "type": "time"
             },
@@ -3795,7 +2298,7 @@
           "measurement": "diskio",
           "orderByTime": "ASC",
           "policy": "default",
-          "query": "SELECT non_negative_derivative(mean(\"read_bytes\"), 1s) AS \"Reads\", non_negative_derivative(mean(\"write_bytes\"), 1s) AS \"Writes\" FROM \"diskio\" WHERE \"host\" =~ /^$server$/ AND $timeFilter GROUP BY time($interval), \"host\", \"name\" fill(null)",
+          "query": "SELECT non_negative_derivative(mean(\"read_bytes\"), 1s) AS \"Reads\", non_negative_derivative(mean(\"write_bytes\"), 1s) AS \"Writes\" FROM \"diskio\" WHERE \"host\" =~ /^$server$/ AND $timeFilter GROUP BY time(10s), \"host\", \"name\" fill(null)",
           "rawQuery": true,
           "refId": "A",
           "resultFormat": "time_series",
@@ -3864,7 +2367,7 @@
     {
       "datasource": {
         "type": "influxdb",
-        "uid": "${ds}"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -3927,10 +2430,10 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 56
+        "y": 33
       },
       "id": 19,
-      "interval": "1s",
+      "interval": "10s",
       "options": {
         "alertThreshold": true,
         "legend": {
@@ -3945,19 +2448,19 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0",
+      "pluginVersion": "12.4.3",
       "targets": [
         {
           "alias": "$tag_host - $tag_name: $col",
           "datasource": {
             "type": "influxdb",
-            "uid": "${ds}"
+            "uid": "${datasource}"
           },
           "dsType": "influxdb",
           "groupBy": [
             {
               "params": [
-                "$interval"
+                "10s"
               ],
               "type": "time"
             },
@@ -4050,7 +2553,7 @@
     {
       "datasource": {
         "type": "influxdb",
-        "uid": "${ds}"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -4114,10 +2617,10 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 63
+        "y": 40
       },
       "id": 20,
-      "interval": "1s",
+      "interval": "10s",
       "options": {
         "alertThreshold": true,
         "legend": {
@@ -4132,7 +2635,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0",
+      "pluginVersion": "12.4.3",
       "targets": [
         {
           "alias": "$tag_host: $col ($tag_path)",
@@ -4140,7 +2643,7 @@
           "groupBy": [
             {
               "params": [
-                "$interval"
+                "10s"
               ],
               "type": "time"
             },
@@ -4239,7 +2742,7 @@
     {
       "datasource": {
         "type": "influxdb",
-        "uid": "${ds}"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -4302,10 +2805,10 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 63
+        "y": 40
       },
       "id": 21,
-      "interval": ">10s",
+      "interval": "10s",
       "options": {
         "alertThreshold": true,
         "legend": {
@@ -4320,7 +2823,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0",
+      "pluginVersion": "12.4.3",
       "targets": [
         {
           "alias": "$tag_host: $col",
@@ -4405,7 +2908,7 @@
     {
       "datasource": {
         "type": "influxdb",
-        "uid": "${ds}"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -4469,10 +2972,10 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 70
+        "y": 47
       },
       "id": 54,
-      "interval": "1s",
+      "interval": "10s",
       "options": {
         "legend": {
           "calcs": [
@@ -4491,19 +2994,19 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0",
+      "pluginVersion": "12.4.3",
       "targets": [
         {
           "alias": "$col - $tag_name",
           "datasource": {
             "type": "influxdb",
-            "uid": "${ds}"
+            "uid": "${datasource}"
           },
           "dsType": "influxdb",
           "groupBy": [
             {
               "params": [
-                "$interval"
+                "10s"
               ],
               "type": "time"
             },
@@ -4529,7 +3032,7 @@
           "measurement": "diskio",
           "orderByTime": "ASC",
           "policy": "default",
-          "query": "SELECT derivative(mean(\"io_time\"), 1ms) AS \"IO utilisation\" FROM \"diskio\" WHERE \"host\" =~ /^$server$/ AND $timeFilter GROUP BY time($__interval), \"name\", \"host\" fill(null)",
+          "query": "SELECT derivative(mean(\"io_time\"), 1ms) AS \"IO utilisation\" FROM \"diskio\" WHERE \"host\" =~ /^$server$/ AND $timeFilter GROUP BY time(10s), \"name\", \"host\" fill(null)",
           "rawQuery": true,
           "refId": "A",
           "resultFormat": "time_series",
@@ -4601,7 +3104,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 77
+        "y": 54
       },
       "id": 34,
       "panels": [],
@@ -4611,7 +3114,7 @@
     {
       "datasource": {
         "type": "influxdb",
-        "uid": "${ds}"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -4674,10 +3177,10 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 78
+        "y": 55
       },
       "id": 14,
-      "interval": "1s",
+      "interval": "10s",
       "options": {
         "alertThreshold": true,
         "legend": {
@@ -4692,7 +3195,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0",
+      "pluginVersion": "12.4.3",
       "targets": [
         {
           "alias": "$tag_host: $col",
@@ -4700,7 +3203,7 @@
           "groupBy": [
             {
               "params": [
-                "$interval"
+                "10s"
               ],
               "type": "time"
             },
@@ -4720,7 +3223,7 @@
           "measurement": "swap",
           "orderByTime": "ASC",
           "policy": "default",
-          "query": "SELECT non_negative_derivative(mean(\"in\"), 10s) AS \"in\", non_negative_derivative(mean(\"out\"), 10s) AS \"out\" FROM \"swap\" WHERE (\"host\" =~ /^$server$/) AND $timeFilter GROUP BY time($interval), \"host\" fill(null)",
+          "query": "SELECT non_negative_derivative(mean(\"in\"), 10s) AS \"in\", non_negative_derivative(mean(\"out\"), 10s) AS \"out\" FROM \"swap\" WHERE (\"host\" =~ /^$server$/) AND $timeFilter GROUP BY time(10s), \"host\" fill(null)",
           "rawQuery": true,
           "refId": "A",
           "resultFormat": "time_series",
@@ -4789,7 +3292,7 @@
     {
       "datasource": {
         "type": "influxdb",
-        "uid": "${ds}"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -4852,10 +3355,10 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 78
+        "y": 55
       },
       "id": 15,
-      "interval": "1s",
+      "interval": "10s",
       "options": {
         "alertThreshold": true,
         "legend": {
@@ -4870,7 +3373,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0",
+      "pluginVersion": "12.4.3",
       "targets": [
         {
           "alias": "$tag_host: $col",
@@ -4878,7 +3381,7 @@
           "groupBy": [
             {
               "params": [
-                "$interval"
+                "10s"
               ],
               "type": "time"
             },
@@ -4935,7 +3438,7 @@
     {
       "datasource": {
         "type": "influxdb",
-        "uid": "${ds}"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -4990,7 +3493,8 @@
                 "value": 80
               }
             ]
-          }
+          },
+          "unit": "bytes"
         },
         "overrides": []
       },
@@ -4998,10 +3502,10 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 78
+        "y": 55
       },
       "id": 16,
-      "interval": "30s",
+      "interval": "10s",
       "options": {
         "alertThreshold": true,
         "legend": {
@@ -5016,7 +3520,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0",
+      "pluginVersion": "12.4.3",
       "targets": [
         {
           "alias": "$tag_host: $col",
@@ -5024,7 +3528,7 @@
           "groupBy": [
             {
               "params": [
-                "$interval"
+                "10s"
               ],
               "type": "time"
             },
@@ -5120,7 +3624,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 85
+        "y": 62
       },
       "id": 32,
       "panels": [],
@@ -5130,7 +3634,7 @@
     {
       "datasource": {
         "type": "influxdb",
-        "uid": "${ds}"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -5207,10 +3711,10 @@
         "h": 10,
         "w": 12,
         "x": 0,
-        "y": 86
+        "y": 63
       },
       "id": 56,
-      "interval": "1s",
+      "interval": "10s",
       "options": {
         "legend": {
           "calcs": [
@@ -5228,19 +3732,19 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0",
+      "pluginVersion": "12.4.3",
       "targets": [
         {
           "alias": "$col ($tag_interface)",
           "datasource": {
             "type": "influxdb",
-            "uid": "000000162"
+            "uid": "${datasource}"
           },
           "dsType": "influxdb",
           "groupBy": [
             {
               "params": [
-                "$interval"
+                "10s"
               ],
               "type": "time"
             },
@@ -5266,7 +3770,7 @@
           "measurement": "net",
           "orderByTime": "ASC",
           "policy": "default",
-          "query": "SELECT derivative(first(bytes_recv), 1s) * 8 as \"in bits/sec\", derivative(first(bytes_sent), 1s) * 8 as \"out bits/sec\" FROM net WHERE host =~ /^$server$/ AND interface =~ /(vlan|eth|bond|vmbr|ens|eno|ixl|gb|enp).*/ AND interface !~ /veth/ AND $timeFilter GROUP BY time($__interval), \"host\", \"interface\" fill(null)",
+          "query": "SELECT derivative(first(bytes_recv), 1s) * 8 as \"in bits/sec\", derivative(first(bytes_sent), 1s) * 8 as \"out bits/sec\" FROM net WHERE host =~ /^$server$/ AND interface =~ /(vlan|eth|bond|vmbr|ens|eno|ixl|gb|enp).*/ AND interface !~ /veth/ AND $timeFilter GROUP BY time(10s), \"host\", \"interface\" fill(null)",
           "rawQuery": true,
           "refId": "A",
           "resultFormat": "time_series",
@@ -5353,7 +3857,7 @@
     {
       "datasource": {
         "type": "influxdb",
-        "uid": "${ds}"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -5430,10 +3934,10 @@
         "h": 10,
         "w": 12,
         "x": 12,
-        "y": 86
+        "y": 63
       },
       "id": 58,
-      "interval": "1s",
+      "interval": "10s",
       "options": {
         "legend": {
           "calcs": [
@@ -5451,19 +3955,19 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0",
+      "pluginVersion": "12.4.3",
       "targets": [
         {
           "alias": "$col ($tag_interface)",
           "datasource": {
             "type": "influxdb",
-            "uid": "000000162"
+            "uid": "${datasource}"
           },
           "dsType": "influxdb",
           "groupBy": [
             {
               "params": [
-                "$interval"
+                "10s"
               ],
               "type": "time"
             },
@@ -5489,7 +3993,7 @@
           "measurement": "net",
           "orderByTime": "ASC",
           "policy": "default",
-          "query": "SELECT NON_NEGATIVE_DIFFERENCE(mean(\"packets_recv\"))/10 AS \"in\", NON_NEGATIVE_DIFFERENCE(mean(\"packets_sent\"))/10 AS \"out\" FROM net WHERE host =~ /^$server$/ AND interface =~ /(vlan|eth|bond|vmbr|ens|eno|ix|gb|enp).*/ AND interface !~ /veth/ AND $timeFilter GROUP BY time($__interval), \"host\", \"interface\" fill(null)",
+          "query": "SELECT NON_NEGATIVE_DIFFERENCE(mean(\"packets_recv\"))/10 AS \"in\", NON_NEGATIVE_DIFFERENCE(mean(\"packets_sent\"))/10 AS \"out\" FROM net WHERE host =~ /^$server$/ AND interface =~ /(vlan|eth|bond|vmbr|ens|eno|ix|gb|enp).*/ AND interface !~ /veth/ AND $timeFilter GROUP BY time(10s), \"host\", \"interface\" fill(null)",
           "rawQuery": true,
           "refId": "A",
           "resultFormat": "time_series",
@@ -5576,7 +4080,7 @@
     {
       "datasource": {
         "type": "influxdb",
-        "uid": "${ds}"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -5639,10 +4143,10 @@
         "h": 7,
         "w": 24,
         "x": 0,
-        "y": 96
+        "y": 73
       },
       "id": 13,
-      "interval": "30s",
+      "interval": "10s",
       "options": {
         "alertThreshold": true,
         "legend": {
@@ -5657,7 +4161,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0",
+      "pluginVersion": "12.4.3",
       "targets": [
         {
           "alias": "$tag_host: $col",
@@ -5665,7 +4169,7 @@
           "groupBy": [
             {
               "params": [
-                "$interval"
+                "10s"
               ],
               "type": "time"
             },
@@ -5884,7 +4388,7 @@
     {
       "datasource": {
         "type": "influxdb",
-        "uid": "${ds}"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -5947,10 +4451,10 @@
         "h": 7,
         "w": 24,
         "x": 0,
-        "y": 103
+        "y": 80
       },
       "id": 52,
-      "interval": "30s",
+      "interval": "10s",
       "options": {
         "alertThreshold": true,
         "legend": {
@@ -5965,7 +4469,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0",
+      "pluginVersion": "12.4.3",
       "targets": [
         {
           "alias": "$tag_host: $col",
@@ -5973,7 +4477,7 @@
           "groupBy": [
             {
               "params": [
-                "$interval"
+                "10s"
               ],
               "type": "time"
             },
@@ -5993,7 +4497,7 @@
           "measurement": "netstat",
           "orderByTime": "ASC",
           "policy": "default",
-          "query": "SELECT mean(\"tcp_close\") AS \"CLOSED\", mean(\"tcp_close_wait\") AS \"CLOSE_WAIT\", mean(\"tcp_closing\") AS \"CLOSING\", mean(\"tcp_established\") AS \"ESTABLISHED\", mean(\"tcp_fin_wait1\") AS \"FIN_WAIT1\", mean(\"tcp_fin_wait2\") AS \"FIN_WAIT2\", mean(\"tcp_last_ack\") AS \"LAST_ACK\", mean(\"tcp_syn_recv\") AS \"SYN_RECV\", mean(\"tcp_syn_sent\") AS \"SYN_SENT\", mean(\"tcp_time_wait\") AS \"TIME_WAIT\" FROM \"netstat\" WHERE (\"host\" =~ /^$server$/) AND $timeFilter GROUP BY time($interval), \"host\" fill(null)",
+          "query": "SELECT mean(\"tcp_close\") AS \"CLOSED\", mean(\"tcp_close_wait\") AS \"CLOSE_WAIT\", mean(\"tcp_closing\") AS \"CLOSING\", mean(\"tcp_established\") AS \"ESTABLISHED\", mean(\"tcp_fin_wait1\") AS \"FIN_WAIT1\", mean(\"tcp_fin_wait2\") AS \"FIN_WAIT2\", mean(\"tcp_last_ack\") AS \"LAST_ACK\", mean(\"tcp_syn_recv\") AS \"SYN_RECV\", mean(\"tcp_syn_sent\") AS \"SYN_SENT\", mean(\"tcp_time_wait\") AS \"TIME_WAIT\" FROM \"netstat\" WHERE (\"host\" =~ /^$server$/) AND $timeFilter GROUP BY time(10s), \"host\" fill(null)",
           "rawQuery": false,
           "refId": "A",
           "resultFormat": "time_series",
@@ -6026,7 +4530,7 @@
     {
       "datasource": {
         "type": "influxdb",
-        "uid": "${ds}"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -6089,10 +4593,10 @@
         "h": 5,
         "w": 12,
         "x": 0,
-        "y": 110
+        "y": 87
       },
       "id": 12,
-      "interval": "1s",
+      "interval": "10s",
       "options": {
         "alertThreshold": true,
         "legend": {
@@ -6107,7 +4611,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0",
+      "pluginVersion": "12.4.3",
       "targets": [
         {
           "alias": "$tag_host: $col ($tag_interface)",
@@ -6115,7 +4619,7 @@
           "groupBy": [
             {
               "params": [
-                "$interval"
+                "10s"
               ],
               "type": "time"
             },
@@ -6141,7 +4645,7 @@
           "measurement": "net",
           "orderByTime": "ASC",
           "policy": "default",
-          "query": "SELECT mean(\"err_in\") AS \"Errors In\", mean(\"err_out\") AS \"Errors Out\" FROM net WHERE host =~ /^$server$/ AND interface =~ /(vlan|eth|bond|vmbr|ens|eno|ix|gb).*/ AND interface !~ /veth/ AND $timeFilter GROUP BY time($interval), \"host\", \"interface\" fill(null)",
+          "query": "SELECT mean(\"err_in\") AS \"Errors In\", mean(\"err_out\") AS \"Errors Out\" FROM net WHERE host =~ /^$server$/ AND interface =~ /(vlan|eth|bond|vmbr|ens|eno|ix|gb).*/ AND interface !~ /veth/ AND $timeFilter GROUP BY time(10s), \"host\", \"interface\" fill(null)",
           "rawQuery": true,
           "refId": "A",
           "resultFormat": "time_series",
@@ -6228,7 +4732,7 @@
     {
       "datasource": {
         "type": "influxdb",
-        "uid": "${ds}"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -6291,10 +4795,10 @@
         "h": 5,
         "w": 12,
         "x": 12,
-        "y": 110
+        "y": 87
       },
       "id": 11,
-      "interval": "1s",
+      "interval": "10s",
       "options": {
         "alertThreshold": true,
         "legend": {
@@ -6309,7 +4813,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0",
+      "pluginVersion": "12.4.3",
       "targets": [
         {
           "alias": "$tag_host: $col ($tag_interface)",
@@ -6317,7 +4821,7 @@
           "groupBy": [
             {
               "params": [
-                "$interval"
+                "10s"
               ],
               "type": "time"
             },
@@ -6343,7 +4847,7 @@
           "measurement": "net",
           "orderByTime": "ASC",
           "policy": "default",
-          "query": "SELECT mean(\"drop_in\") AS \"Drops In\", mean(\"drop_out\") AS \"Drops Out\" FROM net WHERE host =~ /^$server$/ AND interface =~ /(vlan|eth|bond|vmbr|ens|eno|ix|gb).*/ AND interface !~ /veth/ AND $timeFilter GROUP BY time($interval), \"host\", \"interface\" fill(null)",
+          "query": "SELECT mean(\"drop_in\") AS \"Drops In\", mean(\"drop_out\") AS \"Drops Out\" FROM net WHERE host =~ /^$server$/ AND interface =~ /(vlan|eth|bond|vmbr|ens|eno|ix|gb).*/ AND interface !~ /veth/ AND $timeFilter GROUP BY time(10s), \"host\", \"interface\" fill(null)",
           "rawQuery": true,
           "refId": "A",
           "resultFormat": "time_series",
@@ -6445,7 +4949,7 @@
         },
         "datasource": {
           "type": "influxdb",
-          "uid": "${ds}"
+          "uid": "${datasource}"
         },
         "definition": "SHOW TAG VALUES WITH KEY = \"host\"",
         "includeAll": true,
@@ -6468,7 +4972,7 @@
           "text": "HyperbyteDB",
           "value": "PB1A5486EEACB2DDB"
         },
-        "name": "ds",
+        "name": "datasource",
         "options": [],
         "query": "influxdb",
         "refresh": 1,
@@ -6478,7 +4982,7 @@
     ]
   },
   "time": {
-    "from": "now-1h",
+    "from": "now-30m",
     "to": "now"
   },
   "timepicker": {
@@ -6497,6 +5001,6 @@
   "timezone": "utc",
   "title": "Machine Monitoring",
   "uid": "JKqnZxQMk",
-  "version": 2,
+  "version": 4,
   "weekStart": ""
 }

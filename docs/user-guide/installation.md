@@ -50,35 +50,43 @@ The container stores all data under `/var/lib/hyperbytedb`. Mount a volume to pe
 
 ---
 
-## Docker Compose (Full Stack)
+## Docker Compose
 
-The included `docker-compose.yml` starts HyperbyteDB with a full local observability stack. Config files live under `deploy/compose/`.
+Two compose files are provided under `deploy/compose/`:
+
+| File | Use case |
+|------|----------|
+| `docker-compose.getting-started.yml` | Quick start — HyperbyteDB only, pre-built image, single command |
+| `../docker-compose.yml` (root) | Full observability stack — HyperbyteDB (local build), Prometheus, Grafana, Loki, Telegraf |
+
+### Quick start (pre-built image)
 
 ```bash
-git clone https://github.com/hyperbyte-cloud/hyperbytedb.git
-cd hyperbytedb
+docker compose -f deploy/compose/docker-compose.getting-started.yml up -d
+```
+
+This starts HyperbyteDB, Telegraf, Prometheus, Loki, and Grafana from pre-built images — no local compilation needed. Host metrics flow into HyperbyteDB via Telegraf, Prometheus scrapes `/metrics`, and Grafana comes pre-loaded with dashboards.
+
+Open Grafana at http://localhost:3000 (`admin` / `admin`) to explore.
+
+### Full observability stack (local build)
+
+The root `docker-compose.yml` builds HyperbyteDB from source and starts the full stack:
+
+```bash
 docker compose up --build -d
 ```
 
 | Service | Port | Description |
 |---------|------|-------------|
-| HyperbyteDB | 8086 | Time-series database (JSON logs + OTLP traces enabled) |
-| Alloy | 4318 | Docker log shipping → Loki; OTLP ingress → Tempo |
+| HyperbyteDB | 8086 | Time-series database (JSON logs) |
+| Alloy | 4318 | Docker log shipping → Loki |
 | Loki | 3100 | Log aggregation |
-| Tempo | 3200 | Distributed tracing (OTLP from HyperbyteDB) |
 | Telegraf | — | Collects host metrics and writes to HyperbyteDB |
 | Prometheus | 9090 | Scrapes HyperbyteDB `/metrics` |
 | Grafana | 3000 | Pre-provisioned dashboards (login: `admin`/`admin`) |
 
-Validate observability end-to-end:
-
-1. Open Grafana at http://localhost:3000 (admin/admin).
-2. **Metrics** — dashboard *HyperbyteDB Cluster* or Prometheus → `hyperbytedb_*` counters.
-3. **Logs** — Explore → Loki, query `{container=~".*hyperbytedb.*"}` or dashboard *HyperbyteDB Logs (Compose)*.
-4. **Traces** — Explore → Tempo, search `service.name=hyperbytedb` after running writes/queries below.
-5. **Statement summary** — `curl -s http://localhost:8086/api/v1/statements | jq .` (enabled in compose).
-
-Quick smoke test:
+### Smoke test (either compose file)
 
 ```bash
 # Create a database
@@ -282,7 +290,7 @@ The `deploy/kind/` directory contains a setup script and manifests for a local K
 
 This creates a kind cluster with:
 - HyperbyteDB operator and a multi-node `HyperbytedbCluster` CR
-- Observability stack (Prometheus, Grafana, Loki, Tempo, Telegraf)
+- Observability stack (Prometheus, Grafana, Loki, Telegraf)
 - NodePort services mapped to localhost ports
 
 For a single-node stack with full observability, use the root `docker-compose.yml` and configs under `deploy/compose/`.

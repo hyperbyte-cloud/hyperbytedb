@@ -85,7 +85,7 @@ impl ProxyConfig {
                 60,
             )? as u64),
             hold_timeout: Duration::from_secs(
-                env_u32("HYPERBYTEDB_PROXY_HOLD_TIMEOUT_SECS", 10)? as u64
+                env_u32("HYPERBYTEDB_PROXY_HOLD_TIMEOUT_SECS", 30)? as u64
             ),
             max_retries: env_u32("HYPERBYTEDB_PROXY_MAX_RETRIES", 2)?,
             shutdown_grace: Duration::from_secs(env_u32(

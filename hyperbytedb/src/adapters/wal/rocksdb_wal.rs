@@ -7,10 +7,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::application::system_trace;
+use crate::adapters::wal::arrow_cache::WalArrowCache;
+use crate::adapters::wal::wal_ipc;
 use crate::domain::point::Point;
+use crate::domain::prepared_wal::PreparedWalSlot;
 use crate::error::HyperbytedbError;
-use crate::ports::wal::{WalEntry, WalPort};
+use crate::ports::wal::{WalAppendBundle, WalEntry, WalFormat, WalPort};
 
 const WAL_CF: &str = "wal";
 const WAL_META_CF: &str = "wal_meta";
@@ -28,11 +30,36 @@ fn be_bytes_to_u64(bytes: &[u8]) -> u64 {
 
 pub struct RocksDbWal {
     db: Arc<DB>,
-    seq: AtomicU64,
+    seq: Arc<AtomicU64>,
+    arrow_cache: Arc<WalArrowCache>,
+    wal_format: WalFormat,
+    arrow_wal_enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RocksDbWalOptions {
+    pub wal_format: WalFormat,
+    pub arrow_wal_enabled: bool,
+}
+
+impl Default for RocksDbWalOptions {
+    fn default() -> Self {
+        Self {
+            wal_format: WalFormat::Bincode,
+            arrow_wal_enabled: true,
+        }
+    }
 }
 
 impl RocksDbWal {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, HyperbytedbError> {
+        Self::open_with_options(path, RocksDbWalOptions::default())
+    }
+
+    pub fn open_with_options<P: AsRef<Path>>(
+        path: P,
+        options: RocksDbWalOptions,
+    ) -> Result<Self, HyperbytedbError> {
         // The WAL is a sequential write/scan workload — point lookups are
         // rare and the data is short-lived (truncated as soon as it lands
         // in a parquet flush). A small block cache is sufficient because
@@ -169,8 +196,23 @@ impl RocksDbWal {
 
         Ok(Self {
             db,
-            seq: AtomicU64::new(seq),
+            seq: Arc::new(AtomicU64::new(seq)),
+            arrow_cache: Arc::new(WalArrowCache::new()),
+            wal_format: options.wal_format,
+            arrow_wal_enabled: options.arrow_wal_enabled,
         })
+    }
+
+    pub fn wal_format(&self) -> WalFormat {
+        self.wal_format
+    }
+
+    pub fn arrow_wal_enabled(&self) -> bool {
+        self.arrow_wal_enabled
+    }
+
+    pub fn arrow_cache(&self) -> Arc<WalArrowCache> {
+        Arc::clone(&self.arrow_cache)
     }
 
     /// Rewrite any WAL entries that predate the `origin_node_id` field.
@@ -207,6 +249,9 @@ impl RocksDbWal {
             if bincode::deserialize::<WalEntry>(&value).is_ok() {
                 continue;
             }
+            if value.len() >= 4 && &value[..4] == b"HBWA" {
+                continue;
+            }
 
             let legacy: LegacyWalEntry = bincode::deserialize(&value)
                 .map_err(|e| HyperbytedbError::Wal(format!("corrupt WAL entry: {e}")))?;
@@ -234,86 +279,166 @@ impl RocksDbWal {
         Ok(())
     }
 
-    /// Append multiple entries in a single RocksDB `WriteBatch` (group commit).
+    /// Synchronous group-commit append for the dedicated WAL writer thread.
+    pub fn append_batch_sync(&self, entries: Vec<WalEntry>) -> Result<Vec<u64>, HyperbytedbError> {
+        let bundles: Vec<WalAppendBundle> = entries
+            .into_iter()
+            .map(|entry| WalAppendBundle {
+                entry,
+                prepared: None,
+            })
+            .collect();
+        self.append_bundle_batch_sync(bundles)
+    }
+
+    /// Synchronous group-commit append with optional prepared Arrow slots.
+    pub fn append_bundle_batch_sync(
+        &self,
+        bundles: Vec<WalAppendBundle>,
+    ) -> Result<Vec<u64>, HyperbytedbError> {
+        let pre_encoded = vec![None; bundles.len()];
+        self.append_bundle_batch_sync_encoded(bundles, pre_encoded)
+    }
+
+    /// Like [`Self::append_bundle_batch_sync`] but with durable WAL values
+    /// pre-encoded off the writer thread — one `Option<Vec<u8>>` per bundle,
+    /// parallel to `bundles`. `None` entries are encoded inline as before.
     ///
-    /// Returns one sequence number per entry, in order.
-    pub async fn append_batch(&self, entries: Vec<WalEntry>) -> Result<Vec<u64>, HyperbytedbError> {
-        if entries.is_empty() {
-            return Ok(Vec::new());
+    /// Moving the (bincode) serialization onto the parallel request tasks keeps
+    /// the single group-commit writer from becoming a per-point serialization
+    /// bottleneck under high ingest concurrency.
+    pub fn append_bundle_batch_sync_encoded(
+        &self,
+        bundles: Vec<WalAppendBundle>,
+        pre_encoded: Vec<Option<Vec<u8>>>,
+    ) -> Result<Vec<u64>, HyperbytedbError> {
+        write_bundle_batch(
+            &self.db,
+            &self.seq,
+            &self.arrow_cache,
+            self.wal_format,
+            self.arrow_wal_enabled,
+            bundles,
+            pre_encoded,
+        )
+    }
+}
+
+fn write_bundle_batch(
+    db: &DB,
+    seq: &Arc<AtomicU64>,
+    arrow_cache: &WalArrowCache,
+    wal_format: WalFormat,
+    arrow_wal_enabled: bool,
+    mut bundles: Vec<WalAppendBundle>,
+    mut pre_encoded: Vec<Option<Vec<u8>>>,
+) -> Result<Vec<u64>, HyperbytedbError> {
+    if bundles.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let count = bundles.len() as u64;
+    let first_seq = seq.fetch_add(count, Ordering::Relaxed) + 1;
+    let wal_cf = db
+        .cf_handle(WAL_CF)
+        .ok_or_else(|| HyperbytedbError::Wal("wal column family not found".into()))?;
+
+    let mut wb = WriteBatch::default();
+    let mut seqs = Vec::with_capacity(bundles.len());
+    let mut prepared_slots = Vec::with_capacity(bundles.len());
+
+    for (i, bundle) in bundles.iter_mut().enumerate() {
+        let wal_seq = first_seq + i as u64;
+        if let Some(ref mut slot) = bundle.prepared {
+            slot.patch_all_ingest_seqs(wal_seq)?;
         }
 
-        let count = entries.len() as u64;
-        let first_seq = self.seq.fetch_add(count, Ordering::Relaxed) + 1;
-        let db = self.db.clone();
-
-        // NOTE: we intentionally no longer write `last_seq` to the wal_meta
-        // CF on every batch. On restart we recover the last assigned sequence
-        // by reading the tail of the WAL CF directly. The meta key is only
-        // refreshed by `truncate_before`, which covers the edge case of a
-        // fully-truncated WAL.
-        tokio::task::spawn_blocking(move || {
-            let wal_cf = db
-                .cf_handle(WAL_CF)
-                .ok_or_else(|| HyperbytedbError::Wal("wal column family not found".into()))?;
-
-            let mut wb = WriteBatch::default();
-            let mut seqs = Vec::with_capacity(entries.len());
-
-            for (i, entry) in entries.iter().enumerate() {
-                let seq = first_seq + i as u64;
-                let key = u64_to_be_bytes(seq);
-                let value = bincode::serialize(entry)?;
-                wb.put_cf(&wal_cf, key, value);
-                seqs.push(seq);
-            }
-
-            db.write(wb)
-                .map_err(|e| HyperbytedbError::Wal(e.to_string()))?;
-
-            Ok(seqs)
-        })
-        .await
-        .map_err(|e| HyperbytedbError::Wal(format!("WAL batch append task panicked: {e}")))?
+        // Prefer bytes serialized off the writer thread; fall back to encoding
+        // inline (e.g. ArrowIpc, whose payload depends on the assigned seq).
+        let value = match pre_encoded.get_mut(i).and_then(|slot| slot.take()) {
+            Some(bytes) => bytes,
+            None => wal_ipc::encode_wal_value(wal_format, bundle.prepared.as_ref(), &bundle.entry)?,
+        };
+        wb.put_cf(&wal_cf, u64_to_be_bytes(wal_seq), value);
+        seqs.push(wal_seq);
+        prepared_slots.push(bundle.prepared.take());
     }
+
+    db.write(wb)
+        .map_err(|e| HyperbytedbError::Wal(e.to_string()))?;
+
+    if arrow_wal_enabled {
+        for (wal_seq, slot) in seqs.iter().zip(prepared_slots) {
+            if let Some(slot) = slot {
+                arrow_cache.insert(*wal_seq, slot);
+            }
+        }
+    }
+
+    Ok(seqs)
 }
 
 #[async_trait]
 impl WalPort for RocksDbWal {
     async fn append(&self, entry: WalEntry) -> Result<u64, HyperbytedbError> {
-        let db = self.db.clone();
-        let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
-        let point_count = entry.points.len();
+        self.append_bundle(WalAppendBundle {
+            entry,
+            prepared: None,
+        })
+        .await
+    }
+
+    async fn append_bundle(&self, bundle: WalAppendBundle) -> Result<u64, HyperbytedbError> {
+        let db = Arc::clone(&self.db);
+        let seq = Arc::clone(&self.seq);
+        let arrow_cache = Arc::clone(&self.arrow_cache);
+        let wal_format = self.wal_format;
+        let arrow_wal_enabled = self.arrow_wal_enabled;
 
         let result = tokio::task::spawn_blocking(move || {
-            let serialize_start = std::time::Instant::now();
-            let wal_cf = db
-                .cf_handle(WAL_CF)
-                .ok_or_else(|| HyperbytedbError::Wal("wal column family not found".to_string()))?;
-
-            let key = u64_to_be_bytes(seq);
-            let value = bincode::serialize(&entry)?;
-            let serialize_us = serialize_start.elapsed().as_micros() as u64;
-
-            let write_start = std::time::Instant::now();
-            // Single-CF put — `last_seq` is now derived from the WAL CF tail
-            // on recovery (see `RocksDbWal::open`). Halves the puts per
-            // append on the hot path.
-            db.put_cf(&wal_cf, key, value)
-                .map_err(|e| HyperbytedbError::Wal(e.to_string()))?;
-            let write_us = write_start.elapsed().as_micros() as u64;
-
-            Ok::<_, HyperbytedbError>((seq, serialize_us, write_us))
+            write_bundle_batch(
+                &db,
+                &seq,
+                &arrow_cache,
+                wal_format,
+                arrow_wal_enabled,
+                vec![bundle],
+                vec![None],
+            )
         })
         .await
         .map_err(|e| HyperbytedbError::Wal(format!("WAL append task panicked: {e}")))?;
 
         match result {
-            Ok((seq, serialize_us, write_us)) => {
-                system_trace::log_wal_append(seq, point_count, serialize_us, write_us);
+            Ok(seqs) => {
+                let seq = *seqs.first().unwrap_or(&0);
                 Ok(seq)
             }
             Err(e) => Err(e),
         }
+    }
+
+    fn arrow_wal_enabled(&self) -> bool {
+        self.arrow_wal_enabled
+    }
+
+    async fn take_prepared_range(
+        &self,
+        from: u64,
+        to_inclusive: u64,
+        max_entries: usize,
+    ) -> Result<Option<Vec<(u64, PreparedWalSlot)>>, HyperbytedbError> {
+        if !self.arrow_wal_enabled {
+            return Ok(None);
+        }
+        Ok(self.arrow_cache.take_range(from, to_inclusive, max_entries))
+    }
+
+    async fn next_prepared_seq(&self, from: u64) -> Result<Option<u64>, HyperbytedbError> {
+        if !self.arrow_wal_enabled {
+            return Ok(None);
+        }
+        Ok(self.arrow_cache.next_seq_at_or_after(from))
     }
 
     async fn read_from(&self, sequence: u64) -> Result<Vec<(u64, WalEntry)>, HyperbytedbError> {
@@ -325,7 +450,12 @@ impl WalPort for RocksDbWal {
         from: u64,
         max_entries: usize,
     ) -> Result<Vec<(u64, WalEntry)>, HyperbytedbError> {
+        // RocksDB is the source of truth; reads always go to disk. (The former
+        // in-memory `WalMemoryCache` was removed: the prepared flush path uses
+        // the Arrow cache, never this, so it only ever grew unbounded while WAL
+        // truncation was held behind a lagging peer's replication ack.)
         let db = self.db.clone();
+        let wal_format = self.wal_format;
 
         tokio::task::spawn_blocking(move || {
             let wal_cf = db
@@ -344,7 +474,7 @@ impl WalPort for RocksDbWal {
                 }
                 let (key, value) = item.map_err(|e| HyperbytedbError::Wal(e.to_string()))?;
                 let seq = be_bytes_to_u64(&key);
-                let entry: WalEntry = bincode::deserialize(&value)?;
+                let (_, entry) = wal_ipc::decode_wal_value(wal_format, &value)?;
                 results.push((seq, entry));
             }
 
@@ -355,6 +485,7 @@ impl WalPort for RocksDbWal {
     }
 
     async fn truncate_before(&self, sequence: u64) -> Result<(), HyperbytedbError> {
+        self.arrow_cache.truncate_before(sequence);
         let db = self.db.clone();
         // Snapshot the high-water-mark *before* the delete so a fully-
         // truncated WAL CF can still recover the last assigned seq from

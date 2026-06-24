@@ -210,6 +210,12 @@ enum Commands {
         #[command(subcommand)]
         action: ClusterAction,
     },
+    /// Run raw ClickHouse SQL against chDB (admin; uses normal auth)
+    Chdb {
+        /// SQL to execute (append FORMAT TabSeparated or FORMAT JSONEachRow as needed)
+        #[arg(short = 'e', long = "execute", required = true)]
+        execute: String,
+    },
     /// Schema administration (InfluxDB v1-compatible shortcuts)
     Create {
         #[command(subcommand)]
@@ -504,6 +510,10 @@ async fn run_subcommand(
                 Ok(())
             }
         },
+        Commands::Chdb { execute } => {
+            println!("{}", client.chdb(&execute).await?);
+            Ok(())
+        }
         Commands::Create { target } => match target {
             CreateTarget::Database { name } => {
                 let session = build_session(cli, conn.clone());

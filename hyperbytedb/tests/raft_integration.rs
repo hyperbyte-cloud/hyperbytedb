@@ -9,7 +9,9 @@ use hyperbytedb::adapters::cluster::replication_log::ReplicationLog;
 use hyperbytedb::adapters::http::router::{AppState, build_router};
 use hyperbytedb::adapters::metadata::rocksdb_meta::RocksDbMetadata;
 use hyperbytedb::adapters::wal::rocksdb_wal::RocksDbWal;
+use hyperbytedb::application::flush_service::FlushServiceImpl;
 use hyperbytedb::application::ingest_metadata::IngestCardinalityLimits;
+use hyperbytedb::application::materialized_view_service::MaterializedViewService;
 use hyperbytedb::application::peer_ingestion_service::PeerIngestionService;
 use hyperbytedb::application::peer_query_service::PeerQueryService;
 use hyperbytedb::application::query_service::QueryServiceImpl;
@@ -22,31 +24,32 @@ use serial_test::serial;
 
 struct ClusterTestNode {
     url: String,
+    flush: Arc<FlushServiceImpl>,
     _handle: tokio::task::JoinHandle<()>,
 }
 
-async fn start_cluster_node(
+async fn start_cluster_node_with_listener(
     dir: &std::path::Path,
     node_id: u64,
-    peer_addrs: Vec<String>,
+    all_nodes: &[(u64, String)],
+    listener: tokio::net::TcpListener,
+    chdb: SharedSession,
 ) -> ClusterTestNode {
     let wal_dir = dir.join("wal");
     let meta_dir = dir.join("meta");
-    let chdb_dir = dir.join("chdb");
 
     std::fs::create_dir_all(&wal_dir).unwrap();
     std::fs::create_dir_all(&meta_dir).unwrap();
-    std::fs::create_dir_all(&chdb_dir).unwrap();
 
     let wal = Arc::new(RocksDbWal::open(&wal_dir).unwrap());
     let metadata = Arc::new(RocksDbMetadata::open(&meta_dir).unwrap());
-    let shared = SharedSession::new_eager(chdb_dir.to_str().unwrap()).unwrap();
+    let shared = chdb;
+    let chdb_path = shared.data_path().to_string();
     let chdb = Arc::new(ChdbQueryAdapter::from_shared(shared.clone(), 0));
     let sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(shared));
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let url = format!("http://{}", addr);
+    let listener_addr = listener.local_addr().unwrap();
+    let url = format!("http://{}", listener_addr);
 
     let repl_dir = dir.join("repl");
     std::fs::create_dir_all(&repl_dir).unwrap();
@@ -57,17 +60,9 @@ async fn start_cluster_node(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64;
-    membership.add_node(NodeInfo {
-        node_id,
-        addr: addr.to_string(),
-        state: NodeState::Active,
-        joined_at: now,
-        last_heartbeat: now,
-        needs_sync: false,
-    });
-    for (i, peer_addr) in peer_addrs.iter().enumerate() {
+    for (id, peer_addr) in all_nodes {
         membership.add_node(NodeInfo {
-            node_id: node_id + 1 + i as u64,
+            node_id: *id,
             addr: peer_addr.clone(),
             state: NodeState::Active,
             joined_at: now,
@@ -79,19 +74,25 @@ async fn start_cluster_node(
 
     let peer_client = Arc::new(PeerClient::new(
         node_id,
-        addr.to_string(),
+        listener_addr.to_string(),
         shared_membership.clone(),
-        replication_log,
+        replication_log.clone(),
         5,
         8192,
         8,
         8 * 1024 * 1024,
     ));
 
-    let replication_apply = Some(ReplicationApplyQueue::with_defaults(
+    let replication_apply = Some(ReplicationApplyQueue::with_workers_and_sink(
+        1024,
+        8,
         metadata.clone(),
         wal.clone(),
+        Some(sink.clone()),
+        IngestCardinalityLimits::default(),
     ));
+
+    let flush = Arc::new(FlushServiceImpl::new(wal.clone(), 0, sink.clone()));
 
     let base_query_service: Arc<dyn hyperbytedb::adapters::http::router::QueryService> =
         Arc::new(QueryServiceImpl::new(
@@ -112,7 +113,7 @@ async fn start_cluster_node(
         ));
 
     let query_service: Arc<dyn hyperbytedb::adapters::http::router::QueryService> = Arc::new(
-        PeerQueryService::new(base_query_service, peer_client.clone()),
+        PeerQueryService::new(base_query_service, metadata.clone(), peer_client.clone()),
     );
 
     let app_state = Arc::new(AppState {
@@ -121,19 +122,25 @@ async fn start_cluster_node(
         query_port: chdb.clone(),
         metadata: metadata.clone(),
         wal: wal.clone(),
+        points_sink: sink.clone(),
+        mv_service: Arc::new(MaterializedViewService::new(
+            metadata.clone(),
+            chdb.clone(),
+            sink.clone(),
+        )),
         auth: Arc::new(hyperbytedb::adapters::auth::MetadataAuthAdapter::new(
             metadata.clone(),
         )),
         peer_client: Some(peer_client),
         membership: Some(shared_membership),
-        replication_log: None,
+        replication_log: Some(replication_log),
         drain_service: None,
         raft: None,
         auth_enabled: false,
         prometheus_handle: None,
         statement_summary: None,
         replication_apply,
-        chdb_session_data_path: chdb_dir.to_string_lossy().into_owned(),
+        chdb_session_data_path: chdb_path,
         node_id,
         max_body_size_bytes: 25 * 1024 * 1024,
         request_timeout_secs: 30,
@@ -150,8 +157,26 @@ async fn start_cluster_node(
 
     ClusterTestNode {
         url,
+        flush,
         _handle: handle,
     }
+}
+
+async fn start_cluster_node(
+    dir: &std::path::Path,
+    node_id: u64,
+    peer_addrs: Vec<String>,
+) -> ClusterTestNode {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let self_addr = listener.local_addr().unwrap().to_string();
+    let mut all_nodes = vec![(node_id, self_addr)];
+    for (i, peer_addr) in peer_addrs.iter().enumerate() {
+        all_nodes.push((node_id + 1 + i as u64, peer_addr.clone()));
+    }
+    let chdb_dir = dir.join("chdb");
+    std::fs::create_dir_all(&chdb_dir).unwrap();
+    let chdb = SharedSession::new_eager(chdb_dir.to_str().unwrap(), 1).unwrap();
+    start_cluster_node_with_listener(dir, node_id, &all_nodes, listener, chdb).await
 }
 
 #[tokio::test]
@@ -179,6 +204,8 @@ async fn test_single_node_cluster_write() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    node.flush.flush().await.unwrap();
 
     // Verify data is visible in metadata
     let resp = client
@@ -263,7 +290,7 @@ async fn test_cluster_endpoints_without_peers() {
 
     let wal = Arc::new(RocksDbWal::open(&wal_dir).unwrap());
     let metadata = Arc::new(RocksDbMetadata::open(&meta_dir).unwrap());
-    let shared = SharedSession::new_eager(chdb_dir.to_str().unwrap()).unwrap();
+    let shared = SharedSession::new_eager(chdb_dir.to_str().unwrap(), 1).unwrap();
     let chdb = Arc::new(ChdbQueryAdapter::from_shared(shared.clone(), 0));
     let sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(shared));
 
@@ -275,9 +302,14 @@ async fn test_cluster_endpoints_without_peers() {
             10_000,
         ),
     );
-    let query_service: Arc<dyn hyperbytedb::adapters::http::router::QueryService> = Arc::new(
-        QueryServiceImpl::new(chdb.clone(), metadata.clone(), wal.clone(), 30, sink),
-    );
+    let query_service: Arc<dyn hyperbytedb::adapters::http::router::QueryService> =
+        Arc::new(QueryServiceImpl::new(
+            chdb.clone(),
+            metadata.clone(),
+            wal.clone(),
+            30,
+            sink.clone(),
+        ));
 
     let app_state = Arc::new(AppState {
         ingestion: ingestion_service,
@@ -285,6 +317,12 @@ async fn test_cluster_endpoints_without_peers() {
         query_port: chdb.clone(),
         metadata: metadata.clone(),
         wal,
+        points_sink: sink.clone(),
+        mv_service: Arc::new(MaterializedViewService::new(
+            metadata.clone(),
+            chdb.clone(),
+            sink.clone(),
+        )),
         auth: Arc::new(hyperbytedb::adapters::auth::MetadataAuthAdapter::new(
             metadata,
         )),
@@ -321,4 +359,115 @@ async fn test_cluster_endpoints_without_peers() {
         .await
         .unwrap();
     assert_ne!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn test_materialized_view_replicates_to_peer() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_a = dir.path().join("node_a");
+    let dir_b = dir.path().join("node_b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+
+    // libchdb is process-global; share one session across peers in this test.
+    let chdb_dir = dir.path().join("chdb-shared");
+    std::fs::create_dir_all(&chdb_dir).unwrap();
+    let chdb_shared = SharedSession::new_eager(chdb_dir.to_str().unwrap(), 1).unwrap();
+
+    let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap().to_string();
+    let addr_b = listener_b.local_addr().unwrap().to_string();
+    let nodes = [(1u64, addr_a.clone()), (2u64, addr_b.clone())];
+
+    let node_b =
+        start_cluster_node_with_listener(&dir_b, 2, &nodes, listener_b, chdb_shared.clone()).await;
+    let node_a = start_cluster_node_with_listener(&dir_a, 1, &nodes, listener_a, chdb_shared).await;
+
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{}/query", node_a.url))
+        .query(&[("q", "CREATE DATABASE mvdb")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+    let t1 = 1_700_000_000_000_000_000i64;
+    let t2 = t1 + 60_000_000_000;
+    let resp = client
+        .post(format!("{}/write", node_a.url))
+        .query(&[("db", "mvdb"), ("precision", "ns")])
+        .body(format!(
+            "cpu,host=h1 value=10 {t1}\ncpu,host=h1 value=20 {t2}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    node_a.flush.flush().await.unwrap();
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    node_b.flush.flush().await.unwrap();
+
+    let create_mv = r#"CREATE MATERIALIZED VIEW "mv_cpu_5m" ON "mvdb" AS SELECT mean("value") INTO "cpu_5m" FROM "cpu" GROUP BY time(5m), *"#;
+    let resp = client
+        .get(format!("{}/query", node_a.url))
+        .query(&[("q", create_mv), ("db", "mvdb")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.text().await.unwrap();
+    assert!(
+        !body.contains("\"error\":") || body.contains("\"error\":null"),
+        "create MV on node_a failed: {body}"
+    );
+
+    let mut peer_has_mv = false;
+    for _ in 0..50 {
+        let resp = client
+            .get(format!("{}/query", node_b.url))
+            .query(&[("q", "SHOW MATERIALIZED VIEWS"), ("db", "mvdb")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.text().await.unwrap();
+        if body.contains("mv_cpu_5m") {
+            peer_has_mv = true;
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+    assert!(peer_has_mv, "peer node_b did not receive MV metadata");
+
+    let chdb_sql = "SELECT name FROM system.tables WHERE database = 'default' AND name LIKE '%mv_cpu_5m%' FORMAT TabSeparated";
+    let mut peer_has_chdb_mv = false;
+    let mut last_chdb_body = String::new();
+    for _ in 0..50 {
+        let resp = client
+            .post(format!("{}/api/v1/chdb", node_b.url))
+            .json(&serde_json::json!({ "q": chdb_sql }))
+            .send()
+            .await
+            .unwrap();
+        if resp.status() == StatusCode::OK {
+            let body = resp.text().await.unwrap();
+            last_chdb_body = body.clone();
+            if body.contains("mv_cpu_5m") {
+                peer_has_chdb_mv = true;
+                break;
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        peer_has_chdb_mv,
+        "peer node_b missing chDB materialized view object (last body: {last_chdb_body})"
+    );
 }

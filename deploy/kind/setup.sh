@@ -356,26 +356,6 @@ deploy_alloy_logs() {
     kubectl apply -f "$MONITORING_MANIFESTS_DIR/alloy.yaml"
 }
 
-# Ensure the HyperbytedbCluster CR requests OTLP export (operator renders config.toml).
-configure_hyperbytedb_tracing_cr() {
-    if ! kubectl get hyperbytedbcluster hyperbytedb -n "$NAMESPACE" &>/dev/null; then
-        warn "HyperbytedbCluster/hyperbytedb not found — skipping tracing CR patch"
-        return 0
-    fi
-    log "Patching HyperbytedbCluster logging for OTLP → Alloy → Tempo"
-    kubectl patch hyperbytedbcluster hyperbytedb -n "$NAMESPACE" --type=merge -p '{
-      "spec": {
-        "logging": {
-          "level": "info",
-          "format": "json",
-          "detailedTrace": true,
-          "otlpEndpoint": "http://alloy-logs.hyperbytedb.svc:4318",
-          "otlpSampleRatio": "1.0"
-        }
-      }
-    }' 2>/dev/null || warn "CR patch failed (operator may need rebuild for new logging fields)"
-}
-
 verify_tempo_traces() {
     local count
     count=$(kubectl exec -n "$NAMESPACE" deploy/tempo -- \
@@ -588,7 +568,6 @@ cmd_up() {
     fi
 
     header "Waiting for workloads"
-    configure_hyperbytedb_tracing_cr
     wait_for_statefulset hyperbytedb 2 300
     verify_tempo_traces
     wait_for_rollout deployment kube-state-metrics 120s

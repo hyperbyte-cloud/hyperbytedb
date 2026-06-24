@@ -63,6 +63,39 @@ pub fn series_id(measurement: &str, tags: &BTreeMap<String, String>) -> u64 {
     h.finish()
 }
 
+/// ClickHouse `sipHash64` expression for a destination measurement's rolled-up
+/// series key from grouped tag column references (sorted by tag key name).
+///
+/// Used by materialized views that drop tags from the source series (e.g. omit
+/// `server_id`) so destination `series_id` values are distinct from the source.
+#[must_use]
+pub fn series_id_ch_sql(measurement: &str, sorted_tag_column_sql: &[String]) -> String {
+    let meas = measurement.replace('\\', "\\\\").replace('\'', "\\'");
+    let mut expr = format!("'{meas}'");
+    for col in sorted_tag_column_sql {
+        expr = format!("concat({expr}, char(255), toString({col}))");
+    }
+    format!("sipHash64({expr})")
+}
+
+/// Convenience wrapper: build [`series_id_ch_sql`] from logical tag keys and a
+/// table alias prefix (`s` → `s.`column``).
+#[must_use]
+pub fn series_id_ch_sql_for_tags(
+    measurement: &str,
+    grouped_tag_keys: &[String],
+    tag_column: impl Fn(&str) -> String,
+    table_alias: &str,
+) -> String {
+    let mut keys = grouped_tag_keys.to_vec();
+    keys.sort();
+    let cols: Vec<String> = keys
+        .iter()
+        .map(|k| format!("{table_alias}.{}", tag_column(k)))
+        .collect();
+    series_id_ch_sql(measurement, &cols)
+}
+
 /// Convenience wrapper computing [`series_id`] straight from a [`Point`]. `Point::tags`
 /// is already a sorted `BTreeMap`, so this is allocation-free.
 #[must_use]
@@ -104,5 +137,13 @@ mod tests {
             series_id("m", &tags(&[("ab", "c")])),
             series_id("m", &tags(&[("a", "bc")])),
         );
+    }
+
+    #[test]
+    fn series_id_ch_sql_uses_sip_hash_and_tag_columns() {
+        let sql = series_id_ch_sql("cpu_1m", &["s.\"host\"".to_string()]);
+        assert!(sql.starts_with("sipHash64("));
+        assert!(sql.contains("char(255)"));
+        assert!(sql.contains("s.\"host\""));
     }
 }

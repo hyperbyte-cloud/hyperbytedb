@@ -1,10 +1,12 @@
 //! Physical column naming: Influx allows the same identifier as a tag key and a field key.
 //! ClickHouse requires unique column names, so we rename tag columns when they collide.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 
 use crate::domain::measurement::MeasurementMeta;
+use crate::domain::rollup::{MeanRollupField, RollupCombine};
 
 /// Prefix for tag columns when the tag key collides with a field name.
 pub const TAG_COL_PREFIX: &str = "__tag__";
@@ -33,6 +35,8 @@ pub fn tag_col_name_for_columnar(tag_key: &str, field_name: &str) -> String {
 pub struct ColumnMapping {
     pub tag_keys: HashSet<String>,
     pub field_names: HashSet<String>,
+    pub field_rollups: HashMap<String, RollupCombine>,
+    pub mean_fields: HashMap<String, MeanRollupField>,
 }
 
 /// Fingerprint of measurement schema for query-side [`ColumnMapping`] cache invalidation.
@@ -50,6 +54,19 @@ pub fn measurement_meta_fingerprint(m: &MeasurementMeta) -> u64 {
     for k in tags {
         k.hash(&mut h);
     }
+    let mut rollups: Vec<_> = m.field_rollups.iter().collect();
+    rollups.sort_by_key(|(k, _)| *k);
+    for (k, v) in rollups {
+        k.hash(&mut h);
+        v.hash(&mut h);
+    }
+    let mut means: Vec<_> = m.mean_fields.iter().collect();
+    means.sort_by_key(|(k, _)| *k);
+    for (k, v) in means {
+        k.hash(&mut h);
+        v.sum_col.hash(&mut h);
+        v.count_col.hash(&mut h);
+    }
     h.finish()
 }
 
@@ -59,6 +76,8 @@ impl ColumnMapping {
         Self {
             tag_keys: m.tag_keys.iter().cloned().collect(),
             field_names: m.field_types.keys().cloned().collect(),
+            field_rollups: m.field_rollups.clone(),
+            mean_fields: m.mean_fields.clone(),
         }
     }
 

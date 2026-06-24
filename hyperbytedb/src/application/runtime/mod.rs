@@ -1,8 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-mod tracing_init;
-
 use crate::adapters::http::router::build_router;
 use crate::application::cluster::heartbeat;
 use crate::application::cluster::hinted_handoff;
@@ -14,9 +12,8 @@ use crate::bootstrap::build_services;
 use crate::config::{HyperbytedbConfig, RetentionConfig};
 use crate::domain::cluster::membership::NodeState;
 use crate::ports::metadata::MetadataPort;
+use crate::ports::points_sink::PointsSinkPort;
 use crate::ports::wal::WalPort;
-
-pub use tracing_init::{OtelGuard, init_tracing};
 
 pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
     let bootstrapped = build_services(&config).await?;
@@ -123,10 +120,15 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
     let raft_instance = if let Some(ref c) = cluster {
         let meta_port: Arc<dyn MetadataPort> = app_state.metadata.clone();
         let wal_port: Arc<dyn WalPort> = app_state.wal.clone();
-        c.run_startup_sync(&config.cluster, &meta_port, &wal_port)
+        let sink_port: Arc<dyn PointsSinkPort> = app_state.points_sink.clone();
+        c.run_startup_sync(&config.cluster, &meta_port, &wal_port, Some(sink_port))
             .await?;
-        c.start_raft(&config.cluster, app_state.metadata.clone())
-            .await
+        c.start_raft(
+            &config.cluster,
+            app_state.metadata.clone(),
+            app_state.mv_service.clone(),
+        )
+        .await
     } else {
         None
     };
@@ -134,6 +136,9 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
     // Wire Raft to PeerQueryService for consensus-based schema replication
     if let (Some(raft), Some(pqs)) = (&raft_instance, &peer_query_service_ref) {
         pqs.set_raft(raft.clone());
+        if let Some(m) = &membership {
+            pqs.set_membership(m.clone());
+        }
         tracing::info!("schema mutations will be routed through raft consensus");
     }
 

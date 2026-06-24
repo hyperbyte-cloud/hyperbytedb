@@ -70,32 +70,11 @@ Environment variable equivalents:
 ```bash
 HYPERBYTEDB__LOGGING__LEVEL=info
 HYPERBYTEDB__LOGGING__FORMAT=json
-HYPERBYTEDB__LOGGING__DETAILED_TRACE=true
 ```
-
-### Distributed tracing
-
-HyperbyteDB exports OpenTelemetry traces over OTLP HTTP when `logging.otlp_endpoint` is set. This is independent of `detailed_trace`: you can export sampled traces in production without enabling per-phase span creation on every request.
-
-| Setting | Purpose |
-|---------|---------|
-| `detailed_trace = true` | Creates spans on write, query, and flush paths |
-| `otlp_endpoint` | Collector URL (Tempo, Grafana Alloy, or any OTLP HTTP endpoint) |
-| `otlp_sample_ratio` | Export fraction (`1.0` = all traces; use `0.1` or lower under load) |
-
-Traces are tagged with `service.name=hyperbytedb` (override with `OTEL_SERVICE_NAME`).
-
-The root `docker-compose.yml` ships Alloy, Loki, Tempo, and Grafana with trace-to-log correlation preconfigured. After starting the stack:
-
-1. Open Grafana → **Explore** → **Tempo**.
-2. Search for `service.name=hyperbytedb`.
-3. Run a few writes and queries, then inspect span timings.
-
-See [Configuration](configuration.md#logging) for all logging keys.
 
 ### Statement summary
 
-When `statement_summary.enabled = true`, recently executed TimeseriesQL statements are available at `GET /api/v1/statements`. Each entry includes the normalized query text, digest, execution time, and error status. Useful for correlating slow queries with Tempo traces and Loki logs.
+When `statement_summary.enabled = true`, recently executed TimeseriesQL statements are available at `GET /api/v1/statements`. Each entry includes the normalized query text, digest, execution time, and error status.
 
 ### Health endpoint
 
@@ -195,7 +174,7 @@ HyperbyteDB runs several background services as Tokio tasks:
 | Service | Interval | Purpose |
 |---------|----------|---------|
 | Flush | `flush.interval_secs` (10s) | WAL → chDB MergeTree |
-| Retention | `retention.interval` (60s) | `ALTER TABLE … DELETE` for expired rows |
+| Retention | `retention.interval` (12h) | `ALTER TABLE … DELETE` for expired rows |
 | Continuous Query | 10s (fixed) | Execute CQ schedules |
 | Heartbeat | `heartbeat_interval_secs` (2s, cluster) | Peer liveness detection |
 | Leader sync monitor | 30s (cluster) | Compare peer manifests and trigger sync when needed |

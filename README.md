@@ -23,7 +23,7 @@ HyperbyteDB is a time-series database written in Rust that provides InfluxDB v1 
 - **Columnar MergeTree storage** — Per-measurement `ReplacingMergeTree`
 - **RocksDB WAL** — Durable write-ahead log and metadata
 - **Active-active clustering** — Raft for schema consensus; every node accepts writes with async or sync-quorum replication
-- **Built-in observability** — Prometheus metrics, structured logs, and OTLP trace export
+- **Built-in observability** — Prometheus metrics and structured logs
 
 ## Supported Platforms
 
@@ -42,23 +42,17 @@ Docker images at `ghcr.io/hyperbyte-cloud/hyperbytedb` are multi-arch manifests,
 
 For Docker, Compose, kind, and the Kubernetes operator, see [docs/user-guide/installation.md](docs/user-guide/installation.md).
 
-### Docker Compose
+### Docker Compose (quick start)
 
 ```bash
-docker compose up --build -d
+docker compose -f deploy/compose/docker-compose.getting-started.yml up -d
 ```
 
-This starts:
+This starts HyperbyteDB, Telegraf, Prometheus, Loki, and Grafana — pre-configured with host-metrics collection and dashboards.
 
-- **HyperbyteDB** on port 8086 (JSON logs + OTLP traces)
-- **Alloy** on port 4318 (log shipping and trace collection)
-- **Loki** on port 3100
-- **Tempo** on ports 3200 and 4317
-- **Telegraf** (host metrics into HyperbyteDB)
-- **Prometheus** on port 9090
-- **Grafana** on port 3000 (pre-provisioned dashboards)
+Open Grafana at http://localhost:3000 (`admin` / `admin`) and check the **HyperbyteDB Cluster** and **Machine Monitoring** dashboards.
 
-Open Grafana at http://localhost:3000 (`admin` / `admin`) to validate metrics, logs, and traces end-to-end.
+For the full stack (with local build, Alloy log shipping), see [docs/user-guide/installation.md](docs/user-guide/installation.md).
 
 ### CLI client
 

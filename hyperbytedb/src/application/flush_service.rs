@@ -5,10 +5,12 @@ use tokio::sync::Mutex;
 use tokio::sync::watch;
 
 use crate::adapters::cluster::replication_log::ReplicationLog;
-use crate::application::system_trace;
+
+use crate::domain::arrow_coalesce::coalesce_prepared_batches;
 use crate::domain::cluster::membership::SharedMembership;
 use crate::domain::point::Point;
 use crate::domain::point_coalesce::coalesce_points_and_origins;
+use crate::domain::prepared_wal::{PreparedMeasurementBatch, PreparedWalSlot};
 use crate::error::HyperbytedbError;
 use crate::ports::flush::FlushPort;
 use crate::ports::points_sink::PointsSinkPort;
@@ -56,6 +58,12 @@ struct FlushWork {
     points: Vec<Point>,
     /// Per-row `origin_node_id`, parallel to `points`.
     origins: Vec<u64>,
+}
+
+struct PreparedFlushWork {
+    db: String,
+    rp: String,
+    batch: PreparedMeasurementBatch,
 }
 
 impl FlushServiceImpl {
@@ -173,7 +181,14 @@ impl FlushServiceImpl {
         };
 
         if peer_ids.is_empty() {
-            return chunk_max_seq;
+            // Cluster replication is enabled but membership has not yet listed
+            // active peers (common during bootstrap). Truncating here would delete
+            // WAL entries before a joining node can pull them via /internal/sync/wal.
+            tracing::debug!(
+                chunk_max_seq = chunk_max_seq,
+                "replication enabled but no active peers in membership; holding WAL"
+            );
+            return chunk_max_seq.saturating_sub(MAX_WAL_RETENTION_ENTRIES);
         }
 
         // If this node has never originated any WAL entries (all data arrived
@@ -263,6 +278,132 @@ impl FlushServiceImpl {
         oldest_kept
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn flush_prepared_chunk(
+        &self,
+        prepared: Vec<(u64, PreparedWalSlot)>,
+        from_seq: u64,
+        cursor: &mut u64,
+        total_points_flushed: &mut u64,
+        total_entries_processed: &mut u64,
+    ) -> Result<(), HyperbytedbError> {
+        let chunk_entry_count = prepared.len();
+        let chunk_max_seq = prepared.iter().map(|(s, _)| *s).max().unwrap_or(*cursor);
+        for (seq, slot) in &prepared {
+            let origin = slot.origin_node_id;
+            if origin == self.node_id || (self.node_id > 0 && origin == 0) {
+                self.last_local_wal_seq
+                    .fetch_max(*seq, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        let prepare_start = std::time::Instant::now();
+        let mut by_meas: BTreeMap<(String, String, String), Vec<PreparedMeasurementBatch>> =
+            BTreeMap::new();
+        let mut chunk_point_count = 0usize;
+
+        for (_, slot) in prepared {
+            for m in slot.measurements {
+                chunk_point_count += m.row_count;
+                by_meas
+                    .entry((
+                        slot.database.clone(),
+                        slot.retention_policy.clone(),
+                        m.measurement.clone(),
+                    ))
+                    .or_default()
+                    .push(m);
+            }
+        }
+
+        tracing::debug!(
+            entries = chunk_entry_count,
+            points = chunk_point_count,
+            measurements = by_meas.len(),
+            from_seq = from_seq,
+            to_seq = chunk_max_seq,
+            path = "prepared",
+            "flushing prepared WAL chunk to chDB"
+        );
+
+        let mut work_items: Vec<PreparedFlushWork> = Vec::new();
+        for ((db, rp, measurement), batches) in by_meas {
+            let merged = if self.coalesce && batches.len() > 1 {
+                let coalesce_start = std::time::Instant::now();
+                let out = coalesce_prepared_batches(batches)?;
+                histogram!("hyperbytedb_flush_arrow_coalesce_seconds")
+                    .record(coalesce_start.elapsed().as_secs_f64());
+                out.into_iter().collect::<Vec<_>>()
+            } else if batches.len() == 1 {
+                batches
+            } else {
+                coalesce_prepared_batches(batches)?
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            };
+
+            for batch in merged {
+                let mut offset = 0usize;
+                while offset < batch.row_count {
+                    let take = (batch.row_count - offset).min(self.max_points_per_batch);
+                    let slice = slice_prepared_batch(&batch, offset, take);
+                    work_items.push(PreparedFlushWork {
+                        db: db.clone(),
+                        rp: rp.clone(),
+                        batch: slice,
+                    });
+                    offset += take;
+                }
+            }
+            let _ = measurement;
+        }
+
+        histogram!("hyperbytedb_flush_prepare_seconds", "path" => "prepared")
+            .record(prepare_start.elapsed().as_secs_f64());
+
+        let sink = self.sink.clone();
+        let mut handles = Vec::with_capacity(work_items.len());
+        for work in work_items {
+            let sink = sink.clone();
+            handles.push(tokio::spawn(async move {
+                let count = work.batch.row_count;
+                let _ack = sink
+                    .write_prepared_batch(&work.db, &work.rp, &work.batch)
+                    .await?;
+                counter!("hyperbytedb_native_rows_written_total", "path" => "prepared")
+                    .increment(count as u64);
+                Ok::<usize, HyperbytedbError>(count)
+            }));
+        }
+
+        let sink_start = std::time::Instant::now();
+        let mut chunk_points_written = 0u64;
+        for handle in handles {
+            chunk_points_written += handle.await.map_err(|e| {
+                HyperbytedbError::Internal(format!("prepared sink task panicked: {e}"))
+            })?? as u64;
+        }
+        histogram!("hyperbytedb_flush_sink_write_seconds", "path" => "prepared")
+            .record(sink_start.elapsed().as_secs_f64());
+
+        *total_points_flushed += chunk_points_written;
+
+        let safe_truncate_seq = self.compute_safe_truncate_seq(chunk_max_seq).await;
+        self.wal.truncate_before(safe_truncate_seq + 1).await?;
+        if let Some(ref rl) = self.replication_log
+            && let Ok(Some(min_mut_ack)) = rl.min_mutation_ack()
+            && let Err(e) = rl.truncate_mutations_before(min_mut_ack)
+        {
+            tracing::warn!(error = %e, "failed to truncate mutation log");
+        }
+
+        *self.last_flushed.lock().await = chunk_max_seq;
+        *cursor = chunk_max_seq;
+        *total_entries_processed += chunk_entry_count as u64;
+
+        Ok(())
+    }
+
     /// Force an immediate full WAL flush for graceful shutdown / drain.
     /// Blocks until all WAL entries are flushed.
     pub async fn drain(&self) -> Result<(), HyperbytedbError> {
@@ -290,15 +431,45 @@ impl FlushServiceImpl {
             return Ok(());
         }
 
-        let run_span = system_trace::flush_run_span(snapshot_seq, cursor);
-        let run_start = system_trace::start_timer();
-
         loop {
-            let chunk_start = system_trace::start_timer();
             let from_seq = cursor + 1;
 
             let wal_read_start = std::time::Instant::now();
-            let entries = self.wal.read_range(from_seq, WAL_READ_CHUNK).await?;
+            // Bound the native read so a gap in the prepared cache (an entry
+            // with no prepared slot — e.g. a peer WAL catch-up append) does not
+            // swallow the prepared slots that follow it onto the native path.
+            let mut native_limit = WAL_READ_CHUNK;
+            if self.wal.arrow_wal_enabled() {
+                // `take_prepared_range` is bounded by `snapshot_seq`, so the run
+                // it returns is already within the flush window and slots for
+                // writes that arrived mid-flush stay cached for the next flush.
+                if let Some(prepared) = self
+                    .wal
+                    .take_prepared_range(from_seq, snapshot_seq, WAL_READ_CHUNK)
+                    .await?
+                {
+                    if !prepared.is_empty() {
+                        let wal_read_elapsed = wal_read_start.elapsed();
+                        histogram!("hyperbytedb_flush_wal_read_seconds")
+                            .record(wal_read_elapsed.as_secs_f64());
+                        self.flush_prepared_chunk(
+                            prepared,
+                            from_seq,
+                            &mut cursor,
+                            &mut total_points_flushed,
+                            &mut total_entries_processed,
+                        )
+                        .await?;
+                        continue;
+                    }
+                } else if let Some(next) = self.wal.next_prepared_seq(from_seq).await?
+                    && next > from_seq
+                {
+                    native_limit = ((next - from_seq) as usize).min(WAL_READ_CHUNK);
+                }
+            }
+
+            let entries = self.wal.read_range(from_seq, native_limit).await?;
             let wal_read_elapsed = wal_read_start.elapsed();
             histogram!("hyperbytedb_flush_wal_read_seconds").record(wal_read_elapsed.as_secs_f64());
             if entries.is_empty() {
@@ -315,11 +486,6 @@ impl FlushServiceImpl {
 
             let chunk_entry_count = entries.len();
             let chunk_max_seq = entries.iter().map(|(s, _)| *s).max().unwrap_or(cursor);
-            let chunk_span = system_trace::flush_chunk_span(from_seq, chunk_max_seq);
-            let _chunk_guard = chunk_span.enter();
-
-            system_trace::record_phase("wal_read_us", wal_read_elapsed);
-
             let prepare_start = std::time::Instant::now();
             // Group by (db, rp, measurement) only. `origin_node_id` is carried
             // per-row (parallel to points) rather than being part of the key,
@@ -349,7 +515,7 @@ impl FlushServiceImpl {
                 }
             }
 
-            tracing::info!(
+            tracing::debug!(
                 entries = chunk_entry_count,
                 points = chunk_point_count,
                 measurements = by_meas.len(),
@@ -358,7 +524,6 @@ impl FlushServiceImpl {
                 "flushing WAL chunk to chDB"
             );
 
-            let measurement_count = by_meas.len();
             let mut work_items: Vec<FlushWork> = Vec::new();
             for ((db, rp, measurement), (mut points, mut origins)) in by_meas {
                 // Telegraf / columnar writers often emit several lines that share
@@ -375,7 +540,6 @@ impl FlushServiceImpl {
                     }
                     histogram!("hyperbytedb_flush_coalesce_points_seconds")
                         .record(coalesced_start.elapsed().as_secs_f64());
-                    system_trace::record_phase("coalesce_us", coalesced_start.elapsed());
                 }
                 // No Rust-side sort: chDB re-sorts every inserted block by the
                 // table's ORDER BY (tags, time) key, so a time-only pre-sort here
@@ -399,12 +563,6 @@ impl FlushServiceImpl {
 
             histogram!("hyperbytedb_flush_prepare_seconds")
                 .record(prepare_start.elapsed().as_secs_f64());
-            system_trace::record_phase("prepare_us", prepare_start.elapsed());
-            system_trace::record_u64("entries", chunk_entry_count as u64);
-            system_trace::record_u64("points", chunk_point_count as u64);
-            system_trace::record_u64("measurements", measurement_count as u64);
-            system_trace::record_u64("batches", work_items.len() as u64);
-
             let sink = self.sink.clone();
             let mut handles = Vec::with_capacity(work_items.len());
             let chunk_min_seq = from_seq;
@@ -413,7 +571,7 @@ impl FlushServiceImpl {
                 let ingest_seq_base = chunk_min_seq.saturating_add(idx as u64);
                 handles.push(tokio::spawn(async move {
                     let count = work.points.len();
-                    tracing::info!(
+                    tracing::debug!(
                         db = %work.db,
                         rp = %work.rp,
                         measurement = %work.measurement,
@@ -430,7 +588,8 @@ impl FlushServiceImpl {
                             &work.points,
                         )
                         .await?;
-                    counter!("hyperbytedb_native_rows_written_total").increment(count as u64);
+                    counter!("hyperbytedb_native_rows_written_total", "path" => "native")
+                        .increment(count as u64);
                     Ok::<usize, HyperbytedbError>(count)
                 }));
             }
@@ -444,17 +603,11 @@ impl FlushServiceImpl {
             }
             histogram!("hyperbytedb_flush_sink_write_seconds")
                 .record(sink_start.elapsed().as_secs_f64());
-            system_trace::record_phase("sink_write_us", sink_start.elapsed());
-
             total_points_flushed += chunk_points_written;
 
-            let truncate_start = std::time::Instant::now();
             let safe_truncate_seq = self.compute_safe_truncate_seq(chunk_max_seq).await;
 
             self.wal.truncate_before(safe_truncate_seq + 1).await?;
-            system_trace::record_phase("truncate_us", truncate_start.elapsed());
-            system_trace::record_u64("safe_truncate_seq", safe_truncate_seq);
-
             if let Some(ref rl) = self.replication_log
                 && let Ok(Some(min_mut_ack)) = rl.min_mutation_ack()
                 && let Err(e) = rl.truncate_mutations_before(min_mut_ack)
@@ -465,8 +618,6 @@ impl FlushServiceImpl {
             *self.last_flushed.lock().await = chunk_max_seq;
             cursor = chunk_max_seq;
             total_entries_processed += chunk_entry_count as u64;
-
-            system_trace::finish_span(&chunk_span, chunk_start, "flush chunk complete");
         }
 
         if total_entries_processed > 0 {
@@ -474,12 +625,7 @@ impl FlushServiceImpl {
             histogram!("hyperbytedb_flush_duration_seconds").record(elapsed.as_secs_f64());
             counter!("hyperbytedb_flush_points_total").increment(total_points_flushed);
             counter!("hyperbytedb_flush_runs_total").increment(1);
-            if system_trace::is_enabled() {
-                run_span.record("entries", total_entries_processed);
-                run_span.record("points", total_points_flushed);
-            }
-            system_trace::finish_span(&run_span, run_start, "flush run complete");
-            tracing::info!(
+            tracing::debug!(
                 entries = total_entries_processed,
                 points = total_points_flushed,
                 elapsed_ms = elapsed.as_millis() as u64,
@@ -489,6 +635,30 @@ impl FlushServiceImpl {
         gauge!("hyperbytedb_wal_last_sequence").set(*self.last_flushed.lock().await as f64);
 
         Ok(())
+    }
+}
+
+fn slice_prepared_batch(
+    batch: &PreparedMeasurementBatch,
+    offset: usize,
+    len: usize,
+) -> PreparedMeasurementBatch {
+    use std::sync::Arc;
+
+    let sliced = batch.batch.slice(offset, len);
+    PreparedMeasurementBatch {
+        measurement: batch.measurement.clone(),
+        table_name: batch.table_name.clone(),
+        series_table_name: batch.series_table_name.clone(),
+        batch: Arc::new(sliced),
+        row_count: len,
+        min_time: batch.min_time,
+        max_time: batch.max_time,
+        new_series_batch: if offset == 0 {
+            batch.new_series_batch.clone()
+        } else {
+            None
+        },
     }
 }
 

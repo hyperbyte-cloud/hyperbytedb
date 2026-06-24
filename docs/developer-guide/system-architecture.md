@@ -415,33 +415,22 @@ HyperbyteDB uses **chDB** (embedded ClickHouse) as its query engine and storage 
 
 ### Session management
 
-`chDB::Session` is:
-- `Send` but not `Sync` — requires `Mutex` wrapping.
-- **Synchronous** — all calls block the thread, so they must run in `spawn_blocking`.
+Each chDB `Connection` is `Send` but not `Sync`. HyperbyteDB keeps a pool of connections to the same `session_data_path` (see `ChdbConnectionPool` in `adapters/chdb/connection_pool.rs`). Queries and inserts run in `spawn_blocking`, checking out one connection per task.
 
-### Single session (`pool_size = 1`)
+### Single connection (`pool_size = 1`)
 
-```rust
-struct ChdbQueryAdapter {
-    session: Arc<Mutex<Session>>,
-}
-```
+One connection: all chDB work serializes on that client's mutex (legacy / minimal footprint).
 
-Each query:
-1. Clones the `Arc<Mutex<Session>>`.
-2. `spawn_blocking` → `blocking_lock()` → `session.execute(sql, JSONEachRow)`.
-3. Returns the UTF-8 result string.
-
-### Session pool (`pool_size > 1`)
+### Connection pool (`pool_size > 1`)
 
 ```rust
-struct ChdbPool {
-    sessions: Vec<Arc<Mutex<Session>>>,
+struct ChdbConnectionPool {
+    slots: Vec<Mutex<Connection>>,  // same --path for every slot
     next: AtomicUsize,
 }
 ```
 
-Round-robin assignment. Each session has its own `session_data_path` subdirectory (`{base}/pool_{i}`). Multiple sessions allow concurrent queries without contending on a single Mutex.
+Round-robin checkout with `try_lock` on busy slots. Multiple connections share one process-global `EmbeddedServer` for the data path; each connection gets an independent `ChdbClient` mutex, so concurrent flush inserts and queries can overlap.
 
 ### Output format
 
@@ -648,7 +637,7 @@ The internal alias `__time` avoids collision with the raw `time` column. It's re
 
 ## 14. Retention Enforcement
 
-The `RetentionService` runs every 60 seconds:
+The `RetentionService` runs on a configurable interval (default 12 hours):
 
 1. Lists all databases from metadata.
 2. For each database, iterates retention policies.

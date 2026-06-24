@@ -189,7 +189,12 @@ pub async fn handle_replicate_mutation(
         );
     }
 
-    let result = apply_mutation(&state.metadata, req.mutation).await;
+    let result = apply_mutation(
+        &state.metadata,
+        Some(state.mv_service.as_ref()),
+        req.mutation,
+    )
+    .await;
 
     match result {
         Ok(()) => (
@@ -456,62 +461,11 @@ pub async fn handle_drain(State(state): State<Arc<AppState>>) -> impl IntoRespon
 
 async fn apply_mutation(
     metadata: &Arc<dyn MetadataPort>,
+    mv_service: Option<&crate::application::materialized_view_service::MaterializedViewService>,
     req: MutationRequest,
 ) -> Result<(), crate::error::HyperbytedbError> {
-    match req {
-        MutationRequest::CreateDatabase(name) => metadata.create_database(&name).await,
-        MutationRequest::DropDatabase(name) => metadata.drop_database(&name).await,
-        MutationRequest::CreateRetentionPolicy { db, rp } => {
-            metadata.create_retention_policy(&db, rp).await
-        }
-        MutationRequest::DropRetentionPolicy { db, name } => {
-            metadata.drop_retention_policy(&db, &name).await
-        }
-        MutationRequest::CreateUser {
-            username,
-            password_hash,
-            admin,
-        } => metadata.create_user(&username, &password_hash, admin).await,
-        MutationRequest::DropUser(username) => metadata.drop_user(&username).await,
-        MutationRequest::SetPassword {
-            username,
-            password_hash,
-        } => metadata.create_user(&username, &password_hash, false).await,
-        MutationRequest::Delete {
-            database,
-            measurement,
-            predicate_sql,
-        } => {
-            metadata
-                .store_tombstone(&database, &measurement, &predicate_sql)
-                .await?;
-            Ok(())
-        }
-        MutationRequest::CreateContinuousQuery {
-            database,
-            name,
-            definition,
-        } => {
-            metadata
-                .store_continuous_query(&database, &name, &definition)
-                .await
-        }
-        MutationRequest::DropContinuousQuery { database, name } => {
-            metadata.drop_continuous_query(&database, &name).await
-        }
-        MutationRequest::CreateMaterializedView {
-            database,
-            name,
-            definition,
-        } => {
-            metadata
-                .store_materialized_view(&database, &name, &definition)
-                .await
-        }
-        MutationRequest::DropMaterializedView { database, name } => {
-            metadata.drop_materialized_view(&database, &name).await
-        }
-    }
+    crate::application::schema_mutation_apply::apply_schema_mutation(metadata, mv_service, req)
+        .await
 }
 
 async fn build_metadata_snapshot(
@@ -617,6 +571,8 @@ pub async fn handle_sync_trigger(State(state): State<Arc<AppState>>) -> impl Int
 
     let metadata = state.metadata.clone();
     let wal = state.wal.clone();
+    let points_sink = state.points_sink.clone();
+    let mv_service = state.mv_service.clone();
 
     let membership_clone = membership.clone();
 
@@ -629,7 +585,7 @@ pub async fn handle_sync_trigger(State(state): State<Arc<AppState>>) -> impl Int
     };
 
     tokio::spawn(async move {
-        let sync_client = crate::adapters::cluster::sync_client::SyncClient::new(
+        let sync_client = crate::adapters::cluster::sync_client::SyncClient::with_points_sink(
             node_id,
             {
                 let m = membership_clone.read().await;
@@ -640,6 +596,7 @@ pub async fn handle_sync_trigger(State(state): State<Arc<AppState>>) -> impl Int
             membership_clone.clone(),
             metadata.clone(),
             wal.clone(),
+            Some(points_sink),
             fallback_peers,
         );
 
@@ -664,7 +621,15 @@ pub async fn handle_sync_trigger(State(state): State<Arc<AppState>>) -> impl Int
         };
 
         match result {
-            Ok(_) => tracing::info!("sync trigger: completed successfully"),
+            Ok(_) => {
+                if let Err(e) = mv_service.reconcile_all().await {
+                    tracing::warn!(
+                        error = %e,
+                        "sync trigger: materialized view reconcile failed"
+                    );
+                }
+                tracing::info!("sync trigger: completed successfully");
+            }
             Err(e) => tracing::error!(error = %e, "sync trigger: sync failed"),
         }
 

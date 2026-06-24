@@ -29,6 +29,7 @@ use hyperbytedb::adapters::http::router::{AppState, build_router};
 use hyperbytedb::adapters::metadata::rocksdb_meta::RocksDbMetadata;
 use hyperbytedb::adapters::wal::rocksdb_wal::RocksDbWal;
 use hyperbytedb::application::ingest_metadata::IngestCardinalityLimits;
+use hyperbytedb::application::materialized_view_service::MaterializedViewService;
 use hyperbytedb::application::peer_ingestion_service::PeerIngestionService;
 use hyperbytedb::application::peer_query_service::PeerQueryService;
 use hyperbytedb::application::query_service::QueryServiceImpl;
@@ -153,8 +154,9 @@ async fn start_node_on(
             replication,
         ));
 
-    let query: Arc<dyn hyperbytedb::adapters::http::router::QueryService> =
-        Arc::new(PeerQueryService::new(base_query, peer_client.clone()));
+    let query: Arc<dyn hyperbytedb::adapters::http::router::QueryService> = Arc::new(
+        PeerQueryService::new(base_query, metadata.clone(), peer_client.clone()),
+    );
 
     let app_state = Arc::new(AppState {
         ingestion,
@@ -162,6 +164,12 @@ async fn start_node_on(
         query_port: chdb.clone(),
         metadata: metadata.clone(),
         wal: wal.clone(),
+        points_sink: sink.clone(),
+        mv_service: Arc::new(MaterializedViewService::new(
+            metadata.clone(),
+            chdb.clone(),
+            sink.clone(),
+        )),
         auth: Arc::new(hyperbytedb::adapters::auth::MetadataAuthAdapter::new(
             metadata.clone(),
         )),
@@ -215,7 +223,7 @@ async fn start_three_node_cluster(
     // are alive — share one SharedSession across all peers in this process.
     let chdb_dir = dir.join("chdb-shared");
     std::fs::create_dir_all(&chdb_dir).unwrap();
-    let chdb_shared = SharedSession::new_eager(chdb_dir.to_str().unwrap()).unwrap();
+    let chdb_shared = SharedSession::new_eager(chdb_dir.to_str().unwrap(), 1).unwrap();
 
     let l1 = bind_ephemeral().await;
     let l2 = bind_ephemeral().await;
@@ -293,7 +301,7 @@ async fn start_solo_node(
 ) -> TestNode {
     let chdb_dir = dir.join(format!("chdb-{node_id}"));
     std::fs::create_dir_all(&chdb_dir).unwrap();
-    let chdb = SharedSession::new_eager(chdb_dir.to_str().unwrap()).unwrap();
+    let chdb = SharedSession::new_eager(chdb_dir.to_str().unwrap(), 1).unwrap();
     let listener = bind_ephemeral().await;
     start_node_on(dir, node_id, listener, peers, replication, chdb).await
 }

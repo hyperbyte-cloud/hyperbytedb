@@ -2249,6 +2249,20 @@
           "legendFormat": "{{instance}} - sink build SQL p99",
           "range": true,
           "refId": "M"
+        },
+        {
+          "editorMode": "code",
+          "expr": "hyperbytedb_flush_arrow_coalesce_seconds{instance=~\"$instance\", quantile=\"0.5\"}",
+          "legendFormat": "{{instance}} - arrow coalesce p50",
+          "range": true,
+          "refId": "N"
+        },
+        {
+          "editorMode": "code",
+          "expr": "hyperbytedb_flush_prepare_seconds{instance=~\"$instance\", path=\"prepared\", quantile=\"0.5\"}",
+          "legendFormat": "{{instance}} - prepare prepared p50",
+          "range": true,
+          "refId": "O"
         }
       ],
       "title": "Flush Step Latency p50",
@@ -2420,9 +2434,647 @@
           "legendFormat": "{{instance}} - sink build SQL p99",
           "range": true,
           "refId": "M"
+        },
+        {
+          "editorMode": "code",
+          "expr": "hyperbytedb_flush_arrow_coalesce_seconds{instance=~\"$instance\", quantile=\"0.99\"}",
+          "legendFormat": "{{instance}} - arrow coalesce p99",
+          "range": true,
+          "refId": "N"
+        },
+        {
+          "editorMode": "code",
+          "expr": "hyperbytedb_flush_prepare_seconds{instance=~\"$instance\", path=\"prepared\", quantile=\"0.99\"}",
+          "legendFormat": "{{instance}} - prepare prepared p99",
+          "range": true,
+          "refId": "O"
         }
       ],
       "title": "Flush Step Latency p99",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 65
+      },
+      "id": 1220,
+      "panels": [],
+      "title": "Arrow In-Memory WAL",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 15,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 66
+      },
+      "id": 1221,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "sortBy": "Mean",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.4.3",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "rate(hyperbytedb_wal_arrow_cache_hits_total{instance=~\"$instance\"}[$__rate_interval])",
+          "legendFormat": "{{instance}} hits/s",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "rate(hyperbytedb_wal_arrow_cache_misses_total{instance=~\"$instance\"}[$__rate_interval])",
+          "legendFormat": "{{instance}} misses/s",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Arrow Cache Hits / Misses Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "max": 1,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": 0
+              },
+              {
+                "color": "yellow",
+                "value": 0.5
+              },
+              {
+                "color": "green",
+                "value": 0.9
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 4,
+        "x": 8,
+        "y": 66
+      },
+      "id": 1222,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.4.3",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(hyperbytedb_wal_arrow_cache_hits_total{instance=~\"$instance\"}[$__rate_interval])) / clamp_min(sum(rate(hyperbytedb_wal_arrow_cache_hits_total{instance=~\"$instance\"}[$__rate_interval])) + sum(rate(hyperbytedb_wal_arrow_cache_misses_total{instance=~\"$instance\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "{{instance}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Arrow Cache Hit Ratio",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Unflushed prepared Arrow WAL slots held in RAM. Steady-state stays low (flush drains them); a sustained climb means the flush has stalled or WAL truncation is held behind a lagging peer's replication ack — the precursor to an OOM.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 15,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 100000
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 66
+      },
+      "id": 1299,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "sortBy": "Max",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.4.3",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "hyperbytedb_wal_arrow_cache_entries{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Arrow WAL Cache Entries (unflushed)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 15,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 66
+      },
+      "id": 1223,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "sortBy": "Mean",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.4.3",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "hyperbytedb_ingest_arrow_build_seconds{instance=~\"$instance\", quantile=\"0.5\"}",
+          "legendFormat": "{{instance}} p50",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "hyperbytedb_ingest_arrow_build_seconds{instance=~\"$instance\", quantile=\"0.99\"}",
+          "legendFormat": "{{instance}} p99",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Ingest Arrow Build Latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 15,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 74
+      },
+      "id": 1224,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "sortBy": "Mean",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.4.3",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "hyperbytedb_flush_prepare_seconds{instance=~\"$instance\", path=\"prepared\", quantile=\"0.99\"}",
+          "legendFormat": "{{instance}} prepare p99",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "hyperbytedb_flush_arrow_coalesce_seconds{instance=~\"$instance\", quantile=\"0.99\"}",
+          "legendFormat": "{{instance}} arrow coalesce p99",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "editorMode": "code",
+          "expr": "hyperbytedb_flush_sink_write_seconds{instance=~\"$instance\", path=\"prepared\", quantile=\"0.99\"}",
+          "legendFormat": "{{instance}} sink write p99",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "editorMode": "code",
+          "expr": "hyperbytedb_flush_sink_chdb_insert_seconds{instance=~\"$instance\", path=\"prepared\", quantile=\"0.99\"}",
+          "legendFormat": "{{instance}} chdb insert p99",
+          "range": true,
+          "refId": "D"
+        }
+      ],
+      "title": "Prepared Flush Step Latency p99",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 15,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "rows/s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 74
+      },
+      "id": 1225,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "sortBy": "Mean",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.4.3",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "rate(hyperbytedb_native_rows_written_total{instance=~\"$instance\", path=\"prepared\"}[$__rate_interval])",
+          "legendFormat": "{{instance}} prepared rows/s",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "rate(hyperbytedb_flush_sink_writes_total{instance=~\"$instance\", path=\"prepared\"}[$__rate_interval])",
+          "legendFormat": "{{instance}} prepared batches/s",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Prepared Flush Throughput",
       "type": "timeseries"
     },
     {
@@ -2431,7 +3083,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 65
+        "y": 82
       },
       "id": 800,
       "panels": [
@@ -2501,7 +3153,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 90
+            "y": 107
           },
           "id": 504,
           "options": {
@@ -2597,7 +3249,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 90
+            "y": 107
           },
           "id": 506,
           "options": {
@@ -2698,7 +3350,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 122
+            "y": 139
           },
           "id": 505,
           "options": {
@@ -2738,7 +3390,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 66
+        "y": 83
       },
       "id": 600,
       "panels": [
@@ -2808,7 +3460,7 @@
             "h": 8,
             "w": 8,
             "x": 0,
-            "y": 91
+            "y": 108
           },
           "id": 601,
           "options": {
@@ -2904,7 +3556,7 @@
             "h": 8,
             "w": 8,
             "x": 8,
-            "y": 91
+            "y": 108
           },
           "id": 602,
           "options": {
@@ -3026,7 +3678,7 @@
             "h": 8,
             "w": 8,
             "x": 16,
-            "y": 91
+            "y": 108
           },
           "id": 603,
           "options": {
@@ -3140,7 +3792,7 @@
             "h": 8,
             "w": 8,
             "x": 0,
-            "y": 99
+            "y": 116
           },
           "id": 610,
           "options": {
@@ -3254,7 +3906,7 @@
             "h": 8,
             "w": 8,
             "x": 8,
-            "y": 99
+            "y": 116
           },
           "id": 611,
           "options": {
@@ -3382,7 +4034,7 @@
             "h": 8,
             "w": 8,
             "x": 16,
-            "y": 99
+            "y": 116
           },
           "id": 612,
           "options": {
@@ -3496,7 +4148,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 107
+            "y": 124
           },
           "id": 613,
           "options": {
@@ -3601,7 +4253,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 107
+            "y": 124
           },
           "id": 614,
           "options": {
@@ -3649,7 +4301,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 67
+        "y": 84
       },
       "id": 1100,
       "panels": [
@@ -3719,7 +4371,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 140
+            "y": 157
           },
           "id": 1101,
           "options": {
@@ -3831,7 +4483,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 140
+            "y": 157
           },
           "id": 1103,
           "options": {
@@ -3943,7 +4595,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 148
+            "y": 165
           },
           "id": 1104,
           "options": {
@@ -4055,7 +4707,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 148
+            "y": 165
           },
           "id": 1106,
           "options": {
@@ -4167,7 +4819,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 156
+            "y": 173
           },
           "id": 1105,
           "options": {
@@ -4264,7 +4916,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 156
+            "y": 173
           },
           "id": 1102,
           "options": {
@@ -4320,7 +4972,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 68
+        "y": 85
       },
       "id": 1110,
       "panels": [
@@ -4390,7 +5042,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 141
+            "y": 158
           },
           "id": 1112,
           "options": {
@@ -4509,7 +5161,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 141
+            "y": 158
           },
           "id": 1111,
           "options": {
@@ -4572,7 +5224,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 69
+        "y": 86
       },
       "id": 1000,
       "panels": [
@@ -4623,7 +5275,7 @@
             "h": 4,
             "w": 8,
             "x": 0,
-            "y": 265
+            "y": 282
           },
           "id": 1006,
           "options": {
@@ -4678,7 +5330,7 @@
             "h": 4,
             "w": 8,
             "x": 8,
-            "y": 265
+            "y": 282
           },
           "id": 1007,
           "options": {
@@ -4738,7 +5390,7 @@
             "h": 4,
             "w": 8,
             "x": 16,
-            "y": 265
+            "y": 282
           },
           "id": 1008,
           "options": {
@@ -4840,7 +5492,7 @@
             "h": 8,
             "w": 16,
             "x": 0,
-            "y": 269
+            "y": 286
           },
           "id": 1001,
           "options": {
@@ -4863,7 +5515,7 @@
           "targets": [
             {
               "expr": "sum by (instance, peer_id) (rate(hyperbytedb_hinted_handoff_enqueued_total{instance=~\"$instance\"}[$__rate_interval]))",
-              "legendFormat": "{{ instance }} → peer {{ peer_id }}",
+              "legendFormat": "{{ instance }} \u2192 peer {{ peer_id }}",
               "refId": "A"
             }
           ],
@@ -4936,7 +5588,7 @@
             "h": 8,
             "w": 8,
             "x": 16,
-            "y": 269
+            "y": 286
           },
           "id": 1004,
           "options": {
@@ -4963,7 +5615,7 @@
               "refId": "A"
             }
           ],
-          "title": "Verified Compaction — Files Merged",
+          "title": "Verified Compaction \u2014 Files Merged",
           "type": "timeseries"
         },
         {
@@ -5032,7 +5684,7 @@
             "h": 8,
             "w": 16,
             "x": 0,
-            "y": 277
+            "y": 294
           },
           "id": 1002,
           "options": {
@@ -5055,7 +5707,7 @@
           "targets": [
             {
               "expr": "sum by (instance, peer_id) (rate(hyperbytedb_hinted_handoff_drained_total{instance=~\"$instance\"}[$__rate_interval]))",
-              "legendFormat": "{{ instance }} → peer {{ peer_id }}",
+              "legendFormat": "{{ instance }} \u2192 peer {{ peer_id }}",
               "refId": "A"
             }
           ],
@@ -5128,7 +5780,7 @@
             "h": 8,
             "w": 8,
             "x": 16,
-            "y": 277
+            "y": 294
           },
           "id": 1005,
           "options": {
@@ -5155,7 +5807,7 @@
               "refId": "A"
             }
           ],
-          "title": "Verified Compaction — Errors",
+          "title": "Verified Compaction \u2014 Errors",
           "type": "timeseries"
         },
         {
@@ -5224,7 +5876,7 @@
             "h": 8,
             "w": 16,
             "x": 0,
-            "y": 285
+            "y": 302
           },
           "id": 1003,
           "options": {
@@ -5246,7 +5898,7 @@
           "targets": [
             {
               "expr": "sum by (instance, peer_id) (hyperbytedb_hinted_handoff_enqueued_total{instance=~\"$instance\"}) - sum by (instance, peer_id) (hyperbytedb_hinted_handoff_drained_total{instance=~\"$instance\"})",
-              "legendFormat": "{{ instance }} → peer {{ peer_id }}",
+              "legendFormat": "{{ instance }} \u2192 peer {{ peer_id }}",
               "refId": "A"
             }
           ],
@@ -5319,7 +5971,7 @@
             "h": 8,
             "w": 8,
             "x": 16,
-            "y": 285
+            "y": 302
           },
           "id": 704,
           "options": {
@@ -5359,7 +6011,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 70
+        "y": 87
       },
       "id": 900,
       "panels": [
@@ -5429,7 +6081,7 @@
             "h": 10,
             "w": 24,
             "x": 0,
-            "y": 564
+            "y": 581
           },
           "id": 901,
           "options": {
@@ -5474,7 +6126,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 71
+        "y": 88
       },
       "id": 700,
       "panels": [
@@ -5544,7 +6196,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 565
+            "y": 582
           },
           "id": 702,
           "options": {
@@ -5640,7 +6292,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 565
+            "y": 582
           },
           "id": 703,
           "options": {
@@ -5736,7 +6388,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 573
+            "y": 590
           },
           "id": 701,
           "options": {
@@ -5842,7 +6494,7 @@
             "h": 10,
             "w": 24,
             "x": 0,
-            "y": 581
+            "y": 598
           },
           "id": 902,
           "options": {
@@ -5949,7 +6601,7 @@
             "h": 10,
             "w": 24,
             "x": 0,
-            "y": 591
+            "y": 608
           },
           "id": 903,
           "options": {
@@ -6097,7 +6749,7 @@
             "h": 10,
             "w": 24,
             "x": 0,
-            "y": 601
+            "y": 618
           },
           "id": 904,
           "options": {
@@ -6182,7 +6834,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 72
+        "y": 89
       },
       "id": 1200,
       "panels": [
@@ -6211,7 +6863,7 @@
             "h": 4,
             "w": 4,
             "x": 0,
-            "y": 145
+            "y": 162
           },
           "id": 1201,
           "options": {
@@ -6267,7 +6919,7 @@
             "h": 4,
             "w": 5,
             "x": 4,
-            "y": 145
+            "y": 162
           },
           "id": 1202,
           "options": {
@@ -6323,7 +6975,7 @@
             "h": 4,
             "w": 5,
             "x": 9,
-            "y": 145
+            "y": 162
           },
           "id": 1203,
           "options": {
@@ -6379,7 +7031,7 @@
             "h": 4,
             "w": 5,
             "x": 14,
-            "y": 145
+            "y": 162
           },
           "id": 1204,
           "options": {
@@ -6435,7 +7087,7 @@
             "h": 4,
             "w": 5,
             "x": 19,
-            "y": 145
+            "y": 162
           },
           "id": 1205,
           "options": {
@@ -6532,7 +7184,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 149
+            "y": 166
           },
           "id": 1206,
           "options": {
@@ -6628,7 +7280,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 149
+            "y": 166
           },
           "id": 1207,
           "options": {
@@ -6724,7 +7376,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 157
+            "y": 174
           },
           "id": 1208,
           "options": {
@@ -6830,7 +7482,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 157
+            "y": 174
           },
           "id": 1209,
           "options": {
@@ -6853,7 +7505,7 @@
           "targets": [
             {
               "expr": "sum by (from, to) (rate(hyperbytedb_proxy_health_transitions_total{instance=~\"$proxy_instance\"}[$__rate_interval]))",
-              "legendFormat": "{{from}} → {{to}}",
+              "legendFormat": "{{from}} \u2192 {{to}}",
               "refId": "A"
             }
           ],

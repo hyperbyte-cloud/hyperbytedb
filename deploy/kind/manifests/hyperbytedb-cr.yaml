@@ -1,3 +1,5 @@
+# HyperbyteDB cluster for kind — tuned for a 4-CPU / high-memory node (16 GiB pod limit).
+# Matches docker-compose tuning: chDB pool = cores, larger flush batches, faster WAL drain.
 apiVersion: hyperbytedb.hyperbytedb.io/v1alpha1
 kind: HyperbytedbCluster
 metadata:
@@ -12,28 +14,33 @@ spec:
     maxBodySizeBytes: 26214400
     requestTimeoutSecs: 30
     queryTimeoutSecs: 30
-    maxConcurrentQueries: 0
+    # ≥ chdb.poolSize; caps concurrent query tasks on the Tokio blocking pool.
+    maxConcurrentQueries: 32
   storage:
     volumeClaimTemplate:
-      size: 16Gi
+      size: 32Gi
+  chdb:
+    # One chDB connection per CPU — parallel flush inserts and queries.
+    poolSize: 4
   flush:
     intervalSecs: 5
-    walSizeThresholdMb: 64
+    walSizeThresholdMb: 256
     timeBucketDuration: "1h"
-    maxPointsPerBatch: 50000
-    walBatchSize: 64
-    walBatchDelayUs: 200
+    maxPointsPerBatch: 100000
+    walBatchSize: 128
+    walBatchDelayUs: 0
+  retention:
+    enabled: true
+    interval: 12h
   cardinality:
     maxTagValuesPerMeasurement: 100000
     maxMeasurementsPerDatabase: 10000
   cluster:
     heartbeatIntervalSecs: 2
     heartbeatMissThreshold: 5
-    antiEntropyEnabled: false
-    antiEntropyIntervalSecs: 60
     replicationMaxRetries: 5
     replicationQueueDepth: 8192
-    replicationMaxInflightBatches: 8
+    replicationMaxInflightBatches: 4
     replicationMaxCoalesceBodyBytes: 8388608
     replicateReceiverQueueDepth: 1024
     replicationTruncateStalePeerMultiplier: 2
@@ -59,14 +66,10 @@ spec:
   logging:
     level: info
     format: json
-    detailedTrace: true
-    # Base URL is OK; hyperbytedb appends /v1/traces for OTLP HTTP export.
-    otlpEndpoint: http://alloy-logs.hyperbytedb.svc:4318
-    otlpSampleRatio: "1.0"
   resources:
     requests:
-      cpu: 250m
-      memory: 512Mi
+      cpu: "2"
+      memory: 8Gi
     limits:
       cpu: "4"
       memory: 16Gi

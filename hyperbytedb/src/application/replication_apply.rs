@@ -11,9 +11,10 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 use crate::application::ingest_metadata::{
     IngestCardinalityLimits, IngestSchemaCache, prepare_batch_metadata,
 };
-use crate::application::system_trace;
+use crate::application::wal_append::append_points_with_prepared;
 use crate::error::HyperbytedbError;
-use crate::ports::wal::{WalEntry, WalPort};
+use crate::ports::points_sink::PointsSinkPort;
+use crate::ports::wal::WalPort;
 
 const DEFAULT_QUEUE_DEPTH: usize = 1024;
 const DEFAULT_WORKERS: usize = 8;
@@ -50,7 +51,17 @@ impl ReplicationApplyQueue {
         wal: Arc<dyn WalPort>,
         limits: IngestCardinalityLimits,
     ) -> Arc<Self> {
-        Self::with_workers(depth, DEFAULT_WORKERS, metadata, wal, limits)
+        Self::with_sink(depth, metadata, wal, None, limits)
+    }
+
+    pub fn with_sink(
+        depth: usize,
+        metadata: Arc<dyn crate::ports::metadata::MetadataPort>,
+        wal: Arc<dyn WalPort>,
+        sink: Option<Arc<dyn PointsSinkPort>>,
+        limits: IngestCardinalityLimits,
+    ) -> Arc<Self> {
+        Self::with_workers_and_sink(depth, DEFAULT_WORKERS, metadata, wal, sink, limits)
     }
 
     pub fn with_workers(
@@ -58,6 +69,17 @@ impl ReplicationApplyQueue {
         num_workers: usize,
         metadata: Arc<dyn crate::ports::metadata::MetadataPort>,
         wal: Arc<dyn WalPort>,
+        limits: IngestCardinalityLimits,
+    ) -> Arc<Self> {
+        Self::with_workers_and_sink(depth, num_workers, metadata, wal, None, limits)
+    }
+
+    pub fn with_workers_and_sink(
+        depth: usize,
+        num_workers: usize,
+        metadata: Arc<dyn crate::ports::metadata::MetadataPort>,
+        wal: Arc<dyn WalPort>,
+        sink: Option<Arc<dyn PointsSinkPort>>,
         limits: IngestCardinalityLimits,
     ) -> Arc<Self> {
         let depth = depth.max(1);
@@ -85,11 +107,13 @@ impl ReplicationApplyQueue {
                 };
                 let meta = metadata.clone();
                 let w = wal.clone();
+                let sink = sink.clone();
                 let sc = schema_cache.clone();
                 tokio::spawn(async move {
                     let r = apply_batch(
                         &meta,
                         &w,
+                        sink.as_ref(),
                         &job.database,
                         &job.retention_policy,
                         job.precision.as_deref(),
@@ -150,6 +174,7 @@ impl ReplicationApplyQueue {
 async fn apply_batch(
     metadata: &Arc<dyn crate::ports::metadata::MetadataPort>,
     wal: &Arc<dyn WalPort>,
+    sink: Option<&Arc<dyn PointsSinkPort>>,
     database: &str,
     retention_policy: &str,
     precision: Option<&str>,
@@ -159,9 +184,6 @@ async fn apply_batch(
     schema_cache: &IngestSchemaCache,
 ) -> Result<u64, HyperbytedbError> {
     let metrics_start = std::time::Instant::now();
-    let trace_start = system_trace::start_timer();
-    let span = system_trace::replicate_apply_span(database, origin_node_id, body.len());
-    let _guard = span.enter();
 
     if body.is_empty() {
         return wal.last_sequence().await;
@@ -170,39 +192,62 @@ async fn apply_batch(
     let t0 = std::time::Instant::now();
     let points = parse_line_body_to_points(body, precision)?;
     histogram!("hyperbytedb_replication_apply_parse_seconds").record(t0.elapsed().as_secs_f64());
-    system_trace::record_phase("parse_us", t0.elapsed());
     if points.is_empty() {
         return wal.last_sequence().await;
     }
-    system_trace::record_u64("point_count", points.len() as u64);
 
     let t1 = std::time::Instant::now();
-    prepare_batch_metadata(metadata, database, &points, limits, Some(schema_cache)).await?;
+    if let Err(e) = prepare_batch_metadata(
+        metadata,
+        database,
+        retention_policy,
+        &points,
+        limits,
+        Some(schema_cache),
+    )
+    .await
+    {
+        if let HyperbytedbError::FieldTypeConflict {
+            ref field,
+            ref measurement,
+            ref got,
+            ref expected,
+        } = e
+        {
+            tracing::warn!(
+                measurement = %measurement,
+                field = %field,
+                got = %got,
+                expected = %expected,
+                origin_node_id,
+                "replicate apply field type conflict"
+            );
+        }
+        counter!("hyperbytedb_replication_apply_errors_total").increment(1);
+        return Err(e);
+    }
     histogram!("hyperbytedb_replication_apply_metadata_seconds").record(t1.elapsed().as_secs_f64());
-    system_trace::record_phase("metadata_register_us", t1.elapsed());
 
-    let entry = WalEntry {
-        database: database.to_string(),
-        retention_policy: retention_policy.to_string(),
+    let t2 = std::time::Instant::now();
+    let result = append_points_with_prepared(
+        wal.as_ref(),
+        sink,
+        database,
+        retention_policy,
         points,
         origin_node_id,
-    };
-    let t2 = std::time::Instant::now();
-    let result = wal.append(entry).await;
+    )
+    .await;
     histogram!("hyperbytedb_replication_apply_wal_seconds").record(t2.elapsed().as_secs_f64());
-    system_trace::record_phase("wal_append_us", t2.elapsed());
 
     histogram!("hyperbytedb_replication_apply_seconds")
         .record(metrics_start.elapsed().as_secs_f64());
     match &result {
-        Ok(seq) => {
-            system_trace::record_u64("wal_seq", *seq);
+        Ok(_) => {
             counter!("hyperbytedb_replication_apply_total").increment(1);
-            system_trace::finish_span(&span, trace_start, "replicate apply complete");
         }
         Err(_) => {
             counter!("hyperbytedb_replication_apply_errors_total").increment(1);
-            system_trace::finish_span(&span, trace_start, "replicate apply failed");
         }
     }
     result

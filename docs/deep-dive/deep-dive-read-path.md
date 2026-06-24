@@ -177,7 +177,7 @@ On SELECT, `inject_tombstone_predicates()` loads all tombstones for the measurem
 
 ### Session model
 
-chDB's `Session` is synchronous and not `Sync`, so it runs inside `spawn_blocking` behind a `tokio::sync::Mutex`. The engine is a process-global singleton — `chdb.pool_size` is ignored; tune `server.max_concurrent_queries` instead.
+chDB runs inside `spawn_blocking`. HyperbyteDB opens `chdb.pool_size` connections to the same `session_data_path`; each connection has its own `ChdbClient` mutex, so flush inserts and queries can overlap when the pool has more than one connection. Tune `server.max_concurrent_queries` (≥ `pool_size`) to cap in-flight query tasks.
 
 ### Output format
 

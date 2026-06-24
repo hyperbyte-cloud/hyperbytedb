@@ -1,0 +1,2 @@
+[env]
+LD_LIBRARY_PATH = "/home/austin/code/hyperbyte/chdb-rust"

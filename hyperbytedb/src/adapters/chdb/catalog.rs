@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use chdb_rust::format::OutputFormat;
 
-use crate::adapters::chdb::session::SharedSession;
+use crate::adapters::chdb::session::{SharedSession, execute_connection};
 use crate::domain::chdb_naming::quote_backticks;
 use crate::error::HyperbytedbError;
 
@@ -32,21 +32,19 @@ pub async fn persist_default_database_metadata(
         return Ok(false);
     }
 
-    let session = session.get()?;
+    let pool = session.pool()?;
     let raw = tokio::task::spawn_blocking(move || {
-        let sql = "SELECT uuid FROM system.databases WHERE name = 'default' FORMAT TabSeparated";
-        let result = session.0.execute(
-            sql,
-            Some(&[chdb_rust::arg::Arg::OutputFormat(
-                OutputFormat::TabSeparated,
-            )]),
-        );
-        match result {
-            Ok(qr) => qr
-                .data_utf8()
-                .map_err(|e| HyperbytedbError::Chdb(e.to_string())),
-            Err(e) => Err(HyperbytedbError::Chdb(e.to_string())),
-        }
+        pool.with_connection(|conn| {
+            let sql =
+                "SELECT uuid FROM system.databases WHERE name = 'default' FORMAT TabSeparated";
+            let result = execute_connection(conn, sql, OutputFormat::TabSeparated);
+            match result {
+                Ok(qr) => qr
+                    .data_utf8()
+                    .map_err(|e| HyperbytedbError::Chdb(e.to_string())),
+                Err(e) => Err(HyperbytedbError::Chdb(e.to_string())),
+            }
+        })
     })
     .await
     .map_err(|e| {
@@ -105,7 +103,7 @@ pub async fn reload_persisted_tables(session: &SharedSession) -> Result<usize, H
             ))
         })?;
         let sql = attach_sql_for_table(table_name, &body);
-        tracing::info!(table = %table_name, "attaching restored chDB table from on-disk metadata");
+        tracing::debug!(table = %table_name, "attaching restored chDB table from on-disk metadata");
         execute_statement(session, &sql).await?;
         attached += 1;
     }
@@ -237,35 +235,32 @@ async fn query_tab_separated(
     session: &SharedSession,
     sql: &str,
 ) -> Result<String, HyperbytedbError> {
-    let session = session.get()?;
+    let pool = session.pool()?;
     let sql = format!("{sql} FORMAT TabSeparated");
     tokio::task::spawn_blocking(move || {
-        let result = session.0.execute(
-            &sql,
-            Some(&[chdb_rust::arg::Arg::OutputFormat(
-                OutputFormat::TabSeparated,
-            )]),
-        );
-        match result {
-            Ok(qr) => qr
-                .data_utf8()
-                .map_err(|e| HyperbytedbError::Chdb(e.to_string())),
-            Err(e) => Err(HyperbytedbError::Chdb(e.to_string())),
-        }
+        pool.with_connection(|conn| {
+            let result = execute_connection(conn, &sql, OutputFormat::TabSeparated);
+            match result {
+                Ok(qr) => qr
+                    .data_utf8()
+                    .map_err(|e| HyperbytedbError::Chdb(e.to_string())),
+                Err(e) => Err(HyperbytedbError::Chdb(e.to_string())),
+            }
+        })
     })
     .await
     .map_err(|e| HyperbytedbError::Internal(format!("chDB catalog query join error: {e}")))?
 }
 
 async fn execute_statement(session: &SharedSession, sql: &str) -> Result<(), HyperbytedbError> {
-    let session = session.get()?;
+    let pool = session.pool()?;
     let sql = sql.to_string();
     tokio::task::spawn_blocking(move || {
-        session
-            .0
-            .execute(&sql, None)
-            .map(|_| ())
-            .map_err(|e| HyperbytedbError::Chdb(e.to_string()))
+        pool.with_connection(|conn| {
+            execute_connection(conn, &sql, OutputFormat::TabSeparated)
+                .map(|_| ())
+                .map_err(|e| HyperbytedbError::Chdb(e.to_string()))
+        })
     })
     .await
     .map_err(|e| HyperbytedbError::Internal(format!("chDB catalog attach join error: {e}")))?

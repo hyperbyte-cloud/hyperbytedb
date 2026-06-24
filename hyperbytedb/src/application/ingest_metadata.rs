@@ -1,12 +1,14 @@
 //! Shared metadata registration for ingest and replication paths (cardinality, schema, tag values).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
 
+use crate::domain::field_type::merge_field_type_map;
 use crate::domain::point::Point;
+use crate::domain::series::series_id_for_point;
 use crate::error::HyperbytedbError;
 use crate::ports::metadata::{MeasurementMeta, MetadataPort};
 
@@ -116,6 +118,20 @@ impl IngestSchemaCache {
     }
 }
 
+/// Merge field types from durable metadata with those seen in the current batch.
+async fn merged_field_types(
+    metadata: &Arc<dyn MetadataPort>,
+    db: &str,
+    measurement: &str,
+    batch_field_types: &HashMap<String, u8>,
+) -> Result<HashMap<String, u8>, HyperbytedbError> {
+    let mut field_types = batch_field_types.clone();
+    if let Some(existing) = metadata.get_measurement(db, measurement).await? {
+        field_types = merge_field_type_map(&existing.field_types, &field_types);
+    }
+    Ok(field_types)
+}
+
 /// Merge tag keys from durable metadata with those seen in the current batch.
 async fn merged_tag_keys(
     metadata: &Arc<dyn MetadataPort>,
@@ -170,6 +186,7 @@ pub async fn backfill_tag_metadata(
             name: measurement.to_string(),
             field_types: HashMap::new(),
             tag_keys: tag_keys.into_iter().collect(),
+            ..Default::default()
         });
     }
 
@@ -296,6 +313,7 @@ pub async fn prepare_columnar_metadata(
             .await?
             .into_iter()
             .collect(),
+        ..Default::default()
     }];
 
     let tag_batch: Vec<(String, String)> = batch
@@ -325,14 +343,41 @@ pub async fn prepare_columnar_metadata(
     Ok(())
 }
 
+async fn register_series_from_points(
+    metadata: &Arc<dyn MetadataPort>,
+    db: &str,
+    rp: &str,
+    points: &[Point],
+) -> Result<(), HyperbytedbError> {
+    let mut by_meas: HashMap<String, BTreeMap<u64, BTreeMap<String, String>>> = HashMap::new();
+    for p in points {
+        let sid = series_id_for_point(p);
+        by_meas
+            .entry(p.measurement.clone())
+            .or_default()
+            .entry(sid)
+            .or_insert_with(|| p.tags.clone());
+    }
+    for (meas, series) in by_meas {
+        let entries: Vec<(u64, BTreeMap<String, String>)> = series.into_iter().collect();
+        metadata
+            .register_series_batch(db, rp, &meas, &entries)
+            .await?;
+    }
+    Ok(())
+}
+
 /// Register measurements, validate field types, enforce cardinality, persist tag values (batched).
 pub async fn prepare_batch_metadata(
     metadata: &Arc<dyn MetadataPort>,
     db: &str,
+    rp: &str,
     points: &[Point],
     limits: IngestCardinalityLimits,
     schema_cache: Option<&IngestSchemaCache>,
 ) -> Result<(), HyperbytedbError> {
+    register_series_from_points(metadata, db, rp, points).await?;
+
     let mut measurements: HashMap<String, (HashMap<String, u8>, BTreeSet<String>)> = HashMap::new();
 
     for point in points {
@@ -340,7 +385,17 @@ pub async fn prepare_batch_metadata(
             .entry(point.measurement.clone())
             .or_insert_with(|| (HashMap::new(), BTreeSet::new()));
         for (k, v) in &point.fields {
-            entry.0.insert(k.clone(), v.type_discriminant());
+            let disc = v.type_discriminant();
+            match entry.0.get_mut(k) {
+                Some(existing) => {
+                    if let Some(w) = crate::domain::field_type::widen_field_disc(*existing, disc) {
+                        *existing = w;
+                    }
+                }
+                None => {
+                    entry.0.insert(k.clone(), disc);
+                }
+            }
         }
         for k in point.tags.keys() {
             entry.1.insert(k.clone());
@@ -465,8 +520,9 @@ pub async fn prepare_batch_metadata(
             }
         }
 
+        let merged_fields = merged_field_types(metadata, db, meas_name, field_types).await?;
         let field_tuples: Vec<(String, u8)> =
-            field_types.iter().map(|(k, v)| (k.clone(), *v)).collect();
+            merged_fields.iter().map(|(k, v)| (k.clone(), *v)).collect();
         metadata
             .check_field_types(db, meas_name, &field_tuples)
             .await?;
@@ -476,11 +532,13 @@ pub async fn prepare_batch_metadata(
     let mut all_tags: Vec<(String, Vec<(String, String)>)> = Vec::with_capacity(measurements.len());
 
     for (meas_name, (field_types, _tag_keys)) in &measurements {
+        let merged_fields = merged_field_types(metadata, db, meas_name, field_types).await?;
         let merged = merged_tag_keys(metadata, db, meas_name, &measurements[meas_name].1).await?;
         all_metas.push(MeasurementMeta {
             name: meas_name.clone(),
-            field_types: field_types.clone(),
+            field_types: merged_fields,
             tag_keys: merged.into_iter().collect(),
+            ..Default::default()
         });
 
         let mut seen: HashSet<(String, String)> = HashSet::new();
@@ -503,8 +561,9 @@ pub async fn prepare_batch_metadata(
 
     if let Some(sc) = schema_cache {
         for (name, (fields, tags)) in &measurements {
+            let merged_fields = merged_field_types(metadata, db, name, fields).await?;
             let merged = merged_tag_keys(metadata, db, name, tags).await?;
-            sc.mark_schema(db, name, fields, &merged);
+            sc.mark_schema(db, name, &merged_fields, &merged);
         }
         let novel_hashes: Vec<(u64,)> = points
             .iter()
@@ -518,4 +577,114 @@ pub async fn prepare_batch_metadata(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapters::metadata::rocksdb_meta::RocksDbMetadata;
+    use crate::domain::measurement::MeasurementMeta;
+    use crate::domain::point::{FieldValue, Point};
+    use std::collections::{BTreeMap, HashMap};
+
+    fn point(meas: &str, fields: &[(&str, FieldValue)], ts: i64) -> Point {
+        Point {
+            measurement: meas.to_string(),
+            tags: BTreeMap::from([("host".to_string(), "h".to_string())]),
+            fields: fields
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+            timestamp: ts,
+        }
+    }
+
+    /// Simulates two cluster nodes that seeded `uptime` differently in local
+    /// metadata; the same Telegraf unsigned line must succeed on both.
+    #[tokio::test]
+    async fn divergent_node_metadata_accepts_unsigned_uptime() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta: Arc<dyn MetadataPort> =
+            Arc::new(RocksDbMetadata::open(dir.path().join("meta")).unwrap());
+        meta.create_database("db").await.unwrap();
+        meta.register_measurement(
+            "db",
+            &MeasurementMeta {
+                name: "system".to_string(),
+                field_types: HashMap::from([("uptime".to_string(), 1)]),
+                tag_keys: vec!["host".to_string()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let points = vec![point(
+            "system",
+            &[("uptime", FieldValue::UInteger(16697))],
+            1_000_000_000,
+        )];
+        prepare_batch_metadata(
+            &meta,
+            "db",
+            "autogen",
+            &points,
+            IngestCardinalityLimits::default(),
+            None,
+        )
+        .await
+        .expect("unsigned uptime must widen integer metadata");
+
+        let stored = meta.get_measurement("db", "system").await.unwrap().unwrap();
+        assert_eq!(stored.field_types.get("uptime"), Some(&2));
+    }
+
+    /// Partial Telegraf lines must not shrink durable field_types on register.
+    #[tokio::test]
+    async fn partial_line_register_merges_field_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta: Arc<dyn MetadataPort> =
+            Arc::new(RocksDbMetadata::open(dir.path().join("meta")).unwrap());
+        meta.create_database("db").await.unwrap();
+
+        let full = vec![point(
+            "system",
+            &[
+                ("load1", FieldValue::Float(0.5)),
+                ("uptime", FieldValue::UInteger(99)),
+            ],
+            1_000_000_000,
+        )];
+        prepare_batch_metadata(
+            &meta,
+            "db",
+            "autogen",
+            &full,
+            IngestCardinalityLimits::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let partial = vec![point(
+            "system",
+            &[("uptime_format", FieldValue::String("3:25".into()))],
+            2_000_000_000,
+        )];
+        prepare_batch_metadata(
+            &meta,
+            "db",
+            "autogen",
+            &partial,
+            IngestCardinalityLimits::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let stored = meta.get_measurement("db", "system").await.unwrap().unwrap();
+        assert!(stored.field_types.contains_key("load1"));
+        assert!(stored.field_types.contains_key("uptime"));
+        assert!(stored.field_types.contains_key("uptime_format"));
+    }
 }

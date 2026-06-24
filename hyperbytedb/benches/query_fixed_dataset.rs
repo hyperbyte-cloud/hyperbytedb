@@ -42,7 +42,7 @@ fn bench_execute(c: &mut Criterion, group_name: &str, query: &str, throughput: T
     group.throughput(throughput);
     group.bench_function("execute", |b| {
         b.iter(|| {
-            rt.block_on(svc.execute_query(DB, black_box(&q), None, None))
+            rt.block_on(svc.execute_query(DB, black_box(&q), None, None, None))
                 .unwrap();
         });
     });

@@ -78,6 +78,35 @@ impl HyperbytedbClient {
         Ok(String::from_utf8_lossy(&resp.body).into_owned())
     }
 
+    /// Execute raw ClickHouse SQL via `/api/v1/chdb` (admin credentials required when auth is on).
+    pub async fn chdb(&self, sql: &str) -> Result<String> {
+        let headers = self.auth_headers();
+        let mut header_refs: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        header_refs.push(("Content-Type", "application/json"));
+        let body = serde_json::json!({ "q": sql }).to_string();
+        let resp = self
+            .request(
+                "POST",
+                "/api/v1/chdb",
+                "",
+                &header_refs,
+                Some(body.into_bytes()),
+            )
+            .await?;
+        if !(200..300).contains(&resp.status) {
+            let text = String::from_utf8_lossy(&resp.body);
+            return Err(CliError::from_status(
+                reqwest::StatusCode::from_u16(resp.status)
+                    .unwrap_or(reqwest::StatusCode::BAD_REQUEST),
+                &text,
+            ));
+        }
+        Ok(String::from_utf8_lossy(&resp.body).into_owned())
+    }
+
     async fn get_text(&self, path: &str) -> Result<String> {
         let headers = self.auth_headers();
         let header_refs: Vec<(&str, &str)> = headers

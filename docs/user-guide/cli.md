@@ -167,6 +167,8 @@ These are handled locally and are **not** sent to `/query`:
 | `chunked` | Toggle chunked query responses |
 | `chunk size <n>` | Chunk size (default 10000) |
 | `settings` | Show session state |
+| `consistency <level>` | Set write consistency (`any`, `one`, `quorum`, `all`) |
+| `params <json>` | Set bind parameters JSON for queries |
 | `timing` | Toggle per-query duration |
 | `history` | History hint (use up-arrow) |
 | `exit`, `quit` | Exit shell |
@@ -193,6 +195,7 @@ Any other input is TimeseriesQL. Semicolon-separated statements run in sequence.
 | `cluster leader` | Raft leader (admin) |
 | `cluster metrics` | Cluster metrics (admin) |
 | `cluster drain --yes` | Initiate graceful drain (admin) |
+| `chdb -e <sql>` | Run raw ClickHouse SQL (admin) |
 
 ---
 
@@ -202,7 +205,7 @@ Schema shortcuts and TimeseriesQL in the REPL or `-execute`:
 
 - `create database <name>`, `drop database <name>`, or `CREATE/DROP DATABASE`
 - `CREATE/ALTER/DROP RETENTION POLICY`
-- `CREATE/DROP USER`, `SET PASSWORD`, `SHOW USERS`, `GRANT`/`REVOKE`
+- `CREATE/DROP USER`, `SET PASSWORD`, `SHOW USERS` — `GRANT`/`REVOKE` are accepted as no-ops for compatibility
 - `SHOW MEASUREMENTS`, `SHOW TAG KEYS/VALUES`, `SHOW FIELD KEYS`, `SHOW SERIES`
 - `SELECT`, `DELETE`, `DROP MEASUREMENT`
 - `CREATE/DROP/SHOW CONTINUOUS QUERY`

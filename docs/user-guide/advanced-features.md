@@ -176,23 +176,6 @@ This adds support for `Content-Type: application/x-msgpack` on the `/write` endp
 
 ---
 
-## Observability (logs and traces)
-
-```toml
-[logging]
-level = "info"
-format = "json"
-detailed_trace = true
-otlp_endpoint = "http://alloy:4318"
-otlp_sample_ratio = 0.1
-```
-
-- `format = "json"` — structured logs for Loki and similar collectors.
-- `detailed_trace = true` — per-phase spans on write, query, and flush paths.
-- `otlp_endpoint` — export traces to Tempo (or any OTLP HTTP collector).
-
-The Docker Compose stack enables these settings by default. See [Administration](administration.md#distributed-tracing) for Grafana workflows.
-
 ## Statement summary
 
 ```toml

@@ -5,6 +5,7 @@
 //! SHOW RETENTION POLICIES, and SHOW CONTINUOUS QUERIES.
 
 use hyperbytedb::ports::ingestion::{IngestionPort, WritePayloadFormat};
+use serial_test::serial;
 
 use super::TestContext;
 
@@ -148,6 +149,78 @@ async fn show_measurements_empty_database() {
         series.is_empty() || series[0].values.is_empty(),
         "Empty database should return no measurements"
     );
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn show_measurements_filters_by_retention_policy() {
+    let ctx = match TestContext::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("skipping RP filter test: chDB not available");
+            return;
+        }
+    };
+
+    ctx.metadata.create_database("rpdb").await.unwrap();
+    ctx.metadata
+        .create_retention_policy(
+            "rpdb",
+            hyperbytedb::domain::database::RetentionPolicy {
+                name: "high".to_string(),
+                duration: Some(std::time::Duration::from_secs(7 * 24 * 3600)),
+                shard_group_duration: std::time::Duration::from_secs(3600),
+                replication_factor: 1,
+                is_default: false,
+            },
+        )
+        .await
+        .unwrap();
+
+    ctx.write_and_flush("rpdb", "cpu,host=h1 value=1 1700000000000000000")
+        .await
+        .unwrap();
+    ctx.ingestion
+        .ingest(
+            "rpdb",
+            Some("high"),
+            None,
+            b"rollup,host=h1 value=1 1700000000000000000",
+            WritePayloadFormat::LineProtocol,
+        )
+        .await
+        .unwrap();
+    ctx.flush_service.flush().await.unwrap();
+
+    let default_names = measurement_names(
+        &ctx.query_with_rp("rpdb", "SHOW MEASUREMENTS", None)
+            .await
+            .unwrap(),
+    );
+    assert!(default_names.contains(&"cpu".to_string()));
+    assert!(!default_names.contains(&"rollup".to_string()));
+
+    let high_names = measurement_names(
+        &ctx.query_with_rp("rpdb", "SHOW MEASUREMENTS", Some("high"))
+            .await
+            .unwrap(),
+    );
+    assert!(high_names.contains(&"rollup".to_string()));
+    assert!(!high_names.contains(&"cpu".to_string()));
+}
+
+fn measurement_names(resp: &hyperbytedb::domain::query_result::QueryResponse) -> Vec<String> {
+    resp.results
+        .first()
+        .and_then(|r| r.series.as_ref())
+        .map(|series| {
+            series
+                .iter()
+                .flat_map(|s| &s.values)
+                .filter_map(|row| row.first().and_then(|v| v.as_str()).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -630,6 +703,12 @@ async fn show_continuous_queries_after_create() {
                 resample_every_secs: None,
                 resample_for_secs: None,
                 created_at: chrono::Utc::now().to_rfc3339(),
+                group_by_interval_secs: 3600,
+                group_by_offset_secs: 0,
+                execution_interval_secs: 3600,
+                coverage_interval_secs: 3600,
+                is_advanced: false,
+                last_run_at: None,
             },
         )
         .await

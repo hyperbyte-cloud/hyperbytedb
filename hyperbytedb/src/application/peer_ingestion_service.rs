@@ -13,13 +13,14 @@ use crate::application::line_protocol::{
 };
 use crate::application::msgpack_ingest::parse_msgpack_body_to_points;
 use crate::application::replication_dispatch::dispatch_outbound_replication;
-use crate::application::system_trace;
+use crate::application::wal_append::append_points_with_prepared;
 use crate::config::{ReplicationConfig, ReplicationMode};
 use crate::domain::database::Precision;
 use crate::error::HyperbytedbError;
 use crate::ports::ingestion::{IngestionPort, WritePayloadFormat};
+use crate::ports::points_sink::PointsSinkPort;
 use crate::ports::replication::{OutboundReplicationBatch, ReplicationPort};
-use crate::ports::wal::{WalEntry, WalPort};
+use crate::ports::wal::WalPort;
 
 /// Ingestion service for clustered (master-master) mode. Writes are always
 /// appended to the local WAL first; replication then dispatches based on the
@@ -33,6 +34,7 @@ use crate::ports::wal::{WalEntry, WalPort};
 ///   self is never counted toward the quorum.
 pub struct PeerIngestionService {
     wal: Arc<dyn WalPort>,
+    sink: Option<Arc<dyn PointsSinkPort>>,
     metadata: Arc<dyn crate::ports::metadata::MetadataPort>,
     replication_port: Arc<dyn ReplicationPort>,
     node_id: u64,
@@ -67,6 +69,26 @@ impl PeerIngestionService {
         limits: IngestCardinalityLimits,
         replication: ReplicationConfig,
     ) -> Self {
+        Self::with_replication_and_sink(
+            wal,
+            None,
+            metadata,
+            replication_port,
+            node_id,
+            limits,
+            replication,
+        )
+    }
+
+    pub fn with_replication_and_sink(
+        wal: Arc<dyn WalPort>,
+        sink: Option<Arc<dyn PointsSinkPort>>,
+        metadata: Arc<dyn crate::ports::metadata::MetadataPort>,
+        replication_port: Arc<dyn ReplicationPort>,
+        node_id: u64,
+        limits: IngestCardinalityLimits,
+        replication: ReplicationConfig,
+    ) -> Self {
         // Surface the resolved coordinator mode for dashboards. We set ALL
         // mode-labeled gauges so a dashboard query like `sum by (mode)` sees
         // a 0 for the inactive modes after a flip rather than a stale 1.
@@ -77,6 +99,7 @@ impl PeerIngestionService {
 
         Self {
             wal,
+            sink,
             metadata,
             replication_port,
             node_id,
@@ -130,8 +153,6 @@ impl IngestionPort for PeerIngestionService {
 
         let t1 = std::time::Instant::now();
         histogram!("hyperbytedb_ingest_metadata_lookup_seconds").record((t1 - t0).as_secs_f64());
-        system_trace::record_phase("metadata_lookup_us", t1 - t0);
-
         // Columnar fast path: decode once, metadata from batch, then expand for WAL/replication
         #[cfg(feature = "columnar-ingest")]
         if matches!(format, WritePayloadFormat::ColumnarMsgpack) {
@@ -142,7 +163,6 @@ impl IngestionPort for PeerIngestionService {
 
             let t2 = std::time::Instant::now();
             histogram!("hyperbytedb_ingest_parse_seconds").record((t2 - t1).as_secs_f64());
-            system_trace::record_phase("parse_us", t2 - t1);
 
             prepare_columnar_metadata(
                 &self.metadata,
@@ -156,33 +176,30 @@ impl IngestionPort for PeerIngestionService {
             let t3 = std::time::Instant::now();
             histogram!("hyperbytedb_ingest_metadata_register_seconds")
                 .record((t3 - t2).as_secs_f64());
-            system_trace::record_phase("metadata_register_us", t3 - t2);
 
             let point_count = wire.values.len() as u64;
-            system_trace::record_u64("point_count", point_count);
             let points =
                 crate::application::columnar_msgpack::columnar_batch_to_points(&wire, precision)?;
             let precision_val = Precision::from_str_opt(precision);
             let replication_body = encode_points_to_line_protocol(&points, precision_val)?;
 
-            let entry = WalEntry {
-                database: db.to_string(),
-                retention_policy: retention_policy.clone(),
+            let wal_seq = append_points_with_prepared(
+                self.wal.as_ref(),
+                self.sink.as_ref(),
+                db,
+                &retention_policy,
                 points,
-                origin_node_id: self.node_id,
-            };
-            let wal_seq = self.wal.append(entry).await?;
+                self.node_id,
+            )
+            .await?;
 
             let t4 = std::time::Instant::now();
             histogram!("hyperbytedb_ingest_wal_append_seconds").record((t4 - t3).as_secs_f64());
-            system_trace::record_phase("wal_append_us", t4 - t3);
-            system_trace::record_u64("wal_seq", wal_seq);
 
             counter!("hyperbytedb_ingestion_points_total", "db" => db.to_string())
                 .increment(point_count);
             counter!("hyperbytedb_wal_appends_total").increment(1);
 
-            let replication_start = std::time::Instant::now();
             let result = self
                 .dispatch_replication(OutboundReplicationBatch {
                     database: db.to_string(),
@@ -192,7 +209,6 @@ impl IngestionPort for PeerIngestionService {
                     wal_seq,
                 })
                 .await;
-            system_trace::record_phase("replication_us", replication_start.elapsed());
             return result;
         }
 
@@ -220,11 +236,11 @@ impl IngestionPort for PeerIngestionService {
 
         let t2 = std::time::Instant::now();
         histogram!("hyperbytedb_ingest_parse_seconds").record((t2 - t1).as_secs_f64());
-        system_trace::record_phase("parse_us", t2 - t1);
 
         prepare_batch_metadata(
             &self.metadata,
             db,
+            &retention_policy,
             &points,
             self.limits,
             Some(&self.schema_cache),
@@ -233,38 +249,32 @@ impl IngestionPort for PeerIngestionService {
 
         let t3 = std::time::Instant::now();
         histogram!("hyperbytedb_ingest_metadata_register_seconds").record((t3 - t2).as_secs_f64());
-        system_trace::record_phase("metadata_register_us", t3 - t2);
 
         let point_count = points.len() as u64;
-        system_trace::record_u64("point_count", point_count);
-        let entry = WalEntry {
-            database: db.to_string(),
-            retention_policy: retention_policy.clone(),
+        let wal_seq = append_points_with_prepared(
+            self.wal.as_ref(),
+            self.sink.as_ref(),
+            db,
+            &retention_policy,
             points,
-            origin_node_id: self.node_id,
-        };
-        let wal_seq = self.wal.append(entry).await?;
+            self.node_id,
+        )
+        .await?;
 
         let t4 = std::time::Instant::now();
         histogram!("hyperbytedb_ingest_wal_append_seconds").record((t4 - t3).as_secs_f64());
-        system_trace::record_phase("wal_append_us", t4 - t3);
-        system_trace::record_u64("wal_seq", wal_seq);
 
         counter!("hyperbytedb_ingestion_points_total", "db" => db.to_string())
             .increment(point_count);
         counter!("hyperbytedb_wal_appends_total").increment(1);
 
-        let replication_start = std::time::Instant::now();
-        let result = self
-            .dispatch_replication(OutboundReplicationBatch {
-                database: db.to_string(),
-                retention_policy,
-                precision: precision.map(|s| s.to_string()),
-                body: replication_body,
-                wal_seq,
-            })
-            .await;
-        system_trace::record_phase("replication_us", replication_start.elapsed());
-        result
+        self.dispatch_replication(OutboundReplicationBatch {
+            database: db.to_string(),
+            retention_policy,
+            precision: precision.map(|s| s.to_string()),
+            body: replication_body,
+            wal_seq,
+        })
+        .await
     }
 }

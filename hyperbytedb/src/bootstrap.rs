@@ -8,7 +8,7 @@ use crate::adapters::chdb::session::SharedSession;
 use crate::adapters::http::router::AppState;
 use crate::adapters::metadata::rocksdb_meta::RocksDbMetadata;
 use crate::adapters::wal::batching_wal::BatchingWal;
-use crate::adapters::wal::rocksdb_wal::RocksDbWal;
+use crate::adapters::wal::rocksdb_wal::{RocksDbWal, RocksDbWalOptions};
 use crate::application::cluster::bootstrap::ClusterBootstrap;
 use crate::application::cluster::drain::DrainService;
 use crate::application::flush_service::FlushServiceImpl;
@@ -21,6 +21,7 @@ use crate::config::HyperbytedbConfig;
 use crate::ports::metadata::MetadataPort;
 use crate::ports::points_sink::PointsSinkPort;
 use crate::ports::query::QueryService;
+use crate::ports::wal::WalFormat;
 
 /// All constructed services returned by [`build_services`].
 pub struct BootstrappedApp {
@@ -74,7 +75,13 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
 
     // -- Infrastructure adapters --
 
-    let raw_wal = Arc::new(RocksDbWal::open(&config.storage.wal_dir)?);
+    let raw_wal = Arc::new(RocksDbWal::open_with_options(
+        &config.storage.wal_dir,
+        RocksDbWalOptions {
+            wal_format: WalFormat::from_config(&config.storage.wal_format),
+            arrow_wal_enabled: config.flush.arrow_wal_enabled,
+        },
+    )?);
     let wal: Arc<dyn crate::ports::wal::WalPort> = if config.flush.wal_batch_size > 0 {
         tracing::info!(
             batch_size = config.flush.wal_batch_size,
@@ -116,7 +123,13 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
             "failed to prepare chDB metadata before session open"
         );
     }
-    let shared_chdb = SharedSession::new_eager(&config.chdb.session_data_path)?;
+    let shared_chdb =
+        SharedSession::new_eager(&config.chdb.session_data_path, config.chdb.pool_size)?;
+    tracing::info!(
+        pool_size = shared_chdb.configured_pool_size(),
+        path = %config.chdb.session_data_path,
+        "chDB connection pool ready"
+    );
     match catalog::reload_persisted_tables(&shared_chdb).await {
         Ok(attached) => tracing::info!(
             attached,
@@ -129,13 +142,6 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
     }
     let chdb_adapter =
         ChdbQueryAdapter::from_shared(shared_chdb.clone(), config.server.max_concurrent_queries);
-    if config.chdb.pool_size > 1 {
-        tracing::warn!(
-            configured = config.chdb.pool_size,
-            "chdb.pool_size is deprecated and ignored; libchdb only supports one session per \
-             process. Use server.max_concurrent_queries to bound parallelism."
-        );
-    }
     let chdb: Arc<dyn crate::ports::query::QueryPort> = Arc::new(chdb_adapter);
 
     let native_sink = ChdbNativeAdapter::with_metadata(shared_chdb.clone(), Some(metadata.clone()));
@@ -234,11 +240,13 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         max_measurements_per_database: config.cardinality.max_measurements_per_database,
     };
 
-    let ingestion_service: Arc<dyn crate::ports::ingestion::IngestionPort> =
-        if let Some(ref pc) = peer_client {
-            Arc::new(
-                crate::application::peer_ingestion_service::PeerIngestionService::with_replication(
+    let ingestion_service: Arc<dyn crate::ports::ingestion::IngestionPort> = if let Some(ref pc) =
+        peer_client
+    {
+        Arc::new(
+                crate::application::peer_ingestion_service::PeerIngestionService::with_replication_and_sink(
                     wal.clone(),
+                    Some(points_sink.clone()),
                     metadata.clone(),
                     pc.clone(),
                     config.cluster.node_id,
@@ -246,20 +254,22 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
                     config.cluster.replication.clone(),
                 ),
             )
-        } else {
-            Arc::new(IngestionServiceImpl::new(
-                wal.clone(),
-                metadata.clone(),
-                config.cardinality.max_tag_values_per_measurement,
-                config.cardinality.max_measurements_per_database,
-            ))
-        };
+    } else {
+        Arc::new(IngestionServiceImpl::with_sink(
+            wal.clone(),
+            Some(points_sink.clone()),
+            metadata.clone(),
+            config.cardinality.max_tag_values_per_measurement,
+            config.cardinality.max_measurements_per_database,
+        ))
+    };
 
     let replication_apply = if cluster.is_some() {
-        Some(ReplicationApplyQueue::new(
+        Some(ReplicationApplyQueue::with_sink(
             config.cluster.replicate_receiver_queue_depth,
             metadata.clone(),
             wal.clone(),
+            Some(points_sink.clone()),
             ingest_cardinality,
         ))
     } else {
@@ -270,6 +280,7 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         Arc::new(
             crate::application::peer_query_service::PeerQueryService::new(
                 base_query_service.clone(),
+                metadata.clone(),
                 pc.clone(),
             ),
         )
@@ -329,6 +340,8 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         query_port: chdb.clone(),
         metadata: metadata.clone(),
         wal: wal.clone(),
+        points_sink: points_sink.clone(),
+        mv_service: mv_service.clone(),
         auth,
         peer_client,
         membership: membership.clone(),

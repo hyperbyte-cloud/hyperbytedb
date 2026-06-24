@@ -79,7 +79,7 @@ All settings use the `HYPERBYTEDB_PROXY_` prefix. **Required:** backend service 
 | `HYPERBYTEDB_PROXY_HEALTH_PATH` | `/health` | HTTP path for probes; use `/health/ready` if you need chDB-aware readiness at the DB |
 | `HYPERBYTEDB_PROXY_HEALTH_TIMEOUT_MS` | `1500` | Per-probe deadline; slower → `Down` |
 | `HYPERBYTEDB_PROXY_REQUEST_TIMEOUT_SECS` | `60` | Upstream round-trip timeout for proxied requests (large queries) |
-| `HYPERBYTEDB_PROXY_HOLD_TIMEOUT_SECS` | `10` | Max wait when **no** `Active` backend before 503 to client |
+| `HYPERBYTEDB_PROXY_HOLD_TIMEOUT_SECS` | `30` | Max wait when **no** `Active` backend before 503 to client |
 | `HYPERBYTEDB_PROXY_MAX_RETRIES` | `2` | See [Retry semantics](#retry-semantics) |
 | `HYPERBYTEDB_PROXY_SHUTDOWN_GRACE_SECS` | `30` | After SIGTERM, max time before forced exit watchdog |
 | `HYPERBYTEDB_PROXY_SELF_IP` | *(unset)* | Optional pod IP (Downward API); that IP is **never** added as a backend (prevents accidental self-proxy loops) |

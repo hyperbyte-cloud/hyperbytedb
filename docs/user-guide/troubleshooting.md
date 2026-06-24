@@ -135,7 +135,7 @@ Data must be flushed from the WAL into chDB MergeTree tables before it becomes q
 
 2. **Add a time range to your query.** Queries without `WHERE time > ...` scan all data.
 
-3. **Cap concurrent queries.** chDB is a process-global singleton (one real session); `chdb.pool_size` is ignored. Tune `server.max_concurrent_queries` instead so heavy queries don't pile up on the single engine session.
+3. **Cap concurrent queries.** Tune `server.max_concurrent_queries` so heavy queries do not oversubscribe the Tokio blocking pool. For overlapping chDB work, also set `chdb.pool_size` > 1 (same data path, multiple connections) and keep `max_concurrent_queries` ≥ `pool_size`.
 
 4. **Narrow the time range** in your query to reduce scanned data volume.
 
@@ -240,6 +240,12 @@ If nodes have different membership views, check network partitions and ensure al
    wal_batch_size = 32
    wal_batch_delay_us = 500
    ```
+
+3. **Arrow in-memory WAL** (zero-copy flush path): ensure `arrow_wal_enabled = true` and watch:
+   - `hyperbytedb_wal_arrow_cache_hits_total` vs `hyperbytedb_wal_arrow_cache_misses_total`
+   - `hyperbytedb_ingest_arrow_build_seconds` (build at ingest)
+   - `hyperbytedb_flush_prepare_seconds{path="prepared"}` (should be low on cache hits)
+   - If misses dominate after restart, entries fall back to the legacy Point flush path until new writes repopulate the cache.
 
 ---
 

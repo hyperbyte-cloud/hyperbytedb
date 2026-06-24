@@ -1,4 +1,5 @@
 use crate::domain::column_mapping::ColumnMapping;
+use crate::domain::rollup::{RollupCombine, aggregate_source_field_name, mean_rollup_column_names};
 use crate::error::HyperbytedbError;
 use crate::timeseriesql::ast::*;
 use std::fmt::Write;
@@ -110,8 +111,9 @@ pub fn translate_native_table(
     table_source: &str,
     mapping: Option<&ColumnMapping>,
     series: Option<SeriesJoin<'_>>,
+    time_bounds: Option<(Option<i64>, Option<i64>)>,
 ) -> Result<String, HyperbytedbError> {
-    translate_inner(stmt, table_source, mapping, series)
+    translate_inner(stmt, table_source, mapping, series, time_bounds)
 }
 
 fn translate_inner(
@@ -119,6 +121,7 @@ fn translate_inner(
     from_source: &str,
     mapping: Option<&ColumnMapping>,
     series: Option<SeriesJoin<'_>>,
+    time_bounds: Option<(Option<i64>, Option<i64>)>,
 ) -> Result<String, HyperbytedbError> {
     let mut out = String::new();
 
@@ -138,23 +141,25 @@ fn translate_inner(
         _ => 0.0,
     };
 
-    // Collect field alias names for INTERPOLATE clause
+    // Collect field alias names for the INTERPOLATE clause. These must match the
+    // output column names emitted by `translate_field` exactly — otherwise
+    // `fill(previous)`/`fill(linear)` reference a non-existent identifier (e.g.
+    // `INTERPOLATE (MEAN)` while the column is `mean_value`) and chDB errors out.
     let field_aliases: Vec<String> = stmt
         .fields
         .iter()
-        .map(|f| {
-            f.alias.clone().unwrap_or_else(|| match &f.expr {
-                Expr::Identifier(n) => n.clone(),
-                Expr::Call(fc) => fc.name.clone(),
-                _ => String::new(),
-            })
-        })
-        .filter(|s| !s.is_empty())
+        .filter_map(select_output_field_name)
         .collect();
 
     // SELECT - prepend the time bucket column when GROUP BY time() is present
     write!(out, "SELECT ")?;
     let mut select_parts: Vec<String> = Vec::new();
+
+    let has_group_by_time = stmt
+        .group_by
+        .as_ref()
+        .and_then(|gb| gb.time_dimension())
+        .is_some();
 
     if let Some(ref gb) = stmt.group_by {
         if let Some(Dimension::Time { interval, offset }) = gb.time_dimension() {
@@ -169,6 +174,20 @@ fn translate_inner(
         for tag in gb.tag_dimensions() {
             select_parts.push(select_tag_column_sql(tag, mapping));
         }
+    }
+
+    let has_aggregate = stmt.fields.iter().any(|f| expr_contains_call(&f.expr));
+    let has_star = stmt
+        .fields
+        .iter()
+        .any(|f| matches!(f.expr, Expr::Star | Expr::Wildcard));
+
+    // Raw (non-aggregate) selects return one row per point and must carry the
+    // point's `time` column, like InfluxDB. `SELECT *` already projects `time`,
+    // and GROUP BY time() / aggregate queries get their time column elsewhere.
+    let is_raw_select = !has_group_by_time && !has_star && !has_aggregate;
+    if is_raw_select {
+        select_parts.insert(0, quote_identifier("time"));
     }
 
     let field_strs: Vec<String> = stmt
@@ -225,11 +244,28 @@ fn translate_inner(
         }
     });
 
-    // Add ORDER BY (explicit or implicit for fill)
-    let needs_order_by = stmt.order_by.is_some() || (needs_with_fill && time_col.is_some());
+    // InfluxDB orders every result by time ascending by default; an explicit
+    // ORDER BY only changes the direction. Order whenever there is a time column
+    // to sort on: GROUP BY time() buckets, or raw per-point selects (incl. `*`).
+    // Aggregates without GROUP BY time() collapse to one row and need no ordering.
+    let has_orderable_time = time_col.is_some() || (!has_aggregate && !has_group_by_time);
+    let needs_order_by = has_orderable_time;
     if needs_order_by {
         write!(out, "\nORDER BY ")?;
         let time_desc = stmt.order_by.as_ref().is_some_and(|o| o.time_desc);
+        let do_fill = needs_with_fill && time_col.is_some();
+
+        // When filling a tag-grouped query, the tag columns must precede the
+        // time-fill column in ORDER BY so ClickHouse fills each tag group
+        // independently. Without this, WITH FILL fills globally: gap buckets are
+        // emitted with empty tag values (a phantom all-NULL series) and the real
+        // per-tag series is never filled — which surfaces as "no data" in Grafana.
+        if do_fill && let Some(ref gb) = stmt.group_by {
+            for tag in gb.tag_dimensions() {
+                write!(out, "{} ASC, ", group_by_tag_sql(tag, mapping))?;
+            }
+        }
+
         if let Some(ref tc) = time_col {
             write!(out, "{}", tc)?;
         } else {
@@ -241,12 +277,25 @@ fn translate_inner(
             write!(out, " ASC")?;
         }
 
-        if needs_with_fill && time_col.is_some() {
+        if do_fill {
             if let Some(ref gb) = stmt.group_by
                 && let Some(Dimension::Time { interval, .. }) = gb.time_dimension()
             {
                 let step = interval.to_clickhouse_interval();
-                write!(out, " WITH FILL STEP {}", step)?;
+                write!(out, " WITH FILL")?;
+                if let Some((min_nanos, max_nanos)) = time_bounds
+                    && let (Some(min), Some(max)) = (min_nanos, max_nanos)
+                {
+                    write!(
+                        out,
+                        " FROM toStartOfInterval({}, {}) TO toStartOfInterval({}, {})",
+                        nanos_to_ch_timestamp(min),
+                        step,
+                        nanos_to_ch_timestamp(max),
+                        step,
+                    )?;
+                }
+                write!(out, " STEP {}", step)?;
             }
 
             // fill(previous): use INTERPOLATE to carry forward last known value
@@ -292,17 +341,56 @@ pub fn translate_select_into(
     mapping: Option<&ColumnMapping>,
 ) -> Result<String, HyperbytedbError> {
     validate_select_into(stmt)?;
-    let select_sql = translate_inner(stmt, source, mapping, None)?;
+    let select_sql = translate_inner(stmt, source, mapping, None, None)?;
     let select_sql = select_sql.replace("__time", "time");
     Ok(format!("INSERT INTO {}\n{}", dest_table, select_sql))
 }
 
-/// ClickHouse `SELECT` body for a fact-table materialized view. Groups by
-/// `series_id` and the time bucket (not tag columns) and emits the system
-/// columns required by the destination fact table schema.
+fn translate_materialized_view_field(
+    field: &Field,
+    group_by: Option<&GroupBy>,
+    mapping: &ColumnMapping,
+) -> Result<String, HyperbytedbError> {
+    if let Expr::Call(func) = &field.expr
+        && func.name.eq_ignore_ascii_case("mean")
+    {
+        let source = aggregate_source_field_name(func)?;
+        let col = mapping.physical_select_identifier(&source);
+        let col_q = quote_identifier(&col);
+        let (sum_col, count_col) = mean_rollup_column_names(&source);
+        return Ok(format!(
+            "sum({col_q}) AS {}, count({col_q}) AS {}",
+            quote_identifier(&sum_col),
+            quote_identifier(&count_col)
+        ));
+    }
+    translate_field(field, false, 0.0, group_by, Some(mapping))
+}
+
+/// Ensure coalesced MV source rows expose every field referenced in the SELECT.
+fn mapping_with_mv_aggregate_fields(mapping: &ColumnMapping, fields: &[Field]) -> ColumnMapping {
+    let mut expanded = mapping.clone();
+    for field in fields {
+        if let Expr::Call(func) = &field.expr
+            && let Ok(source) = aggregate_source_field_name(func)
+        {
+            expanded
+                .field_names
+                .insert(mapping.physical_select_identifier(&source));
+        }
+    }
+    expanded
+}
+
+/// ClickHouse `SELECT` body for a fact-table materialized view. Joins the source
+/// series dimension, groups by the MV's `GROUP BY time(...)` bucket and tag
+/// dimensions (dropping tags omitted from the GROUP BY, e.g. `server_id`), and
+/// assigns a destination `series_id` via [`crate::domain::series::series_id_ch_sql`].
 pub fn translate_materialized_view_select(
     stmt: &SelectStatement,
     source_fact: &str,
+    source_series: &str,
+    dest_measurement: &str,
     mapping: &ColumnMapping,
 ) -> Result<String, HyperbytedbError> {
     validate_select_into(stmt)?;
@@ -315,34 +403,107 @@ pub fn translate_materialized_view_select(
             "MV requires GROUP BY time(...)".to_string(),
         ));
     };
-    let time_bucket = time_bucket_expr(interval, offset.as_ref());
+    let time_bucket = time_bucket_expr_on("t.time", interval, offset.as_ref());
+
+    let mut grouped_tags: Vec<String> = gb
+        .tag_dimensions()
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    grouped_tags.sort();
+
+    let series_id_expr = crate::domain::series::series_id_ch_sql_for_tags(
+        dest_measurement,
+        &grouped_tags,
+        |tag| quote_identifier(&mapping.tag_column_name(tag)),
+        "s",
+    );
 
     let field_strs: Vec<String> = stmt
         .fields
         .iter()
-        .map(|f| translate_field(f, false, 0.0, stmt.group_by.as_ref(), Some(mapping)))
+        .map(|f| translate_materialized_view_field(f, stmt.group_by.as_ref(), mapping))
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut select_parts = vec![
         format!("{time_bucket} AS time"),
-        "any(origin_node_id) AS origin_node_id".to_string(),
-        "max(ingest_seq) AS ingest_seq".to_string(),
-        "series_id".to_string(),
+        "any(t.`_mv_src_origin_node_id`) AS origin_node_id".to_string(),
+        "max(t.`_mv_src_ingest_seq`) AS ingest_seq".to_string(),
+        format!("min({series_id_expr}) AS series_id"),
     ];
     select_parts.extend(field_strs);
 
+    let mut group_parts = vec![time_bucket.clone()];
+    for tag in &grouped_tags {
+        group_parts.push(format!(
+            "s.{}",
+            quote_identifier(&mapping.tag_column_name(tag))
+        ));
+    }
+
     let mut out = String::new();
     write!(out, "SELECT {}", select_parts.join(", "))?;
-    write!(out, "\nFROM {source_fact}")?;
+    let source_mapping = mapping_with_mv_aggregate_fields(mapping, &stmt.fields);
+    let coalesced_source = build_coalesced_fact_view_with_row_meta(source_fact, &source_mapping);
+    write!(
+        out,
+        "\nFROM {coalesced_source} AS t ANY INNER JOIN {source_series} AS s ON t.`series_id` = s.`series_id`"
+    )?;
 
     if let Some(ref cond) = stmt.condition {
         write!(out, "\nWHERE ")?;
         translate_expr(cond, &mut out, true, Some(mapping))?;
     }
 
-    // GROUP BY the `time` alias — ClickHouse rejects grouping on the raw `time`
-    // column expression when the SELECT output column is also named `time`.
-    write!(out, "\nGROUP BY series_id, time")?;
+    write!(out, "\nGROUP BY {}", group_parts.join(", "))?;
+    Ok(out)
+}
+
+/// ClickHouse `SELECT` for the destination series-dimension MV: one row per
+/// rolled-up tag combination (tags not listed in the MV GROUP BY are dropped).
+pub fn translate_materialized_view_series_select(
+    stmt: &SelectStatement,
+    source_series: &str,
+    dest_measurement: &str,
+    mapping: &ColumnMapping,
+) -> Result<String, HyperbytedbError> {
+    let gb = stmt
+        .group_by
+        .as_ref()
+        .ok_or_else(|| HyperbytedbError::QueryParse("MV requires GROUP BY".to_string()))?;
+    let mut grouped_tags: Vec<String> = gb
+        .tag_dimensions()
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    grouped_tags.sort();
+
+    if grouped_tags.is_empty() {
+        return Ok(format!(
+            "SELECT min({}) AS series_id FROM {source_series} AS s GROUP BY tuple()",
+            crate::domain::series::series_id_ch_sql(dest_measurement, &[] as &[String])
+        ));
+    }
+
+    let series_id_expr = crate::domain::series::series_id_ch_sql_for_tags(
+        dest_measurement,
+        &grouped_tags,
+        |tag| quote_identifier(&mapping.tag_column_name(tag)),
+        "s",
+    );
+
+    let tag_cols: Vec<String> = grouped_tags
+        .iter()
+        .map(|tag| format!("s.{}", quote_identifier(&mapping.tag_column_name(tag))))
+        .collect();
+
+    let mut select_parts = vec![format!("min({series_id_expr}) AS series_id")];
+    select_parts.extend(tag_cols.iter().cloned());
+
+    let mut out = String::new();
+    write!(out, "SELECT {}", select_parts.join(", "))?;
+    write!(out, "\nFROM {source_series} AS s")?;
+    write!(out, "\nGROUP BY {}", tag_cols.join(", "))?;
     Ok(out)
 }
 
@@ -351,10 +512,61 @@ pub fn translate_materialized_view_backfill(
     stmt: &SelectStatement,
     dest_table: &str,
     source_fact: &str,
+    source_series: &str,
+    dest_measurement: &str,
     mapping: &ColumnMapping,
 ) -> Result<String, HyperbytedbError> {
-    let select_sql = translate_materialized_view_select(stmt, source_fact, mapping)?;
-    Ok(format!("INSERT INTO {dest_table}\n{select_sql}"))
+    let select_sql = translate_materialized_view_select(
+        stmt,
+        source_fact,
+        source_series,
+        dest_measurement,
+        mapping,
+    )?;
+    let insert_cols = materialized_view_dest_insert_columns(stmt)?;
+    Ok(format!(
+        "INSERT INTO {dest_table} ({insert_cols})\nSELECT {insert_cols}\nFROM (\n{select_sql}\n)"
+    ))
+}
+
+/// Destination fact columns in physical DDL order (matches [`build_create_table_sql`]).
+fn materialized_view_dest_insert_columns(
+    stmt: &SelectStatement,
+) -> Result<String, HyperbytedbError> {
+    let mut cols = vec![
+        quote_identifier("time"),
+        quote_identifier("origin_node_id"),
+        quote_identifier("ingest_seq"),
+        quote_identifier("series_id"),
+    ];
+    let mut field_names = materialized_view_dest_field_names(stmt)?;
+    field_names.sort();
+    cols.extend(field_names.into_iter().map(|n| quote_identifier(&n)));
+    Ok(cols.join(", "))
+}
+
+/// Output column names for MV destination fields (expands `mean()` to sum/count pairs).
+fn materialized_view_dest_field_names(
+    stmt: &SelectStatement,
+) -> Result<Vec<String>, HyperbytedbError> {
+    let mut names = Vec::new();
+    for field in &stmt.fields {
+        if let Expr::Call(func) = &field.expr
+            && func.name.eq_ignore_ascii_case("mean")
+        {
+            let source = aggregate_source_field_name(func)?;
+            let (sum_col, count_col) = mean_rollup_column_names(&source);
+            names.push(sum_col);
+            names.push(count_col);
+            continue;
+        }
+        names.push(select_output_field_name(field).ok_or_else(|| {
+            HyperbytedbError::QueryParse(
+                "materialized view field requires a name or alias".to_string(),
+            )
+        })?);
+    }
+    Ok(names)
 }
 
 /// Full `CREATE MATERIALIZED VIEW ... TO ... AS SELECT ...` DDL for the fact MV.
@@ -366,13 +578,13 @@ pub fn build_create_fact_materialized_view(
     format!("CREATE MATERIALIZED VIEW {mv_name} TO {dest_table} AS\n{select_sql}")
 }
 
-/// Full `CREATE MATERIALIZED VIEW ... TO ... AS SELECT * FROM ...` for series sync.
+/// Full `CREATE MATERIALIZED VIEW ... TO ... AS SELECT ...` for the series MV.
 pub fn build_create_series_materialized_view(
     mv_name: &str,
     dest_series: &str,
-    source_series: &str,
+    select_sql: &str,
 ) -> String {
-    format!("CREATE MATERIALIZED VIEW {mv_name} TO {dest_series} AS\nSELECT * FROM {source_series}")
+    format!("CREATE MATERIALIZED VIEW {mv_name} TO {dest_series} AS\n{select_sql}")
 }
 
 /// Like [`translate_select_into`], targeting a native MergeTree table source.
@@ -386,7 +598,7 @@ pub fn translate_select_into_native(
     series: Option<SeriesJoin<'_>>,
 ) -> Result<String, HyperbytedbError> {
     validate_select_into(stmt)?;
-    let select_sql = translate_inner(stmt, source_table, mapping, series)?;
+    let select_sql = translate_inner(stmt, source_table, mapping, series, None)?;
     let select_sql = select_sql.replace("__time", "time");
     Ok(format!("INSERT INTO {}\n{}", dest_table, select_sql))
 }
@@ -396,7 +608,7 @@ pub fn translate_with_source(
     stmt: &SelectStatement,
     source: &str,
 ) -> Result<String, HyperbytedbError> {
-    translate_inner(stmt, source, None, None)
+    translate_inner(stmt, source, None, None, None)
 }
 
 /// Whether `expr` references a tag (so the query needs the series join). Treats a
@@ -440,18 +652,46 @@ fn query_references_tag(stmt: &SelectStatement, m: &ColumnMapping) -> bool {
         .is_some_and(|c| expr_references_tag(c, m))
 }
 
-/// Build a query-time view that merges sparse partial rows sharing
-/// `(series_id, time)` — the read-path counterpart to ingest coalescing.
-/// Without this, `ReplacingMergeTree(ingest_seq)` keeps only the highest-seq
-/// whole row, dropping fields from other partial writes.
+/// Build a query-time view that collapses duplicate `(series_id, time)` rows
+/// to the single row with the highest `ingest_seq`.
+///
+/// Partial Telegraf lines are merged at ingest (`coalesce_points_and_origins`);
+/// at query time we must not merge fields independently across rows — per-field
+/// `argMaxIf` can stitch a correct `available` from one row with a corrupt
+/// `used_percent` from another (e.g. async replication writing a second row
+/// for the same instant), which produces nonsense Grafana percentages.
 pub fn build_coalesced_fact_view(fact_table: &str, mapping: &ColumnMapping) -> String {
+    build_coalesced_fact_view_impl(fact_table, mapping, false)
+}
+
+/// Like [`build_coalesced_fact_view`], but preserves `ingest_seq` / `origin_node_id` for
+/// downstream aggregates (materialized view source dedup).
+pub fn build_coalesced_fact_view_with_row_meta(
+    fact_table: &str,
+    mapping: &ColumnMapping,
+) -> String {
+    build_coalesced_fact_view_impl(fact_table, mapping, true)
+}
+
+fn build_coalesced_fact_view_impl(
+    fact_table: &str,
+    mapping: &ColumnMapping,
+    include_row_metadata: bool,
+) -> String {
     let mut field_cols: Vec<&String> = mapping.field_names.iter().collect();
     field_cols.sort();
     let field_aggs: Vec<String> = field_cols
         .iter()
         .map(|f| {
             let q = quote_identifier(f);
-            format!("argMaxIf({q}, `ingest_seq`, isNotNull({q})) AS {q}")
+            let agg = match mapping.field_rollups.get(*f) {
+                Some(RollupCombine::Sum) => format!("sum({q})"),
+                Some(RollupCombine::Min) => format!("min({q})"),
+                Some(RollupCombine::Max) => format!("max({q})"),
+                Some(RollupCombine::First) => format!("argMin({q}, `time`)"),
+                Some(RollupCombine::Last) | None => format!("argMax({q}, `ingest_seq`)"),
+            };
+            format!("{agg} AS {q}")
         })
         .collect();
     let select_fields = if field_aggs.is_empty() {
@@ -459,8 +699,13 @@ pub fn build_coalesced_fact_view(fact_table: &str, mapping: &ColumnMapping) -> S
     } else {
         format!(", {}", field_aggs.join(", "))
     };
+    let row_meta = if include_row_metadata {
+        ", max(`ingest_seq`) AS `_mv_src_ingest_seq`, any(`origin_node_id`) AS `_mv_src_origin_node_id`"
+    } else {
+        ""
+    };
     format!(
-        "(SELECT `series_id`, `time`{select_fields} FROM {fact_table} GROUP BY `series_id`, `time`)"
+        "(SELECT `series_id`, `time`{row_meta}{select_fields} FROM {fact_table} GROUP BY `series_id`, `time`)"
     )
 }
 
@@ -515,15 +760,19 @@ fn group_by_tag_sql(tag: &str, mapping: Option<&ColumnMapping>) -> String {
 }
 
 fn time_bucket_expr(interval: &Duration, offset: Option<&Duration>) -> String {
+    time_bucket_expr_on("time", interval, offset)
+}
+
+fn time_bucket_expr_on(time_col: &str, interval: &Duration, offset: Option<&Duration>) -> String {
     let interval_str = interval.to_clickhouse_interval();
     if let Some(off) = offset {
         let off_str = off.to_clickhouse_interval();
         format!(
-            "toStartOfInterval(time - {}, {}) + {}",
+            "toStartOfInterval({time_col} - {}, {}) + {}",
             off_str, interval_str, off_str
         )
     } else {
-        format!("toStartOfInterval(time, {})", interval_str)
+        format!("toStartOfInterval({time_col}, {})", interval_str)
     }
 }
 
@@ -582,6 +831,17 @@ fn default_field_alias(expr: &Expr) -> Option<String> {
             }
         }
         _ => None,
+    }
+}
+
+/// Whether an expression tree contains a function call (aggregate, selector, or
+/// transform). Used to distinguish raw per-point selects from aggregate queries.
+fn expr_contains_call(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call(_) => true,
+        Expr::BinaryExpr(be) => expr_contains_call(&be.left) || expr_contains_call(&be.right),
+        Expr::UnaryExpr(_, e) => expr_contains_call(e),
+        _ => false,
     }
 }
 
@@ -666,6 +926,16 @@ fn translate_aggregate_call(
     let result = match name_upper.as_str() {
         "MEAN" => {
             let arg = get_single_arg(func, "MEAN")?;
+            if let Some(m) = mapping
+                && let Expr::Identifier(name) | Expr::FieldRef { name, .. } = arg
+                && let Some(mean_def) = m.mean_fields.get(name)
+            {
+                let sum_q = quote_identifier(&mean_def.sum_col);
+                let count_q = quote_identifier(&mean_def.count_col);
+                return Ok(wrap_fill(format!(
+                    "(sum({sum_q}) / nullIf(sum({count_q}), 0))"
+                )));
+            }
             let f = translate_aggregate_arg(arg, mapping)?;
             wrap_fill(format!("avg({})", f))
         }
@@ -1267,9 +1537,13 @@ fn epoch_duration_to_timestamp(d: &Duration) -> String {
         DurationUnit::Nanosecond => format!("fromUnixTimestamp64Nano({})", d.value),
         _ => {
             let nanos = d.to_nanos();
-            format!("fromUnixTimestamp64Nano({})", nanos)
+            nanos_to_ch_timestamp(nanos)
         }
     }
+}
+
+fn nanos_to_ch_timestamp(nanos: i64) -> String {
+    format!("fromUnixTimestamp64Nano({nanos})")
 }
 
 fn binary_op_to_clickhouse(op: &BinaryOp) -> &'static str {
@@ -1308,6 +1582,98 @@ fn format_float(f: f64) -> String {
     }
 }
 
+/// Remove user-supplied `time` comparisons from a WHERE clause. InfluxDB CQs
+/// ignore user time ranges and inject their own window each run.
+pub fn strip_time_predicates(condition: Option<Expr>) -> Option<Expr> {
+    condition.and_then(strip_time_predicates_expr)
+}
+
+fn strip_time_predicates_expr(expr: Expr) -> Option<Expr> {
+    match expr {
+        Expr::BinaryExpr(be) if matches!(be.op, BinaryOp::And) => {
+            let left = strip_time_predicates_expr(be.left);
+            let right = strip_time_predicates_expr(be.right);
+            match (left, right) {
+                (None, None) => None,
+                (Some(l), None) => Some(l),
+                (None, Some(r)) => Some(r),
+                (Some(l), Some(r)) => Some(Expr::BinaryExpr(Box::new(BinaryExpr {
+                    op: BinaryOp::And,
+                    left: l,
+                    right: r,
+                }))),
+            }
+        }
+        Expr::BinaryExpr(be) if is_time_epoch_comparison(&be) => None,
+        other => Some(other),
+    }
+}
+
+/// Build a WHERE clause for CQ coverage `[start, end)` in nanoseconds.
+pub fn cq_time_window_condition(start_nanos: i64, end_nanos: i64) -> Expr {
+    Expr::BinaryExpr(Box::new(BinaryExpr {
+        op: BinaryOp::And,
+        left: Expr::BinaryExpr(Box::new(BinaryExpr {
+            op: BinaryOp::Gte,
+            left: Expr::Identifier("time".to_string()),
+            right: Expr::IntegerLiteral(start_nanos),
+        })),
+        right: Expr::BinaryExpr(Box::new(BinaryExpr {
+            op: BinaryOp::Lt,
+            left: Expr::Identifier("time".to_string()),
+            right: Expr::IntegerLiteral(end_nanos),
+        })),
+    }))
+}
+
+/// Prepare a CQ inner SELECT for execution: strip user time bounds, inject the
+/// computed coverage window, and optionally strip `fill()` (basic syntax).
+pub fn prepare_cq_select(
+    stmt: &SelectStatement,
+    start_nanos: i64,
+    end_nanos: i64,
+    strip_fill: bool,
+) -> SelectStatement {
+    let mut prepared = stmt.clone();
+    let window = cq_time_window_condition(start_nanos, end_nanos);
+    let remaining = strip_time_predicates(prepared.condition.take());
+    prepared.condition = Some(match remaining {
+        Some(existing) => Expr::BinaryExpr(Box::new(BinaryExpr {
+            op: BinaryOp::And,
+            left: existing,
+            right: window,
+        })),
+        None => window,
+    });
+    if strip_fill {
+        prepared.fill = None;
+    }
+    prepared
+}
+
+/// `INSERT INTO <dest> SELECT ...` for a bounded CQ run against native tables.
+pub fn translate_bounded_cq_into(
+    stmt: &SelectStatement,
+    dest_table: &str,
+    source_table: &str,
+    mapping: Option<&ColumnMapping>,
+    series: Option<SeriesJoin<'_>>,
+    start_nanos: i64,
+    end_nanos: i64,
+) -> Result<String, HyperbytedbError> {
+    validate_select_into(stmt)?;
+    let prepared = prepare_cq_select(stmt, start_nanos, end_nanos, false);
+    let select_sql = translate_inner(
+        &prepared,
+        source_table,
+        mapping,
+        series,
+        Some((Some(start_nanos), Some(end_nanos))),
+    )?;
+    let select_sql = select_sql.replace("__time", "time");
+    Ok(format!("INSERT INTO {dest_table}\n{select_sql}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1316,7 +1682,7 @@ mod tests {
     const TEST_TABLE: &str = "`mydb_autogen_cpu`";
 
     fn translate_test(stmt: &SelectStatement) -> String {
-        translate_native_table(stmt, TEST_TABLE, None, None).unwrap()
+        translate_native_table(stmt, TEST_TABLE, None, None, None).unwrap()
     }
 
     const SERIES_TABLE: &str = "`mydb_autogen_cpu_series`";
@@ -1326,6 +1692,7 @@ mod tests {
         ColumnMapping {
             tag_keys: ["host", "region"].into_iter().map(String::from).collect(),
             field_names: ["usage_idle"].into_iter().map(String::from).collect(),
+            ..Default::default()
         }
     }
 
@@ -1339,6 +1706,7 @@ mod tests {
                 table: SERIES_TABLE,
                 force: false,
             }),
+            None,
         )
         .unwrap()
     }
@@ -1474,6 +1842,91 @@ mod tests {
         );
         assert!(sql.contains("avg(\"value\")"));
         assert!(sql.contains("WITH FILL STEP INTERVAL 5 MINUTE"));
+    }
+
+    #[test]
+    fn test_fill_null_with_time_bounds_uses_from_to() {
+        let stmt = parse_select(
+            r#"SELECT mean("load1") FROM "system" WHERE time >= 1781541739132ms AND time <= 1781552539132ms GROUP BY time(10s) fill(null)"#,
+        );
+        let min = 1_781_541_739_132_000_000i64;
+        let max = 1_781_552_539_132_000_000i64;
+        let sql =
+            translate_native_table(&stmt, TEST_TABLE, None, None, Some((Some(min), Some(max))))
+                .unwrap();
+        assert!(
+            sql.contains("WITH FILL FROM toStartOfInterval(fromUnixTimestamp64Nano(1781541739132000000), INTERVAL 10 SECOND)"),
+            "expected FROM bound aligned to bucket, got: {sql}"
+        );
+        assert!(
+            sql.contains("TO toStartOfInterval(fromUnixTimestamp64Nano(1781552539132000000), INTERVAL 10 SECOND)"),
+            "expected TO bound aligned to bucket, got: {sql}"
+        );
+        assert!(
+            sql.contains("STEP INTERVAL 10 SECOND"),
+            "expected STEP after FROM/TO, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_fill_with_group_by_tag_orders_tag_before_time() {
+        // fill() + GROUP BY tag must order the tag column *before* the
+        // time-fill column so ClickHouse fills each tag group independently.
+        // Otherwise WITH FILL emits gap rows with an empty tag value (a phantom
+        // all-NULL series) and never fills the real per-tag series.
+        let stmt = parse_select(
+            r#"SELECT mean("usage_idle") FROM cpu GROUP BY time(10s), "host" fill(null)"#,
+        );
+        let sql = translate_series(&stmt, &cpu_mapping());
+        assert!(
+            sql.contains(
+                "ORDER BY \"host\" ASC, toStartOfInterval(time, INTERVAL 10 SECOND) ASC WITH FILL"
+            ),
+            "tag must precede the time-fill column in ORDER BY, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_raw_select_projects_time_and_orders_ascending() {
+        // Raw (non-aggregate) selects must carry `time` and default to time ASC,
+        // matching InfluxDB. Without this, points come back in storage order.
+        let stmt = parse_select(r#"SELECT "load1", "load5" FROM system"#);
+        let sql = translate_test(&stmt);
+        assert!(
+            sql.starts_with("SELECT \"time\","),
+            "raw select must project time first, got: {sql}"
+        );
+        assert!(
+            sql.contains("ORDER BY time ASC"),
+            "raw select defaults to time ASC, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_group_by_time_defaults_to_order_by_time_ascending() {
+        let stmt = parse_select(r#"SELECT mean("value") FROM cpu GROUP BY time(5m)"#);
+        let sql = translate_test(&stmt);
+        assert!(
+            sql.contains("ORDER BY toStartOfInterval(time, INTERVAL 5 MINUTE) ASC"),
+            "GROUP BY time defaults to time ASC, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_aggregate_without_group_by_time_has_no_order_by() {
+        // Collapses to a single row — no ORDER BY (and no raw `time` column).
+        let stmt = parse_select(r#"SELECT mean("value") FROM cpu"#);
+        let sql = translate_test(&stmt);
+        assert!(!sql.contains("ORDER BY"), "got: {sql}");
+        assert!(!sql.contains("\"time\""), "no raw time column, got: {sql}");
+    }
+
+    #[test]
+    fn test_select_star_orders_by_time_without_duplicate_time() {
+        let stmt = parse_select("SELECT * FROM cpu");
+        let sql = translate_test(&stmt);
+        assert!(sql.starts_with("SELECT *"), "got: {sql}");
+        assert!(sql.contains("ORDER BY time ASC"), "got: {sql}");
     }
 
     #[test]
@@ -1848,19 +2301,128 @@ mod tests {
 
     #[test]
     fn test_translate_materialized_view_select() {
-        let q = r#"SELECT mean("value") INTO "cpu_5m" FROM "cpu" GROUP BY time(5m), *"#;
+        let q = r#"SELECT mean("value") INTO "cpu_5m" FROM "cpu" GROUP BY time(5m), "host""#;
         let stmt = parse_select(q);
         let map = cpu_mapping();
-        let sql = translate_materialized_view_select(&stmt, "`mydb_autogen_cpu`", &map).unwrap();
+        let sql = translate_materialized_view_select(
+            &stmt,
+            "`mydb_autogen_cpu`",
+            "`mydb_autogen_cpu_series`",
+            "cpu_5m",
+            &map,
+        )
+        .unwrap();
         assert!(sql.starts_with("SELECT "));
-        assert!(sql.contains("toStartOfInterval(time, INTERVAL 5 MINUTE) AS time"));
-        assert!(sql.contains("any(origin_node_id) AS origin_node_id"));
-        assert!(sql.contains("max(ingest_seq) AS ingest_seq"));
-        assert!(sql.contains("series_id"));
-        assert!(sql.contains("avg(\"value\")"));
-        assert!(sql.contains("FROM `mydb_autogen_cpu`"));
-        assert!(sql.contains("GROUP BY series_id, time"));
+        assert!(sql.contains("toStartOfInterval(t.time, INTERVAL 5 MINUTE) AS time"));
+        assert!(sql.contains("any(t.`_mv_src_origin_node_id`) AS origin_node_id"));
+        assert!(sql.contains("max(t.`_mv_src_ingest_seq`) AS ingest_seq"));
+        assert!(sql.contains("sipHash64("));
+        assert!(sql.contains("sum(\"value\") AS \"sum_value\""));
+        assert!(sql.contains("count(\"value\") AS \"count_value\""));
+        assert!(!sql.contains("avg(\"value\")"));
+        assert!(
+            sql.contains("argMax(\"value\", `ingest_seq`)"),
+            "MV source should coalesce duplicate raw rows before aggregating"
+        );
+        assert!(
+            sql.contains(
+                "FROM (SELECT `series_id`, `time`, max(`ingest_seq`) AS `_mv_src_ingest_seq`"
+            ),
+            "MV should read from coalesced source subquery, got: {sql}"
+        );
+        assert!(sql.contains("AS t ANY INNER JOIN `mydb_autogen_cpu_series` AS s"));
+        assert!(sql.contains("GROUP BY toStartOfInterval(t.time, INTERVAL 5 MINUTE)"));
+        assert!(sql.contains("s.\"host\""));
         assert!(!sql.contains("INSERT INTO"));
+    }
+
+    #[test]
+    fn materialized_view_backfill_orders_insert_columns_by_physical_name() {
+        let q = r#"SELECT sum("players") AS "players", sum("max_players") AS "maxplayers", sum("cpu") AS "cpu" INTO "server_stats_1m" FROM "server_stats" GROUP BY time(1m), "host""#;
+        let stmt = parse_select(q);
+        let map = cpu_mapping();
+        let sql = translate_materialized_view_backfill(
+            &stmt,
+            "`dest`",
+            "`source`",
+            "`source_series`",
+            "server_stats_1m",
+            &map,
+        )
+        .unwrap();
+        assert!(
+            sql.starts_with(
+                "INSERT INTO `dest` (\"time\", \"origin_node_id\", \"ingest_seq\", \"series_id\", \"cpu\", \"maxplayers\", \"players\")"
+            ),
+            "backfill must name columns in DDL order, got: {sql}"
+        );
+        assert!(
+            sql.contains("SELECT \"time\", \"origin_node_id\", \"ingest_seq\", \"series_id\", \"cpu\", \"maxplayers\", \"players\"\nFROM ("),
+            "backfill outer SELECT must match INSERT column order, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn rollup_fact_view_uses_sum_for_additive_fields() {
+        use crate::domain::rollup::RollupCombine;
+
+        let mut map = cpu_mapping();
+        map.field_rollups
+            .insert("usage_idle".to_string(), RollupCombine::Sum);
+        let sql = build_coalesced_fact_view(TEST_TABLE, &map);
+        assert!(
+            sql.contains("sum(\"usage_idle\") AS \"usage_idle\""),
+            "rollup fields should merge with sum(), got: {sql}"
+        );
+        assert!(
+            !sql.contains("argMax(\"usage_idle\""),
+            "rollup sum fields must not use argMax, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn raw_fact_view_still_uses_argmax_without_rollups() {
+        let map = cpu_mapping();
+        let sql = build_coalesced_fact_view(TEST_TABLE, &map);
+        assert!(
+            sql.contains("argMax(\"usage_idle\", `ingest_seq`)"),
+            "raw measurements should keep argMax coalesce, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn mean_on_rollup_measurement_rewrites_to_sum_over_count() {
+        use crate::domain::rollup::{MeanRollupField, RollupCombine};
+
+        let mut map = cpu_mapping();
+        map.mean_fields.insert(
+            "value".to_string(),
+            MeanRollupField {
+                sum_col: "sum_value".to_string(),
+                count_col: "count_value".to_string(),
+            },
+        );
+        map.field_rollups
+            .insert("sum_value".to_string(), RollupCombine::Sum);
+        map.field_rollups
+            .insert("count_value".to_string(), RollupCombine::Sum);
+
+        let stmt = parse_select(r#"SELECT mean("value") FROM cpu GROUP BY time(5m), "host""#);
+        let sql = translate_native_table(
+            &stmt,
+            TEST_TABLE,
+            Some(&map),
+            Some(SeriesJoin {
+                table: SERIES_TABLE,
+                force: false,
+            }),
+            None,
+        )
+        .unwrap();
+        assert!(
+            sql.contains("sum(\"sum_value\") / nullIf(sum(\"count_value\"), 0)"),
+            "expected weighted mean rewrite, got: {sql}"
+        );
     }
 
     #[test]
@@ -1877,6 +2439,7 @@ mod tests {
                 table: SERIES_TABLE,
                 force: false,
             }),
+            None,
         )
         .unwrap();
         assert!(
@@ -1905,8 +2468,8 @@ mod tests {
             "field-only query should not join the series table, got: {sql}"
         );
         assert!(
-            sql.contains("argMaxIf(\"usage_idle\", `ingest_seq`, isNotNull(\"usage_idle\"))"),
-            "field-only query should coalesce partial rows, got: {sql}"
+            sql.contains("argMax(\"usage_idle\", `ingest_seq`)"),
+            "field-only query should collapse duplicate rows by ingest_seq, got: {sql}"
         );
         assert!(sql.contains("FROM `mydb_autogen_cpu`"), "got: {sql}");
     }
@@ -1936,10 +2499,11 @@ mod tests {
                 table: SERIES_TABLE,
                 force: false,
             }),
+            None,
         )
         .unwrap();
         assert!(
-            sql.contains("argMaxIf(\"usage_idle\", `ingest_seq`, isNotNull(\"usage_idle\"))"),
+            sql.contains("argMax(\"usage_idle\", `ingest_seq`)"),
             "expected coalesced fact view, got: {sql}"
         );
         assert!(
@@ -2021,6 +2585,7 @@ mod tests {
                 table: SERIES_TABLE,
                 force: true,
             }),
+            None,
         )
         .unwrap();
         assert!(

@@ -50,6 +50,7 @@ Local directories for the write-ahead log and metadata store. Time-series data l
 |-----|------|---------|-------------|
 | `wal_dir` | string | `"./wal"` | Write-ahead log directory (RocksDB) |
 | `meta_dir` | string | `"./meta"` | Metadata directory (RocksDB) |
+| `wal_format` | string | `"bincode"` | Durable WAL value encoding: `bincode` or `arrow_ipc` (Arrow IPC stream + embedded legacy entry for peer sync) |
 
 ---
 
@@ -65,6 +66,7 @@ Controls the background WAL-to-chDB flush pipeline.
 | `max_points_per_batch` | integer | `50000` | Max points per chDB insert batch (server clamps to 10k–500k; `0` uses the same default) |
 | `wal_batch_size` | integer | `64` | WAL group-commit: max entries to coalesce per write batch; `0` = disabled |
 | `wal_batch_delay_us` | integer | `200` | WAL group-commit: max microseconds to wait for more entries before flushing |
+| `arrow_wal_enabled` | boolean | `true` | Keep chDB-ready Arrow `RecordBatch`es in an in-memory WAL cache for zero-copy flush |
 
 ---
 
@@ -75,7 +77,7 @@ Embedded ClickHouse (chDB) query engine settings.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `session_data_path` | string | `"./chdb_data"` | chDB session state directory |
-| `pool_size` | integer | `1` | **Ignored.** libchdb is a process-global singleton (one real session). Values other than `1` log a warning at startup. Parallelism is controlled with `server.max_concurrent_queries`. |
+| `pool_size` | integer | `4` | Number of chDB connections to the same `session_data_path`. Each connection has its own client mutex, so flush inserts and concurrent queries overlap when `pool_size > 1`. Clamped to 1–32. For best overlap, set `server.max_concurrent_queries` ≥ `pool_size`. |
 
 ---
 
@@ -149,11 +151,6 @@ Per-node coordinator replication behavior. If the whole block is omitted, mode i
 |-----|------|---------|-------------|
 | `level` | string | `"info"` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
 | `format` | string | `"text"` | Output format: `"text"` or `"json"` (structured, for Loki and similar) |
-| `detailed_trace` | boolean | `false` | Per-phase tracing spans on write, query, and flush hot paths |
-| `otlp_endpoint` | string | *unset* | OTLP HTTP collector URL (e.g. `http://alloy:4318`); `/v1/traces` is appended automatically |
-| `otlp_sample_ratio` | float | `1.0` | Fraction of traces exported to OTLP (`0.0`–`1.0`) |
-
-Set `format = "json"` and `detailed_trace = true` for rich local debugging. Pair with `otlp_endpoint` to export traces to Tempo. The Docker Compose stack enables all three by default.
 
 ---
 
@@ -200,7 +197,7 @@ Controls the background retention enforcement loop. Per-policy `duration` values
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | boolean | `true` | When `false`, expired rows are not deleted automatically |
-| `interval` | string | `"60s"` | How often retention scans run (`humantime` duration, e.g. `1m`, `1h`) |
+| `interval` | string | `"12h"` | How often retention scans run (`humantime` duration, e.g. `1m`, `1h`) |
 
 ---
 
@@ -220,6 +217,7 @@ interval_secs = 10
 
 [chdb]
 session_data_path = "./chdb_data"
+pool_size = 4
 
 [logging]
 level = "info"
@@ -264,9 +262,6 @@ max_measurements_per_database = 10000
 [logging]
 level = "info"
 format = "json"
-detailed_trace = true
-otlp_endpoint = "http://alloy:4318"
-otlp_sample_ratio = 0.1
 ```
 
 ## Example: Environment Variable Overrides
@@ -280,8 +275,6 @@ export HYPERBYTEDB__CHDB__SESSION_DATA_PATH=/var/lib/hyperbytedb/chdb
 export HYPERBYTEDB__SERVER__MAX_CONCURRENT_QUERIES=32
 export HYPERBYTEDB__LOGGING__LEVEL=debug
 export HYPERBYTEDB__LOGGING__FORMAT=json
-export HYPERBYTEDB__LOGGING__DETAILED_TRACE=true
-export HYPERBYTEDB__LOGGING__OTLP_ENDPOINT=http://alloy:4318
 export HYPERBYTEDB__RETENTION__INTERVAL=5m
 ```
 
