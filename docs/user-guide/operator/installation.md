@@ -35,15 +35,15 @@ Install the latest release:
 
 ```bash
 helm install hyperbytedb-operator \
-  oci://ghcr.io/hyperbyte-cloud/hyperbytedb-operator \
+  oci://ghcr.io/hyperbyte-cloud/charts/hyperbytedb-operator \
   --namespace hyperbytedb-system
 ```
 
-Install a specific **Helm chart** version. The value passed to `--version` is the **operator chart** release (not necessarily the `hyperbytedb` server crate version in this repo’s `Cargo.toml`). Use the tag published to `oci://ghcr.io/hyperbyte-cloud/hyperbytedb-operator` for your target release.
+Install a specific **Helm chart** version. The value passed to `--version` is the **operator chart** release (not necessarily the `hyperbytedb` server crate version in this repo’s `Cargo.toml`). Use the tag published to `oci://ghcr.io/hyperbyte-cloud/charts/hyperbytedb-operator` for your target release.
 
 ```bash
 helm install hyperbytedb-operator \
-  oci://ghcr.io/hyperbyte-cloud/hyperbytedb-operator \
+  oci://ghcr.io/hyperbyte-cloud/charts/hyperbytedb-operator \
   --version 0.6.0 \
   --namespace hyperbytedb-system
 ```
@@ -85,7 +85,7 @@ Override default values with `--set` or a values file:
 
 ```bash
 helm install hyperbytedb-operator \
-  oci://ghcr.io/hyperbyte-cloud/hyperbytedb-operator \
+  oci://ghcr.io/hyperbyte-cloud/charts/hyperbytedb-operator \
   --namespace hyperbytedb-system \
   --values custom-values.yaml
 ```
@@ -94,13 +94,18 @@ See the chart's `values.yaml` for all available configuration options. Key setti
 
 | Value | Default | Description |
 |-------|---------|-------------|
-| `controllerManager.manager.image.repository` | `controller` | Operator container image |
-| `controllerManager.manager.image.tag` | Chart appVersion | Image tag |
-| `controllerManager.manager.resources.limits.cpu` | `500m` | CPU limit |
-| `controllerManager.manager.resources.limits.memory` | `128Mi` | Memory limit |
-| `controllerManager.manager.resources.requests.cpu` | `10m` | CPU request |
-| `controllerManager.manager.resources.requests.memory` | `64Mi` | Memory request |
-| `controllerManager.replicas` | `1` | Number of operator replicas |
+| `manager.image.repository` | `ghcr.io/hyperbyte-cloud/hyperbytedb-operator` | Operator container image |
+| `manager.image.tag` | Chart appVersion | Image tag (empty tracks the chart's appVersion) |
+| `manager.replicas` | `1` | Number of operator replicas |
+| `manager.resources.limits.cpu` | `500m` | CPU limit |
+| `manager.resources.limits.memory` | `128Mi` | Memory limit |
+| `manager.resources.requests.cpu` | `10m` | CPU request |
+| `manager.resources.requests.memory` | `64Mi` | Memory request |
+| `crd.enable` | `true` | Install the CRDs with the chart |
+| `crd.keep` | `true` | Retain CRDs on `helm uninstall` |
+| `metrics.enable` | `true` | Expose the RBAC-protected `/metrics` endpoint |
+| `prometheus.enable` | `false` | Create a Prometheus `ServiceMonitor` (requires prometheus-operator) |
+| `rbacHelpers.enable` | `false` | Install convenience admin/editor/viewer roles for the CRDs |
 
 ---
 
@@ -108,7 +113,7 @@ See the chart's `values.yaml` for all available configuration options. Key setti
 
 ```bash
 helm upgrade hyperbytedb-operator \
-  oci://ghcr.io/hyperbyte-cloud/hyperbytedb-operator \
+  oci://ghcr.io/hyperbyte-cloud/charts/hyperbytedb-operator \
   --namespace hyperbytedb-system \
   --version <new-version>
 ```
