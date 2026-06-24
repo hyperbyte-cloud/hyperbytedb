@@ -288,7 +288,7 @@ HyperbyteDB stores WAL, metadata, Raft state, and chDB session data on the per-r
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | `true` | Run the background retention enforcement loop |
-| `interval` | string | `12h` | How often retention scans run (humantime duration) |
+| `interval` | string | `60s` | How often retention scans run (humantime duration) |
 
 ### `cluster`
 
