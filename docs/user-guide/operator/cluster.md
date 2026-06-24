@@ -6,96 +6,23 @@ The `HyperbytedbCluster` custom resource declares a HyperbyteDB database deploym
 
 ## Quick Start
 
+Deploy the operator first, then apply one of the examples below.
+
 ### Single Node
 
 A minimal single-node deployment for development or testing:
 
-```yaml
-apiVersion: hyperbytedb.hyperbyte.cloud/v1alpha1
-kind: HyperbytedbCluster
-metadata:
-  name: hyperbytedb-single
-  namespace: default
-spec:
-  replicas: 1
-  image: hyperbytedb:latest
-  version: "1.0.0"
-  server:
-    port: 8086
-  storage:
-    volumeClaimTemplate:
-      size: 5Gi
-  retention:
-    enabled: true
-    interval: 12h
-  resources:
-    requests:
-      cpu: 250m
-      memory: 512Mi
-    limits:
-      cpu: "1"
-      memory: 2Gi
+```bash
+kubectl apply -f https://raw.githubusercontent.com/hyperbyte-cloud/hyperbytedb/main/deploy/examples/single-node.yaml
 ```
 
 ### Three-Node Cluster
 
-A production-ready cluster with replication, monitoring, and failover:
+A production-ready cluster with replication, monitoring, and failover.
+Requires at least 3 worker nodes or a `topologySpreadConstraints` override.
 
-```yaml
-apiVersion: hyperbytedb.hyperbyte.cloud/v1alpha1
-kind: HyperbytedbCluster
-metadata:
-  name: hyperbytedb-cluster
-  namespace: default
-spec:
-  replicas: 3
-  image: hyperbytedb:latest
-  version: "1.0.0"
-  server:
-    port: 8086
-    requestTimeoutSecs: 30
-    queryTimeoutSecs: 30
-  storage:
-    volumeClaimTemplate:
-      size: 10Gi
-  flush:
-    intervalSecs: 10
-    walSizeThresholdMb: 64
-    timeBucketDuration: "1h"
-  chdb:
-    sessionDataPath: /var/lib/hyperbytedb/chdb
-  retention:
-    enabled: true
-    interval: 12h
-  logging:
-    level: info
-    format: json
-  resources:
-    requests:
-      cpu: 500m
-      memory: 1Gi
-    limits:
-      cpu: "2"
-      memory: 4Gi
-  cluster:
-    heartbeatIntervalSecs: 2
-    heartbeatMissThreshold: 5
-    replicationMaxRetries: 5
-    raftHeartbeatIntervalMs: 300
-    raftElectionTimeoutMs: 1000
-    replication:
-      mode: async
-      ackTimeoutMs: 5000
-  monitoring:
-    enabled: true
-    serviceMonitor: true
-  failover:
-    enabled: true
-    maxFailoverCount: 1
-    failoverTimeoutSecs: 300
-  podAnnotations:
-    prometheus.io/scrape: "true"
-    prometheus.io/port: "8086"
+```bash
+kubectl apply -f https://raw.githubusercontent.com/hyperbyte-cloud/hyperbytedb/main/deploy/examples/three-node.yaml
 ```
 
 ### High-Availability with Autoscaling
@@ -111,7 +38,7 @@ metadata:
 spec:
   replicas: 5
   image: hyperbytedb:latest
-  version: "1.0.0"
+  version: "0.8.3"
   server:
     port: 8086
     requestTimeoutSecs: 60
@@ -207,7 +134,7 @@ metadata:
 spec:
   replicas: 3
   image: hyperbytedb:latest
-  version: "1.0.0"
+  version: "0.8.3"
   server:
     port: 8086
     tls:

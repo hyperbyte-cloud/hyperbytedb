@@ -1,0 +1,24 @@
+apiVersion: hyperbytedb.hyperbyte.cloud/v1alpha1
+kind: HyperbytedbCluster
+metadata:
+  name: hyperbytedb-single
+  namespace: default
+spec:
+  replicas: 1
+  image: hyperbytedb:latest
+  version: "0.8.3"
+  server:
+    port: 8086
+  storage:
+    volumeClaimTemplate:
+      size: 5Gi
+  retention:
+    enabled: true
+    interval: 12h
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 2Gi

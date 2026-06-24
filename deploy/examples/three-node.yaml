@@ -1,0 +1,54 @@
+apiVersion: hyperbytedb.hyperbyte.cloud/v1alpha1
+kind: HyperbytedbCluster
+metadata:
+  name: hyperbytedb-cluster
+  namespace: default
+spec:
+  replicas: 3
+  image: hyperbytedb:latest
+  version: "0.8.3"
+  server:
+    port: 8086
+    requestTimeoutSecs: 30
+    queryTimeoutSecs: 30
+  storage:
+    volumeClaimTemplate:
+      size: 10Gi
+  flush:
+    intervalSecs: 10
+    walSizeThresholdMb: 64
+    timeBucketDuration: "1h"
+  chdb:
+    sessionDataPath: /var/lib/hyperbytedb/chdb
+  retention:
+    enabled: true
+    interval: 12h
+  logging:
+    level: info
+    format: json
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 4Gi
+  cluster:
+    heartbeatIntervalSecs: 2
+    heartbeatMissThreshold: 5
+    replicationMaxRetries: 5
+    raftHeartbeatIntervalMs: 300
+    raftElectionTimeoutMs: 1000
+    replication:
+      mode: async
+      ackTimeoutMs: 5000
+  monitoring:
+    enabled: true
+    serviceMonitor: true
+  failover:
+    enabled: true
+    maxFailoverCount: 1
+    failoverTimeoutSecs: 300
+  podAnnotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8086"
