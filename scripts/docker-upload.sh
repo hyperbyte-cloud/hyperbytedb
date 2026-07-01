@@ -52,7 +52,7 @@ if [ -z "$version" ]; then
     exit 1
 fi
 
-image="$registry/hyperbytedb:v$version"
+image="$registry/hyperbytedb:$version"
 latest="$registry/hyperbytedb:latest"
 
 # Use a dedicated builder so we don't clobber the default `docker` driver
