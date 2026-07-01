@@ -1,0 +1,26 @@
+# syntax=docker/dockerfile:1
+#
+# Release runtime image for hyperbytedb-proxy assembled from PREBUILT binaries.
+# The release workflow (.github/workflows/release.yml) compiles the proxy per
+# architecture in parallel on GitHub-hosted runners, uploads staging artifacts,
+# and points this Dockerfile at the merged tree as its build context:
+#
+#   release-staging/
+#     amd64/{hyperbytedb-proxy, ...}
+#     arm64/{hyperbytedb-proxy, ...}
+FROM debian:bookworm-slim
+
+ARG TARGETARCH
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY ${TARGETARCH}/hyperbytedb-proxy /usr/local/bin/hyperbytedb-proxy
+
+EXPOSE 8086
+
+ENV HYPERBYTEDB_PROXY_LISTEN=0.0.0.0:8086 \
+    HYPERBYTEDB_PROXY_BACKEND_PORT=8086
+
+ENTRYPOINT ["/usr/local/bin/hyperbytedb-proxy"]
