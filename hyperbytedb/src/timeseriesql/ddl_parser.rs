@@ -262,7 +262,21 @@ fn parse_drop(cur: &mut TokenCursor<'_>) -> Result<Statement, HyperbytedbError> 
     let kw = cur.take_ident()?;
     match kw.to_uppercase().as_str() {
         "DATABASE" => Ok(Statement::DropDatabase(cur.take_ident()?)),
-        "MEASUREMENT" => Ok(Statement::DropMeasurement(cur.take_ident()?)),
+        "MEASUREMENT" => {
+            let meas = parse_measurement_ref(cur)?;
+            let name = match meas.name {
+                MeasurementName::Name(n) => n,
+                MeasurementName::Regex(p) => {
+                    return Err(HyperbytedbError::QueryParse(format!(
+                        "DROP MEASUREMENT does not support regex: /{p}/"
+                    )));
+                }
+            };
+            Ok(Statement::DropMeasurement {
+                name,
+                rp: meas.retention_policy,
+            })
+        }
         "SERIES" => parse_drop_series(cur),
         "RETENTION" => {
             cur.expect_keyword("POLICY")?;
@@ -968,5 +982,36 @@ mod tests {
         // an "unterminated regex literal" error.
         let stmt = parse_ddl_statement("DELETE FROM cpu WHERE time > 1000/2").unwrap();
         assert!(matches!(stmt, Statement::Delete(_)));
+    }
+
+    #[test]
+    fn drop_measurement_with_rp() {
+        let stmt =
+            parse_ddl_statement(r#"DROP MEASUREMENT "default_high"."server_stats""#).unwrap();
+        match stmt {
+            Statement::DropMeasurement { name, rp } => {
+                assert_eq!(name, "server_stats");
+                assert_eq!(rp.as_deref(), Some("default_high"));
+            }
+            other => panic!("expected DropMeasurement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drop_measurement_without_rp() {
+        let stmt = parse_ddl_statement(r#"DROP MEASUREMENT "server_stats""#).unwrap();
+        match stmt {
+            Statement::DropMeasurement { name, rp } => {
+                assert_eq!(name, "server_stats");
+                assert!(rp.is_none());
+            }
+            other => panic!("expected DropMeasurement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drop_measurement_rejects_regex() {
+        let result = parse_ddl_statement(r#"DROP MEASUREMENT /^server/"#);
+        assert!(result.is_err());
     }
 }

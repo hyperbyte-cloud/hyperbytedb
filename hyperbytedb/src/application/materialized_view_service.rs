@@ -120,6 +120,21 @@ impl MaterializedViewService {
         let series_mv = quoted_series_mv_name(db, &def.dest_rp, name);
         self.drop_ch_mv_objects(&fact_mv, &series_mv).await?;
 
+        // Drop the destination fact + series tables to avoid orphaned tables.
+        if let Err(e) = self
+            .points_sink
+            .drop_measurement(&def.dest_db, &def.dest_rp, &def.dest_measurement)
+            .await
+        {
+            tracing::warn!(
+                mv = %name,
+                db = %db,
+                dest = %def.dest_measurement,
+                error = %e,
+                "failed to drop MV destination tables"
+            );
+        }
+
         self.metadata.drop_materialized_view(db, name).await?;
 
         tracing::info!(mv = %name, db = %db, "materialized view dropped");
@@ -371,11 +386,14 @@ impl MaterializedViewService {
             build_create_fact_materialized_view(&fact_mv_quoted, &dest_fact, &select_sql);
         self.query_port.execute_sql(&create_fact_mv).await?;
 
+        let dest_field_names: std::collections::HashSet<String> =
+            dest_meta.field_types.keys().cloned().collect();
         let series_select = to_clickhouse::translate_materialized_view_series_select(
             &effective_query,
             &source_series,
             &dest_measurement,
             &source_mapping,
+            Some(&dest_field_names),
         )?;
         let create_series_mv =
             build_create_series_materialized_view(&series_mv_quoted, &dest_series, &series_select);
@@ -523,5 +541,6 @@ fn dest_measurement_meta(
         tag_keys,
         field_rollups,
         mean_fields,
+        materialized: true,
     })
 }

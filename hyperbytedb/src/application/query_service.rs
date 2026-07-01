@@ -252,7 +252,7 @@ fn is_mutating_statement(stmt: &Statement) -> bool {
         | Statement::ShowMaterializedViews => false,
         Statement::CreateDatabase(_)
         | Statement::DropDatabase(_)
-        | Statement::DropMeasurement(_)
+        | Statement::DropMeasurement { .. }
         | Statement::DropSeries(_)
         | Statement::DropUser(_)
         | Statement::CreateRetentionPolicyStmt { .. }
@@ -772,7 +772,7 @@ async fn execute_statement(
                 error: None,
             })
         }
-        Statement::DropMeasurement(name) => {
+        Statement::DropMeasurement { name, rp: stmt_rp } => {
             if let Err(e) = svc.mv_service.drop_for_source_measurement(db, name).await {
                 tracing::warn!(
                     db = db,
@@ -781,11 +781,14 @@ async fn execute_statement(
                     "failed to cascade-drop materialized views for source measurement"
                 );
             }
-            let rp = svc
-                .metadata
-                .get_default_rp(db)
-                .await
-                .unwrap_or_else(|_| "autogen".to_string());
+            let rp = if let Some(inner) = stmt_rp {
+                inner.clone()
+            } else {
+                svc.metadata
+                    .get_default_rp(db)
+                    .await
+                    .unwrap_or_else(|_| "autogen".to_string())
+            };
             svc.metadata.delete_measurement(db, name).await?;
             if let Err(e) = svc.points_sink.drop_measurement(db, &rp, name).await {
                 tracing::warn!(
@@ -1621,18 +1624,47 @@ async fn execute_select_from_source(
             let sub_mapping = svc.column_mapping_for(query_db, sub_source).await?;
             let table = quoted_table_name(query_db, &rp, sub_source);
             let sub_series_table = quoted_series_table_name(query_db, &rp, sub_source);
-            let sub_series_join = sub_mapping.as_ref().map(|_| to_clickhouse::SeriesJoin {
-                table: &sub_series_table,
-                force: false,
-            });
-            let sub_tag_keys = tag_keys_from_mapping(sub_mapping.as_ref());
+
+            let sub_effective_mapping = if let Some(ref mapping) = sub_mapping {
+                let fact_cols = fact_table_columns(svc, query_db, &rp, sub_source).await?;
+                if mapping.field_names.iter().any(|f| !fact_cols.contains(f)) {
+                    let mut reconciled = mapping.clone();
+                    reconciled.field_names = fact_cols.iter().cloned().collect();
+                    for col in &fact_cols {
+                        reconciled
+                            .field_rollups
+                            .entry(col.clone())
+                            .or_insert(crate::domain::rollup::RollupCombine::Last);
+                    }
+                    Some(reconciled)
+                } else {
+                    sub_mapping.clone()
+                }
+            } else {
+                None
+            };
+
+            let sub_series_tag_columns: Vec<String> =
+                series_table_columns(svc, query_db, &rp, sub_source)
+                    .await?
+                    .into_iter()
+                    .collect();
+            let sub_series_join =
+                sub_effective_mapping
+                    .as_ref()
+                    .map(|_| to_clickhouse::SeriesJoin {
+                        table: &sub_series_table,
+                        force: false,
+                        tag_columns: &sub_series_tag_columns,
+                    });
+            let sub_tag_keys = tag_keys_from_mapping(sub_effective_mapping.as_ref());
             let (sub_stmt_expanded, _) = select_with_expanded_group_by(sub_stmt, &sub_tag_keys);
             let (select_stmt_expanded, resolved_group_by_tags) =
                 select_with_expanded_group_by(select_stmt, &sub_tag_keys);
             let sub_sql = to_clickhouse::translate_native_table(
                 &sub_stmt_expanded,
                 &table,
-                sub_mapping.as_ref(),
+                sub_effective_mapping.as_ref(),
                 sub_series_join,
                 Some((time_min, time_max)),
             )?;
@@ -1670,14 +1702,44 @@ async fn execute_measurement_query(
 
     let table = quoted_table_name(db, rp, measurement);
     let series_table = quoted_series_table_name(db, rp, measurement);
-    let series_join = column_mapping.as_ref().map(|_| to_clickhouse::SeriesJoin {
-        table: &series_table,
-        force: !tombstones.is_empty(),
-    });
+
+    // Reconcile the column mapping's field names with the fact table's actual columns.
+    // MV destinations (e.g. from CREATE MATERIALIZED VIEW) may rename fields via aliases,
+    // so the source column mapping's field names may not match the table's column names.
+    let effective_mapping = if let Some(ref mapping) = column_mapping {
+        let fact_cols = fact_table_columns(svc, db, rp, measurement).await?;
+        if mapping.field_names.iter().any(|f| !fact_cols.contains(f)) {
+            let mut reconciled = mapping.clone();
+            reconciled.field_names = fact_cols.iter().cloned().collect();
+            for col in &fact_cols {
+                reconciled
+                    .field_rollups
+                    .entry(col.clone())
+                    .or_insert(crate::domain::rollup::RollupCombine::Last);
+            }
+            Some(reconciled)
+        } else {
+            column_mapping.clone()
+        }
+    } else {
+        None
+    };
+
+    let series_tag_columns: Vec<String> = series_table_columns(svc, db, rp, measurement)
+        .await?
+        .into_iter()
+        .collect();
+    let series_join = effective_mapping
+        .as_ref()
+        .map(|_| to_clickhouse::SeriesJoin {
+            table: &series_table,
+            force: !tombstones.is_empty(),
+            tag_columns: &series_tag_columns,
+        });
     let mut sql = to_clickhouse::translate_native_table(
         &effective_stmt,
         &table,
-        column_mapping.as_ref(),
+        effective_mapping.as_ref(),
         series_join,
         Some((time_min, time_max)),
     )?;
@@ -1858,6 +1920,29 @@ async fn tag_values_for_measurement(
     let phys_col = quote_backticks(&phys);
     let sql = format!(
         "SELECT DISTINCT {phys_col} FROM {series_table} WHERE {phys_col} != '' ORDER BY {phys_col} FORMAT TabSeparated"
+    );
+    let raw = svc.query_port.execute_sql(&sql).await?;
+    Ok(raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Query the non-system column names that exist in the fact table for a given
+/// (db, rp, measurement). Excludes columns managed by the engine.
+async fn fact_table_columns(
+    svc: &QueryServiceImpl,
+    db: &str,
+    rp: &str,
+    measurement: &str,
+) -> Result<Vec<String>, HyperbytedbError> {
+    use crate::domain::chdb_naming::unquoted_table_name;
+    let table = unquoted_table_name(db, rp, measurement);
+    let sql = format!(
+        "SELECT name FROM system.columns WHERE table = '{}' AND name NOT IN ('series_id', 'time', 'origin_node_id', 'ingest_seq') FORMAT TabSeparated",
+        table.replace('\'', "''")
     );
     let raw = svc.query_port.execute_sql(&sql).await?;
     Ok(raw
