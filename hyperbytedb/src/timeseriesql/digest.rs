@@ -22,7 +22,7 @@ pub fn stmt_type(stmt: &Statement) -> &'static str {
         Statement::CreateContinuousQuery(_) => "CREATE",
         Statement::CreateMaterializedView(_) => "CREATE",
         Statement::DropDatabase(_) => "DROP",
-        Statement::DropMeasurement(_) => "DROP",
+        Statement::DropMeasurement { .. } => "DROP",
         Statement::DropSeries(_) => "DROP",
         Statement::DropUser(_) => "DROP",
         Statement::DropRetentionPolicyStmt { .. } => "DROP",
@@ -116,7 +116,7 @@ fn normalize_statement(stmt: &Statement) -> String {
         Statement::ShowMaterializedViews => out.push_str("show materialized views"),
         Statement::CreateDatabase(_) => out.push_str("create database ?"),
         Statement::DropDatabase(_) => out.push_str("drop database ?"),
-        Statement::DropMeasurement(_) => out.push_str("drop measurement ?"),
+        Statement::DropMeasurement { .. } => out.push_str("drop measurement ?"),
         Statement::DropSeries(_) => out.push_str("drop series ?"),
         Statement::CreateRetentionPolicyStmt { .. } => {
             out.push_str("create retention policy ?");

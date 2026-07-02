@@ -98,6 +98,9 @@ pub struct SeriesJoin<'a> {
     /// tag. Set when tombstone predicates (spliced into WHERE post-translation)
     /// reference tag columns that must be present in the FROM source.
     pub force: bool,
+    /// Physical column names that actually exist in the series table.
+    /// When empty, all tags from the ColumnMapping are projected (backward-compat).
+    pub tag_columns: &'a [String],
 }
 
 /// Translate against a native MergeTree table (or other pre-formatted FROM
@@ -419,11 +422,37 @@ pub fn translate_materialized_view_select(
         "s",
     );
 
-    let field_strs: Vec<String> = stmt
-        .fields
-        .iter()
-        .map(|f| translate_materialized_view_field(f, stmt.group_by.as_ref(), mapping))
-        .collect::<Result<Vec<_>, _>>()?;
+    // Field columns must appear in sorted-by-name order to match the
+    // destination fact table's DDL column order (build_create_table_sql
+    // sorts fields by physical name). ClickHouse INSERT matches by position
+    // when no explicit column list is given in the TO clause.
+    // mean() expands to two columns (sum_col, count_col) — flatten them
+    // individually so the interleaved sort is correct.
+    let mut field_expr_by_name: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for field in &stmt.fields {
+        if let Expr::Call(func) = &field.expr
+            && func.name.eq_ignore_ascii_case("mean")
+        {
+            let source = aggregate_source_field_name(func)?;
+            let col = mapping.physical_select_identifier(&source);
+            let col_q = quote_identifier(&col);
+            let (sum_col, count_col) = mean_rollup_column_names(&source);
+            let sum_expr = format!("sum({col_q}) AS {}", quote_identifier(&sum_col));
+            let count_expr = format!("count({col_q}) AS {}", quote_identifier(&count_col));
+            field_expr_by_name.insert(sum_col.clone(), sum_expr);
+            field_expr_by_name.insert(count_col.clone(), count_expr);
+        } else {
+            let expr = translate_materialized_view_field(field, stmt.group_by.as_ref(), mapping)?;
+            let name = select_output_field_name(field).ok_or_else(|| {
+                HyperbytedbError::QueryParse(
+                    "materialized view field requires a name or alias".to_string(),
+                )
+            })?;
+            field_expr_by_name.insert(name, expr);
+        }
+    }
+    let sorted_field_strs: Vec<String> = field_expr_by_name.into_values().collect();
 
     let mut select_parts = vec![
         format!("{time_bucket} AS time"),
@@ -431,7 +460,7 @@ pub fn translate_materialized_view_select(
         "max(t.`_mv_src_ingest_seq`) AS ingest_seq".to_string(),
         format!("min({series_id_expr}) AS series_id"),
     ];
-    select_parts.extend(field_strs);
+    select_parts.extend(sorted_field_strs);
 
     let mut group_parts = vec![time_bucket.clone()];
     for tag in &grouped_tags {
@@ -461,11 +490,19 @@ pub fn translate_materialized_view_select(
 
 /// ClickHouse `SELECT` for the destination series-dimension MV: one row per
 /// rolled-up tag combination (tags not listed in the MV GROUP BY are dropped).
+///
+/// `tag_name_mapping` controls how logical tag keys map to physical column
+/// names (tag-field collision prefix). The source mapping uses the *source*
+/// measurement's field names for collision detection, but the *destination*
+/// series table may have a different set of field columns (MV aliases rename
+/// fields), so callers should pass a dedicated mapping (or set of field names)
+/// that reflects the destination schema for correct physical column naming.
 pub fn translate_materialized_view_series_select(
     stmt: &SelectStatement,
     source_series: &str,
     dest_measurement: &str,
     mapping: &ColumnMapping,
+    dest_field_names: Option<&std::collections::HashSet<String>>,
 ) -> Result<String, HyperbytedbError> {
     let gb = stmt
         .group_by
@@ -485,16 +522,30 @@ pub fn translate_materialized_view_series_select(
         ));
     }
 
+    // Resolve physical tag column names: use destination field names when
+    // provided (the destination series table's column naming depends on the
+    // destination's field set, not the source's).
+    let tag_phys_name = |tag: &str| -> String {
+        match dest_field_names {
+            Some(dfn) => {
+                let fields: std::collections::HashSet<&str> =
+                    dfn.iter().map(|s| s.as_str()).collect();
+                crate::domain::column_mapping::tag_column_name(tag, &fields)
+            }
+            None => mapping.tag_column_name(tag),
+        }
+    };
+
     let series_id_expr = crate::domain::series::series_id_ch_sql_for_tags(
         dest_measurement,
         &grouped_tags,
-        |tag| quote_identifier(&mapping.tag_column_name(tag)),
+        |tag| quote_identifier(&tag_phys_name(tag)),
         "s",
     );
 
     let tag_cols: Vec<String> = grouped_tags
         .iter()
-        .map(|tag| format!("s.{}", quote_identifier(&mapping.tag_column_name(tag))))
+        .map(|tag| format!("s.{}", quote_identifier(&tag_phys_name(tag))))
         .collect();
 
     let mut select_parts = vec![format!("min({series_id_expr}) AS series_id")];
@@ -735,6 +786,14 @@ fn build_from_source(
         return fact;
     }
     let mut tag_cols: Vec<String> = m.tag_keys.iter().map(|t| m.tag_column_name(t)).collect();
+    if tag_cols.is_empty() {
+        return fact;
+    }
+    // Only project tag columns that actually exist in the series table.
+    // MV destinations may have a subset of source tags (GROUP BY columns only).
+    if !sj.tag_columns.is_empty() {
+        tag_cols.retain(|c| sj.tag_columns.contains(c));
+    }
     if tag_cols.is_empty() {
         return fact;
     }
@@ -1705,6 +1764,7 @@ mod tests {
             Some(SeriesJoin {
                 table: SERIES_TABLE,
                 force: false,
+                tag_columns: &[],
             }),
             None,
         )
@@ -2317,8 +2377,8 @@ mod tests {
         assert!(sql.contains("any(t.`_mv_src_origin_node_id`) AS origin_node_id"));
         assert!(sql.contains("max(t.`_mv_src_ingest_seq`) AS ingest_seq"));
         assert!(sql.contains("sipHash64("));
-        assert!(sql.contains("sum(\"value\") AS \"sum_value\""));
-        assert!(sql.contains("count(\"value\") AS \"count_value\""));
+        assert!(sql.contains("AS \"count_value\""));
+        assert!(sql.contains("AS \"sum_value\""));
         assert!(!sql.contains("avg(\"value\")"));
         assert!(
             sql.contains("argMax(\"value\", `ingest_seq`)"),
@@ -2334,6 +2394,15 @@ mod tests {
         assert!(sql.contains("GROUP BY toStartOfInterval(t.time, INTERVAL 5 MINUTE)"));
         assert!(sql.contains("s.\"host\""));
         assert!(!sql.contains("INSERT INTO"));
+        // Field columns must appear in sorted-by-name order (count < sum).
+        let count_pos = sql.find("AS \"count_value\"").unwrap();
+        let sum_pos = sql.find("AS \"sum_value\"").unwrap();
+        assert!(
+            count_pos < sum_pos,
+            "fields should be sorted: count_value before sum_value, got: {}..{}",
+            count_pos,
+            sum_pos
+        );
     }
 
     #[test]
@@ -2415,6 +2484,7 @@ mod tests {
             Some(SeriesJoin {
                 table: SERIES_TABLE,
                 force: false,
+                tag_columns: &[],
             }),
             None,
         )
@@ -2438,6 +2508,7 @@ mod tests {
             Some(SeriesJoin {
                 table: SERIES_TABLE,
                 force: false,
+                tag_columns: &[],
             }),
             None,
         )
@@ -2498,6 +2569,7 @@ mod tests {
             Some(SeriesJoin {
                 table: SERIES_TABLE,
                 force: false,
+                tag_columns: &[],
             }),
             None,
         )
@@ -2584,6 +2656,7 @@ mod tests {
             Some(SeriesJoin {
                 table: SERIES_TABLE,
                 force: true,
+                tag_columns: &[],
             }),
             None,
         )
@@ -2591,6 +2664,66 @@ mod tests {
         assert!(
             sql.contains("ANY LEFT JOIN"),
             "force should join, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn mv_series_select_uses_dest_field_names_for_tag_prefix() {
+        // Tag "host" collides with a field only in the destination, not the source.
+        // Source mapping treats "host" as non-colliding (source field_names is
+        // {"usage_idle"}), so tag_column_name("host") returns "host".
+        // Destination has field "host", so dest_field_names = {"host", "usage_idle"},
+        // and tag_column_name("host") should return "__tag__host".
+        let stmt = parse_select(
+            r#"SELECT mean("usage_idle") INTO "dest" FROM "cpu" GROUP BY time(5m), "host""#,
+        );
+        let mut src_mapping = cpu_mapping();
+        src_mapping.tag_keys.insert("host".to_string());
+
+        let dest_field_names: std::collections::HashSet<String> =
+            ["host".to_string(), "usage_idle".to_string()].into();
+
+        let sql = translate_materialized_view_series_select(
+            &stmt,
+            "`source_series`",
+            "dest",
+            &src_mapping,
+            Some(&dest_field_names),
+        )
+        .unwrap();
+
+        assert!(
+            sql.contains("__tag__host"),
+            "tag 'host' should be prefixed when dest has colliding field, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn mv_series_select_uses_source_names_when_no_dest_field_names() {
+        let stmt = parse_select(
+            r#"SELECT mean("usage_idle") INTO "dest" FROM "cpu" GROUP BY time(5m), "host""#,
+        );
+        let mut src_mapping = cpu_mapping();
+        src_mapping.tag_keys.insert("host".to_string());
+
+        let sql = translate_materialized_view_series_select(
+            &stmt,
+            "`source_series`",
+            "dest",
+            &src_mapping,
+            None,
+        )
+        .unwrap();
+
+        // Without dest field names, source mapping says "host" doesn't collide
+        // (cpu_mapping has only "usage_idle" as field).
+        assert!(
+            sql.contains("\"host\""),
+            "tag 'host' should NOT be prefixed when dest_field_names is None, got: {sql}"
+        );
+        assert!(
+            !sql.contains("__tag__host"),
+            "tag 'host' should NOT be prefixed without dest_field_names, got: {sql}"
         );
     }
 }

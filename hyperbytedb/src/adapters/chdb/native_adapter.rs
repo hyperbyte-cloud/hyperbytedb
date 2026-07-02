@@ -503,6 +503,15 @@ impl ChdbNativeAdapter {
         if let Some(meta) = &self.metadata
             && let Some(meas_meta) = meta.get_measurement(&key.db, &key.measurement).await?
         {
+            // Reject raw ingestion into materialized view destinations.
+            if meas_meta.materialized {
+                return Err(HyperbytedbError::QueryParse(format!(
+                    "cannot write directly to materialized view destination \"{0}\". \
+                     Data must be ingested into the source measurement and the \
+                     materialized view will propagate it automatically.",
+                    key.measurement,
+                )));
+            }
             field_types = merge_field_type_map(&meas_meta.field_types, &field_types);
             for k in &meas_meta.tag_keys {
                 tag_keys.insert(k.clone());

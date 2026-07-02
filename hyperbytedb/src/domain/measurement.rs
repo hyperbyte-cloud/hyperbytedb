@@ -14,6 +14,10 @@ pub struct MeasurementMeta {
     /// Logical fields exposed as `mean(x)` mapped to stored sum/count columns.
     #[serde(default)]
     pub mean_fields: HashMap<String, MeanRollupField>,
+    /// True when this measurement is a materialized view destination.
+    /// Raw writes to materialized destinations are rejected.
+    #[serde(default)]
+    pub materialized: bool,
 }
 
 impl MeasurementMeta {

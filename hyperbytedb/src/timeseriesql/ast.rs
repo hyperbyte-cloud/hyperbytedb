@@ -11,7 +11,10 @@ pub enum Statement {
     ShowSeries(ShowSeriesStatement),
     CreateDatabase(CreateDatabaseStatement),
     DropDatabase(String),
-    DropMeasurement(String),
+    DropMeasurement {
+        name: String,
+        rp: Option<String>,
+    },
     DropSeries(DropSeriesStatement),
     ShowRetentionPolicies(String),
     ShowUsers,
