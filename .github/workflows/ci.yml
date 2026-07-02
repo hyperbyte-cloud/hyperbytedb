@@ -29,7 +29,7 @@ env:
 jobs:
   doc_links:
     name: Doc links (relative .md)
-    runs-on: hyperbytedb-operator-controller
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -42,7 +42,7 @@ jobs:
 
   fmt:
     name: Format
-    runs-on: hyperbytedb-operator-controller
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -61,7 +61,7 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: hyperbytedb-operator-controller
+    runs-on: ubuntu-latest
     needs: [fmt, doc_links]
     steps:
       - uses: actions/checkout@v4
@@ -83,7 +83,7 @@ jobs:
 
   test:
     name: Test
-    runs-on: hyperbytedb-operator-controller
+    runs-on: ubuntu-latest
     # Run after Clippy so node-local sccache and rust-cache are warm. When Test
     # started in parallel with Clippy it always saw 0% sccache hits because
     # Clippy had not finished writing the cache yet (and rust-cache had not saved).
