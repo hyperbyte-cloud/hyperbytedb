@@ -516,4 +516,14 @@ impl WalPort for RocksDbWal {
     async fn last_sequence(&self) -> Result<u64, HyperbytedbError> {
         Ok(self.seq.load(Ordering::Relaxed))
     }
+
+    async fn flush_wal(&self) -> Result<(), HyperbytedbError> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            db.flush_wal(true)
+                .map_err(|e| HyperbytedbError::Wal(e.to_string()))
+        })
+        .await
+        .map_err(|e| HyperbytedbError::Wal(format!("WAL flush panicked: {e}")))?
+    }
 }
