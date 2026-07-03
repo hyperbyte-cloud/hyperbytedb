@@ -339,14 +339,6 @@ impl MaterializedViewService {
                 .await?;
         }
 
-        self.metadata
-            .register_measurement(&dest_db, &dest_meta)
-            .await?;
-
-        self.points_sink
-            .ensure_measurement_schema(&dest_db, &dest_rp, &dest_meta)
-            .await?;
-
         let source_mapping =
             crate::domain::column_mapping::ColumnMapping::from_measurement_meta(&source_meta);
 
@@ -369,11 +361,6 @@ impl MaterializedViewService {
         let fact_mv_quoted = quoted_fact_mv_name(&mv.database, &dest_rp, &mv.name);
         let series_mv_quoted = quoted_series_mv_name(&mv.database, &dest_rp, &mv.name);
 
-        // A prior failed CREATE may have installed ClickHouse MV objects without
-        // recording metadata. Drop orphans so retries succeed.
-        self.drop_ch_mv_objects(&fact_mv_quoted, &series_mv_quoted)
-            .await?;
-
         let select_sql = to_clickhouse::translate_materialized_view_select(
             &effective_query,
             &source_fact,
@@ -384,7 +371,6 @@ impl MaterializedViewService {
 
         let create_fact_mv =
             build_create_fact_materialized_view(&fact_mv_quoted, &dest_fact, &select_sql);
-        self.query_port.execute_sql(&create_fact_mv).await?;
 
         let dest_field_names: std::collections::HashSet<String> =
             dest_meta.field_types.keys().cloned().collect();
@@ -397,7 +383,6 @@ impl MaterializedViewService {
         )?;
         let create_series_mv =
             build_create_series_materialized_view(&series_mv_quoted, &dest_series, &series_select);
-        self.query_port.execute_sql(&create_series_mv).await?;
 
         let backfill_fact = to_clickhouse::translate_materialized_view_backfill(
             &effective_query,
@@ -407,10 +392,66 @@ impl MaterializedViewService {
             &dest_measurement,
             &source_mapping,
         )?;
-        self.query_port.execute_sql(&backfill_fact).await?;
+
+        if let Err(e) = self
+            .execute_mv_ddl(
+                &dest_db,
+                &dest_rp,
+                &dest_meta,
+                &fact_mv_quoted,
+                &series_mv_quoted,
+                &create_fact_mv,
+                &create_series_mv,
+                &backfill_fact,
+                &dest_series,
+                &series_select,
+            )
+            .await
+        {
+            let _ = self
+                .drop_ch_mv_objects(&fact_mv_quoted, &series_mv_quoted)
+                .await;
+            let _ = self
+                .points_sink
+                .drop_measurement(&dest_db, &dest_rp, &dest_measurement)
+                .await;
+            return Err(e);
+        }
+
+        Ok(())
+    }
+
+    async fn execute_mv_ddl(
+        &self,
+        dest_db: &str,
+        dest_rp: &str,
+        dest_meta: &MeasurementMeta,
+        fact_mv_quoted: &str,
+        series_mv_quoted: &str,
+        create_fact_mv: &str,
+        create_series_mv: &str,
+        backfill_fact: &str,
+        dest_series: &str,
+        series_select: &str,
+    ) -> Result<(), HyperbytedbError> {
+        self.points_sink
+            .ensure_measurement_schema(dest_db, dest_rp, dest_meta)
+            .await?;
+
+        self.drop_ch_mv_objects(fact_mv_quoted, series_mv_quoted)
+            .await?;
+
+        self.query_port.execute_sql(create_fact_mv).await?;
+        self.query_port.execute_sql(create_series_mv).await?;
+        self.query_port.execute_sql(backfill_fact).await?;
 
         let backfill_series = format!("INSERT INTO {dest_series}\n{series_select}");
         self.query_port.execute_sql(&backfill_series).await?;
+
+        self.metadata
+            .register_measurement(dest_db, dest_meta)
+            .await?;
+
         Ok(())
     }
 
