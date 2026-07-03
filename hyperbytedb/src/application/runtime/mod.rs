@@ -252,11 +252,17 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
         let handle = axum_server::Handle::new();
         let shutdown_handle = handle.clone();
         tokio::spawn(async move {
-            let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("failed to install SIGTERM handler");
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {},
-                _ = term.recv() => {},
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut term) => {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {},
+                        _ = term.recv() => {},
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to install SIGTERM handler, SIGINT only");
+                    tokio::signal::ctrl_c().await.ok();
+                }
             }
             tracing::info!("shutdown signal received, stopping API server");
             let _ = api_shutdown_tx.send(true);
@@ -274,11 +280,17 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         axum::serve(listener, app)
             .with_graceful_shutdown(async move {
-                let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("failed to install SIGTERM handler");
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {},
-                    _ = term.recv() => {},
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                    Ok(mut term) => {
+                        tokio::select! {
+                            _ = tokio::signal::ctrl_c() => {},
+                            _ = term.recv() => {},
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to install SIGTERM handler, SIGINT only");
+                        tokio::signal::ctrl_c().await.ok();
+                    }
                 }
                 tracing::info!("shutdown signal received, stopping API server");
                 let _ = api_shutdown_tx.send(true);
