@@ -393,21 +393,30 @@ impl MaterializedViewService {
             &source_mapping,
         )?;
 
-        if let Err(e) = self
-            .execute_mv_ddl(
-                &dest_db,
-                &dest_rp,
-                &dest_meta,
-                &fact_mv_quoted,
-                &series_mv_quoted,
-                &create_fact_mv,
-                &create_series_mv,
-                &backfill_fact,
-                &dest_series,
-                &series_select,
-            )
-            .await
-        {
+        let result = async {
+            self.points_sink
+                .ensure_measurement_schema(&dest_db, &dest_rp, &dest_meta)
+                .await?;
+
+            self.drop_ch_mv_objects(&fact_mv_quoted, &series_mv_quoted)
+                .await?;
+
+            self.query_port.execute_sql(&create_fact_mv).await?;
+            self.query_port.execute_sql(&create_series_mv).await?;
+            self.query_port.execute_sql(&backfill_fact).await?;
+
+            let backfill_series = format!("INSERT INTO {dest_series}\n{series_select}");
+            self.query_port.execute_sql(&backfill_series).await?;
+
+            self.metadata
+                .register_measurement(&dest_db, &dest_meta)
+                .await?;
+
+            Ok::<_, HyperbytedbError>(())
+        }
+        .await;
+
+        if let Err(e) = result {
             let _ = self
                 .drop_ch_mv_objects(&fact_mv_quoted, &series_mv_quoted)
                 .await;
@@ -417,40 +426,6 @@ impl MaterializedViewService {
                 .await;
             return Err(e);
         }
-
-        Ok(())
-    }
-
-    async fn execute_mv_ddl(
-        &self,
-        dest_db: &str,
-        dest_rp: &str,
-        dest_meta: &MeasurementMeta,
-        fact_mv_quoted: &str,
-        series_mv_quoted: &str,
-        create_fact_mv: &str,
-        create_series_mv: &str,
-        backfill_fact: &str,
-        dest_series: &str,
-        series_select: &str,
-    ) -> Result<(), HyperbytedbError> {
-        self.points_sink
-            .ensure_measurement_schema(dest_db, dest_rp, dest_meta)
-            .await?;
-
-        self.drop_ch_mv_objects(fact_mv_quoted, series_mv_quoted)
-            .await?;
-
-        self.query_port.execute_sql(create_fact_mv).await?;
-        self.query_port.execute_sql(create_series_mv).await?;
-        self.query_port.execute_sql(backfill_fact).await?;
-
-        let backfill_series = format!("INSERT INTO {dest_series}\n{series_select}");
-        self.query_port.execute_sql(&backfill_series).await?;
-
-        self.metadata
-            .register_measurement(dest_db, dest_meta)
-            .await?;
 
         Ok(())
     }
