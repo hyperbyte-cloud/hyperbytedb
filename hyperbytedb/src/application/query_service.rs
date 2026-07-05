@@ -77,9 +77,10 @@ impl QueryServiceImpl {
     async fn column_mapping_for(
         &self,
         db: &str,
+        rp: &str,
         measurement: &str,
     ) -> Result<Option<ColumnMapping>, HyperbytedbError> {
-        let meta = self.metadata.get_measurement(db, measurement).await?;
+        let meta = self.metadata.get_measurement(db, rp, measurement).await?;
         let Some(m) = meta else {
             return Ok(None);
         };
@@ -370,6 +371,30 @@ async fn execute_statement(
     query_rp: Option<&str>,
     statement_id: u32,
 ) -> Result<StatementResult, HyperbytedbError> {
+    // Verify database exists for DB-scoped statements.
+    // Skip when db is empty (statements like CREATE/DROP RETENTION POLICY
+    // or DROP DATABASE carry their own DB reference). DropDatabase has its
+    // own explicit check below.
+    if !db.is_empty() {
+        match stmt {
+            Statement::ShowDatabases
+            | Statement::CreateDatabase(_)
+            | Statement::DropDatabase(_)
+            | Statement::CreateUser { .. }
+            | Statement::DropUser(_)
+            | Statement::SetPassword { .. }
+            | Statement::ShowUsers
+            | Statement::ShowContinuousQueries
+            | Statement::ShowMaterializedViews => {}
+            _ => {
+                svc.metadata
+                    .get_database(db)
+                    .await?
+                    .ok_or_else(|| HyperbytedbError::DatabaseNotFound(db.to_string()))?;
+            }
+        }
+    }
+
     match stmt {
         Statement::ShowDatabases => {
             let dbs = svc.metadata.list_databases().await?;
@@ -400,7 +425,7 @@ async fn execute_statement(
                 });
             }
             let rp = resolve_retention_policy_for_select(svc.metadata.as_ref(), db, None, query_rp)
-                .await;
+                .await?;
             let names = list_measurements_for_rp(svc, db, &rp).await?;
             let columns = vec!["name".to_string()];
             let values: Vec<Vec<serde_json::Value>> = names
@@ -422,6 +447,9 @@ async fn execute_statement(
         Statement::ShowTagKeys(s) => {
             let db = s.database.as_deref().unwrap_or(db);
             let measurement = s.from.as_ref().and_then(|m| m.name_str());
+            let default_rp =
+                resolve_retention_policy_for_select(svc.metadata.as_ref(), db, None, query_rp)
+                    .await?;
             let keys = if let Some(m) = s.from.as_ref() {
                 if let Some(name) = m.name_str() {
                     if m.retention_policy.is_some() {
@@ -431,16 +459,22 @@ async fn execute_statement(
                             query_db,
                             m.retention_policy.as_deref(),
                         )
-                        .await;
+                        .await?;
                         tag_keys_for_measurement(svc, query_db, &rp, name).await?
                     } else {
-                        svc.metadata.list_tag_keys(db, Some(name)).await?
+                        svc.metadata
+                            .list_tag_keys(db, &default_rp, Some(name))
+                            .await?
                     }
                 } else {
-                    svc.metadata.list_tag_keys(db, measurement).await?
+                    svc.metadata
+                        .list_tag_keys(db, &default_rp, measurement)
+                        .await?
                 }
             } else {
-                svc.metadata.list_tag_keys(db, measurement).await?
+                svc.metadata
+                    .list_tag_keys(db, &default_rp, measurement)
+                    .await?
             };
             let columns = vec!["tagKey".to_string()];
             let values: Vec<Vec<serde_json::Value>> = keys
@@ -462,6 +496,9 @@ async fn execute_statement(
         Statement::ShowTagValues(s) => {
             let db = s.database.as_deref().unwrap_or(db);
             let measurement = s.from.as_ref().and_then(|m| m.name_str());
+            let default_rp =
+                resolve_retention_policy_for_select(svc.metadata.as_ref(), db, None, query_rp)
+                    .await?;
 
             let all_tag_keys = if let (Some(m), Some(name)) = (s.from.as_ref(), measurement) {
                 if m.retention_policy.is_some() {
@@ -471,13 +508,17 @@ async fn execute_statement(
                         query_db,
                         m.retention_policy.as_deref(),
                     )
-                    .await;
+                    .await?;
                     tag_keys_for_measurement(svc, query_db, &rp, name).await?
                 } else {
-                    svc.metadata.list_tag_keys(db, Some(name)).await?
+                    svc.metadata
+                        .list_tag_keys(db, &default_rp, Some(name))
+                        .await?
                 }
             } else {
-                svc.metadata.list_tag_keys(db, measurement).await?
+                svc.metadata
+                    .list_tag_keys(db, &default_rp, measurement)
+                    .await?
             };
 
             let matching_keys: Vec<String> = match &s.tag_key {
@@ -510,16 +551,16 @@ async fn execute_statement(
                             query_db,
                             m.retention_policy.as_deref(),
                         )
-                        .await;
+                        .await?;
                         tag_values_for_measurement(svc, query_db, &rp, name, tag_key).await?
                     } else {
                         svc.metadata
-                            .list_tag_values(db, tag_key, Some(name))
+                            .list_tag_values(db, &default_rp, tag_key, Some(name))
                             .await?
                     }
                 } else {
                     svc.metadata
-                        .list_tag_values(db, tag_key, measurement)
+                        .list_tag_values(db, &default_rp, tag_key, measurement)
                         .await?
                 };
                 for v in values_list {
@@ -553,6 +594,8 @@ async fn execute_statement(
                     error: Some("database is required".to_string()),
                 });
             }
+            let rp = resolve_retention_policy_for_select(svc.metadata.as_ref(), db, None, query_rp)
+                .await?;
             let mut field_values = Vec::new();
             let measurements: Vec<String> = if let Some(m) = measurement {
                 vec![m.to_string()]
@@ -560,7 +603,7 @@ async fn execute_statement(
                 svc.metadata.list_measurements(db).await?
             };
             for m in &measurements {
-                if let Some(meta) = svc.metadata.get_measurement(db, m).await? {
+                if let Some(meta) = svc.metadata.get_measurement(db, &rp, m).await? {
                     for (name, disc) in meta.field_types_as_tuples() {
                         let typ =
                             crate::domain::point::FieldValue::type_name_from_discriminant(disc);
@@ -594,6 +637,10 @@ async fn execute_statement(
             })
         }
         Statement::DropDatabase(name) => {
+            svc.metadata
+                .get_database(name)
+                .await?
+                .ok_or_else(|| HyperbytedbError::DatabaseNotFound(name.clone()))?;
             // Snapshot measurements + retention policies before
             // metadata drops them so the native sink can DROP TABLE
             // each backing chDB table.
@@ -743,20 +790,21 @@ async fn execute_statement(
                 svc.metadata.list_measurements(query_db).await?
             };
 
-            let rps = svc
-                .metadata
-                .list_retention_policies(query_db)
-                .await
-                .unwrap_or_default();
+            let rp = if let Some(ref from) = s.from
+                && let Some(rp_name) = from.retention_policy.as_ref()
+            {
+                resolve_retention_policy(svc.metadata.as_ref(), query_db, Some(rp_name)).await?
+            } else {
+                resolve_retention_policy_for_select(svc.metadata.as_ref(), query_db, None, query_rp)
+                    .await?
+            };
 
             let mut values = Vec::new();
-            for rp in &rps {
-                for meas in &measurements {
-                    let series = svc.metadata.list_series(query_db, &rp.name, meas).await?;
-                    for (_, tags) in series {
-                        let key = SeriesKey::new(meas, &tags);
-                        values.push(vec![serde_json::Value::String(key.to_canonical())]);
-                    }
+            for meas in &measurements {
+                let series = svc.metadata.list_series(query_db, &rp, meas).await?;
+                for (_, tags) in series {
+                    let key = SeriesKey::new(meas, &tags);
+                    values.push(vec![serde_json::Value::String(key.to_canonical())]);
                 }
             }
 
@@ -784,12 +832,9 @@ async fn execute_statement(
             let rp = if let Some(inner) = stmt_rp {
                 inner.clone()
             } else {
-                svc.metadata
-                    .get_default_rp(db)
-                    .await
-                    .unwrap_or_else(|_| "autogen".to_string())
+                svc.metadata.get_default_rp(db).await?
             };
-            svc.metadata.delete_measurement(db, name).await?;
+            svc.metadata.delete_measurement(db, &rp, name).await?;
             if let Err(e) = svc.points_sink.drop_measurement(db, &rp, name).await {
                 tracing::warn!(
                     db = db,
@@ -805,10 +850,19 @@ async fn execute_statement(
             })
         }
         Statement::Delete(del) => {
+            let del_rp = if let Some(rp) = query_rp {
+                rp.to_string()
+            } else {
+                svc.metadata
+                    .get_default_rp(db)
+                    .await
+                    .unwrap_or_else(|_| "autogen".to_string())
+            };
             let predicate_sql = if let Some(ref cond) = del.condition {
                 crate::application::predicate_sql::build_predicate_sql(
                     &svc.metadata,
                     db,
+                    &del_rp,
                     &del.from,
                     cond,
                 )
@@ -818,7 +872,7 @@ async fn execute_statement(
             };
 
             svc.metadata
-                .store_tombstone(db, &del.from, &predicate_sql)
+                .store_tombstone(db, &del_rp, &del.from, &predicate_sql)
                 .await?;
 
             tracing::debug!(
@@ -835,6 +889,11 @@ async fn execute_statement(
             })
         }
         Statement::CreateContinuousQuery(cq) => {
+            svc.metadata
+                .get_database(&cq.database)
+                .await?
+                .ok_or_else(|| HyperbytedbError::DatabaseNotFound(cq.database.clone()))?;
+
             let def = match ContinuousQueryDef::from_create(cq) {
                 Ok(def) => def,
                 Err(e) => {
@@ -847,7 +906,7 @@ async fn execute_statement(
             };
 
             svc.metadata
-                .store_continuous_query(&cq.database, &cq.name, &def)
+                .store_continuous_query(&def.database, &def.name, &def)
                 .await?;
 
             Ok(StatementResult {
@@ -891,6 +950,10 @@ async fn execute_statement(
         }
         Statement::DropContinuousQuery { name, db: cq_db } => {
             let target_db = if cq_db.is_empty() { db } else { cq_db };
+            svc.metadata
+                .get_database(target_db)
+                .await?
+                .ok_or_else(|| HyperbytedbError::DatabaseNotFound(target_db.to_string()))?;
             svc.metadata.drop_continuous_query(target_db, name).await?;
             Ok(StatementResult {
                 statement_id,
@@ -899,6 +962,10 @@ async fn execute_statement(
             })
         }
         Statement::CreateMaterializedView(mv) => {
+            svc.metadata
+                .get_database(&mv.database)
+                .await?
+                .ok_or_else(|| HyperbytedbError::DatabaseNotFound(mv.database.clone()))?;
             svc.mv_service.create(mv).await?;
             Ok(StatementResult {
                 statement_id,
@@ -948,6 +1015,10 @@ async fn execute_statement(
         }
         Statement::DropMaterializedView { name, db: mv_db } => {
             let target_db = if mv_db.is_empty() { db } else { mv_db };
+            svc.metadata
+                .get_database(target_db)
+                .await?
+                .ok_or_else(|| HyperbytedbError::DatabaseNotFound(target_db.to_string()))?;
             svc.mv_service.drop_mv(target_db, name).await?;
             Ok(StatementResult {
                 statement_id,
@@ -957,6 +1028,12 @@ async fn execute_statement(
         }
         Statement::ShowRetentionPolicies(rp_db) => {
             let target_db = if rp_db.is_empty() { db } else { rp_db };
+            if !rp_db.is_empty() {
+                svc.metadata
+                    .get_database(target_db)
+                    .await?
+                    .ok_or_else(|| HyperbytedbError::DatabaseNotFound(target_db.to_string()))?;
+            }
             let rps = svc.metadata.list_retention_policies(target_db).await?;
             let columns = vec![
                 "name".to_string(),
@@ -1132,12 +1209,17 @@ async fn execute_statement(
                 MeasurementName::Name(n) => Some(n.clone()),
                 MeasurementName::Regex(_) => None,
             });
-            let rp = svc.metadata.get_default_rp(target_db).await?;
+            let rp = if let Some(rp) = query_rp {
+                rp.to_string()
+            } else {
+                svc.metadata.get_default_rp(target_db).await?
+            };
             let predicate_sql = if let Some(ref cond) = s.condition {
                 let meas = measurement.as_deref().unwrap_or("");
                 crate::application::predicate_sql::build_predicate_sql(
                     &svc.metadata,
                     target_db,
+                    &rp,
                     meas,
                     cond,
                 )
@@ -1150,7 +1232,7 @@ async fn execute_statement(
                     && !predicate_sql.is_empty()
                 {
                     svc.metadata
-                        .store_tombstone(target_db, meas, &predicate_sql)
+                        .store_tombstone(target_db, &rp, meas, &predicate_sql)
                         .await?;
                 }
                 svc.metadata
@@ -1547,7 +1629,7 @@ async fn execute_select_from_source(
                     m.retention_policy.as_deref(),
                     query_rp,
                 )
-                .await;
+                .await?;
                 let measurements = svc.metadata.list_measurements(query_db).await?;
                 let matching: Vec<_> = {
                     let re = regex_pattern_matches(pattern);
@@ -1584,7 +1666,7 @@ async fn execute_select_from_source(
                     m.retention_policy.as_deref(),
                     query_rp,
                 )
-                .await;
+                .await?;
                 execute_measurement_query(
                     svc,
                     query_db,
@@ -1620,8 +1702,8 @@ async fn execute_select_from_source(
                 sub_meas.retention_policy.as_deref(),
                 query_rp,
             )
-            .await;
-            let sub_mapping = svc.column_mapping_for(query_db, sub_source).await?;
+            .await?;
+            let sub_mapping = svc.column_mapping_for(query_db, &rp, sub_source).await?;
             let table = quoted_table_name(query_db, &rp, sub_source);
             let sub_series_table = quoted_series_table_name(query_db, &rp, sub_source);
 
@@ -1691,14 +1773,14 @@ async fn execute_measurement_query(
     epoch: Option<&str>,
     _group_by_tags: &[String],
 ) -> Result<Vec<SeriesResult>, HyperbytedbError> {
-    let column_mapping = svc.column_mapping_for(db, measurement).await?;
+    let column_mapping = svc.column_mapping_for(db, rp, measurement).await?;
     let tag_keys = tag_keys_from_mapping(column_mapping.as_ref());
     let (effective_stmt, resolved_group_by_tags) = select_with_expanded_group_by(stmt, &tag_keys);
 
     // Tombstone predicates (spliced into WHERE below) may reference tag columns,
     // which only exist on the series-rejoin inline view — so force the join when
     // any tombstone is present for this measurement.
-    let tombstones = svc.metadata.list_tombstones(db, measurement).await?;
+    let tombstones = svc.metadata.list_tombstones(db, rp, measurement).await?;
 
     let table = quoted_table_name(db, rp, measurement);
     let series_table = quoted_series_table_name(db, rp, measurement);
@@ -1787,7 +1869,7 @@ async fn resolve_retention_policy(
     metadata: &dyn MetadataPort,
     db: &str,
     retention_policy: Option<&str>,
-) -> String {
+) -> Result<String, HyperbytedbError> {
     resolve_retention_policy_for_select(metadata, db, retention_policy, None).await
 }
 
@@ -1798,17 +1880,17 @@ async fn resolve_retention_policy_for_select(
     db: &str,
     measurement_rp: Option<&str>,
     query_rp: Option<&str>,
-) -> String {
+) -> Result<String, HyperbytedbError> {
     if let Some(rp) = measurement_rp.filter(|s| !s.is_empty()) {
-        return normalize_rp_name(metadata, db, rp).await;
+        return Ok(normalize_rp_name(metadata, db, rp).await);
     }
     if let Some(rp) = query_rp.filter(|s| !s.is_empty()) {
-        return normalize_rp_name(metadata, db, rp).await;
+        return Ok(normalize_rp_name(metadata, db, rp).await);
     }
-    metadata
-        .get_default_rp(db)
-        .await
-        .unwrap_or_else(|_| "autogen".to_string())
+    if db.is_empty() {
+        return Ok("autogen".to_string());
+    }
+    metadata.get_default_rp(db).await
 }
 
 /// Map InfluxDB's conventional default RP name to this database's default.
@@ -1868,7 +1950,7 @@ async fn tag_keys_from_series_table(
     rp: &str,
     measurement: &str,
 ) -> Result<Vec<String>, HyperbytedbError> {
-    let mapping = svc.column_mapping_for(db, measurement).await?;
+    let mapping = svc.column_mapping_for(db, rp, measurement).await?;
     let Some(mapping) = mapping else {
         return Ok(Vec::new());
     };
@@ -1904,7 +1986,7 @@ async fn tag_values_for_measurement(
         return Ok(result);
     }
 
-    let mapping = svc.column_mapping_for(db, measurement).await?;
+    let mapping = svc.column_mapping_for(db, rp, measurement).await?;
     let Some(mapping) = mapping else {
         return Ok(Vec::new());
     };
@@ -2062,7 +2144,7 @@ async fn write_series_as_points(
             tag_keys: tag_keys.into_iter().collect(),
             ..Default::default()
         };
-        svc.metadata.register_measurement(db, &meta).await?;
+        svc.metadata.register_measurement(db, rp, &meta).await?;
 
         let replication_body = if svc.replication_port.is_some() {
             Some(encode_points_to_line_protocol(
@@ -2136,7 +2218,7 @@ async fn execute_select_into(
                 query_db,
                 m.retention_policy.as_deref(),
             )
-            .await;
+            .await?;
             (query_db.to_string(), rp, name.clone())
         }
         MeasurementSource::Subquery(_) => {
@@ -2152,7 +2234,7 @@ async fn execute_select_into(
         into_db,
         into_target.retention_policy.as_deref(),
     )
-    .await;
+    .await?;
 
     let group_by_tags: Vec<String> = select_stmt
         .group_by

@@ -284,12 +284,22 @@ impl MaterializedViewService {
         mv: &CreateMaterializedViewStatement,
         reset_destination: bool,
     ) -> Result<(), HyperbytedbError> {
-        let (source_db, source_rp, source_measurement) = extract_source(&mv.query, &mv.database)?;
-        let (dest_db, dest_rp, dest_measurement) = extract_dest(&mv.query, &mv.database)?;
+        let (source_db, source_rp_opt, source_measurement) =
+            extract_source(&mv.query, &mv.database)?;
+        let (dest_db, dest_rp_opt, dest_measurement) = extract_dest(&mv.query, &mv.database)?;
+
+        let source_rp = match source_rp_opt {
+            Some(rp) => rp,
+            None => self
+                .metadata
+                .get_default_rp(&source_db)
+                .await
+                .unwrap_or_else(|_| "autogen".to_string()),
+        };
 
         let source_meta = self
             .metadata
-            .get_measurement(&source_db, &source_measurement)
+            .get_measurement(&source_db, &source_rp, &source_measurement)
             .await?
             .ok_or_else(|| {
                 HyperbytedbError::QueryParse(format!(
@@ -298,9 +308,9 @@ impl MaterializedViewService {
                 ))
             })?;
 
-        let dest_meta = dest_measurement_meta(&mv.query, &source_meta)?;
+        let mut dest_meta = dest_measurement_meta(&mv.query, &source_meta)?;
 
-        let dest_rp = match dest_rp {
+        let dest_rp = match dest_rp_opt {
             Some(rp) => rp,
             None => self
                 .metadata
@@ -308,14 +318,7 @@ impl MaterializedViewService {
                 .await
                 .unwrap_or_else(|_| "autogen".to_string()),
         };
-        let source_rp = match source_rp {
-            Some(rp) => rp,
-            None => self
-                .metadata
-                .get_default_rp(&source_db)
-                .await
-                .unwrap_or_else(|_| "autogen".to_string()),
-        };
+        dest_meta.materialized_rp = Some(dest_rp.clone());
 
         if reset_destination {
             // Failed CREATE retries often leave destination tables in a non-default
@@ -335,7 +338,7 @@ impl MaterializedViewService {
                 );
             }
             self.metadata
-                .delete_measurement(&dest_db, &dest_measurement)
+                .delete_measurement(&dest_db, &dest_rp, &dest_measurement)
                 .await?;
         }
 
@@ -409,7 +412,7 @@ impl MaterializedViewService {
             self.query_port.execute_sql(&backfill_series).await?;
 
             self.metadata
-                .register_measurement(&dest_db, &dest_meta)
+                .register_measurement(&dest_db, &dest_rp, &dest_meta)
                 .await?;
 
             Ok::<_, HyperbytedbError>(())
@@ -558,5 +561,6 @@ fn dest_measurement_meta(
         field_rollups,
         mean_fields,
         materialized: true,
+        materialized_rp: None,
     })
 }

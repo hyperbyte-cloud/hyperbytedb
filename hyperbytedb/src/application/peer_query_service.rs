@@ -363,13 +363,15 @@ async fn mutation_request_from_statement(
         }),
         Statement::DropDatabase(name) => Ok(MutationRequest::DropDatabase(name.clone())),
         Statement::Delete(del) => {
+            let del_rp = metadata.get_default_rp(db).await?;
             let predicate_sql = if let Some(ref cond) = del.condition {
-                build_predicate_sql(metadata, db, &del.from, cond).await?
+                build_predicate_sql(metadata, db, &del_rp, &del.from, cond).await?
             } else {
                 String::new()
             };
             Ok(MutationRequest::Delete {
                 database: db.to_string(),
+                rp: del_rp,
                 measurement: del.from.clone(),
                 predicate_sql,
             })
@@ -489,18 +491,40 @@ async fn mutation_request_from_statement(
                 MeasurementName::Name(n) => Some(n.clone()),
                 MeasurementName::Regex(_) => None,
             });
+            let drop_rp = metadata.get_default_rp(target_db).await?;
             let predicate_sql = if let Some(ref cond) = s.condition {
                 let meas = measurement.as_deref().unwrap_or("");
-                build_predicate_sql(metadata, target_db, meas, cond).await?
+                build_predicate_sql(metadata, target_db, &drop_rp, meas, cond).await?
             } else {
                 String::new()
             };
             Ok(MutationRequest::DropSeries {
                 database: target_db.to_string(),
+                rp: drop_rp,
                 measurement,
                 predicate_sql,
             })
         }
+        Statement::DropMeasurement { name, rp: stmt_rp } => {
+            let drop_rp = if let Some(rp) = stmt_rp {
+                rp.clone()
+            } else {
+                metadata.get_default_rp(db).await?
+            };
+            Ok(MutationRequest::DropMeasurement {
+                database: db.to_string(),
+                rp: drop_rp,
+                name: name.clone(),
+            })
+        }
+        Statement::Grant { username, database } => Ok(MutationRequest::Grant {
+            username: username.clone(),
+            database: database.clone(),
+        }),
+        Statement::Revoke { username, database } => Ok(MutationRequest::Revoke {
+            username: username.clone(),
+            database: database.clone(),
+        }),
         _ => Err(HyperbytedbError::Internal(
             "not a cluster mutation statement".into(),
         )),
@@ -524,6 +548,9 @@ fn is_cluster_mutation(stmt: &Statement) -> bool {
             | Statement::CreateUser { .. }
             | Statement::DropUser(_)
             | Statement::SetPassword { .. }
+            | Statement::DropMeasurement { .. }
+            | Statement::Grant { .. }
+            | Statement::Revoke { .. }
     )
 }
 
@@ -631,14 +658,19 @@ impl QueryService for PeerQueryService {
                         },
                     };
                     if result.error.is_none() {
+                        let del_rp = retention_policy
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| "autogen".to_string());
                         let predicate_sql = if let Some(ref cond) = del.condition {
-                            build_predicate_sql(&self.metadata, db, &del.from, cond).await?
+                            build_predicate_sql(&self.metadata, db, &del_rp, &del.from, cond)
+                                .await?
                         } else {
                             String::new()
                         };
                         if let Err(e) = self
                             .replicate_mutation(MutationRequest::Delete {
                                 database: db.to_string(),
+                                rp: del_rp,
                                 measurement: del.from.clone(),
                                 predicate_sql,
                             })
@@ -982,15 +1014,20 @@ impl QueryService for PeerQueryService {
                             MeasurementName::Name(n) => Some(n.clone()),
                             MeasurementName::Regex(_) => None,
                         });
+                        let ds_rp = retention_policy
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| "autogen".to_string());
                         let predicate_sql = if let Some(ref cond) = s.condition {
                             let meas = measurement.as_deref().unwrap_or("");
-                            build_predicate_sql(&self.metadata, target_db, meas, cond).await?
+                            build_predicate_sql(&self.metadata, target_db, &ds_rp, meas, cond)
+                                .await?
                         } else {
                             String::new()
                         };
                         if let Err(e) = self
                             .replicate_mutation(MutationRequest::DropSeries {
                                 database: target_db.to_string(),
+                                rp: ds_rp,
                                 measurement,
                                 predicate_sql,
                             })
@@ -998,6 +1035,103 @@ impl QueryService for PeerQueryService {
                         {
                             result.error = Some(e.to_string());
                         }
+                    }
+                    result
+                }
+                Statement::DropMeasurement {
+                    ref name,
+                    rp: ref stmt_rp,
+                } => {
+                    let resp = self
+                        .inner
+                        .execute_query(db, query, epoch, retention_policy, caller)
+                        .await;
+                    let mut result = match resp {
+                        Ok(r) => r.results.into_iter().next().unwrap_or(StatementResult {
+                            statement_id,
+                            series: Some(vec![]),
+                            error: None,
+                        }),
+                        Err(e) => StatementResult {
+                            statement_id,
+                            series: None,
+                            error: Some(e.to_string()),
+                        },
+                    };
+                    if result.error.is_none()
+                        && let Err(e) = self
+                            .replicate_mutation(MutationRequest::DropMeasurement {
+                                database: db.to_string(),
+                                rp: stmt_rp.clone().unwrap_or_else(|| "autogen".to_string()),
+                                name: name.clone(),
+                            })
+                            .await
+                    {
+                        result.error = Some(e.to_string());
+                    }
+                    result
+                }
+                Statement::Grant {
+                    ref username,
+                    ref database,
+                } => {
+                    let resp = self
+                        .inner
+                        .execute_query(db, query, epoch, retention_policy, caller)
+                        .await;
+                    let mut result = match resp {
+                        Ok(r) => r.results.into_iter().next().unwrap_or(StatementResult {
+                            statement_id,
+                            series: Some(vec![]),
+                            error: None,
+                        }),
+                        Err(e) => StatementResult {
+                            statement_id,
+                            series: None,
+                            error: Some(e.to_string()),
+                        },
+                    };
+                    if result.error.is_none()
+                        && let Err(e) = self
+                            .replicate_mutation(MutationRequest::Grant {
+                                username: username.clone(),
+                                database: database.clone(),
+                            })
+                            .await
+                    {
+                        result.error = Some(e.to_string());
+                    }
+                    result
+                }
+                Statement::Revoke {
+                    ref username,
+                    ref database,
+                } => {
+                    let resp = self
+                        .inner
+                        .execute_query(db, query, epoch, retention_policy, caller)
+                        .await;
+                    let mut result = match resp {
+                        Ok(r) => r.results.into_iter().next().unwrap_or(StatementResult {
+                            statement_id,
+                            series: Some(vec![]),
+                            error: None,
+                        }),
+                        Err(e) => StatementResult {
+                            statement_id,
+                            series: None,
+                            error: Some(e.to_string()),
+                        },
+                    };
+                    if result.error.is_none()
+                        && let Err(e) = self
+                            .replicate_mutation(MutationRequest::Revoke {
+                                username: username.clone(),
+                                database: database.clone(),
+                            })
+                            .await
+                    {
+                        result.error = Some(e.to_string());
                     }
                     result
                 }

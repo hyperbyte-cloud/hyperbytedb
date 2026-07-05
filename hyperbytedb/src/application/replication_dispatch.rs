@@ -14,7 +14,7 @@ pub async fn dispatch_outbound_replication(
 ) -> Result<(), HyperbytedbError> {
     match replication_config.mode {
         ReplicationMode::Async => {
-            replication.replicate_write(batch);
+            replication.replicate_write(batch).await;
             Ok(())
         }
         ReplicationMode::SyncQuorum => {

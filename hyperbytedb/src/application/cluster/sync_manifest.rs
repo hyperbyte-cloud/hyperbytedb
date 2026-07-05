@@ -26,10 +26,12 @@ pub async fn build_manifest(
         let cq_names: Vec<String> = cqs.into_iter().map(|c| c.name).collect();
 
         let mut tombstone_list = Vec::new();
-        for meas in &measurements {
-            let ts = metadata.list_tombstones(&db.name, meas).await?;
-            if !ts.is_empty() {
-                tombstone_list.push((meas.clone(), ts));
+        for rp in &rps {
+            for meas in &measurements {
+                let ts = metadata.list_tombstones(&db.name, &rp.name, meas).await?;
+                if !ts.is_empty() {
+                    tombstone_list.push((meas.clone(), ts));
+                }
             }
         }
 

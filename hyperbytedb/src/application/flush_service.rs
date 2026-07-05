@@ -379,9 +379,13 @@ impl FlushServiceImpl {
         let sink_start = std::time::Instant::now();
         let mut chunk_points_written = 0u64;
         for handle in handles {
-            chunk_points_written += handle.await.map_err(|e| {
-                HyperbytedbError::Internal(format!("prepared sink task panicked: {e}"))
-            })?? as u64;
+            match handle.await {
+                Ok(Ok(count)) => chunk_points_written += count as u64,
+                Ok(Err(e)) => tracing::error!(error = %e, "prepared flush work item failed"),
+                Err(e) => {
+                    tracing::error!(error = %e, "prepared sink task panicked");
+                }
+            }
         }
         histogram!("hyperbytedb_flush_sink_write_seconds", "path" => "prepared")
             .record(sink_start.elapsed().as_secs_f64());
@@ -596,10 +600,13 @@ impl FlushServiceImpl {
             let sink_start = std::time::Instant::now();
             let mut chunk_points_written = 0u64;
             for handle in handles {
-                let count = handle.await.map_err(|e| {
-                    HyperbytedbError::Internal(format!("native sink task panicked: {e}"))
-                })?;
-                chunk_points_written += count? as u64;
+                match handle.await {
+                    Ok(Ok(count)) => chunk_points_written += count as u64,
+                    Ok(Err(e)) => tracing::error!(error = %e, "native flush work item failed"),
+                    Err(e) => {
+                        tracing::error!(error = %e, "native flush task panicked");
+                    }
+                }
             }
             histogram!("hyperbytedb_flush_sink_write_seconds")
                 .record(sink_start.elapsed().as_secs_f64());

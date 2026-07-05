@@ -175,10 +175,12 @@ impl PeerClient {
     }
 
     /// Fan out a line-protocol batch to all active peers (bounded queue + coalescing worker).
-    pub fn replicate_write(self: &Arc<Self>, batch: OutboundReplicationBatch) {
+    /// Awaits capacity in the outbound channel — callers should ensure they are in an
+    /// async context where waiting is acceptable (backpressure to the HTTP handler).
+    pub async fn replicate_write(self: &Arc<Self>, batch: OutboundReplicationBatch) {
         self.start_outbound_processor();
-        if let Err(e) = self.outbound_tx.try_send(batch) {
-            tracing::error!(error = %e, "replication outbound queue full or closed; dropping batch");
+        if let Err(e) = self.outbound_tx.send(batch).await {
+            tracing::error!(error = %e, "replication outbound channel closed; dropping batch");
             counter!("hyperbytedb_replication_queue_drops_total").increment(1);
         }
     }
@@ -598,8 +600,8 @@ impl PeerClient {
 
 #[async_trait::async_trait]
 impl ReplicationPort for PeerClient {
-    fn replicate_write(self: Arc<Self>, batch: OutboundReplicationBatch) {
-        PeerClient::replicate_write(&self, batch);
+    async fn replicate_write(self: Arc<Self>, batch: OutboundReplicationBatch) {
+        PeerClient::replicate_write(&self, batch).await;
     }
 
     async fn replicate_write_sync(

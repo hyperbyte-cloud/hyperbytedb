@@ -31,6 +31,7 @@ pub enum MutationRequest {
     },
     Delete {
         database: String,
+        rp: String,
         measurement: String,
         predicate_sql: String,
     },
@@ -59,8 +60,22 @@ pub enum MutationRequest {
     },
     DropSeries {
         database: String,
+        rp: String,
         measurement: Option<String>,
         predicate_sql: String,
+    },
+    DropMeasurement {
+        database: String,
+        rp: String,
+        name: String,
+    },
+    Grant {
+        username: String,
+        database: Option<String>,
+    },
+    Revoke {
+        username: String,
+        database: Option<String>,
     },
 }
 

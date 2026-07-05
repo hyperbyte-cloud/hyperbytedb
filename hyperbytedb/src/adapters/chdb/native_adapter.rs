@@ -248,27 +248,30 @@ impl ChdbNativeAdapter {
         for db in databases {
             let measurements = meta.list_measurements(&db.name).await?;
             for meas_name in measurements {
-                let Some(meas_meta) = meta.get_measurement(&db.name, &meas_name).await? else {
-                    continue;
-                };
-                let (fact_schema, series_schema) = self
-                    .table_schema_from_measurement_meta(
-                        meta.as_ref(),
-                        &db.name,
-                        &meas_name,
-                        &meas_meta,
-                    )
-                    .await?;
-                if fact_schema.columns.is_empty() && series_schema.columns.is_empty() {
-                    continue;
-                }
                 for rp in &db.retention_policies {
+                    let Some(meas_meta) =
+                        meta.get_measurement(&db.name, &rp.name, &meas_name).await?
+                    else {
+                        continue;
+                    };
+                    let (fact_schema, series_schema) = self
+                        .table_schema_from_measurement_meta(
+                            meta.as_ref(),
+                            &db.name,
+                            &rp.name,
+                            &meas_name,
+                            &meas_meta,
+                        )
+                        .await?;
+                    if fact_schema.columns.is_empty() && series_schema.columns.is_empty() {
+                        continue;
+                    }
                     let key = TableKey {
                         db: db.name.clone(),
                         rp: rp.name.clone(),
                         measurement: meas_name.clone(),
                     };
-                    pending.push((key, fact_schema.clone(), series_schema.clone()));
+                    pending.push((key, fact_schema, series_schema));
                 }
             }
         }
@@ -438,13 +441,27 @@ impl ChdbNativeAdapter {
         let mut out = HashMap::new();
         for line in raw.lines().filter(|l| !l.is_empty()) {
             let mut parts = line.split('\t');
-            let name = parts.next().unwrap_or("").trim();
-            let ty = parts.next().unwrap_or("").trim();
+            let name = match parts.next() {
+                Some(n) if !n.trim().is_empty() => n.trim(),
+                _ => {
+                    tracing::warn!(line = %line, "DESCRIBE TABLE: skipping row without column name");
+                    continue;
+                }
+            };
+            let ty = match parts.next() {
+                Some(t) if !t.trim().is_empty() => t.trim(),
+                _ => {
+                    tracing::warn!(name = %name, "DESCRIBE TABLE: skipping column without type");
+                    continue;
+                }
+            };
             if skip.contains(&name) {
                 continue;
             }
             if let Some(disc) = ch_type_to_field_disc(ty) {
                 out.insert(name.to_string(), disc);
+            } else {
+                tracing::warn!(name = %name, ty = %ty, "DESCRIBE TABLE: unrecognized column type");
             }
         }
         Ok(out)
@@ -501,10 +518,17 @@ impl ChdbNativeAdapter {
         }
 
         if let Some(meta) = &self.metadata
-            && let Some(meas_meta) = meta.get_measurement(&key.db, &key.measurement).await?
+            && let Some(meas_meta) = meta
+                .get_measurement(&key.db, &key.rp, &key.measurement)
+                .await?
         {
             // Reject raw ingestion into materialized view destinations.
-            if meas_meta.materialized {
+            if meas_meta.materialized
+                && meas_meta
+                    .materialized_rp
+                    .as_deref()
+                    .is_none_or(|mr| mr == key.rp)
+            {
                 return Err(HyperbytedbError::QueryParse(format!(
                     "cannot write directly to materialized view destination \"{0}\". \
                      Data must be ingested into the source measurement and the \
@@ -554,6 +578,7 @@ impl ChdbNativeAdapter {
                 .resolve_tag_column_kind(
                     &series_cached,
                     &key.db,
+                    &key.rp,
                     &key.measurement,
                     k,
                     &phys,
@@ -759,7 +784,7 @@ impl ChdbNativeAdapter {
                     }
                 }
                 if let Err(e) =
-                    backfill_tag_metadata(meta, &key.db, &key.measurement, tag_pairs).await
+                    backfill_tag_metadata(meta, &key.db, &key.rp, &key.measurement, tag_pairs).await
                 {
                     tracing::warn!(
                         error = %e,
@@ -776,13 +801,14 @@ impl ChdbNativeAdapter {
         &self,
         meta: &dyn MetadataPort,
         db: &str,
+        rp: &str,
         measurement: &str,
         meas_meta: &MeasurementMeta,
     ) -> Result<(TableSchema, TableSchema), HyperbytedbError> {
         let mut tag_kinds = HashMap::with_capacity(meas_meta.tag_keys.len());
         for tag_key in &meas_meta.tag_keys {
             let count = meta
-                .count_tag_values(db, tag_key, Some(measurement))
+                .count_tag_values(db, rp, tag_key, Some(measurement))
                 .await?;
             tag_kinds.insert(tag_key.clone(), tag_column_kind(count));
         }
@@ -791,10 +817,12 @@ impl ChdbNativeAdapter {
 
     /// Resolve tag column kind using the schema cache when safe, otherwise
     /// count distinct values via metadata.
+    #[allow(clippy::too_many_arguments)]
     async fn resolve_tag_column_kind(
         &self,
         cached: &TableSchema,
         db: &str,
+        rp: &str,
         measurement: &str,
         tag_key: &str,
         phys_col: &str,
@@ -823,7 +851,7 @@ impl ChdbNativeAdapter {
             }
         }
         let count = self
-            .distinct_tag_value_count(db, measurement, tag_key, points)
+            .distinct_tag_value_count(db, rp, measurement, tag_key, points)
             .await?;
         Ok(tag_column_kind(count))
     }
@@ -833,6 +861,7 @@ impl ChdbNativeAdapter {
     async fn distinct_tag_value_count(
         &self,
         db: &str,
+        rp: &str,
         measurement: &str,
         tag_key: &str,
         points: &[Point],
@@ -848,12 +877,14 @@ impl ChdbNativeAdapter {
         };
 
         let base = meta
-            .count_tag_values(db, tag_key, Some(measurement))
+            .count_tag_values(db, rp, tag_key, Some(measurement))
             .await?;
         let mut novel: HashSet<String> = HashSet::new();
         for p in points {
             if let Some(v) = p.tags.get(tag_key)
-                && !meta.tag_value_is_known(db, measurement, tag_key, v).await?
+                && !meta
+                    .tag_value_is_known(db, rp, measurement, tag_key, v)
+                    .await?
             {
                 novel.insert(v.clone());
             }

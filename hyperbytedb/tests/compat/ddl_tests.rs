@@ -59,13 +59,16 @@ async fn drop_database() {
 }
 
 #[tokio::test]
-async fn drop_nonexistent_database_no_error() {
+async fn drop_nonexistent_database_errors() {
     let ctx = TestContext::new_no_chdb().unwrap();
 
-    let resp = ctx.query("", "DROP DATABASE nonexistent").await.unwrap();
+    let err = ctx
+        .query("", "DROP DATABASE nonexistent")
+        .await
+        .unwrap_err();
     assert!(
-        resp.results[0].error.is_none(),
-        "DROP DATABASE on nonexistent DB should succeed silently (InfluxDB behavior)"
+        matches!(err, HyperbytedbError::DatabaseNotFound(_)),
+        "DROP DATABASE on nonexistent DB should error: {err}"
     );
 }
 
@@ -267,7 +270,7 @@ async fn drop_measurement_removes_associated_metadata() {
 
     let tag_keys = ctx
         .metadata
-        .list_tag_keys("testdb", Some("todrop"))
+        .list_tag_keys("testdb", "autogen", Some("todrop"))
         .await
         .unwrap();
     assert!(
@@ -301,7 +304,11 @@ async fn delete_from_measurement_where_time() {
         .unwrap();
     assert!(resp.results[0].error.is_none());
 
-    let tombstones = ctx.metadata.list_tombstones("testdb", "cpu").await.unwrap();
+    let tombstones = ctx
+        .metadata
+        .list_tombstones("testdb", "autogen", "cpu")
+        .await
+        .unwrap();
     assert!(!tombstones.is_empty(), "DELETE should create a tombstone");
 }
 
@@ -508,7 +515,7 @@ async fn materialized_view_sum_survives_multiple_flushes() {
 
     let dest_meta = ctx
         .metadata
-        .get_measurement("mvdb", "metrics_1m")
+        .get_measurement("mvdb", "autogen", "metrics_1m")
         .await
         .unwrap()
         .expect("dest measurement metadata");
@@ -749,7 +756,7 @@ async fn materialized_view_mean_survives_multiple_flushes() {
 
     let dest_meta = ctx
         .metadata
-        .get_measurement("mvdb", "cpu_1m")
+        .get_measurement("mvdb", "autogen", "cpu_1m")
         .await
         .unwrap()
         .expect("dest measurement metadata");
@@ -895,6 +902,59 @@ async fn materialized_view_sum_dedupes_duplicate_source_rows() {
     assert!(
         (dest_sum - 10.0).abs() < 0.01,
         "duplicate source rows must not inflate MV sum, got {dest_sum}"
+    );
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn materialized_view_dest_in_different_rp_poisons_same_name_in_autogen() {
+    let ctx = match TestContext::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("skipping: chDB not available");
+            return;
+        }
+    };
+
+    ctx.metadata.create_database("reprodb").await.unwrap();
+
+    // Create a non-default retention policy.
+    ctx.query(
+        "reprodb",
+        r#"CREATE RETENTION POLICY "high" ON "reprodb" DURATION 30d REPLICATION 1"#,
+    )
+    .await
+    .unwrap();
+
+    // Write to `svstats` in autogen (default RP). Should succeed.
+    ctx.write_and_flush("reprodb", "svstats,host=h1 value=1.0 1700000000000000000")
+        .await
+        .expect("first write to autogen.svstats should succeed");
+
+    // Create an MV that writes *to the same measurement name* but in the "high" RP.
+    let create_resp = ctx
+        .query(
+            "reprodb",
+            r#"CREATE MATERIALIZED VIEW "mv_bug" ON "reprodb" AS SELECT mean("value") INTO "high"."svstats" FROM "svstats" GROUP BY time(1m), *"#,
+        )
+        .await
+        .unwrap();
+    assert!(
+        create_resp.results[0].error.is_none(),
+        "create MV failed: {:?}",
+        create_resp.results[0].error
+    );
+
+    // Write to `svstats` in autogen again. This SHOULD still succeed because
+    // autogen.svstats and high.svstats are different measurements.
+    // Bug: it currently fails with "cannot write directly to materialized view destination".
+    let result = ctx
+        .write_and_flush("reprodb", "svstats,host=h1 value=2.0 1700000000000000000")
+        .await;
+    assert!(
+        result.is_ok(),
+        "BUG REPRODUCED: write to autogen.svstats failed after creating MV dest in high.svstats: {:?}",
+        result
     );
 }
 

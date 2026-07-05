@@ -481,22 +481,27 @@ async fn build_metadata_snapshot(
                 .map_err(|e| crate::error::HyperbytedbError::Metadata(e.to_string()))?,
         });
 
-        let measurements = metadata.list_measurements(&db.name).await?;
-        for meas in &measurements {
-            if let Some(meta) = metadata.get_measurement(&db.name, meas).await? {
-                entries.push(MetadataEntry {
-                    key: format!("meas:{}:{}", db.name, meas),
-                    value: serde_json::to_vec(&meta)
-                        .map_err(|e| crate::error::HyperbytedbError::Metadata(e.to_string()))?,
-                });
-            }
+        let rps = metadata.list_retention_policies(&db.name).await?;
+        for rp in &rps {
+            let measurements = metadata
+                .list_measurements_for_rp(&db.name, &rp.name)
+                .await?;
+            for meas in &measurements {
+                if let Some(meta) = metadata.get_measurement(&db.name, &rp.name, meas).await? {
+                    entries.push(MetadataEntry {
+                        key: format!("meas:{}:{}:{}", db.name, rp.name, meas),
+                        value: serde_json::to_vec(&meta)
+                            .map_err(|e| crate::error::HyperbytedbError::Metadata(e.to_string()))?,
+                    });
+                }
 
-            let tombstones = metadata.list_tombstones(&db.name, meas).await?;
-            for (id, predicate) in tombstones {
-                entries.push(MetadataEntry {
-                    key: format!("tombstone:{}:{}:{}", db.name, meas, id),
-                    value: predicate.into_bytes(),
-                });
+                let tombstones = metadata.list_tombstones(&db.name, &rp.name, meas).await?;
+                for (id, predicate) in tombstones {
+                    entries.push(MetadataEntry {
+                        key: format!("tombstone:{}:{}:{}:{}", db.name, rp.name, meas, id),
+                        value: predicate.into_bytes(),
+                    });
+                }
             }
         }
 

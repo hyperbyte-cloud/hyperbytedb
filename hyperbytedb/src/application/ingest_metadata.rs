@@ -19,6 +19,11 @@ pub struct IngestCardinalityLimits {
     pub max_measurements_per_database: usize,
 }
 
+/// Maximum number of cached tag-value hashes. Beyond this the set is
+/// evicted to prevent unbounded memory growth under high cardinality.
+/// Cache misses are harmless (fall back to a RocksDB lookup).
+const MAX_CACHED_TAG_HASHES: usize = 1_048_576;
+
 /// Fast in-memory cache for the ingest hot path.  Tracks which measurement
 /// schemas and tag values have already been persisted so that
 /// `prepare_batch_metadata` can return immediately with zero I/O when
@@ -65,9 +70,10 @@ impl IngestSchemaCache {
         h.finish()
     }
 
-    pub fn hash_tag(db: &str, meas: &str, tag_key: &str, tag_value: &str) -> u64 {
+    pub fn hash_tag(db: &str, rp: &str, meas: &str, tag_key: &str, tag_value: &str) -> u64 {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         db.hash(&mut h);
+        rp.hash(&mut h);
         meas.hash(&mut h);
         tag_key.hash(&mut h);
         tag_value.hash(&mut h);
@@ -100,8 +106,8 @@ impl IngestSchemaCache {
         cache.insert(key, schema_hash);
     }
 
-    fn is_tag_known(&self, db: &str, meas: &str, tag_key: &str, tag_value: &str) -> bool {
-        let h = Self::hash_tag(db, meas, tag_key, tag_value);
+    fn is_tag_known(&self, db: &str, rp: &str, meas: &str, tag_key: &str, tag_value: &str) -> bool {
+        let h = Self::hash_tag(db, rp, meas, tag_key, tag_value);
         self.is_tag_known_by_hash(h)
     }
 
@@ -112,6 +118,10 @@ impl IngestSchemaCache {
 
     fn mark_tags(&self, entries: &[(u64,)]) {
         let mut cache = self.tags.write();
+        if cache.len() > MAX_CACHED_TAG_HASHES {
+            cache.clear();
+            cache.shrink_to(4096);
+        }
         for (h,) in entries {
             cache.insert(*h);
         }
@@ -122,11 +132,12 @@ impl IngestSchemaCache {
 async fn merged_field_types(
     metadata: &Arc<dyn MetadataPort>,
     db: &str,
+    rp: &str,
     measurement: &str,
     batch_field_types: &HashMap<String, u8>,
 ) -> Result<HashMap<String, u8>, HyperbytedbError> {
     let mut field_types = batch_field_types.clone();
-    if let Some(existing) = metadata.get_measurement(db, measurement).await? {
+    if let Some(existing) = metadata.get_measurement(db, rp, measurement).await? {
         field_types = merge_field_type_map(&existing.field_types, &field_types);
     }
     Ok(field_types)
@@ -136,11 +147,12 @@ async fn merged_field_types(
 async fn merged_tag_keys(
     metadata: &Arc<dyn MetadataPort>,
     db: &str,
+    rp: &str,
     measurement: &str,
     batch_tag_keys: &BTreeSet<String>,
 ) -> Result<BTreeSet<String>, HyperbytedbError> {
     let mut tag_keys = batch_tag_keys.clone();
-    if let Some(existing) = metadata.get_measurement(db, measurement).await? {
+    if let Some(existing) = metadata.get_measurement(db, rp, measurement).await? {
         for k in &existing.tag_keys {
             tag_keys.insert(k.clone());
         }
@@ -153,6 +165,7 @@ async fn merged_tag_keys(
 pub async fn backfill_tag_metadata(
     metadata: &Arc<dyn MetadataPort>,
     db: &str,
+    rp: &str,
     measurement: &str,
     tags: impl IntoIterator<Item = (String, String)>,
 ) -> Result<(), HyperbytedbError> {
@@ -170,7 +183,7 @@ pub async fn backfill_tag_metadata(
     }
 
     let mut meas_updates: Vec<MeasurementMeta> = Vec::new();
-    if let Some(mut existing) = metadata.get_measurement(db, measurement).await? {
+    if let Some(mut existing) = metadata.get_measurement(db, rp, measurement).await? {
         let before_len = existing.tag_keys.len();
         for k in &tag_keys {
             if !existing.tag_keys.contains(k) {
@@ -192,7 +205,7 @@ pub async fn backfill_tag_metadata(
 
     let tag_entries = vec![(measurement.to_string(), tag_batch)];
     metadata
-        .register_metadata_batch(db, &meas_updates, &tag_entries)
+        .register_metadata_batch(db, rp, &meas_updates, &tag_entries)
         .await
 }
 
@@ -205,6 +218,7 @@ pub async fn backfill_tag_metadata(
 pub async fn prepare_columnar_metadata(
     metadata: &Arc<dyn MetadataPort>,
     db: &str,
+    rp: &str,
     batch: &crate::application::columnar_msgpack::ColumnarMsgpackBatch,
     limits: IngestCardinalityLimits,
     schema_cache: Option<&IngestSchemaCache>,
@@ -220,7 +234,7 @@ pub async fn prepare_columnar_metadata(
         let all_tags_known = batch
             .tags
             .iter()
-            .all(|(k, v)| sc.is_tag_known(db, &batch.measurement, k, v));
+            .all(|(k, v)| sc.is_tag_known(db, rp, &batch.measurement, k, v));
         if all_tags_known {
             metrics::counter!("hyperbytedb_ingest_schema_cache_hits_total").increment(1);
             return Ok(());
@@ -230,7 +244,7 @@ pub async fn prepare_columnar_metadata(
             .tags
             .iter()
             .filter_map(|(k, v)| {
-                let h = IngestSchemaCache::hash_tag(db, &batch.measurement, k, v);
+                let h = IngestSchemaCache::hash_tag(db, rp, &batch.measurement, k, v);
                 if !sc.is_tag_known_by_hash(h) {
                     Some((h,))
                 } else {
@@ -244,14 +258,14 @@ pub async fn prepare_columnar_metadata(
                 .tags
                 .iter()
                 .filter(|(k, v)| {
-                    let h = IngestSchemaCache::hash_tag(db, &batch.measurement, k, v);
+                    let h = IngestSchemaCache::hash_tag(db, rp, &batch.measurement, k, v);
                     novel_hashes.iter().any(|(nh,)| *nh == h)
                 })
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
             if !tag_batch.is_empty() {
                 metadata
-                    .register_metadata_batch(db, &[], &[(batch.measurement.clone(), tag_batch)])
+                    .register_metadata_batch(db, rp, &[], &[(batch.measurement.clone(), tag_batch)])
                     .await?;
                 sc.mark_tags(&novel_hashes);
             }
@@ -277,11 +291,11 @@ pub async fn prepare_columnar_metadata(
     if limits.max_tag_values_per_measurement > 0 {
         for (tag_key, tag_value) in &batch.tags {
             let count = metadata
-                .count_tag_values(db, tag_key, Some(&batch.measurement))
+                .count_tag_values(db, rp, tag_key, Some(&batch.measurement))
                 .await
                 .unwrap_or(0);
             let total = if metadata
-                .tag_value_is_known(db, &batch.measurement, tag_key, tag_value)
+                .tag_value_is_known(db, rp, &batch.measurement, tag_key, tag_value)
                 .await
                 .unwrap_or(false)
             {
@@ -303,13 +317,13 @@ pub async fn prepare_columnar_metadata(
     let field_tuples: Vec<(String, u8)> =
         field_types.iter().map(|(k, v)| (k.clone(), *v)).collect();
     metadata
-        .check_field_types(db, &batch.measurement, &field_tuples)
+        .check_field_types(db, rp, &batch.measurement, &field_tuples)
         .await?;
 
     let metas = vec![MeasurementMeta {
         name: batch.measurement.clone(),
         field_types: field_types.clone(),
-        tag_keys: merged_tag_keys(metadata, db, &batch.measurement, &tag_keys)
+        tag_keys: merged_tag_keys(metadata, db, rp, &batch.measurement, &tag_keys)
             .await?
             .into_iter()
             .collect(),
@@ -327,15 +341,25 @@ pub async fn prepare_columnar_metadata(
         vec![(batch.measurement.clone(), tag_batch)]
     };
 
-    metadata.register_metadata_batch(db, &metas, &tags).await?;
+    metadata
+        .register_metadata_batch(db, rp, &metas, &tags)
+        .await?;
 
     if let Some(sc) = schema_cache {
-        let merged = merged_tag_keys(metadata, db, &batch.measurement, &tag_keys).await?;
+        let merged = merged_tag_keys(metadata, db, rp, &batch.measurement, &tag_keys).await?;
         sc.mark_schema(db, &batch.measurement, &field_types, &merged);
         let novel_hashes: Vec<(u64,)> = batch
             .tags
             .iter()
-            .map(|(k, v)| (IngestSchemaCache::hash_tag(db, &batch.measurement, k, v),))
+            .map(|(k, v)| {
+                (IngestSchemaCache::hash_tag(
+                    db,
+                    rp,
+                    &batch.measurement,
+                    k,
+                    v,
+                ),)
+            })
             .collect();
         sc.mark_tags(&novel_hashes);
     }
@@ -412,7 +436,7 @@ pub async fn prepare_batch_metadata(
             let all_tags_known = points.iter().all(|p| {
                 p.tags
                     .iter()
-                    .all(|(k, v)| sc.is_tag_known(db, &p.measurement, k, v))
+                    .all(|(k, v)| sc.is_tag_known(db, rp, &p.measurement, k, v))
             });
             if all_tags_known {
                 // Full cache hit: zero I/O.
@@ -428,7 +452,7 @@ pub async fn prepare_batch_metadata(
                 .iter()
                 .flat_map(|p| {
                     p.tags.iter().filter_map(move |(k, v)| {
-                        let h = IngestSchemaCache::hash_tag(db, &p.measurement, k, v);
+                        let h = IngestSchemaCache::hash_tag(db, rp, &p.measurement, k, v);
                         if !sc.is_tag_known_by_hash(h) {
                             Some((h,))
                         } else {
@@ -446,7 +470,7 @@ pub async fn prepare_batch_metadata(
                 let mut batch: Vec<(String, String)> = Vec::new();
                 for point in points.iter().filter(|pt| pt.measurement == *meas_name) {
                     for (k, v) in &point.tags {
-                        let h = IngestSchemaCache::hash_tag(db, &point.measurement, k, v);
+                        let h = IngestSchemaCache::hash_tag(db, rp, &point.measurement, k, v);
                         if novel_set.contains(&h) && seen.insert((k.clone(), v.clone())) {
                             batch.push((k.clone(), v.clone()));
                         }
@@ -458,7 +482,7 @@ pub async fn prepare_batch_metadata(
             }
             if !tag_batch_for_bg.is_empty() {
                 metadata
-                    .register_metadata_batch(db, &[], &tag_batch_for_bg)
+                    .register_metadata_batch(db, rp, &[], &tag_batch_for_bg)
                     .await?;
                 sc.mark_tags(&novel_hashes);
             }
@@ -490,7 +514,7 @@ pub async fn prepare_batch_metadata(
         if limits.max_tag_values_per_measurement > 0 {
             for tag_key in tag_keys.iter() {
                 let count = metadata
-                    .count_tag_values(db, tag_key, Some(meas_name))
+                    .count_tag_values(db, rp, tag_key, Some(meas_name))
                     .await
                     .unwrap_or(0);
                 let new_values: std::collections::BTreeSet<&String> = points
@@ -501,7 +525,7 @@ pub async fn prepare_batch_metadata(
                 let mut novel: HashSet<&String> = HashSet::new();
                 for v in &new_values {
                     if !metadata
-                        .tag_value_is_known(db, meas_name, tag_key, v)
+                        .tag_value_is_known(db, rp, meas_name, tag_key, v)
                         .await
                         .unwrap_or(false)
                     {
@@ -520,11 +544,11 @@ pub async fn prepare_batch_metadata(
             }
         }
 
-        let merged_fields = merged_field_types(metadata, db, meas_name, field_types).await?;
+        let merged_fields = merged_field_types(metadata, db, rp, meas_name, field_types).await?;
         let field_tuples: Vec<(String, u8)> =
             merged_fields.iter().map(|(k, v)| (k.clone(), *v)).collect();
         metadata
-            .check_field_types(db, meas_name, &field_tuples)
+            .check_field_types(db, rp, meas_name, &field_tuples)
             .await?;
     }
 
@@ -532,8 +556,9 @@ pub async fn prepare_batch_metadata(
     let mut all_tags: Vec<(String, Vec<(String, String)>)> = Vec::with_capacity(measurements.len());
 
     for (meas_name, (field_types, _tag_keys)) in &measurements {
-        let merged_fields = merged_field_types(metadata, db, meas_name, field_types).await?;
-        let merged = merged_tag_keys(metadata, db, meas_name, &measurements[meas_name].1).await?;
+        let merged_fields = merged_field_types(metadata, db, rp, meas_name, field_types).await?;
+        let merged =
+            merged_tag_keys(metadata, db, rp, meas_name, &measurements[meas_name].1).await?;
         all_metas.push(MeasurementMeta {
             name: meas_name.clone(),
             field_types: merged_fields,
@@ -556,13 +581,13 @@ pub async fn prepare_batch_metadata(
     }
 
     metadata
-        .register_metadata_batch(db, &all_metas, &all_tags)
+        .register_metadata_batch(db, rp, &all_metas, &all_tags)
         .await?;
 
     if let Some(sc) = schema_cache {
         for (name, (fields, tags)) in &measurements {
-            let merged_fields = merged_field_types(metadata, db, name, fields).await?;
-            let merged = merged_tag_keys(metadata, db, name, tags).await?;
+            let merged_fields = merged_field_types(metadata, db, rp, name, fields).await?;
+            let merged = merged_tag_keys(metadata, db, rp, name, tags).await?;
             sc.mark_schema(db, name, &merged_fields, &merged);
         }
         let novel_hashes: Vec<(u64,)> = points
@@ -570,7 +595,7 @@ pub async fn prepare_batch_metadata(
             .flat_map(|p| {
                 p.tags
                     .iter()
-                    .map(move |(k, v)| (IngestSchemaCache::hash_tag(db, &p.measurement, k, v),))
+                    .map(move |(k, v)| (IngestSchemaCache::hash_tag(db, rp, &p.measurement, k, v),))
             })
             .collect();
         sc.mark_tags(&novel_hashes);
@@ -609,6 +634,7 @@ mod tests {
         meta.create_database("db").await.unwrap();
         meta.register_measurement(
             "db",
+            "autogen",
             &MeasurementMeta {
                 name: "system".to_string(),
                 field_types: HashMap::from([("uptime".to_string(), 1)]),
@@ -635,7 +661,11 @@ mod tests {
         .await
         .expect("unsigned uptime must widen integer metadata");
 
-        let stored = meta.get_measurement("db", "system").await.unwrap().unwrap();
+        let stored = meta
+            .get_measurement("db", "autogen", "system")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(stored.field_types.get("uptime"), Some(&2));
     }
 
@@ -682,7 +712,11 @@ mod tests {
         .await
         .unwrap();
 
-        let stored = meta.get_measurement("db", "system").await.unwrap().unwrap();
+        let stored = meta
+            .get_measurement("db", "autogen", "system")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(stored.field_types.contains_key("load1"));
         assert!(stored.field_types.contains_key("uptime"));
         assert!(stored.field_types.contains_key("uptime_format"));
