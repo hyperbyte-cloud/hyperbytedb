@@ -378,11 +378,16 @@ impl FlushServiceImpl {
 
         let sink_start = std::time::Instant::now();
         let mut chunk_points_written = 0u64;
+        let mut any_failed = false;
         for handle in handles {
             match handle.await {
                 Ok(Ok(count)) => chunk_points_written += count as u64,
-                Ok(Err(e)) => tracing::error!(error = %e, "prepared flush work item failed"),
+                Ok(Err(e)) => {
+                    any_failed = true;
+                    tracing::error!(error = %e, "prepared flush work item failed");
+                }
                 Err(e) => {
+                    any_failed = true;
                     tracing::error!(error = %e, "prepared sink task panicked");
                 }
             }
@@ -392,7 +397,17 @@ impl FlushServiceImpl {
 
         *total_points_flushed += chunk_points_written;
 
-        let safe_truncate_seq = self.compute_safe_truncate_seq(chunk_max_seq).await;
+        // If any sink write failed, hold the WAL at the start of this chunk so the
+        // failed entries are retried on the next flush instead of being truncated
+        // away (silent data loss). Coalescing merges multiple WAL sequences into a
+        // single work item, so the chunk is the finest safe retry granularity.
+        let flushed_through = if any_failed {
+            from_seq.saturating_sub(1)
+        } else {
+            chunk_max_seq
+        };
+
+        let safe_truncate_seq = self.compute_safe_truncate_seq(flushed_through).await;
         self.wal.truncate_before(safe_truncate_seq + 1).await?;
         if let Some(ref rl) = self.replication_log
             && let Ok(Some(min_mut_ack)) = rl.min_mutation_ack()
@@ -401,9 +416,17 @@ impl FlushServiceImpl {
             tracing::warn!(error = %e, "failed to truncate mutation log");
         }
 
-        *self.last_flushed.lock().await = chunk_max_seq;
-        *cursor = chunk_max_seq;
+        *self.last_flushed.lock().await = flushed_through;
+        *cursor = flushed_through;
         *total_entries_processed += chunk_entry_count as u64;
+
+        if any_failed {
+            // Stop this flush cycle (retry next tick). Returning Err also prevents
+            // drain() from looping forever on a persistently-failing chunk.
+            return Err(HyperbytedbError::Internal(
+                "prepared flush sink write failed; holding WAL for retry".into(),
+            ));
+        }
 
         Ok(())
     }
@@ -599,11 +622,16 @@ impl FlushServiceImpl {
             }
             let sink_start = std::time::Instant::now();
             let mut chunk_points_written = 0u64;
+            let mut any_failed = false;
             for handle in handles {
                 match handle.await {
                     Ok(Ok(count)) => chunk_points_written += count as u64,
-                    Ok(Err(e)) => tracing::error!(error = %e, "native flush work item failed"),
+                    Ok(Err(e)) => {
+                        any_failed = true;
+                        tracing::error!(error = %e, "native flush work item failed");
+                    }
                     Err(e) => {
+                        any_failed = true;
                         tracing::error!(error = %e, "native flush task panicked");
                     }
                 }
@@ -612,7 +640,17 @@ impl FlushServiceImpl {
                 .record(sink_start.elapsed().as_secs_f64());
             total_points_flushed += chunk_points_written;
 
-            let safe_truncate_seq = self.compute_safe_truncate_seq(chunk_max_seq).await;
+            // If any sink write failed, hold the WAL at the start of this chunk so the
+            // failed entries are retried on the next flush instead of being truncated
+            // away (silent data loss). Coalescing merges multiple WAL sequences into a
+            // single work item, so the chunk is the finest safe retry granularity.
+            let flushed_through = if any_failed {
+                from_seq.saturating_sub(1)
+            } else {
+                chunk_max_seq
+            };
+
+            let safe_truncate_seq = self.compute_safe_truncate_seq(flushed_through).await;
 
             self.wal.truncate_before(safe_truncate_seq + 1).await?;
             if let Some(ref rl) = self.replication_log
@@ -622,9 +660,17 @@ impl FlushServiceImpl {
                 tracing::warn!(error = %e, "failed to truncate mutation log");
             }
 
-            *self.last_flushed.lock().await = chunk_max_seq;
-            cursor = chunk_max_seq;
+            *self.last_flushed.lock().await = flushed_through;
+            cursor = flushed_through;
             total_entries_processed += chunk_entry_count as u64;
+
+            if any_failed {
+                // Stop this flush cycle (retry next tick). Returning Err also prevents
+                // drain() from looping forever on a persistently-failing chunk.
+                return Err(HyperbytedbError::Internal(
+                    "native flush sink write failed; holding WAL for retry".into(),
+                ));
+            }
         }
 
         if total_entries_processed > 0 {
@@ -673,5 +719,93 @@ fn slice_prepared_batch(
 impl FlushPort for FlushServiceImpl {
     async fn drain(&self) -> Result<(), HyperbytedbError> {
         FlushServiceImpl::drain(self).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use tempfile::TempDir;
+
+    use crate::adapters::wal::rocksdb_wal::{RocksDbWal, RocksDbWalOptions};
+    use crate::domain::point::{FieldValue, Point};
+    use crate::domain::wal::WalEntry;
+    use crate::error::HyperbytedbError;
+    use crate::ports::points_sink::{PointsSinkPort, WriteAck};
+    use crate::ports::wal::{WalFormat, WalPort};
+
+    use super::FlushServiceImpl;
+
+    /// Native sink whose write always fails, to exercise the flush error path.
+    struct FailingSink;
+
+    #[async_trait]
+    impl PointsSinkPort for FailingSink {
+        async fn write_points(
+            &self,
+            _db: &str,
+            _rp: &str,
+            _measurement: &str,
+            _origins: &[u64],
+            _ingest_seq_base: u64,
+            _points: &[Point],
+        ) -> Result<WriteAck, HyperbytedbError> {
+            Err(HyperbytedbError::Internal(
+                "simulated chDB write failure".into(),
+            ))
+        }
+    }
+
+    fn entry() -> WalEntry {
+        let mut tags = std::collections::BTreeMap::new();
+        tags.insert("host".to_string(), "h1".to_string());
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert("v".to_string(), FieldValue::Float(1.0));
+        WalEntry {
+            database: "db".into(),
+            retention_policy: "autogen".into(),
+            points: vec![Point {
+                measurement: "cpu".into(),
+                tags,
+                fields,
+                timestamp: 1_700_000_000_000_000_000,
+            }],
+            origin_node_id: 0,
+        }
+    }
+
+    /// Regression: a failed sink write must hold the WAL (retry next flush)
+    /// rather than truncating the failed chunk away — otherwise acknowledged
+    /// writes are silently lost on any transient chDB error.
+    #[tokio::test]
+    async fn failed_sink_write_holds_wal_instead_of_dropping_data() {
+        let tmp = TempDir::new().unwrap();
+        let wal: Arc<dyn WalPort> = Arc::new(
+            RocksDbWal::open_with_options(
+                tmp.path(),
+                RocksDbWalOptions {
+                    wal_format: WalFormat::Bincode,
+                    arrow_wal_enabled: false,
+                },
+            )
+            .unwrap(),
+        );
+        let seq = wal.append(entry()).await.unwrap();
+
+        let flush = FlushServiceImpl::new(wal.clone(), 0, Arc::new(FailingSink));
+        let result = flush.flush().await;
+
+        assert!(
+            result.is_err(),
+            "flush must surface the sink failure, not swallow it"
+        );
+        let remaining = wal.read_range(seq, 16).await.unwrap();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "failed chunk must stay in the WAL for retry, not be truncated"
+        );
     }
 }

@@ -35,7 +35,7 @@ fn meas_rp_prefix(db: &str, rp: &str) -> Vec<u8> {
 fn tag_val_prefix(db: &str, rp: &str, meas: Option<&str>) -> Vec<u8> {
     match meas {
         Some(m) => format!("tag_val:{}:{}:{}:", db, rp, m).into_bytes(),
-        None => format!("tag_val:{}:", db).into_bytes(),
+        None => format!("tag_val:{}:{}:", db, rp).into_bytes(),
     }
 }
 
@@ -881,7 +881,7 @@ impl MetadataPort for RocksDbMetadata {
             if let Ok(s) = std::str::from_utf8(rest) {
                 // Key format: tag_val:{db}:{rp}:{meas}:{tag_key}:{tag_value}
                 // When meas is Some: prefix = tag_val:{db}:{rp}:{meas}:, rest = "{tag_key}:{tag_value}"
-                // When meas is None: prefix = tag_val:{db}:, rest = "{rp}:{meas}:{tag_key}:{tag_value}"
+                // When meas is None: prefix = tag_val:{db}:{rp}:, rest = "{meas}:{tag_key}:{tag_value}"
                 let (k, v) = if measurement.is_some() {
                     let parts: Vec<&str> = s.splitn(2, ':').collect();
                     if parts.len() == 2 {
@@ -890,9 +890,9 @@ impl MetadataPort for RocksDbMetadata {
                         continue;
                     }
                 } else {
-                    let parts: Vec<&str> = s.splitn(4, ':').collect();
-                    if parts.len() == 4 {
-                        (parts[2], parts[3])
+                    let parts: Vec<&str> = s.splitn(3, ':').collect();
+                    if parts.len() == 3 {
+                        (parts[1], parts[2])
                     } else {
                         continue;
                     }

@@ -18,7 +18,7 @@ pub struct OutboundReplicationBatch {
 /// Outbound write/mutation replication to cluster peers.
 #[async_trait]
 pub trait ReplicationPort: Send + Sync {
-    async fn replicate_write(self: Arc<Self>, batch: OutboundReplicationBatch);
+    fn replicate_write(self: Arc<Self>, batch: OutboundReplicationBatch);
 
     async fn replicate_write_sync(
         self: Arc<Self>,
