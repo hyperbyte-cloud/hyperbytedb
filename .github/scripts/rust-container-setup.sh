@@ -14,7 +14,8 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
   llvm-dev \
   pkg-config
 
-curl -sSL https://lib.chdb.io | bash
+curl -fsSL https://lib.chdb.io -o /tmp/install-chdb.sh
+bash /tmp/install-chdb.sh
 
 # Install sccache so cargo's RUSTC_WRAPPER works inside the container. The
 # compiled-object cache lives in the bind-mounted SCCACHE_DIR (see
