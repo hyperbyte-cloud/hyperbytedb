@@ -658,9 +658,11 @@ impl QueryService for PeerQueryService {
                         },
                     };
                     if result.error.is_none() {
-                        let del_rp = retention_policy
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| "autogen".to_string());
+                        let del_rp = if let Some(rp) = retention_policy {
+                            rp.to_string()
+                        } else {
+                            self.metadata.get_default_rp(db).await?
+                        };
                         let predicate_sql = if let Some(ref cond) = del.condition {
                             build_predicate_sql(&self.metadata, db, &del_rp, &del.from, cond)
                                 .await?
@@ -1014,9 +1016,11 @@ impl QueryService for PeerQueryService {
                             MeasurementName::Name(n) => Some(n.clone()),
                             MeasurementName::Regex(_) => None,
                         });
-                        let ds_rp = retention_policy
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| "autogen".to_string());
+                        let ds_rp = if let Some(rp) = retention_policy {
+                            rp.to_string()
+                        } else {
+                            self.metadata.get_default_rp(target_db).await?
+                        };
                         let predicate_sql = if let Some(ref cond) = s.condition {
                             let meas = measurement.as_deref().unwrap_or("");
                             build_predicate_sql(&self.metadata, target_db, &ds_rp, meas, cond)
@@ -1058,16 +1062,22 @@ impl QueryService for PeerQueryService {
                             error: Some(e.to_string()),
                         },
                     };
-                    if result.error.is_none()
-                        && let Err(e) = self
+                    if result.error.is_none() {
+                        let dm_rp = if let Some(rp) = stmt_rp {
+                            rp.clone()
+                        } else {
+                            self.metadata.get_default_rp(db).await?
+                        };
+                        if let Err(e) = self
                             .replicate_mutation(MutationRequest::DropMeasurement {
                                 database: db.to_string(),
-                                rp: stmt_rp.clone().unwrap_or_else(|| "autogen".to_string()),
+                                rp: dm_rp,
                                 name: name.clone(),
                             })
                             .await
-                    {
-                        result.error = Some(e.to_string());
+                        {
+                            result.error = Some(e.to_string());
+                        }
                     }
                     result
                 }

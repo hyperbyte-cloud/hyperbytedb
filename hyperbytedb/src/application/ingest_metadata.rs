@@ -29,7 +29,7 @@ const MAX_CACHED_TAG_HASHES: usize = 1_048_576;
 /// `prepare_batch_metadata` can return immediately with zero I/O when
 /// nothing has changed (the common steady-state case).
 pub struct IngestSchemaCache {
-    /// (db, measurement) → hash of (field_types, tag_keys) for schema identity.
+    /// (db, rp, measurement) → hash of (field_types, tag_keys) for schema identity.
     schema: RwLock<HashMap<u64, u64>>,
     /// Set of hashed (db, measurement, tag_key, tag_value) tuples already persisted.
     tags: RwLock<HashSet<u64>>,
@@ -49,10 +49,11 @@ impl IngestSchemaCache {
         }
     }
 
-    fn hash_key(a: &str, b: &str) -> u64 {
+    fn hash_key(db: &str, rp: &str, meas: &str) -> u64 {
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        a.hash(&mut h);
-        b.hash(&mut h);
+        db.hash(&mut h);
+        rp.hash(&mut h);
+        meas.hash(&mut h);
         h.finish()
     }
 
@@ -83,11 +84,12 @@ impl IngestSchemaCache {
     fn is_schema_known(
         &self,
         db: &str,
+        rp: &str,
         meas: &str,
         field_types: &HashMap<String, u8>,
         tag_keys: &BTreeSet<String>,
     ) -> bool {
-        let key = Self::hash_key(db, meas);
+        let key = Self::hash_key(db, rp, meas);
         let schema_hash = Self::hash_schema(field_types, tag_keys);
         let cache = self.schema.read();
         cache.get(&key) == Some(&schema_hash)
@@ -96,11 +98,12 @@ impl IngestSchemaCache {
     fn mark_schema(
         &self,
         db: &str,
+        rp: &str,
         meas: &str,
         field_types: &HashMap<String, u8>,
         tag_keys: &BTreeSet<String>,
     ) {
-        let key = Self::hash_key(db, meas);
+        let key = Self::hash_key(db, rp, meas);
         let schema_hash = Self::hash_schema(field_types, tag_keys);
         let mut cache = self.schema.write();
         cache.insert(key, schema_hash);
@@ -229,7 +232,7 @@ pub async fn prepare_columnar_metadata(
     let tag_keys: BTreeSet<String> = batch.tags.keys().cloned().collect();
 
     if let Some(sc) = schema_cache
-        && sc.is_schema_known(db, &batch.measurement, &field_types, &tag_keys)
+        && sc.is_schema_known(db, rp, &batch.measurement, &field_types, &tag_keys)
     {
         let all_tags_known = batch
             .tags
@@ -347,7 +350,7 @@ pub async fn prepare_columnar_metadata(
 
     if let Some(sc) = schema_cache {
         let merged = merged_tag_keys(metadata, db, rp, &batch.measurement, &tag_keys).await?;
-        sc.mark_schema(db, &batch.measurement, &field_types, &merged);
+        sc.mark_schema(db, rp, &batch.measurement, &field_types, &merged);
         let novel_hashes: Vec<(u64,)> = batch
             .tags
             .iter()
@@ -429,7 +432,7 @@ pub async fn prepare_batch_metadata(
     if let Some(sc) = schema_cache {
         let all_schemas_known = measurements
             .iter()
-            .all(|(name, (fields, tags))| sc.is_schema_known(db, name, fields, tags));
+            .all(|(name, (fields, tags))| sc.is_schema_known(db, rp, name, fields, tags));
 
         if all_schemas_known {
             // Schema is known → field types are unchanged, check_field_types is redundant.
@@ -588,7 +591,7 @@ pub async fn prepare_batch_metadata(
         for (name, (fields, tags)) in &measurements {
             let merged_fields = merged_field_types(metadata, db, rp, name, fields).await?;
             let merged = merged_tag_keys(metadata, db, rp, name, tags).await?;
-            sc.mark_schema(db, name, &merged_fields, &merged);
+            sc.mark_schema(db, rp, name, &merged_fields, &merged);
         }
         let novel_hashes: Vec<(u64,)> = points
             .iter()
