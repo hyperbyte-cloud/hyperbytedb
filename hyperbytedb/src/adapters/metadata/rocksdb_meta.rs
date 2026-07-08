@@ -20,38 +20,52 @@ fn db_key(name: &str) -> Vec<u8> {
     format!("db:{}", name).into_bytes()
 }
 
-fn meas_key(db: &str, name: &str) -> Vec<u8> {
-    format!("meas:{}:{}", db, name).into_bytes()
+fn meas_key(db: &str, rp: &str, name: &str) -> Vec<u8> {
+    format!("meas:{}:{}:{}", db, rp, name).into_bytes()
 }
 
 fn meas_prefix(db: &str) -> Vec<u8> {
     format!("meas:{}:", db).into_bytes()
 }
 
-fn tag_val_prefix(db: &str, meas: Option<&str>) -> Vec<u8> {
+fn meas_rp_prefix(db: &str, rp: &str) -> Vec<u8> {
+    format!("meas:{}:{}:", db, rp).into_bytes()
+}
+
+fn tag_val_prefix(db: &str, rp: &str, meas: Option<&str>) -> Vec<u8> {
     match meas {
-        Some(m) => format!("tag_val:{}:{}:", db, m).into_bytes(),
-        None => format!("tag_val:{}:", db).into_bytes(),
+        Some(m) => format!("tag_val:{}:{}:{}:", db, rp, m).into_bytes(),
+        None => format!("tag_val:{}:{}:", db, rp).into_bytes(),
     }
 }
 
-fn tag_val_storage_key(db: &str, measurement: &str, tag_key: &str, tag_value: &str) -> String {
-    format!("tag_val:{}:{}:{}:{}", db, measurement, tag_key, tag_value)
+fn tag_val_storage_key(
+    db: &str,
+    rp: &str,
+    measurement: &str,
+    tag_key: &str,
+    tag_value: &str,
+) -> String {
+    format!(
+        "tag_val:{}:{}:{}:{}:{}",
+        db, rp, measurement, tag_key, tag_value
+    )
 }
 
-/// In-memory `(db, measurement, tag_key) → distinct value count`.
-fn tag_count_cache_key(db: &str, measurement: &str, tag_key: &str) -> String {
-    format!("{db}:{measurement}:{tag_key}")
+/// In-memory `(db, rp, measurement, tag_key) → distinct value count`.
+fn tag_count_cache_key(db: &str, rp: &str, measurement: &str, tag_key: &str) -> String {
+    format!("{db}:{rp}:{measurement}:{tag_key}")
 }
 
-fn parse_tag_val_storage_key(key: &str) -> Option<(String, String, String)> {
+fn parse_tag_val_storage_key(key: &str) -> Option<(String, String, String, String)> {
     let rest = key.strip_prefix("tag_val:")?;
-    let parts: Vec<&str> = rest.splitn(4, ':').collect();
-    if parts.len() == 4 {
+    let parts: Vec<&str> = rest.splitn(5, ':').collect();
+    if parts.len() == 5 {
         Some((
             parts[0].to_string(),
             parts[1].to_string(),
             parts[2].to_string(),
+            parts[3].to_string(),
         ))
     } else {
         None
@@ -61,6 +75,7 @@ fn parse_tag_val_storage_key(key: &str) -> Option<(String, String, String)> {
 fn bump_tag_count_cache(
     counts: &mut HashMap<String, usize>,
     db: &str,
+    rp: &str,
     measurement: &str,
     delta: usize,
     tag_key: &str,
@@ -68,15 +83,15 @@ fn bump_tag_count_cache(
     if delta == 0 {
         return;
     }
-    let ck = tag_count_cache_key(db, measurement, tag_key);
+    let ck = tag_count_cache_key(db, rp, measurement, tag_key);
     *counts.entry(ck).or_insert(0) += delta;
 }
 
 fn bump_tag_counts_from_storage_keys(counts: &mut HashMap<String, usize>, storage_keys: &[String]) {
     let mut per_key: HashMap<String, usize> = HashMap::new();
     for key in storage_keys {
-        if let Some((db, meas, tag_key)) = parse_tag_val_storage_key(key) {
-            let ck = tag_count_cache_key(&db, &meas, &tag_key);
+        if let Some((db, rp, meas, tag_key)) = parse_tag_val_storage_key(key) {
+            let ck = tag_count_cache_key(&db, &rp, &meas, &tag_key);
             *per_key.entry(ck).or_insert(0) += 1;
         }
     }
@@ -145,7 +160,7 @@ pub struct RocksDbMetadata {
     user_cache: RwLock<HashMap<String, StoredUser>>,
     /// Generation-gated measurement list: `db → (generation, names)`.
     meas_list_cache: RwLock<HashMap<String, (u64, Vec<String>)>>,
-    /// Tombstone cache: `"{db}:{meas}" → [(id, predicate)]`.
+    /// Tombstone cache: `"{db}:{rp}:{meas}" → [(id, predicate)]`.
     tombstone_cache: RwLock<HashMap<String, Vec<(String, String)>>>,
     /// CQ list cache: all continuous queries, invalidated on CQ DDL.
     cq_cache: RwLock<Option<Vec<ContinuousQueryDef>>>,
@@ -472,7 +487,10 @@ impl MetadataPort for RocksDbMetadata {
             self.meas_cache
                 .write()
                 .retain(|k, _| !k.starts_with(&prefix));
-            self.tag_known.write().retain(|k| !k.starts_with(&prefix));
+            let tag_known_prefix = format!("tag_val:{}:", name);
+            self.tag_known
+                .write()
+                .retain(|k| !k.starts_with(&tag_known_prefix));
             let count_prefix = format!("{name}:");
             self.tag_count_cache
                 .write()
@@ -624,9 +642,10 @@ impl MetadataPort for RocksDbMetadata {
     async fn register_measurement(
         &self,
         db: &str,
+        rp: &str,
         measurement: &MeasurementMeta,
     ) -> Result<(), HyperbytedbError> {
-        let cache_key = format!("{}:{}", db, measurement.name);
+        let cache_key = format!("{}:{}:{}", db, rp, measurement.name);
         {
             let cache = self.meas_cache.read();
             if let Some(existing) = cache.get(&cache_key)
@@ -639,7 +658,7 @@ impl MetadataPort for RocksDbMetadata {
             }
         }
         let rdb = self.db.clone();
-        let key = meas_key(db, &measurement.name);
+        let key = meas_key(db, rp, &measurement.name);
         let value = serde_json::to_vec(measurement)
             .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
         tokio::task::spawn_blocking(move || {
@@ -665,9 +684,10 @@ impl MetadataPort for RocksDbMetadata {
     async fn get_measurement(
         &self,
         db: &str,
+        rp: &str,
         name: &str,
     ) -> Result<Option<MeasurementMeta>, HyperbytedbError> {
-        let cache_key = format!("{}:{}", db, name);
+        let cache_key = format!("{}:{}:{}", db, rp, name);
         {
             let cache = self.meas_cache.read();
             if let Some(m) = cache.get(&cache_key) {
@@ -675,7 +695,7 @@ impl MetadataPort for RocksDbMetadata {
             }
         }
         let rdb = self.db.clone();
-        let key = meas_key(db, name);
+        let key = meas_key(db, rp, name);
         let result = tokio::task::spawn_blocking(move || {
             let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
                 HyperbytedbError::Metadata("metadata column family not found".to_string())
@@ -727,7 +747,9 @@ impl MetadataPort for RocksDbMetadata {
             }
             let rest = &key[prefix.len()..];
             if let Ok(s) = std::str::from_utf8(rest) {
-                let name = s.split(':').next().unwrap_or(s);
+                // Key format: meas:{db}:{rp}:{name}, prefix strips meas:{db}:
+                // so rest = "{rp}:{name}". Extract the last component as name.
+                let name = s.split(':').next_back().unwrap_or(s);
                 names.push(name.to_string());
             }
         }
@@ -740,13 +762,43 @@ impl MetadataPort for RocksDbMetadata {
         Ok(names)
     }
 
+    async fn list_measurements_for_rp(
+        &self,
+        db: &str,
+        rp: &str,
+    ) -> Result<Vec<String>, HyperbytedbError> {
+        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
+            HyperbytedbError::Metadata("metadata column family not found".to_string())
+        })?;
+        let mut names = Vec::new();
+        let prefix = meas_rp_prefix(db, rp);
+        let iter = self.db.iterator_cf_opt(
+            &cf,
+            rocksdb::ReadOptions::default(),
+            IteratorMode::From(prefix.as_slice(), rocksdb::Direction::Forward),
+        );
+        for item in iter {
+            let (key, _) = item.map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let rest = &key[prefix.len()..];
+            if let Ok(s) = std::str::from_utf8(rest) {
+                names.push(s.to_string());
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+
     async fn check_field_types(
         &self,
         db: &str,
+        rp: &str,
         measurement: &str,
         fields: &[(String, u8)],
     ) -> Result<(), HyperbytedbError> {
-        let meta = match self.get_measurement(db, measurement).await? {
+        let meta = match self.get_measurement(db, rp, measurement).await? {
             Some(m) => m,
             None => return Ok(()), // First write for this measurement, no conflicts possible
         };
@@ -769,13 +821,14 @@ impl MetadataPort for RocksDbMetadata {
     async fn list_tag_keys(
         &self,
         db: &str,
+        rp: &str,
         measurement: Option<&str>,
     ) -> Result<Vec<String>, HyperbytedbError> {
         let mut keys: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         match measurement {
             Some(m) => {
-                if let Some(meta) = self.get_measurement(db, m).await? {
+                if let Some(meta) = self.get_measurement(db, rp, m).await? {
                     for k in &meta.tag_keys {
                         keys.insert(k.clone());
                     }
@@ -783,10 +836,13 @@ impl MetadataPort for RocksDbMetadata {
             }
             None => {
                 let measurements = self.list_measurements(db).await?;
+                let rps = self.list_retention_policies(db).await?;
                 for m in &measurements {
-                    if let Some(meta) = self.get_measurement(db, m).await? {
-                        for k in &meta.tag_keys {
-                            keys.insert(k.clone());
+                    for rp_policy in &rps {
+                        if let Some(meta) = self.get_measurement(db, &rp_policy.name, m).await? {
+                            for k in &meta.tag_keys {
+                                keys.insert(k.clone());
+                            }
                         }
                     }
                 }
@@ -801,6 +857,7 @@ impl MetadataPort for RocksDbMetadata {
     async fn list_tag_values(
         &self,
         db: &str,
+        rp: &str,
         tag_key: &str,
         measurement: Option<&str>,
     ) -> Result<Vec<String>, HyperbytedbError> {
@@ -808,7 +865,7 @@ impl MetadataPort for RocksDbMetadata {
             HyperbytedbError::Metadata("metadata column family not found".to_string())
         })?;
         let mut values: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let prefix = tag_val_prefix(db, measurement);
+        let prefix = tag_val_prefix(db, rp, measurement);
         let iter = self.db.iterator_cf_opt(
             &cf,
             rocksdb::ReadOptions::default(),
@@ -822,8 +879,9 @@ impl MetadataPort for RocksDbMetadata {
             }
             let rest = &key[prefix.len()..];
             if let Ok(s) = std::str::from_utf8(rest) {
-                // When measurement is Some: rest = "tag_key:tag_value"
-                // When measurement is None: rest = "measurement:tag_key:tag_value"
+                // Key format: tag_val:{db}:{rp}:{meas}:{tag_key}:{tag_value}
+                // When meas is Some: prefix = tag_val:{db}:{rp}:{meas}:, rest = "{tag_key}:{tag_value}"
+                // When meas is None: prefix = tag_val:{db}:{rp}:, rest = "{meas}:{tag_key}:{tag_value}"
                 let (k, v) = if measurement.is_some() {
                     let parts: Vec<&str> = s.splitn(2, ':').collect();
                     if parts.len() == 2 {
@@ -852,15 +910,19 @@ impl MetadataPort for RocksDbMetadata {
     async fn count_tag_values(
         &self,
         db: &str,
+        rp: &str,
         tag_key: &str,
         measurement: Option<&str>,
     ) -> Result<usize, HyperbytedbError> {
         if let Some(meas) = measurement {
-            let ck = tag_count_cache_key(db, meas, tag_key);
+            let ck = tag_count_cache_key(db, rp, meas, tag_key);
             if let Some(&count) = self.tag_count_cache.read().get(&ck) {
                 return Ok(count);
             }
-            let count = self.list_tag_values(db, tag_key, Some(meas)).await?.len();
+            let count = self
+                .list_tag_values(db, rp, tag_key, Some(meas))
+                .await?
+                .len();
             self.tag_count_cache.write().insert(ck, count);
             return Ok(count);
         }
@@ -877,17 +939,18 @@ impl MetadataPort for RocksDbMetadata {
         if cached > 0 {
             return Ok(cached);
         }
-        Ok(self.list_tag_values(db, tag_key, None).await?.len())
+        Ok(self.list_tag_values(db, rp, tag_key, None).await?.len())
     }
 
     async fn tag_value_is_known(
         &self,
         db: &str,
+        rp: &str,
         measurement: &str,
         tag_key: &str,
         tag_value: &str,
     ) -> Result<bool, HyperbytedbError> {
-        let k = tag_val_storage_key(db, measurement, tag_key, tag_value);
+        let k = tag_val_storage_key(db, rp, measurement, tag_key, tag_value);
         Ok(self.tag_known.read().contains(&k))
     }
 
@@ -912,8 +975,8 @@ impl MetadataPort for RocksDbMetadata {
                 let Ok(s) = std::str::from_utf8(&key) else {
                     continue;
                 };
-                if let Some((db, meas, tag_key)) = parse_tag_val_storage_key(s) {
-                    bump_tag_count_cache(&mut counts, &db, &meas, 1, &tag_key);
+                if let Some((db, rp, meas, tag_key)) = parse_tag_val_storage_key(s) {
+                    bump_tag_count_cache(&mut counts, &db, &rp, &meas, 1, &tag_key);
                 }
             }
             Ok::<HashMap<String, usize>, HyperbytedbError>(counts)
@@ -1096,12 +1159,14 @@ impl MetadataPort for RocksDbMetadata {
     async fn store_tag_value(
         &self,
         db: &str,
+        rp: &str,
         measurement: &str,
         tag_key: &str,
         tag_value: &str,
     ) -> Result<(), HyperbytedbError> {
         self.store_tag_values_batch(
             db,
+            rp,
             measurement,
             &[(tag_key.to_string(), tag_value.to_string())],
         )
@@ -1111,6 +1176,7 @@ impl MetadataPort for RocksDbMetadata {
     async fn store_tag_values_batch(
         &self,
         db: &str,
+        rp: &str,
         measurement: &str,
         entries: &[(String, String)],
     ) -> Result<(), HyperbytedbError> {
@@ -1122,7 +1188,7 @@ impl MetadataPort for RocksDbMetadata {
             entries
                 .iter()
                 .filter_map(|(tag_key, tag_value)| {
-                    let k = tag_val_storage_key(db, measurement, tag_key, tag_value);
+                    let k = tag_val_storage_key(db, rp, measurement, tag_key, tag_value);
                     if cache.contains(&k) { None } else { Some(k) }
                 })
                 .collect()
@@ -1162,6 +1228,7 @@ impl MetadataPort for RocksDbMetadata {
     async fn register_metadata_batch(
         &self,
         db: &str,
+        rp: &str,
         measurements: &[MeasurementMeta],
         tag_entries: &[(String, Vec<(String, String)>)],
     ) -> Result<(), HyperbytedbError> {
@@ -1172,7 +1239,7 @@ impl MetadataPort for RocksDbMetadata {
         {
             let meas_cache = self.meas_cache.read();
             for m in measurements {
-                let cache_key = format!("{}:{}", db, m.name);
+                let cache_key = format!("{}:{}:{}", db, rp, m.name);
                 let merged = match meas_cache.get(&cache_key) {
                     Some(existing) => {
                         let mut meta = m.clone();
@@ -1215,7 +1282,7 @@ impl MetadataPort for RocksDbMetadata {
             let tag_cache = self.tag_known.read();
             for (meas_name, tags) in tag_entries {
                 for (tag_key, tag_value) in tags {
-                    let k = tag_val_storage_key(db, meas_name, tag_key, tag_value);
+                    let k = tag_val_storage_key(db, rp, meas_name, tag_key, tag_value);
                     if !tag_cache.contains(&k) {
                         novel_tags.push(k);
                     }
@@ -1231,7 +1298,7 @@ impl MetadataPort for RocksDbMetadata {
         let rdb = self.db.clone();
         let meas_keys: Vec<(Vec<u8>, Vec<u8>)> = meas_updates
             .iter()
-            .map(|(_, value, m)| (meas_key(db, &m.name), value.clone()))
+            .map(|(_, value, m)| (meas_key(db, rp, &m.name), value.clone()))
             .collect();
         let tag_keys = novel_tags.clone();
 
@@ -1418,11 +1485,16 @@ impl MetadataPort for RocksDbMetadata {
         Ok(())
     }
 
-    async fn delete_measurement(&self, db: &str, name: &str) -> Result<(), HyperbytedbError> {
+    async fn delete_measurement(
+        &self,
+        db: &str,
+        rp: &str,
+        name: &str,
+    ) -> Result<(), HyperbytedbError> {
         let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
             HyperbytedbError::Metadata("metadata column family not found".to_string())
         })?;
-        let key = meas_key(db, name);
+        let key = meas_key(db, rp, name);
         self.db
             .delete_cf(&cf, key)
             .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
@@ -1456,15 +1528,15 @@ impl MetadataPort for RocksDbMetadata {
                 .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
         }
 
-        let cache_key = format!("{}:{}", db, name);
+        let cache_key = format!("{}:{}:{}", db, rp, name);
         self.meas_cache.write().remove(&cache_key);
         self.meas_list_cache.write().remove(db);
         {
-            let tag_prefix = format!("tag_val:{}:{}:", db, name);
+            let tag_prefix = format!("tag_val:{}:{}:{}:", db, rp, name);
             self.tag_known
                 .write()
                 .retain(|k| !k.starts_with(&tag_prefix));
-            let count_prefix = format!("{db}:{name}:");
+            let count_prefix = format!("{db}:{rp}:{name}:");
             self.tag_count_cache
                 .write()
                 .retain(|k, _| !k.starts_with(&count_prefix));
@@ -1482,6 +1554,7 @@ impl MetadataPort for RocksDbMetadata {
     async fn store_tombstone(
         &self,
         db: &str,
+        rp: &str,
         measurement: &str,
         predicate_sql: &str,
     ) -> Result<String, HyperbytedbError> {
@@ -1489,11 +1562,11 @@ impl MetadataPort for RocksDbMetadata {
             HyperbytedbError::Metadata("metadata column family not found".to_string())
         })?;
         let id = uuid::Uuid::new_v4().to_string();
-        let key = format!("tombstone:{}:{}:{}", db, measurement, id);
+        let key = format!("tombstone:{}:{}:{}:{}", db, rp, measurement, id);
         self.db
             .put_cf(&cf, key.as_bytes(), predicate_sql.as_bytes())
             .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-        let tomb_key = format!("{}:{}", db, measurement);
+        let tomb_key = format!("{}:{}:{}", db, rp, measurement);
         self.tombstone_cache.write().remove(&tomb_key);
         Ok(id)
     }
@@ -1501,9 +1574,10 @@ impl MetadataPort for RocksDbMetadata {
     async fn list_tombstones(
         &self,
         db: &str,
+        rp: &str,
         measurement: &str,
     ) -> Result<Vec<(String, String)>, HyperbytedbError> {
-        let tomb_key = format!("{}:{}", db, measurement);
+        let tomb_key = format!("{}:{}:{}", db, rp, measurement);
         {
             let cache = self.tombstone_cache.read();
             if let Some(entries) = cache.get(&tomb_key) {
@@ -1514,7 +1588,7 @@ impl MetadataPort for RocksDbMetadata {
         let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
             HyperbytedbError::Metadata("metadata column family not found".to_string())
         })?;
-        let prefix = format!("tombstone:{}:{}:", db, measurement);
+        let prefix = format!("tombstone:{}:{}:{}:", db, rp, measurement);
         let prefix_bytes = prefix.as_bytes();
         let iter = self.db.iterator_cf_opt(
             &cf,

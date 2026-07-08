@@ -222,6 +222,7 @@ fn bench_metadata_fast(c: &mut Criterion) {
             rt.block_on(prepare_columnar_metadata(
                 &meta_port,
                 "benchdb",
+                "autogen",
                 black_box(&batch),
                 limits,
                 Some(&cache),
@@ -257,6 +258,7 @@ fn bench_wal_fast(c: &mut Criterion) {
             rt.block_on(prepare_columnar_metadata(
                 &meta_port,
                 "benchdb",
+                "autogen",
                 &wire,
                 limits,
                 Some(&cache),
@@ -344,6 +346,7 @@ fn bench_metadata_concurrent(c: &mut Criterion) {
                                 prepare_columnar_metadata(
                                     &meta_port,
                                     "benchdb",
+                                    "autogen",
                                     batch.as_ref(),
                                     limits,
                                     Some(cache.as_ref()),
@@ -400,6 +403,7 @@ fn bench_wal_concurrent(c: &mut Criterion) {
                                 prepare_columnar_metadata(
                                     &meta_port,
                                     "benchdb",
+                                    "autogen",
                                     &wire,
                                     limits,
                                     Some(cache.as_ref()),
@@ -475,6 +479,7 @@ fn bench_wal_batched_concurrent(c: &mut Criterion) {
                                 prepare_columnar_metadata(
                                     &meta_port,
                                     "benchdb",
+                                    "autogen",
                                     &wire,
                                     limits,
                                     Some(cache.as_ref()),

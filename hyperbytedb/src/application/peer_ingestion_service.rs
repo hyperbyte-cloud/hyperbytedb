@@ -139,11 +139,7 @@ impl IngestionPort for PeerIngestionService {
 
         let retention_policy = match rp {
             Some(s) => s.to_string(),
-            None => self
-                .metadata
-                .get_default_rp(db)
-                .await
-                .unwrap_or_else(|_| "autogen".to_string()),
+            None => self.metadata.get_default_rp(db).await?,
         };
 
         self.metadata
@@ -167,11 +163,30 @@ impl IngestionPort for PeerIngestionService {
             prepare_columnar_metadata(
                 &self.metadata,
                 db,
+                &retention_policy,
                 &wire,
                 self.limits,
                 Some(&self.schema_cache),
             )
             .await?;
+
+            // Reject writes to materialized view destinations at ingestion time
+            // (before the WAL entry is created) to avoid stuck-flush liveness gaps.
+            if let Some(meta) = self
+                .metadata
+                .get_measurement(db, &retention_policy, &wire.measurement)
+                .await?
+                && meta.materialized
+                && meta
+                    .materialized_rp
+                    .as_deref()
+                    .is_none_or(|mr| mr == retention_policy)
+            {
+                return Err(HyperbytedbError::QueryParse(format!(
+                    "cannot write directly to materialized view destination \"{0}\"",
+                    wire.measurement,
+                )));
+            }
 
             let t3 = std::time::Instant::now();
             histogram!("hyperbytedb_ingest_metadata_register_seconds")
@@ -246,6 +261,28 @@ impl IngestionPort for PeerIngestionService {
             Some(&self.schema_cache),
         )
         .await?;
+
+        // Reject writes to materialized view destinations at ingestion time
+        // (before the WAL entry is created) to avoid stuck-flush liveness gaps.
+        let mut checked_meas = std::collections::HashSet::new();
+        for point in &points {
+            if checked_meas.insert(&point.measurement)
+                && let Some(meta) = self
+                    .metadata
+                    .get_measurement(db, &retention_policy, &point.measurement)
+                    .await?
+                && meta.materialized
+                && meta
+                    .materialized_rp
+                    .as_deref()
+                    .is_none_or(|mr| mr == retention_policy)
+            {
+                return Err(HyperbytedbError::QueryParse(format!(
+                    "cannot write directly to materialized view destination \"{0}\"",
+                    point.measurement,
+                )));
+            }
+        }
 
         let t3 = std::time::Instant::now();
         histogram!("hyperbytedb_ingest_metadata_register_seconds").record((t3 - t2).as_secs_f64());

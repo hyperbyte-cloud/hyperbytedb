@@ -11,11 +11,12 @@ use crate::timeseriesql::to_clickhouse;
 pub async fn build_predicate_sql(
     metadata: &Arc<dyn MetadataPort>,
     db: &str,
+    rp: &str,
     measurement: &str,
     cond: &Expr,
 ) -> Result<String, HyperbytedbError> {
     let mapping = metadata
-        .get_measurement(db, measurement)
+        .get_measurement(db, rp, measurement)
         .await?
         .map(|m| ColumnMapping::from_measurement_meta(&m));
     let mut sql = String::new();

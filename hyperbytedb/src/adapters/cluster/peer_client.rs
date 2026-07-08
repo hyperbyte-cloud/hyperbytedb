@@ -175,6 +175,9 @@ impl PeerClient {
     }
 
     /// Fan out a line-protocol batch to all active peers (bounded queue + coalescing worker).
+    /// Non-blocking: if the outbound queue is full (a peer is down/slow) the batch is
+    /// dropped rather than stalling ingestion. Divergence is reconciled by anti-entropy
+    /// sync; async replication must never block the write path on an unhealthy peer.
     pub fn replicate_write(self: &Arc<Self>, batch: OutboundReplicationBatch) {
         self.start_outbound_processor();
         if let Err(e) = self.outbound_tx.try_send(batch) {

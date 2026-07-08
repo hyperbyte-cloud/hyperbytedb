@@ -810,7 +810,7 @@ async fn uptime_integer_then_unsigned_widens() {
 
     let meta = ctx
         .metadata
-        .get_measurement("db", "system")
+        .get_measurement("db", "autogen", "system")
         .await
         .unwrap()
         .unwrap();

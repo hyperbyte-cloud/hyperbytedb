@@ -322,12 +322,13 @@ impl SyncClient {
                     .await?;
             }
         } else if entry.key.starts_with("meas:") {
-            let parts: Vec<&str> = entry.key.splitn(3, ':').collect();
-            if parts.len() == 3 {
+            let parts: Vec<&str> = entry.key.splitn(4, ':').collect();
+            if parts.len() == 4 {
                 let db = parts[1];
+                let rp = parts[2];
                 let meta: MeasurementMeta = serde_json::from_slice(&entry.value)
                     .map_err(|e| HyperbytedbError::Metadata(format!("parse meas: {e}")))?;
-                self.metadata.register_measurement(db, &meta).await?;
+                self.metadata.register_measurement(db, rp, &meta).await?;
             }
         } else if let Some(username) = entry.key.strip_prefix("user:") {
             let user: StoredUser = serde_json::from_slice(&entry.value)
@@ -336,12 +337,19 @@ impl SyncClient {
                 .create_user(username, &user.password_hash, user.admin)
                 .await?;
         } else if entry.key.starts_with("tombstone:") {
-            let parts: Vec<&str> = entry.key.splitn(4, ':').collect();
-            if parts.len() == 4 {
+            let parts: Vec<&str> = entry.key.splitn(5, ':').collect();
+            if parts.len() == 5 {
                 let db = parts[1];
-                let meas = parts[2];
-                let predicate = std::str::from_utf8(&entry.value).unwrap_or("");
-                self.metadata.store_tombstone(db, meas, predicate).await?;
+                let rp = parts[2];
+                let meas = parts[3];
+                let predicate = std::str::from_utf8(&entry.value).map_err(|e| {
+                    HyperbytedbError::Metadata(format!(
+                        "invalid UTF-8 in tombstone value for {db}/{rp}/{meas}: {e}"
+                    ))
+                })?;
+                self.metadata
+                    .store_tombstone(db, rp, meas, predicate)
+                    .await?;
             }
         } else if entry.key.starts_with("cq:") {
             let parts: Vec<&str> = entry.key.splitn(3, ':').collect();

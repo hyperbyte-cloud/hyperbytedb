@@ -43,11 +43,12 @@ pub async fn apply_schema_mutation(
         } => metadata.create_user(&username, &password_hash, false).await,
         MutationRequest::Delete {
             database,
+            rp,
             measurement,
             predicate_sql,
         } => {
             metadata
-                .store_tombstone(&database, &measurement, &predicate_sql)
+                .store_tombstone(&database, &rp, &measurement, &predicate_sql)
                 .await?;
             Ok(())
         }
@@ -88,13 +89,52 @@ pub async fn apply_schema_mutation(
         }
         MutationRequest::DropSeries {
             database,
+            rp,
             measurement,
             predicate_sql,
         } => {
-            let rp = metadata.get_default_rp(&database).await?;
+            if !predicate_sql.is_empty() && measurement.is_some() {
+                metadata
+                    .store_tombstone(
+                        &database,
+                        &rp,
+                        measurement.as_deref().unwrap_or(""),
+                        &predicate_sql,
+                    )
+                    .await?;
+            }
             metadata
                 .delete_series_matching(&database, &rp, measurement.as_deref(), &predicate_sql)
                 .await?;
+            Ok(())
+        }
+        MutationRequest::DropMeasurement { database, rp, name } => {
+            metadata.delete_measurement(&database, &rp, &name).await
+        }
+        MutationRequest::Grant { username, database } => {
+            if let Some(db) = &database {
+                metadata
+                    .grant_privilege(&username, db, crate::domain::user::DatabasePrivilege::All)
+                    .await?;
+            } else {
+                if let Some(user) = metadata.get_user(&username).await? {
+                    metadata
+                        .create_user(&username, &user.password_hash, true)
+                        .await?;
+                }
+            }
+            Ok(())
+        }
+        MutationRequest::Revoke { username, database } => {
+            if let Some(db) = &database {
+                metadata.revoke_privilege(&username, db).await?;
+            } else {
+                if let Some(user) = metadata.get_user(&username).await? {
+                    metadata
+                        .create_user(&username, &user.password_hash, false)
+                        .await?;
+                }
+            }
             Ok(())
         }
     }

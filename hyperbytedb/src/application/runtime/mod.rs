@@ -162,7 +162,8 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
         );
     }
 
-    // Keep a handle to drain_service for the shutdown sequence
+    // Keep handles for the shutdown sequence
+    let shutdown_wal = app_state.wal.clone();
     let shutdown_drain_service = app_state.drain_service.clone();
     let shutdown_membership = membership.clone();
     let shutdown_node_id = config.cluster.node_id;
@@ -251,7 +252,18 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
         let handle = axum_server::Handle::new();
         let shutdown_handle = handle.clone();
         tokio::spawn(async move {
-            tokio::signal::ctrl_c().await.ok();
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut term) => {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {},
+                        _ = term.recv() => {},
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to install SIGTERM handler, SIGINT only");
+                    tokio::signal::ctrl_c().await.ok();
+                }
+            }
             tracing::info!("shutdown signal received, stopping API server");
             let _ = api_shutdown_tx.send(true);
             shutdown_handle.graceful_shutdown(Some(Duration::from_secs(10)));
@@ -268,7 +280,18 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         axum::serve(listener, app)
             .with_graceful_shutdown(async move {
-                tokio::signal::ctrl_c().await.ok();
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                    Ok(mut term) => {
+                        tokio::select! {
+                            _ = tokio::signal::ctrl_c() => {},
+                            _ = term.recv() => {},
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to install SIGTERM handler, SIGINT only");
+                        tokio::signal::ctrl_c().await.ok();
+                    }
+                }
                 tracing::info!("shutdown signal received, stopping API server");
                 let _ = api_shutdown_tx.send(true);
                 // Also consume api_rx so it is moved into this future
@@ -279,9 +302,14 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
 
     // ── Phase 2: API is down — drain if cluster mode ────────────────────
     // The HTTP server has fully stopped; no new external requests will arrive.
+    // Flush the RocksDB WAL to physical media before drain, so all acknowledged
+    // writes are durable even if the process crashes during drain.
     // Run the drain procedure so WAL is flushed and peers acknowledge replication
     // before we tear down background services.
-    tracing::info!("API server stopped, beginning shutdown drain");
+    tracing::info!("API server stopped, flushing WAL to disk");
+    if let Err(e) = shutdown_wal.flush_wal().await {
+        tracing::error!(error = %e, "WAL flush before drain failed");
+    }
 
     if let Some(ref ds) = shutdown_drain_service {
         // Skip drain if it was already triggered by the Kubernetes preStop hook

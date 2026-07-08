@@ -18,6 +18,12 @@ pub struct MeasurementMeta {
     /// Raw writes to materialized destinations are rejected.
     #[serde(default)]
     pub materialized: bool,
+    /// When materialized, the retention policy of the MV destination.
+    /// Only writes whose RP matches this value are rejected; writes to
+    /// other RPs (e.g. autogen) with the same measurement name are allowed.
+    /// `None` (legacy entries) conservatively rejects all RPs.
+    #[serde(default)]
+    pub materialized_rp: Option<String>,
 }
 
 impl MeasurementMeta {

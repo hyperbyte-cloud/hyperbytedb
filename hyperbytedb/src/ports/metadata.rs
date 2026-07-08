@@ -47,19 +47,38 @@ pub trait MetadataPort: Send + Sync {
     async fn register_measurement(
         &self,
         db: &str,
+        rp: &str,
         measurement: &MeasurementMeta,
     ) -> Result<(), HyperbytedbError>;
     async fn get_measurement(
         &self,
         db: &str,
+        rp: &str,
         name: &str,
     ) -> Result<Option<MeasurementMeta>, HyperbytedbError>;
     async fn list_measurements(&self, db: &str) -> Result<Vec<String>, HyperbytedbError>;
+
+    /// List measurement names in a specific retention policy.
+    async fn list_measurements_for_rp(
+        &self,
+        db: &str,
+        rp: &str,
+    ) -> Result<Vec<String>, HyperbytedbError> {
+        let all = self.list_measurements(db).await?;
+        let mut result = Vec::new();
+        for name in all {
+            if self.get_measurement(db, rp, &name).await?.is_some() {
+                result.push(name);
+            }
+        }
+        Ok(result)
+    }
 
     // Field type validation
     async fn check_field_types(
         &self,
         db: &str,
+        rp: &str,
         measurement: &str,
         fields: &[(String, u8)],
     ) -> Result<(), HyperbytedbError>;
@@ -68,11 +87,13 @@ pub trait MetadataPort: Send + Sync {
     async fn list_tag_keys(
         &self,
         db: &str,
+        rp: &str,
         measurement: Option<&str>,
     ) -> Result<Vec<String>, HyperbytedbError>;
     async fn list_tag_values(
         &self,
         db: &str,
+        rp: &str,
         tag_key: &str,
         measurement: Option<&str>,
     ) -> Result<Vec<String>, HyperbytedbError>;
@@ -82,22 +103,27 @@ pub trait MetadataPort: Send + Sync {
     async fn count_tag_values(
         &self,
         db: &str,
+        rp: &str,
         tag_key: &str,
         measurement: Option<&str>,
     ) -> Result<usize, HyperbytedbError> {
-        Ok(self.list_tag_values(db, tag_key, measurement).await?.len())
+        Ok(self
+            .list_tag_values(db, rp, tag_key, measurement)
+            .await?
+            .len())
     }
 
     /// Whether `(tag_key, tag_value)` is already recorded for the measurement.
     async fn tag_value_is_known(
         &self,
         db: &str,
+        rp: &str,
         measurement: &str,
         tag_key: &str,
         tag_value: &str,
     ) -> Result<bool, HyperbytedbError> {
         Ok(self
-            .list_tag_values(db, tag_key, Some(measurement))
+            .list_tag_values(db, rp, tag_key, Some(measurement))
             .await?
             .iter()
             .any(|v| v == tag_value))
@@ -112,6 +138,7 @@ pub trait MetadataPort: Send + Sync {
     async fn store_tag_value(
         &self,
         db: &str,
+        rp: &str,
         measurement: &str,
         tag_key: &str,
         tag_value: &str,
@@ -121,6 +148,7 @@ pub trait MetadataPort: Send + Sync {
     async fn store_tag_values_batch(
         &self,
         db: &str,
+        rp: &str,
         measurement: &str,
         entries: &[(String, String)],
     ) -> Result<(), HyperbytedbError>;
@@ -130,14 +158,15 @@ pub trait MetadataPort: Send + Sync {
     async fn register_metadata_batch(
         &self,
         db: &str,
+        rp: &str,
         measurements: &[MeasurementMeta],
         tag_entries: &[(String, Vec<(String, String)>)],
     ) -> Result<(), HyperbytedbError> {
         for m in measurements {
-            self.register_measurement(db, m).await?;
+            self.register_measurement(db, rp, m).await?;
         }
         for (meas, tags) in tag_entries {
-            self.store_tag_values_batch(db, meas, tags).await?;
+            self.store_tag_values_batch(db, rp, meas, tags).await?;
         }
         Ok(())
     }
@@ -247,18 +276,25 @@ pub trait MetadataPort: Send + Sync {
     ) -> Result<(), HyperbytedbError>;
 
     // Measurement deletion
-    async fn delete_measurement(&self, db: &str, name: &str) -> Result<(), HyperbytedbError>;
+    async fn delete_measurement(
+        &self,
+        db: &str,
+        rp: &str,
+        name: &str,
+    ) -> Result<(), HyperbytedbError>;
 
     // Tombstone management (for DELETE statements)
     async fn store_tombstone(
         &self,
         db: &str,
+        rp: &str,
         measurement: &str,
         predicate_sql: &str,
     ) -> Result<String, HyperbytedbError>;
     async fn list_tombstones(
         &self,
         db: &str,
+        rp: &str,
         measurement: &str,
     ) -> Result<Vec<(String, String)>, HyperbytedbError>;
     async fn remove_tombstone(&self, db: &str, tombstone_id: &str) -> Result<(), HyperbytedbError>;
