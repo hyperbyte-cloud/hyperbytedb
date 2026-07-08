@@ -1,23 +1,33 @@
 # Installation
 
-Deploy HyperbyteDB with Docker images, Docker Compose, release tarballs, a source build, or Kubernetes ([kind](#kubernetes-kind) for local dev, [operator](operator/index.md) for production).
+Deploy HyperbyteDB using pre-built images and charts — no compiler required.
 
-## Supported platforms
+| Path | Best for |
+|------|----------|
+| [Docker](#docker) | Single node, quick evaluation, simple production |
+| [Docker Compose](#docker-compose) | Local or small deployments with observability pre-wired |
+| [Kubernetes operator](#kubernetes-hyperbytedb-operator) | Production clusters on EKS, AKS, GKE, or self-managed Kubernetes |
+| [Linux release tarballs](#linux-release-tarballs-optional) | Bare-metal or VM installs without containers |
 
-| Platform           | Docker image | Release tarball | Build from source |
-|--------------------|:------------:|:---------------:|:-----------------:|
-| Linux x86_64       | yes          | yes             | yes               |
-| Linux aarch64 (ARM)| yes          | yes             | yes               |
-| macOS arm64 (Apple Silicon) | —   | —               | yes               |
-| macOS x86_64       | —            | —               | yes               |
-
-The Docker images are multi-arch manifests, so `docker pull ghcr.io/hyperbyte-cloud/hyperbytedb:latest` automatically picks `linux/amd64` or `linux/arm64` based on the host. macOS is supported as a from-source target only — pre-built macOS binaries are not currently published.
+For building from source, local kind clusters, and Compose stacks that compile HyperbyteDB, see [Development setup](../developer-guide/development-setup.md).
 
 ---
 
-## Pre-built Docker Image (Recommended)
+## Supported platforms
 
-The fastest way to run HyperbyteDB. Images are published to GitHub Container Registry as a multi-arch manifest covering `linux/amd64` and `linux/arm64`.
+| Platform | Docker image | Release tarball |
+|----------|:------------:|:---------------:|
+| Linux x86_64 | yes | yes |
+| Linux aarch64 (ARM) | yes | yes |
+| macOS | — | — |
+
+Docker images are multi-arch manifests — `docker pull ghcr.io/hyperbyte-cloud/hyperbytedb:latest` selects `linux/amd64` or `linux/arm64` automatically. Pre-built server tarballs and `hyperbytedb-cli` install scripts target **Linux only**. macOS is supported for development builds only; see [Development setup](../developer-guide/development-setup.md).
+
+---
+
+## Docker
+
+The fastest way to run a single HyperbyteDB node. Images are published to GitHub Container Registry (`ghcr.io/hyperbyte-cloud/hyperbytedb`).
 
 ```bash
 docker pull ghcr.io/hyperbyte-cloud/hyperbytedb:latest
@@ -31,62 +41,49 @@ docker run -d \
   ghcr.io/hyperbyte-cloud/hyperbytedb:latest
 ```
 
-To force a specific architecture (e.g. when running emulated builds for testing):
-
-```bash
-docker pull --platform=linux/arm64 ghcr.io/hyperbyte-cloud/hyperbytedb:latest
-```
-
-Verify it started:
+Verify the server is up:
 
 ```bash
 curl -sSf http://localhost:8086/health
 # {"status":"pass","message":"ready for queries and writes"}
 ```
 
-The container stores all data under `/var/lib/hyperbytedb`. Mount a volume to persist data across container restarts.
+Data is stored under `/var/lib/hyperbytedb` inside the container. Mount a volume (as above) to persist across restarts.
 
 > **Note:** `HYPERBYTEDB__SERVER__BIND_ADDRESS=0.0.0.0` is required so the process accepts connections from outside the container.
+
+The image includes `hyperbytedb-cli`:
+
+```bash
+docker exec -it hyperbytedb hyperbytedb-cli -host http://127.0.0.1:8086 ping
+```
+
+To install the CLI on the host instead, see [CLI (hyperbytedb-cli)](cli.md).
 
 ---
 
 ## Docker Compose
 
-Two compose files are provided under `deploy/compose/`:
+### Getting started stack
 
-| File | Use case |
-|------|----------|
-| `docker-compose.getting-started.yml` | Quick start — HyperbyteDB only, pre-built image, single command |
-| `../docker-compose.yml` (root) | Full observability stack — HyperbyteDB (local build), Prometheus, Grafana, Loki, Telegraf |
-
-### Quick start (pre-built image)
+The getting-started compose file starts HyperbyteDB plus Telegraf, Prometheus, Loki, and Grafana from **pre-built images** — no local compilation.
 
 ```bash
 docker compose -f deploy/compose/docker-compose.getting-started.yml up -d
 ```
 
-This starts HyperbyteDB, Telegraf, Prometheus, Loki, and Grafana from pre-built images — no local compilation needed. Host metrics flow into HyperbyteDB via Telegraf, Prometheus scrapes `/metrics`, and Grafana comes pre-loaded with dashboards.
+Host metrics flow into HyperbyteDB via Telegraf. Prometheus scrapes `/metrics`. Grafana ships with pre-provisioned dashboards.
 
-Open Grafana at http://localhost:3000 (`admin` / `admin`) to explore.
-
-### Full observability stack (local build)
-
-The root `docker-compose.yml` builds HyperbyteDB from source and starts the full stack:
-
-```bash
-docker compose up --build -d
-```
+Open Grafana at http://localhost:3000 (`admin` / `admin`).
 
 | Service | Port | Description |
 |---------|------|-------------|
-| HyperbyteDB | 8086 | Time-series database (JSON logs) |
-| Alloy | 4318 | Docker log shipping → Loki |
-| Loki | 3100 | Log aggregation |
-| Telegraf | — | Collects host metrics and writes to HyperbyteDB |
-| Prometheus | 9090 | Scrapes HyperbyteDB `/metrics` |
-| Grafana | 3000 | Pre-provisioned dashboards (login: `admin`/`admin`) |
+| HyperbyteDB | 8086 | Time-series database |
+| Grafana | 3000 | Dashboards |
+| Prometheus | 9090 | Metrics |
+| Loki | 3100 | Logs |
 
-### Smoke test (either compose file)
+### Smoke test
 
 ```bash
 # Create a database
@@ -102,121 +99,9 @@ curl -sS -G 'http://localhost:8086/query' \
   --data-urlencode 'q=SELECT * FROM cpu'
 ```
 
----
+### Multi-node cluster (Compose)
 
-## Pre-built Binary Tarballs
-
-For each `v*` tag, CI publishes a GitHub Release with self-contained tarballs for Linux:
-
-- `hyperbytedb-vX.Y.Z-linux-x86_64.tar.gz`
-- `hyperbytedb-vX.Y.Z-linux-aarch64.tar.gz`
-
-Each tarball contains the `hyperbytedb` binary plus the matching `libchdb.so` (extracted from the same Docker image that gets published to GHCR, so they're guaranteed to be in sync).
-
-```bash
-# Pick the right arch
-arch=$(uname -m)              # x86_64 or aarch64
-tag=vX.Y.Z                    # match the GitHub release you want
-url="https://github.com/hyperbyte-cloud/hyperbytedb/releases/download/${tag}/hyperbytedb-${tag}-linux-${arch}.tar.gz"
-
-curl -fsSL "$url" -o hyperbytedb.tar.gz
-sudo tar -xzf hyperbytedb.tar.gz -C /usr/local/bin hyperbytedb
-sudo tar -xzf hyperbytedb.tar.gz -C /usr/local/lib  libchdb.so
-sudo ldconfig
-
-hyperbytedb serve
-```
-
-A matching `*.sha256` file is attached to every release for integrity verification.
-
----
-
-## Building from Source
-
-### Prerequisites
-
-| Requirement | Details |
-|-------------|---------|
-| **Rust** | Latest stable toolchain (`rustup update stable`) |
-| **libchdb** | Embedded ClickHouse library (`https://lib.chdb.io` ships builds for Linux x86_64/aarch64 and macOS x86_64/arm64) |
-| **System packages** | `clang`, `llvm-dev`, `libclang-dev`, `pkg-config`, `libssl-dev` |
-| **Platforms** | Linux x86_64, Linux aarch64, macOS x86_64, macOS arm64 |
-
-### Install system dependencies
-
-```bash
-# Debian/Ubuntu (works for both amd64 and arm64)
-sudo apt-get update && sudo apt-get install -y \
-  clang llvm-dev libclang-dev pkg-config libssl-dev build-essential
-
-# Fedora/RHEL
-sudo dnf install -y clang llvm-devel clang-devel pkgconfig openssl-devel
-
-# macOS (Homebrew) — needed for both Apple Silicon and Intel
-brew install llvm pkg-config openssl@3
-export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
-```
-
-### Install libchdb
-
-```bash
-curl -sL https://lib.chdb.io | bash
-# Linux only — refresh the dynamic linker cache after the install
-sudo ldconfig 2>/dev/null || true
-```
-
-The installer auto-detects your platform and pulls the right artifact (Linux x86_64/aarch64, macOS x86_64/arm64). It places `libchdb.so` in `/usr/local/lib/` and `chdb.h` in `/usr/local/include/`.
-
-> **macOS note:** the chdb installer writes `libchdb.so` even on macOS (not `.dylib`). The Rust crate links against it by name, so leave the file as-is. If `cargo build` later complains about `libchdb` not being found at runtime, ensure `/usr/local/lib` is on `DYLD_LIBRARY_PATH` (Apple Silicon Homebrew users sometimes need this).
-
-Verify:
-
-```bash
-ls /usr/local/lib/libchdb.so
-ls /usr/local/include/chdb.h
-```
-
-If the build links successfully but the binary exits with `libchdb.so: cannot open shared object file`, the library may be present under `/usr/local/lib` but not in the system loader’s search path. Add that directory to the linker configuration and run `ldconfig` again; see the **libchdb.so** entry in [Troubleshooting](troubleshooting.md).
-
-### Build
-
-```bash
-# Debug build (faster compilation, slower runtime)
-cargo build
-
-# Release build (optimized, recommended for production)
-cargo build --release
-```
-
-The release build uses LTO, single codegen unit, and strip for maximum performance and minimum binary size.
-
-### Run
-
-```bash
-# Start with default config (./config.toml)
-./target/release/hyperbytedb serve
-
-# Start with a custom config file
-./target/release/hyperbytedb -c /etc/hyperbytedb/config.toml serve
-```
-
-### CLI Commands
-
-| Command | Description |
-|---------|-------------|
-| `hyperbytedb serve` | Start the HTTP server |
-| `hyperbytedb backup --output <path>` | Create a full backup |
-| `hyperbytedb restore --input <path>` | Restore from a backup |
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-c`, `--config` | `config.toml` | Path to TOML config file |
-
----
-
-## Docker Compose Cluster (3-Node)
-
-For a clustered deployment with Docker Compose, create a compose file with three HyperbyteDB services. Each node needs a unique `NODE_ID` and must list the other nodes as peers:
+For a three-node active-active cluster on Docker networks, run one service per node with unique `HYPERBYTEDB__CLUSTER__NODE_ID` and peer lists. Example pattern:
 
 ```yaml
 services:
@@ -272,36 +157,13 @@ networks:
     driver: bridge
 ```
 
-```bash
-docker compose up -d
-```
-
-Write to any node; all nodes see the same data after replication.
-
----
-
-## Kubernetes (kind)
-
-The `deploy/kind/` directory contains a setup script and manifests for a local Kubernetes cluster using kind:
-
-```bash
-./deploy/kind/setup.sh
-```
-
-This creates a kind cluster with:
-- HyperbyteDB operator and a multi-node `HyperbytedbCluster` CR
-- Observability stack (Prometheus, Grafana, Loki, Telegraf)
-- NodePort services mapped to localhost ports
-
-For a single-node stack with full observability, use the root `docker-compose.yml` and configs under `deploy/compose/`.
-
-See [Administration](administration.md) for cluster operations.
+Write to any node; data replicates to peers asynchronously by default. See [Advanced features](advanced-features.md) for sync-quorum mode and [Administration](administration.md) for cluster operations.
 
 ---
 
 ## Kubernetes (HyperbyteDB operator)
 
-For production-style deployments on a **real Kubernetes cluster**, use the [HyperbyteDB Kubernetes operator](operator/index.md). It extends the API with `HyperbytedbCluster`, `HyperbytedbBackup`, and `HyperbytedbRestore`, and reconciles StatefulSets, services, and optional monitoring resources.
+For production on Kubernetes, install the [HyperbyteDB operator](operator/index.md). It manages `HyperbytedbCluster`, `HyperbytedbBackup`, and `HyperbytedbRestore` custom resources and reconciles StatefulSets, Services, TLS, and optional monitoring.
 
 | Doc | What it covers |
 |-----|----------------|
@@ -311,7 +173,31 @@ For production-style deployments on a **real Kubernetes cluster**, use the [Hype
 | [Backup and restore (operator)](operator/backup-restore.md) | S3 backups and restores via custom resources |
 | [hyperbytedb-proxy](operator/hyperbytedb-proxy.md) | Optional health-aware HTTP proxy in front of the database Service |
 
-The [kind-based setup](#kubernetes-kind) above is aimed at local development. Treat the operator path as the supported way to run managed HyperbyteDB on Kubernetes in production.
+Tested Kubernetes distros include EKS, AKS, GKE, and kind (kind is for local development — see [Development setup](../developer-guide/development-setup.md)).
+
+---
+
+## Linux release tarballs (optional)
+
+Each `v*` GitHub Release includes self-contained Linux tarballs (server + `libchdb.so`, synced with the Docker image):
+
+- `hyperbytedb-vX.Y.Z-linux-x86_64.tar.gz`
+- `hyperbytedb-vX.Y.Z-linux-aarch64.tar.gz`
+
+```bash
+arch=$(uname -m)              # x86_64 or aarch64
+tag=vX.Y.Z                    # match the GitHub release you want
+url="https://github.com/hyperbyte-cloud/hyperbytedb/releases/download/${tag}/hyperbytedb-${tag}-linux-${arch}.tar.gz"
+
+curl -fsSL "$url" -o hyperbytedb.tar.gz
+sudo tar -xzf hyperbytedb.tar.gz -C /usr/local/bin hyperbytedb
+sudo tar -xzf hyperbytedb.tar.gz -C /usr/local/lib libchdb.so
+sudo ldconfig
+
+hyperbytedb serve
+```
+
+A matching `*.sha256` file is attached to every release for integrity verification. Downloads are at [github.com/hyperbyte-cloud/hyperbytedb/releases](https://github.com/hyperbyte-cloud/hyperbytedb/releases).
 
 ---
 
@@ -319,3 +205,5 @@ The [kind-based setup](#kubernetes-kind) above is aimed at local development. Tr
 
 - [Configuration](configuration.md) — Tune settings for your workload
 - [Basic operations](basic-operations.md) — Start writing and querying data
+- [CLI (hyperbytedb-cli)](cli.md) — Interactive shell and batch commands
+- [Resource sizing](resource-sizing.md) — CPU, memory, and disk guidelines

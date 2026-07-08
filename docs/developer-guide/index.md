@@ -8,7 +8,7 @@ Technical documentation for contributors and engineers extending HyperbyteDB.
 |---|-------|-------------|
 | 1 | [Architecture](architecture.md) | Hexagonal design, components, data flow |
 | 2 | [System architecture](system-architecture.md) | Module layout, storage, services |
-| 3 | [Development setup](development-setup.md) | Prerequisites, build, run, Compose, kind |
+| 3 | [Development setup](development-setup.md) | Build from source, local Compose (build), kind |
 | 4 | **Internals** | |
 | | [Core modules](internals/core-modules.md) | Source tree guide |
 | | [Key design decisions](internals/key-design-decisions.md) | Write path, read path, compaction, replication |
@@ -17,7 +17,8 @@ Technical documentation for contributors and engineers extending HyperbyteDB.
 | 5 | [Coding standards](coding-standards.md) | Errors, async, naming, metrics |
 | 6 | [Testing](testing.md) | Suites, running tests, CI |
 | 7 | [Building & CI](building-and-ci.md) | Pipeline, Docker, releases |
-| 8 | [Contributing](contributing.md) | PR process and review checklist |
+| 8 | [Dependency audit](dependency-audit.md) | CVE triage, supply chain, pinning policy |
+| 9 | [Contributing](contributing.md) | PR process and review checklist |
 
 ## Quick reference
 
