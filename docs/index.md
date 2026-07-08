@@ -32,13 +32,14 @@ For operators and application developers deploying HyperbyteDB.
 
 | Topic | Description |
 |-------|-------------|
-| [Installation](user-guide/installation.md) | Docker, Compose, binaries, kind, Kubernetes operator |
+| [Installation](user-guide/installation.md) | Docker, Compose, Kubernetes operator, Linux tarballs |
 | [Configuration](user-guide/configuration.md) | `config.toml` and `HYPERBYTEDB__*` environment variables |
 | [Basic operations](user-guide/basic-operations.md) | Databases, writes, queries, retention |
 | [Authentication](user-guide/authentication.md) | Credentials, public routes, admin APIs |
 | [Advanced features](user-guide/advanced-features.md) | Clustering, continuous queries, TLS, tracing |
 | [Common workflows](user-guide/common-workflows.md) | InfluxDB migration, Telegraf, Grafana, monitoring |
 | [Administration](user-guide/administration.md) | Metrics, logs, traces, backup, cluster ops |
+| [Resource sizing](user-guide/resource-sizing.md) | CPU, memory, disk, and cluster guidelines |
 | [Troubleshooting](user-guide/troubleshooting.md) | Common problems |
 | [API reference](user-guide/reference.md) | HTTP endpoints and TimeseriesQL compatibility |
 | [Kubernetes operator](user-guide/operator/index.md) | Helm install, CRDs, backups |

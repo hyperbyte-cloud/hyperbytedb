@@ -1,17 +1,10 @@
-<div align="center">
-  <table>
-    <tr>
-      <td align="center" bgcolor="#000000">
-        <img src="docs/img/hyperbytedb_white.png" alt="HyperbyteDB" width="450">
-      </td>
-    </tr>
-  </table>
-<p align="center">
-  <a href="https://docs.hyperbyte.cloud">Documentation</a> · <a href="https://hyperbyte.cloud/hyperbytedb">Website</a>
-</p>
-</div>
+
+|     |
+| --- |
+|     |
 
 
+[Documentation](https://docs.hyperbyte.cloud) · [Website](https://hyperbyte.cloud/hyperbytedb)
 
 HyperbyteDB is a time-series database written in Rust that provides InfluxDB v1 API compatibility, uses embedded ClickHouse (chDB) for queries and native MergeTree storage, and RocksDB for WAL/metadata. It supports master-master clustering for replication.
 
@@ -19,28 +12,23 @@ HyperbyteDB is a time-series database written in Rust that provides InfluxDB v1 
 
 - **InfluxDB v1 API compatible** — Line protocol and HTTP API for Telegraf, Grafana, and other 1.x clients
 - **TimeseriesQL** — Time-series analytics query language
-- **Embedded chDB engine** — ClickHouse in-process datastore
 - **Columnar MergeTree storage** — Per-measurement `ReplacingMergeTree`
-- **RocksDB WAL** — Durable write-ahead log and metadata
+- **WAL** — Durable write-ahead log and metadata
 - **Active-active clustering** — Raft for schema consensus; every node accepts writes with async or sync-quorum replication
 - **Built-in observability** — Prometheus metrics and structured logs
 
-## Supported Platforms
-
-| Platform                    | Docker image | Release tarball | Build from source |
-|-----------------------------|:------------:|:---------------:|:-----------------:|
-| Linux x86_64                | yes          | yes             | yes               |
-| Linux aarch64 (ARM)         | yes          | yes             | yes               |
-| macOS arm64 (Apple Silicon) | —            | —               | yes               |
-| macOS x86_64                | —            | —               | yes               |
-
-Docker images at `ghcr.io/hyperbyte-cloud/hyperbytedb` are multi-arch manifests, so `docker pull` automatically resolves to `linux/amd64` or `linux/arm64`. Each `v*` GitHub Release also ships standalone `linux-x86_64` and `linux-aarch64` tarballs (binaries + matching `libchdb.so`, plus `sha256` files).
-
 ## Quick Start
 
-### Pre-built Docker image (GHCR)
+### Docker
 
-For Docker, Compose, kind, and the Kubernetes operator, see [docs/user-guide/installation.md](docs/user-guide/installation.md).
+```bash
+docker pull ghcr.io/hyperbyte-cloud/hyperbytedb:latest
+
+docker run -d \
+  --name hyperbytedb \
+  -p 8086:8086 \
+  ghcr.io/hyperbyte-cloud/hyperbytedb:latest
+```
 
 ### Docker Compose (quick start)
 
@@ -50,101 +38,33 @@ docker compose -f deploy/compose/docker-compose.getting-started.yml up -d
 
 This starts HyperbyteDB, Telegraf, Prometheus, Loki, and Grafana — pre-configured with host-metrics collection and dashboards.
 
-Open Grafana at http://localhost:3000 (`admin` / `admin`) and check the **HyperbyteDB Cluster** and **Machine Monitoring** dashboards.
+Open Grafana at [http://localhost:3000](http://localhost:3000) (`admin` / `admin`) and check the **HyperbyteDB Cluster** and **Machine Monitoring** dashboards.
 
-For the full stack (with local build, Alloy log shipping), see [docs/user-guide/installation.md](docs/user-guide/installation.md).
+For a Compose stack that builds from source (contributors), see [docs/developer-guide/development-setup.md](docs/developer-guide/development-setup.md).
 
 ### CLI client
 
 `hyperbytedb-cli` provides an interactive TimeseriesQL shell, batch queries, and write/import over the HTTP API (InfluxDB v1 `influx`-compatible). See [docs/user-guide/cli.md](docs/user-guide/cli.md).
 
 ```bash
-cargo build --release -p hyperbytedb-cli
-./target/release/hyperbytedb-cli -host http://localhost:8086 -execute 'SHOW DATABASES'
+curl -fsSL https://raw.githubusercontent.com/hyperbyte-cloud/hyperbytedb/main/scripts/install-cli.sh | sudo bash
 ```
 
-### Manual Build
-
-1. **Prerequisites**: Rust (latest stable), libchdb
-2. **Install libchdb**:
-  ```bash
-   curl -sL https://lib.chdb.io | bash
-  ```
-3. **Build**:
-  ```bash
-   cargo build --release
-  ```
-4. **Run**:
-  ```bash
-   ./target/release/hyperbytedb serve
-  ```
-
-## Configuration
-
-HyperbyteDB is configured via `config.toml` or environment variables. Environment variables use the `HYPERBYTEDB__` prefix with double underscores separating sections and keys (e.g., `HYPERBYTEDB__SERVER__PORT=9090`). See [docs/user-guide/configuration.md](docs/user-guide/configuration.md) for the full reference.
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         HTTP Layer (axum)                               │
-│              /write  /query  /ping  /health  /metrics                   │
-└─────────────────────────────────────────────────────────────────────────┘
-                                     │
-                                     ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      Application Services                               │
-│         Write Service │ Query Service │ Auth │ Flush │ Retention        │
-└─────────────────────────────────────────────────────────────────────────┘
-                                     │
-                                     ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                          Ports (traits)                                 │
-│         WalPort │ QueryPort │ MetadataPort │ PointsSinkPort             │
-└─────────────────────────────────────────────────────────────────────────┘
-                                     │
-                                     ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         Adapters                                        │
-│       RocksDB (WAL, metadata) │ chDB (queries + native MergeTree)       │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### Data Flow
-
-**Write path**: Line protocol → parse → RocksDB WAL → background flush → chDB `INSERT` into MergeTree tables
-
-**Query path**: TimeseriesQL → transpile to ClickHouse SQL → chDB `SELECT` from native tables
-
-## Supported TimeseriesQL
-
-- **SELECT** with aggregates: `mean`, `median`, `count`, `sum`, `min`, `max`, `first`, `last`, `percentile`, `spread`, `stddev`, `mode`, `distinct`
-- **Transforms**: `derivative`, `non_negative_derivative`, `difference`, `moving_average`, `cumulative_sum`, `elapsed`
-- **GROUP BY**: `time()` + tags
-- **Fill modes**: `null`, `none`, `previous`, `linear`, `0`
-- **Regex measurements** (e.g., `/^cpu.*/`)
-- **Subqueries**
-- **Arithmetic expressions**
-
-See [docs/user-guide/reference.md#influxdb-v1-compatibility-matrix](docs/user-guide/reference.md#influxdb-v1-compatibility-matrix) for the compatibility matrix.
-
-If the server crashes with `std::bad_function_call` on startup, see [docs/user-guide/troubleshooting.md](docs/user-guide/troubleshooting.md).
+Installs the latest Linux release from [GitHub Releases](https://github.com/hyperbyte-cloud/hyperbytedb/releases) to `/usr/local/bin`. See [cli.md](docs/user-guide/cli.md) for version pinning and user-local installs.
 
 ## Documentation
 
 
-| Doc                                                                                                          | Description                                                                                                                                                                                                |
-| ------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [docs/index.md](docs/index.md)                                                                               | Documentation home and navigation                                                                                                                                                                          |
-| [docs/user-guide/index.md](docs/user-guide/index.md)                                                         | **User guide** (install, configure, operate)                                                                                                                                                               |
-| [docs/user-guide/configuration.md](docs/user-guide/configuration.md)                                         | Config file and environment variables                                                                                                                                                                      |
-| [docs/user-guide/administration.md](docs/user-guide/administration.md)                                       | Backups, metrics, cluster ops |
-| [docs/developer-guide/system-architecture.md](docs/developer-guide/system-architecture.md)                   | Internal design overview                                                                                                                                                                                   |
-| [docs/deep-dive/deep-dive-clustering.md](docs/deep-dive/deep-dive-clustering.md)                             | Replication, Raft, sync APIs                                                                                                                                                                               |
-| [docs/developer-guide/internals/replication-design.md](docs/developer-guide/internals/replication-design.md) | Replication wire format and evolution                                                                                                                                                                      |
-| [docs/developer-guide/index.md](docs/developer-guide/index.md)                                               | Building and contributing                                                                                                                                                                                  |
-| [docs/engineering/code-review-rubric.md](docs/engineering/code-review-rubric.md)                             | PR review checklist and test ownership                                                                                                                                                                     |
+| Doc                                                                                                          | Description                                  |
+| ------------------------------------------------------------------------------------------------------------ | -------------------------------------------- |
+| [docs/index.md](docs/index.md)                                                                               | Documentation home and navigation            |
+| [docs/user-guide/index.md](docs/user-guide/index.md)                                                         | **User guide** (install, configure, operate) |
+| [docs/user-guide/configuration.md](docs/user-guide/configuration.md)                                         | Config file and environment variables        |
+| [docs/user-guide/administration.md](docs/user-guide/administration.md)                                       | Backups, metrics, cluster ops                |
+| [docs/developer-guide/system-architecture.md](docs/developer-guide/system-architecture.md)                   | Internal design overview                     |
+| [docs/deep-dive/deep-dive-clustering.md](docs/deep-dive/deep-dive-clustering.md)                             | Replication, Raft, sync APIs                 |
+| [docs/developer-guide/internals/replication-design.md](docs/developer-guide/internals/replication-design.md) | Replication wire format and evolution        |
+| [docs/developer-guide/index.md](docs/developer-guide/index.md)                                               | Building and contributing                    |
+| [docs/engineering/code-review-rubric.md](docs/engineering/code-review-rubric.md)                             | PR review checklist and test ownership       |
 
-## License
 
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.

@@ -8,6 +8,26 @@ Backup and restore remain **server-local** operations on the `hyperbytedb` binar
 
 ## Installation
 
+### One-line install (Linux)
+
+Downloads the matching release binary from [GitHub Releases](https://github.com/hyperbyte-cloud/hyperbytedb/releases), verifies the SHA256 checksum, and installs to `/usr/local/bin`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hyperbyte-cloud/hyperbytedb/main/scripts/install-cli.sh | sudo bash
+```
+
+Pin a version or install without sudo:
+
+```bash
+# Specific release
+curl -fsSL https://raw.githubusercontent.com/hyperbyte-cloud/hyperbytedb/main/scripts/install-cli.sh | bash -s -- --version v0.8.4-beta
+
+# User-local install (~/.local/bin)
+curl -fsSL https://raw.githubusercontent.com/hyperbyte-cloud/hyperbytedb/main/scripts/install-cli.sh | bash -s -- --install-dir "$HOME/.local/bin"
+```
+
+Pre-built CLI binaries are published for **Linux x86_64 and aarch64** only. On macOS, build from source — see [Development setup](../developer-guide/development-setup.md#building).
+
 ### Release tarball
 
 Each `v*` GitHub Release ships `hyperbytedb-cli` alongside `hyperbytedb` and `libchdb.so`:
@@ -27,10 +47,7 @@ docker exec -it <container> hyperbytedb-cli -host http://127.0.0.1:8086 ping
 
 ### Build from source
 
-```bash
-cargo build --release -p hyperbytedb-cli
-./target/release/hyperbytedb-cli --help
-```
+See [Development setup](../developer-guide/development-setup.md#building) (`cargo build --release -p hyperbytedb-cli`).
 
 ---
 

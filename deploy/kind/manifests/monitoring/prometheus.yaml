@@ -46,6 +46,9 @@ data:
       scrape_interval: 15s
       evaluation_interval: 15s
 
+    rule_files:
+      - "/etc/prometheus/rules/*.yml"
+
     scrape_configs:
       - job_name: "hyperbytedb"
         metrics_path: "/metrics"
@@ -54,6 +57,91 @@ data:
               - "hyperbytedb-0.hyperbytedb-headless:8086"
               - "hyperbytedb-1.hyperbytedb-headless:8086"
               - "hyperbytedb-2.hyperbytedb-headless:8086"
+  hyperbytedb-alerts.yml: |
+    groups:
+      - name: hyperbytedb
+        interval: 30s
+        rules:
+          - alert: HyperbytedbInstanceDown
+            expr: up{job="hyperbytedb"} == 0
+            for: 1m
+            labels:
+              severity: critical
+            annotations:
+              summary: "HyperbyteDB instance {{ $labels.instance }} is down"
+              description: "Instance {{ $labels.instance }} has been unreachable for more than 1 minute."
+          - alert: HyperbytedbWriteErrors
+            expr: rate(hyperbytedb_write_errors_total[5m]) > 0
+            for: 1m
+            labels:
+              severity: warning
+            annotations:
+              summary: "HyperbyteDB write errors detected"
+              description: "Write errors on {{ $labels.instance }}: {{ $value }} errors/s over 5m."
+          - alert: HyperbytedbQueryErrors
+            expr: rate(hyperbytedb_query_errors_total[5m]) > 0
+            for: 1m
+            labels:
+              severity: warning
+            annotations:
+              summary: "HyperbyteDB query errors detected"
+              description: "Query errors on {{ $labels.instance }}: {{ $value }} errors/s over 5m."
+          - alert: HyperbytedbSlowQueries
+            expr: histogram_quantile(0.99, rate(hyperbytedb_query_duration_seconds_bucket[5m])) > 10
+            for: 2m
+            labels:
+              severity: warning
+            annotations:
+              summary: "HyperbyteDB P99 query latency exceeds 10s"
+              description: "P99 query latency on {{ $labels.instance }} is {{ $value }}s."
+          - alert: HyperbytedbFlushErrors
+            expr: rate(hyperbytedb_flush_errors_total[5m]) > 0
+            for: 2m
+            labels:
+              severity: critical
+            annotations:
+              summary: "HyperbyteDB flush errors detected"
+              description: "WAL-to-chDB flush is failing on {{ $labels.instance }}: {{ $value }} errors/s over 5m."
+          - alert: HyperbytedbSlowFlushes
+            expr: histogram_quantile(0.99, rate(hyperbytedb_flush_duration_seconds_bucket[5m])) > 30
+            for: 2m
+            labels:
+              severity: warning
+            annotations:
+              summary: "HyperbyteDB P99 flush latency exceeds 30s"
+              description: "P99 flush latency on {{ $labels.instance }} is {{ $value }}s."
+          - alert: HyperbytedbReplicationErrors
+            expr: rate(hyperbytedb_replication_errors_total[5m]) > 0
+            for: 2m
+            labels:
+              severity: warning
+            annotations:
+              summary: "HyperbyteDB replication errors detected"
+              description: "Replication errors on {{ $labels.instance }}: {{ $value }} errors/s over 5m."
+          - alert: HyperbytedbNodeNotActive
+            expr: hyperbytedb_cluster_node_state != 3
+            for: 1m
+            labels:
+              severity: critical
+            annotations:
+              summary: "HyperbyteDB node is not active"
+              description: "Node {{ $labels.instance }} is in state {{ $value }} (expected 3=Active)."
+          - alert: HyperbytedbPeerCountLow
+            expr: hyperbytedb_cluster_peers_active < 2
+            for: 1m
+            labels:
+              severity: warning
+            annotations:
+              summary: "HyperbyteDB cluster has fewer than 2 active peers"
+              description: "Node {{ $labels.instance }} has {{ $value }} active peers."
+          - alert: HyperbytedbWALGrowing
+            expr: hyperbytedb_wal_last_sequence - hyperbytedb_flush_points_total > 100000
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "HyperbyteDB WAL backlog is growing"
+              description: "WAL sequence is {{ $value }} points ahead of flushed on {{ $labels.instance }}."
 
       - job_name: "hyperbytedb-proxy"
         metrics_path: "/metrics"
@@ -152,6 +240,9 @@ spec:
               mountPath: /etc/prometheus/prometheus.yml
               subPath: prometheus.yml
               readOnly: true
+            - name: rules
+              mountPath: /etc/prometheus/rules
+              readOnly: true
             - name: data
               mountPath: /prometheus
           readinessProbe:
@@ -171,6 +262,15 @@ spec:
         - name: config
           configMap:
             name: prometheus-config
+            items:
+              - key: prometheus.yml
+                path: prometheus.yml
+        - name: rules
+          configMap:
+            name: prometheus-config
+            items:
+              - key: hyperbytedb-alerts.yml
+                path: hyperbytedb-alerts.yml
         - name: data
           emptyDir: {}
 
