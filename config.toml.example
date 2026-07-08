@@ -3,6 +3,12 @@ bind_address = "0.0.0.0"
 port = 8086
 max_body_size_bytes = 26214400  # 25 MB
 request_timeout_secs = 30
+query_timeout_secs = 30
+# Max concurrent TimeseriesQL executions; 0 = unlimited
+max_concurrent_queries = 0
+tls_enabled = false
+tls_cert_path = ""
+tls_key_path = ""
 
 [storage]
 wal_dir = "./wal"
@@ -15,6 +21,10 @@ interval_secs = 10
 wal_size_threshold_mb = 64
 time_bucket_duration = "1h"
 max_points_per_batch = 50000
+# WAL group-commit: max entries to coalesce per write batch (0 = disabled)
+wal_batch_size = 64
+# WAL group-commit: max microseconds to wait before flushing a partial batch
+wal_batch_delay_us = 200
 # Keep chDB-ready Arrow batches in RAM for zero-copy flush (default true)
 arrow_wal_enabled = true
 
@@ -45,12 +55,18 @@ heartbeat_miss_threshold = 5
 replication_log_dir = "./replication_log"
 raft_dir = "./raft"
 replication_max_retries = 5
+replication_queue_depth = 8192
+replication_max_inflight_batches = 8
+replication_max_coalesce_body_bytes = 8388608
+replicate_receiver_queue_depth = 1024
+# Deprecated: receiver always uses a single ordered worker.
+replicate_receiver_workers = 1
+replication_truncate_stale_peer_multiplier = 2
 # Raft consensus settings (used when cluster is enabled)
 # raft_heartbeat_interval_ms = 300
 # raft_election_timeout_ms = 1000
 # raft_snapshot_threshold = 1000
 
-# ----------------------------------------------------------------------------
 # Per-node replication mode. Controls only THIS node's coordinator behavior
 # (how writes accepted by this node are replicated). Receivers always accept
 # both async (fire-and-forget) and sync (header-gated, ack-with-WAL-seq)
@@ -58,29 +74,19 @@ replication_max_retries = 5
 # restarts are safe at any moment.
 #
 # Modes:
-#   "async"        Fire-and-forget HTTP fan-out (default; preserves today's
-#                  behavior). Local WAL append succeeds immediately and
-#                  replication is best-effort with hinted handoff retries.
-#   "sync_quorum"  HTTP fan-out + await W-of-N peer acks before returning to
-#                  the client. Trades latency for stronger durability.
+#   "async"        Fire-and-forget HTTP fan-out (default).
+#   "sync_quorum"  HTTP fan-out + await W-of-N peer acks before returning.
 #
 # Omit the entire [cluster.replication] block to keep async behavior.
-# ----------------------------------------------------------------------------
 [cluster.replication]
 mode = "async"
 # Worst-case latency budget for a sync_quorum write. On timeout the coordinator
-# returns 504; the in-flight peer tasks keep running so durability still
-# ratchets forward in the background (and pushes to hinted handoff on failure).
+# returns 504; in-flight peer tasks keep running in the background.
 ack_timeout_ms = 5000
 
 [cluster.replication.sync_quorum]
-# Number of PEER acks required. The local WAL append always happens first, so
-# self-durability is implicit and the local node is never counted toward the
-# quorum. Two forms accepted:
-#   "majority"   floor(N/2) peer acks where N is the total cluster size,
-#                resolved at request time against current active_peers().
-#                For N=3 this means 1 peer ack; for N=5, 2 peer acks.
-#   <integer>    explicit peer ack count, clamped to active_peers().
+# Number of PEER acks required. The local WAL append always happens first.
+# "majority" or an explicit integer peer ack count.
 min_acks = "majority"
 
 [logging]
@@ -91,17 +97,18 @@ format = "text"
 enabled = true
 max_entries = 1000
 
-# ----------------------------------------------------------------------------
-# Retention policy enforcement loop. Periodically runs `ALTER TABLE … DELETE`
-# for rows older than each RP's `duration`. This block governs only how often
-# that scan runs — the per-policy duration is metadata stored alongside each RP.
-#
-#   enabled   When false, the loop is not spawned and expired files remain on
-#             disk until manually deleted. Defaults to `true`.
-#   interval  How often the scan runs, as a `humantime` duration string
-#             ("30s", "1m", "1h", "24h", "1d", ...). Defaults to "12h".
-#             Invalid or zero values fall back to 60s and emit a warning.
-# ----------------------------------------------------------------------------
+# Hinted handoff stores writes for unreachable peers and replays on recovery.
+[hinted_handoff]
+enabled = true
+max_hints_per_peer = 100000
+max_hint_age_secs = 3600
+
+# HTTP rate limiting for /write and /query.
+[rate_limit]
+enabled = false
+max_requests_per_second = 0
+
+# Retention policy enforcement loop. Per-policy duration is metadata (CREATE RP).
 [retention]
 enabled = true
 interval = "12h"

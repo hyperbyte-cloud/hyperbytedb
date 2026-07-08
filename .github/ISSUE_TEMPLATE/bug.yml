@@ -1,0 +1,82 @@
+name: Bug Report
+description: Report a bug in HyperbyteDB
+title: "[BUG] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please fill in as much detail as you can.
+
+  - type: input
+    id: version
+    attributes:
+      label: HyperbyteDB version
+      description: Server version, Docker image tag, or Git commit SHA
+      placeholder: "0.8.3 / ghcr.io/hyperbyte-cloud/hyperbytedb:v0.8.3"
+    validations:
+      required: true
+
+  - type: input
+    id: libchdb
+    attributes:
+      label: libchdb version
+      description: Output of chdb --version or the libchdb version bundled with your image
+      placeholder: "3.x.x"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: topology
+    attributes:
+      label: Deployment topology
+      options:
+        - Single node (binary / Docker)
+        - Docker Compose cluster
+        - Kubernetes operator (Helm)
+        - kind (local dev)
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the bug and any error messages
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps, curl commands, or config snippets
+      placeholder: |
+        1. Start server with ...
+        2. POST /write ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / metrics
+      description: Relevant log lines or Prometheus output (redact secrets)
+      render: shell
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration
+      description: config.toml or environment variables (redact passwords and tokens)
+      render: toml
