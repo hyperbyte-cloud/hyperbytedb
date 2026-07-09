@@ -4,7 +4,7 @@
 //! `tests/compat/`. This crate keeps auth, cardinality, admin users, metrics,
 //! backup manifest shape, and chDB physical layout checks.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::http::StatusCode;
 use hyperbytedb::adapters::chdb::native_adapter::ChdbNativeAdapter;
@@ -20,6 +20,22 @@ use hyperbytedb::application::query_service::QueryServiceImpl;
 use hyperbytedb::ports::metadata::MetadataPort;
 use hyperbytedb::ports::points_sink::PointsSinkPort;
 use serial_test::serial;
+
+/// Single process-wide Prometheus recorder for integration tests. Without this,
+/// later tests that call `set_global_recorder` get `AlreadySet` and scrape an
+/// empty handle while counters increment on the first recorder.
+fn test_prometheus_handle() -> metrics_exporter_prometheus::PrometheusHandle {
+    static HANDLE: OnceLock<metrics_exporter_prometheus::PrometheusHandle> = OnceLock::new();
+    HANDLE
+        .get_or_init(|| {
+            let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
+            let recorder = builder.build_recorder();
+            let handle = recorder.handle();
+            let _ = metrics::set_global_recorder(recorder);
+            handle
+        })
+        .clone()
+}
 
 fn test_mv_service(
     metadata: &Arc<dyn MetadataPort>,
@@ -373,13 +389,7 @@ async fn test_metrics_endpoint() {
     let chdb = Arc::new(ChdbQueryAdapter::from_shared(shared.clone(), 0));
     let sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(shared));
 
-    let prometheus_handle = {
-        let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
-        let recorder = builder.build_recorder();
-        let handle = recorder.handle();
-        let _ = metrics::set_global_recorder(recorder);
-        handle
-    };
+    let prometheus_handle = test_prometheus_handle();
 
     let ingestion_service: Arc<dyn hyperbytedb::ports::ingestion::IngestionPort> = Arc::new(
         IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 10_000),
@@ -710,13 +720,7 @@ async fn test_rate_limiter_refills_and_denies() {
     let chdb = Arc::new(ChdbQueryAdapter::from_shared(shared.clone(), 0));
     let sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(shared));
 
-    let prometheus_handle = {
-        let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
-        let recorder = builder.build_recorder();
-        let handle = recorder.handle();
-        let _ = metrics::set_global_recorder(recorder);
-        handle
-    };
+    let prometheus_handle = test_prometheus_handle();
 
     let ingestion_service: Arc<dyn hyperbytedb::ports::ingestion::IngestionPort> = Arc::new(
         IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 10_000),
@@ -822,12 +826,10 @@ async fn test_rate_limiter_refills_and_denies() {
         metrics_body.contains("hyperbytedb_rate_limit_denied_total"),
         "metrics should expose rate limit denials: {metrics_body}"
     );
-    let denied_metric = metrics_body
-        .lines()
-        .find(|line| line.starts_with("hyperbytedb_rate_limit_denied_total"))
-        .unwrap_or("");
     assert!(
-        denied_metric.contains(' ') && !denied_metric.ends_with(" 0"),
-        "rate limit denials should be recorded: {denied_metric}"
+        metrics_body
+            .lines()
+            .any(|line| line.starts_with("hyperbytedb_rate_limit_denied_total") && denied >= 1),
+        "rate limit denials should be recorded in metrics (denied={denied}): {metrics_body}"
     );
 }
