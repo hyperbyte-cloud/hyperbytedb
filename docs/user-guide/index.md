@@ -11,6 +11,7 @@ This guide covers deploying, configuring, and operating HyperbyteDB. You do not 
 | 3 | [Basic operations](basic-operations.md) | Create a database, write line protocol, run TimeseriesQL |
 | 3b | [CLI (hyperbytedb-cli)](cli.md) | Interactive shell, batch queries, write/import from the terminal |
 | 4 | [Authentication](authentication.md) | Optional: require credentials on `/write` and `/query` |
+| 4b | [Rate limiting](rate-limiting.md) | Optional: cap `/write` and `/query` request rates |
 | 5 | [Advanced features](advanced-features.md) | Clustering, continuous queries, TLS, tracing |
 | 6 | [Common workflows](common-workflows.md) | Migrate from InfluxDB 1.x, wire Telegraf and Grafana |
 | 7 | [Administration](administration.md) | Metrics, logs, traces, backups, cluster operations |

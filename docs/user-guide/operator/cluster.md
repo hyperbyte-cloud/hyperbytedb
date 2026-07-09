@@ -278,10 +278,12 @@ HyperbyteDB stores WAL, metadata, Raft state, and chDB session data on the per-r
 
 ### `rateLimit`
 
+Per-endpoint token-bucket rate limiting for `/write` and `/query`. Each endpoint refills at `maxRequestsPerSecond` tokens per wall-clock second. See [Rate limiting](../rate-limiting.md) for behavior and tuning.
+
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | `false` | Enable per-endpoint rate limiting |
-| `maxRequestsPerSecond` | int64 | `0` | Max requests per second per endpoint (`0` = unlimited) |
+| `maxRequestsPerSecond` | int64 | `0` | Max requests per second **per endpoint** (`/write` and `/query` each get this budget; `0` = unlimited) |
 
 ### `retention`
 
