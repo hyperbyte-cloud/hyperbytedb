@@ -26,7 +26,7 @@ pub use crate::ports::query::QueryService;
 
 use super::{
     auth_middleware, chdb, cluster, metrics, middleware as http_middleware, peer_handlers, ping,
-    query, raft_handlers, statements, write,
+    query, raft_handlers, rate_limit, statements, write,
 };
 
 pub struct AppState {
@@ -53,7 +53,7 @@ pub struct AppState {
     pub node_id: u64,
     pub max_body_size_bytes: usize,
     pub request_timeout_secs: u64,
-    pub rate_limiter: Option<Arc<tokio::sync::Semaphore>>,
+    pub rate_limiter: Option<Arc<rate_limit::EndpointRateLimiters>>,
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -74,11 +74,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
                 .layer(DefaultBodyLimit::max(body_limit))
                 .layer(axum::middleware::from_fn_with_state(
                     auth_state.clone(),
-                    auth_middleware::rate_limit_layer,
+                    auth_middleware::auth_layer,
                 ))
                 .layer(axum::middleware::from_fn_with_state(
                     auth_state.clone(),
-                    auth_middleware::auth_layer,
+                    auth_middleware::rate_limit_write_layer,
                 )),
         )
         .route(
@@ -88,11 +88,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
                 .layer(DefaultBodyLimit::max(body_limit))
                 .layer(axum::middleware::from_fn_with_state(
                     auth_state.clone(),
-                    auth_middleware::rate_limit_layer,
+                    auth_middleware::auth_layer,
                 ))
                 .layer(axum::middleware::from_fn_with_state(
                     auth_state.clone(),
-                    auth_middleware::auth_layer,
+                    auth_middleware::rate_limit_query_layer,
                 )),
         )
         .route("/metrics", get(metrics::handle_metrics))

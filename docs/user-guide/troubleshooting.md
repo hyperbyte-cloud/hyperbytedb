@@ -226,6 +226,30 @@ If nodes have different membership views, check network partitions and ensure al
 
 ---
 
+## HTTP 429 (rate limit exceeded)
+
+**Symptom:** Clients receive `429 Too Many Requests` with body `rate limit exceeded, try again later` on `/write` or `/query`.
+
+**Cause:** `[rate_limit]` is enabled and the endpoint's token bucket is empty. `/write` and `/query` have **separate** buckets; each refills at `max_requests_per_second` per wall-clock second.
+
+**Fix:**
+
+1. Confirm configuration:
+   ```toml
+   [rate_limit]
+   enabled = true
+   max_requests_per_second = 100   # must be > 0 when enabled
+   ```
+2. Check whether legitimate traffic exceeds the limit:
+   ```bash
+   curl -s http://localhost:8086/metrics | grep hyperbytedb_rate_limit_denied_total
+   ```
+3. Raise `max_requests_per_second`, spread load across nodes or [hyperbytedb-proxy](operator/hyperbytedb-proxy.md), or fix client retry storms (back off at least one second after 429).
+
+See [Rate limiting](rate-limiting.md) for full behavior and tuning.
+
+---
+
 ## High Memory Usage
 
 1. **Reduce flush batch size:**
@@ -252,4 +276,5 @@ If nodes have different membership views, check network partitions and ensure al
 ## See Also
 
 - [Configuration](configuration.md) — All tuning parameters
+- [Rate limiting](rate-limiting.md) — Token bucket behavior and HTTP 429
 - [Administration](administration.md) — Monitoring and operational procedures

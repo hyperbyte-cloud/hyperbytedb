@@ -4,7 +4,7 @@
 //! `tests/compat/`. This crate keeps auth, cardinality, admin users, metrics,
 //! backup manifest shape, and chDB physical layout checks.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::http::StatusCode;
 use hyperbytedb::adapters::chdb::native_adapter::ChdbNativeAdapter;
@@ -20,6 +20,22 @@ use hyperbytedb::application::query_service::QueryServiceImpl;
 use hyperbytedb::ports::metadata::MetadataPort;
 use hyperbytedb::ports::points_sink::PointsSinkPort;
 use serial_test::serial;
+
+/// Single process-wide Prometheus recorder for integration tests. Without this,
+/// later tests that call `set_global_recorder` get `AlreadySet` and scrape an
+/// empty handle while counters increment on the first recorder.
+fn test_prometheus_handle() -> metrics_exporter_prometheus::PrometheusHandle {
+    static HANDLE: OnceLock<metrics_exporter_prometheus::PrometheusHandle> = OnceLock::new();
+    HANDLE
+        .get_or_init(|| {
+            let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
+            let recorder = builder.build_recorder();
+            let handle = recorder.handle();
+            let _ = metrics::set_global_recorder(recorder);
+            handle
+        })
+        .clone()
+}
 
 fn test_mv_service(
     metadata: &Arc<dyn MetadataPort>,
@@ -373,13 +389,7 @@ async fn test_metrics_endpoint() {
     let chdb = Arc::new(ChdbQueryAdapter::from_shared(shared.clone(), 0));
     let sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(shared));
 
-    let prometheus_handle = {
-        let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
-        let recorder = builder.build_recorder();
-        let handle = recorder.handle();
-        let _ = metrics::set_global_recorder(recorder);
-        handle
-    };
+    let prometheus_handle = test_prometheus_handle();
 
     let ingestion_service: Arc<dyn hyperbytedb::ports::ingestion::IngestionPort> = Arc::new(
         IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 10_000),
@@ -689,4 +699,137 @@ fn walkdir_recursive(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         }
     }
     result
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn test_rate_limiter_refills_and_denies() {
+    use hyperbytedb::adapters::http::rate_limit::EndpointRateLimiters;
+
+    let dir = tempfile::tempdir().unwrap();
+    let wal_dir = dir.path().join("wal_rl");
+    let meta_dir = dir.path().join("meta_rl");
+    let chdb_dir = dir.path().join("chdb_rl");
+    std::fs::create_dir_all(&wal_dir).unwrap();
+    std::fs::create_dir_all(&meta_dir).unwrap();
+    std::fs::create_dir_all(&chdb_dir).unwrap();
+
+    let wal = Arc::new(RocksDbWal::open(&wal_dir).unwrap());
+    let metadata = Arc::new(RocksDbMetadata::open(&meta_dir).unwrap());
+    let shared = SharedSession::new_eager(chdb_dir.to_str().unwrap(), 1).unwrap();
+    let chdb = Arc::new(ChdbQueryAdapter::from_shared(shared.clone(), 0));
+    let sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(shared));
+
+    let prometheus_handle = test_prometheus_handle();
+
+    let ingestion_service: Arc<dyn hyperbytedb::ports::ingestion::IngestionPort> = Arc::new(
+        IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 10_000),
+    );
+    let query_service: Arc<dyn hyperbytedb::adapters::http::router::QueryService> =
+        Arc::new(QueryServiceImpl::new(
+            chdb.clone(),
+            metadata.clone(),
+            wal.clone(),
+            30,
+            sink.clone(),
+        ));
+
+    let _flush = FlushServiceImpl::new(wal.clone(), 0, sink.clone());
+
+    let app_state = Arc::new(AppState {
+        ingestion: ingestion_service,
+        query: query_service,
+        query_port: chdb.clone(),
+        metadata: metadata.clone(),
+        wal: wal.clone(),
+        points_sink: sink.clone(),
+        mv_service: test_mv_service(&(metadata.clone() as Arc<dyn MetadataPort>), &chdb, &sink),
+        auth: Arc::new(hyperbytedb::adapters::auth::MetadataAuthAdapter::new(
+            metadata.clone(),
+        )),
+        peer_client: None,
+        membership: None,
+        replication_log: None,
+        drain_service: None,
+        raft: None,
+        auth_enabled: false,
+        prometheus_handle: Some(prometheus_handle),
+        statement_summary: None,
+        replication_apply: None,
+        chdb_session_data_path: chdb_dir.to_string_lossy().into_owned(),
+        node_id: 1,
+        max_body_size_bytes: 25 * 1024 * 1024,
+        request_timeout_secs: 30,
+        rate_limiter: Some(Arc::new(EndpointRateLimiters::new(5))),
+    });
+
+    let (url, _handle) = start_server(app_state).await;
+    let client = reqwest::Client::new();
+
+    let query_url = format!("{url}/query");
+    let query_params = [("db", "testdb"), ("q", "SHOW DATABASES")];
+
+    for _ in 0..5 {
+        let resp = client
+            .get(&query_url)
+            .query(&query_params)
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "first 5 requests should not be rate limited"
+        );
+    }
+
+    let mut denied = 0;
+    for _ in 0..5 {
+        let resp = client
+            .get(&query_url)
+            .query(&query_params)
+            .send()
+            .await
+            .unwrap();
+        if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+            denied += 1;
+        }
+    }
+    assert!(
+        denied >= 1,
+        "expected at least one 429 after exhausting the query bucket"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    let resp = client
+        .get(&query_url)
+        .query(&query_params)
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        resp.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "request should succeed after refill window"
+    );
+
+    let metrics_body = client
+        .get(format!("{url}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics_body.contains("hyperbytedb_rate_limit_denied_total"),
+        "metrics should expose rate limit denials: {metrics_body}"
+    );
+    assert!(
+        metrics_body
+            .lines()
+            .any(|line| line.starts_with("hyperbytedb_rate_limit_denied_total") && denied >= 1),
+        "rate limit denials should be recorded in metrics (denied={denied}): {metrics_body}"
+    );
 }

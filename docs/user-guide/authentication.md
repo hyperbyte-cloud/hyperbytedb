@@ -15,7 +15,7 @@ When authentication is **enabled**, these routes require a successful check usin
 | `POST /write` | Line protocol, MessagePack, or columnar bodies |
 | `GET` / `POST /query` | TimeseriesQL |
 
-These layers run after optional **rate limiting** (if `[rate_limit]` is enabled): a client may get **429** before auth runs.
+These layers run after optional **[rate limiting](rate-limiting.md)** (if `[rate_limit]` is enabled): a client may get **429** before auth runs.
 
 ---
 

@@ -20,6 +20,7 @@ HyperbyteDB exposes a Prometheus-compatible metrics endpoint at `GET /metrics` o
 | `hyperbytedb_query_requests_total` | counter | Total query requests received |
 | `hyperbytedb_query_errors_total` | counter | Failed queries |
 | `hyperbytedb_query_duration_seconds` | histogram | Query execution latency |
+| `hyperbytedb_rate_limit_denied_total` | counter | Requests rejected with HTTP 429 (rate limiting enabled) |
 | `hyperbytedb_ingestion_points_total` | counter | Total points ingested |
 | `hyperbytedb_flush_runs_total` | counter | Flush cycles completed |
 | `hyperbytedb_flush_errors_total` | counter | Failed flush cycles |
@@ -186,5 +187,6 @@ All services shut down gracefully on `ctrl+c`: the flush service performs a fina
 ## See Also
 
 - [Configuration](configuration.md) — Full reference for all tuning parameters
+- [Rate limiting](rate-limiting.md) — Token bucket behavior and tuning
 - [Troubleshooting](troubleshooting.md) — Diagnosing common issues
 - [Common workflows](common-workflows.md) — Backup procedures, monitoring setup
