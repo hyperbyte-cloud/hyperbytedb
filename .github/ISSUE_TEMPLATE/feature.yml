@@ -1,0 +1,45 @@
+name: Feature Request
+description: Suggest a new feature or enhancement
+title: "[FEATURE] "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the problem you are trying to solve and how you would like HyperbyteDB to help.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      description: What need does this address? Who is affected?
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: How should HyperbyteDB behave?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds or other approaches you evaluated
+
+  - type: dropdown
+    id: impact
+    attributes:
+      label: Impact
+      description: Who benefits from this change?
+      options:
+        - Single-node / lab users
+        - Production cluster operators
+        - Application developers / integrators
+        - All of the above
+    validations:
+      required: true

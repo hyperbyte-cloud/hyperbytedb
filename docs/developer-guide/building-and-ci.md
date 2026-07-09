@@ -114,9 +114,10 @@ docker run -d -p 8086:8086 hyperbytedb:dev
 
 1. Ensure CI is green on `main`.
 2. Update `version` in `Cargo.toml`.
-3. Tag the commit: `git tag vX.Y.Z` (must match `version` in `Cargo.toml`).
-4. Push the tag: `git push origin vX.Y.Z`.
-5. The release workflow (`release.yml`) builds and pushes the multi-arch Docker image, packages `hyperbytedb` + `hyperbytedb-cli` + `libchdb.so` tarballs per platform, and publishes a GitHub Release.
+3. Add a dated entry to [`CHANGELOG.md`](../../CHANGELOG.md) under the new version (Keep a Changelog format: Added, Changed, Fixed, Security).
+4. Tag the commit: `git tag vX.Y.Z` (must match `version` in `Cargo.toml`).
+5. Push the tag: `git push origin vX.Y.Z`.
+6. The release workflow (`release.yml`) builds and pushes the multi-arch Docker image, packages `hyperbytedb` + `hyperbytedb-cli` + `libchdb.so` tarballs per platform, and publishes a GitHub Release.
 
 ---
 
