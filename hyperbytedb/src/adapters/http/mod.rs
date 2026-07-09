@@ -8,6 +8,7 @@ pub mod peer_handlers;
 pub mod ping;
 pub mod query;
 pub mod raft_handlers;
+pub mod rate_limit;
 pub mod response;
 pub mod router;
 pub mod statements;

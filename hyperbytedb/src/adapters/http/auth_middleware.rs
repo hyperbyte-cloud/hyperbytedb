@@ -137,29 +137,45 @@ pub async fn internal_auth_layer(
     }
 }
 
-/// Rate-limiting middleware. When a rate limiter is configured, attempts to
-/// acquire a permit; returns 429 if the semaphore is exhausted.
-pub async fn rate_limit_layer(
+fn rate_limit_response() -> Response {
+    metrics::counter!("hyperbytedb_rate_limit_denied_total").increment(1);
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        "rate limit exceeded, try again later",
+    )
+        .into_response()
+}
+
+fn check_rate_limit(bucket: &super::rate_limit::TokenBucket) -> bool {
+    bucket.try_acquire()
+}
+
+/// Rate-limiting middleware for `/write`.
+pub async fn rate_limit_write_layer(
     State(state): State<Arc<AppState>>,
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
-    if let Some(ref limiter) = state.rate_limiter {
-        match limiter.try_acquire() {
-            Ok(permit) => {
-                let resp = next.run(request).await;
-                drop(permit);
-                resp
-            }
-            Err(_) => (
-                StatusCode::TOO_MANY_REQUESTS,
-                "rate limit exceeded, try again later",
-            )
-                .into_response(),
-        }
-    } else {
-        next.run(request).await
+    if let Some(ref limiters) = state.rate_limiter
+        && !check_rate_limit(&limiters.write)
+    {
+        return rate_limit_response();
     }
+    next.run(request).await
+}
+
+/// Rate-limiting middleware for `/query`.
+pub async fn rate_limit_query_layer(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    if let Some(ref limiters) = state.rate_limiter
+        && !check_rate_limit(&limiters.query)
+    {
+        return rate_limit_response();
+    }
+    next.run(request).await
 }
 
 pub fn hash_password(password: &str) -> Result<String, crate::error::HyperbytedbError> {

@@ -5,6 +5,7 @@ use crate::adapters::chdb::catalog;
 use crate::adapters::chdb::native_adapter::ChdbNativeAdapter;
 use crate::adapters::chdb::query_adapter::ChdbQueryAdapter;
 use crate::adapters::chdb::session::SharedSession;
+use crate::adapters::http::rate_limit;
 use crate::adapters::http::router::AppState;
 use crate::adapters::metadata::rocksdb_meta::RocksDbMetadata;
 use crate::adapters::wal::batching_wal::BatchingWal;
@@ -358,8 +359,8 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         request_timeout_secs: config.server.request_timeout_secs,
         rate_limiter: if config.rate_limit.enabled && config.rate_limit.max_requests_per_second > 0
         {
-            Some(Arc::new(tokio::sync::Semaphore::new(
-                config.rate_limit.max_requests_per_second as usize,
+            Some(Arc::new(rate_limit::EndpointRateLimiters::new(
+                config.rate_limit.max_requests_per_second,
             )))
         } else {
             None

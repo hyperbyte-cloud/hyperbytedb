@@ -24,7 +24,8 @@ pub struct HyperbytedbConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RateLimitConfig {
     pub enabled: bool,
-    /// Maximum requests per second per endpoint (/write, /query). 0 = unlimited.
+    /// Maximum requests per second per endpoint (`/write` and `/query` each get
+    /// this budget). Tokens refill every wall-clock second.
     pub max_requests_per_second: u64,
 }
 

@@ -181,12 +181,17 @@ Hinted handoff stores writes destined for unreachable peers and replays them whe
 
 ## [rate_limit]
 
-HTTP rate limiting for `/write` and `/query`.
+HTTP rate limiting for `/write` and `/query`. Each endpoint has its own
+token bucket that refills at `max_requests_per_second` tokens per wall-clock
+second. When the bucket is empty, the server returns **429 Too Many Requests**
+before authentication runs.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | boolean | `false` | Enable per-endpoint request rate limiting |
-| `max_requests_per_second` | integer | `0` | Max requests per second per endpoint; `0` = unlimited when enabled (set a positive value to enforce) |
+| `max_requests_per_second` | integer | `0` | Max requests per second **per endpoint** (`/write` and `/query` each get this budget); `0` = unlimited when enabled (set a positive value to enforce) |
+
+Rejected requests increment the `hyperbytedb_rate_limit_denied_total` Prometheus counter.
 
 ---
 
