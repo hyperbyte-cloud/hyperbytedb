@@ -1,10 +1,15 @@
-
-|     |
-| --- |
-|     |
-
-
-[Documentation](https://docs.hyperbyte.cloud) · [Website](https://hyperbyte.cloud/hyperbytedb)
+<div align="center">
+  <table>
+    <tr>
+      <td align="center" bgcolor="#000000">
+        <img src="docs/img/hyperbytedb_white.png" alt="HyperbyteDB" width="450">
+      </td>
+    </tr>
+  </table>
+<p align="center">
+  <a href="https://docs.hyperbyte.cloud">Documentation</a> · <a href="https://hyperbyte.cloud/hyperbytedb">Website</a>
+</p>
+</div>
 
 HyperbyteDB is a time-series database written in Rust that provides InfluxDB v1 API compatibility, uses embedded ClickHouse (chDB) for queries and native MergeTree storage, and RocksDB for WAL/metadata. It supports master-master clustering for replication.
 
@@ -40,31 +45,31 @@ This starts HyperbyteDB, Telegraf, Prometheus, Loki, and Grafana — pre-configu
 
 Open Grafana at [http://localhost:3000](http://localhost:3000) (`admin` / `admin`) and check the **HyperbyteDB Cluster** and **Machine Monitoring** dashboards.
 
-For a Compose stack that builds from source (contributors), see [docs/developer-guide/development-setup.md](docs/developer-guide/development-setup.md).
+For a Compose stack that builds from source (contributors), see the [Development Setup](https://docs.hyperbyte.cloud/developer-guide/development-setup/) guide.
 
 ### CLI client
 
-`hyperbytedb-cli` provides an interactive TimeseriesQL shell, batch queries, and write/import over the HTTP API (InfluxDB v1 `influx`-compatible). See [docs/user-guide/cli.md](docs/user-guide/cli.md).
+`hyperbytedb-cli` provides an interactive TimeseriesQL shell, batch queries, and write/import over the HTTP API (InfluxDB v1 `influx`-compatible). See the [CLI guide](https://docs.hyperbyte.cloud/user-guide/cli/).
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/hyperbyte-cloud/hyperbytedb/main/scripts/install-cli.sh | sudo bash
 ```
 
-Installs the latest Linux release from [GitHub Releases](https://github.com/hyperbyte-cloud/hyperbytedb/releases) to `/usr/local/bin`. See [cli.md](docs/user-guide/cli.md) for version pinning and user-local installs.
+Installs the latest Linux release from [GitHub Releases](https://github.com/hyperbyte-cloud/hyperbytedb/releases) to `/usr/local/bin`. See the [CLI guide](https://docs.hyperbyte.cloud/user-guide/cli/) for version pinning and user-local installs.
 
 ## Documentation
 
 
 | Doc                                                                                                          | Description                                  |
 | ------------------------------------------------------------------------------------------------------------ | -------------------------------------------- |
-| [docs/index.md](docs/index.md)                                                                               | Documentation home and navigation            |
-| [docs/user-guide/index.md](docs/user-guide/index.md)                                                         | **User guide** (install, configure, operate) |
-| [docs/user-guide/configuration.md](docs/user-guide/configuration.md)                                         | Config file and environment variables        |
-| [docs/user-guide/administration.md](docs/user-guide/administration.md)                                       | Backups, metrics, cluster ops                |
-| [docs/developer-guide/system-architecture.md](docs/developer-guide/system-architecture.md)                   | Internal design overview                     |
-| [docs/deep-dive/deep-dive-clustering.md](docs/deep-dive/deep-dive-clustering.md)                             | Replication, Raft, sync APIs                 |
-| [docs/developer-guide/internals/replication-design.md](docs/developer-guide/internals/replication-design.md) | Replication wire format and evolution        |
-| [docs/developer-guide/index.md](docs/developer-guide/index.md)                                               | Building and contributing                    |
-| [docs/engineering/code-review-rubric.md](docs/engineering/code-review-rubric.md)                             | PR review checklist and test ownership       |
+| [Documentation home](https://docs.hyperbyte.cloud/)                                                          | Documentation home and navigation            |
+| [User Guide](https://docs.hyperbyte.cloud/user-guide/)                                                       | Install, configure, and operate              |
+| [Configuration](https://docs.hyperbyte.cloud/user-guide/configuration/)                                      | Config file and environment variables        |
+| [Administration](https://docs.hyperbyte.cloud/user-guide/administration/)                                    | Backups, metrics, cluster ops                |
+| [System Architecture](https://docs.hyperbyte.cloud/developer-guide/system-architecture/)                     | Internal design overview                     |
+| [Clustering Deep Dive](https://docs.hyperbyte.cloud/deep-dive/deep-dive-clustering/)                         | Replication, Raft, sync APIs                 |
+| [Replication Design](https://docs.hyperbyte.cloud/developer-guide/internals/replication-design/)             | Replication wire format and evolution        |
+| [Developer Guide](https://docs.hyperbyte.cloud/developer-guide/)                                             | Building and contributing                    |
+| [Code Review Rubric](https://docs.hyperbyte.cloud/engineering/code-review-rubric/)                           | PR review checklist and test ownership       |
 
 
