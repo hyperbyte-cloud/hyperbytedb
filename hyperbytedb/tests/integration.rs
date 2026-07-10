@@ -879,7 +879,7 @@ async fn test_cross_database_on_clause_requires_authorization() {
     metadata.create_database("victim").await.unwrap();
 
     let ingestion_service: Arc<dyn hyperbytedb::ports::ingestion::IngestionPort> = Arc::new(
-        IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 10_000),
+        IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 10_000, 0),
     );
     let query_service: Arc<dyn hyperbytedb::adapters::http::router::QueryService> =
         Arc::new(QueryServiceImpl::new(
@@ -915,6 +915,7 @@ async fn test_cross_database_on_clause_requires_authorization() {
         chdb_session_data_path: chdb_dir.to_string_lossy().into_owned(),
         node_id: 1,
         max_body_size_bytes: 25 * 1024 * 1024,
+        max_points_per_request: 0,
         request_timeout_secs: 30,
         rate_limiter: None,
     });
