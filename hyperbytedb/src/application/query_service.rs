@@ -190,6 +190,126 @@ impl QueryServiceImpl {
     }
 }
 
+/// Databases a statement actually touches for authorization, mirroring execution.
+#[derive(Debug, Default)]
+struct StatementAuthTargets {
+    read: Vec<String>,
+    write: Vec<String>,
+    requires_admin: bool,
+}
+
+fn push_db_unique(targets: &mut Vec<String>, db: &str) {
+    if !db.is_empty() && !targets.iter().any(|d| d == db) {
+        targets.push(db.to_string());
+    }
+}
+
+/// Resolve `ON <db>` (or statement-embedded database) the same way execution does.
+fn resolve_on_db(stmt_db: &str, request_db: &str) -> String {
+    if stmt_db.is_empty() {
+        request_db.to_string()
+    } else {
+        stmt_db.to_string()
+    }
+}
+
+fn statement_auth_targets(stmt: &Statement, request_db: &str) -> StatementAuthTargets {
+    let mut targets = StatementAuthTargets::default();
+
+    match stmt {
+        Statement::CreateDatabase(_)
+        | Statement::DropDatabase(_)
+        | Statement::CreateUser { .. }
+        | Statement::DropUser(_)
+        | Statement::SetPassword { .. }
+        | Statement::Grant { .. }
+        | Statement::Revoke { .. } => {
+            targets.requires_admin = true;
+        }
+        Statement::Select(s) => {
+            push_db_unique(&mut targets.read, request_db);
+            if let Some(into) = &s.into {
+                let into_db = into.database.as_deref().unwrap_or(request_db);
+                push_db_unique(&mut targets.write, into_db);
+            }
+            for source in &s.from {
+                if let MeasurementSource::Concrete(m) = source
+                    && let Some(src_db) = m.database.as_deref()
+                {
+                    push_db_unique(&mut targets.read, src_db);
+                }
+            }
+        }
+        Statement::ShowRetentionPolicies(db) => {
+            push_db_unique(&mut targets.read, &resolve_on_db(db, request_db));
+        }
+        Statement::ShowMeasurements(s) => {
+            push_db_unique(
+                &mut targets.read,
+                s.database.as_deref().unwrap_or(request_db),
+            );
+        }
+        Statement::ShowTagKeys(s) => {
+            push_db_unique(
+                &mut targets.read,
+                s.database.as_deref().unwrap_or(request_db),
+            );
+        }
+        Statement::ShowTagValues(s) => {
+            push_db_unique(
+                &mut targets.read,
+                s.database.as_deref().unwrap_or(request_db),
+            );
+        }
+        Statement::ShowFieldKeys(s) => {
+            push_db_unique(
+                &mut targets.read,
+                s.database.as_deref().unwrap_or(request_db),
+            );
+        }
+        Statement::ShowSeries(s) => {
+            push_db_unique(
+                &mut targets.read,
+                s.database.as_deref().unwrap_or(request_db),
+            );
+        }
+        Statement::ShowDatabases
+        | Statement::ShowUsers
+        | Statement::ShowContinuousQueries
+        | Statement::ShowMaterializedViews => {
+            push_db_unique(&mut targets.read, request_db);
+        }
+        Statement::CreateRetentionPolicyStmt { db, .. }
+        | Statement::AlterRetentionPolicyStmt { db, .. }
+        | Statement::DropRetentionPolicyStmt { db, .. } => {
+            push_db_unique(&mut targets.write, &resolve_on_db(db, request_db));
+        }
+        Statement::CreateContinuousQuery(cq) => {
+            push_db_unique(&mut targets.write, &cq.database);
+        }
+        Statement::DropContinuousQuery { db, .. } => {
+            push_db_unique(&mut targets.write, &resolve_on_db(db, request_db));
+        }
+        Statement::CreateMaterializedView(mv) => {
+            push_db_unique(&mut targets.write, &mv.database);
+        }
+        Statement::DropMaterializedView { db, .. } => {
+            push_db_unique(&mut targets.write, &resolve_on_db(db, request_db));
+        }
+        Statement::DropSeries(s) => {
+            push_db_unique(
+                &mut targets.write,
+                s.database.as_deref().unwrap_or(request_db),
+            );
+        }
+        Statement::Delete(_) | Statement::DropMeasurement { .. } => {
+            push_db_unique(&mut targets.write, request_db);
+        }
+    }
+
+    targets
+}
+
 pub(crate) fn check_authorization(
     user: &crate::domain::user::StoredUser,
     db: &str,
@@ -198,51 +318,30 @@ pub(crate) fn check_authorization(
     if user.admin {
         return Ok(());
     }
-    match stmt {
-        Statement::CreateDatabase(_)
-        | Statement::DropDatabase(_)
-        | Statement::CreateUser { .. }
-        | Statement::DropUser(_)
-        | Statement::SetPassword { .. }
-        | Statement::Grant { .. }
-        | Statement::Revoke { .. } => Err(HyperbytedbError::Forbidden(
+
+    let targets = statement_auth_targets(stmt, db);
+    if targets.requires_admin {
+        return Err(HyperbytedbError::Forbidden(
             "admin privileges required".to_string(),
-        )),
-        Statement::Select(s) if s.into.is_some() => {
-            if !db.is_empty() && !user.can_write(db) {
-                return Err(HyperbytedbError::Forbidden(format!(
-                    "not authorized to write to database '{db}'"
-                )));
-            }
-            Ok(())
-        }
-        Statement::Select(_)
-        | Statement::ShowDatabases
-        | Statement::ShowMeasurements(_)
-        | Statement::ShowTagKeys(_)
-        | Statement::ShowTagValues(_)
-        | Statement::ShowFieldKeys(_)
-        | Statement::ShowSeries(_)
-        | Statement::ShowRetentionPolicies(_)
-        | Statement::ShowUsers
-        | Statement::ShowContinuousQueries
-        | Statement::ShowMaterializedViews => {
-            if !db.is_empty() && !user.can_read(db) {
-                return Err(HyperbytedbError::Forbidden(format!(
-                    "not authorized to read from database '{db}'"
-                )));
-            }
-            Ok(())
-        }
-        _ => {
-            if !db.is_empty() && !user.can_write(db) {
-                return Err(HyperbytedbError::Forbidden(format!(
-                    "not authorized to write to database '{db}'"
-                )));
-            }
-            Ok(())
+        ));
+    }
+
+    for read_db in &targets.read {
+        if !user.can_read(read_db) {
+            return Err(HyperbytedbError::Forbidden(format!(
+                "not authorized to read from database '{read_db}'"
+            )));
         }
     }
+    for write_db in &targets.write {
+        if !user.can_write(write_db) {
+            return Err(HyperbytedbError::Forbidden(format!(
+                "not authorized to write to database '{write_db}'"
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 /// Returns true for DDL/DML and for `SELECT ... INTO` (writes).
@@ -2313,4 +2412,80 @@ fn reconstruct_cq_text(cq: &ContinuousQueryDef) -> String {
     }
     out.push_str("END");
     out
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use std::collections::HashMap;
+
+    use super::check_authorization;
+    use crate::domain::user::{DatabasePrivilege, StoredUser};
+    use crate::error::HyperbytedbError;
+    use crate::timeseriesql::ddl_parser::parse_ddl_statement;
+    use crate::timeseriesql::parser::parse_query;
+
+    fn writer_on_mine() -> StoredUser {
+        StoredUser {
+            password_hash: String::new(),
+            admin: false,
+            created_at: String::new(),
+            privileges: HashMap::from([("mine".to_string(), DatabasePrivilege::Write)]),
+        }
+    }
+
+    fn assert_forbidden(user: &StoredUser, request_db: &str, query: &str) {
+        let stmt = parse_ddl_statement(query)
+            .or_else(|_| parse_query(query).map(|mut v| v.remove(0)))
+            .expect("parse query");
+        let err = check_authorization(user, request_db, &stmt).unwrap_err();
+        assert!(
+            matches!(err, HyperbytedbError::Forbidden(_)),
+            "expected Forbidden, got {err:?}"
+        );
+    }
+
+    fn assert_allowed(user: &StoredUser, request_db: &str, query: &str) {
+        let stmt = parse_ddl_statement(query)
+            .or_else(|_| parse_query(query).map(|mut v| v.remove(0)))
+            .expect("parse query");
+        check_authorization(user, request_db, &stmt).expect("should be authorized");
+    }
+
+    #[test]
+    fn on_clause_write_targets_statement_database() {
+        let user = writer_on_mine();
+        assert_forbidden(
+            &user,
+            "mine",
+            "ALTER RETENTION POLICY autogen ON victim DURATION 1h",
+        );
+        assert_forbidden(
+            &user,
+            "mine",
+            "CREATE RETENTION POLICY extra ON victim DURATION 1h REPLICATION 1",
+        );
+        assert_forbidden(&user, "mine", "DROP RETENTION POLICY autogen ON victim");
+        assert_forbidden(&user, "mine", "DROP SERIES FROM cpu ON victim");
+    }
+
+    #[test]
+    fn on_clause_read_targets_statement_database() {
+        let user = StoredUser {
+            privileges: HashMap::from([("mine".to_string(), DatabasePrivilege::Read)]),
+            ..writer_on_mine()
+        };
+        assert_forbidden(&user, "mine", "SHOW MEASUREMENTS ON victim");
+        assert_forbidden(&user, "mine", "SHOW RETENTION POLICIES ON victim");
+        assert_forbidden(&user, "mine", "SHOW TAG KEYS ON victim FROM cpu");
+    }
+
+    #[test]
+    fn same_database_on_clause_still_allowed() {
+        let user = writer_on_mine();
+        assert_allowed(
+            &user,
+            "mine",
+            "ALTER RETENTION POLICY autogen ON mine DURATION 1h",
+        );
+    }
 }
