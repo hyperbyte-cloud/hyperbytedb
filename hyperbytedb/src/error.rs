@@ -73,6 +73,9 @@ pub enum HyperbytedbError {
     #[error("request payload too large: {0}")]
     PayloadTooLarge(String),
 
+    #[error("insufficient storage: {0}")]
+    InsufficientStorage(String),
+
     #[error("WAL backpressure: write queue full for {timeout_ms}ms")]
     WalBackpressure { timeout_ms: u64 },
 

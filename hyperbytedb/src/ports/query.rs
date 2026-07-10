@@ -41,10 +41,5 @@ pub trait QueryService: Send + Sync {
         &self,
         cq: &mut ContinuousQueryDef,
         now: chrono::DateTime<chrono::Utc>,
-    ) -> Result<CqRunResult, HyperbytedbError> {
-        let _ = (cq, now);
-        Err(HyperbytedbError::Internal(
-            "continuous query execution not supported".to_string(),
-        ))
-    }
+    ) -> Result<CqRunResult, HyperbytedbError>;
 }

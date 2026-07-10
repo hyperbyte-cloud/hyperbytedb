@@ -22,6 +22,7 @@ use hyperbytedb::adapters::chdb::session::SharedSession;
 use hyperbytedb::adapters::http::router::QueryService;
 use hyperbytedb::adapters::metadata::rocksdb_meta::RocksDbMetadata;
 use hyperbytedb::adapters::wal::rocksdb_wal::RocksDbWal;
+use hyperbytedb::application::continuous_query_service::ContinuousQueryService;
 use hyperbytedb::application::flush_service::FlushServiceImpl;
 use hyperbytedb::application::ingestion_service::IngestionServiceImpl;
 use hyperbytedb::application::query_service::QueryServiceImpl;
@@ -74,7 +75,7 @@ pub struct TestContext {
     pub wal: Arc<dyn WalPort>,
     pub metadata: Arc<dyn MetadataPort>,
     pub query_port: Arc<dyn QueryPort>,
-    pub query_service: QueryServiceImpl,
+    pub query_service: Arc<QueryServiceImpl>,
     pub ingestion: IngestionServiceImpl,
     pub flush_service: Arc<FlushServiceImpl>,
     _tmpdir: tempfile::TempDir,
@@ -106,13 +107,13 @@ impl TestContext {
             Some(metadata.clone()),
         ));
 
-        let query_service = QueryServiceImpl::new(
+        let query_service = Arc::new(QueryServiceImpl::new(
             query_port.clone(),
             metadata.clone(),
             wal.clone(),
             30,
             points_sink.clone(),
-        );
+        ));
 
         let ingestion =
             IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 10_000, 0);
@@ -148,13 +149,13 @@ impl TestContext {
         let query_port: Arc<dyn QueryPort> = Arc::new(MockQueryPort);
         let points_sink: Arc<dyn PointsSinkPort> = Arc::new(NoopPointsSink);
 
-        let query_service = QueryServiceImpl::new(
+        let query_service = Arc::new(QueryServiceImpl::new(
             query_port.clone(),
             metadata.clone(),
             wal.clone(),
             30,
             points_sink.clone(),
-        );
+        ));
 
         let ingestion =
             IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 10_000, 0);
@@ -206,5 +207,10 @@ impl TestContext {
         self.query_service
             .execute_query(db, q, None, rp, None)
             .await
+    }
+
+    pub fn continuous_query_service(&self) -> ContinuousQueryService {
+        let query: Arc<dyn hyperbytedb::ports::query::QueryService> = self.query_service.clone();
+        ContinuousQueryService::new(self.metadata.clone(), query, None, 1)
     }
 }

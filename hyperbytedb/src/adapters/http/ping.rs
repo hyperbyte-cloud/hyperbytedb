@@ -13,6 +13,20 @@ pub async fn ping() -> Response {
     StatusCode::NO_CONTENT.into_response()
 }
 
+fn wal_batcher_healthy(state: &AppState) -> bool {
+    state
+        .wal_batcher_alive
+        .as_ref()
+        .is_none_or(|alive| alive.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+fn disk_healthy(state: &AppState) -> bool {
+    state
+        .disk_read_only
+        .as_ref()
+        .is_none_or(|ro| !ro.load(std::sync::atomic::Ordering::SeqCst))
+}
+
 /// GET /health - readiness check.
 /// Returns 200 when the node is Active (or standalone).
 /// Returns 503 when the node is Syncing, Joining, Draining, or Leaving
@@ -41,6 +55,24 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Response {
         }
     }
 
+    if !wal_batcher_healthy(&state) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("Content-Type", "application/json")],
+            r#"{"status":"fail","message":"WAL batcher writer unavailable"}"#.to_string(),
+        )
+            .into_response();
+    }
+
+    if !disk_healthy(&state) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("Content-Type", "application/json")],
+            r#"{"status":"fail","message":"disk read-only due to low free space"}"#.to_string(),
+        )
+            .into_response();
+    }
+
     (
         StatusCode::OK,
         [("Content-Type", "application/json")],
@@ -56,24 +88,39 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Response {
 /// initialise. This is more expensive than `/health` (one round-trip into
 /// libchdb) so it should be polled at the order of seconds, not millis.
 pub async fn health_ready(State(state): State<Arc<AppState>>) -> Response {
+    if !wal_batcher_healthy(&state) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("Content-Type", "application/json")],
+            r#"{"status":"fail","message":"WAL batcher writer unavailable"}"#.to_string(),
+        )
+            .into_response();
+    }
+
+    if !disk_healthy(&state) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("Content-Type", "application/json")],
+            r#"{"status":"fail","message":"disk read-only due to low free space"}"#.to_string(),
+        )
+            .into_response();
+    }
+
     match state.query_port.ping().await {
         Ok(()) => (
             StatusCode::OK,
             [("Content-Type", "application/json")],
-            r#"{"status":"pass","message":"chdb engine reachable"}"#.to_string(),
+            r#"{"status":"pass","message":"chDB engine responsive"}"#.to_string(),
         )
             .into_response(),
-        Err(e) => {
-            let body = format!(
-                r#"{{"status":"fail","message":"chdb ping failed: {}"}}"#,
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("Content-Type", "application/json")],
+            format!(
+                r#"{{"status":"fail","message":"chDB engine not ready: {}"}}"#,
                 e.to_string().replace('"', "\\\"")
-            );
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                [("Content-Type", "application/json")],
-                body,
-            )
-                .into_response()
-        }
+            ),
+        )
+            .into_response(),
     }
 }

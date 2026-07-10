@@ -182,6 +182,100 @@ async fn basic_cq_downsamples_bus_data_at_8am() {
 
 #[tokio::test]
 #[serial(chdb)]
+async fn cq_scheduler_tick_runs_due_queries() {
+    let ctx = match TestContext::new() {
+        Ok(ctx) => ctx,
+        Err(_) => {
+            eprintln!("skipping cq_scheduler_tick_runs_due_queries: chDB unavailable");
+            return;
+        }
+    };
+
+    ctx.metadata
+        .create_database("transportation")
+        .await
+        .unwrap();
+
+    let lines = format!(
+        "bus_data passengers=5i {}\n\
+         bus_data passengers=8i {}\n\
+         bus_data passengers=8i {}\n\
+         bus_data passengers=7i {}",
+        ts(7, 0),
+        ts(7, 15),
+        ts(7, 30),
+        ts(7, 45),
+    );
+    ctx.write_and_flush("transportation", &lines).await.unwrap();
+
+    let resp = ctx
+        .query(
+            "transportation",
+            r#"CREATE CONTINUOUS QUERY "cq_sched" ON "transportation" BEGIN SELECT mean("passengers") INTO "average_passengers" FROM "bus_data" GROUP BY time(1h) END"#,
+        )
+        .await
+        .unwrap();
+    assert!(
+        resp.results[0].error.is_none(),
+        "{:?}",
+        resp.results[0].error
+    );
+
+    let mut cq = ctx
+        .metadata
+        .get_continuous_query("transportation", "cq_sched")
+        .await
+        .unwrap()
+        .unwrap();
+    cq.last_run_at = Some(
+        Utc.with_ymd_and_hms(2016, 8, 28, 7, 0, 0)
+            .unwrap()
+            .to_rfc3339(),
+    );
+    ctx.metadata
+        .store_continuous_query(&cq.database, &cq.name, &cq)
+        .await
+        .unwrap();
+
+    let run_at = Utc.with_ymd_and_hms(2016, 8, 28, 8, 0, 0).unwrap();
+    assert!(should_run(run_at, &cq));
+
+    let scheduler = ctx.continuous_query_service();
+    scheduler.tick_once_at(run_at).await.unwrap();
+
+    ctx.flush_service.flush().await.unwrap();
+
+    let resp = ctx
+        .query(
+            "transportation",
+            &format!(
+                r#"SELECT * FROM "average_passengers" WHERE time >= {} AND time < {}"#,
+                ts(7, 0),
+                ts(8, 0),
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(
+        resp.results[0].error.is_none(),
+        "{:?}",
+        resp.results[0].error
+    );
+    let series = &resp.results[0].series.as_ref().unwrap()[0];
+    let mean_idx = series
+        .columns
+        .iter()
+        .position(|c| c == "mean" || c == "mean_passengers")
+        .unwrap();
+    let mean = series.values[0][mean_idx].as_f64().unwrap();
+    assert!(
+        (mean - 7.0).abs() < 0.01,
+        "scheduler tick should downsample 7:00-8:00 window, got {mean}"
+    );
+}
+
+#[tokio::test]
+#[serial(chdb)]
 async fn advanced_every_cq_recomputes_current_hour_bucket() {
     let ctx = match TestContext::new() {
         Ok(ctx) => ctx,

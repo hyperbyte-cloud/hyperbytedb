@@ -149,6 +149,8 @@ async fn start_cluster_node_with_listener(
         max_points_per_request: 0,
         request_timeout_secs: 30,
         rate_limiter: None,
+        wal_batcher_alive: None,
+        disk_read_only: None,
     });
 
     let app = build_router(app_state);
@@ -348,6 +350,8 @@ async fn test_cluster_endpoints_without_peers() {
         max_points_per_request: 0,
         request_timeout_secs: 30,
         rate_limiter: None,
+        wal_batcher_alive: None,
+        disk_read_only: None,
     });
 
     let app = build_router(app_state);

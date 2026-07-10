@@ -112,6 +112,8 @@ fn setup(dir: &tempfile::TempDir) -> (Arc<AppState>, Arc<FlushServiceImpl>) {
         replicate_body_limit_bytes: 32 * 1024 * 1024,
         max_points_per_request: 0,
         request_timeout_secs: 30,
+        wal_batcher_alive: None,
+        disk_read_only: None,
         rate_limiter: None,
     });
 
@@ -194,6 +196,8 @@ async fn test_auth_blocks_unauthenticated() {
         replicate_body_limit_bytes: 32 * 1024 * 1024,
         max_points_per_request: 0,
         request_timeout_secs: 30,
+        wal_batcher_alive: None,
+        disk_read_only: None,
         rate_limiter: None,
     });
 
@@ -295,6 +299,8 @@ async fn test_cardinality_limit() {
         replicate_body_limit_bytes: 32 * 1024 * 1024,
         max_points_per_request: 0,
         request_timeout_secs: 30,
+        wal_batcher_alive: None,
+        disk_read_only: None,
         rate_limiter: None,
     });
 
@@ -441,6 +447,8 @@ async fn test_metrics_endpoint() {
         replicate_body_limit_bytes: 32 * 1024 * 1024,
         max_points_per_request: 0,
         request_timeout_secs: 30,
+        wal_batcher_alive: None,
+        disk_read_only: None,
         rate_limiter: None,
     });
 
@@ -776,6 +784,8 @@ async fn test_rate_limiter_refills_and_denies() {
         max_points_per_request: 0,
         request_timeout_secs: 30,
         rate_limiter: Some(Arc::new(EndpointRateLimiters::new(5))),
+        wal_batcher_alive: None,
+        disk_read_only: None,
     });
 
     let (url, _handle) = start_server(app_state).await;
@@ -929,6 +939,8 @@ async fn test_cross_database_on_clause_requires_authorization() {
         replicate_body_limit_bytes: 32 * 1024 * 1024,
         max_points_per_request: 0,
         request_timeout_secs: 30,
+        wal_batcher_alive: None,
+        disk_read_only: None,
         rate_limiter: None,
     });
 

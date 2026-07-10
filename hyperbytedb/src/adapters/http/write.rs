@@ -36,6 +36,16 @@ pub async fn handle_write(
     Query(params): Query<WriteParams>,
     body: axum::body::Bytes,
 ) -> Result<Response, HyperbytedbError> {
+    if state
+        .disk_read_only
+        .as_ref()
+        .is_some_and(|ro| ro.load(std::sync::atomic::Ordering::SeqCst))
+    {
+        return Err(HyperbytedbError::InsufficientStorage(
+            "node is in read-only mode due to low disk space".into(),
+        ));
+    }
+
     // Reject writes if this node is draining or syncing
     if let Some(ref membership) = state.membership {
         let m = membership.read().await;

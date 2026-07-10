@@ -169,6 +169,21 @@ When enabled, recently executed statements are accessible via `GET /api/v1/state
 
 ---
 
+## [disk]
+
+Periodic free-space checks on WAL, metadata, and chDB data directories. When free space drops below `readonly_threshold_mb`, the node enters **read-only mode**: `/write` returns HTTP 507 and `/health` reports unavailable until space recovers.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `true` | Run the background disk monitor |
+| `check_interval_secs` | integer | `60` | Seconds between checks |
+| `warn_threshold_mb` | integer | `1024` | Log a warning when free space on any data path falls below this (also checked once at startup) |
+| `readonly_threshold_mb` | integer | `256` | Enter read-only mode when free space on any data path falls below this |
+
+Prometheus metrics: `hyperbytedb_disk_free_bytes{path}`, `hyperbytedb_disk_readonly_events_total`.
+
+---
+
 ## [hinted_handoff]
 
 Hinted handoff stores writes destined for unreachable peers and replays them when the peer recovers.

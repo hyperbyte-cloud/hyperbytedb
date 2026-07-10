@@ -7,6 +7,7 @@ use crate::application::cluster::hinted_handoff;
 use crate::application::cluster::leader_monitor;
 use crate::application::cluster::raft_formation;
 use crate::application::continuous_query_service::ContinuousQueryService;
+use crate::application::disk_monitor;
 use crate::application::retention_service::RetentionService;
 use crate::bootstrap::build_services;
 use crate::config::{HyperbytedbConfig, RetentionConfig};
@@ -17,6 +18,9 @@ use crate::ports::wal::WalPort;
 
 pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
     let bootstrapped = build_services(&config).await?;
+    let disk_paths = bootstrapped.disk_paths.clone();
+    let disk_config = bootstrapped.disk_config.clone();
+    let disk_read_only = bootstrapped.disk_read_only.clone();
     let mut app_state = bootstrapped.app_state;
     let flush_service = bootstrapped.flush_service;
     let cluster = bootstrapped.cluster;
@@ -192,6 +196,22 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
         })
     };
 
+    let disk_monitor_handle = if disk_config.enabled {
+        let paths = disk_paths;
+        let cfg = disk_config;
+        // Guaranteed by bootstrap: disk_read_only is Some when disk_config.enabled.
+        #[allow(clippy::expect_used)]
+        let ro = disk_read_only
+            .clone()
+            .expect("disk_read_only set when disk monitor enabled");
+        let rx = service_shutdown_rx.clone();
+        Some(tokio::spawn(async move {
+            disk_monitor::run_disk_monitor(paths, cfg, ro, rx).await;
+        }))
+    } else {
+        None
+    };
+
     let app_state = Arc::new(app_state);
     let app = build_router(app_state.clone());
 
@@ -345,6 +365,9 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
 
     flush_handle.await?;
     cq_handle.await?;
+    if let Some(h) = disk_monitor_handle {
+        h.await?;
+    }
     if let Some(h) = retention_handle {
         h.await?;
     }

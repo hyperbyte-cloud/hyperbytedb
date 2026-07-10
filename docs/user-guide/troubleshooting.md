@@ -250,6 +250,31 @@ See [Rate limiting](rate-limiting.md) for full behavior and tuning.
 
 ---
 
+## Disk read-only mode
+
+**Symptom:** `/write` returns HTTP 507 with `node is in read-only mode due to low disk space`. `/health` returns 503 with `disk read-only due to low free space`.
+
+**Cause:** The `[disk]` monitor detected free space below `readonly_threshold_mb` on the WAL, metadata, or chDB data path.
+
+**Fix:**
+
+1. Free disk space on the data volume (or expand the volume).
+2. Confirm recovery:
+   ```bash
+   curl -s http://localhost:8086/health
+   curl -s http://localhost:8086/metrics | grep hyperbytedb_disk_free_bytes
+   ```
+3. Tune thresholds if needed:
+   ```toml
+   [disk]
+   warn_threshold_mb = 2048
+   readonly_threshold_mb = 512
+   ```
+
+The node exits read-only automatically when free space rises above `readonly_threshold_mb` on the next monitor tick.
+
+---
+
 ## High Memory Usage
 
 1. **Reduce flush batch size:**

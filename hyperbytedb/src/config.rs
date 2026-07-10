@@ -19,6 +19,8 @@ pub struct HyperbytedbConfig {
     pub rate_limit: RateLimitConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
+    #[serde(default)]
+    pub disk: DiskConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -381,6 +383,41 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DiskConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_disk_check_interval_secs")]
+    pub check_interval_secs: u64,
+    #[serde(default = "default_disk_warn_threshold_mb")]
+    pub warn_threshold_mb: u64,
+    #[serde(default = "default_disk_readonly_threshold_mb")]
+    pub readonly_threshold_mb: u64,
+}
+
+fn default_disk_check_interval_secs() -> u64 {
+    60
+}
+
+fn default_disk_warn_threshold_mb() -> u64 {
+    1024
+}
+
+fn default_disk_readonly_threshold_mb() -> u64 {
+    256
+}
+
+impl Default for DiskConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            check_interval_secs: default_disk_check_interval_secs(),
+            warn_threshold_mb: default_disk_warn_threshold_mb(),
+            readonly_threshold_mb: default_disk_readonly_threshold_mb(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct HintedHandoffConfig {
     pub enabled: bool,
     /// Maximum queued hints per unreachable peer before oldest are dropped.
@@ -550,6 +587,7 @@ impl HyperbytedbConfig {
                 max_requests_per_second: 0,
             },
             retention: RetentionConfig::default(),
+            disk: DiskConfig::default(),
         }
     }
 }
