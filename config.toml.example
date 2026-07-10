@@ -62,6 +62,8 @@ replication_max_retries = 5
 replication_queue_depth = 8192
 replication_max_inflight_batches = 8
 replication_max_coalesce_body_bytes = 8388608
+# Max HTTP body for /internal/replicate (0 = auto: max(4× coalesce, server.max_body_size_bytes))
+# replicate_body_limit_bytes = 0
 replicate_receiver_queue_depth = 1024
 # Deprecated: receiver always uses a single ordered worker.
 replicate_receiver_workers = 1

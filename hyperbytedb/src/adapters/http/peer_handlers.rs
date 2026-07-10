@@ -23,6 +23,22 @@ use crate::ports::metadata::MetadataPort;
 
 use super::router::AppState;
 
+/// Reject spoofed origin node IDs not present in cluster membership.
+async fn validate_origin_node_id(state: &AppState, origin_node_id: u64) -> Result<(), StatusCode> {
+    if origin_node_id == 0 {
+        return Ok(());
+    }
+    let Some(ref membership) = state.membership else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    let m = membership.read().await;
+    if m.get_node(origin_node_id).is_some() {
+        Ok(())
+    } else {
+        Err(StatusCode::BAD_REQUEST)
+    }
+}
+
 /// Receives replicated line-protocol writes from a peer (`POST /internal/replicate`).
 pub async fn handle_replicate_write(
     State(state): State<Arc<AppState>>,
@@ -46,6 +62,13 @@ pub async fn handle_replicate_write(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
+
+    if let Err(status) = validate_origin_node_id(&state, origin_node_id).await {
+        return (
+            status,
+            Json(serde_json::json!({"error": "invalid origin node id"})),
+        );
+    }
 
     let ct = headers
         .get(CONTENT_TYPE)
@@ -173,6 +196,13 @@ pub async fn handle_replicate_mutation(
 ) -> impl IntoResponse {
     let sender_seq = req.seq;
     let origin = req.origin_node_id;
+
+    if let Err(status) = validate_origin_node_id(&state, origin).await {
+        return (
+            status,
+            Json(serde_json::json!({"error": "invalid origin node id"})),
+        );
+    }
 
     if origin != 0
         && let Some(ref rl) = state.replication_log

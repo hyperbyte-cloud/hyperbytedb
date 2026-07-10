@@ -193,9 +193,9 @@ impl Precision {
     pub fn to_nanos(&self, ts: i64) -> i64 {
         match self {
             Precision::Nanosecond => ts,
-            Precision::Microsecond => ts * 1_000,
-            Precision::Millisecond => ts * 1_000_000,
-            Precision::Second => ts * 1_000_000_000,
+            Precision::Microsecond => ts.saturating_mul(1_000),
+            Precision::Millisecond => ts.saturating_mul(1_000_000),
+            Precision::Second => ts.saturating_mul(1_000_000_000),
         }
     }
 

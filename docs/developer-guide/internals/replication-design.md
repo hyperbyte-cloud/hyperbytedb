@@ -52,7 +52,7 @@ See [`flush_service`](../../../src/application/flush_service.rs): per-peer ack w
 
 ## Operational knobs
 
-`[cluster]` in `config.rs`: `replication_queue_depth`, `replication_max_inflight_batches`, `replication_max_coalesce_body_bytes`, `replicate_receiver_queue_depth`, `replication_truncate_stale_peer_multiplier`, etc.
+`[cluster]` in `config.rs`: `replication_queue_depth`, `replication_max_inflight_batches`, `replication_max_coalesce_body_bytes`, `replicate_body_limit_bytes`, `replicate_receiver_queue_depth`, `replication_truncate_stale_peer_multiplier`, etc.
 
 ## Flow control
 

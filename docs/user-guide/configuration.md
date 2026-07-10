@@ -32,7 +32,7 @@ HTTP server settings.
 |-----|------|---------|-------------|
 | `bind_address` | string | `"0.0.0.0"` | Network interface to bind to |
 | `port` | integer | `8086` | HTTP listen port |
-| `max_body_size_bytes` | integer | `26214400` | Maximum request body size (25 MB) |
+| `max_body_size_bytes` | integer | `26214400` | Maximum request body size for client `/write` (25 MB). Also used when `[cluster] replicate_body_limit_bytes = 0` to compute the auto replicate HTTP cap (see [cluster](#cluster)). |
 | `request_timeout_secs` | integer | `30` | HTTP request timeout |
 | `query_timeout_secs` | integer | `30` | TimeseriesQL query execution timeout |
 | `max_concurrent_queries` | integer | `0` | Max concurrent TimeseriesQL executions; `0` = unlimited (bounded by work-stealing / resources). Use with single chDB session. |
@@ -126,6 +126,7 @@ Master-master peer-to-peer clustering with Raft consensus for schema mutations.
 | `replication_queue_depth` | integer | `8192` | Bounded outbound replication queue (ingest-sized batches) |
 | `replication_max_inflight_batches` | integer | `8` | Max concurrent outbound replication fan-out rounds |
 | `replication_max_coalesce_body_bytes` | integer | `8388608` | Max bytes for coalescing consecutive WAL batches (same db/rp/precision) |
+| `replicate_body_limit_bytes` | integer | `0` (auto) | Max HTTP body size for `/internal/replicate` and `/internal/replicate-mutation`. When `0`, resolves to `max(4 × replication_max_coalesce_body_bytes, server.max_body_size_bytes)` at startup (default **33554432** / 32 MiB with stock settings). Must be ≥ `replication_max_coalesce_body_bytes` or coalesced peer batches may receive HTTP 413. |
 | `replicate_receiver_queue_depth` | integer | `1024` | Bounded apply queue on the replicate receiver |
 | `replicate_receiver_workers` | integer | `1` | **Ignored.** Receiver uses a single ordered worker |
 | `replication_truncate_stale_peer_multiplier` | integer | `2` | When >0, peers with ack 0 and stale heartbeats are omitted from truncate barrier (× heartbeat interval) |
@@ -162,8 +163,9 @@ Query statement tracking for debugging and observability.
 |-----|------|---------|-------------|
 | `enabled` | boolean | `true` | Enable statement summary tracking |
 | `max_entries` | integer | `1000` | Max recent statements kept in the ring buffer |
+| `require_auth` | boolean | `true` | Require auth for `GET`/`DELETE` `/api/v1/statements` when `[auth] enabled = true` |
 
-When enabled, recently executed statements are accessible via `GET /api/v1/statements`.
+When enabled, recently executed statements are accessible via `GET /api/v1/statements`. Password literals in stored query samples are redacted.
 
 ---
 

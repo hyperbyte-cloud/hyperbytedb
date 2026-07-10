@@ -70,6 +70,9 @@ pub enum HyperbytedbError {
     #[error("request exceeds maximum point count: {count} points (limit: {limit})")]
     RequestPointLimitExceeded { count: usize, limit: usize },
 
+    #[error("request payload too large: {0}")]
+    PayloadTooLarge(String),
+
     #[error("WAL backpressure: write queue full for {timeout_ms}ms")]
     WalBackpressure { timeout_ms: u64 },
 

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Instant;
 
 use crate::domain::user::StoredUser;
@@ -10,6 +10,21 @@ use crate::ports::auth::AuthPort;
 use crate::ports::metadata::MetadataPort;
 
 const CREDENTIAL_CACHE_TTL_SECS: u64 = 60;
+
+/// Argon2 hash used for constant-time rejection of unknown usernames.
+static DUMMY_PASSWORD_HASH: LazyLock<String> = LazyLock::new(|| {
+    use argon2::Argon2;
+    use argon2::password_hash::{PasswordHasher, SaltString};
+    // Hardcoded valid salt and dummy password; constant-time dummy is a
+    // compile-time invariant, not user input.
+    #[allow(clippy::expect_used)]
+    let salt = SaltString::from_b64("dGVzdHNhbHR0ZXN0c2FsdA").expect("valid salt b64");
+    #[allow(clippy::expect_used)]
+    Argon2::default()
+        .hash_password(b"timing-constant-dummy", &salt)
+        .expect("dummy hash")
+        .to_string()
+});
 
 /// Fast non-crypto hash of the input password for cache keying.
 fn password_fingerprint(password: &str) -> u64 {
@@ -52,7 +67,10 @@ impl AuthPort for MetadataAuthAdapter {
     ) -> Result<Option<StoredUser>, HyperbytedbError> {
         let stored = match self.metadata.get_user(username).await? {
             Some(s) => s,
-            None => return Ok(None),
+            None => {
+                let _ = verify_password(password, &DUMMY_PASSWORD_HASH);
+                return Ok(None);
+            }
         };
 
         let pw_fp = password_fingerprint(password);
