@@ -49,6 +49,35 @@ pub fn fingerprint(stmt: &Statement) -> (String, String) {
     (short_digest, normalized)
 }
 
+/// Redact credential literals before storing query text in the statement summary.
+pub fn redact_credentials(query: &str) -> String {
+    use regex::Regex;
+    use std::sync::OnceLock;
+
+    static PASSWORD_SINGLE: OnceLock<Regex> = OnceLock::new();
+    static PASSWORD_DOUBLE: OnceLock<Regex> = OnceLock::new();
+    static QUERY_CREDS: OnceLock<Regex> = OnceLock::new();
+
+    let mut out = query.to_string();
+    // Literal patterns; invalid regex is a programming error, not user input.
+    let re = PASSWORD_SINGLE.get_or_init(|| {
+        #[allow(clippy::expect_used)]
+        Regex::new(r"(?i)(PASSWORD\s+)'[^']*'").expect("password single-quote re")
+    });
+    out = re.replace_all(&out, "$1'****'").into_owned();
+    let re = PASSWORD_DOUBLE.get_or_init(|| {
+        #[allow(clippy::expect_used)]
+        Regex::new(r#"(?i)(PASSWORD\s+)"[^"]*""#).expect("password double-quote re")
+    });
+    out = re.replace_all(&out, r#"$1"****""#).into_owned();
+    let re = QUERY_CREDS.get_or_init(|| {
+        #[allow(clippy::expect_used)]
+        Regex::new(r"(?i)([?&](?:u|p)=)[^&\s]+").expect("query creds re")
+    });
+    out = re.replace_all(&out, "$1****").into_owned();
+    out
+}
+
 fn normalize_statement(stmt: &Statement) -> String {
     let mut out = String::new();
     match stmt {
@@ -536,5 +565,13 @@ mod tests {
         // distinct predicates (e.g. `(a + b) * c` vs `a + b * c`) no longer
         // collide on the same digest.
         assert_eq!(n1, "select mean(usage) from cpu where (host = ?)");
+    }
+
+    #[test]
+    fn redact_credentials_masks_password_literals() {
+        let raw = r#"CREATE USER "x" WITH PASSWORD 's3cret'"#;
+        let redacted = redact_credentials(raw);
+        assert!(!redacted.contains("s3cret"));
+        assert!(redacted.contains("****"));
     }
 }

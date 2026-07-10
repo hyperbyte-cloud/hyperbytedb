@@ -29,8 +29,9 @@ The following are **not** wrapped in the user auth middleware when `auth.enabled
 | `GET` / `HEAD` `/health` | JSON health |
 | `GET` / `HEAD` `/health/ready` | Readiness (chDB probe) |
 | `GET` `/metrics` | Prometheus text |
+| `GET` / `DELETE` `/api/v1/statements` | Only when `statement_summary.require_auth = false` (default: **requires auth**) |
 
-`GET` / `DELETE` **`/api/v1/statements`** (statement summary) is also **unauthenticated** today. It only exposes recent query digests and timings when [statement summary](configuration.md#statement_summary) is enabled, but in locked-down environments you should still restrict access at the network (or proxy) layer.
+When `statement_summary.require_auth` is `true` (the default) and `[auth] enabled = true`, statement summary requires the same credentials as `/query`.
 
 ---
 
@@ -88,7 +89,7 @@ Run through `/query` (or `POST` with form `q=...`).
 
 **Admin flag:** the parser sets `admin` if the `CREATE USER` text contains `ALL PRIVILEGES` or `ADMIN` (case-insensitive). Only admin users can access **internal** cluster routes when auth is on.
 
-**Authorization model:** no per-database GRANT/REVOKE. `GRANT` / `REVOKE` are accepted as no-ops for compatibility. Plan around **admin** vs **non-admin** only.
+**Authorization model:** per-database `GRANT ALL ON <db> TO <user>` / `REVOKE ALL ON <db> FROM <user>` control write and query access for non-admin users. Non-admin users without a grant on a database cannot read or write it. Admin users bypass per-database checks. `GRANT ALL PRIVILEGES TO <user>` (no `ON` clause) promotes an existing user to admin; `REVOKE ALL PRIVILEGES FROM <user>` removes admin.
 
 ---
 

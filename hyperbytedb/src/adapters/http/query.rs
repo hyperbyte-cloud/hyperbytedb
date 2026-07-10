@@ -237,10 +237,12 @@ async fn handle_query_impl(
 
         if let Some(ref summary) = state.statement_summary {
             let latency_us = elapsed.as_micros() as u64;
+            let sample_query =
+                crate::timeseriesql::digest::redact_credentials(&q);
             summary.record(
                 &digest_hex,
                 &normalized_query,
-                &q,
+                &sample_query,
                 db,
                 stmt_type_label,
                 latency_us,

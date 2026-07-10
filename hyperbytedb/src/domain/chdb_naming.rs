@@ -53,8 +53,8 @@ pub fn unquoted_table_name(db: &str, rp: &str, measurement: &str) -> String {
 /// generated SQL.
 #[must_use]
 pub fn quote_backticks(ident: &str) -> String {
-    let escaped = ident.replace('`', "``");
-    format!("`{}`", escaped)
+    let escaped = ident.replace('\\', "\\\\").replace('`', "``");
+    format!("`{escaped}`")
 }
 
 /// Backtick-quoted, sanitised table name suitable for splicing into

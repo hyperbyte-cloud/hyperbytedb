@@ -95,7 +95,7 @@ pub async fn handle_write(
                 .into_response());
         }
 
-        let decompressed = maybe_decompress_gzip(&headers, &body)?;
+        let decompressed = maybe_decompress_gzip(&headers, &body, state.max_body_size_bytes)?;
         let payload: &[u8] = decompressed.as_deref().unwrap_or(&body);
         histogram!("hyperbytedb_write_payload_bytes").record(payload.len() as f64);
 
@@ -161,6 +161,7 @@ fn write_payload_format_from_headers(ct_norm: &str) -> WritePayloadFormat {
 fn maybe_decompress_gzip(
     headers: &HeaderMap,
     body: &[u8],
+    max_decompressed_bytes: usize,
 ) -> Result<Option<Vec<u8>>, HyperbytedbError> {
     let is_gzip = headers
         .get("content-encoding")
@@ -169,15 +170,21 @@ fn maybe_decompress_gzip(
 
     if is_gzip {
         use flate2::read::GzDecoder;
-        use std::io::Read;
-        let mut decoder = GzDecoder::new(body);
-        let mut decompressed = Vec::with_capacity(body.len() * 2);
-        decoder.read_to_end(&mut decompressed).map_err(|e| {
+        use std::io::{Read, Take};
+        let decoder = GzDecoder::new(body);
+        let mut limited: Take<GzDecoder<&[u8]>> = decoder.take(max_decompressed_bytes as u64 + 1);
+        let mut decompressed = Vec::new();
+        limited.read_to_end(&mut decompressed).map_err(|e| {
             HyperbytedbError::LineProtocolParse {
                 line: String::new(),
                 reason: format!("gzip decompression failed: {e}"),
             }
         })?;
+        if decompressed.len() > max_decompressed_bytes {
+            return Err(HyperbytedbError::PayloadTooLarge(format!(
+                "decompressed body exceeds {max_decompressed_bytes} bytes"
+            )));
+        }
         Ok(Some(decompressed))
     } else {
         Ok(None)

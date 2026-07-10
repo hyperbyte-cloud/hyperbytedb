@@ -177,6 +177,11 @@ pub struct ClusterConfig {
     /// Max bytes for coalescing consecutive WAL batches (same db/rp/precision).
     #[serde(default = "default_replication_max_coalesce_body_bytes")]
     pub replication_max_coalesce_body_bytes: usize,
+    /// Max HTTP body size for `/internal/replicate` and `/internal/replicate-mutation`.
+    /// `0` resolves at startup to `max(4 × replication_max_coalesce_body_bytes,
+    /// server.max_body_size_bytes)`.
+    #[serde(default)]
+    pub replicate_body_limit_bytes: usize,
     /// Bounded apply queue on the replicate receiver.
     #[serde(default = "default_replicate_receiver_queue_depth")]
     pub replicate_receiver_queue_depth: usize,
@@ -343,6 +348,17 @@ impl ClusterConfig {
             .filter(|s| !s.is_empty())
             .collect()
     }
+
+    /// Resolved HTTP body cap for peer replication endpoints.
+    pub fn effective_replicate_body_limit_bytes(&self, max_body_size_bytes: usize) -> usize {
+        if self.replicate_body_limit_bytes > 0 {
+            self.replicate_body_limit_bytes
+        } else {
+            self.replication_max_coalesce_body_bytes
+                .saturating_mul(4)
+                .max(max_body_size_bytes)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -355,6 +371,13 @@ pub struct LoggingConfig {
 pub struct StatementSummaryConfig {
     pub enabled: bool,
     pub max_entries: usize,
+    /// Require auth for GET/DELETE `/api/v1/statements` when `[auth] enabled = true`.
+    #[serde(default = "default_true")]
+    pub require_auth: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -498,6 +521,7 @@ impl HyperbytedbConfig {
                 replication_queue_depth: default_replication_queue_depth(),
                 replication_max_inflight_batches: default_replication_max_inflight_batches(),
                 replication_max_coalesce_body_bytes: default_replication_max_coalesce_body_bytes(),
+                replicate_body_limit_bytes: 0,
                 replicate_receiver_queue_depth: default_replicate_receiver_queue_depth(),
                 replicate_receiver_workers: default_replicate_receiver_workers(),
                 replication_truncate_stale_peer_multiplier:
@@ -514,6 +538,7 @@ impl HyperbytedbConfig {
             statement_summary: StatementSummaryConfig {
                 enabled: true,
                 max_entries: 1000,
+                require_auth: true,
             },
             hinted_handoff: HintedHandoffConfig {
                 enabled: true,
@@ -653,5 +678,66 @@ mod retention_config_tests {
         let r: RetentionConfig = serde_json::from_str(r#"{"enabled":false}"#).expect("parse");
         assert!(!r.enabled);
         assert_eq!(r.interval, "12h");
+    }
+}
+
+#[cfg(test)]
+mod replicate_body_limit_tests {
+    use super::ClusterConfig;
+
+    fn base_cluster() -> ClusterConfig {
+        ClusterConfig {
+            enabled: true,
+            node_id: 1,
+            cluster_addr: "127.0.0.1:8086".into(),
+            peers: String::new(),
+            heartbeat_interval_secs: 2,
+            heartbeat_miss_threshold: 5,
+            anti_entropy_enabled: false,
+            anti_entropy_interval_secs: 60,
+            replication_log_dir: "./replication_log".into(),
+            raft_dir: "./raft".into(),
+            replication_max_retries: 5,
+            replication_queue_depth: 8192,
+            replication_max_inflight_batches: 8,
+            replication_max_coalesce_body_bytes: 8 * 1024 * 1024,
+            replicate_body_limit_bytes: 0,
+            replicate_receiver_queue_depth: 1024,
+            replicate_receiver_workers: 1,
+            replication_truncate_stale_peer_multiplier: 2,
+            raft_heartbeat_interval_ms: None,
+            raft_election_timeout_ms: None,
+            raft_snapshot_threshold: None,
+            replication: super::ReplicationConfig::default(),
+        }
+    }
+
+    #[test]
+    fn auto_limit_uses_four_times_coalesce_when_larger_than_write_cap() {
+        let c = base_cluster();
+        assert_eq!(
+            c.effective_replicate_body_limit_bytes(25 * 1024 * 1024),
+            32 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn auto_limit_uses_write_cap_when_coalesce_times_four_is_smaller() {
+        let mut c = base_cluster();
+        c.replication_max_coalesce_body_bytes = 1024;
+        assert_eq!(
+            c.effective_replicate_body_limit_bytes(25 * 1024 * 1024),
+            25 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn explicit_limit_overrides_auto() {
+        let mut c = base_cluster();
+        c.replicate_body_limit_bytes = 64 * 1024 * 1024;
+        assert_eq!(
+            c.effective_replicate_body_limit_bytes(25 * 1024 * 1024),
+            64 * 1024 * 1024
+        );
     }
 }

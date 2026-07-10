@@ -169,6 +169,15 @@ pub fn decode_prepared_slot(
             .read_exact(&mut len_buf)
             .map_err(|e| HyperbytedbError::Wal(e.to_string()))?;
         let fact_len = u32::from_le_bytes(len_buf) as usize;
+        let remaining = cursor
+            .get_ref()
+            .len()
+            .saturating_sub(cursor.position() as usize);
+        if fact_len > remaining {
+            return Err(HyperbytedbError::Wal(format!(
+                "invalid fact_ipc length {fact_len} (only {remaining} bytes remaining)"
+            )));
+        }
         let mut fact_ipc = vec![0u8; fact_len];
         cursor
             .read_exact(&mut fact_ipc)
@@ -180,6 +189,15 @@ pub fn decode_prepared_slot(
             .map_err(|e| HyperbytedbError::Wal(e.to_string()))?;
         let series_len = u32::from_le_bytes(len_buf) as usize;
         let new_series_batch = if series_len > 0 {
+            let remaining = cursor
+                .get_ref()
+                .len()
+                .saturating_sub(cursor.position() as usize);
+            if series_len > remaining {
+                return Err(HyperbytedbError::Wal(format!(
+                    "invalid series_ipc length {series_len} (only {remaining} bytes remaining)"
+                )));
+            }
             let mut series_ipc = vec![0u8; series_len];
             cursor
                 .read_exact(&mut series_ipc)
@@ -206,6 +224,15 @@ pub fn decode_prepared_slot(
         .map_err(|e| HyperbytedbError::Wal(e.to_string()))?;
     let legacy_len = u32::from_le_bytes(mc_buf) as usize;
     let legacy_entry = if legacy_len > 0 {
+        let remaining = cursor
+            .get_ref()
+            .len()
+            .saturating_sub(cursor.position() as usize);
+        if legacy_len > remaining {
+            return Err(HyperbytedbError::Wal(format!(
+                "invalid legacy entry length {legacy_len} (only {remaining} bytes remaining)"
+            )));
+        }
         let mut legacy = vec![0u8; legacy_len];
         cursor
             .read_exact(&mut legacy)

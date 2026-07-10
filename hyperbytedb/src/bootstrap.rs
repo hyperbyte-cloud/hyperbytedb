@@ -72,6 +72,17 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
             "cluster enabled: replicated durability is via shared WAL/metadata sync; embedded \
              chDB state is rebuilt from the WAL on each peer"
         );
+        let replicate_limit = config
+            .cluster
+            .effective_replicate_body_limit_bytes(config.server.max_body_size_bytes);
+        if config.cluster.replication_max_coalesce_body_bytes > replicate_limit {
+            tracing::warn!(
+                coalesce_bytes = config.cluster.replication_max_coalesce_body_bytes,
+                replicate_body_limit_bytes = replicate_limit,
+                "replication_max_coalesce_body_bytes exceeds replicate_body_limit_bytes; \
+                 outbound coalesced batches may be rejected by peers (HTTP 413)"
+            );
+        }
     }
 
     // -- Infrastructure adapters --
@@ -365,10 +376,14 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         auth_enabled: config.auth.enabled,
         prometheus_handle: Some(prometheus_handle.clone()),
         statement_summary,
+        statement_summary_require_auth: config.statement_summary.require_auth,
         replication_apply,
         chdb_session_data_path: config.chdb.session_data_path.clone(),
         node_id: config.cluster.node_id,
         max_body_size_bytes: config.server.max_body_size_bytes,
+        replicate_body_limit_bytes: config
+            .cluster
+            .effective_replicate_body_limit_bytes(config.server.max_body_size_bytes),
         max_points_per_request: config.server.max_points_per_request,
         request_timeout_secs: config.server.request_timeout_secs,
         rate_limiter: if config.rate_limit.enabled && config.rate_limit.max_requests_per_second > 0

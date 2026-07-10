@@ -82,30 +82,11 @@ fn extract_credentials(headers: &HeaderMap, query: &AuthParams) -> Option<(Strin
 }
 
 fn base64_decode(input: &str) -> Result<String, ()> {
-    let bytes = input.as_bytes();
-    let decoded = base64_decode_bytes(bytes).map_err(|_| ())?;
+    use base64::Engine;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(input.trim())
+        .map_err(|_| ())?;
     String::from_utf8(decoded).map_err(|_| ())
-}
-
-fn base64_decode_bytes(input: &[u8]) -> Result<Vec<u8>, ()> {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut output = Vec::new();
-    let mut buf = 0u32;
-    let mut bits = 0;
-    for &b in input {
-        if b == b'=' || b == b'\n' || b == b'\r' {
-            continue;
-        }
-        let val = TABLE.iter().position(|&c| c == b).ok_or(())? as u32;
-        buf = (buf << 6) | val;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            output.push((buf >> bits) as u8);
-            buf &= (1 << bits) - 1;
-        }
-    }
-    Ok(output)
 }
 
 /// Auth layer for internal cluster routes (/internal/*, /cluster/*).

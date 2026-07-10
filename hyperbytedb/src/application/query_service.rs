@@ -1360,11 +1360,12 @@ async fn execute_statement(
                         .await?;
                 }
                 None => {
-                    if let Some(user) = svc.metadata.get_user(username).await? {
-                        svc.metadata
-                            .create_user(username, &user.password_hash, true)
-                            .await?;
-                    }
+                    let user = svc.metadata.get_user(username).await?.ok_or_else(|| {
+                        HyperbytedbError::QueryParse(format!("user '{username}' does not exist"))
+                    })?;
+                    svc.metadata
+                        .create_user(username, &user.password_hash, true)
+                        .await?;
                 }
             }
             Ok(StatementResult {
@@ -1379,11 +1380,12 @@ async fn execute_statement(
                     svc.metadata.revoke_privilege(username, db).await?;
                 }
                 None => {
-                    if let Some(user) = svc.metadata.get_user(username).await? {
-                        svc.metadata
-                            .create_user(username, &user.password_hash, false)
-                            .await?;
-                    }
+                    let user = svc.metadata.get_user(username).await?.ok_or_else(|| {
+                        HyperbytedbError::QueryParse(format!("user '{username}' does not exist"))
+                    })?;
+                    svc.metadata
+                        .create_user(username, &user.password_hash, false)
+                        .await?;
                 }
             }
             Ok(StatementResult {
