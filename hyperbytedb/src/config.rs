@@ -34,6 +34,9 @@ pub struct ServerConfig {
     pub bind_address: String,
     pub port: u16,
     pub max_body_size_bytes: usize,
+    /// Max points accepted per `/write` request. `0` uses [`default_max_points_per_request`].
+    #[serde(default = "default_max_points_per_request")]
+    pub max_points_per_request: usize,
     pub request_timeout_secs: u64,
     pub query_timeout_secs: u64,
     pub max_concurrent_queries: usize,
@@ -69,6 +72,10 @@ pub struct FlushConfig {
     /// WAL group-commit: max microseconds to wait for more entries before flushing.
     #[serde(default = "default_wal_batch_delay_us")]
     pub wal_batch_delay_us: u64,
+    /// Max milliseconds to wait for WAL batcher queue space before returning 503.
+    /// `0` waits until space is available (parks the task, no busy-spin).
+    #[serde(default = "default_wal_enqueue_timeout_ms")]
+    pub wal_enqueue_timeout_ms: u64,
     /// When true, keep chDB-ready Arrow batches in an in-memory WAL cache for
     /// zero-copy flush. Requires ingest to supply prepared slots via
     /// [`WalAppendBundle`].
@@ -82,6 +89,18 @@ fn default_arrow_wal_enabled() -> bool {
 
 fn default_max_points_per_batch() -> usize {
     50_000
+}
+
+pub fn default_max_points_per_request() -> usize {
+    500_000
+}
+
+fn default_wal_enqueue_timeout_ms() -> u64 {
+    0
+}
+
+pub fn default_schema_cache_max_entries() -> usize {
+    10_000
 }
 
 fn default_wal_batch_size() -> usize {
@@ -102,6 +121,10 @@ pub struct ChdbConfig {
     /// Clamped to 1..=32. For best overlap, set `server.max_concurrent_queries`
     /// ≥ `pool_size`.
     pub pool_size: usize,
+    /// Max `(db, rp, measurement)` entries in the chDB native adapter in-memory
+    /// schema and series caches. Oldest entries are evicted (LRU).
+    #[serde(default = "default_schema_cache_max_entries")]
+    pub schema_cache_max_entries: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -427,6 +450,7 @@ impl HyperbytedbConfig {
                 bind_address: "0.0.0.0".to_string(),
                 port: 8086,
                 max_body_size_bytes: 25 * 1024 * 1024,
+                max_points_per_request: default_max_points_per_request(),
                 request_timeout_secs: 30,
                 query_timeout_secs: 30,
                 max_concurrent_queries: 0,
@@ -446,11 +470,13 @@ impl HyperbytedbConfig {
                 max_points_per_batch: default_max_points_per_batch(),
                 wal_batch_size: default_wal_batch_size(),
                 wal_batch_delay_us: default_wal_batch_delay_us(),
+                wal_enqueue_timeout_ms: default_wal_enqueue_timeout_ms(),
                 arrow_wal_enabled: default_arrow_wal_enabled(),
             },
             chdb: ChdbConfig {
                 session_data_path: "./chdb_data".to_string(),
                 pool_size: default_chdb_pool_size(),
+                schema_cache_max_entries: default_schema_cache_max_entries(),
             },
             auth: AuthConfig { enabled: false },
             cardinality: CardinalityConfig {

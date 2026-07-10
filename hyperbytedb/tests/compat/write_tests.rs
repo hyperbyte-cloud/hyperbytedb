@@ -571,3 +571,54 @@ async fn create_db_write_flush_query_select_star() {
     assert!(series[0].columns.contains(&"value".to_string()));
     assert!(series[0].values.len() >= 2);
 }
+
+#[tokio::test]
+async fn write_rejects_batch_exceeding_point_limit() {
+    use hyperbytedb::application::ingestion_service::IngestionServiceImpl;
+    use hyperbytedb::error::HyperbytedbError;
+
+    let ctx = TestContext::new_no_chdb().unwrap();
+    ctx.metadata.create_database("testdb").await.unwrap();
+
+    let limited =
+        IngestionServiceImpl::new(ctx.wal.clone(), ctx.metadata.clone(), 100_000, 10_000, 1);
+
+    let err = limited
+        .ingest(
+            "testdb",
+            None,
+            None,
+            b"cpu value=1 1000000000\ncpu value=2 1000000001",
+            WritePayloadFormat::LineProtocol,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        HyperbytedbError::RequestPointLimitExceeded { count: 2, limit: 1 }
+    ));
+}
+
+#[tokio::test]
+async fn write_blank_lines_do_not_count_as_points() {
+    let ctx = TestContext::new_no_chdb().unwrap();
+    ctx.metadata.create_database("testdb").await.unwrap();
+
+    ctx.ingestion
+        .ingest(
+            "testdb",
+            None,
+            None,
+            b"\n\n\n",
+            WritePayloadFormat::LineProtocol,
+        )
+        .await
+        .unwrap();
+
+    let entries = ctx.wal.read_from(1).await.unwrap();
+    assert!(
+        entries.is_empty(),
+        "blank lines should produce no WAL entries"
+    );
+}

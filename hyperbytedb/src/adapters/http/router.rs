@@ -52,6 +52,7 @@ pub struct AppState {
     pub chdb_session_data_path: String,
     pub node_id: u64,
     pub max_body_size_bytes: usize,
+    pub max_points_per_request: usize,
     pub request_timeout_secs: u64,
     pub rate_limiter: Option<Arc<rate_limit::EndpointRateLimiters>>,
 }

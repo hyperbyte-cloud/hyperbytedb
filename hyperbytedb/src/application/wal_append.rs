@@ -14,7 +14,12 @@ pub async fn append_points_with_prepared(
     rp: &str,
     points: Vec<Point>,
     origin_node_id: u64,
+    max_points_per_request: usize,
 ) -> Result<u64, HyperbytedbError> {
+    crate::application::ingest_metadata::validate_point_count(
+        points.len(),
+        max_points_per_request,
+    )?;
     let build_start = std::time::Instant::now();
     if wal.arrow_wal_enabled()
         && let Some(sink) = sink

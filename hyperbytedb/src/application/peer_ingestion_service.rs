@@ -6,10 +6,10 @@ use metrics::{counter, histogram};
 #[cfg(feature = "columnar-ingest")]
 use crate::application::ingest_metadata::prepare_columnar_metadata;
 use crate::application::ingest_metadata::{
-    IngestCardinalityLimits, IngestSchemaCache, prepare_batch_metadata,
+    IngestCardinalityLimits, IngestSchemaCache, prepare_batch_metadata, validate_point_count,
 };
 use crate::application::line_protocol::{
-    encode_points_to_line_protocol, parse_line_body_to_points,
+    encode_points_to_line_protocol, parse_line_body_to_points_limited,
 };
 use crate::application::msgpack_ingest::parse_msgpack_body_to_points;
 use crate::application::replication_dispatch::dispatch_outbound_replication;
@@ -39,6 +39,7 @@ pub struct PeerIngestionService {
     replication_port: Arc<dyn ReplicationPort>,
     node_id: u64,
     limits: IngestCardinalityLimits,
+    max_points_per_request: usize,
     schema_cache: IngestSchemaCache,
     replication: ReplicationConfig,
 }
@@ -57,6 +58,7 @@ impl PeerIngestionService {
             replication_port,
             node_id,
             limits,
+            0,
             ReplicationConfig::default(),
         )
     }
@@ -67,6 +69,7 @@ impl PeerIngestionService {
         replication_port: Arc<dyn ReplicationPort>,
         node_id: u64,
         limits: IngestCardinalityLimits,
+        max_points_per_request: usize,
         replication: ReplicationConfig,
     ) -> Self {
         Self::with_replication_and_sink(
@@ -76,10 +79,12 @@ impl PeerIngestionService {
             replication_port,
             node_id,
             limits,
+            max_points_per_request,
             replication,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn with_replication_and_sink(
         wal: Arc<dyn WalPort>,
         sink: Option<Arc<dyn PointsSinkPort>>,
@@ -87,6 +92,7 @@ impl PeerIngestionService {
         replication_port: Arc<dyn ReplicationPort>,
         node_id: u64,
         limits: IngestCardinalityLimits,
+        max_points_per_request: usize,
         replication: ReplicationConfig,
     ) -> Self {
         // Surface the resolved coordinator mode for dashboards. We set ALL
@@ -104,6 +110,7 @@ impl PeerIngestionService {
             replication_port,
             node_id,
             limits,
+            max_points_per_request,
             schema_cache: IngestSchemaCache::new(),
             replication,
         }
@@ -156,6 +163,7 @@ impl IngestionPort for PeerIngestionService {
             if wire.values.is_empty() {
                 return Ok(());
             }
+            validate_point_count(wire.values.len(), self.max_points_per_request)?;
 
             let t2 = std::time::Instant::now();
             histogram!("hyperbytedb_ingest_parse_seconds").record((t2 - t1).as_secs_f64());
@@ -205,6 +213,7 @@ impl IngestionPort for PeerIngestionService {
                 &retention_policy,
                 points,
                 self.node_id,
+                self.max_points_per_request,
             )
             .await?;
 
@@ -228,7 +237,9 @@ impl IngestionPort for PeerIngestionService {
         }
 
         let points = match format {
-            WritePayloadFormat::LineProtocol => parse_line_body_to_points(body, precision)?,
+            WritePayloadFormat::LineProtocol => {
+                parse_line_body_to_points_limited(body, precision, self.max_points_per_request)?
+            }
             WritePayloadFormat::Msgpack => parse_msgpack_body_to_points(body, precision)?,
             #[cfg(feature = "columnar-ingest")]
             WritePayloadFormat::ColumnarMsgpack => {
@@ -237,6 +248,9 @@ impl IngestionPort for PeerIngestionService {
         };
         if points.is_empty() {
             return Ok(());
+        }
+        if !matches!(format, WritePayloadFormat::LineProtocol) {
+            validate_point_count(points.len(), self.max_points_per_request)?;
         }
 
         let precision_val = Precision::from_str_opt(precision);
@@ -295,6 +309,7 @@ impl IngestionPort for PeerIngestionService {
             &retention_policy,
             points,
             self.node_id,
+            self.max_points_per_request,
         )
         .await?;
 

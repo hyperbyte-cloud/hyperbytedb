@@ -32,7 +32,10 @@
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
+
+use lru::LruCache;
 
 use arrow::array::{
     ArrayRef, DictionaryArray, Float64Builder, Int32Array, Int64Builder, RecordBatch, StringArray,
@@ -167,6 +170,34 @@ struct TableKey {
     measurement: String,
 }
 
+fn table_cache_capacity(max_entries: usize) -> NonZeroUsize {
+    let effective = if max_entries == 0 {
+        crate::config::default_schema_cache_max_entries()
+    } else {
+        max_entries
+    };
+    NonZeroUsize::new(effective.max(1)).unwrap_or(NonZeroUsize::MIN)
+}
+
+fn schema_cache_get(
+    cache: &mut LruCache<TableKey, TableSchema>,
+    key: &TableKey,
+) -> Option<TableSchema> {
+    cache.get(key).cloned()
+}
+
+fn schema_cache_entry<'a>(
+    cache: &'a mut LruCache<TableKey, TableSchema>,
+    key: &TableKey,
+) -> &'a mut TableSchema {
+    if !cache.contains(key) {
+        cache.put(key.clone(), TableSchema::default());
+    }
+    cache
+        .get_mut(key)
+        .unwrap_or_else(|| unreachable!("key present after contains/put"))
+}
+
 /// chDB-native `PointsSinkPort`.
 pub struct ChdbNativeAdapter {
     session: SharedSession,
@@ -176,23 +207,24 @@ pub struct ChdbNativeAdapter {
     /// `_series` table). Hot-path reads take the read lock; schema mutations
     /// take the write lock plus the per-table mutex below to serialise
     /// concurrent ADD COLUMN attempts on the same table.
-    schemas: Arc<RwLock<HashMap<TableKey, TableSchema>>>,
+    schemas: Arc<RwLock<LruCache<TableKey, TableSchema>>>,
     /// Cached per-table SERIES (tag dimension) schemas, parallel to `schemas`.
     /// Holds the tag columns of the `<table>_series` table. New tag *keys*
     /// ALTER this table, never the fact table.
-    series_schemas: Arc<RwLock<HashMap<TableKey, TableSchema>>>,
+    series_schemas: Arc<RwLock<LruCache<TableKey, TableSchema>>>,
     /// Per-table set of `series_id`s already inserted into the `_series`
     /// dimension table and persisted to metadata, so steady-state flushes skip
     /// the dimension insert + metadata write. Loaded on startup by
     /// [`Self::warm_series_from_metadata`]. A lean `HashSet<u64>` — the
     /// authoritative `series_id → tags` map lives in the metadata layer.
-    known_series: Arc<RwLock<HashMap<TableKey, HashSet<u64>>>>,
+    known_series: Arc<RwLock<LruCache<TableKey, HashSet<u64>>>>,
     /// Per-table async mutex serialising DDL. Without this two
     /// concurrent flush tasks for the same measurement could each
     /// observe the cache miss, race on `ALTER TABLE`, and one could
     /// fail loudly on a duplicate-column error. With it, the second
     /// caller waits, sees the cached schema, and is a no-op.
-    ddl_locks: Arc<tokio::sync::Mutex<HashMap<TableKey, Arc<tokio::sync::Mutex<()>>>>>,
+    ddl_locks: Arc<tokio::sync::Mutex<LruCache<TableKey, Arc<tokio::sync::Mutex<()>>>>>,
+    cache_capacity: NonZeroUsize,
     /// When true (default), inserts go through the Arrow C Data Interface
     /// (`INSERT INTO … SELECT * FROM ArrowStream(...)`) instead of building a
     /// giant `INSERT … VALUES` SQL string. The Arrow path avoids SQL
@@ -207,14 +239,28 @@ impl ChdbNativeAdapter {
     }
 
     pub fn with_metadata(session: SharedSession, metadata: Option<Arc<dyn MetadataPort>>) -> Self {
+        Self::with_metadata_and_cache_limit(
+            session,
+            metadata,
+            crate::config::default_schema_cache_max_entries(),
+        )
+    }
+
+    pub fn with_metadata_and_cache_limit(
+        session: SharedSession,
+        metadata: Option<Arc<dyn MetadataPort>>,
+        schema_cache_max_entries: usize,
+    ) -> Self {
+        let cache_capacity = table_cache_capacity(schema_cache_max_entries);
         let use_arrow = std::env::var("HYPERBYTEDB_DISABLE_ARROW_INSERT").is_err();
         Self {
             session,
             metadata,
-            schemas: Arc::new(RwLock::new(HashMap::new())),
-            series_schemas: Arc::new(RwLock::new(HashMap::new())),
-            known_series: Arc::new(RwLock::new(HashMap::new())),
-            ddl_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            schemas: Arc::new(RwLock::new(LruCache::new(cache_capacity))),
+            series_schemas: Arc::new(RwLock::new(LruCache::new(cache_capacity))),
+            known_series: Arc::new(RwLock::new(LruCache::new(cache_capacity))),
+            ddl_locks: Arc::new(tokio::sync::Mutex::new(LruCache::new(cache_capacity))),
+            cache_capacity,
             use_arrow,
         }
     }
@@ -277,15 +323,20 @@ impl ChdbNativeAdapter {
             }
         }
 
-        let warmed = pending.len();
+        let cap = self.cache_capacity.get();
         let mut fact_writers = self.schemas.write();
         let mut series_writers = self.series_schemas.write();
+        let mut inserted = 0usize;
         for (key, fact_schema, series_schema) in pending {
-            fact_writers.insert(key.clone(), fact_schema);
-            series_writers.insert(key, series_schema);
+            if inserted >= cap {
+                break;
+            }
+            fact_writers.put(key.clone(), fact_schema);
+            series_writers.put(key, series_schema);
+            inserted += 1;
         }
 
-        Ok(warmed)
+        Ok(inserted)
     }
 
     /// Mark schema-cache entries as materialized when the engine catalog already
@@ -320,7 +371,7 @@ impl ChdbNativeAdapter {
             return Ok(0);
         }
 
-        let keys: Vec<TableKey> = self.schemas.read().keys().cloned().collect();
+        let keys: Vec<TableKey> = self.schemas.read().iter().map(|(k, _)| k.clone()).collect();
         let mut synced = 0usize;
         let mut fact_writers = self.schemas.write();
         let mut series_writers = self.series_schemas.write();
@@ -358,10 +409,17 @@ impl ChdbNativeAdapter {
         };
         let databases = meta.list_databases().await?;
         let mut warmed = 0usize;
+        let cap = self.cache_capacity.get();
         for db in databases {
             let measurements = meta.list_measurements(&db.name).await?;
             for meas_name in &measurements {
                 for rp in &db.retention_policies {
+                    // Stop once the cache is full — warming more would just
+                    // evict earlier entries. Checked under a short-lived read
+                    // lock so no guard is held across the metadata `await`s.
+                    if self.known_series.read().len() >= cap {
+                        return Ok(warmed);
+                    }
                     // IDs only — decoding each series' tag map here would cost
                     // a `BTreeMap` allocation per series and dominate startup
                     // memory/time at high cardinality. The warm only needs IDs.
@@ -376,7 +434,7 @@ impl ChdbNativeAdapter {
                     };
                     let ids: HashSet<u64> = series.into_iter().collect();
                     warmed += ids.len();
-                    self.known_series.write().insert(key, ids);
+                    self.known_series.write().put(key, ids);
                 }
             }
         }
@@ -386,23 +444,29 @@ impl ChdbNativeAdapter {
     /// True if `series_id` is already registered (dimension row inserted +
     /// persisted) for this table.
     fn series_known(&self, key: &TableKey, sid: u64) -> bool {
-        self.known_series
-            .read()
-            .get(key)
-            .is_some_and(|s| s.contains(&sid))
+        let mut map = self.known_series.write();
+        map.get(key).is_some_and(|s| s.contains(&sid))
     }
 
     /// Record `series_id`s as registered for this table.
     fn mark_series(&self, key: &TableKey, ids: impl IntoIterator<Item = u64>) {
         let mut map = self.known_series.write();
-        map.entry(key.clone()).or_default().extend(ids);
+        if !map.contains(key) {
+            map.put(key.clone(), HashSet::new());
+        }
+        if let Some(set) = map.get_mut(key) {
+            set.extend(ids);
+        }
     }
 
     async fn ddl_mutex(&self, key: &TableKey) -> Arc<tokio::sync::Mutex<()>> {
         let mut map = self.ddl_locks.lock().await;
-        map.entry(key.clone())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+        if !map.contains(key) {
+            map.put(key.clone(), Arc::new(tokio::sync::Mutex::new(())));
+        }
+        map.get(key)
+            .cloned()
+            .unwrap_or_else(|| unreachable!("ddl lock present after contains/put"))
     }
 
     /// Load fact-table field columns from the engine catalog (`DESCRIBE TABLE`).
@@ -547,8 +611,16 @@ impl ChdbNativeAdapter {
         // Snapshot pre-existing schemas first (enables flush fast path without
         // scanning all tag values when both tables are materialized). The fact
         // schema holds only field columns; the series schema holds tag columns.
-        let cached = { self.schemas.read().get(key).cloned() }.unwrap_or_default();
-        let series_cached = { self.series_schemas.read().get(key).cloned() }.unwrap_or_default();
+        let cached = {
+            let mut guard = self.schemas.write();
+            schema_cache_get(&mut guard, key)
+        }
+        .unwrap_or_default();
+        let series_cached = {
+            let mut guard = self.series_schemas.write();
+            schema_cache_get(&mut guard, key)
+        }
+        .unwrap_or_default();
 
         // Union cached/materialized chDB columns so sparse batches still pad to
         // the full on-disk table width after restart (metadata may be partial).
@@ -627,8 +699,16 @@ impl ChdbNativeAdapter {
 
         // Re-read caches under the DDL lock; another writer may have already
         // added the columns we needed while we were waiting.
-        let cached = { self.schemas.read().get(key).cloned() }.unwrap_or_default();
-        let series_cached = { self.series_schemas.read().get(key).cloned() }.unwrap_or_default();
+        let cached = {
+            let mut guard = self.schemas.write();
+            schema_cache_get(&mut guard, key)
+        }
+        .unwrap_or_default();
+        let series_cached = {
+            let mut guard = self.series_schemas.write();
+            schema_cache_get(&mut guard, key)
+        }
+        .unwrap_or_default();
 
         // Fact table: fields only. ALTERs run only against an already-existing
         // table (materialized) or a warmed-from-metadata entry; a cold CREATE
@@ -684,7 +764,7 @@ impl ChdbNativeAdapter {
         // Update the fact cache (fields) and series cache (tags).
         {
             let mut writers = self.schemas.write();
-            let entry = writers.entry(key.clone()).or_default();
+            let entry = schema_cache_entry(&mut writers, key);
             for (_, phys, d) in &field_phys {
                 entry.columns.insert(phys.clone(), ColumnKind::Field(*d));
             }
@@ -692,7 +772,7 @@ impl ChdbNativeAdapter {
         }
         {
             let mut writers = self.series_schemas.write();
-            let entry = writers.entry(key.clone()).or_default();
+            let entry = schema_cache_entry(&mut writers, key);
             for (_, phys, kind) in &tag_phys {
                 entry.columns.insert(phys.clone(), *kind);
             }
@@ -928,8 +1008,16 @@ impl ChdbNativeAdapter {
             .collect();
         field_phys.sort_by(|a, b| a.1.cmp(&b.1));
 
-        let cached = { self.schemas.read().get(&key).cloned() }.unwrap_or_default();
-        let series_cached = { self.series_schemas.read().get(&key).cloned() }.unwrap_or_default();
+        let cached = {
+            let mut guard = self.schemas.write();
+            schema_cache_get(&mut guard, &key)
+        }
+        .unwrap_or_default();
+        let series_cached = {
+            let mut guard = self.series_schemas.write();
+            schema_cache_get(&mut guard, &key)
+        }
+        .unwrap_or_default();
 
         if cached.materialized && series_cached.materialized {
             return Ok(());
@@ -938,8 +1026,16 @@ impl ChdbNativeAdapter {
         let ddl_lock = self.ddl_mutex(&key).await;
         let _guard = ddl_lock.lock().await;
 
-        let cached = { self.schemas.read().get(&key).cloned() }.unwrap_or_default();
-        let series_cached = { self.series_schemas.read().get(&key).cloned() }.unwrap_or_default();
+        let cached = {
+            let mut guard = self.schemas.write();
+            schema_cache_get(&mut guard, &key)
+        }
+        .unwrap_or_default();
+        let series_cached = {
+            let mut guard = self.series_schemas.write();
+            schema_cache_get(&mut guard, &key)
+        }
+        .unwrap_or_default();
 
         if !cached.materialized {
             let sql = build_create_table_sql(&table, &field_phys, summing_columns_from_meta(meta));
@@ -954,7 +1050,7 @@ impl ChdbNativeAdapter {
 
         {
             let mut writers = self.schemas.write();
-            let entry = writers.entry(key.clone()).or_default();
+            let entry = schema_cache_entry(&mut writers, &key);
             for (_, phys, d) in &field_phys {
                 entry.columns.insert(phys.clone(), ColumnKind::Field(*d));
             }
@@ -962,7 +1058,7 @@ impl ChdbNativeAdapter {
         }
         {
             let mut writers = self.series_schemas.write();
-            let entry = writers.entry(key).or_default();
+            let entry = schema_cache_entry(&mut writers, &key);
             for (_, phys, kind) in &tag_phys {
                 entry.columns.insert(phys.clone(), *kind);
             }
@@ -1335,9 +1431,10 @@ impl PointsSinkPort for ChdbNativeAdapter {
             .await?;
         self.execute(format!("DROP TABLE IF EXISTS {series_table}"))
             .await?;
-        self.schemas.write().remove(&key);
-        self.series_schemas.write().remove(&key);
-        self.known_series.write().remove(&key);
+        self.schemas.write().pop(&key);
+        self.series_schemas.write().pop(&key);
+        self.known_series.write().pop(&key);
+        self.ddl_locks.lock().await.pop(&key);
         Ok(())
     }
 }

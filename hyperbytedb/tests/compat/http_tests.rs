@@ -84,7 +84,7 @@ impl HttpTestContext {
         let points_sink: Arc<dyn PointsSinkPort> = Arc::new(NoopPointsSink);
 
         let ingestion: Arc<dyn hyperbytedb::ports::ingestion::IngestionPort> = Arc::new(
-            IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 10_000),
+            IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 10_000, 0),
         );
 
         let query_service: Arc<dyn QueryService> = Arc::new(QueryServiceImpl::new(
@@ -126,6 +126,7 @@ impl HttpTestContext {
             chdb_session_data_path: chdb_dir.to_string_lossy().into_owned(),
             node_id: 1,
             max_body_size_bytes: 25 * 1024 * 1024,
+            max_points_per_request: 0,
             request_timeout_secs: 30,
             rate_limiter: None,
         });

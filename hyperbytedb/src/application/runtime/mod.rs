@@ -121,8 +121,14 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
         let meta_port: Arc<dyn MetadataPort> = app_state.metadata.clone();
         let wal_port: Arc<dyn WalPort> = app_state.wal.clone();
         let sink_port: Arc<dyn PointsSinkPort> = app_state.points_sink.clone();
-        c.run_startup_sync(&config.cluster, &meta_port, &wal_port, Some(sink_port))
-            .await?;
+        c.run_startup_sync(
+            &config.cluster,
+            &meta_port,
+            &wal_port,
+            Some(sink_port),
+            config.server.max_points_per_request,
+        )
+        .await?;
         c.start_raft(
             &config.cluster,
             app_state.metadata.clone(),

@@ -19,6 +19,7 @@ pub struct SyncClient {
     metadata: Arc<dyn MetadataPort>,
     wal: Arc<dyn WalPort>,
     points_sink: Option<Arc<dyn PointsSinkPort>>,
+    max_points_per_request: usize,
     client: reqwest::Client,
     /// Static peer addresses from config, used as fallback when the
     /// membership has no active peers yet (Raft hasn't formed).
@@ -41,10 +42,12 @@ impl SyncClient {
             metadata,
             wal,
             None,
+            0,
             fallback_peer_addrs,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn with_points_sink(
         node_id: u64,
         node_addr: String,
@@ -52,6 +55,7 @@ impl SyncClient {
         metadata: Arc<dyn MetadataPort>,
         wal: Arc<dyn WalPort>,
         points_sink: Option<Arc<dyn PointsSinkPort>>,
+        max_points_per_request: usize,
         fallback_peer_addrs: Vec<String>,
     ) -> Self {
         let client = reqwest::Client::builder()
@@ -66,6 +70,7 @@ impl SyncClient {
             metadata,
             wal,
             points_sink,
+            max_points_per_request,
             client,
             fallback_peer_addrs,
         }
@@ -451,6 +456,7 @@ impl SyncClient {
             &entry.retention_policy,
             entry.points.clone(),
             entry.origin_node_id,
+            self.max_points_per_request,
         )
         .await?;
         Ok(())

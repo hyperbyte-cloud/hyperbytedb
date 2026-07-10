@@ -97,6 +97,7 @@ impl ClusterBootstrap {
         metadata: &Arc<dyn MetadataPort>,
         wal: &Arc<dyn WalPort>,
         points_sink: Option<Arc<dyn PointsSinkPort>>,
+        max_points_per_request: usize,
     ) -> anyhow::Result<()> {
         {
             let mut m = self.membership.write().await;
@@ -113,6 +114,7 @@ impl ClusterBootstrap {
             metadata.clone(),
             wal.clone(),
             points_sink,
+            max_points_per_request,
             self.peer_addrs.clone(),
         );
 

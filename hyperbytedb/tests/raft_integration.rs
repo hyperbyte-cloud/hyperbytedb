@@ -90,6 +90,7 @@ async fn start_cluster_node_with_listener(
         wal.clone(),
         Some(sink.clone()),
         IngestCardinalityLimits::default(),
+        0,
     ));
 
     let flush = Arc::new(FlushServiceImpl::new(wal.clone(), 0, sink.clone()));
@@ -143,6 +144,7 @@ async fn start_cluster_node_with_listener(
         chdb_session_data_path: chdb_path,
         node_id,
         max_body_size_bytes: 25 * 1024 * 1024,
+        max_points_per_request: 0,
         request_timeout_secs: 30,
         rate_limiter: None,
     });
@@ -300,6 +302,7 @@ async fn test_cluster_endpoints_without_peers() {
             metadata.clone(),
             100_000,
             10_000,
+            0,
         ),
     );
     let query_service: Arc<dyn hyperbytedb::adapters::http::router::QueryService> =
@@ -338,6 +341,7 @@ async fn test_cluster_endpoints_without_peers() {
         chdb_session_data_path: chdb_dir.to_string_lossy().into_owned(),
         node_id: 1,
         max_body_size_bytes: 25 * 1024 * 1024,
+        max_points_per_request: 0,
         request_timeout_secs: 30,
         rate_limiter: None,
     });

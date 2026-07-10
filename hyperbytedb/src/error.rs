@@ -67,6 +67,12 @@ pub enum HyperbytedbError {
         limit: usize,
     },
 
+    #[error("request exceeds maximum point count: {count} points (limit: {limit})")]
+    RequestPointLimitExceeded { count: usize, limit: usize },
+
+    #[error("WAL backpressure: write queue full for {timeout_ms}ms")]
+    WalBackpressure { timeout_ms: u64 },
+
     #[error("query timeout exceeded")]
     QueryTimeout,
 

@@ -17,6 +17,7 @@ fn shared_ingestion(ctx: &TestContext) -> Arc<dyn IngestionPort> {
             ctx.metadata.clone(),
             100_000,
             10_000,
+            0,
         ),
     )
 }

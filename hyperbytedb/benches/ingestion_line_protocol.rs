@@ -329,7 +329,7 @@ fn bench_wal_batched_concurrent(c: &mut Criterion) {
     rt.block_on(metadata.create_database("benchdb")).unwrap();
     let meta_port: Arc<dyn MetadataPort> = metadata.clone();
     let wal: Arc<BatchingWal> =
-        rt.block_on(async { BatchingWal::new(raw_wal.clone(), 2048, 512, Duration::ZERO) });
+        rt.block_on(async { BatchingWal::new(raw_wal.clone(), 2048, 512, Duration::ZERO, 0) });
     let cache = Arc::new(IngestSchemaCache::new());
     let limits = IngestCardinalityLimits::default();
 

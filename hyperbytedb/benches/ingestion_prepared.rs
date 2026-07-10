@@ -105,7 +105,7 @@ fn setup_prepared_ingest() -> PreparedIngestEnv {
     std::fs::create_dir_all(&chdb_dir).unwrap();
 
     let raw_wal = Arc::new(RocksDbWal::open(&wal_dir).unwrap());
-    let wal = BatchingWal::new(raw_wal, 2048, 512, Duration::ZERO);
+    let wal = BatchingWal::new(raw_wal, 2048, 512, Duration::ZERO, 0);
     let metadata = Arc::new(RocksDbMetadata::open(&meta_dir).unwrap());
     rt.block_on(metadata.create_database("benchdb")).unwrap();
 
@@ -119,6 +119,7 @@ fn setup_prepared_ingest() -> PreparedIngestEnv {
         metadata,
         100_000,
         10_000,
+        0,
     ));
 
     PreparedIngestEnv {
@@ -268,7 +269,7 @@ fn bench_wal_prepared_append_concurrent(c: &mut Criterion) {
     let wal_dir = tmpdir.path().join("wal");
     std::fs::create_dir_all(&wal_dir).unwrap();
     let raw_wal = Arc::new(RocksDbWal::open(&wal_dir).unwrap());
-    let wal = BatchingWal::new(raw_wal, 2048, 512, Duration::ZERO);
+    let wal = BatchingWal::new(raw_wal, 2048, 512, Duration::ZERO, 0);
 
     let points: Arc<Vec<Point>> = Arc::new(synthetic_points(BATCH as usize));
     let batch = build_fact_batch(BATCH as usize);
