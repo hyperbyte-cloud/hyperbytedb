@@ -349,7 +349,15 @@ fn write_bundle_batch(
 
     for (i, bundle) in bundles.iter_mut().enumerate() {
         let wal_seq = first_seq + i as u64;
-        if let Some(ref mut slot) = bundle.prepared {
+        // ArrowIpc embeds the batch in the durable value, so its ingest_seq
+        // column must be patched before encoding. Bincode slots are cached
+        // unpatched and patched in `take_prepared_range` instead: the patch is
+        // O(rows) and this loop runs on the single group-commit writer thread
+        // (the measured ingest bottleneck), while the flush consumer has
+        // plenty of headroom.
+        if wal_format == WalFormat::ArrowIpc
+            && let Some(ref mut slot) = bundle.prepared
+        {
             slot.patch_all_ingest_seqs(wal_seq)?;
         }
 
@@ -431,7 +439,18 @@ impl WalPort for RocksDbWal {
         if !self.arrow_wal_enabled {
             return Ok(None);
         }
-        Ok(self.arrow_cache.take_range(from, to_inclusive, max_entries))
+        let Some(mut slots) = self.arrow_cache.take_range(from, to_inclusive, max_entries) else {
+            return Ok(None);
+        };
+        // Bincode-format slots are cached with relative ingest_seq offsets (see
+        // `write_bundle_batch`); assign the absolute sequences here on the
+        // flush path. ArrowIpc slots were already patched before encoding.
+        if self.wal_format == WalFormat::Bincode {
+            for (seq, slot) in &mut slots {
+                slot.patch_all_ingest_seqs(*seq)?;
+            }
+        }
+        Ok(Some(slots))
     }
 
     async fn next_prepared_seq(&self, from: u64) -> Result<Option<u64>, HyperbytedbError> {
@@ -525,5 +544,136 @@ impl WalPort for RocksDbWal {
         })
         .await
         .map_err(|e| HyperbytedbError::Wal(format!("WAL flush panicked: {e}")))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use arrow::array::UInt64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::domain::point::{FieldValue, Point};
+
+    fn seq_only_batch(n: usize) -> Arc<RecordBatch> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ingest_seq",
+            DataType::UInt64,
+            false,
+        )]));
+        Arc::new(
+            RecordBatch::try_new(
+                schema,
+                vec![Arc::new(UInt64Array::from(
+                    (0..n as u64).collect::<Vec<_>>(),
+                ))],
+            )
+            .unwrap(),
+        )
+    }
+
+    /// Two measurements (2 + 3 rows) so the per-measurement row offset is covered.
+    fn relative_slot() -> PreparedWalSlot {
+        let meas = |name: &str, n: usize| crate::domain::prepared_wal::PreparedMeasurementBatch {
+            measurement: name.into(),
+            table_name: format!("`db_autogen_{name}`"),
+            series_table_name: format!("`db_autogen_{name}_series`"),
+            batch: seq_only_batch(n),
+            row_count: n,
+            min_time: 1,
+            max_time: n as i64,
+            new_series_batch: None,
+        };
+        PreparedWalSlot {
+            database: "db".into(),
+            retention_policy: "autogen".into(),
+            origin_node_id: 0,
+            measurements: vec![meas("m1", 2), meas("m2", 3)],
+        }
+    }
+
+    fn test_entry() -> WalEntry {
+        let mut fields = BTreeMap::new();
+        fields.insert("v".to_string(), FieldValue::Float(1.0));
+        WalEntry {
+            database: "db".into(),
+            retention_policy: "autogen".into(),
+            points: vec![Point {
+                measurement: "m1".into(),
+                tags: BTreeMap::new(),
+                fields,
+                timestamp: 1,
+            }],
+            origin_node_id: 0,
+        }
+    }
+
+    fn assert_absolute_seqs(taken: &[(u64, PreparedWalSlot)]) {
+        for (seq, slot) in taken {
+            let mut row_offset = 0u64;
+            for m in &slot.measurements {
+                let col = m
+                    .batch
+                    .column_by_name("ingest_seq")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap();
+                for i in 0..col.len() {
+                    assert_eq!(
+                        col.value(i),
+                        seq + row_offset + i as u64,
+                        "measurement {} row {i} of slot seq {seq}",
+                        m.measurement
+                    );
+                }
+                row_offset += m.row_count as u64;
+            }
+        }
+    }
+
+    async fn append_and_take(wal: &RocksDbWal) -> Vec<(u64, PreparedWalSlot)> {
+        let mut seqs = Vec::new();
+        for _ in 0..2 {
+            let bundle = WalAppendBundle {
+                entry: test_entry(),
+                prepared: Some(relative_slot()),
+            };
+            seqs.push(wal.append_bundle(bundle).await.unwrap());
+        }
+        let taken = wal
+            .take_prepared_range(seqs[0], *seqs.last().unwrap(), 10)
+            .await
+            .unwrap()
+            .expect("prepared slots cached");
+        assert_eq!(taken.len(), 2);
+        taken
+    }
+
+    #[tokio::test]
+    async fn bincode_slots_get_absolute_seqs_exactly_once_at_take() {
+        let tmp = TempDir::new().unwrap();
+        let wal = RocksDbWal::open(tmp.path()).unwrap();
+        assert_eq!(wal.wal_format(), WalFormat::Bincode);
+        assert_absolute_seqs(&append_and_take(&wal).await);
+    }
+
+    #[tokio::test]
+    async fn arrow_ipc_slots_are_patched_at_write_not_double_patched_at_take() {
+        let tmp = TempDir::new().unwrap();
+        let wal = RocksDbWal::open_with_options(
+            tmp.path(),
+            RocksDbWalOptions {
+                wal_format: WalFormat::ArrowIpc,
+                arrow_wal_enabled: true,
+            },
+        )
+        .unwrap();
+        assert_absolute_seqs(&append_and_take(&wal).await);
     }
 }

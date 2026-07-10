@@ -339,7 +339,8 @@ async fn delete_from_measurement_where_tag() {
         "DELETE with tag predicate should fail at parse: {err:?}"
     );
     assert!(
-        err.to_string().contains("fields not allowed"),
+        err.to_string()
+            .contains("only time predicates are supported"),
         "unexpected error: {err:?}"
     );
 }

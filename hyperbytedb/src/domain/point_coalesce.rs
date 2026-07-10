@@ -2,9 +2,10 @@
 //! series-instant into one logical point (InfluxDB-compatible behaviour).
 //!
 //! Coalesce helpers operate on `(timestamp, tags)` only — **not** measurement name.
-//! Callers must group by measurement first (see [`coalesce_points_within_measurements`])
+//! Callers must group by measurement first (see [`group_and_coalesce_by_measurement`])
 //! when a batch contains multiple measurements, e.g. a Telegraf write bundle.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 
@@ -15,10 +16,18 @@ use crate::domain::point::Point;
 /// Returns `None` when every point has a unique series-instant — callers use
 /// their inputs unchanged with zero allocation.
 pub fn coalesce_plan(points: &[Point]) -> Option<Vec<Vec<u32>>> {
-    let mut groups: Vec<Vec<u32>> = Vec::with_capacity(points.len());
-    let mut buckets: HashMap<u64, Vec<u32>> = HashMap::with_capacity(points.len());
+    let idxs: Vec<u32> = (0..points.len() as u32).collect();
+    coalesce_plan_indexed(points, &idxs)
+}
 
-    for (i, p) in points.iter().enumerate() {
+/// Like [`coalesce_plan`] but over the subset of `points` selected by `idxs`
+/// (indices into `points`). Returned groups likewise hold indices into `points`.
+pub fn coalesce_plan_indexed(points: &[Point], idxs: &[u32]) -> Option<Vec<Vec<u32>>> {
+    let mut groups: Vec<Vec<u32>> = Vec::with_capacity(idxs.len());
+    let mut buckets: HashMap<u64, Vec<u32>> = HashMap::with_capacity(idxs.len());
+
+    for &i in idxs {
+        let p = &points[i as usize];
         let h = series_instant_hash(p);
         let bucket = buckets.entry(h).or_default();
         let existing = bucket
@@ -26,16 +35,16 @@ pub fn coalesce_plan(points: &[Point]) -> Option<Vec<Vec<u32>>> {
             .copied()
             .find(|&g| same_series_instant(&points[groups[g as usize][0] as usize], p));
         match existing {
-            Some(g) => groups[g as usize].push(i as u32),
+            Some(g) => groups[g as usize].push(i),
             None => {
                 let g = groups.len() as u32;
-                groups.push(vec![i as u32]);
+                groups.push(vec![i]);
                 bucket.push(g);
             }
         }
     }
 
-    if groups.len() == points.len() {
+    if groups.len() == idxs.len() {
         None
     } else {
         Some(groups)
@@ -74,50 +83,38 @@ pub fn coalesce_points_and_origins(
     Some((merged_points, merged_origins))
 }
 
-/// Group by measurement, then coalesce partial rows within each measurement.
+/// Group points by measurement, coalescing partial rows within each group.
 ///
 /// Matches the native WAL flush path: cross-measurement points that share the
-/// same `(timestamp, tags)` (common in Telegraf bundles) stay separate.
-pub fn coalesce_points_within_measurements(points: &[Point]) -> Vec<Point> {
-    coalesce_points_within_measurements_with_origins(points, &vec![0; points.len()]).0
-}
-
-/// Like [`coalesce_points_within_measurements`] but preserves per-row origins.
-pub fn coalesce_points_within_measurements_with_origins(
-    points: &[Point],
-    origins: &[u64],
-) -> (Vec<Point>, Vec<u64>) {
-    assert_eq!(
-        points.len(),
-        origins.len(),
-        "points and origins must be parallel"
-    );
-    if points.is_empty() {
-        return (Vec::new(), Vec::new());
-    }
-
-    let mut by_meas: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+/// same `(timestamp, tags)` (common in Telegraf bundles) stay separate. The
+/// common no-merge case borrows the caller's points without cloning; only
+/// measurements that actually contain partial-write duplicates allocate
+/// merged points.
+pub fn group_and_coalesce_by_measurement(points: &[Point]) -> Vec<(&str, Vec<Cow<'_, Point>>)> {
+    let mut by_meas: BTreeMap<&str, Vec<u32>> = BTreeMap::new();
     for (i, p) in points.iter().enumerate() {
-        by_meas.entry(p.measurement.clone()).or_default().push(i);
+        by_meas
+            .entry(p.measurement.as_str())
+            .or_default()
+            .push(i as u32);
     }
 
-    let mut merged_points = Vec::with_capacity(points.len());
-    let mut merged_origins = Vec::with_capacity(points.len());
-    for indices in by_meas.into_values() {
-        let meas_points: Vec<Point> = indices.iter().map(|&i| points[i].clone()).collect();
-        let meas_origins: Vec<u64> = indices.iter().map(|&i| origins[i]).collect();
-        match coalesce_points_and_origins(&meas_points, &meas_origins) {
-            Some((m_points, m_origins)) => {
-                merged_points.extend(m_points);
-                merged_origins.extend(m_origins);
-            }
-            None => {
-                merged_points.extend(meas_points);
-                merged_origins.extend(meas_origins);
-            }
-        }
-    }
-    (merged_points, merged_origins)
+    by_meas
+        .into_iter()
+        .map(|(measurement, idxs)| {
+            let meas_points: Vec<Cow<'_, Point>> = match coalesce_plan_indexed(points, &idxs) {
+                None => idxs
+                    .iter()
+                    .map(|&i| Cow::Borrowed(&points[i as usize]))
+                    .collect(),
+                Some(groups) => groups
+                    .iter()
+                    .map(|g| Cow::Owned(merge_point_group(points, g)))
+                    .collect(),
+            };
+            (measurement, meas_points)
+        })
+        .collect()
 }
 
 fn series_instant_hash(p: &Point) -> u64 {
@@ -260,8 +257,19 @@ mod tests {
                 &[("usage_idle", FieldValue::Float(90.0))],
             ),
         ];
-        let merged = coalesce_points_within_measurements(&points);
+        let grouped = group_and_coalesce_by_measurement(&points);
+        let merged: Vec<&Point> = grouped
+            .iter()
+            .flat_map(|(_, pts)| pts.iter().map(|c| c.as_ref()))
+            .collect();
         assert_eq!(merged.len(), points.len());
+        assert!(
+            grouped
+                .iter()
+                .flat_map(|(_, pts)| pts.iter())
+                .all(|c| matches!(c, Cow::Borrowed(_))),
+            "no-merge case must borrow, not clone"
+        );
         let mut names: Vec<_> = merged.iter().map(|p| p.measurement.as_str()).collect();
         names.sort_unstable();
         assert_eq!(
@@ -293,7 +301,11 @@ mod tests {
             ),
             make_named_point("mem", ts, tags, &[("used", FieldValue::Float(100.0))]),
         ];
-        let merged = coalesce_points_within_measurements(&points);
+        let grouped = group_and_coalesce_by_measurement(&points);
+        let merged: Vec<&Point> = grouped
+            .iter()
+            .flat_map(|(_, pts)| pts.iter().map(|c| c.as_ref()))
+            .collect();
         assert_eq!(merged.len(), 2);
         let system = merged
             .iter()

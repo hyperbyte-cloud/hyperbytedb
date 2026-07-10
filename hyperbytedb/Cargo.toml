@@ -112,6 +112,10 @@ name = "ingestion_line_protocol"
 harness = false
 
 [[bench]]
+name = "ingestion_prepared"
+harness = false
+
+[[bench]]
 name = "ingestion_columnar"
 harness = false
 

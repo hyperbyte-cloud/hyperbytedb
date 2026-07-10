@@ -29,6 +29,7 @@
 //! the TimeseriesQL→ClickHouse translator produces identical column
 //! references regardless of storage format.
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -479,10 +480,10 @@ impl ChdbNativeAdapter {
     /// Compute the union of tag keys across `points`, then ensure the
     /// table exists with at least those columns plus all fields. Returns
     /// the post-update schema snapshot used by the INSERT renderer.
-    async fn ensure_table(
+    async fn ensure_table<P: Borrow<Point> + Sync>(
         &self,
         key: &TableKey,
-        points: &[Point],
+        points: &[P],
     ) -> Result<EnsuredTable, HyperbytedbError> {
         let table = quoted_table_name(&key.db, &key.rp, &key.measurement);
         let series_table = quoted_series_table_name(&key.db, &key.rp, &key.measurement);
@@ -497,6 +498,7 @@ impl ChdbNativeAdapter {
         let mut tag_keys: BTreeSet<String> = BTreeSet::new();
         let mut field_types: HashMap<String, u8> = HashMap::new();
         for p in points {
+            let p = p.borrow();
             for k in p.tags.keys() {
                 if !tag_keys.contains(k) {
                     tag_keys.insert(k.clone());
@@ -818,7 +820,7 @@ impl ChdbNativeAdapter {
     /// Resolve tag column kind using the schema cache when safe, otherwise
     /// count distinct values via metadata.
     #[allow(clippy::too_many_arguments)]
-    async fn resolve_tag_column_kind(
+    async fn resolve_tag_column_kind<P: Borrow<Point> + Sync>(
         &self,
         cached: &TableSchema,
         db: &str,
@@ -826,7 +828,7 @@ impl ChdbNativeAdapter {
         measurement: &str,
         tag_key: &str,
         phys_col: &str,
-        points: &[Point],
+        points: &[P],
     ) -> Result<ColumnKind, HyperbytedbError> {
         if cached.materialized
             && let Some(kind) = cached.columns.get(phys_col).copied()
@@ -858,18 +860,18 @@ impl ChdbNativeAdapter {
 
     /// Distinct tag values for `(db, measurement, tag_key)` from metadata plus
     /// novel values in this batch.
-    async fn distinct_tag_value_count(
+    async fn distinct_tag_value_count<P: Borrow<Point> + Sync>(
         &self,
         db: &str,
         rp: &str,
         measurement: &str,
         tag_key: &str,
-        points: &[Point],
+        points: &[P],
     ) -> Result<usize, HyperbytedbError> {
         let Some(meta) = &self.metadata else {
             let mut values: HashSet<String> = HashSet::new();
             for p in points {
-                if let Some(v) = p.tags.get(tag_key) {
+                if let Some(v) = p.borrow().tags.get(tag_key) {
                     values.insert(v.clone());
                 }
             }
@@ -881,7 +883,7 @@ impl ChdbNativeAdapter {
             .await?;
         let mut novel: HashSet<String> = HashSet::new();
         for p in points {
-            if let Some(v) = p.tags.get(tag_key)
+            if let Some(v) = p.borrow().tags.get(tag_key)
                 && !meta
                     .tag_value_is_known(db, rp, measurement, tag_key, v)
                     .await?
@@ -985,9 +987,7 @@ impl ChdbNativeAdapter {
         origin_node_id: u64,
         points: &[Point],
     ) -> Result<crate::domain::prepared_wal::PreparedWalSlot, HyperbytedbError> {
-        use std::collections::BTreeMap;
-
-        use crate::domain::point_coalesce::coalesce_points_within_measurements;
+        use crate::domain::point_coalesce::group_and_coalesce_by_measurement;
         use crate::domain::prepared_wal::PreparedWalSlot;
 
         if points.is_empty() {
@@ -999,19 +999,16 @@ impl ChdbNativeAdapter {
             });
         }
 
-        let coalesced_points = coalesce_points_within_measurements(points);
+        // Group by measurement and merge partial writes; the common no-merge
+        // case borrows the caller's points without cloning the batch.
+        let grouped = group_and_coalesce_by_measurement(points);
 
-        let mut by_meas: BTreeMap<String, Vec<Point>> = BTreeMap::new();
-        for p in coalesced_points {
-            by_meas.entry(p.measurement.clone()).or_default().push(p);
-        }
-
-        let mut measurements = Vec::with_capacity(by_meas.len());
-        for (measurement, meas_points) in by_meas {
+        let mut measurements = Vec::with_capacity(grouped.len());
+        for (measurement, meas_points) in grouped {
             let key = TableKey {
                 db: db.to_string(),
                 rp: rp.to_string(),
-                measurement: measurement.clone(),
+                measurement: measurement.to_string(),
             };
             measurements.push(
                 self.prepare_measurement_batch(&key, origin_node_id, &meas_points, 0)
@@ -1027,11 +1024,11 @@ impl ChdbNativeAdapter {
         })
     }
 
-    async fn prepare_measurement_batch(
+    async fn prepare_measurement_batch<P: Borrow<Point> + Sync>(
         &self,
         key: &TableKey,
         origin_node_id: u64,
-        points: &[Point],
+        points: &[P],
         ingest_seq_base: u64,
     ) -> Result<crate::domain::prepared_wal::PreparedMeasurementBatch, HyperbytedbError> {
         use std::sync::Arc;
@@ -1040,7 +1037,10 @@ impl ChdbNativeAdapter {
 
         let ensured = self.ensure_table(key, points).await?;
         let origins = vec![origin_node_id; points.len()];
-        let sids: Vec<u64> = points.iter().map(series_id_for_point).collect();
+        let sids: Vec<u64> = points
+            .iter()
+            .map(|p| series_id_for_point(p.borrow()))
+            .collect();
         let new_series_batch = self
             .build_new_series_batch(key, &ensured, points, &sids)
             .await?;
@@ -1060,11 +1060,11 @@ impl ChdbNativeAdapter {
         })
     }
 
-    async fn build_new_series_batch(
+    async fn build_new_series_batch<P: Borrow<Point> + Sync>(
         &self,
         key: &TableKey,
         ensured: &EnsuredTable,
-        points: &[Point],
+        points: &[P],
         sids: &[u64],
     ) -> Result<Option<Arc<RecordBatch>>, HyperbytedbError> {
         let mut seen: HashSet<u64> = HashSet::new();
@@ -1073,7 +1073,7 @@ impl ChdbNativeAdapter {
             if self.series_known(key, sid) || !seen.insert(sid) {
                 continue;
             }
-            new_series.push((sid, &points[i]));
+            new_series.push((sid, points[i].borrow()));
         }
         if new_series.is_empty() {
             return Ok(None);
@@ -1267,7 +1267,7 @@ impl PointsSinkPort for ChdbNativeAdapter {
 
         // Re-align legacy sparse prepared batches (pre-coalesce WAL entries)
         // to the current metadata-driven table schema before insert.
-        let ensured = self.ensure_table(&key, &[]).await?;
+        let ensured = self.ensure_table::<Point>(&key, &[]).await?;
         let padded = pad_record_batch_to_ensured(&batch.batch, &ensured)?;
 
         let pool = self.session.pool()?;
@@ -1668,13 +1668,13 @@ fn build_series_tag_column(
 
 /// Build one Arrow column for a field, nulling rows that lack the field or
 /// whose value doesn't match the column's resolved type.
-fn build_field_column(points: &[Point], logical: &str, disc: u8) -> ArrayRef {
+fn build_field_column<P: Borrow<Point>>(points: &[P], logical: &str, disc: u8) -> ArrayRef {
     let n = points.len();
     match disc {
         1 => {
             let mut b = Int64Builder::with_capacity(n);
             for p in points {
-                match p.fields.get(logical) {
+                match p.borrow().fields.get(logical) {
                     Some(FieldValue::Integer(v)) => b.append_value(*v),
                     Some(FieldValue::UInteger(v)) if *v <= i64::MAX as u64 => {
                         b.append_value(*v as i64)
@@ -1688,7 +1688,7 @@ fn build_field_column(points: &[Point], logical: &str, disc: u8) -> ArrayRef {
         2 => {
             let mut b = UInt64Builder::with_capacity(n);
             for p in points {
-                match p.fields.get(logical) {
+                match p.borrow().fields.get(logical) {
                     Some(FieldValue::UInteger(v)) => b.append_value(*v),
                     Some(FieldValue::Integer(v)) if *v >= 0 => b.append_value(*v as u64),
                     _ => b.append_null(),
@@ -1699,7 +1699,7 @@ fn build_field_column(points: &[Point], logical: &str, disc: u8) -> ArrayRef {
         3 => {
             let mut b = StringBuilder::new();
             for p in points {
-                match p.fields.get(logical) {
+                match p.borrow().fields.get(logical) {
                     Some(FieldValue::String(v)) => b.append_value(v),
                     _ => b.append_null(),
                 }
@@ -1709,7 +1709,7 @@ fn build_field_column(points: &[Point], logical: &str, disc: u8) -> ArrayRef {
         4 => {
             let mut b = UInt8Builder::with_capacity(n);
             for p in points {
-                match p.fields.get(logical) {
+                match p.borrow().fields.get(logical) {
                     Some(FieldValue::Boolean(v)) => b.append_value(u8::from(*v)),
                     _ => b.append_null(),
                 }
@@ -1720,7 +1720,7 @@ fn build_field_column(points: &[Point], logical: &str, disc: u8) -> ArrayRef {
         _ => {
             let mut b = Float64Builder::with_capacity(n);
             for p in points {
-                match p.fields.get(logical) {
+                match p.borrow().fields.get(logical) {
                     Some(FieldValue::Float(v)) => b.append_value(*v),
                     Some(FieldValue::Integer(v)) => b.append_value(*v as f64),
                     _ => b.append_null(),
@@ -1735,11 +1735,11 @@ fn build_field_column(points: &[Point], logical: &str, disc: u8) -> ArrayRef {
 /// schema, with per-row `origins` and `sids` (parallel to `points`). Columns are
 /// `time`, `origin_node_id`, `ingest_seq`, `series_id`, then the field columns
 /// (nullable). Returns the batch plus the observed `(min_time, max_time)`.
-fn build_record_batch(
+fn build_record_batch<P: Borrow<Point>>(
     ensured: &EnsuredTable,
     origins: &[u64],
     ingest_seq_base: u64,
-    points: &[Point],
+    points: &[P],
     sids: &[u64],
 ) -> Result<(RecordBatch, i64, i64), HyperbytedbError> {
     let n = points.len();
@@ -1751,6 +1751,7 @@ fn build_record_batch(
     let mut times = Vec::with_capacity(n);
     let mut seqs = Vec::with_capacity(n);
     for (i, p) in points.iter().enumerate() {
+        let p = p.borrow();
         min_time = min_time.min(p.timestamp);
         max_time = max_time.max(p.timestamp);
         times.push(p.timestamp);

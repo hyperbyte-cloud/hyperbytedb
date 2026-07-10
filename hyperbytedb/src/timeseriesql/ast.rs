@@ -242,18 +242,21 @@ pub struct Duration {
 }
 
 impl Duration {
+    /// Convert to nanoseconds, saturating at `i64::MIN`/`i64::MAX` instead of
+    /// overflowing. (The signature is infallible and widely called, so
+    /// saturation is used rather than returning an error.)
     pub fn to_nanos(&self) -> i64 {
-        self.value
-            * match self.unit {
-                DurationUnit::Nanosecond => 1,
-                DurationUnit::Microsecond => 1_000,
-                DurationUnit::Millisecond => 1_000_000,
-                DurationUnit::Second => 1_000_000_000,
-                DurationUnit::Minute => 60 * 1_000_000_000,
-                DurationUnit::Hour => 3_600 * 1_000_000_000,
-                DurationUnit::Day => 86_400 * 1_000_000_000,
-                DurationUnit::Week => 7 * 86_400 * 1_000_000_000,
-            }
+        let per_unit: i64 = match self.unit {
+            DurationUnit::Nanosecond => 1,
+            DurationUnit::Microsecond => 1_000,
+            DurationUnit::Millisecond => 1_000_000,
+            DurationUnit::Second => 1_000_000_000,
+            DurationUnit::Minute => 60 * 1_000_000_000,
+            DurationUnit::Hour => 3_600 * 1_000_000_000,
+            DurationUnit::Day => 86_400 * 1_000_000_000,
+            DurationUnit::Week => 7 * 86_400 * 1_000_000_000,
+        };
+        self.value.saturating_mul(per_unit)
     }
 
     pub fn to_clickhouse_interval(&self) -> String {
@@ -265,7 +268,7 @@ impl Duration {
             DurationUnit::Minute => (self.value, "MINUTE"),
             DurationUnit::Hour => (self.value, "HOUR"),
             DurationUnit::Day => (self.value, "DAY"),
-            DurationUnit::Week => (self.value * 7, "DAY"),
+            DurationUnit::Week => (self.value.saturating_mul(7), "DAY"),
         };
         format!("INTERVAL {val} {unit}")
     }
@@ -445,4 +448,48 @@ pub struct CreateMaterializedViewStatement {
     pub database: String,
     pub query: SelectStatement,
     pub raw_query: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_duration_to_nanos_saturates_instead_of_overflowing() {
+        let d = Duration {
+            value: i64::MAX,
+            unit: DurationUnit::Week,
+        };
+        assert_eq!(d.to_nanos(), i64::MAX);
+
+        let d = Duration {
+            value: i64::MIN,
+            unit: DurationUnit::Hour,
+        };
+        assert_eq!(d.to_nanos(), i64::MIN);
+
+        let d = Duration {
+            value: 2,
+            unit: DurationUnit::Hour,
+        };
+        assert_eq!(d.to_nanos(), 7_200_000_000_000);
+    }
+
+    #[test]
+    fn test_to_clickhouse_interval_week_saturates() {
+        let d = Duration {
+            value: i64::MAX,
+            unit: DurationUnit::Week,
+        };
+        assert_eq!(
+            d.to_clickhouse_interval(),
+            format!("INTERVAL {} DAY", i64::MAX)
+        );
+
+        let d = Duration {
+            value: 2,
+            unit: DurationUnit::Week,
+        };
+        assert_eq!(d.to_clickhouse_interval(), "INTERVAL 14 DAY");
+    }
 }
