@@ -151,6 +151,7 @@ async fn start_node_on(
             peer_client.clone(),
             node_id,
             IngestCardinalityLimits::default(),
+            0,
             replication,
         ));
 
@@ -185,6 +186,7 @@ async fn start_node_on(
         chdb_session_data_path: chdb_path_str,
         node_id,
         max_body_size_bytes: 25 * 1024 * 1024,
+        max_points_per_request: 0,
         request_timeout_secs: 30,
         rate_limiter: None,
     });

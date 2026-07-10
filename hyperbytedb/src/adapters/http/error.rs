@@ -31,6 +31,8 @@ fn error_to_status_and_message(err: &HyperbytedbError) -> (StatusCode, String) {
         | HyperbytedbError::MissingParameter(_)
         | HyperbytedbError::QueryParse(_) => StatusCode::BAD_REQUEST,
         HyperbytedbError::CardinalityExceeded { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+        HyperbytedbError::RequestPointLimitExceeded { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+        HyperbytedbError::WalBackpressure { .. } => StatusCode::SERVICE_UNAVAILABLE,
         HyperbytedbError::QueryTimeout => StatusCode::REQUEST_TIMEOUT,
         HyperbytedbError::ClusterUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         HyperbytedbError::PeerUnreachable(_) => StatusCode::BAD_GATEWAY,

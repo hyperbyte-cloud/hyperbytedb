@@ -114,7 +114,8 @@ impl TestContext {
             points_sink.clone(),
         );
 
-        let ingestion = IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 10_000);
+        let ingestion =
+            IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 10_000, 0);
 
         let flush_service = Arc::new(FlushServiceImpl::new(wal.clone(), 0, points_sink));
 
@@ -155,7 +156,8 @@ impl TestContext {
             points_sink.clone(),
         );
 
-        let ingestion = IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 10_000);
+        let ingestion =
+            IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 10_000, 0);
 
         let flush_service = Arc::new(FlushServiceImpl::new(wal.clone(), 0, points_sink));
 

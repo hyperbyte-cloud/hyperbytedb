@@ -5,9 +5,9 @@ use std::sync::Arc;
 #[cfg(feature = "columnar-ingest")]
 use crate::application::ingest_metadata::prepare_columnar_metadata;
 use crate::application::ingest_metadata::{
-    IngestCardinalityLimits, IngestSchemaCache, prepare_batch_metadata,
+    IngestCardinalityLimits, IngestSchemaCache, prepare_batch_metadata, validate_point_count,
 };
-use crate::application::line_protocol::parse_line_body_to_points;
+use crate::application::line_protocol::parse_line_body_to_points_limited;
 use crate::application::msgpack_ingest::parse_msgpack_body_to_points;
 use crate::application::wal_append::append_points_with_prepared;
 use crate::domain::point::Point;
@@ -21,6 +21,7 @@ pub struct IngestionServiceImpl {
     sink: Option<Arc<dyn PointsSinkPort>>,
     metadata: Arc<dyn crate::ports::metadata::MetadataPort>,
     limits: IngestCardinalityLimits,
+    max_points_per_request: usize,
     schema_cache: IngestSchemaCache,
 }
 
@@ -30,8 +31,16 @@ impl IngestionServiceImpl {
         metadata: Arc<dyn crate::ports::metadata::MetadataPort>,
         max_tag_values: usize,
         max_measurements: usize,
+        max_points_per_request: usize,
     ) -> Self {
-        Self::with_sink(wal, None, metadata, max_tag_values, max_measurements)
+        Self::with_sink(
+            wal,
+            None,
+            metadata,
+            max_tag_values,
+            max_measurements,
+            max_points_per_request,
+        )
     }
 
     pub fn with_sink(
@@ -40,6 +49,7 @@ impl IngestionServiceImpl {
         metadata: Arc<dyn crate::ports::metadata::MetadataPort>,
         max_tag_values: usize,
         max_measurements: usize,
+        max_points_per_request: usize,
     ) -> Self {
         Self {
             wal,
@@ -49,6 +59,7 @@ impl IngestionServiceImpl {
                 max_tag_values_per_measurement: max_tag_values,
                 max_measurements_per_database: max_measurements,
             },
+            max_points_per_request,
             schema_cache: IngestSchemaCache::new(),
         }
     }
@@ -67,6 +78,7 @@ impl IngestionServiceImpl {
             rp,
             points,
             origin_node_id,
+            self.max_points_per_request,
         )
         .await
     }
@@ -103,6 +115,7 @@ impl IngestionPort for IngestionServiceImpl {
             if wire.values.is_empty() {
                 return Ok(());
             }
+            validate_point_count(wire.values.len(), self.max_points_per_request)?;
 
             let t2 = std::time::Instant::now();
             histogram!("hyperbytedb_ingest_parse_seconds").record((t2 - t1).as_secs_f64());
@@ -155,7 +168,9 @@ impl IngestionPort for IngestionServiceImpl {
         }
 
         let points = match format {
-            WritePayloadFormat::LineProtocol => parse_line_body_to_points(body, precision)?,
+            WritePayloadFormat::LineProtocol => {
+                parse_line_body_to_points_limited(body, precision, self.max_points_per_request)?
+            }
             WritePayloadFormat::Msgpack => parse_msgpack_body_to_points(body, precision)?,
             #[cfg(feature = "columnar-ingest")]
             WritePayloadFormat::ColumnarMsgpack => {
@@ -164,6 +179,9 @@ impl IngestionPort for IngestionServiceImpl {
         };
         if points.is_empty() {
             return Ok(());
+        }
+        if !matches!(format, WritePayloadFormat::LineProtocol) {
+            validate_point_count(points.len(), self.max_points_per_request)?;
         }
 
         let t2 = std::time::Instant::now();

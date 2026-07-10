@@ -102,6 +102,7 @@ comfy-table = "7.2.2"
 colored = "3.1.1"
 simd-json = { version = "0.17.0", features = ["serde_impl"] }
 humantime = "2"
+lru = "0.12"
 
 [features]
 default = ["columnar-ingest"]

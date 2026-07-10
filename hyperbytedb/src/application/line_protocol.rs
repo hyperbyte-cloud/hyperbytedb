@@ -21,8 +21,44 @@ pub fn parse_line_body_to_points(
     body: &[u8],
     precision: Option<&str>,
 ) -> Result<Vec<Point>, HyperbytedbError> {
-    let cap = body.iter().filter(|&&b| b == b'\n').count().max(1);
-    parse_line_body_to_points_with_capacity(body, precision, cap)
+    parse_line_body_to_points_limited(body, precision, 0)
+}
+
+/// Like [`parse_line_body_to_points`] but rejects batches above `max_points`
+/// during parsing (`0` = [`crate::config::default_max_points_per_request`]).
+pub fn parse_line_body_to_points_limited(
+    body: &[u8],
+    precision: Option<&str>,
+    max_points: usize,
+) -> Result<Vec<Point>, HyperbytedbError> {
+    let limit = if max_points == 0 {
+        crate::config::default_max_points_per_request()
+    } else {
+        max_points
+    };
+    let cap = estimate_points_capacity(body).min(limit);
+    parse_line_body_inner(body, precision, cap, Some(limit))
+}
+
+/// Count lines that contain at least one non-whitespace byte. Blank lines are
+/// ignored so adversarial `\n`-only bodies do not pre-allocate a huge `Vec`.
+fn estimate_points_capacity(body: &[u8]) -> usize {
+    let mut count = 0usize;
+    let mut line_has_content = false;
+    for &b in body {
+        if b == b'\n' {
+            if line_has_content {
+                count += 1;
+            }
+            line_has_content = false;
+        } else if !b.is_ascii_whitespace() {
+            line_has_content = true;
+        }
+    }
+    if line_has_content {
+        count += 1;
+    }
+    count.max(1)
 }
 
 /// Like [`parse_line_body_to_points`] with an explicit capacity hint for the points vector.
@@ -30,6 +66,15 @@ pub fn parse_line_body_to_points_with_capacity(
     body: &[u8],
     precision: Option<&str>,
     points_capacity: usize,
+) -> Result<Vec<Point>, HyperbytedbError> {
+    parse_line_body_inner(body, precision, points_capacity, None)
+}
+
+fn parse_line_body_inner(
+    body: &[u8],
+    precision: Option<&str>,
+    points_capacity: usize,
+    max_points: Option<usize>,
 ) -> Result<Vec<Point>, HyperbytedbError> {
     let input = std::str::from_utf8(body).map_err(|e| HyperbytedbError::LineProtocolParse {
         line: String::new(),
@@ -45,6 +90,14 @@ pub fn parse_line_body_to_points_with_capacity(
         })?;
         let point = parsed_line_to_point(&parsed, &precision_val)?;
         points.push(point);
+        if let Some(limit) = max_points
+            && points.len() > limit
+        {
+            return Err(HyperbytedbError::RequestPointLimitExceeded {
+                count: points.len(),
+                limit,
+            });
+        }
     }
     Ok(points)
 }
@@ -222,6 +275,14 @@ fn escape_string_field(s: &str) -> String {
 #[cfg(test)]
 mod encode_tests {
     use super::*;
+
+    #[test]
+    fn blank_lines_do_not_inflate_capacity_hint() {
+        let body = vec![b'\n'; 10_000];
+        assert_eq!(estimate_points_capacity(&body), 1);
+        let points = parse_line_body_to_points(&body, None).unwrap();
+        assert!(points.is_empty());
+    }
 
     #[test]
     fn encode_decode_round_trip_ns() {

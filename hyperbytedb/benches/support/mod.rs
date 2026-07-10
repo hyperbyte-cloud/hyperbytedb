@@ -110,7 +110,7 @@ pub fn setup_flush(profile: DatasetProfile) -> FlushBenchEnv {
     let shared = SharedSession::new_eager(chdb_dir.to_str().unwrap(), 1).unwrap();
     let points_sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(shared));
 
-    let ingestion = IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 10_000);
+    let ingestion = IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 10_000, 0);
     let flush_service = Arc::new(FlushServiceImpl::new(wal, 0, points_sink));
 
     FlushBenchEnv {
@@ -171,7 +171,7 @@ pub fn setup(profile: DatasetProfile) -> BenchEnv {
     let query_port = Arc::new(ChdbQueryAdapter::from_shared(shared.clone(), 0));
     let points_sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(shared));
 
-    let ingestion = IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 10_000);
+    let ingestion = IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 10_000, 0);
     let flush_service = FlushServiceImpl::new(wal.clone(), 0, points_sink.clone());
     let query_service =
         QueryServiceImpl::new(query_port, metadata.clone(), wal.clone(), 120, points_sink);

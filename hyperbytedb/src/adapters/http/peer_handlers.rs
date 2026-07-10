@@ -578,6 +578,7 @@ pub async fn handle_sync_trigger(State(state): State<Arc<AppState>>) -> impl Int
     let wal = state.wal.clone();
     let points_sink = state.points_sink.clone();
     let mv_service = state.mv_service.clone();
+    let max_points_per_request = state.max_points_per_request;
 
     let membership_clone = membership.clone();
 
@@ -602,6 +603,7 @@ pub async fn handle_sync_trigger(State(state): State<Arc<AppState>>) -> impl Int
             metadata.clone(),
             wal.clone(),
             Some(points_sink),
+            max_points_per_request,
             fallback_peers,
         );
 

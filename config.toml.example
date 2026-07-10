@@ -2,6 +2,7 @@
 bind_address = "0.0.0.0"
 port = 8086
 max_body_size_bytes = 26214400  # 25 MB
+max_points_per_request = 500000  # 0 = default (500k)
 request_timeout_secs = 30
 query_timeout_secs = 30
 # Max concurrent TimeseriesQL executions; 0 = unlimited
@@ -25,12 +26,15 @@ max_points_per_batch = 50000
 wal_batch_size = 64
 # WAL group-commit: max microseconds to wait before flushing a partial batch
 wal_batch_delay_us = 200
+# Max ms to wait for WAL batcher queue space before 503 (0 = wait until space is available)
+wal_enqueue_timeout_ms = 0
 # Keep chDB-ready Arrow batches in RAM for zero-copy flush (default true)
 arrow_wal_enabled = true
 
 [chdb]
 session_data_path = "./chdb_data"
 pool_size = 4  # same-path chDB connections for parallel flush inserts and queries
+schema_cache_max_entries = 10000
 
 [auth]
 enabled = false

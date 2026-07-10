@@ -94,6 +94,7 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
             config.flush.wal_batch_size * 4,
             config.flush.wal_batch_size,
             std::time::Duration::from_micros(config.flush.wal_batch_delay_us),
+            config.flush.wal_enqueue_timeout_ms,
         )
     } else {
         raw_wal
@@ -145,7 +146,11 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         ChdbQueryAdapter::from_shared(shared_chdb.clone(), config.server.max_concurrent_queries);
     let chdb: Arc<dyn crate::ports::query::QueryPort> = Arc::new(chdb_adapter);
 
-    let native_sink = ChdbNativeAdapter::with_metadata(shared_chdb.clone(), Some(metadata.clone()));
+    let native_sink = ChdbNativeAdapter::with_metadata_and_cache_limit(
+        shared_chdb.clone(),
+        Some(metadata.clone()),
+        config.chdb.schema_cache_max_entries,
+    );
     match native_sink.warm_schemas_from_metadata().await {
         Ok(tables) => tracing::info!(
             tables,
@@ -218,6 +223,8 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         metrics::gauge!("hyperbytedb_cluster_peers").set(0.0);
     }
 
+    let max_points_per_request = config.server.max_points_per_request;
+
     let base_query_service: Arc<dyn QueryService> = {
         let mut qs = QueryServiceImpl::new(
             chdb.clone(),
@@ -225,7 +232,8 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
             wal.clone(),
             config.server.query_timeout_secs,
             points_sink.clone(),
-        );
+        )
+        .with_max_points_per_request(max_points_per_request);
         if let Some(ref pc) = peer_client {
             qs = qs.with_cluster_replication(
                 pc.clone(),
@@ -241,6 +249,8 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         max_measurements_per_database: config.cardinality.max_measurements_per_database,
     };
 
+    let max_points_per_request = config.server.max_points_per_request;
+
     let ingestion_service: Arc<dyn crate::ports::ingestion::IngestionPort> = if let Some(ref pc) =
         peer_client
     {
@@ -252,6 +262,7 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
                     pc.clone(),
                     config.cluster.node_id,
                     ingest_cardinality,
+                    max_points_per_request,
                     config.cluster.replication.clone(),
                 ),
             )
@@ -262,6 +273,7 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
             metadata.clone(),
             config.cardinality.max_tag_values_per_measurement,
             config.cardinality.max_measurements_per_database,
+            max_points_per_request,
         ))
     };
 
@@ -272,6 +284,7 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
             wal.clone(),
             Some(points_sink.clone()),
             ingest_cardinality,
+            max_points_per_request,
         ))
     } else {
         None
@@ -356,6 +369,7 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         chdb_session_data_path: config.chdb.session_data_path.clone(),
         node_id: config.cluster.node_id,
         max_body_size_bytes: config.server.max_body_size_bytes,
+        max_points_per_request: config.server.max_points_per_request,
         request_timeout_secs: config.server.request_timeout_secs,
         rate_limiter: if config.rate_limit.enabled && config.rate_limit.max_requests_per_second > 0
         {

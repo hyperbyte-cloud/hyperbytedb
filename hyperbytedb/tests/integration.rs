@@ -66,7 +66,7 @@ fn setup(dir: &tempfile::TempDir) -> (Arc<AppState>, Arc<FlushServiceImpl>) {
     let points_sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(shared));
 
     let ingestion_service: Arc<dyn hyperbytedb::ports::ingestion::IngestionPort> = Arc::new(
-        IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 10_000),
+        IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 10_000, 0),
     );
 
     let query_service: Arc<dyn hyperbytedb::adapters::http::router::QueryService> =
@@ -108,6 +108,7 @@ fn setup(dir: &tempfile::TempDir) -> (Arc<AppState>, Arc<FlushServiceImpl>) {
         chdb_session_data_path: chdb_path_str,
         node_id: 1,
         max_body_size_bytes: 25 * 1024 * 1024,
+        max_points_per_request: 0,
         request_timeout_secs: 30,
         rate_limiter: None,
     });
@@ -151,7 +152,7 @@ async fn test_auth_blocks_unauthenticated() {
         .unwrap();
 
     let ingestion_service: Arc<dyn hyperbytedb::ports::ingestion::IngestionPort> = Arc::new(
-        IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 10_000),
+        IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 10_000, 0),
     );
     let query_service: Arc<dyn hyperbytedb::adapters::http::router::QueryService> =
         Arc::new(QueryServiceImpl::new(
@@ -187,6 +188,7 @@ async fn test_auth_blocks_unauthenticated() {
         chdb_session_data_path: chdb_dir.to_string_lossy().into_owned(),
         node_id: 1,
         max_body_size_bytes: 25 * 1024 * 1024,
+        max_points_per_request: 0,
         request_timeout_secs: 30,
         rate_limiter: None,
     });
@@ -249,7 +251,7 @@ async fn test_cardinality_limit() {
     let sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(shared));
 
     let ingestion_service: Arc<dyn hyperbytedb::ports::ingestion::IngestionPort> = Arc::new(
-        IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 2),
+        IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 2, 0),
     );
     let query_service: Arc<dyn hyperbytedb::adapters::http::router::QueryService> =
         Arc::new(QueryServiceImpl::new(
@@ -285,6 +287,7 @@ async fn test_cardinality_limit() {
         chdb_session_data_path: chdb_dir.to_string_lossy().into_owned(),
         node_id: 1,
         max_body_size_bytes: 25 * 1024 * 1024,
+        max_points_per_request: 0,
         request_timeout_secs: 30,
         rate_limiter: None,
     });
@@ -392,7 +395,7 @@ async fn test_metrics_endpoint() {
     let prometheus_handle = test_prometheus_handle();
 
     let ingestion_service: Arc<dyn hyperbytedb::ports::ingestion::IngestionPort> = Arc::new(
-        IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 10_000),
+        IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 10_000, 0),
     );
     let query_service: Arc<dyn hyperbytedb::adapters::http::router::QueryService> =
         Arc::new(QueryServiceImpl::new(
@@ -428,6 +431,7 @@ async fn test_metrics_endpoint() {
         chdb_session_data_path: chdb_dir.to_string_lossy().into_owned(),
         node_id: 1,
         max_body_size_bytes: 25 * 1024 * 1024,
+        max_points_per_request: 0,
         request_timeout_secs: 30,
         rate_limiter: None,
     });
@@ -723,7 +727,7 @@ async fn test_rate_limiter_refills_and_denies() {
     let prometheus_handle = test_prometheus_handle();
 
     let ingestion_service: Arc<dyn hyperbytedb::ports::ingestion::IngestionPort> = Arc::new(
-        IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 10_000),
+        IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 10_000, 0),
     );
     let query_service: Arc<dyn hyperbytedb::adapters::http::router::QueryService> =
         Arc::new(QueryServiceImpl::new(
@@ -759,6 +763,7 @@ async fn test_rate_limiter_refills_and_denies() {
         chdb_session_data_path: chdb_dir.to_string_lossy().into_owned(),
         node_id: 1,
         max_body_size_bytes: 25 * 1024 * 1024,
+        max_points_per_request: 0,
         request_timeout_secs: 30,
         rate_limiter: Some(Arc::new(EndpointRateLimiters::new(5))),
     });

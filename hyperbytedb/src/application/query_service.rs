@@ -44,6 +44,7 @@ pub struct QueryServiceImpl {
     replication_port: Option<Arc<dyn ReplicationPort>>,
     node_id: u64,
     replication_config: ReplicationConfig,
+    max_points_per_request: usize,
     mv_service: Arc<MaterializedViewService>,
 }
 
@@ -70,8 +71,15 @@ impl QueryServiceImpl {
             replication_port: None,
             node_id: 0,
             replication_config: ReplicationConfig::default(),
+            max_points_per_request: 0,
             mv_service,
         }
+    }
+
+    #[must_use]
+    pub fn with_max_points_per_request(mut self, max_points_per_request: usize) -> Self {
+        self.max_points_per_request = max_points_per_request;
+        self
     }
 
     async fn column_mapping_for(
@@ -2146,6 +2154,10 @@ async fn write_series_as_points(
     }
 
     if !all_points.is_empty() {
+        crate::application::ingest_metadata::validate_point_count(
+            all_points.len(),
+            svc.max_points_per_request,
+        )?;
         // Register metadata
         let mut field_types = std::collections::HashMap::new();
         for p in &all_points {

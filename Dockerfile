@@ -56,6 +56,8 @@ RUN mkdir -p hyperbytedb/benches hyperbytedb/benches/support \
     && echo "fn main(){}" > hyperbytedb/benches/ingestion_line_protocol.rs \
     && echo "fn main(){}" > hyperbytedb/benches/query_fixed_dataset.rs \
     && echo "fn main(){}" > hyperbytedb/benches/flush_service.rs \
+    && echo "fn main(){}" > hyperbytedb/benches/schema_cache.rs \
+    && echo "fn main(){}" > hyperbytedb/benches/ingestion_prepared.rs \
     && echo "" > hyperbytedb/benches/support/mod.rs \
     && echo "fn main(){}" > hyperbytedb-proxy/benches/routing.rs \
     && echo "" > hyperbytedb-proxy/benches/support/mod.rs

@@ -3,13 +3,12 @@
 //! concurrent write load.
 
 use std::sync::Arc;
-use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use metrics::histogram;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 
 use crate::adapters::wal::rocksdb_wal::RocksDbWal;
 use crate::domain::prepared_wal::PreparedWalSlot;
@@ -18,7 +17,7 @@ use crate::ports::wal::{WalAppendBundle, WalEntry, WalFormat, WalPort};
 
 struct BatchRequest {
     bundle: WalAppendBundle,
-    /// Durable WAL value serialized off the writer thread (bincode format).
+    /// Durable WAL value serialized off the writer task (bincode format).
     /// `None` => the writer encodes inline (e.g. ArrowIpc).
     pre_encoded: Option<Vec<u8>>,
     enqueued_at: Instant,
@@ -26,7 +25,8 @@ struct BatchRequest {
 }
 
 pub struct BatchingWal {
-    sender: SyncSender<BatchRequest>,
+    sender: mpsc::Sender<BatchRequest>,
+    enqueue_timeout: Option<Duration>,
     _writer: JoinHandle<()>,
     inner: Arc<RocksDbWal>,
 }
@@ -37,6 +37,7 @@ impl BatchingWal {
         channel_depth: usize,
         max_batch: usize,
         max_delay: Duration,
+        enqueue_timeout_ms: u64,
     ) -> Arc<Self> {
         if !max_delay.is_zero() {
             tracing::debug!(
@@ -44,30 +45,30 @@ impl BatchingWal {
                 "BatchingWal: max_delay is ignored — drain-only coalescing in use"
             );
         }
-        let (sync_tx, sync_rx) = mpsc::sync_channel(channel_depth.max(1));
+        let (tx, rx) = mpsc::channel(channel_depth.max(1));
         let wal = inner.clone();
-        let writer = thread::Builder::new()
-            .name("hyperbytedb-wal-writer".into())
-            .spawn(move || Self::writer_loop(sync_rx, wal, max_batch))
-            .unwrap_or_else(|e| panic!("spawn hyperbytedb-wal-writer thread: {e}"));
+        let writer = tokio::spawn(async move {
+            Self::writer_loop(rx, wal, max_batch).await;
+        });
 
         Arc::new(Self {
-            sender: sync_tx,
+            sender: tx,
+            enqueue_timeout: (enqueue_timeout_ms > 0)
+                .then(|| Duration::from_millis(enqueue_timeout_ms)),
             _writer: writer,
             inner,
         })
     }
 
-    fn writer_loop(rx: mpsc::Receiver<BatchRequest>, wal: Arc<RocksDbWal>, max_batch: usize) {
+    async fn writer_loop(
+        mut rx: mpsc::Receiver<BatchRequest>,
+        wal: Arc<RocksDbWal>,
+        max_batch: usize,
+    ) {
         let mut batch: Vec<BatchRequest> = Vec::with_capacity(max_batch);
 
-        loop {
+        while let Some(first) = rx.recv().await {
             batch.clear();
-
-            let first = match rx.recv() {
-                Ok(r) => r,
-                Err(_) => break,
-            };
 
             let t_first = Instant::now();
             histogram!("hyperbytedb_wal_batcher_queue_wait_seconds")
@@ -77,8 +78,8 @@ impl BatchingWal {
             while batch.len() < max_batch {
                 match rx.try_recv() {
                     Ok(req) => batch.push(req),
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => break,
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => break,
                 }
             }
 
@@ -100,7 +101,12 @@ impl BatchingWal {
                 pre_encoded.push(req.pre_encoded);
                 responses.push((req.enqueued_at, req.tx));
             }
-            let result = wal.append_bundle_batch_sync_encoded(bundles, pre_encoded);
+
+            let wal_for_write = wal.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                wal_for_write.append_bundle_batch_sync_encoded(bundles, pre_encoded)
+            })
+            .await;
 
             let t_write_end = Instant::now();
             let write_elapsed = t_write_end.duration_since(t_coalesce_end);
@@ -108,19 +114,27 @@ impl BatchingWal {
 
             let now = Instant::now();
             match result {
-                Ok(seqs) => {
+                Ok(Ok(seqs)) => {
                     for ((enqueued_at, tx), seq) in responses.into_iter().zip(seqs) {
                         histogram!("hyperbytedb_wal_batcher_response_seconds")
                             .record(now.duration_since(enqueued_at).as_secs_f64());
                         let _ = tx.send(Ok(seq));
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     let msg = e.to_string();
                     for (enqueued_at, tx) in responses {
                         histogram!("hyperbytedb_wal_batcher_response_seconds")
                             .record(now.duration_since(enqueued_at).as_secs_f64());
                         let _ = tx.send(Err(HyperbytedbError::Wal(msg.clone())));
+                    }
+                }
+                Err(e) => {
+                    let msg = format!("WAL batcher write join error: {e}");
+                    for (enqueued_at, tx) in responses {
+                        histogram!("hyperbytedb_wal_batcher_response_seconds")
+                            .record(now.duration_since(enqueued_at).as_secs_f64());
+                        let _ = tx.send(Err(HyperbytedbError::Internal(msg.clone())));
                     }
                 }
             }
@@ -129,11 +143,11 @@ impl BatchingWal {
 
     async fn enqueue(&self, bundle: WalAppendBundle) -> Result<u64, HyperbytedbError> {
         // Serialize the durable WAL value here — on the parallel request task —
-        // rather than on the single group-commit writer thread. For the bincode
-        // format the bytes are independent of the sequence number assigned at
-        // commit time, so this is safe and moves the per-point serialization
-        // cost off the writer (the measured ingest bottleneck). ArrowIpc still
-        // encodes inline because its payload is patched with the assigned seq.
+        // rather than on the group-commit writer task. For the bincode format
+        // the bytes are independent of the sequence number assigned at commit
+        // time, so this is safe and moves the per-point serialization cost off
+        // the writer (the measured ingest bottleneck). ArrowIpc still encodes
+        // inline because its payload is patched with the assigned seq.
         let pre_encoded = if self.inner.wal_format() == WalFormat::Bincode {
             Some(
                 bincode::serialize(&bundle.entry)
@@ -143,25 +157,27 @@ impl BatchingWal {
             None
         };
         let (tx, rx) = oneshot::channel();
-        let mut req = BatchRequest {
+        let req = BatchRequest {
             bundle,
             pre_encoded,
             enqueued_at: Instant::now(),
             tx,
         };
 
-        loop {
-            match self.sender.try_send(req) {
-                Ok(()) => break,
-                Err(TrySendError::Full(pending)) => {
-                    tokio::task::yield_now().await;
-                    req = pending;
-                }
-                Err(TrySendError::Disconnected(_)) => {
-                    return Err(HyperbytedbError::Wal("WAL batcher channel closed".into()));
+        let send_result = if let Some(timeout) = self.enqueue_timeout {
+            match tokio::time::timeout(timeout, self.sender.send(req)).await {
+                Ok(result) => result,
+                Err(_) => {
+                    return Err(HyperbytedbError::WalBackpressure {
+                        timeout_ms: timeout.as_millis() as u64,
+                    });
                 }
             }
-        }
+        } else {
+            self.sender.send(req).await
+        };
+
+        send_result.map_err(|_| HyperbytedbError::Wal("WAL batcher channel closed".into()))?;
 
         rx.await
             .map_err(|_| HyperbytedbError::Wal("WAL batcher dropped response".into()))?
@@ -262,7 +278,7 @@ mod tests {
     async fn batching_wal_round_trip_preserves_points_single() {
         let tmp = TempDir::new().unwrap();
         let raw = Arc::new(RocksDbWal::open(tmp.path()).unwrap());
-        let wal = BatchingWal::new(raw, 256, 64, Duration::from_micros(0));
+        let wal = BatchingWal::new(raw, 256, 64, Duration::from_micros(0), 0);
 
         let seq = wal.append(marker_entry()).await.unwrap();
         let read_back = wal.read_range(seq, 16).await.unwrap();
@@ -273,5 +289,19 @@ mod tests {
         assert_eq!(got_entry.points.len(), 1);
         assert_eq!(got_entry.database, "replica_check");
         assert_eq!(got_entry.origin_node_id, 99);
+    }
+
+    #[tokio::test]
+    async fn timed_out_channel_send_does_not_enqueue() {
+        use tokio::sync::mpsc;
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(()).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), tx.send(()))
+                .await
+                .is_err()
+        );
+        assert_eq!(rx.try_recv().ok(), Some(()));
+        assert!(rx.try_recv().is_err());
     }
 }

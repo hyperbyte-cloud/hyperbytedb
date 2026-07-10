@@ -11,6 +11,7 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 use crate::application::ingest_metadata::{
     IngestCardinalityLimits, IngestSchemaCache, prepare_batch_metadata,
 };
+use crate::application::line_protocol::parse_line_body_to_points_limited;
 use crate::application::wal_append::append_points_with_prepared;
 use crate::error::HyperbytedbError;
 use crate::ports::points_sink::PointsSinkPort;
@@ -51,7 +52,7 @@ impl ReplicationApplyQueue {
         wal: Arc<dyn WalPort>,
         limits: IngestCardinalityLimits,
     ) -> Arc<Self> {
-        Self::with_sink(depth, metadata, wal, None, limits)
+        Self::with_sink(depth, metadata, wal, None, limits, 0)
     }
 
     pub fn with_sink(
@@ -60,8 +61,17 @@ impl ReplicationApplyQueue {
         wal: Arc<dyn WalPort>,
         sink: Option<Arc<dyn PointsSinkPort>>,
         limits: IngestCardinalityLimits,
+        max_points_per_request: usize,
     ) -> Arc<Self> {
-        Self::with_workers_and_sink(depth, DEFAULT_WORKERS, metadata, wal, sink, limits)
+        Self::with_workers_and_sink(
+            depth,
+            DEFAULT_WORKERS,
+            metadata,
+            wal,
+            sink,
+            limits,
+            max_points_per_request,
+        )
     }
 
     pub fn with_workers(
@@ -71,7 +81,7 @@ impl ReplicationApplyQueue {
         wal: Arc<dyn WalPort>,
         limits: IngestCardinalityLimits,
     ) -> Arc<Self> {
-        Self::with_workers_and_sink(depth, num_workers, metadata, wal, None, limits)
+        Self::with_workers_and_sink(depth, num_workers, metadata, wal, None, limits, 0)
     }
 
     pub fn with_workers_and_sink(
@@ -81,6 +91,7 @@ impl ReplicationApplyQueue {
         wal: Arc<dyn WalPort>,
         sink: Option<Arc<dyn PointsSinkPort>>,
         limits: IngestCardinalityLimits,
+        max_points_per_request: usize,
     ) -> Arc<Self> {
         let depth = depth.max(1);
         let num_workers = num_workers.max(1);
@@ -120,6 +131,7 @@ impl ReplicationApplyQueue {
                         &job.body,
                         job.origin_node_id,
                         limits,
+                        max_points_per_request,
                         &sc,
                     )
                     .await;
@@ -181,6 +193,7 @@ async fn apply_batch(
     body: &[u8],
     origin_node_id: u64,
     limits: IngestCardinalityLimits,
+    max_points_per_request: usize,
     schema_cache: &IngestSchemaCache,
 ) -> Result<u64, HyperbytedbError> {
     let metrics_start = std::time::Instant::now();
@@ -190,7 +203,7 @@ async fn apply_batch(
     }
 
     let t0 = std::time::Instant::now();
-    let points = parse_line_body_to_points(body, precision)?;
+    let points = parse_line_body_to_points_limited(body, precision, max_points_per_request)?;
     histogram!("hyperbytedb_replication_apply_parse_seconds").record(t0.elapsed().as_secs_f64());
     if points.is_empty() {
         return wal.last_sequence().await;
@@ -236,6 +249,7 @@ async fn apply_batch(
         retention_policy,
         points,
         origin_node_id,
+        max_points_per_request,
     )
     .await;
     histogram!("hyperbytedb_replication_apply_wal_seconds").record(t2.elapsed().as_secs_f64());

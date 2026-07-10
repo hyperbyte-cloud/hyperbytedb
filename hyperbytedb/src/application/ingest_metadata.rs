@@ -19,6 +19,20 @@ pub struct IngestCardinalityLimits {
     pub max_measurements_per_database: usize,
 }
 
+/// Reject ingest batches that exceed the configured per-request point cap.
+/// `max_points == 0` uses the same default as [`crate::config::default_max_points_per_request`].
+pub fn validate_point_count(count: usize, max_points: usize) -> Result<(), HyperbytedbError> {
+    let limit = if max_points == 0 {
+        crate::config::default_max_points_per_request()
+    } else {
+        max_points
+    };
+    if count > limit {
+        return Err(HyperbytedbError::RequestPointLimitExceeded { count, limit });
+    }
+    Ok(())
+}
+
 /// Maximum number of cached tag-value hashes. Beyond this the set is
 /// evicted to prevent unbounded memory growth under high cardinality.
 /// Cache misses are harmless (fall back to a RocksDB lookup).
