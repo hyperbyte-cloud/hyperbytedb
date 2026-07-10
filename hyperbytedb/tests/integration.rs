@@ -833,3 +833,128 @@ async fn test_rate_limiter_refills_and_denies() {
         "rate limit denials should be recorded in metrics (denied={denied}): {metrics_body}"
     );
 }
+
+#[tokio::test]
+#[serial(chdb)]
+async fn test_cross_database_on_clause_requires_authorization() {
+    use hyperbytedb::domain::user::DatabasePrivilege;
+
+    let dir = tempfile::tempdir().unwrap();
+    let wal_dir = dir.path().join("wal_xdb");
+    let meta_dir = dir.path().join("meta_xdb");
+    let chdb_dir = dir.path().join("chdb_xdb");
+    std::fs::create_dir_all(&wal_dir).unwrap();
+    std::fs::create_dir_all(&meta_dir).unwrap();
+    std::fs::create_dir_all(&chdb_dir).unwrap();
+
+    let wal = Arc::new(RocksDbWal::open(&wal_dir).unwrap());
+    let metadata = Arc::new(RocksDbMetadata::open(&meta_dir).unwrap());
+    let shared = SharedSession::new_eager(chdb_dir.to_str().unwrap(), 1).unwrap();
+    let chdb = Arc::new(ChdbQueryAdapter::from_shared(shared.clone(), 0));
+    let sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(shared));
+
+    let admin_hash =
+        hyperbytedb::adapters::http::auth_middleware::hash_password("adminpw").unwrap();
+    metadata
+        .create_user("admin", &admin_hash, true)
+        .await
+        .unwrap();
+    let writer_hash =
+        hyperbytedb::adapters::http::auth_middleware::hash_password("writerpw").unwrap();
+    metadata
+        .create_user("writer", &writer_hash, false)
+        .await
+        .unwrap();
+    metadata
+        .grant_privilege("writer", "mine", DatabasePrivilege::Write)
+        .await
+        .unwrap();
+
+    metadata.create_database("mine").await.unwrap();
+    metadata.create_database("victim").await.unwrap();
+
+    let ingestion_service: Arc<dyn hyperbytedb::ports::ingestion::IngestionPort> = Arc::new(
+        IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 10_000),
+    );
+    let query_service: Arc<dyn hyperbytedb::adapters::http::router::QueryService> =
+        Arc::new(QueryServiceImpl::new(
+            chdb.clone(),
+            metadata.clone(),
+            wal.clone(),
+            30,
+            sink.clone(),
+        ));
+
+    let _flush = FlushServiceImpl::new(wal.clone(), 0, sink.clone());
+
+    let app_state = Arc::new(AppState {
+        ingestion: ingestion_service,
+        query: query_service,
+        query_port: chdb.clone(),
+        metadata: metadata.clone(),
+        wal: wal.clone(),
+        points_sink: sink.clone(),
+        mv_service: test_mv_service(&(metadata.clone() as Arc<dyn MetadataPort>), &chdb, &sink),
+        auth: Arc::new(hyperbytedb::adapters::auth::MetadataAuthAdapter::new(
+            metadata.clone(),
+        )),
+        peer_client: None,
+        membership: None,
+        replication_log: None,
+        drain_service: None,
+        raft: None,
+        auth_enabled: true,
+        prometheus_handle: None,
+        statement_summary: None,
+        replication_apply: None,
+        chdb_session_data_path: chdb_dir.to_string_lossy().into_owned(),
+        node_id: 1,
+        max_body_size_bytes: 25 * 1024 * 1024,
+        request_timeout_secs: 30,
+        rate_limiter: None,
+    });
+
+    let (url, _handle) = start_server(app_state).await;
+    let client = reqwest::Client::new();
+
+    let denied = client
+        .get(format!("{url}/query"))
+        .query(&[
+            ("db", "mine"),
+            (
+                "q",
+                "ALTER RETENTION POLICY autogen ON victim DURATION 1h REPLICATION 1",
+            ),
+            ("u", "writer"),
+            ("p", "writerpw"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        denied.status(),
+        StatusCode::FORBIDDEN,
+        "cross-database ON clause must be forbidden"
+    );
+
+    let allowed = client
+        .get(format!("{url}/query"))
+        .query(&[
+            ("db", "mine"),
+            (
+                "q",
+                "ALTER RETENTION POLICY autogen ON mine DURATION 168h REPLICATION 1",
+            ),
+            ("u", "writer"),
+            ("p", "writerpw"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        allowed.status(),
+        StatusCode::OK,
+        "same-database ON clause should still succeed: {}",
+        allowed.text().await.unwrap_or_default()
+    );
+}
