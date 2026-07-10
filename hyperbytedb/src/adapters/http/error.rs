@@ -33,6 +33,7 @@ fn error_to_status_and_message(err: &HyperbytedbError) -> (StatusCode, String) {
         HyperbytedbError::CardinalityExceeded { .. } => StatusCode::UNPROCESSABLE_ENTITY,
         HyperbytedbError::RequestPointLimitExceeded { .. }
         | HyperbytedbError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+        HyperbytedbError::InsufficientStorage(_) => StatusCode::INSUFFICIENT_STORAGE,
         HyperbytedbError::WalBackpressure { .. } => StatusCode::SERVICE_UNAVAILABLE,
         HyperbytedbError::QueryTimeout => StatusCode::REQUEST_TIMEOUT,
         HyperbytedbError::ClusterUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,

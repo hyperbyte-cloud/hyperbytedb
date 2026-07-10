@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use axum::{
     Router,
@@ -59,6 +60,10 @@ pub struct AppState {
     pub max_points_per_request: usize,
     pub request_timeout_secs: u64,
     pub rate_limiter: Option<Arc<rate_limit::EndpointRateLimiters>>,
+    /// Set when WAL group-commit is enabled; `false` after the writer task exits.
+    pub wal_batcher_alive: Option<Arc<AtomicBool>>,
+    /// Set when `[disk] enabled`; `true` when free space is below readonly threshold.
+    pub disk_read_only: Option<Arc<AtomicBool>>,
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {

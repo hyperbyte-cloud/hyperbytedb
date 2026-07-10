@@ -39,6 +39,7 @@ tempfile = "3"
 # WAL + metadata
 rocksdb = { version = "0.24", features = ["multi-threaded-cf"] }
 bincode = "1"
+libc = "0.2"
 
 # Global allocator. The default glibc malloc holds freed heap in its arenas
 # and almost never returns it to the OS, so the large *transient* startup

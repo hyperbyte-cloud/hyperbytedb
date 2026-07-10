@@ -3,6 +3,7 @@ pub mod backup;
 pub mod cluster;
 pub mod columnar_msgpack;
 pub mod continuous_query_service;
+pub mod disk_monitor;
 pub mod flush_service;
 pub mod ingest_metadata;
 pub mod ingestion_service;

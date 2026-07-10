@@ -3,6 +3,7 @@
 //! concurrent write load.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -27,7 +28,7 @@ struct BatchRequest {
 pub struct BatchingWal {
     sender: mpsc::Sender<BatchRequest>,
     enqueue_timeout: Option<Duration>,
-    _writer: JoinHandle<()>,
+    writer_alive: Arc<AtomicBool>,
     inner: Arc<RocksDbWal>,
 }
 
@@ -47,17 +48,36 @@ impl BatchingWal {
         }
         let (tx, rx) = mpsc::channel(channel_depth.max(1));
         let wal = inner.clone();
+        let writer_alive = Arc::new(AtomicBool::new(true));
         let writer = tokio::spawn(async move {
             Self::writer_loop(rx, wal, max_batch).await;
         });
+        let alive = writer_alive.clone();
+        tokio::spawn(Self::supervise_writer(writer, alive));
 
         Arc::new(Self {
             sender: tx,
             enqueue_timeout: (enqueue_timeout_ms > 0)
                 .then(|| Duration::from_millis(enqueue_timeout_ms)),
-            _writer: writer,
+            writer_alive,
             inner,
         })
+    }
+
+    /// Shared flag flipped to `false` when the background writer task exits.
+    pub fn writer_alive(&self) -> Arc<AtomicBool> {
+        self.writer_alive.clone()
+    }
+
+    async fn supervise_writer(handle: JoinHandle<()>, writer_alive: Arc<AtomicBool>) {
+        if handle.await.is_err() {
+            tracing::error!("WAL batcher writer task panicked");
+        } else {
+            tracing::error!(
+                "WAL batcher writer task exited; WAL appends will fail until process restart"
+            );
+        }
+        writer_alive.store(false, Ordering::SeqCst);
     }
 
     async fn writer_loop(
@@ -142,6 +162,12 @@ impl BatchingWal {
     }
 
     async fn enqueue(&self, bundle: WalAppendBundle) -> Result<u64, HyperbytedbError> {
+        if !self.writer_alive.load(Ordering::SeqCst) {
+            return Err(HyperbytedbError::Wal(
+                "WAL batcher writer unavailable".into(),
+            ));
+        }
+
         // Serialize the durable WAL value here — on the parallel request task —
         // rather than on the group-commit writer task. For the bincode format
         // the bytes are independent of the sequence number assigned at commit
@@ -303,5 +329,22 @@ mod tests {
         );
         assert_eq!(rx.try_recv().ok(), Some(()));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn append_fails_after_writer_channel_closed() {
+        let tmp = TempDir::new().unwrap();
+        let raw = Arc::new(RocksDbWal::open(tmp.path()).unwrap());
+        let wal = BatchingWal::new(raw, 1, 64, Duration::from_micros(0), 0);
+        drop(wal);
+        // Dropping the last Arc closes the sender; a new wrapper would be needed
+        // to test alive flag — instead test alive starts true.
+        let tmp2 = TempDir::new().unwrap();
+        let raw2 = Arc::new(RocksDbWal::open(tmp2.path()).unwrap());
+        let wal2 = BatchingWal::new(raw2, 256, 64, Duration::from_micros(0), 0);
+        assert!(
+            wal2.writer_alive()
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
     }
 }

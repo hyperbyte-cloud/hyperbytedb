@@ -103,6 +103,12 @@ format = "text"
 enabled = true
 max_entries = 1000
 
+[disk]
+enabled = true
+check_interval_secs = 60
+warn_threshold_mb = 1024
+readonly_threshold_mb = 256
+
 # Hinted handoff stores writes for unreachable peers and replays on recovery.
 [hinted_handoff]
 enabled = true

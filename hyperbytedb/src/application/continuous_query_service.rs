@@ -57,7 +57,7 @@ impl ContinuousQueryService {
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    if let Err(e) = self.run_pending_queries().await {
+                    if let Err(e) = self.run_pending_queries(chrono::Utc::now()).await {
                         tracing::error!("continuous query execution error: {}", e);
                     }
                 }
@@ -71,7 +71,18 @@ impl ContinuousQueryService {
         }
     }
 
-    async fn run_pending_queries(&self) -> Result<(), HyperbytedbError> {
+    /// Run one scheduler iteration at `now` (exposed for tests).
+    pub async fn tick_once_at(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), HyperbytedbError> {
+        self.run_pending_queries(now).await
+    }
+
+    async fn run_pending_queries(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), HyperbytedbError> {
         if !self.is_raft_leader() {
             tracing::debug!(
                 node_id = self.node_id,
@@ -84,8 +95,6 @@ impl ContinuousQueryService {
         if cqs.is_empty() {
             return Ok(());
         }
-
-        let now = chrono::Utc::now();
 
         for mut cq in cqs {
             if let Err(e) = cq.normalize() {

@@ -157,6 +157,8 @@ async fn start_auth_cluster_node(dir: &std::path::Path) -> AuthClusterNode {
         max_points_per_request: 0,
         request_timeout_secs: 30,
         rate_limiter: None,
+        wal_batcher_alive: None,
+        disk_read_only: None,
     });
 
     let app = build_router(app_state);
@@ -346,4 +348,87 @@ async fn metadata_create_db(url: &str, client: &reqwest::Client) {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn grant_revoke_controls_query_access() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = start_auth_cluster_node(dir.path()).await;
+    let client = reqwest::Client::new();
+
+    metadata_create_db(&node.url, &client).await;
+
+    let create_other = client
+        .get(format!("{}/query", node.url))
+        .query(&[
+            ("q", r#"CREATE DATABASE "otherdb""#),
+            ("u", "admin"),
+            ("p", "adminpw"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_other.status(), StatusCode::OK);
+
+    let seed = client
+        .post(format!("{}/write", node.url))
+        .query(&[("db", "mydb"), ("u", "admin"), ("p", "adminpw")])
+        .body("cpu,host=a value=1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(seed.status(), StatusCode::NO_CONTENT);
+
+    let denied_mydb = client
+        .get(format!("{}/query", node.url))
+        .query(&[
+            ("db", "mydb"),
+            ("q", r#"SELECT * FROM "cpu""#),
+            ("u", "writer"),
+            ("p", "writerpw"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied_mydb.status(), StatusCode::FORBIDDEN);
+
+    let grant = client
+        .get(format!("{}/query", node.url))
+        .query(&[
+            ("db", "mydb"),
+            ("q", r#"GRANT ALL ON "mydb" TO "writer""#),
+            ("u", "admin"),
+            ("p", "adminpw"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(grant.status(), StatusCode::OK);
+
+    let allowed_mydb = client
+        .get(format!("{}/query", node.url))
+        .query(&[
+            ("db", "mydb"),
+            ("q", r#"SELECT * FROM "cpu""#),
+            ("u", "writer"),
+            ("p", "writerpw"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(allowed_mydb.status(), StatusCode::OK);
+
+    let denied_otherdb = client
+        .get(format!("{}/query", node.url))
+        .query(&[
+            ("db", "otherdb"),
+            ("q", r#"SHOW MEASUREMENTS"#),
+            ("u", "writer"),
+            ("p", "writerpw"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied_otherdb.status(), StatusCode::FORBIDDEN);
 }

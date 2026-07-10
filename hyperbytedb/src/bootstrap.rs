@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use crate::adapters::auth::MetadataAuthAdapter;
 use crate::adapters::chdb::catalog;
 use crate::adapters::chdb::native_adapter::ChdbNativeAdapter;
@@ -12,6 +10,7 @@ use crate::adapters::wal::batching_wal::BatchingWal;
 use crate::adapters::wal::rocksdb_wal::{RocksDbWal, RocksDbWalOptions};
 use crate::application::cluster::bootstrap::ClusterBootstrap;
 use crate::application::cluster::drain::DrainService;
+use crate::application::disk_monitor::{self, DiskMonitorPaths};
 use crate::application::flush_service::FlushServiceImpl;
 use crate::application::ingest_metadata::IngestCardinalityLimits;
 use crate::application::ingestion_service::IngestionServiceImpl;
@@ -23,6 +22,8 @@ use crate::ports::metadata::MetadataPort;
 use crate::ports::points_sink::PointsSinkPort;
 use crate::ports::query::QueryService;
 use crate::ports::wal::WalFormat;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 /// All constructed services returned by [`build_services`].
 pub struct BootstrappedApp {
@@ -31,6 +32,9 @@ pub struct BootstrappedApp {
     pub cluster: Option<ClusterBootstrap>,
     pub peer_query_service: Option<Arc<crate::application::peer_query_service::PeerQueryService>>,
     pub prometheus_handle: metrics_exporter_prometheus::PrometheusHandle,
+    pub disk_paths: DiskMonitorPaths,
+    pub disk_config: crate::config::DiskConfig,
+    pub disk_read_only: Option<Arc<AtomicBool>>,
 }
 
 /// Construct all adapters and application services from config.
@@ -94,22 +98,40 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
             arrow_wal_enabled: config.flush.arrow_wal_enabled,
         },
     )?);
-    let wal: Arc<dyn crate::ports::wal::WalPort> = if config.flush.wal_batch_size > 0 {
+    let wal: Arc<dyn crate::ports::wal::WalPort>;
+    let wal_batcher_alive: Option<Arc<std::sync::atomic::AtomicBool>>;
+    if config.flush.wal_batch_size > 0 {
         tracing::info!(
             batch_size = config.flush.wal_batch_size,
             batch_delay_us = config.flush.wal_batch_delay_us,
             "WAL group-commit enabled"
         );
-        BatchingWal::new(
+        let batching = BatchingWal::new(
             raw_wal,
             config.flush.wal_batch_size * 4,
             config.flush.wal_batch_size,
             std::time::Duration::from_micros(config.flush.wal_batch_delay_us),
             config.flush.wal_enqueue_timeout_ms,
-        )
+        );
+        wal_batcher_alive = Some(batching.writer_alive());
+        wal = batching;
     } else {
-        raw_wal
+        wal_batcher_alive = None;
+        wal = raw_wal;
     };
+
+    let disk_paths = DiskMonitorPaths {
+        wal: config.storage.wal_dir.clone(),
+        meta: config.storage.meta_dir.clone(),
+        chdb: config.chdb.session_data_path.clone(),
+    };
+    if config.disk.enabled {
+        disk_monitor::startup_disk_warning(&disk_paths, config.disk.warn_threshold_mb);
+    }
+    let disk_read_only = config
+        .disk
+        .enabled
+        .then(|| Arc::new(AtomicBool::new(false)));
     let metadata = Arc::new(RocksDbMetadata::open(&config.storage.meta_dir)?);
     match metadata.warm_tag_value_counts().await {
         Ok(tag_counters) => {
@@ -394,6 +416,8 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         } else {
             None
         },
+        wal_batcher_alive,
+        disk_read_only: disk_read_only.clone(),
     };
 
     Ok(BootstrappedApp {
@@ -402,5 +426,8 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         cluster,
         peer_query_service: peer_query_service_ref,
         prometheus_handle,
+        disk_paths,
+        disk_config: config.disk.clone(),
+        disk_read_only,
     })
 }
