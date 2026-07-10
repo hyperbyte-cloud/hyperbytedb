@@ -56,23 +56,21 @@ fn normalize_statement(stmt: &Statement) -> String {
         Statement::ShowDatabases => out.push_str("show databases"),
         Statement::ShowMeasurements(s) => {
             out.push_str("show measurements");
-            if let Some(ref db) = s.database {
-                write!(out, " on {}", db.to_lowercase()).ok();
-            }
-            if let Some(ref cond) = s.condition {
-                out.push_str(" where ");
-                normalize_expr(&mut out, cond, true);
-            }
+            normalize_on_db(&mut out, &s.database);
+            normalize_show_tail(&mut out, &s.condition, &s.limit, &s.offset);
         }
         Statement::ShowTagKeys(s) => {
             out.push_str("show tag keys");
+            normalize_on_db(&mut out, &s.database);
             if let Some(ref m) = s.from {
                 out.push_str(" from ");
                 normalize_measurement(&mut out, m);
             }
+            normalize_show_tail(&mut out, &s.condition, &s.limit, &s.offset);
         }
         Statement::ShowTagValues(s) => {
             out.push_str("show tag values");
+            normalize_on_db(&mut out, &s.database);
             if let Some(ref m) = s.from {
                 out.push_str(" from ");
                 normalize_measurement(&mut out, m);
@@ -80,22 +78,23 @@ fn normalize_statement(stmt: &Statement) -> String {
             match &s.tag_key {
                 TagKeySelector::All => out.push_str(" with key = *"),
                 TagKeySelector::Eq(k) => {
-                    write!(out, " with key = {}", k.to_lowercase()).ok();
+                    write!(out, " with key = {}", k).ok();
                 }
                 TagKeySelector::Neq(k) => {
-                    write!(out, " with key != {}", k.to_lowercase()).ok();
+                    write!(out, " with key != {}", k).ok();
                 }
                 TagKeySelector::Regex(r) => {
                     write!(out, " with key =~ /{}/", r).ok();
                 }
                 TagKeySelector::In(keys) => {
-                    let lower: Vec<String> = keys.iter().map(|k| k.to_lowercase()).collect();
-                    write!(out, " with key in ({})", lower.join(", ")).ok();
+                    write!(out, " with key in ({})", keys.join(", ")).ok();
                 }
             }
+            normalize_show_tail(&mut out, &s.condition, &s.limit, &s.offset);
         }
         Statement::ShowFieldKeys(s) => {
             out.push_str("show field keys");
+            normalize_on_db(&mut out, &s.database);
             if let Some(ref m) = s.from {
                 out.push_str(" from ");
                 normalize_measurement(&mut out, m);
@@ -103,13 +102,15 @@ fn normalize_statement(stmt: &Statement) -> String {
         }
         Statement::ShowSeries(s) => {
             out.push_str("show series");
+            normalize_on_db(&mut out, &s.database);
             if let Some(ref m) = s.from {
                 out.push_str(" from ");
                 normalize_measurement(&mut out, m);
             }
+            normalize_show_tail(&mut out, &s.condition, &s.limit, &s.offset);
         }
         Statement::ShowRetentionPolicies(db) => {
-            write!(out, "show retention policies on {}", db.to_lowercase()).ok();
+            write!(out, "show retention policies on {}", db).ok();
         }
         Statement::ShowUsers => out.push_str("show users"),
         Statement::ShowContinuousQueries => out.push_str("show continuous queries"),
@@ -145,7 +146,7 @@ fn normalize_statement(stmt: &Statement) -> String {
             }
         }
         Statement::Delete(del) => {
-            write!(out, "delete from {}", del.from.to_lowercase()).ok();
+            write!(out, "delete from {}", del.from).ok();
             if let Some(ref cond) = del.condition {
                 out.push_str(" where ");
                 normalize_expr(&mut out, cond, true);
@@ -155,40 +156,50 @@ fn normalize_statement(stmt: &Statement) -> String {
             write!(
                 out,
                 "create continuous query {} on {}",
-                cq.name.to_lowercase(),
-                cq.database.to_lowercase()
+                cq.name, cq.database
             )
             .ok();
         }
         Statement::DropContinuousQuery { name, db } => {
-            write!(
-                out,
-                "drop continuous query {} on {}",
-                name.to_lowercase(),
-                db.to_lowercase()
-            )
-            .ok();
+            write!(out, "drop continuous query {} on {}", name, db).ok();
         }
         Statement::CreateMaterializedView(mv) => {
             write!(
                 out,
                 "create materialized view {} on {}",
-                mv.name.to_lowercase(),
-                mv.database.to_lowercase()
+                mv.name, mv.database
             )
             .ok();
         }
         Statement::DropMaterializedView { name, db } => {
-            write!(
-                out,
-                "drop materialized view {} on {}",
-                name.to_lowercase(),
-                db.to_lowercase()
-            )
-            .ok();
+            write!(out, "drop materialized view {} on {}", name, db).ok();
         }
     }
     out
+}
+
+fn normalize_on_db(out: &mut String, database: &Option<String>) {
+    if let Some(db) = database {
+        write!(out, " on {}", db).ok();
+    }
+}
+
+fn normalize_show_tail(
+    out: &mut String,
+    condition: &Option<Expr>,
+    limit: &Option<u64>,
+    offset: &Option<u64>,
+) {
+    if let Some(cond) = condition {
+        out.push_str(" where ");
+        normalize_expr(out, cond, true);
+    }
+    if let Some(l) = limit {
+        write!(out, " limit {l}").ok();
+    }
+    if let Some(o) = offset {
+        write!(out, " offset {o}").ok();
+    }
 }
 
 fn normalize_select(out: &mut String, sel: &SelectStatement) {
@@ -200,7 +211,7 @@ fn normalize_select(out: &mut String, sel: &SelectStatement) {
         }
         normalize_expr(out, &field.expr, false);
         if let Some(ref alias) = field.alias {
-            write!(out, " as {}", alias.to_lowercase()).ok();
+            write!(out, " as {}", alias).ok();
         }
     }
 
@@ -245,7 +256,7 @@ fn normalize_select(out: &mut String, sel: &SelectStatement) {
                     }
                 }
                 Dimension::Tag(name) => {
-                    write!(out, "{}", name.to_lowercase()).ok();
+                    write!(out, "{}", name).ok();
                 }
                 Dimension::AllTags => {
                     out.push('*');
@@ -287,14 +298,19 @@ fn normalize_select(out: &mut String, sel: &SelectStatement) {
     if let Some(soffset) = sel.soffset {
         write!(out, " soffset {}", soffset).ok();
     }
+    if let Some(ref tz) = sel.timezone {
+        write!(out, " tz({})", tz).ok();
+    }
 }
 
 /// Normalize an expression. When `in_condition` is true, literal values
 /// are replaced with `?` placeholders to produce a canonical form.
 fn normalize_expr(out: &mut String, expr: &Expr, in_condition: bool) {
     match expr {
+        // Identifiers keep their case: InfluxQL identifiers are case-sensitive,
+        // so `CPU` and `cpu` are different series and must digest differently.
         Expr::Identifier(name) => {
-            write!(out, "{}", name.to_lowercase()).ok();
+            write!(out, "{}", name).ok();
         }
         Expr::Star | Expr::Wildcard => out.push('*'),
         Expr::StringLiteral(_) => {
@@ -335,7 +351,7 @@ fn normalize_expr(out: &mut String, expr: &Expr, in_condition: bool) {
         }
         Expr::Now => out.push_str("now()"),
         Expr::FieldRef { name, .. } => {
-            write!(out, "{}", name.to_lowercase()).ok();
+            write!(out, "{}", name).ok();
         }
         Expr::Call(call) => {
             write!(out, "{}(", call.name.to_lowercase()).ok();
@@ -350,6 +366,8 @@ fn normalize_expr(out: &mut String, expr: &Expr, in_condition: bool) {
         Expr::BinaryExpr(bin) => {
             let child_in_cond = in_condition || matches!(bin.op, BinaryOp::And | BinaryOp::Or);
 
+            // Parenthesize so `(a + b) * c` and `a + b * c` digest differently.
+            out.push('(');
             normalize_expr(out, &bin.left, child_in_cond);
             let op_str = match bin.op {
                 BinaryOp::Add => " + ",
@@ -370,6 +388,7 @@ fn normalize_expr(out: &mut String, expr: &Expr, in_condition: bool) {
             };
             out.push_str(op_str);
             normalize_expr(out, &bin.right, child_in_cond);
+            out.push(')');
         }
         Expr::UnaryExpr(op, inner) => {
             match op {
@@ -383,14 +402,14 @@ fn normalize_expr(out: &mut String, expr: &Expr, in_condition: bool) {
 
 fn normalize_measurement(out: &mut String, m: &Measurement) {
     if let Some(ref db) = m.database {
-        write!(out, "{}.", db.to_lowercase()).ok();
+        write!(out, "{}.", db).ok();
     }
     if let Some(ref rp) = m.retention_policy {
-        write!(out, "{}.", rp.to_lowercase()).ok();
+        write!(out, "{}.", rp).ok();
     }
     match &m.name {
         MeasurementName::Name(name) => {
-            write!(out, "{}", name.to_lowercase()).ok();
+            write!(out, "{}", name).ok();
         }
         MeasurementName::Regex(r) => {
             write!(out, "/{}/", r).ok();
@@ -513,6 +532,9 @@ mod tests {
         let (d2, n2) = fingerprint(&stmt2);
         assert_eq!(d1, d2, "same structure should produce same digest");
         assert_eq!(n1, n2);
-        assert_eq!(n1, "select mean(usage) from cpu where host = ?");
+        // WHERE binary expressions are now parenthesized so that structurally
+        // distinct predicates (e.g. `(a + b) * c` vs `a + b * c`) no longer
+        // collide on the same digest.
+        assert_eq!(n1, "select mean(usage) from cpu where (host = ?)");
     }
 }

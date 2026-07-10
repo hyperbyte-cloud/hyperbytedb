@@ -79,11 +79,27 @@ pub fn split_statements(input: &str) -> Result<Vec<String>, HyperbytedbError> {
     let bytes = input.as_bytes();
     let mut in_single = false;
     let mut in_double = false;
+    let mut in_regex = false;
     let mut begin_depth = 0i32;
+    // Last significant (non-whitespace) char outside string/regex literals,
+    // used to decide whether a `/` is in operand position (regex start).
+    let mut prev_sig: Option<char> = None;
 
     while i < bytes.len() {
         let c = bytes[i] as char;
 
+        if in_regex {
+            if c == '\\' {
+                i += 2;
+                continue;
+            }
+            if c == '/' {
+                in_regex = false;
+                prev_sig = Some('/');
+            }
+            i += 1;
+            continue;
+        }
         if in_single {
             if c == '\'' {
                 if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
@@ -91,6 +107,7 @@ pub fn split_statements(input: &str) -> Result<Vec<String>, HyperbytedbError> {
                     continue;
                 }
                 in_single = false;
+                prev_sig = Some('\'');
             }
             i += 1;
             continue;
@@ -102,14 +119,22 @@ pub fn split_statements(input: &str) -> Result<Vec<String>, HyperbytedbError> {
                     continue;
                 }
                 in_double = false;
+                prev_sig = Some('"');
             }
             i += 1;
             continue;
         }
 
+        let at_word_boundary = i == 0 || !is_ident_continue(bytes[i - 1] as char);
+
         match c {
             '\'' => in_single = true,
             '"' => in_double = true,
+            // `/` in operand position (after `=~`, `!~`, `(`, `,` or `=`)
+            // starts a regex literal; a `;` inside it must not split.
+            '/' if matches!(prev_sig, Some('~') | Some('(') | Some(',') | Some('=')) => {
+                in_regex = true;
+            }
             ';' if begin_depth == 0 => {
                 let slice = input[start..i].trim();
                 if !slice.is_empty() {
@@ -117,11 +142,20 @@ pub fn split_statements(input: &str) -> Result<Vec<String>, HyperbytedbError> {
                 }
                 start = i + 1;
             }
-            _ if is_ident_start(c) && matches_keyword_at(input, i, "BEGIN") => begin_depth += 1,
-            _ if is_ident_start(c) && begin_depth > 0 && matches_keyword_at(input, i, "END") => {
+            _ if is_ident_start(c) && at_word_boundary && matches_keyword_at(input, i, "BEGIN") => {
+                begin_depth += 1
+            }
+            _ if is_ident_start(c)
+                && at_word_boundary
+                && begin_depth > 0
+                && matches_keyword_at(input, i, "END") =>
+            {
                 begin_depth -= 1;
             }
             _ => {}
+        }
+        if !c.is_whitespace() {
+            prev_sig = Some(c);
         }
         i += 1;
     }
@@ -134,11 +168,14 @@ pub fn split_statements(input: &str) -> Result<Vec<String>, HyperbytedbError> {
 }
 
 fn matches_keyword_at(input: &str, start: usize, kw: &str) -> bool {
-    let rest = &input[start..];
-    if rest.len() < kw.len() || !rest[..kw.len()].eq_ignore_ascii_case(kw) {
+    // Byte-wise compare: slicing `rest[..kw.len()]` panics when a multibyte
+    // char straddles the boundary (e.g. an identifier containing `ﬁ`).
+    let rest = input.as_bytes().get(start..);
+    let Some(rest) = rest else { return false };
+    if rest.len() < kw.len() || !rest[..kw.len()].eq_ignore_ascii_case(kw.as_bytes()) {
         return false;
     }
-    !matches!(rest.as_bytes().get(kw.len()), Some(b) if is_ident_continue(*b as char))
+    !matches!(rest.get(kw.len()), Some(b) if is_ident_continue(*b as char))
 }
 
 /// Sum compound duration text (e.g. `1h30m`, `0`, `INF`) to nanoseconds.
@@ -320,10 +357,16 @@ impl<'a> TokenCursor<'a> {
                 kind: TokenKind::Ident(s),
                 ..
             }) => Ok(s),
-            Some(Token {
-                kind: TokenKind::Keyword(k),
-                ..
-            }) => Ok(k),
+            // An unquoted identifier that happens to be a keyword (e.g. a
+            // database named `offset`) must keep its source spelling — the
+            // token kind carries the canonicalized UPPERCASE form, which would
+            // otherwise leak into stored names.
+            Some(
+                tok @ Token {
+                    kind: TokenKind::Keyword(_),
+                    ..
+                },
+            ) => Ok(self.input[tok.start..tok.end].to_string()),
             Some(Token {
                 kind: TokenKind::StringLit(_),
                 ..
@@ -953,5 +996,32 @@ mod tests {
             .filter(|t| matches!(&t.kind, TokenKind::Keyword(k) if k == "LIMIT"))
             .count();
         assert_eq!(limits, 1);
+    }
+
+    #[test]
+    fn split_statements_ignores_semicolon_in_regex() {
+        let stmts = split_statements(r#"SELECT * FROM cpu WHERE host =~ /a;b/"#).unwrap();
+        assert_eq!(stmts.len(), 1, "`;` inside a regex literal must not split");
+    }
+
+    #[test]
+    fn split_statements_begin_needs_word_boundary() {
+        let stmts = split_statements("SELECT * FROM tx_begin; SELECT * FROM cpu").unwrap();
+        assert_eq!(
+            stmts.len(),
+            2,
+            "`begin` suffix of an identifier must not open a block: {stmts:?}"
+        );
+        assert_eq!(stmts[0], "SELECT * FROM tx_begin");
+    }
+
+    #[test]
+    fn split_statements_still_respects_begin_end_blocks() {
+        let stmts = split_statements(
+            "CREATE CONTINUOUS QUERY cq ON db BEGIN SELECT mean(v) INTO m2 FROM m1 GROUP BY time(30m) END; SHOW DATABASES",
+        )
+        .unwrap();
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts[0].ends_with("END"));
     }
 }

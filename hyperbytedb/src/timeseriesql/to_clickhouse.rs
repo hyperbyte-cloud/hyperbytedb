@@ -53,15 +53,17 @@ fn collect_time_bounds(expr: &Expr, min_time: &mut Option<i64>, max_time: &mut O
             }
         };
 
+        // ANDed bounds intersect: keep the tightest lower bound (max) and the
+        // tightest upper bound (min).
         match effective_op {
             BinaryOp::Gte | BinaryOp::Gt | BinaryOp::Eq => {
-                *min_time = Some(min_time.map_or(nanos, |cur| cur.min(nanos)));
+                *min_time = Some(min_time.map_or(nanos, |cur| cur.max(nanos)));
             }
             _ => {}
         }
         match effective_op {
             BinaryOp::Lte | BinaryOp::Lt | BinaryOp::Eq => {
-                *max_time = Some(max_time.map_or(nanos, |cur| cur.max(nanos)));
+                *max_time = Some(max_time.map_or(nanos, |cur| cur.min(nanos)));
             }
             _ => {}
         }
@@ -128,21 +130,30 @@ fn translate_inner(
 ) -> Result<String, HyperbytedbError> {
     let mut out = String::new();
 
+    // InfluxQL treats a GROUP BY time() query without an explicit fill() as
+    // fill(null): every bucket in the queried range is emitted, with NULL
+    // aggregates for empty buckets. Writes (`SELECT ... INTO` / CQ runs) keep
+    // the absent-fill case as "no fill" so synthetic NULL rows are never
+    // inserted into the destination.
+    let effective_fill = match (&stmt.fill, &stmt.into) {
+        (Some(f), _) => f.clone(),
+        (None, Some(_)) => FillOption::None,
+        (None, None) => FillOption::Null,
+    };
+
     // Only `fill(<number>)` coerces NULL aggregates to a numeric default in SQL.
     // `fill(null)` must leave NULL so JSON shows null, not 0.
-    let use_ifnull_fill = matches!(stmt.fill, Some(FillOption::Value(_)));
-    let needs_with_fill = matches!(
-        stmt.fill,
-        Some(FillOption::Null)
-            | Some(FillOption::Value(_))
-            | Some(FillOption::Previous)
-            | Some(FillOption::Linear)
-    );
-    let fill_value = match &stmt.fill {
-        Some(FillOption::Value(v)) => *v,
-        Some(FillOption::Null) => 0.0,
+    let use_ifnull_fill = matches!(effective_fill, FillOption::Value(_));
+    let needs_with_fill = !matches!(effective_fill, FillOption::None);
+    let fill_value = match &effective_fill {
+        FillOption::Value(v) => *v,
         _ => 0.0,
     };
+
+    // tz() flows into every bucketing expression (SELECT / GROUP BY / ORDER BY
+    // and the WITH FILL grid anchors) so buckets align on local-time boundaries,
+    // including 23/25-hour DST days.
+    let tz = stmt.timezone.as_deref();
 
     // Collect field alias names for the INTERPOLATE clause. These must match the
     // output column names emitted by `translate_field` exactly — otherwise
@@ -166,7 +177,7 @@ fn translate_inner(
 
     if let Some(ref gb) = stmt.group_by {
         if let Some(Dimension::Time { interval, offset }) = gb.time_dimension() {
-            let time_expr = time_bucket_expr(interval, offset.as_ref());
+            let time_expr = time_bucket_expr(interval, offset.as_ref(), tz);
             // Use __time alias to avoid collision with the raw `time` column,
             // then rename back to `time` in the result parser.
             select_parts.push(format!("{} AS __time", time_expr));
@@ -184,12 +195,22 @@ fn translate_inner(
         .fields
         .iter()
         .any(|f| matches!(f.expr, Expr::Star | Expr::Wildcard));
+    // True aggregates collapse rows; bare window transforms (difference("v"),
+    // moving_average("v", n), ...) stay per-point and must keep the raw `time`
+    // column and per-point ordering like raw selects.
+    let has_true_aggregate = stmt.fields.iter().any(|f| expr_contains_aggregate(&f.expr));
+    let has_raw_transform = stmt
+        .fields
+        .iter()
+        .any(|f| expr_contains_raw_transform(&f.expr));
 
     // Raw (non-aggregate) selects return one row per point and must carry the
     // point's `time` column, like InfluxDB. `SELECT *` already projects `time`,
     // and GROUP BY time() / aggregate queries get their time column elsewhere.
     let is_raw_select = !has_group_by_time && !has_star && !has_aggregate;
-    if is_raw_select {
+    let projects_point_time =
+        is_raw_select || (has_raw_transform && !has_group_by_time && !has_star);
+    if projects_point_time {
         select_parts.insert(0, quote_identifier("time"));
     }
 
@@ -221,27 +242,35 @@ fn translate_inner(
 
     // GROUP BY
     if let Some(ref gb) = stmt.group_by {
-        write!(out, "\nGROUP BY ")?;
         let mut gb_parts = Vec::new();
 
         if let Some(Dimension::Time { interval, offset }) = gb.time_dimension() {
-            gb_parts.push(time_bucket_expr(interval, offset.as_ref()));
+            gb_parts.push(time_bucket_expr(interval, offset.as_ref(), tz));
         }
 
-        for tag in gb.tag_dimensions() {
-            // Must match the SELECT expression: physical column name (handles the
-            // `__tag__` collision prefix). Previously emitted the logical name,
-            // which is wrong for collision-renamed tags.
-            gb_parts.push(group_by_tag_sql(tag, mapping));
+        // Tag dimensions only group the SQL when a true aggregate is present.
+        // Raw selects / bare window transforms keep one row per point: their
+        // tag columns stay projected (for per-series splitting in the result
+        // parser and PARTITION BY in window clauses) but grouping by them
+        // would be NOT_AN_AGGREGATE in ClickHouse.
+        if has_true_aggregate {
+            for tag in gb.tag_dimensions() {
+                // Must match the SELECT expression: physical column name (handles the
+                // `__tag__` collision prefix). Previously emitted the logical name,
+                // which is wrong for collision-renamed tags.
+                gb_parts.push(group_by_tag_sql(tag, mapping));
+            }
         }
 
-        write!(out, "{}", gb_parts.join(", "))?;
+        if !gb_parts.is_empty() {
+            write!(out, "\nGROUP BY {}", gb_parts.join(", "))?;
+        }
     }
 
     // Compute time column expression for ORDER BY
     let time_col = stmt.group_by.as_ref().and_then(|gb| {
         if let Some(Dimension::Time { interval, offset }) = gb.time_dimension() {
-            Some(time_bucket_expr(interval, offset.as_ref()))
+            Some(time_bucket_expr(interval, offset.as_ref(), tz))
         } else {
             None
         }
@@ -249,14 +278,20 @@ fn translate_inner(
 
     // InfluxDB orders every result by time ascending by default; an explicit
     // ORDER BY only changes the direction. Order whenever there is a time column
-    // to sort on: GROUP BY time() buckets, or raw per-point selects (incl. `*`).
+    // to sort on: GROUP BY time() buckets, raw per-point selects (incl. `*`), or
+    // bare window transforms (which are per-point and project raw `time`).
     // Aggregates without GROUP BY time() collapse to one row and need no ordering.
-    let has_orderable_time = time_col.is_some() || (!has_aggregate && !has_group_by_time);
-    let needs_order_by = has_orderable_time;
-    if needs_order_by {
+    let has_orderable_time =
+        time_col.is_some() || (!has_aggregate && !has_group_by_time) || projects_point_time;
+    let time_desc = stmt.order_by.as_ref().is_some_and(|o| o.time_desc);
+    let do_fill = needs_with_fill && time_col.is_some();
+    // ClickHouse WITH FILL on a DESC-ordered column never matches the ascending
+    // FROM/TO anchors we emit, so no fill rows are generated. Fill ascending in
+    // this (inner) SELECT and re-order descending in a wrapper below.
+    let wrap_desc_fill = time_desc && do_fill;
+
+    if has_orderable_time {
         write!(out, "\nORDER BY ")?;
-        let time_desc = stmt.order_by.as_ref().is_some_and(|o| o.time_desc);
-        let do_fill = needs_with_fill && time_col.is_some();
 
         // When filling a tag-grouped query, the tag columns must precede the
         // time-fill column in ORDER BY so ClickHouse fills each tag group
@@ -274,65 +309,221 @@ fn translate_inner(
         } else {
             write!(out, "time")?;
         }
-        if time_desc {
+        if time_desc && !wrap_desc_fill {
             write!(out, " DESC")?;
         } else {
             write!(out, " ASC")?;
         }
 
-        if do_fill {
-            if let Some(ref gb) = stmt.group_by
-                && let Some(Dimension::Time { interval, .. }) = gb.time_dimension()
+        if do_fill
+            && let Some(ref gb) = stmt.group_by
+            && let Some(Dimension::Time { interval, offset }) = gb.time_dimension()
+        {
+            let step = interval.to_clickhouse_interval();
+            write!(out, " WITH FILL")?;
+            if let Some((min_nanos, max_nanos)) = time_bounds
+                && let (Some(min), Some(max)) = (min_nanos, max_nanos)
             {
-                let step = interval.to_clickhouse_interval();
-                write!(out, " WITH FILL")?;
-                if let Some((min_nanos, max_nanos)) = time_bounds
-                    && let (Some(min), Some(max)) = (min_nanos, max_nanos)
-                {
-                    write!(
-                        out,
-                        " FROM toStartOfInterval({}, {}) TO toStartOfInterval({}, {})",
-                        nanos_to_ch_timestamp(min),
-                        step,
-                        nanos_to_ch_timestamp(max),
-                        step,
-                    )?;
+                // The grid anchors must use the same bucket shape (offset +
+                // timezone) as the bucket expression, or the generated grid
+                // interleaves phantom buckets. `WITH FILL ... TO` is exclusive,
+                // so extend one step past the bucket containing the upper WHERE
+                // bound to emit the final bucket.
+                let from_anchor =
+                    time_bucket_expr_on(&nanos_to_ch_timestamp(min), interval, offset.as_ref(), tz);
+                let to_anchor =
+                    time_bucket_expr_on(&nanos_to_ch_timestamp(max), interval, offset.as_ref(), tz);
+                write!(out, " FROM {from_anchor} TO {to_anchor} + {step}")?;
+            }
+            write!(out, " STEP {}", step)?;
+
+            match effective_fill {
+                // fill(previous): use INTERPOLATE to carry forward last known value
+                FillOption::Previous if !field_aliases.is_empty() => {
+                    let interp_cols: Vec<String> =
+                        field_aliases.iter().map(|a| quote_identifier(a)).collect();
+                    write!(out, " INTERPOLATE ({})", interp_cols.join(", "))?;
                 }
-                write!(out, " STEP {}", step)?;
-            }
-
-            // fill(previous): use INTERPOLATE to carry forward last known value
-            if matches!(stmt.fill, Some(FillOption::Previous)) && !field_aliases.is_empty() {
-                let interp_cols: Vec<String> =
-                    field_aliases.iter().map(|a| quote_identifier(a)).collect();
-                write!(out, " INTERPOLATE ({})", interp_cols.join(", "))?;
-            }
-
-            // fill(linear): use INTERPOLATE with linear expressions
-            if matches!(stmt.fill, Some(FillOption::Linear)) && !field_aliases.is_empty() {
-                let interp_cols: Vec<String> = field_aliases
-                    .iter()
-                    .map(|a| {
-                        let q = quote_identifier(a);
-                        format!("{q} AS {q}")
-                    })
-                    .collect();
-                write!(out, " INTERPOLATE ({})", interp_cols.join(", "))?;
+                // fill(linear): use INTERPOLATE with linear expressions
+                FillOption::Linear if !field_aliases.is_empty() => {
+                    let interp_cols: Vec<String> = field_aliases
+                        .iter()
+                        .map(|a| {
+                            let q = quote_identifier(a);
+                            format!("{q} AS {q}")
+                        })
+                        .collect();
+                    write!(out, " INTERPOLATE ({})", interp_cols.join(", "))?;
+                }
+                // fill(<number>): WITH FILL-generated rows get column defaults
+                // (NULL) that the ifNull() around the aggregate can't reach; a
+                // constant INTERPOLATE expression sets generated rows —
+                // including leading gaps — to the fill value.
+                FillOption::Value(v) if !field_aliases.is_empty() => {
+                    let interp_cols: Vec<String> = field_aliases
+                        .iter()
+                        .map(|a| format!("{} AS {}", quote_identifier(a), format_float(v)))
+                        .collect();
+                    write!(out, " INTERPOLATE ({})", interp_cols.join(", "))?;
+                }
+                _ => {}
             }
         }
     }
 
-    // LIMIT
-    if let Some(limit) = stmt.limit {
-        write!(out, "\nLIMIT {}", limit)?;
+    // GROUP BY tag dimensions carry InfluxQL per-series LIMIT semantics and
+    // outer ordering. These are the logical (output) column names.
+    let tag_dims: Vec<&str> = stmt
+        .group_by
+        .as_ref()
+        .map(|gb| gb.tag_dimensions())
+        .unwrap_or_default();
+
+    if wrap_desc_fill {
+        // Re-order the ascending filled grid descending, tags first (matching
+        // the tag-first fill ordering above). Outer clauses stay on the `)`
+        // line so tombstone WHERE-splicing targets only the inner query.
+        let mut order_parts: Vec<String> = tag_dims
+            .iter()
+            .map(|t| format!("{} ASC", quote_identifier(t)))
+            .collect();
+        order_parts.push("__time DESC".to_string());
+        out = format!(
+            "SELECT * FROM (\n{out}\n) ORDER BY {}",
+            order_parts.join(", ")
+        );
+    } else if has_raw_transform && !has_group_by_time {
+        // InfluxQL omits rows where a per-point window transform has no value
+        // yet (difference/derivative/elapsed first point, moving_average until
+        // the window is full). Those surface as NULL transform outputs here;
+        // filter them in a wrapper. Rows where every named transform output is
+        // NULL are dropped — in InfluxDB a point with a null input field would
+        // not exist in that field's series at all.
+        let transform_aliases: Vec<String> = stmt
+            .fields
+            .iter()
+            .filter(|f| expr_contains_raw_transform(&f.expr))
+            .filter_map(select_output_field_name)
+            .collect();
+        if !transform_aliases.is_empty() {
+            let cond = transform_aliases
+                .iter()
+                .map(|a| format!("{} IS NOT NULL", quote_identifier(a)))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let dir = if time_desc { "DESC" } else { "ASC" };
+            out = format!(
+                "SELECT * FROM (\n{out}\n) WHERE {cond} ORDER BY {} {dir}",
+                quote_identifier("time")
+            );
+        }
     }
 
-    // OFFSET
-    if let Some(offset) = stmt.offset {
-        write!(out, "\nOFFSET {}", offset)?;
+    // LIMIT / OFFSET — InfluxQL LIMIT/OFFSET paginate points *per series*; with
+    // tag dimensions in GROUP BY that maps to ClickHouse `LIMIT [m,] n BY tags`.
+    // Without tag grouping the whole result is one series, so plain LIMIT works.
+    if !tag_dims.is_empty() && stmt.limit.is_some() {
+        let by_cols = tag_dims
+            .iter()
+            .map(|t| quote_identifier(t))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let limit = stmt.limit.unwrap_or(0);
+        match stmt.offset {
+            Some(offset) => write!(out, "\nLIMIT {offset}, {limit} BY ({by_cols})")?,
+            None => write!(out, "\nLIMIT {limit} BY ({by_cols})")?,
+        }
+    } else {
+        if let Some(limit) = stmt.limit {
+            write!(out, "\nLIMIT {}", limit)?;
+        }
+        if let Some(offset) = stmt.offset {
+            write!(out, "\nOFFSET {}", offset)?;
+        }
     }
 
     Ok(out)
+}
+
+/// Whether a call is a per-point window transform (translated to a ClickHouse
+/// window function) rather than a true aggregate.
+fn is_window_transform_call(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "DERIVATIVE"
+            | "NON_NEGATIVE_DERIVATIVE"
+            | "DIFFERENCE"
+            | "NON_NEGATIVE_DIFFERENCE"
+            | "MOVING_AVERAGE"
+            | "CUMULATIVE_SUM"
+            | "ELAPSED"
+    )
+}
+
+/// Whether an expression contains a row-collapsing aggregate. Window transforms
+/// only count when they wrap a nested aggregate (e.g. `difference(mean(v))`).
+fn expr_contains_aggregate(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call(fc) if is_window_transform_call(&fc.name) => {
+            fc.args.first().is_some_and(|a| matches!(a, Expr::Call(_)))
+        }
+        Expr::Call(_) => true,
+        Expr::BinaryExpr(be) => {
+            expr_contains_aggregate(&be.left) || expr_contains_aggregate(&be.right)
+        }
+        Expr::UnaryExpr(_, e) => expr_contains_aggregate(e),
+        _ => false,
+    }
+}
+
+/// Whether an expression contains a window transform applied directly to a raw
+/// field (no nested aggregate) — a per-point transform.
+fn expr_contains_raw_transform(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call(fc) if is_window_transform_call(&fc.name) => {
+            !fc.args.first().is_some_and(|a| matches!(a, Expr::Call(_)))
+        }
+        Expr::Call(_) => false,
+        Expr::BinaryExpr(be) => {
+            expr_contains_raw_transform(&be.left) || expr_contains_raw_transform(&be.right)
+        }
+        Expr::UnaryExpr(_, e) => expr_contains_raw_transform(e),
+        _ => false,
+    }
+}
+
+/// Rename the internal `__time` bucket alias to `time`, for INSERT ... SELECT
+/// destinations and subquery FROM sources. Only standalone `__time` tokens are
+/// rewritten (bare, `"__time"`, or `` `__time` ``); identifiers that merely
+/// contain the substring (e.g. `"cpu__time"`) are preserved.
+#[must_use]
+pub fn rename_time_bucket_alias(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut out = String::with_capacity(sql.len());
+    let mut last = 0usize;
+    for (pos, _) in sql.match_indices("__time") {
+        if pos < last {
+            continue;
+        }
+        let prev = if pos == 0 { None } else { Some(bytes[pos - 1]) };
+        let next = bytes.get(pos + "__time".len()).copied();
+        // The exact quoted identifier, or a bare token not embedded in a longer
+        // (possibly quoted) identifier.
+        let exact_quoted = matches!(
+            (prev, next),
+            (Some(b'"'), Some(b'"')) | (Some(b'`'), Some(b'`'))
+        );
+        let bare = prev.is_none_or(|c| !is_ident(c) && c != b'"' && c != b'`')
+            && next.is_none_or(|c| !is_ident(c) && c != b'"' && c != b'`');
+        if exact_quoted || bare {
+            out.push_str(&sql[last..pos]);
+            out.push_str("time");
+            last = pos + "__time".len();
+        }
+    }
+    out.push_str(&sql[last..]);
+    out
 }
 
 /// Wrap a translated SELECT as `INSERT INTO <dest> SELECT ...`, renaming `__time` to `time`
@@ -345,7 +536,7 @@ pub fn translate_select_into(
 ) -> Result<String, HyperbytedbError> {
     validate_select_into(stmt)?;
     let select_sql = translate_inner(stmt, source, mapping, None, None)?;
-    let select_sql = select_sql.replace("__time", "time");
+    let select_sql = rename_time_bucket_alias(&select_sql);
     Ok(format!("INSERT INTO {}\n{}", dest_table, select_sql))
 }
 
@@ -406,7 +597,12 @@ pub fn translate_materialized_view_select(
             "MV requires GROUP BY time(...)".to_string(),
         ));
     };
-    let time_bucket = time_bucket_expr_on("t.time", interval, offset.as_ref());
+    let time_bucket = time_bucket_expr_on(
+        "t.time",
+        interval,
+        offset.as_ref(),
+        stmt.timezone.as_deref(),
+    );
 
     let mut grouped_tags: Vec<String> = gb
         .tag_dimensions()
@@ -474,9 +670,11 @@ pub fn translate_materialized_view_select(
     write!(out, "SELECT {}", select_parts.join(", "))?;
     let source_mapping = mapping_with_mv_aggregate_fields(mapping, &stmt.fields);
     let coalesced_source = build_coalesced_fact_view_with_row_meta(source_fact, &source_mapping);
+    // ANY LEFT JOIN for consistency with the query path: fact rows whose series
+    // row hasn't landed yet must not be silently dropped from the rollup.
     write!(
         out,
-        "\nFROM {coalesced_source} AS t ANY INNER JOIN {source_series} AS s ON t.`series_id` = s.`series_id`"
+        "\nFROM {coalesced_source} AS t ANY LEFT JOIN {source_series} AS s ON t.`series_id` = s.`series_id`"
     )?;
 
     if let Some(ref cond) = stmt.condition {
@@ -650,7 +848,7 @@ pub fn translate_select_into_native(
 ) -> Result<String, HyperbytedbError> {
     validate_select_into(stmt)?;
     let select_sql = translate_inner(stmt, source_table, mapping, series, None)?;
-    let select_sql = select_sql.replace("__time", "time");
+    let select_sql = rename_time_bucket_alias(&select_sql);
     Ok(format!("INSERT INTO {}\n{}", dest_table, select_sql))
 }
 
@@ -818,20 +1016,31 @@ fn group_by_tag_sql(tag: &str, mapping: Option<&ColumnMapping>) -> String {
     }
 }
 
-fn time_bucket_expr(interval: &Duration, offset: Option<&Duration>) -> String {
-    time_bucket_expr_on("time", interval, offset)
+fn time_bucket_expr(interval: &Duration, offset: Option<&Duration>, tz: Option<&str>) -> String {
+    time_bucket_expr_on("time", interval, offset, tz)
 }
 
-fn time_bucket_expr_on(time_col: &str, interval: &Duration, offset: Option<&Duration>) -> String {
+/// Bucketing expression over an arbitrary time expression. `tz` (from `tz()`)
+/// makes `toStartOfInterval` bucket on local-time boundaries in that zone,
+/// which is what keeps `GROUP BY time(1d)` correct across 23/25-hour DST days.
+fn time_bucket_expr_on(
+    time_col: &str,
+    interval: &Duration,
+    offset: Option<&Duration>,
+    tz: Option<&str>,
+) -> String {
     let interval_str = interval.to_clickhouse_interval();
+    let tz_arg = tz
+        .map(|t| format!(", {}", quote_string(t)))
+        .unwrap_or_default();
     if let Some(off) = offset {
         let off_str = off.to_clickhouse_interval();
         format!(
-            "toStartOfInterval({time_col} - {}, {}) + {}",
+            "toStartOfInterval({time_col} - {}, {}{tz_arg}) + {}",
             off_str, interval_str, off_str
         )
     } else {
-        format!("toStartOfInterval({time_col}, {})", interval_str)
+        format!("toStartOfInterval({time_col}, {}{tz_arg})", interval_str)
     }
 }
 
@@ -1001,12 +1210,24 @@ fn translate_aggregate_call(
         "MEDIAN" => {
             let arg = get_single_arg(func, "MEDIAN")?;
             let f = translate_aggregate_arg(arg, mapping)?;
-            wrap_fill(format!("median({})", f))
+            // InfluxQL median averages the two middle values on even counts;
+            // quantileExactInclusive(0.5) matches that exactly (ClickHouse
+            // `median` is sampling-based and approximate).
+            wrap_fill(format!("quantileExactInclusive(0.5)({})", f))
         }
         "COUNT" => {
             let arg = get_single_arg(func, "COUNT")?;
-            let f = translate_aggregate_arg(arg, mapping)?;
-            wrap_fill(format!("count({})", f))
+            // count(distinct("v")) → exact distinct count.
+            if let Expr::Call(inner) = arg
+                && inner.name.eq_ignore_ascii_case("distinct")
+            {
+                let inner_arg = get_single_arg(inner, "DISTINCT")?;
+                let f = translate_aggregate_arg(inner_arg, mapping)?;
+                wrap_fill(format!("uniqExact({})", f))
+            } else {
+                let f = translate_aggregate_arg(arg, mapping)?;
+                wrap_fill(format!("count({})", f))
+            }
         }
         "SUM" => {
             let arg = get_single_arg(func, "SUM")?;
@@ -1046,7 +1267,9 @@ fn translate_aggregate_call(
                     )));
                 }
             };
-            wrap_fill(format!("quantile({})({})", format_float(pct), f))
+            // InfluxQL percentile is nearest-rank and returns an actual sample
+            // (for [10,20,30,40] p50 = 20); quantileExactLow matches that.
+            wrap_fill(format!("quantileExactLow({})({})", format_float(pct), f))
         }
         "SPREAD" => {
             let arg = get_single_arg(func, "SPREAD")?;
@@ -1056,17 +1279,23 @@ fn translate_aggregate_call(
         "STDDEV" => {
             let arg = get_single_arg(func, "STDDEV")?;
             let f = translate_aggregate_arg(arg, mapping)?;
-            wrap_fill(format!("stddevPop({})", f))
+            // InfluxQL stddev is the *sample* standard deviation.
+            wrap_fill(format!("stddevSamp({})", f))
         }
         "MODE" => {
             let arg = get_single_arg(func, "MODE")?;
             let f = translate_aggregate_arg(arg, mapping)?;
-            wrap_fill(format!("topKWeighted(1)({}, 1)", f))
+            // topKWeighted returns an Array; unwrap to a scalar. Still
+            // approximate and tie-breaking is unspecified, unlike InfluxQL's
+            // lowest-value tie-break.
+            wrap_fill(format!("arrayElement(topKWeighted(1)({}, 1), 1)", f))
         }
         "DISTINCT" => {
             let arg = get_single_arg(func, "DISTINCT")?;
             let f = translate_aggregate_arg(arg, mapping)?;
-            format!("DISTINCT {}", f)
+            // arrayJoin(groupUniqArray(...)) yields one row per distinct value
+            // and — unlike `SELECT DISTINCT` — stays valid inside GROUP BY time().
+            format!("arrayJoin(groupUniqArray({}))", f)
         }
         "DERIVATIVE" | "NON_NEGATIVE_DERIVATIVE" => {
             let field_arg = get_single_arg(func, &name_upper)?;
@@ -1134,10 +1363,14 @@ fn translate_aggregate_call(
                     .join(", ");
                 format!("PARTITION BY {p} ")
             };
-            format!(
-                "avg({f}) OVER ({partition_clause}ORDER BY {time_ref} ROWS BETWEEN {preceding} PRECEDING AND CURRENT ROW)",
+            // InfluxQL emits moving_average values only once the window holds N
+            // points; gate on the frame's non-null count so shorter leading
+            // frames yield NULL (filtered for per-point transforms).
+            let frame = format!(
+                "({partition_clause}ORDER BY {time_ref} ROWS BETWEEN {preceding} PRECEDING AND CURRENT ROW)",
                 preceding = n - 1
-            )
+            );
+            format!("if(count({f}) OVER {frame} >= {n}, avg({f}) OVER {frame}, NULL)")
         }
         "CUMULATIVE_SUM" => {
             let arg = get_single_arg(func, "CUMULATIVE_SUM")?;
@@ -1177,8 +1410,11 @@ fn translate_aggregate_call(
                 1_000_000_000
             };
             let unit_seconds = format_float(unit_nanos as f64 / 1_000_000_000.0);
+            // toNullable: lagInFrame on the non-Nullable time column would
+            // default to epoch 0 out-of-frame, making the first row a huge
+            // elapsed value instead of NULL (InfluxQL omits the first point).
             format!(
-                "((toFloat64({time_ref}) - toFloat64(lagInFrame({time_ref}, 1) {window})) / {unit_seconds})"
+                "((toFloat64({time_ref}) - toFloat64(lagInFrame(toNullable({time_ref}), 1) {window})) / {unit_seconds})"
             )
         }
         _ => {
@@ -1371,19 +1607,41 @@ fn try_translate_where_binary_expr(
     out: &mut String,
     m: &ColumnMapping,
 ) -> Result<bool, HyperbytedbError> {
-    let (name, lit, id_on_left) = match (&be.left, &be.right) {
-        (Expr::Identifier(n), rhs) if is_where_literal(rhs) => (n.as_str(), rhs, true),
+    let (name, lit, id_on_left, explicit_tag) = match (&be.left, &be.right) {
+        (Expr::Identifier(n), rhs) if is_where_literal(rhs) => (n.as_str(), rhs, true, false),
         (Expr::FieldRef { name, typ: None }, rhs) if is_where_literal(rhs) => {
-            (name.as_str(), rhs, true)
+            (name.as_str(), rhs, true, false)
         }
-        (lhs, Expr::Identifier(n)) if is_where_literal(lhs) => (n.as_str(), lhs, false),
+        (
+            Expr::FieldRef {
+                name,
+                typ: Some(FieldType::Tag),
+            },
+            rhs,
+        ) if is_where_literal(rhs) => (name.as_str(), rhs, true, true),
+        (lhs, Expr::Identifier(n)) if is_where_literal(lhs) => (n.as_str(), lhs, false, false),
         (lhs, Expr::FieldRef { name, typ: None }) if is_where_literal(lhs) => {
-            (name.as_str(), lhs, false)
+            (name.as_str(), lhs, false, false)
         }
+        (
+            lhs,
+            Expr::FieldRef {
+                name,
+                typ: Some(FieldType::Tag),
+            },
+        ) if is_where_literal(lhs) => (name.as_str(), lhs, false, true),
         _ => return Ok(false),
     };
     if matches!(be.op, BinaryOp::And | BinaryOp::Or) {
         return Ok(false);
+    }
+    // Tags are strings; comparing one to a numeric literal never matches in
+    // InfluxQL (and would be a type error in ClickHouse). Emit constant-false
+    // so the query runs and returns an empty result.
+    let is_pure_tag = explicit_tag || (m.tag_keys.contains(name) && !m.field_names.contains(name));
+    if is_pure_tag && matches!(lit, Expr::IntegerLiteral(_) | Expr::FloatLiteral(_)) {
+        write!(out, "1 = 0")?;
+        return Ok(true);
     }
     if !tag_field_collision(m, name) {
         return Ok(false);
@@ -1729,7 +1987,7 @@ pub fn translate_bounded_cq_into(
         series,
         Some((Some(start_nanos), Some(end_nanos))),
     )?;
-    let select_sql = select_sql.replace("__time", "time");
+    let select_sql = rename_time_bucket_alias(&select_sql);
     Ok(format!("INSERT INTO {dest_table}\n{select_sql}"))
 }
 
@@ -1799,7 +2057,8 @@ mod tests {
         let stmt =
             parse_select(r#"SELECT median("x"), count("x"), sum("x"), min("x"), max("x") FROM m"#);
         let sql = translate_test(&stmt);
-        assert!(sql.contains("median(\"x\")"));
+        // InfluxQL median averages the two middle samples on even counts.
+        assert!(sql.contains("quantileExactInclusive(0.5)(\"x\")"));
         assert!(sql.contains("count(\"x\")"));
         assert!(sql.contains("sum(\"x\")"));
         assert!(sql.contains("min(\"x\")"));
@@ -1818,7 +2077,8 @@ mod tests {
     fn test_percentile() {
         let stmt = parse_select(r#"SELECT percentile("value", 95) FROM m"#);
         let sql = translate_test(&stmt);
-        assert!(sql.contains("quantile(0.95)(\"value\")"));
+        // Nearest-rank sample percentile, matching InfluxQL.
+        assert!(sql.contains("quantileExactLow(0.95)(\"value\")"));
     }
 
     #[test]
@@ -1827,9 +2087,34 @@ mod tests {
             parse_select(r#"SELECT spread("v"), stddev("v"), mode("v"), distinct("v") FROM m"#);
         let sql = translate_test(&stmt);
         assert!(sql.contains("(max(\"v\") - min(\"v\"))"));
-        assert!(sql.contains("stddevPop(\"v\")"));
-        assert!(sql.contains("topKWeighted(1)(\"v\", 1)"));
-        assert!(sql.contains("DISTINCT \"v\""));
+        // InfluxQL stddev is sample stddev.
+        assert!(sql.contains("stddevSamp(\"v\")"));
+        // mode() must be a scalar, not a one-element Array.
+        assert!(sql.contains("arrayElement(topKWeighted(1)(\"v\", 1), 1)"));
+        // distinct() must stay valid inside GROUP BY time(); SELECT DISTINCT is not.
+        assert!(sql.contains("arrayJoin(groupUniqArray(\"v\"))"));
+        assert!(!sql.contains("DISTINCT \"v\""));
+    }
+
+    #[test]
+    fn test_count_distinct() {
+        let stmt = parse_select(r#"SELECT count(distinct("v")) FROM m GROUP BY time(1m)"#);
+        let sql = translate_test(&stmt);
+        assert!(
+            sql.contains("uniqExact(\"v\")"),
+            "count(distinct(v)) should translate to uniqExact, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_distinct_with_group_by_time_is_valid_expression() {
+        let stmt = parse_select(r#"SELECT distinct("v") FROM m GROUP BY time(1m)"#);
+        let sql = translate_test(&stmt);
+        assert!(
+            sql.contains("arrayJoin(groupUniqArray(\"v\"))"),
+            "distinct(v) must be an expression usable with GROUP BY time, got: {sql}"
+        );
+        assert!(!sql.contains("DISTINCT "), "got: {sql}");
     }
 
     #[test]
@@ -1918,13 +2203,42 @@ mod tests {
             sql.contains("WITH FILL FROM toStartOfInterval(fromUnixTimestamp64Nano(1781541739132000000), INTERVAL 10 SECOND)"),
             "expected FROM bound aligned to bucket, got: {sql}"
         );
+        // WITH FILL ... TO is exclusive: the anchor extends one step past the
+        // bucket containing the upper bound so the final bucket is generated.
         assert!(
-            sql.contains("TO toStartOfInterval(fromUnixTimestamp64Nano(1781552539132000000), INTERVAL 10 SECOND)"),
-            "expected TO bound aligned to bucket, got: {sql}"
+            sql.contains("TO toStartOfInterval(fromUnixTimestamp64Nano(1781552539132000000), INTERVAL 10 SECOND) + INTERVAL 10 SECOND"),
+            "expected TO bound one step past the last bucket, got: {sql}"
         );
         assert!(
             sql.contains("STEP INTERVAL 10 SECOND"),
             "expected STEP after FROM/TO, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_fill_grid_anchors_use_group_by_time_offset() {
+        // `time(1m, 30s)` bucket expression is `toStartOfInterval(t - 30s, 1m) + 30s`;
+        // the WITH FILL FROM/TO anchors must use the same shape or the grid
+        // interleaves phantom buckets between real ones.
+        let stmt = parse_select(
+            r#"SELECT mean("v") FROM m WHERE time >= 1781541730000ms AND time <= 1781541790000ms GROUP BY time(1m, 30s) fill(null)"#,
+        );
+        let min = 1_781_541_730_000_000_000i64;
+        let max = 1_781_541_790_000_000_000i64;
+        let sql =
+            translate_native_table(&stmt, TEST_TABLE, None, None, Some((Some(min), Some(max))))
+                .unwrap();
+        assert!(
+            sql.contains(
+                "WITH FILL FROM toStartOfInterval(fromUnixTimestamp64Nano(1781541730000000000) - INTERVAL 30 SECOND, INTERVAL 1 MINUTE) + INTERVAL 30 SECOND"
+            ),
+            "FROM anchor must apply the GROUP BY time offset, got: {sql}"
+        );
+        assert!(
+            sql.contains(
+                "TO toStartOfInterval(fromUnixTimestamp64Nano(1781541790000000000) - INTERVAL 30 SECOND, INTERVAL 1 MINUTE) + INTERVAL 30 SECOND + INTERVAL 1 MINUTE"
+            ),
+            "TO anchor must apply the GROUP BY time offset and extend one step, got: {sql}"
         );
     }
 
@@ -1995,6 +2309,89 @@ mod tests {
         let sql = translate_test(&stmt);
         assert!(sql.contains("ifNull(avg(\"value\"), 0)"));
         assert!(sql.contains("WITH FILL"));
+        // ifNull only reaches existing rows; WITH FILL-generated rows need a
+        // constant INTERPOLATE or they surface as column defaults, not the value.
+        assert!(
+            sql.contains("INTERPOLATE (\"mean_value\" AS 0)"),
+            "fill(N) must INTERPOLATE generated rows with N, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_fill_value_interpolates_every_field_alias() {
+        let stmt = parse_select(
+            r#"SELECT mean("a") AS x, max("b") AS y FROM m GROUP BY time(1m) fill(100)"#,
+        );
+        let sql = translate_test(&stmt);
+        assert!(
+            sql.contains("INTERPOLATE (\"x\" AS 100, \"y\" AS 100)"),
+            "fill(100) must INTERPOLATE all field aliases, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_missing_fill_defaults_to_fill_null() {
+        // InfluxQL: a GROUP BY time() query without fill() behaves as fill(null).
+        let stmt = parse_select(r#"SELECT mean("value") FROM cpu GROUP BY time(5m)"#);
+        let sql = translate_test(&stmt);
+        assert!(
+            sql.contains("WITH FILL STEP INTERVAL 5 MINUTE"),
+            "absent fill() must default to fill(null), got: {sql}"
+        );
+        assert!(
+            !sql.contains("ifNull"),
+            "default fill must leave NULL aggregates as NULL, got: {sql}"
+        );
+        assert!(
+            !sql.contains("INTERPOLATE"),
+            "default fill must not interpolate, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_select_into_does_not_default_fill() {
+        // Writes must not insert synthetic NULL grid rows.
+        let stmt = parse_select(r#"SELECT mean("value") INTO "dest" FROM "cpu" GROUP BY time(5m)"#);
+        let sql = translate_select_into(&stmt, "`dest`", "`src`", None).unwrap();
+        assert!(
+            !sql.contains("WITH FILL"),
+            "SELECT INTO without fill() must not emit WITH FILL, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_order_by_time_desc_with_fill_wraps_ascending_fill() {
+        // WITH FILL on a DESC column generates nothing against ascending
+        // FROM/TO anchors; the fill happens ascending in an inner SELECT and an
+        // outer SELECT re-orders descending.
+        let stmt = parse_select(
+            r#"SELECT mean("value") FROM cpu GROUP BY time(5m) fill(null) ORDER BY time DESC"#,
+        );
+        let sql = translate_test(&stmt);
+        assert!(
+            sql.starts_with("SELECT * FROM (\n"),
+            "DESC + fill must wrap, got: {sql}"
+        );
+        assert!(
+            sql.contains(" ASC WITH FILL"),
+            "inner fill must be ascending, got: {sql}"
+        );
+        assert!(
+            sql.contains(") ORDER BY __time DESC"),
+            "outer must re-order descending, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_order_by_time_desc_with_fill_and_tags_orders_tags_first() {
+        let stmt = parse_select(
+            r#"SELECT mean("usage_idle") FROM cpu GROUP BY time(10s), "host" fill(null) ORDER BY time DESC"#,
+        );
+        let sql = translate_series(&stmt, &cpu_mapping());
+        assert!(
+            sql.contains(") ORDER BY \"host\" ASC, __time DESC"),
+            "outer ordering must keep tags first, got: {sql}"
+        );
     }
 
     #[test]
@@ -2127,6 +2524,12 @@ mod tests {
         let sql = translate_test(&stmt);
         assert!(sql.contains("avg(\"value\") OVER"));
         assert!(sql.contains("ROWS BETWEEN 4 PRECEDING AND CURRENT ROW"));
+        // InfluxQL emits values only once the window holds N points.
+        assert!(
+            sql.contains("if(count(\"value\") OVER"),
+            "moving_average must gate on a full window, got: {sql}"
+        );
+        assert!(sql.contains(">= 5"), "window-full check, got: {sql}");
     }
 
     #[test]
@@ -2142,8 +2545,8 @@ mod tests {
         let stmt = parse_select(r#"SELECT elapsed("value", 1s) FROM cpu"#);
         let sql = translate_test(&stmt);
         assert!(
-            sql.contains("lagInFrame(time, 1)"),
-            "expected lagInFrame, got: {sql}"
+            sql.contains("lagInFrame(toNullable(time), 1)"),
+            "expected NULL-defaulting lagInFrame so the first row is omitted, got: {sql}"
         );
         assert!(
             sql.contains("toFloat64"),
@@ -2390,7 +2793,10 @@ mod tests {
             ),
             "MV should read from coalesced source subquery, got: {sql}"
         );
-        assert!(sql.contains("AS t ANY INNER JOIN `mydb_autogen_cpu_series` AS s"));
+        assert!(
+            sql.contains("AS t ANY LEFT JOIN `mydb_autogen_cpu_series` AS s"),
+            "MV must not drop fact rows whose series row hasn't landed, got: {sql}"
+        );
         assert!(sql.contains("GROUP BY toStartOfInterval(t.time, INTERVAL 5 MINUTE)"));
         assert!(sql.contains("s.\"host\""));
         assert!(!sql.contains("INSERT INTO"));
@@ -2725,5 +3131,312 @@ mod tests {
             !sql.contains("__tag__host"),
             "tag 'host' should NOT be prefixed without dest_field_names, got: {sql}"
         );
+    }
+
+    // --- per-series LIMIT/OFFSET (InfluxQL points-per-series semantics) ---
+
+    #[test]
+    fn test_limit_with_group_by_tag_uses_limit_by() {
+        let stmt =
+            parse_select(r#"SELECT mean("usage_idle") FROM cpu GROUP BY time(1m), "host" LIMIT 3"#);
+        let sql = translate_series(&stmt, &cpu_mapping());
+        assert!(
+            sql.contains("LIMIT 3 BY (\"host\")"),
+            "LIMIT with tag grouping must be per series, got: {sql}"
+        );
+        assert!(
+            !sql.contains("\nLIMIT 3\n") && !sql.ends_with("\nLIMIT 3"),
+            "no global LIMIT alongside LIMIT BY, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_limit_offset_with_group_by_tags_uses_limit_by() {
+        let stmt = parse_select(
+            r#"SELECT mean("usage_idle") FROM cpu GROUP BY time(1m), "host", "region" LIMIT 3 OFFSET 2"#,
+        );
+        let sql = translate_series(&stmt, &cpu_mapping());
+        assert!(
+            sql.contains("LIMIT 2, 3 BY (\"host\", \"region\")"),
+            "OFFSET with tag grouping must be per series, got: {sql}"
+        );
+        assert!(!sql.contains("\nOFFSET"), "got: {sql}");
+    }
+
+    #[test]
+    fn test_limit_without_tags_stays_global() {
+        let stmt = parse_select(r#"SELECT mean("v") FROM m GROUP BY time(1m) LIMIT 4 OFFSET 1"#);
+        let sql = translate_test(&stmt);
+        assert!(sql.contains("\nLIMIT 4"), "got: {sql}");
+        assert!(sql.contains("\nOFFSET 1"), "got: {sql}");
+        assert!(!sql.contains(" BY ("), "got: {sql}");
+    }
+
+    // --- raw (non-aggregate) SELECT with GROUP BY tag ---
+
+    #[test]
+    fn test_raw_select_with_group_by_tag_has_no_sql_group_by() {
+        let stmt = parse_select(r#"SELECT "usage_idle" FROM cpu GROUP BY "host""#);
+        let sql = translate_series(&stmt, &cpu_mapping());
+        assert!(
+            !sql.contains("\nGROUP BY"),
+            "raw select must not GROUP BY tags in SQL (NOT_AN_AGGREGATE), got: {sql}"
+        );
+        // Tag stays projected so the result parser can split per-series.
+        let select_line = sql.lines().next().unwrap();
+        assert!(
+            select_line.contains("\"host\""),
+            "tag must be projected for series splitting, got: {select_line}"
+        );
+        assert!(
+            select_line.starts_with("SELECT \"time\""),
+            "raw select keeps time first, got: {select_line}"
+        );
+        assert!(sql.contains("ORDER BY time ASC"), "got: {sql}");
+    }
+
+    // --- per-point window transforms without GROUP BY time ---
+
+    #[test]
+    fn test_difference_without_group_by_time_projects_time_and_orders() {
+        let stmt = parse_select(r#"SELECT difference("value") FROM cpu"#);
+        let sql = translate_test(&stmt);
+        assert!(
+            sql.contains("SELECT \"time\","),
+            "transform must project the point time, got: {sql}"
+        );
+        assert!(
+            sql.contains("ORDER BY \"time\" ASC"),
+            "transform output must be time-ordered, got: {sql}"
+        );
+        // InfluxQL omits the first point (no previous value): NULL outputs are
+        // filtered by an outer SELECT.
+        assert!(
+            sql.starts_with("SELECT * FROM (\n"),
+            "transform must wrap to filter NULL rows, got: {sql}"
+        );
+        assert!(
+            sql.contains(") WHERE \"difference_value\" IS NOT NULL"),
+            "leading NULL transform rows must be filtered, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_transform_with_group_by_tag_partitions_without_sql_group_by() {
+        let stmt = parse_select(r#"SELECT difference("usage_idle") FROM cpu GROUP BY "host""#);
+        let sql = translate_series(&stmt, &cpu_mapping());
+        assert!(
+            !sql.contains("\nGROUP BY"),
+            "bare transform must not GROUP BY tags in SQL, got: {sql}"
+        );
+        assert!(
+            sql.contains("PARTITION BY \"host\""),
+            "transform must still partition per series, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_transform_with_group_by_time_keeps_grid_nulls() {
+        // GROUP BY time + fill keeps the filled grid (Grafana relies on the
+        // NULL rows); no NULL-filtering wrapper.
+        let stmt =
+            parse_select(r#"SELECT difference(mean("v")) FROM m GROUP BY time(1m) fill(null)"#);
+        let sql = translate_test(&stmt);
+        assert!(!sql.starts_with("SELECT * FROM (\n"), "got: {sql}");
+    }
+
+    // --- tag compared to numeric literal ---
+
+    #[test]
+    fn test_tag_numeric_comparison_is_constant_false() {
+        let stmt = parse_select(r#"SELECT mean("usage_idle") FROM cpu WHERE "host" = 3"#);
+        let sql = translate_series(&stmt, &cpu_mapping());
+        assert!(
+            sql.contains("WHERE (1 = 0)"),
+            "tag vs numeric literal must be constant-false, got: {sql}"
+        );
+        assert!(
+            !sql.contains("\"host\" = 3"),
+            "must not emit a string/number comparison, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_tag_string_comparison_is_unaffected() {
+        let stmt = parse_select(r#"SELECT mean("usage_idle") FROM cpu WHERE "host" = '3'"#);
+        let sql = translate_series(&stmt, &cpu_mapping());
+        assert!(sql.contains("\"host\" = '3'"), "got: {sql}");
+        assert!(!sql.contains("1 = 0"), "got: {sql}");
+    }
+
+    #[test]
+    fn test_field_numeric_comparison_is_unaffected() {
+        let stmt = parse_select(r#"SELECT mean("usage_idle") FROM cpu WHERE "usage_idle" > 3"#);
+        let sql = translate_series(&stmt, &cpu_mapping());
+        assert!(sql.contains("\"usage_idle\" > 3"), "got: {sql}");
+        assert!(!sql.contains("1 = 0"), "got: {sql}");
+    }
+
+    // --- extract_time_bounds keeps the intersection of ANDed bounds ---
+
+    #[test]
+    fn test_extract_time_bounds_intersects_anded_bounds() {
+        let stmt = parse_select(
+            "SELECT * FROM m WHERE time >= 1000000000 AND time >= 3000000000 \
+             AND time <= 9000000000 AND time <= 7000000000",
+        );
+        let (min, max) = extract_time_bounds(stmt.condition.as_ref());
+        assert_eq!(min, Some(3_000_000_000), "lower bounds keep the MAX");
+        assert_eq!(max, Some(7_000_000_000), "upper bounds keep the MIN");
+    }
+
+    // --- precise __time renaming ---
+
+    #[test]
+    fn test_rename_time_bucket_alias_is_token_precise() {
+        assert_eq!(
+            rename_time_bucket_alias("toStartOfInterval(time, INTERVAL 1 MINUTE) AS __time"),
+            "toStartOfInterval(time, INTERVAL 1 MINUTE) AS time"
+        );
+        assert_eq!(
+            rename_time_bucket_alias("ORDER BY __time DESC"),
+            "ORDER BY time DESC"
+        );
+        assert_eq!(rename_time_bucket_alias("\"__time\""), "\"time\"");
+        assert_eq!(rename_time_bucket_alias("`__time`"), "`time`");
+        // Identifiers merely containing the substring survive.
+        assert_eq!(
+            rename_time_bucket_alias("\"cpu__time\" AS __time"),
+            "\"cpu__time\" AS time"
+        );
+        assert_eq!(rename_time_bucket_alias("lag__timer"), "lag__timer");
+    }
+
+    // --- subquery source: inner GROUP BY time must expose `time` ---
+
+    #[test]
+    fn test_subquery_source_bucket_column_composes() {
+        // Built directly (the parser can't produce subqueries yet): the inner
+        // statement is translated, its `__time` alias renamed to `time`, and
+        // used as the outer FROM source.
+        let minute = Duration {
+            value: 1,
+            unit: DurationUnit::Minute,
+        };
+        let five_minutes = Duration {
+            value: 5,
+            unit: DurationUnit::Minute,
+        };
+        let inner = SelectStatement {
+            fields: vec![Field {
+                expr: Expr::Call(FunctionCall {
+                    name: "mean".to_string(),
+                    args: vec![Expr::Identifier("v".to_string())],
+                }),
+                alias: Some("x".to_string()),
+            }],
+            into: None,
+            from: vec![],
+            condition: None,
+            group_by: Some(GroupBy {
+                dimensions: vec![Dimension::Time {
+                    interval: minute,
+                    offset: None,
+                }],
+            }),
+            order_by: None,
+            limit: None,
+            offset: None,
+            slimit: None,
+            soffset: None,
+            fill: None,
+            timezone: None,
+        };
+        let inner_sql = translate_native_table(&inner, TEST_TABLE, None, None, None).unwrap();
+        let inner_sql = rename_time_bucket_alias(&inner_sql);
+        assert!(
+            inner_sql.contains("AS time"),
+            "inner bucket must be exposed as `time`, got: {inner_sql}"
+        );
+        assert!(!inner_sql.contains("__time"), "got: {inner_sql}");
+
+        let outer = SelectStatement {
+            fields: vec![Field {
+                expr: Expr::Call(FunctionCall {
+                    name: "max".to_string(),
+                    args: vec![Expr::Identifier("x".to_string())],
+                }),
+                alias: None,
+            }],
+            into: None,
+            from: vec![],
+            condition: None,
+            group_by: Some(GroupBy {
+                dimensions: vec![Dimension::Time {
+                    interval: five_minutes,
+                    offset: None,
+                }],
+            }),
+            order_by: None,
+            limit: None,
+            offset: None,
+            slimit: None,
+            soffset: None,
+            fill: None,
+            timezone: None,
+        };
+        let outer_sql = translate_with_source(&outer, &format!("({inner_sql})")).unwrap();
+        assert!(
+            outer_sql.contains("toStartOfInterval(time, INTERVAL 5 MINUTE) AS __time"),
+            "outer buckets the inner `time` column, got: {outer_sql}"
+        );
+        assert!(outer_sql.contains("max(\"x\")"), "got: {outer_sql}");
+    }
+
+    // --- tz() flows into bucketing and fill anchors ---
+
+    #[test]
+    fn test_timezone_in_bucket_expr_and_fill_anchors() {
+        let mut stmt = parse_select(
+            r#"SELECT mean("v") FROM m WHERE time >= 1000000000 AND time <= 3000000000 GROUP BY time(1d) fill(null)"#,
+        );
+        stmt.timezone = Some("America/New_York".to_string());
+        let sql = translate_native_table(
+            &stmt,
+            TEST_TABLE,
+            None,
+            None,
+            Some((Some(1_000_000_000), Some(3_000_000_000))),
+        )
+        .unwrap();
+        assert!(
+            sql.contains("toStartOfInterval(time, INTERVAL 1 DAY, 'America/New_York') AS __time"),
+            "bucket expression must carry the timezone, got: {sql}"
+        );
+        assert!(
+            sql.contains(
+                "WITH FILL FROM toStartOfInterval(fromUnixTimestamp64Nano(1000000000), INTERVAL 1 DAY, 'America/New_York')"
+            ),
+            "fill anchors must bucket in the same timezone, got: {sql}"
+        );
+        assert!(
+            sql.contains("GROUP BY toStartOfInterval(time, INTERVAL 1 DAY, 'America/New_York')"),
+            "GROUP BY must match the SELECT bucket expression, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_timezone_string_is_escaped() {
+        let mut stmt = parse_select(r#"SELECT mean("v") FROM m GROUP BY time(1h)"#);
+        stmt.timezone = Some("bad'zone".to_string());
+        let sql = translate_test_tz(&stmt);
+        assert!(
+            sql.contains("'bad\\'zone'"),
+            "timezone must go through quote_string escaping, got: {sql}"
+        );
+    }
+
+    fn translate_test_tz(stmt: &SelectStatement) -> String {
+        translate_native_table(stmt, TEST_TABLE, None, None, None).unwrap()
     }
 }

@@ -227,8 +227,116 @@ async fn percentile_and_spread_group_by_time() {
         .unwrap();
     let s = &series_of(&resp)[0];
     assert_eq!(fval(s, 0, "sp"), 30.0, "spread = max-min = 40-10");
-    let p50 = fval(s, 0, "p50");
-    assert!((20.0..=30.0).contains(&p50), "p50 in range, got {p50}");
+    // InfluxQL percentile is nearest-rank and returns an actual sample:
+    // p50 of [10,20,30,40] is exactly 20 (not an interpolated 25).
+    assert_eq!(fval(s, 0, "p50"), 20.0, "nearest-rank sample percentile");
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn median_averages_middle_pair_on_even_counts() {
+    let ctx = TestContext::new().unwrap();
+    ctx.metadata.create_database("db").await.unwrap();
+    let mut lp = String::new();
+    for (i, v) in [10.0, 20.0, 30.0, 40.0].iter().enumerate() {
+        lp.push_str(&format!("m v={v} {}\n", S + (i as i64) * (S / 10)));
+    }
+    ctx.write_and_flush("db", &lp).await.unwrap();
+
+    let resp = ctx
+        .query("db", "SELECT median(v) AS md FROM m")
+        .await
+        .unwrap();
+    let s = &series_of(&resp)[0];
+    // InfluxQL median of an even count averages the two middle samples.
+    assert_eq!(fval(s, 0, "md"), 25.0, "median([10,20,30,40]) = 25");
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn stddev_is_sample_stddev() {
+    let ctx = TestContext::new().unwrap();
+    ctx.metadata.create_database("db").await.unwrap();
+    let mut lp = String::new();
+    for (i, v) in [1.0, 2.0, 3.0, 4.0].iter().enumerate() {
+        lp.push_str(&format!("m v={v} {}\n", S + (i as i64) * (S / 10)));
+    }
+    ctx.write_and_flush("db", &lp).await.unwrap();
+
+    let resp = ctx
+        .query("db", "SELECT stddev(v) AS sd FROM m")
+        .await
+        .unwrap();
+    let s = &series_of(&resp)[0];
+    let expected = (5.0f64 / 3.0).sqrt(); // sample stddev of [1,2,3,4]
+    let sd = fval(s, 0, "sd");
+    assert!(
+        (sd - expected).abs() < 1e-9,
+        "InfluxQL stddev is the sample stddev {expected}, got {sd}"
+    );
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn mode_returns_scalar() {
+    let ctx = TestContext::new().unwrap();
+    ctx.metadata.create_database("db").await.unwrap();
+    ctx.write_and_flush(
+        "db",
+        &format!("m v=7.0 {}\nm v=7.0 {}\nm v=9.0 {}", S, 2 * S, 3 * S),
+    )
+    .await
+    .unwrap();
+
+    let resp = ctx
+        .query("db", "SELECT mode(v) AS mo FROM m")
+        .await
+        .unwrap();
+    let s = &series_of(&resp)[0];
+    assert_eq!(fval(s, 0, "mo"), 7.0, "mode must be a scalar, not an array");
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn distinct_and_count_distinct() {
+    let ctx = TestContext::new().unwrap();
+    ctx.metadata.create_database("db").await.unwrap();
+    ctx.write_and_flush(
+        "db",
+        &format!("m v=1.0 {}\nm v=1.0 {}\nm v=2.0 {}", S, 2 * S, 3 * S),
+    )
+    .await
+    .unwrap();
+
+    let resp = ctx
+        .query("db", "SELECT distinct(v) AS dv FROM m")
+        .await
+        .unwrap();
+    let s = &series_of(&resp)[0];
+    let mut vals: Vec<f64> = (0..s.values.len()).map(|r| fval(s, r, "dv")).collect();
+    vals.sort_by(f64::total_cmp);
+    assert_eq!(vals, vec![1.0, 2.0], "one row per distinct value");
+
+    let resp = ctx
+        .query("db", "SELECT count(distinct(v)) AS c FROM m")
+        .await
+        .unwrap();
+    let s = &series_of(&resp)[0];
+    assert_eq!(
+        fval(s, 0, "c"),
+        2.0,
+        "count(distinct(v)) is the exact count"
+    );
+
+    let resp = ctx
+        .query("db", "SELECT distinct(v) AS dv FROM m GROUP BY time(10s)")
+        .await
+        .unwrap();
+    assert!(
+        resp.results[0].error.is_none(),
+        "distinct(v) with GROUP BY time must be valid SQL: {:?}",
+        resp.results[0].error
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -995,4 +1103,494 @@ async fn swap_used_percent_survives_schema_evolution() {
         vec![10.0, 25.0],
         "used_percent must hold its own values"
     );
+}
+
+// ---------------------------------------------------------------------------
+// fill() grid correctness: fill(N) values, bound buckets, DESC, defaults
+// ---------------------------------------------------------------------------
+
+/// fill(100): WITH FILL-generated rows (leading, interior, and trailing gap
+/// buckets) must carry 100, not the column default 0.
+#[tokio::test]
+#[serial(chdb)]
+async fn fill_value_fills_leading_and_trailing_gap_buckets() {
+    let ctx = TestContext::new().unwrap();
+    ctx.metadata.create_database("db").await.unwrap();
+    // Data only at 3s; window 1s..=5s → gaps at 1,2 (leading) and 4,5 (trailing).
+    ctx.write_and_flush("db", &format!("m v=5.0 {}", 3 * S))
+        .await
+        .unwrap();
+
+    let resp = ctx
+        .query(
+            "db",
+            &format!(
+                "SELECT mean(v) AS a FROM m WHERE time >= {} AND time <= {} GROUP BY time(1s) fill(100)",
+                S,
+                5 * S
+            ),
+        )
+        .await
+        .unwrap();
+    let s = &series_of(&resp)[0];
+    assert_eq!(s.values.len(), 5, "full 5-bucket grid");
+    let vals: Vec<f64> = (0..5).map(|r| fval(s, r, "a")).collect();
+    assert_eq!(
+        vals,
+        vec![100.0, 100.0, 5.0, 100.0, 100.0],
+        "generated buckets must carry the fill value"
+    );
+}
+
+/// The bucket containing the upper WHERE bound must be generated even when it
+/// holds no data (`WITH FILL ... TO` is exclusive).
+#[tokio::test]
+#[serial(chdb)]
+async fn fill_generates_final_bucket_without_data() {
+    let ctx = TestContext::new().unwrap();
+    ctx.metadata.create_database("db").await.unwrap();
+    ctx.write_and_flush("db", &format!("m v=1.0 {}", S))
+        .await
+        .unwrap();
+
+    let resp = ctx
+        .query(
+            "db",
+            &format!(
+                "SELECT mean(v) AS a FROM m WHERE time >= {} AND time <= {} GROUP BY time(1s) fill(null)",
+                S,
+                3 * S
+            ),
+        )
+        .await
+        .unwrap();
+    let s = &series_of(&resp)[0];
+    assert_eq!(
+        s.values.len(),
+        3,
+        "grid must include the (empty) final bucket"
+    );
+    assert_eq!(fval(s, 0, "a"), 1.0);
+    assert!(is_null(s, 1, "a"));
+    assert!(is_null(s, 2, "a"), "trailing bucket generated and null");
+}
+
+/// ORDER BY time DESC + fill: the filled grid must exist and come back
+/// descending (WITH FILL on a DESC column generates nothing).
+#[tokio::test]
+#[serial(chdb)]
+async fn order_by_time_desc_with_fill_returns_descending_grid() {
+    let ctx = TestContext::new().unwrap();
+    ctx.metadata.create_database("db").await.unwrap();
+    ctx.write_and_flush("db", &format!("m v=7.0 {}\nm v=9.0 {}", S, 3 * S))
+        .await
+        .unwrap();
+
+    let resp = ctx
+        .query_service
+        .execute_query(
+            "db",
+            &format!(
+                "SELECT mean(v) AS a FROM m WHERE time >= {} AND time <= {} GROUP BY time(1s) fill(null) ORDER BY time DESC",
+                S,
+                4 * S
+            ),
+            Some("s"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let s = &series_of(&resp)[0];
+    assert_eq!(s.values.len(), 4, "full grid despite DESC");
+    let ti = idx(s, "time");
+    let times: Vec<i64> = s.values.iter().map(|r| r[ti].as_i64().unwrap()).collect();
+    assert_eq!(times, vec![4, 3, 2, 1], "descending bucket order");
+    assert!(is_null(s, 0, "a"), "4s gap bucket filled");
+    assert_eq!(fval(s, 1, "a"), 9.0);
+    assert!(is_null(s, 2, "a"), "2s gap bucket filled");
+    assert_eq!(fval(s, 3, "a"), 7.0);
+}
+
+/// InfluxQL default: GROUP BY time() without fill() behaves as fill(null) —
+/// every bucket in the bounded range is emitted with NULL aggregates.
+#[tokio::test]
+#[serial(chdb)]
+async fn missing_fill_defaults_to_fill_null_grid() {
+    let ctx = TestContext::new().unwrap();
+    ctx.metadata.create_database("db").await.unwrap();
+    ctx.write_and_flush("db", &format!("m v=7.0 {}\nm v=9.0 {}", S, 3 * S))
+        .await
+        .unwrap();
+
+    let resp = ctx
+        .query(
+            "db",
+            &format!(
+                "SELECT mean(v) AS a FROM m WHERE time >= {} AND time <= {} GROUP BY time(1s)",
+                S,
+                4 * S
+            ),
+        )
+        .await
+        .unwrap();
+    let s = &series_of(&resp)[0];
+    assert_eq!(s.values.len(), 4, "default fill(null) emits the full grid");
+    assert_eq!(fval(s, 0, "a"), 7.0);
+    assert!(is_null(s, 1, "a"), "gap bucket present and null by default");
+    assert_eq!(fval(s, 2, "a"), 9.0);
+    assert!(is_null(s, 3, "a"), "trailing bucket present and null");
+}
+
+/// GROUP BY time(1m, 30s): the fill grid anchors must use the offset bucket
+/// shape, or phantom buckets interleave between the real 30s-aligned ones.
+#[tokio::test]
+#[serial(chdb)]
+async fn fill_grid_respects_group_by_time_offset() {
+    let ctx = TestContext::new().unwrap();
+    ctx.metadata.create_database("db").await.unwrap();
+    ctx.write_and_flush("db", &format!("m v=1.0 {}", 90 * S))
+        .await
+        .unwrap();
+
+    let resp = ctx
+        .query_service
+        .execute_query(
+            "db",
+            &format!(
+                "SELECT mean(v) AS a FROM m WHERE time >= {} AND time <= {} GROUP BY time(1m, 30s) fill(null)",
+                30 * S,
+                150 * S
+            ),
+            Some("s"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let s = &series_of(&resp)[0];
+    let ti = idx(s, "time");
+    let times: Vec<i64> = s.values.iter().map(|r| r[ti].as_i64().unwrap()).collect();
+    assert_eq!(
+        times,
+        vec![30, 90, 150],
+        "grid must be exactly the 30s-offset buckets (no interleaved phantoms)"
+    );
+    assert_eq!(fval(s, 1, "a"), 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// LIMIT is points-per-series; raw selects with GROUP BY tag
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial(chdb)]
+async fn limit_applies_per_series_with_group_by_tag() {
+    let ctx = TestContext::new().unwrap();
+    ctx.metadata.create_database("db").await.unwrap();
+    let mut lp = String::new();
+    for host in ["a", "b"] {
+        for i in 1..=3i64 {
+            lp.push_str(&format!("m,host={host} v={i}.0 {}\n", i * S));
+        }
+    }
+    ctx.write_and_flush("db", &lp).await.unwrap();
+
+    let resp = ctx
+        .query(
+            "db",
+            "SELECT mean(v) AS a FROM m GROUP BY time(1s), host fill(none) LIMIT 2",
+        )
+        .await
+        .unwrap();
+    let series = series_of(&resp);
+    assert_eq!(series.len(), 2, "both series survive LIMIT");
+    for s in series {
+        assert_eq!(
+            s.values.len(),
+            2,
+            "LIMIT 2 caps points per series, host {}",
+            tag(s, "host")
+        );
+        assert_eq!(fval(s, 0, "a"), 1.0, "earliest points first");
+    }
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn limit_offset_apply_per_series_for_raw_select_group_by_tag() {
+    let ctx = TestContext::new().unwrap();
+    ctx.metadata.create_database("db").await.unwrap();
+    let mut lp = String::new();
+    for host in ["a", "b"] {
+        for i in 1..=3i64 {
+            lp.push_str(&format!("m,host={host} v={i}.0 {}\n", i * S));
+        }
+    }
+    ctx.write_and_flush("db", &lp).await.unwrap();
+
+    let resp = ctx
+        .query("db", "SELECT v FROM m GROUP BY host LIMIT 1 OFFSET 1")
+        .await
+        .unwrap();
+    let series = series_of(&resp);
+    assert_eq!(series.len(), 2, "both series survive LIMIT/OFFSET");
+    for s in series {
+        assert_eq!(s.values.len(), 1, "one point per series after offset");
+        assert_eq!(fval(s, 0, "v"), 2.0, "OFFSET 1 skips the first point");
+    }
+}
+
+/// Raw (non-aggregate) SELECT with GROUP BY tag: previously emitted
+/// NOT_AN_AGGREGATE SQL; must split into per-tag series with raw points.
+#[tokio::test]
+#[serial(chdb)]
+async fn raw_select_with_group_by_tag_splits_series() {
+    let ctx = TestContext::new().unwrap();
+    ctx.metadata.create_database("db").await.unwrap();
+    ctx.write_and_flush(
+        "db",
+        &format!(
+            "m,host=a v=1.0 {}\nm,host=a v=2.0 {}\nm,host=b v=10.0 {}",
+            S,
+            2 * S,
+            S
+        ),
+    )
+    .await
+    .unwrap();
+
+    let resp = ctx
+        .query("db", "SELECT v FROM m GROUP BY host")
+        .await
+        .unwrap();
+    let series = series_of(&resp);
+    assert_eq!(series.len(), 2, "one series per host");
+    let a = series
+        .iter()
+        .find(|s| tag(s, "host") == "a")
+        .expect("host a");
+    let b = series
+        .iter()
+        .find(|s| tag(s, "host") == "b")
+        .expect("host b");
+    assert_eq!(a.columns[0], "time");
+    assert_eq!(a.values.len(), 2);
+    assert_eq!(fval(a, 0, "v"), 1.0);
+    assert_eq!(fval(a, 1, "v"), 2.0);
+    assert_eq!(b.values.len(), 1);
+    assert_eq!(fval(b, 0, "v"), 10.0);
+    assert!(
+        !a.columns.contains(&"host".to_string()),
+        "tag must be in tags, not columns"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Per-point window transforms without GROUP BY time
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial(chdb)]
+async fn difference_without_group_by_time_is_influx_shaped() {
+    let ctx = TestContext::new().unwrap();
+    ctx.metadata.create_database("db").await.unwrap();
+    ctx.write_and_flush(
+        "db",
+        &format!("m v=1.0 {}\nm v=3.0 {}\nm v=6.0 {}", S, 2 * S, 3 * S),
+    )
+    .await
+    .unwrap();
+
+    let resp = ctx
+        .query_service
+        .execute_query(
+            "db",
+            "SELECT difference(v) AS d FROM m",
+            Some("s"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let s = &series_of(&resp)[0];
+    assert_eq!(s.columns[0], "time", "transform output must carry time");
+    assert_eq!(
+        s.values.len(),
+        2,
+        "first point has no previous value and is omitted"
+    );
+    let ti = idx(s, "time");
+    assert_eq!(s.values[0][ti].as_i64().unwrap(), 2, "ordered by time");
+    assert_eq!(fval(s, 0, "d"), 2.0);
+    assert_eq!(fval(s, 1, "d"), 3.0);
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn moving_average_without_group_by_time_waits_for_full_window() {
+    let ctx = TestContext::new().unwrap();
+    ctx.metadata.create_database("db").await.unwrap();
+    ctx.write_and_flush(
+        "db",
+        &format!("m v=1.0 {}\nm v=3.0 {}\nm v=6.0 {}", S, 2 * S, 3 * S),
+    )
+    .await
+    .unwrap();
+
+    let resp = ctx
+        .query("db", "SELECT moving_average(v, 2) AS ma FROM m")
+        .await
+        .unwrap();
+    let s = &series_of(&resp)[0];
+    assert_eq!(
+        s.values.len(),
+        2,
+        "rows appear only once the window holds 2 points"
+    );
+    assert_eq!(fval(s, 0, "ma"), 2.0, "avg(1,3)");
+    assert_eq!(fval(s, 1, "ma"), 4.5, "avg(3,6)");
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn cumulative_sum_without_group_by_time_keeps_all_points_in_order() {
+    let ctx = TestContext::new().unwrap();
+    ctx.metadata.create_database("db").await.unwrap();
+    ctx.write_and_flush(
+        "db",
+        &format!("m v=1.0 {}\nm v=2.0 {}\nm v=3.0 {}", 2 * S, S, 3 * S),
+    )
+    .await
+    .unwrap();
+
+    let resp = ctx
+        .query("db", "SELECT cumulative_sum(v) AS cs FROM m")
+        .await
+        .unwrap();
+    let s = &series_of(&resp)[0];
+    assert_eq!(s.columns[0], "time");
+    let cs: Vec<f64> = (0..s.values.len()).map(|r| fval(s, r, "cs")).collect();
+    assert_eq!(cs, vec![2.0, 3.0, 6.0], "running total in time order");
+}
+
+// ---------------------------------------------------------------------------
+// Tag compared to a numeric literal
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial(chdb)]
+async fn tag_compared_to_number_returns_empty_not_error() {
+    let ctx = TestContext::new().unwrap();
+    ctx.metadata.create_database("db").await.unwrap();
+    ctx.write_and_flush("db", &format!("m,host=3 v=1.0 {}", S))
+        .await
+        .unwrap();
+
+    let resp = ctx
+        .query("db", "SELECT mean(v) AS a FROM m WHERE host = 3")
+        .await
+        .unwrap();
+    assert!(
+        resp.results[0].error.is_none(),
+        "tag vs number must not error: {:?}",
+        resp.results[0].error
+    );
+    assert!(
+        series_of(&resp).is_empty()
+            || series_of(&resp).iter().all(|s| s
+                .values
+                .iter()
+                .all(|r| r.iter().skip(1).all(|v| v.is_null()))),
+        "tag vs number matches nothing (tags are strings)"
+    );
+
+    // The string form still matches.
+    let resp = ctx
+        .query("db", "SELECT mean(v) AS a FROM m WHERE host = '3'")
+        .await
+        .unwrap();
+    let s = &series_of(&resp)[0];
+    assert_eq!(fval(s, 0, "a"), 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// tz(): DST-correct GROUP BY time(1d) bucketing
+// ---------------------------------------------------------------------------
+
+/// America/New_York DST starts 2026-03-08 02:00 local: that local day is 23
+/// hours. Buckets and the fill grid must align on local midnights (05:00Z
+/// before the transition, 04:00Z after). Exercises the translator + chDB
+/// directly (the parser-side tz() handling is fixed separately).
+#[tokio::test]
+#[serial(chdb)]
+async fn tz_group_by_day_is_dst_correct() {
+    use hyperbytedb::timeseriesql::ast::Statement;
+    use hyperbytedb::timeseriesql::to_clickhouse;
+
+    let ctx = TestContext::new().unwrap();
+    ctx.metadata.create_database("db").await.unwrap();
+
+    const MAR8_LOCAL_MIDNIGHT_UTC: i64 = 1_772_946_000; // 2026-03-08 05:00Z = 00:00 EST
+    const MAR9_LOCAL_MIDNIGHT_UTC: i64 = 1_773_028_800; // 2026-03-09 04:00Z = 00:00 EDT (23h day)
+    let point_a = (MAR8_LOCAL_MIDNIGHT_UTC + 3600) * S; // 01:00 EST Mar 8
+    let point_b = (MAR9_LOCAL_MIDNIGHT_UTC - 3 * 3600) * S; // 21:00 EDT Mar 8 (still local Mar 8)
+    let point_c = (MAR9_LOCAL_MIDNIGHT_UTC + 3600) * S; // 01:00 EDT Mar 9
+    ctx.write_and_flush(
+        "db",
+        &format!("mtz v=1.0 {point_a}\nmtz v=1.0 {point_b}\nmtz v=1.0 {point_c}"),
+    )
+    .await
+    .unwrap();
+
+    let min = MAR8_LOCAL_MIDNIGHT_UTC * S;
+    let max = point_c;
+    let q = format!(
+        "SELECT count(v) AS c FROM mtz WHERE time >= {min} AND time <= {max} GROUP BY time(1d) fill(null)"
+    );
+    let mut stmt = match hyperbytedb::timeseriesql::parse(&q)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+    {
+        Statement::Select(s) => s,
+        _ => panic!("expected SELECT"),
+    };
+    // The parser-side tz() fix lands separately; inject the zone directly.
+    stmt.timezone = Some("America/New_York".to_string());
+
+    let sql = to_clickhouse::translate_native_table(
+        &stmt,
+        "`db_autogen_mtz`",
+        None,
+        None,
+        Some((Some(min), Some(max))),
+    )
+    .unwrap();
+    let wrapped =
+        format!("SELECT toUnixTimestamp(__time) AS bucket, c FROM ({sql}) ORDER BY bucket");
+    let raw = ctx.query_port.execute_sql(&wrapped).await.unwrap();
+
+    let rows: Vec<(i64, Option<i64>)> = raw
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).unwrap();
+            (
+                v["bucket"].as_i64().unwrap(),
+                v["c"]
+                    .as_i64()
+                    .or_else(|| v["c"].as_str().and_then(|s| s.parse().ok())),
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        rows.iter().map(|(b, _)| *b).collect::<Vec<_>>(),
+        vec![MAR8_LOCAL_MIDNIGHT_UTC, MAR9_LOCAL_MIDNIGHT_UTC],
+        "1d buckets must start at local midnight across the 23-hour DST day"
+    );
+    assert_eq!(rows[0].1, Some(2), "both Mar 8 local points in one bucket");
+    assert_eq!(rows[1].1, Some(1), "Mar 9 local point in the next bucket");
 }

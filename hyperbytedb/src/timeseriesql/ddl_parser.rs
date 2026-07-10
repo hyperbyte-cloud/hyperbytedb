@@ -15,7 +15,7 @@ pub fn parse_ddl_statement(input: &str) -> Result<Statement, HyperbytedbError> {
     let first = cur
         .peek()
         .ok_or_else(|| HyperbytedbError::QueryParse("empty statement".to_string()))?;
-    match &first.kind {
+    let stmt = match &first.kind {
         TokenKind::Keyword(k) => match k.as_str() {
             "SHOW" => parse_show(&mut cur),
             "CREATE" => parse_create(&mut cur),
@@ -33,7 +33,18 @@ pub fn parse_ddl_statement(input: &str) -> Result<Statement, HyperbytedbError> {
             "expected statement keyword, found {:?}",
             first.kind
         ))),
+    }?;
+    // Trailing tokens mean an unsupported or misplaced clause. Silently
+    // ignoring them turned e.g. `CREATE USER x WITH PASSWORD 'p' WITH ALL
+    // PRIVILEGES` into a non-admin user and `SHOW MEASUREMENTS WITH
+    // MEASUREMENT =~ /re/` into an unfiltered listing.
+    if let Some(tok) = cur.peek() {
+        return Err(HyperbytedbError::QueryParse(format!(
+            "unexpected trailing input: '{}'",
+            cur.remaining_from(tok).trim()
+        )));
     }
+    Ok(stmt)
 }
 
 fn parse_show(cur: &mut TokenCursor<'_>) -> Result<Statement, HyperbytedbError> {
@@ -65,6 +76,15 @@ fn parse_show(cur: &mut TokenCursor<'_>) -> Result<Statement, HyperbytedbError> 
                     limit: None,
                     offset: None,
                 };
+                // Previously this clause was silently dropped, listing every
+                // measurement unfiltered. Reject loudly until implemented.
+                if cur.match_keyword("WITH") {
+                    return Err(HyperbytedbError::QueryParse(
+                        "SHOW MEASUREMENTS WITH MEASUREMENT is not supported; \
+                         use a WHERE clause instead"
+                            .to_string(),
+                    ));
+                }
                 parse_show_tail(
                     cur,
                     &mut stmt.database,
@@ -79,11 +99,7 @@ fn parse_show(cur: &mut TokenCursor<'_>) -> Result<Statement, HyperbytedbError> 
                 let sub = cur.take_ident()?;
                 match sub.to_uppercase().as_str() {
                     "KEYS" => {
-                        let from = parse_optional_from_measurement(cur)?;
-                        let mut database = None;
-                        if database.is_none() {
-                            database = parse_optional_on_db(cur)?;
-                        }
+                        let (mut database, from) = parse_show_on_from(cur)?;
                         let mut condition = None;
                         let mut limit = None;
                         let mut offset = None;
@@ -103,8 +119,7 @@ fn parse_show(cur: &mut TokenCursor<'_>) -> Result<Statement, HyperbytedbError> 
                         }))
                     }
                     "VALUES" => {
-                        let from = parse_optional_from_measurement(cur)?;
-                        let mut database = parse_optional_on_db(cur)?;
+                        let (mut database, from) = parse_show_on_from(cur)?;
                         let tag_key = parse_with_key(cur)?;
                         let mut condition = None;
                         let mut limit = None;
@@ -133,8 +148,7 @@ fn parse_show(cur: &mut TokenCursor<'_>) -> Result<Statement, HyperbytedbError> 
             "FIELD" => {
                 cur.bump();
                 cur.expect_keyword("KEYS")?;
-                let from = parse_optional_from_measurement(cur)?;
-                let database = parse_optional_on_db(cur)?;
+                let (database, from) = parse_show_on_from(cur)?;
                 Ok(Statement::ShowFieldKeys(ShowFieldKeysStatement {
                     database,
                     from,
@@ -142,8 +156,7 @@ fn parse_show(cur: &mut TokenCursor<'_>) -> Result<Statement, HyperbytedbError> 
             }
             "SERIES" => {
                 cur.bump();
-                let from = parse_optional_from_measurement(cur)?;
-                let mut database = parse_optional_on_db(cur)?;
+                let (mut database, from) = parse_show_on_from(cur)?;
                 let mut condition = None;
                 let mut limit = None;
                 let mut offset = None;
@@ -252,6 +265,22 @@ fn parse_create_database(cur: &mut TokenCursor<'_>) -> Result<Statement, Hyperby
                 }
                 _ => break,
             }
+        }
+    }
+    // Same rules as retention policies: zero means infinite (represented as
+    // no duration → engine default), anything else must be at least 1h.
+    if let Some(ref d) = stmt.duration {
+        if d.to_nanos() == 0 {
+            stmt.duration = None;
+        } else {
+            validate_rp_duration(d)?;
+        }
+    }
+    if let Some(ref sd) = stmt.shard_duration {
+        if sd.to_nanos() == 0 {
+            stmt.shard_duration = None;
+        } else {
+            validate_rp_duration(sd)?;
         }
     }
     Ok(Statement::CreateDatabase(stmt))
@@ -363,6 +392,12 @@ fn parse_alter(cur: &mut TokenCursor<'_>) -> Result<Statement, HyperbytedbError>
             "ALTER RETENTION POLICY requires at least one option".to_string(),
         ));
     }
+    if let Some(ref d) = duration {
+        validate_rp_duration(d)?;
+    }
+    if let Some(ref sd) = shard_duration {
+        validate_rp_duration(sd)?;
+    }
     Ok(Statement::AlterRetentionPolicyStmt {
         name,
         db,
@@ -422,7 +457,9 @@ fn validate_cq_mv_select(stmt: &SelectStatement) -> Result<(), HyperbytedbError>
 fn validate_delete_predicate(expr: &Expr) -> Result<(), HyperbytedbError> {
     if !expr_is_time_only(expr) {
         return Err(HyperbytedbError::QueryParse(
-            "fields not allowed in DELETE WHERE clause".to_string(),
+            "only time predicates are supported in DELETE WHERE clause \
+             (tag and field filters are not supported)"
+                .to_string(),
         ));
     }
     Ok(())
@@ -502,6 +539,11 @@ fn parse_create_retention_policy(cur: &mut TokenCursor<'_>) -> Result<Statement,
 
 fn validate_rp_duration(d: &Duration) -> Result<(), HyperbytedbError> {
     let nanos = d.to_nanos();
+    if nanos < 0 {
+        return Err(HyperbytedbError::QueryParse(
+            "retention policy duration must not be negative".to_string(),
+        ));
+    }
     if nanos > 0 && nanos < MIN_RP_DURATION_NANOS {
         return Err(HyperbytedbError::QueryParse(
             "retention policy duration must be at least 1h or infinite (0/INF)".to_string(),
@@ -514,13 +556,20 @@ fn parse_create_user(cur: &mut TokenCursor<'_>) -> Result<Statement, Hyperbytedb
     let username = cur.take_ident()?;
     let mut password = String::new();
     let mut admin = false;
-    if cur.match_keyword("WITH") {
+    // InfluxQL: CREATE USER u WITH PASSWORD 'p' [WITH ALL PRIVILEGES] — the
+    // clauses come as separate WITH blocks in either order. Consuming only the
+    // first one silently created a non-admin user from the canonical admin
+    // statement.
+    while cur.match_keyword("WITH") {
         if cur.match_keyword("ALL") {
             let _ = cur.match_keyword("PRIVILEGES");
             admin = true;
-        }
-        if cur.match_keyword("PASSWORD") {
+        } else if cur.match_keyword("PASSWORD") {
             password = parse_password_value(cur)?;
+        } else {
+            return Err(HyperbytedbError::QueryParse(
+                "expected PASSWORD or ALL PRIVILEGES after WITH".to_string(),
+            ));
         }
     }
     Ok(Statement::CreateUser {
@@ -633,6 +682,12 @@ fn parse_create_materialized_view(
         let inner = cur.input[start..].trim();
         let stmt = crate::timeseriesql::parser::parse_select_statement(inner)?;
         validate_cq_mv_select(&stmt)?;
+        // The SELECT body was consumed as a raw slice; drain its tokens so the
+        // trailing-input check in `parse_ddl_statement` doesn't fire. (Guard on
+        // peek: `bump()` returns the Eof token without advancing.)
+        while cur.peek().is_some() {
+            cur.bump();
+        }
         (inner.to_string(), stmt)
     } else {
         let (raw, stmt) = extract_begin_end_select(cur)?;
@@ -717,6 +772,32 @@ fn parse_optional_from_measurement(
     }
 }
 
+/// Parse `[ON db]` and `[FROM measurement]` in either order (InfluxQL's SHOW
+/// grammar puts ON first; the previous FROM-then-ON parsing silently dropped
+/// both clauses for the documented order).
+fn parse_show_on_from(
+    cur: &mut TokenCursor<'_>,
+) -> Result<(Option<String>, Option<Measurement>), HyperbytedbError> {
+    let mut database = None;
+    let mut from = None;
+    loop {
+        if database.is_none()
+            && let Some(db) = parse_optional_on_db(cur)?
+        {
+            database = Some(db);
+            continue;
+        }
+        if from.is_none()
+            && let Some(m) = parse_optional_from_measurement(cur)?
+        {
+            from = Some(m);
+            continue;
+        }
+        break;
+    }
+    Ok((database, from))
+}
+
 fn parse_measurement_ref(cur: &mut TokenCursor<'_>) -> Result<Measurement, HyperbytedbError> {
     let first = cur.take_ident()?;
     if matches!(
@@ -792,28 +873,38 @@ fn parse_with_key(cur: &mut TokenCursor<'_>) -> Result<TagKeySelector, Hyperbyte
 }
 
 fn parse_duration_token(cur: &mut TokenCursor<'_>) -> Result<Duration, HyperbytedbError> {
+    const INFINITE: Duration = Duration {
+        value: 0,
+        unit: DurationUnit::Second,
+    };
+    // Zero of any unit normalizes to the infinite sentinel (0s) so `DURATION
+    // 0m` means infinite like InfluxDB, not a finite zero. Negative durations
+    // are rejected outright: downstream retention math casts through u64, so
+    // a negative duration wrapped into a cutoff in the future and deleted
+    // every point in the measurement.
+    let check = |n: i64| -> Result<Duration, HyperbytedbError> {
+        if n < 0 {
+            return Err(HyperbytedbError::QueryParse(
+                "duration must not be negative".to_string(),
+            ));
+        }
+        if n == 0 {
+            return Ok(INFINITE);
+        }
+        Ok(nanos_to_ast_duration(n))
+    };
     let tok = cur
         .bump()
         .ok_or_else(|| HyperbytedbError::QueryParse("expected duration".to_string()))?;
     match tok.kind {
-        TokenKind::Duration { nanos: None } => Ok(Duration {
-            value: 0,
-            unit: DurationUnit::Second,
-        }),
-        TokenKind::Duration { nanos: Some(n) } => Ok(nanos_to_ast_duration(n)),
-        TokenKind::Ident(s) if s.eq_ignore_ascii_case("INF") => Ok(Duration {
-            value: 0,
-            unit: DurationUnit::Second,
-        }),
+        TokenKind::Duration { nanos: None } => Ok(INFINITE),
+        TokenKind::Duration { nanos: Some(n) } => check(n),
+        TokenKind::Ident(s) if s.eq_ignore_ascii_case("INF") => Ok(INFINITE),
         _ => {
             let text = cur.slice(&tok);
-            let nanos = parse_duration_text(text)?;
-            match nanos {
-                None => Ok(Duration {
-                    value: 0,
-                    unit: DurationUnit::Second,
-                }),
-                Some(n) => Ok(nanos_to_ast_duration(n)),
+            match parse_duration_text(text)? {
+                None => Ok(INFINITE),
+                Some(n) => check(n),
             }
         }
     }
@@ -830,9 +921,9 @@ fn parse_replication(cur: &mut TokenCursor<'_>) -> Result<u32, HyperbytedbError>
             .parse()
             .map_err(|_| HyperbytedbError::QueryParse("invalid REPLICATION".to_string()))?,
     };
-    if n < 1 {
+    if n < 1 || n > u32::MAX as i64 {
         return Err(HyperbytedbError::QueryParse(
-            "REPLICATION must be at least 1".to_string(),
+            "REPLICATION must be between 1 and 4294967295".to_string(),
         ));
     }
     Ok(n as u32)
@@ -1013,5 +1104,152 @@ mod tests {
     fn drop_measurement_rejects_regex() {
         let result = parse_ddl_statement(r#"DROP MEASUREMENT /^server/"#);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn create_user_password_then_all_privileges_is_admin() {
+        let stmt =
+            parse_ddl_statement("CREATE USER paul WITH PASSWORD 'pw' WITH ALL PRIVILEGES").unwrap();
+        match stmt {
+            Statement::CreateUser {
+                username,
+                password,
+                admin,
+            } => {
+                assert_eq!(username, "paul");
+                assert_eq!(password, "pw");
+                assert!(admin, "second WITH block must set admin");
+            }
+            other => panic!("expected CreateUser, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_user_all_privileges_then_password_is_admin() {
+        let stmt =
+            parse_ddl_statement("CREATE USER paul WITH ALL PRIVILEGES WITH PASSWORD 'pw'").unwrap();
+        match stmt {
+            Statement::CreateUser {
+                password, admin, ..
+            } => {
+                assert_eq!(password, "pw");
+                assert!(admin);
+            }
+            other => panic!("expected CreateUser, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn negative_durations_rejected_everywhere() {
+        for q in [
+            "CREATE RETENTION POLICY rp ON db DURATION -1h REPLICATION 1",
+            "CREATE RETENTION POLICY rp ON db DURATION 2h REPLICATION 1 SHARD DURATION -30m",
+            "CREATE DATABASE db WITH DURATION -1h",
+            "ALTER RETENTION POLICY rp ON db DURATION -1h",
+        ] {
+            assert!(
+                parse_ddl_statement(q).is_err(),
+                "negative duration must be rejected: {q}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_duration_any_unit_means_infinite() {
+        let stmt =
+            parse_ddl_statement("CREATE RETENTION POLICY rp ON db DURATION 0m REPLICATION 1")
+                .unwrap();
+        match stmt {
+            Statement::CreateRetentionPolicyStmt { duration, .. } => {
+                assert!(duration.is_none(), "0m must mean infinite");
+            }
+            other => panic!("expected CreateRetentionPolicyStmt, got {other:?}"),
+        }
+        let stmt = parse_ddl_statement("CREATE DATABASE db WITH DURATION 0d").unwrap();
+        match stmt {
+            Statement::CreateDatabase(s) => {
+                assert!(s.duration.is_none(), "0d must mean infinite");
+            }
+            other => panic!("expected CreateDatabase, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn show_statements_accept_on_before_from() {
+        let stmt =
+            parse_ddl_statement(r#"SHOW TAG VALUES ON mydb FROM cpu WITH KEY = "host""#).unwrap();
+        match stmt {
+            Statement::ShowTagValues(s) => {
+                assert_eq!(s.database.as_deref(), Some("mydb"));
+                assert!(s.from.is_some(), "FROM cpu must be captured");
+                assert!(matches!(s.tag_key, TagKeySelector::Eq(ref k) if k == "host"));
+            }
+            other => panic!("expected ShowTagValues, got {other:?}"),
+        }
+        let stmt = parse_ddl_statement("SHOW TAG KEYS ON mydb FROM cpu").unwrap();
+        match stmt {
+            Statement::ShowTagKeys(s) => {
+                assert_eq!(s.database.as_deref(), Some("mydb"));
+                assert!(s.from.is_some());
+            }
+            other => panic!("expected ShowTagKeys, got {other:?}"),
+        }
+        let stmt = parse_ddl_statement("SHOW FIELD KEYS ON db FROM cpu").unwrap();
+        match stmt {
+            Statement::ShowFieldKeys(s) => {
+                assert_eq!(s.database.as_deref(), Some("db"));
+                assert!(s.from.is_some());
+            }
+            other => panic!("expected ShowFieldKeys, got {other:?}"),
+        }
+        let stmt = parse_ddl_statement(r#"SHOW SERIES ON db FROM cpu WHERE "host" = 'a'"#).unwrap();
+        match stmt {
+            Statement::ShowSeries(s) => {
+                assert_eq!(s.database.as_deref(), Some("db"));
+                assert!(s.from.is_some());
+                assert!(s.condition.is_some(), "WHERE must be captured");
+            }
+            other => panic!("expected ShowSeries, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trailing_garbage_rejected() {
+        assert!(parse_ddl_statement("DROP DATABASE foo bar baz").is_err());
+        let err = parse_ddl_statement("SHOW MEASUREMENTS WITH MEASUREMENT =~ /cpu/").unwrap_err();
+        assert!(
+            err.to_string().contains("not supported"),
+            "WITH MEASUREMENT must fail loudly, got: {err}"
+        );
+    }
+
+    #[test]
+    fn replication_out_of_u32_range_rejected() {
+        assert!(
+            parse_ddl_statement(
+                "CREATE RETENTION POLICY rp ON db DURATION 1h REPLICATION 4294967296"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn keyword_named_identifiers_keep_source_spelling() {
+        match parse_ddl_statement("CREATE DATABASE offset").unwrap() {
+            Statement::CreateDatabase(s) => assert_eq!(s.name, "offset"),
+            other => panic!("expected CreateDatabase, got {other:?}"),
+        }
+        match parse_ddl_statement("DROP DATABASE Field").unwrap() {
+            Statement::DropDatabase(name) => assert_eq!(name, "Field"),
+            other => panic!("expected DropDatabase, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_materialized_view_as_select_survives_trailing_check() {
+        let stmt = parse_ddl_statement(
+            r#"CREATE MATERIALIZED VIEW mv ON db AS SELECT mean("v") FROM m GROUP BY time(5m)"#,
+        );
+        assert!(stmt.is_ok(), "AS-form MV must parse: {stmt:?}");
     }
 }

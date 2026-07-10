@@ -69,7 +69,7 @@ services:
       - "3000:3000"
     volumes:
       - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
-      - ./grafana/provisioning/datasources/datasources.getting-started.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+      - ./grafana/datasources.getting-started.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
       - grafana-data:/var/lib/grafana
     environment:

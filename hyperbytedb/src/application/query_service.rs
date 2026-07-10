@@ -1578,6 +1578,17 @@ fn inject_tombstone_predicates(sql: String, tombstones: &[(String, String)]) -> 
     if tombstones.is_empty() {
         return sql;
     }
+    // Wrapped translations (`ORDER BY time DESC` + fill, per-point transform
+    // NULL filtering) hold the real query in an inner SELECT whose closing
+    // `\n) ` line carries the outer clauses; splice predicates into the inner.
+    if let Some(inner_and_tail) = sql.strip_prefix("SELECT * FROM (\n")
+        && let Some(end) = inner_and_tail.rfind("\n) ")
+    {
+        let inner = inner_and_tail[..end].to_string();
+        let tail = &inner_and_tail[end..];
+        let injected = inject_tombstone_predicates(inner, tombstones);
+        return format!("SELECT * FROM (\n{injected}{tail}");
+    }
     let mut result = sql;
     for (_id, predicate) in tombstones {
         if predicate.is_empty() {
@@ -1750,6 +1761,10 @@ async fn execute_select_from_source(
                 sub_series_join,
                 Some((time_min, time_max)),
             )?;
+            // A GROUP BY time() inner query exposes its bucket column under the
+            // internal `__time` alias; as a FROM source it must expose `time`
+            // so the outer query's bucketing/ordering can reference it.
+            let sub_sql = to_clickhouse::rename_time_bucket_alias(&sub_sql);
             let outer_sql = to_clickhouse::translate_with_source(
                 &select_stmt_expanded,
                 &format!("({sub_sql})"),

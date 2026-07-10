@@ -756,8 +756,12 @@ async fn subquery() {
     .await
     .unwrap();
 
+    // Concrete field (not `mean(*)`): the wildcard-aggregate form is a separate
+    // unimplemented feature. Before subqueries parsed, this test passed
+    // vacuously — the mangled `FROM (...)` collapsed to an empty result with no
+    // error — so it never actually exercised the subquery path. It does now.
     let resp = ctx
-        .query("testdb", "SELECT mean(*) FROM (SELECT * FROM cpu)")
+        .query("testdb", "SELECT mean(value) FROM (SELECT * FROM cpu)")
         .await
         .unwrap();
     assert!(
@@ -765,6 +769,11 @@ async fn subquery() {
         "Subquery should be supported: {:?}",
         resp.results[0].error
     );
+    let series = resp.results[0]
+        .series
+        .as_ref()
+        .expect("subquery must return a series");
+    assert_eq!(series[0].values.len(), 1, "mean over 2 points → 1 row");
 }
 
 // ---------------------------------------------------------------------------
