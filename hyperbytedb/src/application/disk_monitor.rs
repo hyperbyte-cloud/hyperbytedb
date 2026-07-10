@@ -27,7 +27,7 @@ pub fn free_bytes(path: &Path) -> std::io::Result<u64> {
     if rc != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(stat.f_bavail as u64 * stat.f_frsize as u64)
+    Ok(stat.f_bavail * stat.f_frsize)
 }
 
 pub async fn run_disk_monitor(
