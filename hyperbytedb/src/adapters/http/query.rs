@@ -72,21 +72,71 @@ fn merge_form_body(query: QueryParams, body: &[u8]) -> QueryParams {
     }
 }
 
+fn escape_bind_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn bind_param_replacement(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => format!("'{}'", escape_bind_string(s)),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Null => "NULL".to_string(),
+        _ => value.to_string(),
+    }
+}
+
+fn is_bind_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// Replace `$name` only on token boundaries so `$host` does not match inside
+/// `$hostname`.
+fn replace_bind_param(query: &str, key: &str, replacement: &str) -> String {
+    let placeholder = format!("${key}");
+    let mut out = String::with_capacity(query.len());
+    let mut i = 0usize;
+    while i < query.len() {
+        if query[i..].starts_with(&placeholder) {
+            let end = i + placeholder.len();
+            let boundary_ok =
+                end >= query.len() || !query[end..].chars().next().is_some_and(is_bind_ident_char);
+            if boundary_ok {
+                out.push_str(replacement);
+                i = end;
+                continue;
+            }
+        }
+        let ch = match query[i..].chars().next() {
+            Some(c) => c,
+            None => break,
+        };
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 fn substitute_bind_params(query: &str, params_json: &str) -> Result<String, HyperbytedbError> {
     let params: serde_json::Map<String, serde_json::Value> = serde_json::from_str(params_json)
         .map_err(|e| HyperbytedbError::QueryParse(format!("invalid params JSON: {e}")))?;
 
+    // Longest keys first so `$hostname` is substituted before `$host`.
+    let mut keys: Vec<&String> = params.keys().collect();
+    keys.sort_by_key(|b| std::cmp::Reverse(b.len()));
+
     let mut result = query.to_string();
-    for (key, value) in &params {
-        let placeholder = format!("${key}");
-        let replacement = match value {
-            serde_json::Value::String(s) => format!("'{}'", s.replace('\'', "\\'")),
-            serde_json::Value::Number(n) => n.to_string(),
-            serde_json::Value::Bool(b) => b.to_string(),
-            serde_json::Value::Null => "NULL".to_string(),
-            _ => value.to_string(),
-        };
-        result = result.replace(&placeholder, &replacement);
+    for key in keys {
+        let replacement = bind_param_replacement(&params[key]);
+        result = replace_bind_param(&result, key, &replacement);
     }
     Ok(result)
 }
@@ -243,4 +293,42 @@ async fn handle_query_impl(
         Ok(response)
     }
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bind_param_escapes_backslash_and_quote() {
+        let out = substitute_bind_params(
+            r#"SELECT * FROM cpu WHERE host = $host"#,
+            r#"{"host":"a\\b"}"#,
+        )
+        .unwrap();
+        assert_eq!(out, r#"SELECT * FROM cpu WHERE host = 'a\\b'"#);
+    }
+
+    #[test]
+    fn bind_param_does_not_replace_prefix_of_longer_name() {
+        let out = substitute_bind_params(
+            r#"SELECT * FROM cpu WHERE host = $hostname AND region = $host"#,
+            r#"{"host":"east"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            r#"SELECT * FROM cpu WHERE host = $hostname AND region = 'east'"#
+        );
+    }
+
+    #[test]
+    fn bind_param_longest_key_wins() {
+        let out = substitute_bind_params(
+            r#"SELECT * FROM cpu WHERE host = $hostname"#,
+            r#"{"host":"short","hostname":"long"}"#,
+        )
+        .unwrap();
+        assert_eq!(out, r#"SELECT * FROM cpu WHERE host = 'long'"#);
+    }
 }
