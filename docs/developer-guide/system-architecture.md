@@ -415,13 +415,20 @@ HyperbyteDB uses **chDB** (embedded ClickHouse) as its query engine and storage 
 
 ### Session management
 
-Each chDB `Connection` is `Send` but not `Sync`. HyperbyteDB keeps a pool of connections to the same `session_data_path` (see `ChdbConnectionPool` in `adapters/chdb/connection_pool.rs`). Queries and inserts run in `spawn_blocking`, checking out one connection per task.
+Each chDB `Connection` is `Send` but not `Sync`. HyperbyteDB opens **two** connection pools to the same `session_data_path` (see `ChdbConnectionPool` in `adapters/chdb/connection_pool.rs`):
 
-### Single connection (`pool_size = 1`)
+- **Query pool** (`chdb.query_pool_size`, default 4) — used by `ChdbQueryAdapter` for reads.
+- **Write pool** (`chdb.write_pool_size`, default 4) — used by `ChdbNativeAdapter` for ingest/flush.
 
-One connection: all chDB work serializes on that client's mutex (legacy / minimal footprint).
+Legacy `chdb.pool_size` (when non-zero) sets both pools to the same size when the explicit keys are unset. Each pool is clamped to 1–128 connections.
 
-### Connection pool (`pool_size > 1`)
+Queries and inserts run in `spawn_blocking`, checking out one connection from the appropriate pool per task. Separate pools isolate flush inserts from concurrent queries.
+
+### Single connection (`query_pool_size = 1` or `write_pool_size = 1`)
+
+One connection in a pool: all work on that pool serializes on that client's mutex (minimal footprint).
+
+### Connection pool (size > 1)
 
 ```rust
 struct ChdbConnectionPool {
@@ -430,7 +437,7 @@ struct ChdbConnectionPool {
 }
 ```
 
-Round-robin checkout with `try_lock` on busy slots. Multiple connections share one process-global `EmbeddedServer` for the data path; each connection gets an independent `ChdbClient` mutex, so concurrent flush inserts and queries can overlap.
+Round-robin checkout with `try_lock` on busy slots. Multiple connections share one process-global `EmbeddedServer` for the data path; each connection gets an independent `ChdbClient` mutex, so concurrent tasks within a pool can overlap.
 
 ### Output format
 

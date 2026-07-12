@@ -158,14 +158,17 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
             "failed to prepare chDB metadata before session open"
         );
     }
-    let shared_chdb =
-        SharedSession::new_eager(&config.chdb.session_data_path, config.chdb.pool_size)?;
+    let query_pool_size = config.chdb.resolved_query_pool_size();
+    let write_pool_size = config.chdb.resolved_write_pool_size();
+    let query_chdb = SharedSession::new_eager(&config.chdb.session_data_path, query_pool_size)?;
+    let write_chdb = SharedSession::new_eager(&config.chdb.session_data_path, write_pool_size)?;
     tracing::info!(
-        pool_size = shared_chdb.configured_pool_size(),
+        query_pool_size = query_chdb.configured_pool_size(),
+        write_pool_size = write_chdb.configured_pool_size(),
         path = %config.chdb.session_data_path,
-        "chDB connection pool ready"
+        "chDB query and write connection pools ready"
     );
-    match catalog::reload_persisted_tables(&shared_chdb).await {
+    match catalog::reload_persisted_tables(&write_chdb).await {
         Ok(attached) => tracing::info!(
             attached,
             "attached restored chDB tables from on-disk metadata"
@@ -176,11 +179,11 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         ),
     }
     let chdb_adapter =
-        ChdbQueryAdapter::from_shared(shared_chdb.clone(), config.server.max_concurrent_queries);
+        ChdbQueryAdapter::from_shared(query_chdb, config.server.max_concurrent_queries);
     let chdb: Arc<dyn crate::ports::query::QueryPort> = Arc::new(chdb_adapter);
 
     let native_sink = ChdbNativeAdapter::with_metadata_and_cache_limit(
-        shared_chdb.clone(),
+        write_chdb,
         Some(metadata.clone()),
         config.chdb.schema_cache_max_entries,
     );
