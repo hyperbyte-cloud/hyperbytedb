@@ -135,7 +135,7 @@ Data must be flushed from the WAL into chDB MergeTree tables before it becomes q
 
 2. **Add a time range to your query.** Queries without `WHERE time > ...` scan all data.
 
-3. **Cap concurrent queries.** Tune `server.max_concurrent_queries` so heavy queries do not oversubscribe the Tokio blocking pool. For overlapping chDB work, also set `chdb.pool_size` > 1 (same data path, multiple connections) and keep `max_concurrent_queries` ≥ `pool_size`.
+3. **Cap concurrent queries.** Tune `server.max_concurrent_queries` so heavy queries do not oversubscribe the Tokio blocking pool. For overlapping chDB query work, set `chdb.query_pool_size` > 1 (same data path, multiple connections) and keep `max_concurrent_queries` ≥ `query_pool_size`. Ingest/flush uses a separate `write_pool_size` pool, so heavy queries do not block inserts.
 
 4. **Narrow the time range** in your query to reduce scanned data volume.
 

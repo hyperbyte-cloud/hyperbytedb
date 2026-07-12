@@ -177,7 +177,7 @@ On SELECT, `inject_tombstone_predicates()` loads all tombstones for the measurem
 
 ### Session model
 
-chDB runs inside `spawn_blocking`. HyperbyteDB opens `chdb.pool_size` connections to the same `session_data_path`; each connection has its own `ChdbClient` mutex, so flush inserts and queries can overlap when the pool has more than one connection. Tune `server.max_concurrent_queries` (≥ `pool_size`) to cap in-flight query tasks.
+chDB runs inside `spawn_blocking`. HyperbyteDB opens separate query and write connection pools to the same `session_data_path` (`chdb.query_pool_size` and `chdb.write_pool_size`, default 4 each). The read path uses the query pool only; each connection has its own `ChdbClient` mutex, so concurrent query tasks overlap when `query_pool_size > 1`. Ingest/flush uses the write pool, so heavy queries do not block inserts. Tune `server.max_concurrent_queries` (≥ `query_pool_size`) to cap in-flight query tasks.
 
 ### Output format
 

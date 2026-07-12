@@ -116,17 +116,36 @@ fn default_wal_batch_delay_us() -> u64 {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChdbConfig {
     pub session_data_path: String,
-    /// Number of chDB connections opened to the same `session_data_path`.
-    /// Each connection has its own `ChdbClient` mutex, so flush inserts and
-    /// concurrent queries overlap when `pool_size > 1`. A second connection
-    /// to a *different* path still fails (process-global singleton per path).
-    /// Clamped to 1..=32. For best overlap, set `server.max_concurrent_queries`
-    /// ≥ `pool_size`.
+    /// Legacy: when non-zero and `query_pool_size` / `write_pool_size` are unset,
+    /// applies the same size to both pools.
+    #[serde(default)]
     pub pool_size: usize,
+    /// chDB connections for queries (`ChdbQueryAdapter`). When unset, uses
+    /// `pool_size` if non-zero, else 4. Clamped to 1..=128.
+    #[serde(default)]
+    pub query_pool_size: Option<usize>,
+    /// chDB connections for ingest/flush (`ChdbNativeAdapter`). When unset, uses
+    /// `pool_size` if non-zero, else 4. Clamped to 1..=128.
+    #[serde(default)]
+    pub write_pool_size: Option<usize>,
     /// Max `(db, rp, measurement)` entries in the chDB native adapter in-memory
     /// schema and series caches. Oldest entries are evicted (LRU).
     #[serde(default = "default_schema_cache_max_entries")]
     pub schema_cache_max_entries: usize,
+}
+
+impl ChdbConfig {
+    pub fn resolved_query_pool_size(&self) -> usize {
+        self.query_pool_size
+            .or((self.pool_size > 0).then_some(self.pool_size))
+            .unwrap_or(crate::adapters::chdb::connection_pool::DEFAULT_QUERY_POOL_SIZE)
+    }
+
+    pub fn resolved_write_pool_size(&self) -> usize {
+        self.write_pool_size
+            .or((self.pool_size > 0).then_some(self.pool_size))
+            .unwrap_or(crate::adapters::chdb::connection_pool::DEFAULT_WRITE_POOL_SIZE)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -486,10 +505,6 @@ impl RetentionConfig {
     }
 }
 
-fn default_chdb_pool_size() -> usize {
-    crate::adapters::chdb::connection_pool::DEFAULT_POOL_SIZE
-}
-
 impl HyperbytedbConfig {
     pub fn load(config_path: Option<&str>) -> anyhow::Result<Self> {
         let mut figment = Figment::new().merge(Serialized::defaults(Self::defaults()));
@@ -535,7 +550,9 @@ impl HyperbytedbConfig {
             },
             chdb: ChdbConfig {
                 session_data_path: "./chdb_data".to_string(),
-                pool_size: default_chdb_pool_size(),
+                pool_size: 0,
+                query_pool_size: None,
+                write_pool_size: None,
                 schema_cache_max_entries: default_schema_cache_max_entries(),
             },
             auth: AuthConfig { enabled: false },
@@ -716,6 +733,69 @@ mod retention_config_tests {
         let r: RetentionConfig = serde_json::from_str(r#"{"enabled":false}"#).expect("parse");
         assert!(!r.enabled);
         assert_eq!(r.interval, "12h");
+    }
+}
+
+#[cfg(test)]
+mod chdb_pool_config_tests {
+    use super::ChdbConfig;
+
+    #[test]
+    fn split_pool_defaults_when_unset() {
+        let c = ChdbConfig {
+            session_data_path: "./chdb".into(),
+            pool_size: 0,
+            query_pool_size: None,
+            write_pool_size: None,
+            schema_cache_max_entries: 10_000,
+        };
+        assert_eq!(c.resolved_query_pool_size(), 4);
+        assert_eq!(c.resolved_write_pool_size(), 4);
+    }
+
+    #[test]
+    fn legacy_pool_size_applies_to_both() {
+        let c = ChdbConfig {
+            session_data_path: "./chdb".into(),
+            pool_size: 6,
+            query_pool_size: None,
+            write_pool_size: None,
+            schema_cache_max_entries: 10_000,
+        };
+        assert_eq!(c.resolved_query_pool_size(), 6);
+        assert_eq!(c.resolved_write_pool_size(), 6);
+    }
+
+    #[test]
+    fn explicit_split_overrides_pool_size() {
+        let c = ChdbConfig {
+            session_data_path: "./chdb".into(),
+            pool_size: 6,
+            query_pool_size: Some(64),
+            write_pool_size: Some(8),
+            schema_cache_max_entries: 10_000,
+        };
+        assert_eq!(c.resolved_query_pool_size(), 64);
+        assert_eq!(c.resolved_write_pool_size(), 8);
+    }
+
+    #[test]
+    fn deserializes_split_pools_from_toml() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let c: ChdbConfig = Figment::new()
+            .merge(Toml::string(
+                r#"
+                session_data_path = "./chdb"
+                query_pool_size = 32
+                write_pool_size = 4
+                "#,
+            ))
+            .extract()
+            .expect("parse");
+        assert_eq!(c.resolved_query_pool_size(), 32);
+        assert_eq!(c.resolved_write_pool_size(), 4);
     }
 }
 

@@ -49,9 +49,10 @@ Size CPU and RAM from how many queries run at once and how heavy they are — no
   max_concurrent_queries = 16
 
   [chdb]
-  pool_size = 4
+  query_pool_size = 4
+  write_pool_size = 4
   ```
-  Set `max_concurrent_queries` ≥ `pool_size` so flush and queries can overlap. See [Configuration](configuration.md).
+  Set `max_concurrent_queries` ≥ `query_pool_size` so concurrent queries can use the query pool. Ingest/flush uses a separate `write_pool_size` pool. See [Configuration](configuration.md).
 - If queries are slow but CPU is idle, you may be I/O-bound on disk — check storage type and free space before adding cores.
 - If CPU is saturated while ingest stays healthy, reduce concurrency or simplify queries before scaling write throughput assumptions.
 
@@ -176,7 +177,7 @@ Example starting points (per node, before replication overhead):
 
 | Symptom | Likely cause | What to try |
 |---------|-------------|-------------|
-| High CPU | Many concurrent or heavy queries | Lower `max_concurrent_queries`; narrow time ranges in queries; reduce `pool_size` if threads oversubscribe |
+| High CPU | Many concurrent or heavy queries | Lower `max_concurrent_queries`; narrow time ranges in queries; reduce `query_pool_size` if threads oversubscribe |
 | Slow queries | Wide scans, missing time filter | Add `WHERE time > ...`; reduce concurrent query load |
 | High memory | chDB working set or Arrow cache | Cap concurrent queries; set `arrow_wal_enabled = false` if flush cache is the issue |
 | Disk filling up | Retention too long or underestimated volume | Shorten retention policies; verify `[retention]` is enabled |
@@ -205,7 +206,7 @@ Start with defaults, deploy with realistic query patterns (same dashboards and a
 
 ## See Also
 
-- [Configuration](configuration.md) — Tuning parameters (`max_concurrent_queries`, `pool_size`, flush settings)
+- [Configuration](configuration.md) — Tuning parameters (`max_concurrent_queries`, `query_pool_size`, `write_pool_size`, flush settings)
 - [Administration](administration.md) — Metrics and monitoring
 - [Troubleshooting](troubleshooting.md) — Query timeouts, memory, and flush issues
 - [V1 Stable Scope](v1-stable-scope.md) — Supported topologies and availability model

@@ -13,8 +13,10 @@ use parking_lot::Mutex;
 use crate::error::HyperbytedbError;
 
 pub const MIN_POOL_SIZE: usize = 1;
-pub const MAX_POOL_SIZE: usize = 32;
+pub const MAX_POOL_SIZE: usize = 128;
 pub const DEFAULT_POOL_SIZE: usize = 4;
+pub const DEFAULT_QUERY_POOL_SIZE: usize = 4;
+pub const DEFAULT_WRITE_POOL_SIZE: usize = 4;
 
 /// Clamp configured pool size to a safe range.
 pub fn clamp_pool_size(size: usize) -> usize {
@@ -112,7 +114,8 @@ mod tests {
         assert_eq!(clamp_pool_size(0), 1);
         assert_eq!(clamp_pool_size(1), 1);
         assert_eq!(clamp_pool_size(4), 4);
-        assert_eq!(clamp_pool_size(100), 32);
+        assert_eq!(clamp_pool_size(100), 100);
+        assert_eq!(clamp_pool_size(200), 128);
     }
 
     #[test]

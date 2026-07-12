@@ -33,7 +33,10 @@ arrow_wal_enabled = true
 
 [chdb]
 session_data_path = "./chdb_data"
-pool_size = 4  # same-path chDB connections for parallel flush inserts and queries
+# Legacy: sets both pools when query_pool_size / write_pool_size are unset.
+# pool_size = 4
+query_pool_size = 4   # connections reserved for queries
+write_pool_size = 4   # connections reserved for ingest/flush (isolated from queries)
 schema_cache_max_entries = 10000
 
 [auth]

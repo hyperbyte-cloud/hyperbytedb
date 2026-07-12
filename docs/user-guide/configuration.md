@@ -77,7 +77,9 @@ Embedded ClickHouse (chDB) query engine settings.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `session_data_path` | string | `"./chdb_data"` | chDB session state directory |
-| `pool_size` | integer | `4` | Number of chDB connections to the same `session_data_path`. Each connection has its own client mutex, so flush inserts and concurrent queries overlap when `pool_size > 1`. Clamped to 1–32. For best overlap, set `server.max_concurrent_queries` ≥ `pool_size`. |
+| `query_pool_size` | integer | `4` | chDB connections reserved for queries (`ChdbQueryAdapter`). Each connection has its own client mutex, so concurrent `spawn_blocking` query tasks overlap when > 1. Clamped to 1–128. For best overlap, set `server.max_concurrent_queries` ≥ `query_pool_size`. |
+| `write_pool_size` | integer | `4` | chDB connections reserved for ingest/flush (`ChdbNativeAdapter`), isolated from the query pool so heavy queries do not block inserts. Clamped to 1–128. |
+| `pool_size` | integer | `0` (unused) | **Legacy.** When non-zero and `query_pool_size` / `write_pool_size` are unset, applies the same size to both pools. Prefer explicit `query_pool_size` and `write_pool_size`. |
 
 ---
 
@@ -236,7 +238,8 @@ interval_secs = 10
 
 [chdb]
 session_data_path = "./chdb_data"
-pool_size = 4
+query_pool_size = 4
+write_pool_size = 4
 
 [logging]
 level = "info"
@@ -263,6 +266,8 @@ interval_secs = 10
 
 [chdb]
 session_data_path = "/var/lib/hyperbytedb/chdb"
+query_pool_size = 32
+write_pool_size = 4
 
 [cluster]
 enabled = true
