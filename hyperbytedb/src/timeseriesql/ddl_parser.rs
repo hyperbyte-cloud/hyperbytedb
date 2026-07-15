@@ -677,6 +677,12 @@ fn parse_create_materialized_view(
 ) -> Result<Statement, HyperbytedbError> {
     let name = cur.take_ident()?;
     let database = parse_on_db(cur)?;
+    let backfill_on_create = if cur.match_keyword("WITH") {
+        cur.expect_keyword("BACKFILL")?;
+        true
+    } else {
+        false
+    };
     let (raw_query, select_stmt) = if cur.match_keyword("AS") {
         let start = cur.peek().map(|t| t.start).unwrap_or(0);
         let inner = cur.input[start..].trim();
@@ -700,6 +706,7 @@ fn parse_create_materialized_view(
             database,
             query: select_stmt,
             raw_query,
+            backfill_on_create,
         },
     ))
 }
@@ -1251,5 +1258,29 @@ mod tests {
             r#"CREATE MATERIALIZED VIEW mv ON db AS SELECT mean("v") FROM m GROUP BY time(5m)"#,
         );
         assert!(stmt.is_ok(), "AS-form MV must parse: {stmt:?}");
+    }
+
+    #[test]
+    fn create_materialized_view_with_backfill_parses() {
+        let stmt = parse_ddl_statement(
+            r#"CREATE MATERIALIZED VIEW mv ON db WITH BACKFILL AS SELECT mean("v") FROM m GROUP BY time(5m)"#,
+        )
+        .unwrap();
+        match stmt {
+            Statement::CreateMaterializedView(mv) => assert!(mv.backfill_on_create),
+            other => panic!("expected CreateMaterializedView, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_materialized_view_without_backfill_defaults_false() {
+        let stmt = parse_ddl_statement(
+            r#"CREATE MATERIALIZED VIEW mv ON db AS SELECT mean("v") FROM m GROUP BY time(5m)"#,
+        )
+        .unwrap();
+        match stmt {
+            Statement::CreateMaterializedView(mv) => assert!(!mv.backfill_on_create),
+            other => panic!("expected CreateMaterializedView, got {other:?}"),
+        }
     }
 }

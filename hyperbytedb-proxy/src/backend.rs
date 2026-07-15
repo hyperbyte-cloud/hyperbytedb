@@ -2,7 +2,7 @@
 //! counters are atomic so the routing hot path is lock-free.
 
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicI64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicUsize, Ordering};
 use std::time::SystemTime;
 
 /// Health classification observed by the most recent probe.
@@ -62,6 +62,10 @@ pub struct Backend {
     /// Consecutive probe failures. Used to log transitions cleanly and (in
     /// future) to back-off probes for backends that are deeply broken.
     consecutive_failures: AtomicUsize,
+    /// Operator-driven exclusion flag. When true, `pick_active` skips this
+    /// backend entirely — set by the operator before killing a pod during
+    /// rolling upgrades.
+    excluded: AtomicBool,
 }
 
 impl Backend {
@@ -75,6 +79,7 @@ impl Backend {
             inflight: AtomicUsize::new(0),
             last_probe_unix: AtomicI64::new(0),
             consecutive_failures: AtomicUsize::new(0),
+            excluded: AtomicBool::new(false),
         }
     }
 
@@ -108,6 +113,15 @@ impl Backend {
 
     pub fn inflight(&self) -> usize {
         self.inflight.load(Ordering::Relaxed)
+    }
+
+    pub fn is_excluded(&self) -> bool {
+        self.excluded.load(Ordering::Acquire)
+    }
+
+    /// Set the operator-driven exclusion flag. Returns the previous value.
+    pub fn set_excluded(&self, val: bool) -> bool {
+        self.excluded.swap(val, Ordering::AcqRel)
     }
 
     /// RAII guard that increments `inflight` on construction and decrements

@@ -105,6 +105,17 @@ CREATE MATERIALIZED VIEW "mv_cpu_1h" ON "mydb"
 AS SELECT mean("usage_idle") INTO "cpu_1h" FROM "cpu" GROUP BY time(1h), *
 ```
 
+By default, `CREATE` installs the destination tables and ClickHouse materialized views only — rollups begin with the next write to the source. Historical backfill is **disabled by default** because it can scan the entire source measurement and take minutes on large datasets.
+
+To also aggregate existing source history on create, add `WITH BACKFILL`:
+
+```sql
+CREATE MATERIALIZED VIEW "mv_cpu_1h" ON "mydb" WITH BACKFILL
+AS SELECT mean("usage_idle") INTO "cpu_1h" FROM "cpu" GROUP BY time(1h), *
+```
+
+A `WHERE time > ...` clause in the SELECT limits the backfill scan when `WITH BACKFILL` is used.
+
 Requirements (same as `SELECT INTO` / continuous queries):
 
 - `INTO` destination measurement is required
@@ -116,7 +127,7 @@ On `CREATE`, HyperbyteDB:
 1. Registers the destination measurement in metadata
 2. Creates destination MergeTree tables in chDB
 3. Installs fact and series ClickHouse materialized views
-4. Backfills historical data from the source
+4. Backfills historical data from the source **only when `WITH BACKFILL` is specified**
 
 ### Manage materialized views
 
@@ -133,7 +144,7 @@ DROP MATERIALIZED VIEW "mv_cpu_1h" ON "mydb"
 |--|------------------|-------------------|
 | Trigger | 10s scheduler | Each flush to source |
 | Latency | Up to resample interval | Near real-time |
-| Backfill | Re-scans window each run | One-time on CREATE; then incremental |
+| Backfill | Re-scans window each run | Opt-in on CREATE (`WITH BACKFILL`); then incremental |
 | Engine | WAL writeback | ClickHouse MV |
 
 ---

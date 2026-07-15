@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::Router;
-use axum::routing::{any, get};
+use axum::routing::{any, get, post};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
@@ -60,6 +60,9 @@ pub async fn run() -> Result<()> {
         .route("/readyz", get(admin::readyz))
         .route("/metrics", get(admin::metrics_endpoint))
         .route("/admin/backends", get(admin::list_backends))
+        .route("/admin/backends/{ip}/exclude", post(admin::exclude_backend))
+        .route("/admin/backends/{ip}/include", post(admin::include_backend))
+        .route("/admin/pool", get(admin::pool_status))
         .with_state(admin_state);
 
     // Order matters: admin routes first, then the catch-all proxy fallback.

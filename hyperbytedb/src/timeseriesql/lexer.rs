@@ -861,6 +861,7 @@ fn is_keyword(word: &str) -> bool {
             | "BEGIN"
             | "END"
             | "RESAMPLE"
+            | "BACKFILL"
             | "EVERY"
             | "FOR"
             | "KEY"

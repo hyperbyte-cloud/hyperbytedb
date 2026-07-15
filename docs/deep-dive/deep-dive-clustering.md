@@ -296,7 +296,7 @@ Raft messages are exchanged via HTTP:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `raft_heartbeat_interval_ms` | 300 | Raft heartbeat interval |
+| `raft_heartbeat_interval_ms` | 1000 | Raft heartbeat interval |
 | `raft_election_timeout_ms` | 1000 | Raft election timeout |
 | `raft_snapshot_threshold` | 1000 | Log entries before snapshot |
 
@@ -564,7 +564,7 @@ Step 5: Set node state to Leaving
 | `raft_dir` | `"./raft"` | RocksDB directory for Raft state |
 | `sync_max_concurrent_files` | `4` | Max concurrent file downloads during sync |
 | `replication_max_retries` | `5` | Max retries for failed replications |
-| `raft_heartbeat_interval_ms` | `300` | Raft heartbeat interval (milliseconds) |
+| `raft_heartbeat_interval_ms` | `1000` | Raft heartbeat interval (milliseconds) |
 | `raft_election_timeout_ms` | `1000` | Raft election timeout (milliseconds) |
 | `raft_snapshot_threshold` | `1000` | Log entries before Raft snapshot |
 | `replication.mode` | `"async"` | Coordinator replication mode: `"async"` (default) or `"sync_quorum"` |

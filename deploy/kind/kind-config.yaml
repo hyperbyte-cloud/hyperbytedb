@@ -7,13 +7,13 @@ nodes:
     # hyperbytedb-proxy NodePort → 30086 → localhost:8086
     extraPortMappings:
       - containerPort: 30086
-        hostPort: 8086
+        hostPort: 18086
         protocol: TCP
       - containerPort: 30090
-        hostPort: 9090
+        hostPort: 19090
         protocol: TCP
       - containerPort: 30000
-        hostPort: 3000
+        hostPort: 13000
         protocol: TCP
   - role: worker
     extraMounts:

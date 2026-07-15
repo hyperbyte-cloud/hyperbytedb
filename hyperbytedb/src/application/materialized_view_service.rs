@@ -52,7 +52,8 @@ impl MaterializedViewService {
             )));
         }
 
-        self.materialize_ddl(mv, true).await?;
+        self.materialize_ddl(mv, true, mv.backfill_on_create)
+            .await?;
 
         let (source_db, source_rp_opt, source_measurement) =
             extract_source(&mv.query, &mv.database)?;
@@ -87,6 +88,7 @@ impl MaterializedViewService {
             ch_fact_mv_name: unquoted_fact_mv_name(&mv.database, &dest_rp, &mv.name),
             ch_series_mv_name: unquoted_series_mv_name(&mv.database, &dest_rp, &mv.name),
             created_at: chrono::Utc::now().to_rfc3339(),
+            backfill_on_create: mv.backfill_on_create,
         };
 
         self.metadata
@@ -98,6 +100,7 @@ impl MaterializedViewService {
             db = %mv.database,
             source = %def.source_measurement,
             dest = %def.dest_measurement,
+            backfill = mv.backfill_on_create,
             "materialized view created"
         );
 
@@ -221,6 +224,7 @@ impl MaterializedViewService {
             database: definition.database.clone(),
             query: parse_mv_select(&definition.query_text)?,
             raw_query: definition.query_text.clone(),
+            backfill_on_create: definition.backfill_on_create,
         };
         self.create(&stmt).await?;
         Ok(())
@@ -269,8 +273,9 @@ impl MaterializedViewService {
             database: def.database.clone(),
             query: parse_mv_select(&def.query_text)?,
             raw_query: def.query_text.clone(),
+            backfill_on_create: false,
         };
-        self.materialize_ddl(&stmt, false).await?;
+        self.materialize_ddl(&stmt, false, false).await?;
         tracing::info!(
             mv = %def.name,
             db = %def.database,
@@ -283,6 +288,7 @@ impl MaterializedViewService {
         &self,
         mv: &CreateMaterializedViewStatement,
         reset_destination: bool,
+        backfill_on_create: bool,
     ) -> Result<(), HyperbytedbError> {
         let (source_db, source_rp_opt, source_measurement) =
             extract_source(&mv.query, &mv.database)?;
@@ -406,10 +412,19 @@ impl MaterializedViewService {
 
             self.query_port.execute_sql(&create_fact_mv).await?;
             self.query_port.execute_sql(&create_series_mv).await?;
-            self.query_port.execute_sql(&backfill_fact).await?;
 
-            let backfill_series = format!("INSERT INTO {dest_series}\n{series_select}");
-            self.query_port.execute_sql(&backfill_series).await?;
+            if backfill_on_create {
+                self.query_port.execute_sql(&backfill_fact).await?;
+
+                let backfill_series = format!("INSERT INTO {dest_series}\n{series_select}");
+                self.query_port.execute_sql(&backfill_series).await?;
+            } else {
+                tracing::info!(
+                    mv = %mv.name,
+                    db = %mv.database,
+                    "skipping materialized view historical backfill (use WITH BACKFILL to enable)"
+                );
+            }
 
             self.metadata
                 .register_measurement(&dest_db, &dest_rp, &dest_meta)
@@ -470,6 +485,7 @@ pub fn def_from_statement(
         ch_fact_mv_name: unquoted_fact_mv_name(&mv.database, dest_rp, &mv.name),
         ch_series_mv_name: unquoted_series_mv_name(&mv.database, dest_rp, &mv.name),
         created_at: chrono::Utc::now().to_rfc3339(),
+        backfill_on_create: mv.backfill_on_create,
     })
 }
 

@@ -37,7 +37,7 @@ spec:
     heartbeatIntervalSecs: 2
     heartbeatMissThreshold: 5
     replicationMaxRetries: 5
-    raftHeartbeatIntervalMs: 300
+    raftHeartbeatIntervalMs: 1000
     raftElectionTimeoutMs: 1000
     replication:
       mode: async

@@ -263,7 +263,7 @@ impl ClusterBootstrap {
         let network = Network::new();
 
         let raft_config = match (RaftConfig {
-            heartbeat_interval: config.raft_heartbeat_interval_ms.unwrap_or(300),
+            heartbeat_interval: config.raft_heartbeat_interval_ms.unwrap_or(1000),
             election_timeout_min: config.raft_election_timeout_ms.unwrap_or(1000),
             election_timeout_max: config.raft_election_timeout_ms.unwrap_or(1000) * 2,
             snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(

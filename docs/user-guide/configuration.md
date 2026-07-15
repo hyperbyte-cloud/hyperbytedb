@@ -130,7 +130,7 @@ Master-master peer-to-peer clustering with Raft consensus for schema mutations.
 | `replicate_receiver_queue_depth` | integer | `1024` | Bounded apply queue on the replicate receiver |
 | `replicate_receiver_workers` | integer | `1` | **Ignored.** Receiver uses a single ordered worker |
 | `replication_truncate_stale_peer_multiplier` | integer | `2` | When >0, peers with ack 0 and stale heartbeats are omitted from truncate barrier (× heartbeat interval) |
-| `raft_heartbeat_interval_ms` | — | *unset* | Optional Raft heartbeat (ms); uses internal default if omitted |
+| `raft_heartbeat_interval_ms` | — | *unset* | Optional Raft heartbeat (ms); defaults to 1000 if omitted |
 | `raft_election_timeout_ms` | — | *unset* | Optional Raft election timeout (ms) |
 | `raft_snapshot_threshold` | — | *unset* | Optional log entries before Raft snapshot |
 

@@ -6,18 +6,31 @@
 //! immediately, and walks the snapshot. Discovery and health probing are
 //! background tasks that mutate the pool atomically (publish-via-replace).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use serde::Serialize;
 use tokio::sync::{Notify, RwLock};
 use tokio::time::{MissedTickBehavior, interval, timeout};
 
 use crate::backend::{Backend, Health};
 use crate::config::ProxyConfig;
+
+/// JSON-serializable backend status for the admin pool endpoint.
+#[derive(Serialize)]
+pub struct BackendStatus {
+    pub addr: String,
+    pub port: u16,
+    pub health: String,
+    pub excluded: bool,
+    pub inflight: usize,
+    pub consecutive_failures: usize,
+    pub last_probe_unix: i64,
+}
 
 pub struct BackendPool {
     cfg: ProxyConfig,
@@ -25,6 +38,13 @@ pub struct BackendPool {
     /// Current snapshot. Replaced wholesale when discovery sees a new set of
     /// IPs; mutated in place (atomically per-backend) when health changes.
     backends: RwLock<Arc<Vec<Arc<Backend>>>>,
+
+    /// Operator-driven exclusion set. IPs in this set are never routed to
+    /// even when their health is `Active`. The operator populates this via
+    /// `POST /admin/backends/{ip}/exclude` before killing a pod during
+    /// rolling upgrades, and clears it via `POST /admin/backends/{ip}/include`
+    /// once the replacement pod is healthy.
+    excluded: RwLock<HashSet<IpAddr>>,
 
     /// Round-robin cursor. Wraps via modulo at pick-time.
     cursor: AtomicUsize,
@@ -49,6 +69,7 @@ impl BackendPool {
         Ok(Arc::new(Self {
             cfg,
             backends: RwLock::new(Arc::new(Vec::new())),
+            excluded: RwLock::new(HashSet::new()),
             cursor: AtomicUsize::new(0),
             probe_client,
             on_active: Notify::new(),
@@ -72,18 +93,66 @@ impl BackendPool {
         Arc::clone(&*self.backends.read().await)
     }
 
-    /// Round-robin pick over backends in `Active` state. Returns `None` if
-    /// the pool currently has zero active backends — the caller decides
-    /// whether to hold-and-retry or fail fast.
+    /// Operator-driven exclusion: mark a backend IP so `pick_active` never
+    /// routes to it. Returns `true` if newly excluded, or `Err` if the IP
+    /// is not in the pool.
+    pub async fn exclude_backend(&self, ip: IpAddr) -> anyhow::Result<bool> {
+        let snap = self.snapshot().await;
+        let backend = snap
+            .iter()
+            .find(|b| b.addr == ip)
+            .ok_or_else(|| anyhow::anyhow!("backend {ip} not found in pool"))?;
+        backend.set_excluded(true);
+        let mut guard = self.excluded.write().await;
+        Ok(guard.insert(ip))
+    }
+
+    /// Operator-driven inclusion: clear the exclusion flag so `pick_active`
+    /// may route to this backend again. Returns `true` if it was previously
+    /// excluded.
+    pub async fn include_backend(&self, ip: IpAddr) -> bool {
+        let snap = self.snapshot().await;
+        if let Some(backend) = snap.iter().find(|b| b.addr == ip) {
+            backend.set_excluded(false);
+        }
+        let mut guard = self.excluded.write().await;
+        guard.remove(&ip)
+    }
+
+    /// Returns true if the given IP is currently excluded.
+    pub async fn is_excluded(&self, ip: &IpAddr) -> bool {
+        self.excluded.read().await.contains(ip)
+    }
+
+    /// JSON-serializable snapshot of the pool for `GET /admin/pool`.
+    pub async fn pool_status(&self) -> Vec<BackendStatus> {
+        let snap = self.snapshot().await;
+        let excluded = self.excluded.read().await;
+        snap.iter()
+            .map(|b| BackendStatus {
+                addr: b.addr.to_string(),
+                port: b.port,
+                health: b.health().as_str().to_string(),
+                excluded: excluded.contains(&b.addr),
+                inflight: b.inflight(),
+                consecutive_failures: b.consecutive_failures(),
+                last_probe_unix: b.last_probe_unix(),
+            })
+            .collect()
+    }
+
+    /// Round-robin pick over backends in `Active` state that are not
+    /// excluded. Returns `None` if the pool currently has zero routable
+    /// backends — the caller decides whether to hold-and-retry or fail fast.
     pub async fn pick_active(&self) -> Option<Arc<Backend>> {
         let snap = self.snapshot().await;
         if snap.is_empty() {
             return None;
         }
-        // Filter by health into a tight Vec; small (cluster size <= dozens).
+        // Filter by health and exclusion into a tight Vec; small (cluster size <= dozens).
         let active: Vec<&Arc<Backend>> = snap
             .iter()
-            .filter(|b| b.health() == Health::Active)
+            .filter(|b| b.health() == Health::Active && !b.is_excluded())
             .collect();
         if active.is_empty() {
             return None;
@@ -92,13 +161,16 @@ impl BackendPool {
         Some(Arc::clone(active[idx]))
     }
 
-    /// Pick an active backend that isn't `exclude`. Used by the retry loop so
-    /// we don't re-try the same broken backend twice in a row.
+    /// Pick an active backend that isn't `exclude` and isn't excluded by the
+    /// operator. Used by the retry loop so we don't re-try the same broken
+    /// backend twice in a row.
     pub async fn pick_active_excluding(&self, exclude: &Arc<Backend>) -> Option<Arc<Backend>> {
         let snap = self.snapshot().await;
         let active: Vec<&Arc<Backend>> = snap
             .iter()
-            .filter(|b| b.health() == Health::Active && !Arc::ptr_eq(b, exclude))
+            .filter(|b| {
+                b.health() == Health::Active && !Arc::ptr_eq(b, exclude) && !b.is_excluded()
+            })
             .collect();
         if active.is_empty() {
             return None;
@@ -222,8 +294,17 @@ impl BackendPool {
 
         // Atomic publish.
         let new_snap = Arc::new(next);
-        let mut guard = self.backends.write().await;
-        *guard = new_snap;
+        {
+            let mut guard = self.backends.write().await;
+            *guard = new_snap;
+        }
+
+        // Garbage-collect exclusion entries for IPs that are no longer in the pool.
+        if removed > 0 {
+            let mut excl = self.excluded.write().await;
+            let fresh_set: HashSet<IpAddr> = fresh_ips.into_iter().collect();
+            excl.retain(|ip| fresh_set.contains(ip));
+        }
     }
 
     async fn probe_one(&self, backend: &Arc<Backend>) {
