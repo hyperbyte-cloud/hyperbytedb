@@ -1,6 +1,6 @@
 # HyperbyteDB cluster for kind — tuned for a 4-CPU / high-memory node (16 GiB pod limit).
 # Matches docker-compose tuning: chDB pool = cores, larger flush batches, faster WAL drain.
-apiVersion: hyperbytedb.hyperbytedb.io/v1alpha1
+apiVersion: hyperbytedb.hyperbyte.cloud/v1alpha1
 kind: HyperbytedbCluster
 metadata:
   name: hyperbytedb
@@ -48,6 +48,7 @@ spec:
     raftHeartbeatIntervalMs: 1000
     raftElectionTimeoutMs: 5000
     raftSnapshotThreshold: 1000
+    drainWaitSecs: 30
     replication:
       mode: async
       ackTimeoutMs: 5000

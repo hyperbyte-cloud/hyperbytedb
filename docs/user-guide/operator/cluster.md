@@ -86,7 +86,7 @@ spec:
     heartbeatIntervalSecs: 1
     heartbeatMissThreshold: 3
     replicationMaxRetries: 10
-    raftHeartbeatIntervalMs: 200
+    raftHeartbeatIntervalMs: 1000
     raftElectionTimeoutMs: 800
     raftSnapshotThreshold: 500
     replication:
@@ -306,7 +306,7 @@ Tuning parameters for multi-replica cluster behavior. These only take effect whe
 | `replicationMaxCoalesceBodyBytes` | int64 | `8388608` | Max bytes for coalescing consecutive WAL batches |
 | `replicateReceiverQueueDepth` | int32 | `1024` | Bounded apply queue on the replicate receiver |
 | `replicationTruncateStalePeerMultiplier` | int64 | `2` | Omit stale peers from WAL truncate barrier |
-| `raftHeartbeatIntervalMs` | int32 | `300` | Raft leader heartbeat interval |
+| `raftHeartbeatIntervalMs` | int32 | `1000` | Raft leader heartbeat interval |
 | `raftElectionTimeoutMs` | int32 | `1000` | Raft election timeout |
 | `raftSnapshotThreshold` | int32 | `1000` | Log entries before Raft snapshot |
 | `replication.mode` | string | `async` | `async` or `sync_quorum` |

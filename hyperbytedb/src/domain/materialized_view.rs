@@ -14,4 +14,7 @@ pub struct MaterializedViewDef {
     pub ch_fact_mv_name: String,
     pub ch_series_mv_name: String,
     pub created_at: String,
+    /// Whether CREATE ran a one-time historical backfill (`WITH BACKFILL`).
+    #[serde(default)]
+    pub backfill_on_create: bool,
 }

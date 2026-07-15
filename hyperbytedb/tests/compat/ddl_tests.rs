@@ -13,6 +13,20 @@ use super::TestContext;
 /// Epoch nanoseconds on a 1-minute boundary (matches MV `toStartOfInterval` bucket keys).
 const MV_MINUTE_ALIGNED_NS: i64 = 1_700_000_040_000_000_000;
 
+async fn mv_fact_row_count(ctx: &TestContext, table: &str) -> u64 {
+    ctx.query_port
+        .execute_sql(&format!(
+            "SELECT count() AS c FROM `{table}` FORMAT JSONEachRow"
+        ))
+        .await
+        .unwrap()
+        .lines()
+        .next()
+        .and_then(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .and_then(|v| v.get("c").and_then(|c| c.as_u64()))
+        .unwrap_or(0)
+}
+
 // ---------------------------------------------------------------------------
 // CREATE / DROP DATABASE
 // ---------------------------------------------------------------------------
@@ -504,7 +518,7 @@ async fn materialized_view_sum_survives_multiple_flushes() {
     let create_resp = ctx
         .query(
             "mvdb",
-            r#"CREATE MATERIALIZED VIEW "mv_metrics_sum" ON "mvdb" AS SELECT sum("value") AS "value" INTO "metrics_1m" FROM "metrics" GROUP BY time(1m), "host""#,
+            r#"CREATE MATERIALIZED VIEW "mv_metrics_sum" ON "mvdb" WITH BACKFILL AS SELECT sum("value") AS "value" INTO "metrics_1m" FROM "metrics" GROUP BY time(1m), "host""#,
         )
         .await
         .unwrap();
@@ -606,7 +620,7 @@ async fn materialized_view_dest_uses_summing_merge_tree() {
     let create_resp = ctx
         .query(
             "mvdb",
-            r#"CREATE MATERIALIZED VIEW "mv_metrics_sum" ON "mvdb" AS SELECT sum("value") AS "value" INTO "metrics_1m" FROM "metrics" GROUP BY time(1m), "host""#,
+            r#"CREATE MATERIALIZED VIEW "mv_metrics_sum" ON "mvdb" WITH BACKFILL AS SELECT sum("value") AS "value" INTO "metrics_1m" FROM "metrics" GROUP BY time(1m), "host""#,
         )
         .await
         .unwrap();
@@ -654,7 +668,7 @@ async fn materialized_view_sum_matches_raw_after_many_single_point_flushes() {
     let create_resp = ctx
         .query(
             "mvdb",
-            r#"CREATE MATERIALIZED VIEW "mv_metrics_many" ON "mvdb" AS SELECT sum("value") AS "value" INTO "metrics_many" FROM "metrics" GROUP BY time(1m), "host""#,
+            r#"CREATE MATERIALIZED VIEW "mv_metrics_many" ON "mvdb" WITH BACKFILL AS SELECT sum("value") AS "value" INTO "metrics_many" FROM "metrics" GROUP BY time(1m), "host""#,
         )
         .await
         .unwrap();
@@ -745,7 +759,7 @@ async fn materialized_view_mean_survives_multiple_flushes() {
     let create_resp = ctx
         .query(
             "mvdb",
-            r#"CREATE MATERIALIZED VIEW "mv_cpu_mean" ON "mvdb" AS SELECT mean("value") INTO "cpu_1m" FROM "cpu" GROUP BY time(1m), "host""#,
+            r#"CREATE MATERIALIZED VIEW "mv_cpu_mean" ON "mvdb" WITH BACKFILL AS SELECT mean("value") INTO "cpu_1m" FROM "cpu" GROUP BY time(1m), "host""#,
         )
         .await
         .unwrap();
@@ -846,7 +860,7 @@ async fn materialized_view_sum_dedupes_duplicate_source_rows() {
     let create_resp = ctx
         .query(
             "mvdb",
-            r#"CREATE MATERIALIZED VIEW "mv_metrics_dedup" ON "mvdb" AS SELECT sum("value") AS "value" INTO "metrics_dedup" FROM "metrics" GROUP BY time(1m), "host""#,
+            r#"CREATE MATERIALIZED VIEW "mv_metrics_dedup" ON "mvdb" WITH BACKFILL AS SELECT sum("value") AS "value" INTO "metrics_dedup" FROM "metrics" GROUP BY time(1m), "host""#,
         )
         .await
         .unwrap();
@@ -960,6 +974,435 @@ async fn materialized_view_dest_in_different_rp_poisons_same_name_in_autogen() {
 }
 
 #[tokio::test]
+#[serial(chdb)]
+async fn create_materialized_view_without_backfill_leaves_dest_empty_until_new_writes() {
+    let ctx = match TestContext::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("skipping MV no-backfill test: chDB not available");
+            return;
+        }
+    };
+
+    ctx.metadata.create_database("mvdb").await.unwrap();
+
+    let t = MV_MINUTE_ALIGNED_NS;
+    ctx.write_and_flush("mvdb", &format!("metrics,host=h1 value=10 {t}"))
+        .await
+        .unwrap();
+
+    let create_resp = ctx
+        .query(
+            "mvdb",
+            r#"CREATE MATERIALIZED VIEW "mv_no_backfill" ON "mvdb" AS SELECT sum("value") AS "value" INTO "metrics_nobf" FROM "metrics" GROUP BY time(1m), "host""#,
+        )
+        .await
+        .unwrap();
+    assert!(
+        create_resp.results[0].error.is_none(),
+        "create MV failed: {:?}",
+        create_resp.results[0].error
+    );
+
+    let dest_count: u64 = mv_fact_row_count(&ctx, "mvdb_autogen_metrics_nobf").await;
+    assert_eq!(
+        dest_count, 0,
+        "dest fact table should be empty before any post-create writes"
+    );
+
+    let t2 = t + 1_000_000_000;
+    ctx.write_and_flush("mvdb", &format!("metrics,host=h1 value=5 {t2}"))
+        .await
+        .unwrap();
+
+    let dest_resp = ctx
+        .query(
+            "mvdb",
+            &format!(r#"SELECT sum("value") FROM "metrics_nobf" WHERE time = {t}"#),
+        )
+        .await
+        .unwrap();
+    assert!(
+        dest_resp.results[0].error.is_none(),
+        "query dest failed: {:?}",
+        dest_resp.results[0].error
+    );
+    let dest_sum: f64 = dest_resp.results[0]
+        .series
+        .as_ref()
+        .unwrap()
+        .first()
+        .and_then(|s| s.values.first())
+        .and_then(|row| row.last())
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    assert!(
+        (dest_sum - 5.0).abs() < 0.01,
+        "only post-create writes should appear in dest, got {dest_sum}"
+    );
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn create_materialized_view_with_backfill_populates_history() {
+    let ctx = match TestContext::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("skipping MV with-backfill test: chDB not available");
+            return;
+        }
+    };
+
+    ctx.metadata.create_database("mvdb").await.unwrap();
+
+    let t = MV_MINUTE_ALIGNED_NS;
+    ctx.write_and_flush("mvdb", &format!("metrics,host=h1 value=10 {t}"))
+        .await
+        .unwrap();
+
+    let create_resp = ctx
+        .query(
+            "mvdb",
+            r#"CREATE MATERIALIZED VIEW "mv_with_backfill" ON "mvdb" WITH BACKFILL AS SELECT sum("value") AS "value" INTO "metrics_bf" FROM "metrics" GROUP BY time(1m), "host""#,
+        )
+        .await
+        .unwrap();
+    assert!(
+        create_resp.results[0].error.is_none(),
+        "create MV failed: {:?}",
+        create_resp.results[0].error
+    );
+
+    let mvs = ctx.metadata.list_materialized_views("mvdb").await.unwrap();
+    let mv_def = mvs.iter().find(|m| m.name == "mv_with_backfill").unwrap();
+    assert!(mv_def.backfill_on_create);
+
+    let dest_resp = ctx
+        .query(
+            "mvdb",
+            &format!(r#"SELECT sum("value") FROM "metrics_bf" WHERE time = {t}"#),
+        )
+        .await
+        .unwrap();
+    assert!(
+        dest_resp.results[0].error.is_none(),
+        "query dest failed: {:?}",
+        dest_resp.results[0].error
+    );
+    let dest_sum: f64 = dest_resp.results[0]
+        .series
+        .as_ref()
+        .unwrap()
+        .first()
+        .and_then(|s| s.values.first())
+        .and_then(|row| row.last())
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    assert!(
+        (dest_sum - 10.0).abs() < 0.01,
+        "WITH BACKFILL should populate historical data, got {dest_sum}"
+    );
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn create_materialized_view_without_backfill_records_metadata_flag() {
+    let ctx = match TestContext::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("skipping MV metadata flag test: chDB not available");
+            return;
+        }
+    };
+
+    ctx.metadata.create_database("mvdb").await.unwrap();
+
+    let t = MV_MINUTE_ALIGNED_NS;
+    ctx.write_and_flush("mvdb", &format!("metrics,host=h1 value=1 {t}"))
+        .await
+        .unwrap();
+
+    let create_resp = ctx
+        .query(
+            "mvdb",
+            r#"CREATE MATERIALIZED VIEW "mv_flag_off" ON "mvdb" AS SELECT sum("value") AS "value" INTO "metrics_flag" FROM "metrics" GROUP BY time(1m), "host""#,
+        )
+        .await
+        .unwrap();
+    assert!(
+        create_resp.results[0].error.is_none(),
+        "create MV failed: {:?}",
+        create_resp.results[0].error
+    );
+
+    let mvs = ctx.metadata.list_materialized_views("mvdb").await.unwrap();
+    let mv_def = mvs.iter().find(|m| m.name == "mv_flag_off").unwrap();
+    assert!(
+        !mv_def.backfill_on_create,
+        "default CREATE should persist backfill_on_create=false"
+    );
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn create_materialized_view_without_backfill_on_empty_source() {
+    let ctx = match TestContext::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("skipping MV empty-source no-backfill test: chDB not available");
+            return;
+        }
+    };
+
+    ctx.metadata.create_database("mvdb").await.unwrap();
+
+    let t = MV_MINUTE_ALIGNED_NS;
+    ctx.write_and_flush("mvdb", &format!("metrics,host=h1 value=1 {t}"))
+        .await
+        .unwrap();
+    let delete_resp = ctx
+        .query("mvdb", &format!("DELETE FROM metrics WHERE time <= {t}"))
+        .await
+        .unwrap();
+    assert!(
+        delete_resp.results[0].error.is_none(),
+        "delete failed: {:?}",
+        delete_resp.results[0].error
+    );
+
+    let create_resp = ctx
+        .query(
+            "mvdb",
+            r#"CREATE MATERIALIZED VIEW "mv_empty_src" ON "mvdb" AS SELECT sum("value") AS "value" INTO "metrics_empty" FROM "metrics" GROUP BY time(1m), "host""#,
+        )
+        .await
+        .unwrap();
+    assert!(
+        create_resp.results[0].error.is_none(),
+        "create MV failed: {:?}",
+        create_resp.results[0].error
+    );
+
+    assert_eq!(
+        mv_fact_row_count(&ctx, "mvdb_autogen_metrics_empty").await,
+        0,
+        "dest should stay empty when source has no data and backfill is off"
+    );
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn create_materialized_view_without_vs_with_backfill_on_same_source() {
+    let ctx = match TestContext::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("skipping MV without-vs-with test: chDB not available");
+            return;
+        }
+    };
+
+    ctx.metadata.create_database("mvdb").await.unwrap();
+
+    let t = MV_MINUTE_ALIGNED_NS;
+    ctx.write_and_flush(
+        "mvdb",
+        &format!("metrics,host=h1 value=10 {t}\nmetrics,host=h2 value=20 {t}"),
+    )
+    .await
+    .unwrap();
+
+    let no_bf = ctx
+        .query(
+            "mvdb",
+            r#"CREATE MATERIALIZED VIEW "mv_cmp_no_bf" ON "mvdb" AS SELECT sum("value") AS "value" INTO "metrics_cmp_nobf" FROM "metrics" GROUP BY time(1m), "host""#,
+        )
+        .await
+        .unwrap();
+    assert!(
+        no_bf.results[0].error.is_none(),
+        "create without backfill failed: {:?}",
+        no_bf.results[0].error
+    );
+
+    let with_bf = ctx
+        .query(
+            "mvdb",
+            r#"CREATE MATERIALIZED VIEW "mv_cmp_with_bf" ON "mvdb" WITH BACKFILL AS SELECT sum("value") AS "value" INTO "metrics_cmp_bf" FROM "metrics" GROUP BY time(1m), "host""#,
+        )
+        .await
+        .unwrap();
+    assert!(
+        with_bf.results[0].error.is_none(),
+        "create with backfill failed: {:?}",
+        with_bf.results[0].error
+    );
+
+    assert_eq!(
+        mv_fact_row_count(&ctx, "mvdb_autogen_metrics_cmp_nobf").await,
+        0,
+        "without-backfill dest should be empty before new writes"
+    );
+    assert!(
+        mv_fact_row_count(&ctx, "mvdb_autogen_metrics_cmp_bf").await >= 2,
+        "with-backfill dest should contain rolled-up rows for each host"
+    );
+
+    let bf_total_resp = ctx
+        .query(
+            "mvdb",
+            &format!(r#"SELECT sum("value") FROM "metrics_cmp_bf" WHERE time = {t}"#),
+        )
+        .await
+        .unwrap();
+    assert!(bf_total_resp.results[0].error.is_none());
+    let bf_total: f64 = bf_total_resp.results[0]
+        .series
+        .as_ref()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s.values.first()?.last()?.as_f64())
+        .sum();
+    assert!(
+        (bf_total - 30.0).abs() < 0.01,
+        "with-backfill dest should include all pre-create source data, got {bf_total}"
+    );
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn create_materialized_view_with_backfill_respects_where_time() {
+    let ctx = match TestContext::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("skipping MV bounded backfill test: chDB not available");
+            return;
+        }
+    };
+
+    ctx.metadata.create_database("mvdb").await.unwrap();
+
+    let t_old = MV_MINUTE_ALIGNED_NS;
+    let t_new = t_old + 3_600_000_000_000; // +1h, distinct minute bucket
+    ctx.write_and_flush("mvdb", &format!("metrics,host=h1 value=100 {t_old}"))
+        .await
+        .unwrap();
+    ctx.write_and_flush("mvdb", &format!("metrics,host=h1 value=5 {t_new}"))
+        .await
+        .unwrap();
+
+    let create_resp = ctx
+        .query(
+            "mvdb",
+            &format!(
+                r#"CREATE MATERIALIZED VIEW "mv_bounded_bf" ON "mvdb" WITH BACKFILL AS SELECT sum("value") AS "value" INTO "metrics_bounded" FROM "metrics" WHERE time >= {t_new} GROUP BY time(1m), "host""#
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(
+        create_resp.results[0].error.is_none(),
+        "create MV failed: {:?}",
+        create_resp.results[0].error
+    );
+
+    let old_count: u64 = ctx
+        .query_port
+        .execute_sql("SELECT count() AS c FROM `mvdb_autogen_metrics_bounded` FORMAT JSONEachRow")
+        .await
+        .unwrap()
+        .lines()
+        .next()
+        .and_then(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .and_then(|v| v.get("c").and_then(|c| c.as_u64()))
+        .unwrap_or(0);
+    assert_eq!(
+        old_count, 1,
+        "bounded backfill should only materialize the recent bucket"
+    );
+
+    let new_resp = ctx
+        .query(
+            "mvdb",
+            &format!(r#"SELECT sum("value") FROM "metrics_bounded" WHERE time = {t_new}"#),
+        )
+        .await
+        .unwrap();
+    assert!(new_resp.results[0].error.is_none());
+    let new_sum: f64 = new_resp.results[0]
+        .series
+        .as_ref()
+        .unwrap()
+        .first()
+        .and_then(|s| s.values.first())
+        .and_then(|row| row.last())
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    assert!(
+        (new_sum - 5.0).abs() < 0.01,
+        "bounded backfill should include matching recent bucket, got {new_sum}"
+    );
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn create_materialized_view_with_backfill_then_incremental_write() {
+    let ctx = match TestContext::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("skipping MV backfill plus incremental test: chDB not available");
+            return;
+        }
+    };
+
+    ctx.metadata.create_database("mvdb").await.unwrap();
+
+    let t = MV_MINUTE_ALIGNED_NS;
+    ctx.write_and_flush("mvdb", &format!("metrics,host=h1 value=10 {t}"))
+        .await
+        .unwrap();
+
+    let create_resp = ctx
+        .query(
+            "mvdb",
+            r#"CREATE MATERIALIZED VIEW "mv_bf_incr" ON "mvdb" WITH BACKFILL AS SELECT sum("value") AS "value" INTO "metrics_bf_incr" FROM "metrics" GROUP BY time(1m), "host""#,
+        )
+        .await
+        .unwrap();
+    assert!(
+        create_resp.results[0].error.is_none(),
+        "create MV failed: {:?}",
+        create_resp.results[0].error
+    );
+
+    let t2 = t + 1_000_000_000;
+    ctx.write_and_flush("mvdb", &format!("metrics,host=h1 value=5 {t2}"))
+        .await
+        .unwrap();
+
+    let dest_resp = ctx
+        .query(
+            "mvdb",
+            &format!(r#"SELECT sum("value") FROM "metrics_bf_incr" WHERE time = {t}"#),
+        )
+        .await
+        .unwrap();
+    assert!(dest_resp.results[0].error.is_none());
+    let dest_sum: f64 = dest_resp.results[0]
+        .series
+        .as_ref()
+        .unwrap()
+        .first()
+        .and_then(|s| s.values.first())
+        .and_then(|row| row.last())
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    assert!(
+        (dest_sum - 15.0).abs() < 0.01,
+        "backfill plus incremental flush should accumulate in the same bucket, got {dest_sum}"
+    );
+}
+
+#[tokio::test]
 async fn drop_materialized_view() {
     let ctx = TestContext::new_no_chdb().unwrap();
     ctx.metadata.create_database("testdb").await.unwrap();
@@ -981,6 +1424,7 @@ async fn drop_materialized_view() {
                 ch_fact_mv_name: "testdb_autogen_mv_drop_mv".to_string(),
                 ch_series_mv_name: "testdb_autogen_mv_drop_series_mv".to_string(),
                 created_at: chrono::Utc::now().to_rfc3339(),
+                backfill_on_create: false,
             },
         )
         .await

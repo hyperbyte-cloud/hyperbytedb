@@ -69,7 +69,7 @@ replicate_receiver_queue_depth = 1024
 replicate_receiver_workers = 1
 replication_truncate_stale_peer_multiplier = 2
 # Raft consensus settings (used when cluster is enabled)
-# raft_heartbeat_interval_ms = 300
+# raft_heartbeat_interval_ms = 1000
 # raft_election_timeout_ms = 1000
 # raft_snapshot_threshold = 1000
 

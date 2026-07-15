@@ -1349,8 +1349,58 @@ mod tests {
             Statement::CreateMaterializedView(mv) => {
                 assert_eq!(mv.name, "mv_5m");
                 assert_eq!(mv.database, "mydb");
+                assert!(!mv.backfill_on_create);
                 assert!(mv.query.into.is_some());
                 assert!(mv.query.group_by.is_some());
+            }
+            _ => panic!("expected CREATE MATERIALIZED VIEW"),
+        }
+    }
+
+    #[test]
+    fn test_parse_create_materialized_view_with_backfill() {
+        let q = r#"CREATE MATERIALIZED VIEW "mv_5m" ON "mydb" WITH BACKFILL AS SELECT mean("value") INTO "cpu_5m" FROM "cpu" GROUP BY time(5m), *"#;
+        let stmts = parse_query(q).unwrap();
+        match &stmts[0] {
+            Statement::CreateMaterializedView(mv) => {
+                assert_eq!(mv.name, "mv_5m");
+                assert_eq!(mv.database, "mydb");
+                assert!(mv.backfill_on_create);
+            }
+            _ => panic!("expected CREATE MATERIALIZED VIEW"),
+        }
+    }
+
+    #[test]
+    fn test_parse_create_materialized_view_with_without_backfill_keyword_fails() {
+        let q = r#"CREATE MATERIALIZED VIEW "mv" ON "mydb" WITH AS SELECT mean("value") INTO "cpu_5m" FROM "cpu" GROUP BY time(5m), *"#;
+        assert!(
+            parse_query(q).is_err(),
+            "WITH without BACKFILL should be a parse error"
+        );
+    }
+
+    #[test]
+    fn test_parse_create_materialized_view_with_backfill_begin_syntax() {
+        let q = r#"CREATE MATERIALIZED VIEW "mv_1h" ON "mydb" WITH BACKFILL BEGIN SELECT mean("value") INTO "cpu_1h" FROM "cpu" GROUP BY time(1h), * END"#;
+        let stmts = parse_query(q).unwrap();
+        match &stmts[0] {
+            Statement::CreateMaterializedView(mv) => {
+                assert_eq!(mv.name, "mv_1h");
+                assert!(mv.backfill_on_create);
+                assert!(mv.query.group_by.is_some());
+            }
+            _ => panic!("expected CREATE MATERIALIZED VIEW"),
+        }
+    }
+
+    #[test]
+    fn test_parse_create_materialized_view_begin_syntax_without_backfill() {
+        let q = r#"CREATE MATERIALIZED VIEW "mv_1h" ON "mydb" BEGIN SELECT mean("value") INTO "cpu_1h" FROM "cpu" GROUP BY time(1h), * END"#;
+        let stmts = parse_query(q).unwrap();
+        match &stmts[0] {
+            Statement::CreateMaterializedView(mv) => {
+                assert!(!mv.backfill_on_create);
             }
             _ => panic!("expected CREATE MATERIALIZED VIEW"),
         }

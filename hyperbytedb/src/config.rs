@@ -193,7 +193,7 @@ pub struct ClusterConfig {
     /// When >0, peers with ack 0 and stale heartbeats are omitted from truncate barrier.
     #[serde(default = "default_replication_truncate_stale_peer_multiplier")]
     pub replication_truncate_stale_peer_multiplier: u64,
-    /// Raft heartbeat interval in milliseconds (default: 300).
+    /// Raft heartbeat interval in milliseconds (default: 1000).
     pub raft_heartbeat_interval_ms: Option<u64>,
     /// Raft election timeout in milliseconds (default: 1000).
     pub raft_election_timeout_ms: Option<u64>,

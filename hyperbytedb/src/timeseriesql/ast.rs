@@ -448,6 +448,8 @@ pub struct CreateMaterializedViewStatement {
     pub database: String,
     pub query: SelectStatement,
     pub raw_query: String,
+    /// When true, run a one-time historical backfill on CREATE (`WITH BACKFILL`).
+    pub backfill_on_create: bool,
 }
 
 #[cfg(test)]

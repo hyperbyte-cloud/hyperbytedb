@@ -199,6 +199,9 @@ fn normalize_statement(stmt: &Statement) -> String {
                 mv.name, mv.database
             )
             .ok();
+            if mv.backfill_on_create {
+                out.push_str(" with backfill");
+            }
         }
         Statement::DropMaterializedView { name, db } => {
             write!(out, "drop materialized view {} on {}", name, db).ok();
@@ -573,5 +576,28 @@ mod tests {
         let redacted = redact_credentials(raw);
         assert!(!redacted.contains("s3cret"));
         assert!(redacted.contains("****"));
+    }
+
+    #[test]
+    fn normalize_create_mv_without_backfill() {
+        let stmt = crate::timeseriesql::parse(
+            r#"CREATE MATERIALIZED VIEW "mv" ON "db" AS SELECT mean("v") FROM "m" GROUP BY time(1m)"#,
+        )
+        .unwrap()
+        .remove(0);
+        let (_, norm) = fingerprint(&stmt);
+        assert_eq!(norm, "create materialized view mv on db");
+        assert!(!norm.contains("with backfill"));
+    }
+
+    #[test]
+    fn normalize_create_mv_with_backfill() {
+        let stmt = crate::timeseriesql::parse(
+            r#"CREATE MATERIALIZED VIEW "mv" ON "db" WITH BACKFILL AS SELECT mean("v") FROM "m" GROUP BY time(1m)"#,
+        )
+        .unwrap()
+        .remove(0);
+        let (_, norm) = fingerprint(&stmt);
+        assert_eq!(norm, "create materialized view mv on db with backfill");
     }
 }
