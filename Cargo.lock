@@ -1832,7 +1832,7 @@ dependencies = [
 
 [[package]]
 name = "hyperbytedb"
-version = "0.8.3"
+version = "0.8.5"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1885,7 +1885,7 @@ dependencies = [
 
 [[package]]
 name = "hyperbytedb-cli"
-version = "0.8.3"
+version = "0.8.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -1919,7 +1919,7 @@ dependencies = [
 
 [[package]]
 name = "hyperbytedb-proxy"
-version = "0.8.3"
+version = "0.8.5"
 dependencies = [
  "anyhow",
  "axum",

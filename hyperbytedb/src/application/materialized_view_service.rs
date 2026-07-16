@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::application::ingest_metadata::register_series_from_series_table;
 use crate::domain::chdb_naming::{
     quoted_fact_mv_name, quoted_series_mv_name, quoted_series_table_name, quoted_table_name,
     unquoted_fact_mv_name, unquoted_series_mv_name,
@@ -415,20 +416,40 @@ impl MaterializedViewService {
 
             if backfill_on_create {
                 self.query_port.execute_sql(&backfill_fact).await?;
-
-                let backfill_series = format!("INSERT INTO {dest_series}\n{series_select}");
-                self.query_port.execute_sql(&backfill_series).await?;
             } else {
                 tracing::info!(
                     mv = %mv.name,
                     db = %mv.database,
-                    "skipping materialized view historical backfill (use WITH BACKFILL to enable)"
+                    "skipping materialized view fact backfill (use WITH BACKFILL to enable historical data)"
                 );
             }
+
+            let backfill_series = format!("INSERT INTO {dest_series}\n{series_select}");
+            self.query_port.execute_sql(&backfill_series).await?;
 
             self.metadata
                 .register_measurement(&dest_db, &dest_rp, &dest_meta)
                 .await?;
+
+            if let Err(e) = register_series_from_series_table(
+                &self.metadata,
+                &self.query_port,
+                &dest_db,
+                &dest_rp,
+                &dest_measurement,
+                &dest_meta,
+                &dest_series,
+            )
+            .await
+            {
+                tracing::warn!(
+                    mv = %mv.name,
+                    db = %mv.database,
+                    dest = %dest_measurement,
+                    error = %e,
+                    "failed to persist MV destination series metadata"
+                );
+            }
 
             Ok::<_, HyperbytedbError>(())
         }
