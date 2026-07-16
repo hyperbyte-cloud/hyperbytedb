@@ -1,6 +1,6 @@
 [package]
 name = "hyperbytedb-cli"
-version = "0.8.3"
+version = "0.8.5"
 edition = "2024"
 description = "Interactive CLI client for HyperbyteDB — InfluxDB v1-compatible REPL, query, write, and admin"
 license = "Apache-2.0"

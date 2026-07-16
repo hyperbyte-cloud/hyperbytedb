@@ -6,11 +6,14 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
+use crate::domain::chdb_naming::quote_backticks;
+use crate::domain::column_mapping::ColumnMapping;
 use crate::domain::field_type::merge_field_type_map;
 use crate::domain::point::Point;
 use crate::domain::series::series_id_for_point;
 use crate::error::HyperbytedbError;
 use crate::ports::metadata::{MeasurementMeta, MetadataPort};
+use crate::ports::query::QueryPort;
 
 /// Cardinality limits (0 = unlimited for that bound), matching [`crate::config::CardinalityConfig`].
 #[derive(Debug, Clone, Copy, Default)]
@@ -224,6 +227,70 @@ pub async fn backfill_tag_metadata(
     metadata
         .register_metadata_batch(db, rp, &meas_updates, &tag_entries)
         .await
+}
+
+/// Load series rows from a chDB `_series` table and persist them to RocksDB for
+/// `SHOW SERIES` / `SHOW TAG VALUES` (used after MV destination dimension backfill).
+pub async fn register_series_from_series_table(
+    metadata: &Arc<dyn MetadataPort>,
+    query_port: &Arc<dyn QueryPort>,
+    db: &str,
+    rp: &str,
+    measurement: &str,
+    dest_meta: &MeasurementMeta,
+    series_table_quoted: &str,
+) -> Result<(), HyperbytedbError> {
+    let mapping = ColumnMapping::from_measurement_meta(dest_meta);
+    let tag_keys: Vec<String> = dest_meta.tag_keys.clone();
+
+    let select_cols: Vec<String> = if tag_keys.is_empty() {
+        vec!["series_id".to_string()]
+    } else {
+        let mut cols = vec!["series_id".to_string()];
+        for key in &tag_keys {
+            cols.push(quote_backticks(&mapping.tag_column_name(key)));
+        }
+        cols
+    };
+
+    let sql = format!(
+        "SELECT {} FROM {series_table_quoted} FINAL FORMAT TabSeparated",
+        select_cols.join(", ")
+    );
+    let raw = query_port.execute_sql(&sql).await?;
+    if raw.trim().is_empty() {
+        return Ok(());
+    }
+
+    let mut entries: Vec<(u64, BTreeMap<String, String>)> = Vec::new();
+    let mut tag_pairs: Vec<(String, String)> = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('\t').collect();
+        let sid: u64 = parts[0].parse().map_err(|e| {
+            HyperbytedbError::Internal(format!("invalid series_id in {series_table_quoted}: {e}"))
+        })?;
+        let mut tags = BTreeMap::new();
+        for (i, key) in tag_keys.iter().enumerate() {
+            let val = parts.get(i + 1).map(|s| s.to_string()).unwrap_or_default();
+            tags.insert(key.clone(), val.clone());
+            if !val.is_empty() {
+                tag_pairs.push((key.clone(), val));
+            }
+        }
+        entries.push((sid, tags));
+    }
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    metadata
+        .register_series_batch(db, rp, measurement, &entries)
+        .await?;
+    backfill_tag_metadata(metadata, db, rp, measurement, tag_pairs).await
 }
 
 /// Fast-path metadata preparation for columnar batches.

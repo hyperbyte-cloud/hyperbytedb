@@ -1010,6 +1010,12 @@ async fn create_materialized_view_without_backfill_leaves_dest_empty_until_new_w
         "dest fact table should be empty before any post-create writes"
     );
 
+    let dest_series_count: u64 = mv_fact_row_count(&ctx, "mvdb_autogen_metrics_nobf_series").await;
+    assert!(
+        dest_series_count > 0,
+        "dest series table should be seeded at create even without fact backfill"
+    );
+
     let t2 = t + 1_000_000_000;
     ctx.write_and_flush("mvdb", &format!("metrics,host=h1 value=5 {t2}"))
         .await
@@ -1039,6 +1045,133 @@ async fn create_materialized_view_without_backfill_leaves_dest_empty_until_new_w
     assert!(
         (dest_sum - 5.0).abs() < 0.01,
         "only post-create writes should appear in dest, got {dest_sum}"
+    );
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn create_materialized_view_without_backfill_seeds_dest_series_metadata() {
+    use chrono::{TimeZone, Utc};
+
+    let ctx = match TestContext::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("skipping MV dest series metadata test: chDB not available");
+            return;
+        }
+    };
+
+    fn ts(h: u32, m: u32) -> i64 {
+        Utc.with_ymd_and_hms(2016, 8, 28, h, m, 0)
+            .unwrap()
+            .timestamp_nanos_opt()
+            .unwrap()
+    }
+
+    ctx.metadata.create_database("gameservers").await.unwrap();
+    ctx.metadata
+        .create_retention_policy(
+            "gameservers",
+            hyperbytedb::domain::database::RetentionPolicy {
+                name: "default_high".to_string(),
+                duration: Some(std::time::Duration::from_secs(7 * 24 * 3600)),
+                shard_group_duration: std::time::Duration::from_secs(3600),
+                replication_factor: 1,
+                is_default: false,
+            },
+        )
+        .await
+        .unwrap();
+
+    let minute = ts(8, 0);
+    let lines = format!(
+        "server_stats,region_id=us,server_id=s1 cpu=1i {minute}\n\
+         server_stats,region_id=eu,server_id=s2 cpu=1i {minute}\n\
+         server_stats,region_id=ap,server_id=s3 cpu=1i {minute}\n\
+         server_stats,region_id=us,server_id=s4 cpu=1i {minute}\n\
+         server_stats,region_id=eu,server_id=s5 cpu=1i {minute}",
+    );
+    ctx.write_and_flush("gameservers", &lines).await.unwrap();
+
+    let create_resp = ctx
+        .query(
+            "gameservers",
+            r#"CREATE MATERIALIZED VIEW "mv_server_stats" ON "gameservers" AS SELECT count("cpu") AS "num_servers" INTO "default_high"."server_stats" FROM "server_stats" GROUP BY time(1m), "region_id""#,
+        )
+        .await
+        .unwrap();
+    assert!(
+        create_resp.results[0].error.is_none(),
+        "create MV failed: {:?}",
+        create_resp.results[0].error
+    );
+
+    let dest_series_count: u64 =
+        mv_fact_row_count(&ctx, "gameservers_default_high_server_stats_series").await;
+    assert_eq!(
+        dest_series_count, 3,
+        "dest series should collapse to one row per region_id"
+    );
+
+    let tag_keys = ctx
+        .query(
+            "gameservers",
+            r#"SHOW TAG KEYS FROM "default_high"."server_stats""#,
+        )
+        .await
+        .unwrap();
+    assert!(
+        tag_keys.results[0].error.is_none(),
+        "{:?}",
+        tag_keys.results[0].error
+    );
+    let keys: Vec<&str> = tag_keys.results[0].series.as_ref().unwrap()[0]
+        .values
+        .iter()
+        .filter_map(|row| row.first().and_then(|v| v.as_str()))
+        .collect();
+    assert!(keys.contains(&"region_id"));
+    assert!(!keys.contains(&"server_id"));
+
+    let tag_values = ctx
+        .query(
+            "gameservers",
+            r#"SHOW TAG VALUES FROM "default_high"."server_stats" WITH KEY = "region_id""#,
+        )
+        .await
+        .unwrap();
+    assert!(
+        tag_values.results[0].error.is_none(),
+        "{:?}",
+        tag_values.results[0].error
+    );
+    let regions: Vec<&str> = tag_values.results[0].series.as_ref().unwrap()[0]
+        .values
+        .iter()
+        .filter_map(|row| row.get(1).and_then(|v| v.as_str()))
+        .collect();
+    assert_eq!(regions.len(), 3);
+    assert!(regions.contains(&"us"));
+    assert!(regions.contains(&"eu"));
+    assert!(regions.contains(&"ap"));
+
+    let show_series = ctx
+        .query(
+            "gameservers",
+            r#"SHOW SERIES FROM "default_high"."server_stats""#,
+        )
+        .await
+        .unwrap();
+    assert!(
+        show_series.results[0].error.is_none(),
+        "{:?}",
+        show_series.results[0].error
+    );
+    let series_keys = &show_series.results[0].series.as_ref().unwrap()[0].values;
+    assert_eq!(
+        series_keys.len(),
+        3,
+        "SHOW SERIES should list collapsed dest series"
     );
 }
 
