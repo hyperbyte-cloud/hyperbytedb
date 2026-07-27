@@ -13,6 +13,10 @@ use crate::application::line_protocol::{
 };
 use crate::application::msgpack_ingest::parse_msgpack_body_to_points_limited;
 use crate::application::replication_dispatch::dispatch_outbound_replication;
+use crate::application::shard_routing::{
+    ensure_measurement_bootstrapped, forward_shard_write, partition_points, region_peer_targets,
+    ShardRoutingContext,
+};
 use crate::application::wal_append::{
     ColumnarWalAppend, append_columnar_with_prepared, append_points_with_prepared,
 };
@@ -22,6 +26,7 @@ use crate::error::HyperbytedbError;
 use crate::ports::ingestion::{IngestionPort, WritePayloadFormat};
 use crate::ports::points_sink::PointsSinkPort;
 use crate::ports::replication::{OutboundReplicationBatch, ReplicationPort};
+use crate::ports::sharding::ShardMapPort;
 use crate::ports::wal::WalPort;
 
 /// Ingestion service for clustered (master-master) mode. Writes are always
@@ -44,6 +49,9 @@ pub struct PeerIngestionService {
     max_points_per_request: usize,
     schema_cache: IngestSchemaCache,
     replication: ReplicationConfig,
+    shard_routing: Option<Arc<ShardRoutingContext>>,
+    is_raft_leader: Arc<dyn Fn() -> bool + Send + Sync>,
+    raft_leader_addr: Arc<dyn Fn() -> Option<String> + Send + Sync>,
 }
 
 impl PeerIngestionService {
@@ -115,7 +123,99 @@ impl PeerIngestionService {
             max_points_per_request,
             schema_cache: IngestSchemaCache::new(),
             replication,
+            shard_routing: None,
+            is_raft_leader: Arc::new(|| false),
+            raft_leader_addr: Arc::new(|| None),
         }
+    }
+
+    pub fn with_sharding(
+        mut self,
+        ctx: Arc<ShardRoutingContext>,
+        is_leader: Arc<dyn Fn() -> bool + Send + Sync>,
+        leader_addr: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    ) -> Self {
+        self.shard_routing = Some(ctx);
+        self.is_raft_leader = is_leader;
+        self.raft_leader_addr = leader_addr;
+        self
+    }
+
+    async fn ingest_sharded_points(
+        &self,
+        db: &str,
+        rp: &str,
+        precision: Option<&str>,
+        points: Vec<crate::domain::point::Point>,
+        _replication_body: Vec<u8>,
+    ) -> Result<(), HyperbytedbError> {
+        let ctx = self.shard_routing.as_ref().expect("sharding ctx");
+        let mut measurements = std::collections::HashSet::new();
+        for p in &points {
+            measurements.insert(p.measurement.clone());
+        }
+        let leader = (self.raft_leader_addr)();
+        for meas in &measurements {
+            ensure_measurement_bootstrapped(
+                ctx,
+                db,
+                rp,
+                meas,
+                (self.is_raft_leader)(),
+                leader.as_deref(),
+            )
+            .await?;
+        }
+
+        let buckets = partition_points(ctx, db, rp, &points).await?;
+        let precision_val = Precision::from_str_opt(precision);
+
+        if !buckets.local.is_empty() {
+            let local_points = buckets.local.clone();
+            prepare_batch_metadata(
+                &self.metadata,
+                db,
+                rp,
+                &buckets.local,
+                self.limits,
+                Some(&self.schema_cache),
+            )
+            .await?;
+            let wal_seq = append_points_with_prepared(
+                self.wal.as_ref(),
+                self.sink.as_ref(),
+                db,
+                rp,
+                buckets.local,
+                self.node_id,
+                self.max_points_per_request,
+            )
+            .await?;
+
+            let local_body = encode_points_to_line_protocol(&local_points, precision_val)?;
+
+            let sid = crate::domain::series::series_id_for_point(&local_points[0]);
+            let map = ctx.shard_map.snapshot().await?;
+            let region = ctx
+                .location_cache
+                .locate(&map, db, rp, &local_points[0].measurement, sid)
+                .ok_or_else(|| HyperbytedbError::ShardMap("no region".into()))?;
+            let targets = region_peer_targets(&region, self.node_id);
+            self.dispatch_replication(OutboundReplicationBatch {
+                database: db.to_string(),
+                retention_policy: rp.to_string(),
+                precision: precision.map(|s| s.to_string()),
+                body: local_body,
+                wal_seq,
+                target_node_ids: Some(targets),
+            })
+            .await?;
+        }
+
+        for (primary, fwd_points) in buckets.forward {
+            forward_shard_write(ctx, primary, db, rp, precision, &fwd_points).await?;
+        }
+        Ok(())
     }
 
     /// Dispatch replication based on the configured mode. Local WAL append
@@ -241,6 +341,7 @@ impl IngestionPort for PeerIngestionService {
                     precision: precision.map(|s| s.to_string()),
                     body: replication_body,
                     wal_seq,
+                    target_node_ids: None,
                 })
                 .await;
             return result;
@@ -277,6 +378,12 @@ impl IngestionPort for PeerIngestionService {
 
         let t2 = std::time::Instant::now();
         histogram!("hyperbytedb_ingest_parse_seconds").record((t2 - t1).as_secs_f64());
+
+        if self.shard_routing.is_some() {
+            return self
+                .ingest_sharded_points(db, &retention_policy, precision, points, replication_body)
+                .await;
+        }
 
         prepare_batch_metadata(
             &self.metadata,
@@ -338,6 +445,7 @@ impl IngestionPort for PeerIngestionService {
             precision: precision.map(|s| s.to_string()),
             body: replication_body,
             wal_seq,
+            target_node_ids: None,
         })
         .await
     }

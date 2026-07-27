@@ -15,7 +15,11 @@ pub async fn dispatch_outbound_replication(
     match replication_config.mode {
         ReplicationMode::Async => replication.replicate_write(batch),
         ReplicationMode::SyncQuorum => {
-            let peer_count = replication.active_peer_count(node_id).await;
+            let peer_count = if let Some(ref targets) = batch.target_node_ids {
+                targets.len()
+            } else {
+                replication.active_peer_count(node_id).await
+            };
             let min_acks: SyncQuorumMinAcks = replication_config.sync_quorum.min_acks;
             let required = min_acks.resolve(peer_count);
             let timeout = Duration::from_millis(replication_config.ack_timeout_ms);

@@ -78,6 +78,32 @@ impl PeerClient {
         self
     }
 
+    pub fn membership(&self) -> &SharedMembership {
+        &self.membership
+    }
+
+    pub fn http_client(&self) -> &reqwest::Client {
+        &self.client
+    }
+
+    async fn resolve_replication_peers_async(
+        &self,
+        target_node_ids: Option<&[u64]>,
+    ) -> Vec<(u64, String)> {
+        let m = self.membership.read().await;
+        if let Some(targets) = target_node_ids {
+            targets
+                .iter()
+                .filter_map(|id| m.get_node(*id).map(|n| (n.node_id, n.addr.clone())))
+                .collect()
+        } else {
+            m.replication_peers(self.node_id)
+                .into_iter()
+                .map(|n| (n.node_id, n.addr.clone()))
+                .collect()
+        }
+    }
+
     pub fn start_outbound_processor(self: &Arc<Self>) {
         if self
             .outbound_started
@@ -166,10 +192,6 @@ impl PeerClient {
         self.node_id
     }
 
-    pub fn membership(&self) -> &SharedMembership {
-        &self.membership
-    }
-
     pub fn replication_log(&self) -> &Arc<ReplicationLog> {
         &self.replication_log
     }
@@ -251,13 +273,9 @@ impl PeerClient {
 
     async fn do_replicate_write(&self, job: &OutboundReplicationBatch) {
         let start = std::time::Instant::now();
-        let peers = {
-            let m = self.membership.read().await;
-            m.replication_peers(self.node_id)
-                .into_iter()
-                .map(|n| (n.node_id, n.addr.clone()))
-                .collect::<Vec<_>>()
-        };
+        let peers = self
+            .resolve_replication_peers_async(job.target_node_ids.as_deref())
+            .await;
 
         if peers.is_empty() {
             return;
@@ -318,13 +336,9 @@ impl PeerClient {
         ack_timeout: Duration,
     ) -> Result<(), HyperbytedbError> {
         let start = std::time::Instant::now();
-        let peers = {
-            let m = self.membership.read().await;
-            m.replication_peers(self.node_id)
-                .into_iter()
-                .map(|n| (n.node_id, n.addr.clone()))
-                .collect::<Vec<_>>()
-        };
+        let peers = self
+            .resolve_replication_peers_async(batch.target_node_ids.as_deref())
+            .await;
 
         let required = min_acks.min(peers.len());
         metrics::gauge!("hyperbytedb_replication_sync_required_acks").set(required as f64);
@@ -553,19 +567,17 @@ impl PeerClient {
         }
     }
 
-    async fn do_replicate_mutation(&self, req: &MutationRequest) -> Result<(), HyperbytedbError> {
+    async fn do_replicate_mutation(
+        &self,
+        req: &MutationRequest,
+        target_node_ids: Option<&[u64]>,
+    ) -> Result<(), HyperbytedbError> {
         let mutation_seq = self.replication_log.append_mutation(req).map_err(|e| {
             tracing::error!(error = %e, "failed to log mutation");
             HyperbytedbError::Internal(format!("failed to log mutation: {e}").into())
         })?;
 
-        let peers = {
-            let m = self.membership.read().await;
-            m.replication_peers(self.node_id)
-                .into_iter()
-                .map(|n| (n.node_id, n.addr.clone()))
-                .collect::<Vec<_>>()
-        };
+        let peers = self.resolve_replication_peers_async(target_node_ids).await;
 
         if peers.is_empty() {
             return Ok(());
@@ -575,6 +587,7 @@ impl PeerClient {
             seq: mutation_seq,
             origin_node_id: self.node_id,
             mutation: req.clone(),
+            target_node_ids: target_node_ids.map(|ids| ids.to_vec()),
         };
 
         let futures: Vec<_> = peers
@@ -656,11 +669,18 @@ impl PeerClient {
         Ok(())
     }
 
-    /// Fan out a mutation to all active peers.
-    pub fn replicate_mutation(self: &Arc<Self>, req: MutationRequest) {
+    /// Fan out a mutation to cluster peers (optionally scoped by node id).
+    pub fn replicate_mutation(
+        self: &Arc<Self>,
+        req: MutationRequest,
+        target_node_ids: Option<Vec<u64>>,
+    ) {
         let this = Arc::clone(self);
         tokio::spawn(async move {
-            if let Err(e) = this.do_replicate_mutation(&req).await {
+            if let Err(e) = this
+                .do_replicate_mutation(&req, target_node_ids.as_deref())
+                .await
+            {
                 tracing::error!(error = %e, "background mutation replication failed");
             }
         });
@@ -670,7 +690,7 @@ impl PeerClient {
         self: &Arc<Self>,
         req: MutationRequest,
     ) -> Result<(), HyperbytedbError> {
-        self.do_replicate_mutation(&req).await
+        self.do_replicate_mutation(&req, None).await
     }
 }
 
@@ -692,8 +712,8 @@ impl ReplicationPort for PeerClient {
         PeerClient::replicate_write_sync(&self, batch, required_acks, timeout).await
     }
 
-    fn replicate_mutation(self: Arc<Self>, req: MutationRequest) {
-        PeerClient::replicate_mutation(&self, req);
+    fn replicate_mutation(self: Arc<Self>, req: MutationRequest, target_node_ids: Option<Vec<u64>>) {
+        PeerClient::replicate_mutation(&self, req, target_node_ids);
     }
 
     async fn replicate_mutation_sync(

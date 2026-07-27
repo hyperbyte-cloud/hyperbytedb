@@ -597,5 +597,49 @@ Step 5: Set node state to Leaving
 |--------|------|-------------|
 | `hyperbytedb_cluster_node_state` | gauge | Current node state (0=Joining, 1=Syncing, 2=Active, 3=Disconnected, 4=Draining, 5=Leaving) |
 | `hyperbytedb_drain_total` | counter | Drain procedures initiated |
+
+---
+
+## 15. Series Sharding (Experimental)
+
+When `[sharding] enabled = true` (requires `[cluster] enabled = true`), HyperbyteDB partitions each measurement's series space by `series_id` into **regions** covering `[0, u64::MAX)`.
+
+### Control plane
+
+- **Shard map** is stored in RocksDB and replicated via Raft (`ClusterRequest::ShardMapMutation`).
+- The **Raft leader** runs a **shard scheduler** that evaluates region heartbeats and proposes split, merge, and rebalance operations.
+- Split/merge respect `split_merge_interval_secs` cooldown and `schedule_limit` concurrent ops.
+
+### Data plane
+
+- **Writes** are partitioned by `series_id`; the coordinator forwards non-local buckets to region primaries via `/internal/shard/write`.
+- **Region-scoped replication** uses `target_node_ids` on outbound replication batches.
+- **SELECT** queries scatter to region owners via `/internal/shard/query` with `series_id` range predicates injected per region.
+- **SHOW TAG KEYS/VALUES/SERIES** scatter via `/internal/shard/metadata` and merge on the coordinator.
+- **DELETE / DropSeries / DropMeasurement** store a logical tombstone once, then fan out physical cleanup via `/internal/shard/delete`.
+
+### Transfer and lifecycle
+
+- After split, the scheduler runs **region transfer** (WAL export + `/internal/shard/transfer`) to move vacated ranges to new primaries.
+- **Drain** performs `TransferPrimary` + transfer + `MovePeer` for regions where the draining node is primary.
+- **Sync manifests** include per-region WAL watermarks; join sync pulls from region primaries where the joining node is a peer.
+
+### Metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `hyperbytedb_shard_splits_total` | counter | Split operations proposed |
+| `hyperbytedb_shard_merges_total` | counter | Merge operations proposed |
+| `hyperbytedb_shard_rebalances_total` | counter | Primary transfer / rebalance ops |
+| `hyperbytedb_shard_transfers_total` | counter | Completed region transfers |
+| `hyperbytedb_shard_transfer_bytes` | counter | Bytes moved by transfer |
+| `hyperbytedb_shard_delete_applied_total` | counter | Region delete cleanups applied |
+| `hyperbytedb_shard_region_lag_wal_seq` | gauge | Per-region WAL lag vs primary (leader monitor) |
+
+### Limitations
+
+- Enable sharding only on **new clusters**; in-place conversion is not supported.
+- **Materialized views** are rejected when sharding is enabled.
+- **Proxy** load balancing is not shard-aware; any node can coordinate scatter-gather queries.
 | `hyperbytedb_cluster_peers_active` | gauge | Number of active peers |
 | `hyperbytedb_uptime_seconds` | gauge | Node uptime in seconds |

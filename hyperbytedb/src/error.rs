@@ -149,6 +149,20 @@ pub enum HyperbytedbError {
     #[error("peer unreachable: {0}")]
     PeerUnreachable(String),
 
+    #[error("shard not owner for series_id {series_id} on {db}.{rp}.{measurement}")]
+    ShardNotOwner {
+        db: String,
+        rp: String,
+        measurement: String,
+        series_id: u64,
+    },
+
+    #[error("stale shard epoch for region {region_id}")]
+    StaleShardEpoch { region_id: u64 },
+
+    #[error("shard map error: {0}")]
+    ShardMap(String),
+
     #[error("sync failed: {0}")]
     SyncFailed(String),
 

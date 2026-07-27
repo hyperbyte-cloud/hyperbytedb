@@ -1,3 +1,4 @@
+use hyperbytedb::config::ReplicationConfig;
 use std::sync::Arc;
 
 use axum::http::StatusCode;
@@ -152,6 +153,14 @@ async fn start_cluster_node_with_listener(
         rate_limiter: None,
         wal_batcher_alive: None,
         disk_read_only: None,
+
+        sharding_enabled: false,
+        shard_map: None,
+        shard_location_cache: Arc::new(hyperbytedb::domain::sharding::ShardLocationCache::new()),
+        shard_routing: None,
+        shard_scheduler: None,
+        ingest_cardinality: IngestCardinalityLimits::default(),
+        cluster_replication: ReplicationConfig::default(),
     });
 
     let app = build_router(app_state);
@@ -354,6 +363,14 @@ async fn test_cluster_endpoints_without_peers() {
         rate_limiter: None,
         wal_batcher_alive: None,
         disk_read_only: None,
+
+        sharding_enabled: false,
+        shard_map: None,
+        shard_location_cache: Arc::new(hyperbytedb::domain::sharding::ShardLocationCache::new()),
+        shard_routing: None,
+        shard_scheduler: None,
+        ingest_cardinality: IngestCardinalityLimits::default(),
+        cluster_replication: ReplicationConfig::default(),
     });
 
     let app = build_router(app_state);

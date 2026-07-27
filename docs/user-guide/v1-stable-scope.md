@@ -47,6 +47,8 @@ without a major version bump:
 - Non-S3 backup destinations
 - Custom TLS certificate authority integration beyond cert-manager or operator-generated certs
 - Metrics label schema (new labels may be added)
+- **Automatic series sharding** (`[sharding] enabled = true`) — cluster-only experimental feature; split/merge/rebalance semantics may change
+- **Materialized views with sharding enabled** — `CREATE MATERIALIZED VIEW` is rejected when `[sharding] enabled = true`
 
 ## Breaking vs Non-Breaking Changes
 

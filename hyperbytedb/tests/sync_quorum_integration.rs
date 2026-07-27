@@ -194,6 +194,14 @@ async fn start_node_on(
         rate_limiter: None,
         wal_batcher_alive: None,
         disk_read_only: None,
+
+        sharding_enabled: false,
+        shard_map: None,
+        shard_location_cache: Arc::new(hyperbytedb::domain::sharding::ShardLocationCache::new()),
+        shard_routing: None,
+        shard_scheduler: None,
+        ingest_cardinality: IngestCardinalityLimits::default(),
+        cluster_replication: ReplicationConfig::default(),
     });
 
     let app = build_router(app_state);

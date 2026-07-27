@@ -49,6 +49,9 @@ enum Commands {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let config = HyperbytedbConfig::load(Some(&cli.config))?;
+    config
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid configuration: {e}"))?;
 
     let filter = match tracing_subscriber::EnvFilter::try_from_default_env() {
         Ok(f) => f,

@@ -15,20 +15,25 @@ use crate::adapters::cluster::peer_client::PeerClient;
 use crate::adapters::cluster::raft::HyperbytedbRaft;
 use crate::adapters::cluster::replication_log::ReplicationLog;
 use crate::application::cluster::drain::DrainService;
+use crate::application::ingest_metadata::IngestCardinalityLimits;
 use crate::application::materialized_view_service::MaterializedViewService;
 use crate::application::replication_apply::ReplicationApplyQueue;
+use crate::application::shard_routing::ShardRoutingContext;
+use crate::application::shard_scheduler::ShardScheduler;
 use crate::application::statement_summary::StatementSummary;
+use crate::config::ReplicationConfig;
 use crate::domain::cluster::membership::SharedMembership;
+use crate::domain::sharding::ShardLocationCache;
 use crate::ports::{
     auth::AuthPort, ingestion::IngestionPort, metadata::MetadataPort, points_sink::PointsSinkPort,
-    query::QueryPort, wal::WalPort,
+    query::QueryPort, sharding::ShardMapPort, wal::WalPort,
 };
 
 pub use crate::ports::query::QueryService;
 
 use super::{
     auth_middleware, chdb, cluster, metrics, middleware as http_middleware, peer_handlers, ping,
-    query, raft_handlers, rate_limit, statements, write,
+    query, raft_handlers, rate_limit, shard_handlers, statements, write,
 };
 
 pub struct AppState {
@@ -67,6 +72,13 @@ pub struct AppState {
     pub wal_batcher_alive: Option<Arc<AtomicBool>>,
     /// Set when `[disk] enabled`; `true` when free space is below readonly threshold.
     pub disk_read_only: Option<Arc<AtomicBool>>,
+    pub sharding_enabled: bool,
+    pub shard_map: Option<Arc<dyn ShardMapPort>>,
+    pub shard_location_cache: Arc<ShardLocationCache>,
+    pub shard_routing: Option<Arc<ShardRoutingContext>>,
+    pub shard_scheduler: Option<Arc<ShardScheduler>>,
+    pub ingest_cardinality: IngestCardinalityLimits,
+    pub cluster_replication: ReplicationConfig,
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -172,6 +184,30 @@ pub fn build_router(state: Arc<AppState>) -> Router {
                 post(peer_handlers::handle_sync_trigger),
             )
             .route("/internal/drain", post(peer_handlers::handle_drain));
+
+        if state.sharding_enabled {
+            cluster_router = cluster_router
+                .route("/internal/shard/bootstrap", post(shard_handlers::handle_shard_bootstrap))
+                .route("/internal/shard/write", post(shard_handlers::handle_shard_write))
+                .route("/internal/shard/query", post(shard_handlers::handle_shard_query))
+                .route(
+                    "/internal/shard/heartbeat",
+                    post(shard_handlers::handle_shard_heartbeat),
+                )
+                .route(
+                    "/internal/shard/transfer",
+                    post(shard_handlers::handle_shard_transfer),
+                )
+                .route(
+                    "/internal/shard/metadata",
+                    post(shard_handlers::handle_shard_metadata),
+                )
+                .route(
+                    "/internal/shard/delete",
+                    post(shard_handlers::handle_shard_delete),
+                )
+                .route("/internal/shard/map", get(shard_handlers::handle_shard_map));
+        }
     }
 
     if state.raft.is_some() {

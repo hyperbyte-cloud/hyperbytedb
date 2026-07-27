@@ -13,6 +13,7 @@ use crate::application::ingest_metadata::{
 };
 use crate::application::line_protocol::parse_line_body_to_points_limited;
 use crate::application::wal_append::append_points_with_prepared;
+use crate::domain::cluster::membership::SharedMembership;
 use crate::error::HyperbytedbError;
 use crate::ports::points_sink::PointsSinkPort;
 use crate::ports::wal::WalPort;
@@ -63,6 +64,30 @@ impl ReplicationApplyQueue {
         limits: IngestCardinalityLimits,
         max_points_per_request: usize,
     ) -> Arc<Self> {
+        Self::with_sink_and_sharding(
+            depth,
+            metadata,
+            wal,
+            sink,
+            limits,
+            max_points_per_request,
+            false,
+            0,
+            None,
+        )
+    }
+
+    pub fn with_sink_and_sharding(
+        depth: usize,
+        metadata: Arc<dyn crate::ports::metadata::MetadataPort>,
+        wal: Arc<dyn WalPort>,
+        sink: Option<Arc<dyn PointsSinkPort>>,
+        limits: IngestCardinalityLimits,
+        max_points_per_request: usize,
+        sharding_enabled: bool,
+        node_id: u64,
+        membership: Option<SharedMembership>,
+    ) -> Arc<Self> {
         Self::with_workers_and_sink(
             depth,
             DEFAULT_WORKERS,
@@ -71,19 +96,13 @@ impl ReplicationApplyQueue {
             sink,
             limits,
             max_points_per_request,
+            sharding_enabled,
+            node_id,
+            membership,
         )
     }
 
-    pub fn with_workers(
-        depth: usize,
-        num_workers: usize,
-        metadata: Arc<dyn crate::ports::metadata::MetadataPort>,
-        wal: Arc<dyn WalPort>,
-        limits: IngestCardinalityLimits,
-    ) -> Arc<Self> {
-        Self::with_workers_and_sink(depth, num_workers, metadata, wal, None, limits, 0)
-    }
-
+    #[allow(clippy::too_many_arguments)]
     pub fn with_workers_and_sink(
         depth: usize,
         num_workers: usize,
@@ -92,6 +111,27 @@ impl ReplicationApplyQueue {
         sink: Option<Arc<dyn PointsSinkPort>>,
         limits: IngestCardinalityLimits,
         max_points_per_request: usize,
+        sharding_enabled: bool,
+        node_id: u64,
+        membership: Option<SharedMembership>,
+    ) -> Arc<Self> {
+        let ctx = ApplyContext {
+            limits,
+            max_points_per_request,
+            sharding_enabled,
+            node_id,
+            membership,
+        };
+        Self::spawn_workers(depth, num_workers, metadata, wal, sink, ctx)
+    }
+
+    fn spawn_workers(
+        depth: usize,
+        num_workers: usize,
+        metadata: Arc<dyn crate::ports::metadata::MetadataPort>,
+        wal: Arc<dyn WalPort>,
+        sink: Option<Arc<dyn PointsSinkPort>>,
+        ctx: ApplyContext,
     ) -> Arc<Self> {
         let depth = depth.max(1);
         let num_workers = num_workers.max(1);
@@ -115,6 +155,7 @@ impl ReplicationApplyQueue {
                 let w = wal.clone();
                 let sink = sink.clone();
                 let sc = schema_cache.clone();
+                let apply_ctx = ctx.clone();
                 tokio::spawn(async move {
                     let r = apply_batch(
                         &meta,
@@ -125,8 +166,7 @@ impl ReplicationApplyQueue {
                         job.precision.as_deref(),
                         &job.body,
                         job.origin_node_id,
-                        limits,
-                        max_points_per_request,
+                        &apply_ctx,
                         &sc,
                     )
                     .await;
@@ -137,6 +177,27 @@ impl ReplicationApplyQueue {
         });
 
         Arc::new(Self { tx })
+    }
+
+    pub fn with_workers(
+        depth: usize,
+        num_workers: usize,
+        metadata: Arc<dyn crate::ports::metadata::MetadataPort>,
+        wal: Arc<dyn WalPort>,
+        limits: IngestCardinalityLimits,
+    ) -> Arc<Self> {
+        Self::with_workers_and_sink(
+            depth,
+            num_workers,
+            metadata,
+            wal,
+            None,
+            limits,
+            0,
+            false,
+            0,
+            None,
+        )
     }
 
     pub fn with_defaults(
@@ -177,6 +238,46 @@ impl ReplicationApplyQueue {
     }
 }
 
+#[derive(Clone)]
+struct ApplyContext {
+    limits: IngestCardinalityLimits,
+    max_points_per_request: usize,
+    sharding_enabled: bool,
+    node_id: u64,
+    membership: Option<SharedMembership>,
+}
+
+fn replica_metadata_limits(ctx: &ApplyContext) -> IngestCardinalityLimits {
+    if ctx.sharding_enabled {
+        IngestCardinalityLimits {
+            max_tag_values_per_measurement: 0,
+            max_measurements_per_database: 0,
+        }
+    } else {
+        ctx.limits
+    }
+}
+
+async fn verify_replication_peer(
+    ctx: &ApplyContext,
+    origin_node_id: u64,
+) -> Result<(), HyperbytedbError> {
+    if !ctx.sharding_enabled || origin_node_id == ctx.node_id {
+        return Ok(());
+    }
+    let Some(ref m) = ctx.membership else {
+        return Ok(());
+    };
+    let guard = m.read().await;
+    if guard.get_node(origin_node_id).is_some() {
+        Ok(())
+    } else {
+        Err(HyperbytedbError::Internal(format!(
+            "replicate apply rejected: unknown origin peer {origin_node_id}"
+        )))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn apply_batch(
     metadata: &Arc<dyn crate::ports::metadata::MetadataPort>,
@@ -187,8 +288,7 @@ async fn apply_batch(
     precision: Option<&str>,
     body: &[u8],
     origin_node_id: u64,
-    limits: IngestCardinalityLimits,
-    max_points_per_request: usize,
+    ctx: &ApplyContext,
     schema_cache: &IngestSchemaCache,
 ) -> Result<u64, HyperbytedbError> {
     let metrics_start = std::time::Instant::now();
@@ -197,8 +297,10 @@ async fn apply_batch(
         return wal.last_sequence().await;
     }
 
+    verify_replication_peer(ctx, origin_node_id).await?;
+
     let t0 = std::time::Instant::now();
-    let points = parse_line_body_to_points_limited(body, precision, max_points_per_request)?;
+    let points = parse_line_body_to_points_limited(body, precision, ctx.max_points_per_request)?;
     histogram!("hyperbytedb_replication_apply_parse_seconds").record(t0.elapsed().as_secs_f64());
     if points.is_empty() {
         return wal.last_sequence().await;
@@ -210,7 +312,7 @@ async fn apply_batch(
         database,
         retention_policy,
         &points,
-        limits,
+        replica_metadata_limits(ctx),
         Some(schema_cache),
     )
     .await
@@ -244,7 +346,7 @@ async fn apply_batch(
         retention_policy,
         points,
         origin_node_id,
-        max_points_per_request,
+        ctx.max_points_per_request,
     )
     .await;
     histogram!("hyperbytedb_replication_apply_wal_seconds").record(t2.elapsed().as_secs_f64());

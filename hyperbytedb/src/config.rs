@@ -22,6 +22,107 @@ pub struct HyperbytedbConfig {
     pub retention: RetentionConfig,
     #[serde(default)]
     pub disk: DiskConfig,
+    #[serde(default)]
+    pub sharding: ShardingConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ShardingConfig {
+    /// Master switch for automatic series_id range sharding (requires cluster).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Target replica count per shard region.
+    #[serde(default = "default_sharding_replication_factor")]
+    pub replication_factor: usize,
+    /// Target series count per region before split consideration.
+    #[serde(default = "default_region_split_series")]
+    pub region_split_series: u64,
+    /// Split when region series_count exceeds this (~1.5× target).
+    #[serde(default = "default_region_max_series")]
+    pub region_max_series: u64,
+    /// Merge when both adjacent regions are below this.
+    #[serde(default = "default_region_merge_series")]
+    pub region_merge_series: u64,
+    /// Cooldown between split and merge on the same region (seconds).
+    #[serde(default = "default_split_merge_interval_secs")]
+    pub split_merge_interval_secs: u64,
+    /// Max concurrent split/move/merge operators.
+    #[serde(default = "default_schedule_limit")]
+    pub schedule_limit: usize,
+    /// Interval for region heartbeat reports to the Raft leader.
+    #[serde(default = "default_shard_heartbeat_interval_secs")]
+    pub heartbeat_interval_secs: u64,
+    /// Load-based split QPS threshold; 0 = disabled.
+    #[serde(default)]
+    pub load_split_qps_threshold: u64,
+    /// Timeout for synchronous bootstrap RPC to the Raft leader.
+    #[serde(default = "default_shard_bootstrap_timeout_ms")]
+    pub bootstrap_timeout_ms: u64,
+}
+
+impl Default for ShardingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            replication_factor: default_sharding_replication_factor(),
+            region_split_series: default_region_split_series(),
+            region_max_series: default_region_max_series(),
+            region_merge_series: default_region_merge_series(),
+            split_merge_interval_secs: default_split_merge_interval_secs(),
+            schedule_limit: default_schedule_limit(),
+            heartbeat_interval_secs: default_shard_heartbeat_interval_secs(),
+            load_split_qps_threshold: 0,
+            bootstrap_timeout_ms: default_shard_bootstrap_timeout_ms(),
+        }
+    }
+}
+
+fn default_sharding_replication_factor() -> usize {
+    3
+}
+
+fn default_region_split_series() -> u64 {
+    100_000
+}
+
+fn default_region_max_series() -> u64 {
+    150_000
+}
+
+fn default_region_merge_series() -> u64 {
+    20_000
+}
+
+fn default_split_merge_interval_secs() -> u64 {
+    3600
+}
+
+fn default_schedule_limit() -> usize {
+    4
+}
+
+fn default_shard_heartbeat_interval_secs() -> u64 {
+    10
+}
+
+fn default_shard_bootstrap_timeout_ms() -> u64 {
+    5000
+}
+
+impl HyperbytedbConfig {
+    /// Validate cross-field constraints after Figment merge.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.sharding.enabled && !self.cluster.enabled {
+            return Err(
+                "sharding.enabled requires cluster.enabled = true (series sharding is cluster-only)"
+                    .into(),
+            );
+        }
+        if self.sharding.replication_factor == 0 {
+            return Err("sharding.replication_factor must be >= 1".into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -674,6 +775,7 @@ impl HyperbytedbConfig {
             },
             retention: RetentionConfig::default(),
             disk: DiskConfig::default(),
+            sharding: ShardingConfig::default(),
         }
     }
 }

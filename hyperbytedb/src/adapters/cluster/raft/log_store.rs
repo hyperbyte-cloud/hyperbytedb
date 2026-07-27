@@ -21,8 +21,10 @@ use rocksdb::{
 use crate::application::materialized_view_service::MaterializedViewService;
 use crate::application::schema_mutation_apply::{self, SchemaMutationDeps};
 use crate::domain::cluster::membership::{NodeInfo, NodeState, SharedMembership};
+use crate::domain::sharding::ShardLocationCache;
 use crate::ports::metadata::MetadataPort;
 use crate::ports::points_sink::PointsSinkPort;
+use crate::ports::sharding::ShardMapPort;
 use crate::ports::wal::WalPort;
 
 use super::TypeConfig;
@@ -96,6 +98,8 @@ pub struct RaftStore {
     mv_service: Option<Arc<MaterializedViewService>>,
     points_sink: Option<Arc<dyn PointsSinkPort>>,
     wal: Option<Arc<dyn WalPort>>,
+    shard_map: Option<Arc<dyn ShardMapPort>>,
+    shard_location_cache: Option<Arc<ShardLocationCache>>,
 }
 
 impl RaftStore {
@@ -170,6 +174,8 @@ impl RaftStore {
             mv_service: None,
             points_sink: None,
             wal: None,
+            shard_map: None,
+            shard_location_cache: None,
         })
     }
 
@@ -275,6 +281,16 @@ impl RaftStore {
 
     pub fn with_wal(mut self, wal: Arc<dyn WalPort>) -> Self {
         self.wal = Some(wal);
+        self
+    }
+
+    pub fn with_shard_map(
+        mut self,
+        shard_map: Arc<dyn ShardMapPort>,
+        location_cache: Arc<ShardLocationCache>,
+    ) -> Self {
+        self.shard_map = Some(shard_map);
+        self.shard_location_cache = Some(location_cache);
         self
     }
 
@@ -471,6 +487,8 @@ impl RaftStorage<TypeConfig> for RaftStore {
             mv_service: self.mv_service.clone(),
             points_sink: self.points_sink.clone(),
             wal: self.wal.clone(),
+            shard_map: self.shard_map.clone(),
+            shard_location_cache: self.shard_location_cache.clone(),
         }
     }
 
@@ -639,6 +657,8 @@ impl RaftStorage<TypeConfig> for RaftStore {
             mv_service: self.mv_service.clone(),
             points_sink: self.points_sink.clone(),
             wal: self.wal.clone(),
+            shard_map: self.shard_map.clone(),
+            shard_location_cache: self.shard_location_cache.clone(),
         }
     }
 
@@ -876,6 +896,21 @@ impl RaftStore {
                     }
                 } else {
                     ClusterResponse::error("metadata port not available")
+                }
+            }
+            ClusterRequest::ShardMapMutation(op) => {
+                if let Some(ref shard_map) = self.shard_map {
+                    match shard_map.apply_op(*op).await {
+                        Ok(map) => {
+                            if let Some(ref cache) = self.shard_location_cache {
+                                cache.refresh_from_map(&map);
+                            }
+                            ClusterResponse::success()
+                        }
+                        Err(e) => ClusterResponse::error(e.to_string()),
+                    }
+                } else {
+                    ClusterResponse::error("shard map not available")
                 }
             }
         }

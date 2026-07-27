@@ -87,6 +87,9 @@ pub struct MutationReplicateRequest {
     #[serde(default)]
     pub origin_node_id: u64,
     pub mutation: MutationRequest,
+    /// When set, replicate only to these node ids (sharding region peers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_node_ids: Option<Vec<u64>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

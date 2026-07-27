@@ -7,6 +7,7 @@
 //! These tests use a mock QueryPort (no chDB required) for metadata and DDL
 //! operations. Tests requiring SELECT query execution are marked `#[ignore]`.
 
+use hyperbytedb::config::ReplicationConfig;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -14,6 +15,7 @@ use axum::http::StatusCode;
 use hyperbytedb::adapters::http::router::{AppState, QueryService, build_router};
 use hyperbytedb::adapters::metadata::rocksdb_meta::RocksDbMetadata;
 use hyperbytedb::adapters::wal::rocksdb_wal::RocksDbWal;
+use hyperbytedb::application::ingest_metadata::IngestCardinalityLimits;
 use hyperbytedb::application::flush_service::FlushServiceImpl;
 use hyperbytedb::application::ingestion_service::IngestionServiceImpl;
 use hyperbytedb::application::materialized_view_service::MaterializedViewService;

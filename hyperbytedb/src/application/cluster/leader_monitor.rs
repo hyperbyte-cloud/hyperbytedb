@@ -50,7 +50,13 @@ pub async fn run_leader_replication_monitor(
 
         // Get local manifest as the baseline (WAL watermark + catalog).
         let local_manifest =
-            match sync_manifest::build_manifest(node_id, &state.metadata, &state.wal).await {
+            match sync_manifest::build_manifest(
+                node_id,
+                &state.metadata,
+                &state.wal,
+                state.shard_map.as_ref().map(|m| m.as_ref() as &dyn crate::ports::sharding::ShardMapPort),
+            )
+            .await {
                 Ok(m) => m,
                 Err(e) => {
                     tracing::debug!(error = %e, "leader monitor: could not build local manifest");
@@ -93,11 +99,46 @@ pub async fn run_leader_replication_monitor(
             metrics::gauge!("hyperbytedb_replication_lag_wal_seq", "peer_id" => peer_id.to_string())
                 .set(wal_gap as f64);
 
-            if wal_gap == 0 && !*needs_sync {
+            let mut region_lag = false;
+            if let Some(ref local_db) = local_manifest.databases.first() {
+                for local_meas in &local_db.measurements {
+                    if let Some(peer_db) = peer_manifest
+                        .databases
+                        .iter()
+                        .find(|d| d.name == local_db.name)
+                    {
+                        if let Some(peer_meas) = peer_db
+                            .measurements
+                            .iter()
+                            .find(|m| m.name == local_meas.name && m.rp == local_meas.rp)
+                        {
+                            for rw in &local_meas.region_watermarks {
+                                let peer_wm = peer_meas
+                                    .region_watermarks
+                                    .iter()
+                                    .find(|p| p.region_id == rw.region_id)
+                                    .map(|p| p.wal_watermark)
+                                    .unwrap_or(0);
+                                if rw.wal_watermark.saturating_sub(peer_wm) > 0 {
+                                    region_lag = true;
+                                    metrics::gauge!(
+                                        "hyperbytedb_shard_region_lag_wal_seq",
+                                        "peer_id" => peer_id.to_string(),
+                                        "region_id" => rw.region_id.to_string()
+                                    )
+                                    .set(rw.wal_watermark.saturating_sub(peer_wm) as f64);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if wal_gap == 0 && !*needs_sync && !region_lag {
                 continue;
             }
 
-            let should_trigger = *needs_sync || wal_gap > 0;
+            let should_trigger = *needs_sync || wal_gap > 0 || region_lag;
 
             if should_trigger {
                 tracing::warn!(

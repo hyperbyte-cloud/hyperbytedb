@@ -4,10 +4,18 @@ use crate::domain::database::RetentionPolicy;
 use crate::domain::point::Point;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegionWatermark {
+    pub region_id: u64,
+    pub wal_watermark: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncManifest {
     pub node_id: u64,
     pub wal_last_seq: u64,
     pub databases: Vec<DatabaseManifest>,
+    #[serde(default)]
+    pub shard_map_version: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,6 +32,8 @@ pub struct DatabaseManifest {
 pub struct MeasurementManifest {
     pub name: String,
     pub rp: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub region_watermarks: Vec<RegionWatermark>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -16,11 +16,15 @@ use crate::ports::metadata::MetadataPort;
 use crate::ports::points_sink::PointsSinkPort;
 use crate::ports::wal::WalPort;
 
+mod shard_heartbeat;
+
 pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
     let bootstrapped = build_services(&config).await?;
     let disk_paths = bootstrapped.disk_paths.clone();
     let disk_config = bootstrapped.disk_config.clone();
     let disk_read_only = bootstrapped.disk_read_only.clone();
+    let raft_leader_callbacks = bootstrapped.raft_leader_callbacks.clone();
+    let rocks_shard_map = bootstrapped.rocks_shard_map.clone();
     let mut app_state = bootstrapped.app_state;
     let flush_service = bootstrapped.flush_service;
     let cluster = bootstrapped.cluster;
@@ -113,6 +117,10 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
                     app_state.mv_service.clone(),
                     app_state.points_sink.clone(),
                     app_state.wal.clone(),
+                    rocks_shard_map
+                        .as_ref()
+                        .zip(Some(app_state.shard_location_cache.clone()))
+                        .map(|(m, cache)| (m.clone(), cache)),
                 )
                 .await?,
             )
@@ -156,7 +164,99 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
     let shutdown_node_id = config.cluster.node_id;
 
     // Set Raft instance on AppState before building the router
-    app_state.raft = raft_instance;
+    app_state.raft = raft_instance.clone();
+
+    if let (Some(raft), Some(callbacks)) = (&raft_instance, &raft_leader_callbacks) {
+        callbacks.set_raft(raft.clone());
+    }
+
+    // Shard scheduler (leader-only PD-lite) and periodic region heartbeats.
+    let shard_scheduler_handle = if config.sharding.enabled {
+        if let (Some(raft), Some(map)) = (&raft_instance, &rocks_shard_map) {
+            let scheduler = Arc::new(crate::application::shard_scheduler::ShardScheduler::new(
+                map.clone(),
+                membership
+                    .clone()
+                    .expect("sharding requires cluster membership"),
+                raft.clone(),
+                peer_client.clone(),
+                app_state.metadata.clone(),
+                app_state.wal.clone(),
+                Some(app_state.points_sink.clone()),
+                config.cluster.node_id,
+                config.sharding.clone(),
+                config.server.max_points_per_request,
+            ));
+            app_state.shard_scheduler = Some(scheduler.clone());
+
+            if let (Some(sr), Some(pc), Some(m), Some(rl)) = (
+                app_state.shard_routing.as_ref(),
+                peer_client.as_ref(),
+                &membership,
+                &app_state.replication_log,
+            ) {
+                use crate::application::cluster::drain::DrainService;
+                use crate::ports::flush::FlushPort;
+                let flush_for_drain: Arc<dyn FlushPort> = flush_service.clone();
+                app_state.drain_service = Some(Arc::new(
+                    DrainService::new(
+                        config.cluster.node_id,
+                        m.clone(),
+                        flush_for_drain,
+                        rl.clone(),
+                        app_state.wal.clone(),
+                    )
+                    .with_sharding(
+                        sr.clone(),
+                        pc.clone(),
+                        app_state.metadata.clone(),
+                        app_state.points_sink.clone(),
+                        raft.clone(),
+                        config.server.max_points_per_request,
+                    ),
+                ));
+            }
+
+            let interval = Duration::from_secs(config.sharding.heartbeat_interval_secs.max(1) * 6);
+            let rx = service_shutdown_rx.clone();
+            let sched = scheduler.clone();
+            let hb_handle = {
+                let pc = peer_client.clone();
+                let node_id = config.cluster.node_id;
+                let map = map.clone();
+                let meta = app_state.metadata.clone();
+                let raft = raft.clone();
+                let m = membership.clone().expect("sharding requires membership");
+                let hb_interval =
+                    Duration::from_secs(config.sharding.heartbeat_interval_secs.max(1));
+                let hb_rx = service_shutdown_rx.clone();
+                Some(tokio::spawn(async move {
+                    if let Some(pc) = pc {
+                        shard_heartbeat::run_region_heartbeat_reporter(
+                            node_id,
+                            pc,
+                            m,
+                            map,
+                            raft,
+                            meta,
+                            hb_interval,
+                            hb_rx,
+                        )
+                        .await;
+                    }
+                }))
+            };
+
+            let sched_handle = tokio::spawn(async move {
+                sched.run(interval, rx).await;
+            });
+            Some((sched_handle, hb_handle))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // Continuous queries run on a single node: the Raft leader when cluster
     // mode is enabled, otherwise the sole local instance.
@@ -186,12 +286,15 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
                 "retention.interval is invalid or zero, falling back to default"
             );
         }
-        let retention_service = Arc::new(RetentionService::new(
-            app_state.metadata.clone(),
-            app_state.query_port.clone(),
-            app_state.raft.clone(),
-            config.cluster.node_id,
-        ));
+        let retention_service = Arc::new(
+            RetentionService::new(
+                app_state.metadata.clone(),
+                app_state.query_port.clone(),
+                app_state.raft.clone(),
+                config.cluster.node_id,
+            )
+            .with_sharding(config.sharding.enabled, app_state.shard_map.clone()),
+        );
         let rx = service_shutdown_rx.clone();
         Some(tokio::spawn(async move {
             retention_service.run(retention_interval, rx).await;
@@ -388,6 +491,12 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
     }
     if let Some(h) = hinted_handoff_handle {
         h.await?;
+    }
+    if let Some((sched, hb)) = shard_scheduler_handle {
+        sched.await?;
+        if let Some(h) = hb {
+            h.await?;
+        }
     }
     tracing::info!("Hyperbytedb shut down cleanly");
 

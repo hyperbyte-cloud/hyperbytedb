@@ -407,6 +407,7 @@ pub async fn handle_sync_manifest(State(state): State<Arc<AppState>>) -> impl In
         state.node_id,
         &state.metadata,
         &state.wal,
+        state.shard_map.as_ref().map(|m| m.as_ref() as &dyn crate::ports::sharding::ShardMapPort),
     )
     .await
     {
@@ -635,6 +636,7 @@ pub async fn handle_sync_trigger(State(state): State<Arc<AppState>>) -> impl Int
     let points_sink = state.points_sink.clone();
     let mv_service = state.mv_service.clone();
     let max_points_per_request = state.max_points_per_request;
+    let shard_map = state.shard_map.clone();
 
     let membership_clone = membership.clone();
 
@@ -647,7 +649,7 @@ pub async fn handle_sync_trigger(State(state): State<Arc<AppState>>) -> impl Int
     };
 
     tokio::spawn(async move {
-        let sync_client = crate::adapters::cluster::sync_client::SyncClient::with_points_sink(
+        let mut sync_client = crate::adapters::cluster::sync_client::SyncClient::with_points_sink(
             node_id,
             {
                 let m = membership_clone.read().await;
@@ -662,6 +664,10 @@ pub async fn handle_sync_trigger(State(state): State<Arc<AppState>>) -> impl Int
             max_points_per_request,
             fallback_peers,
         );
+        if let Some(ref map) = shard_map {
+            let sm: Arc<dyn crate::ports::sharding::ShardMapPort> = map.clone();
+            sync_client = sync_client.with_shard_map(sm);
+        }
 
         let has_data = metadata
             .list_databases()

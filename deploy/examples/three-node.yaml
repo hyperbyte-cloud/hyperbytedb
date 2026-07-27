@@ -47,6 +47,16 @@ spec:
     enabled: true
     maxFailoverCount: 1
     failoverTimeoutSecs: 300
+  # Experimental: automatic series sharding (requires replicas >= 2, cluster mode)
+  # sharding:
+  #   enabled: true
+  #   replicationFactor: 2
+  #   regionSplitSeries: 100000
+  #   regionMaxSeries: 150000
+  #   regionMergeSeries: 50000
+  #   splitMergeIntervalSecs: 3600
+  #   scheduleLimit: 2
+  #   heartbeatIntervalSecs: 10
   podAnnotations:
     prometheus.io/scrape: "true"
     prometheus.io/port: "8086"
