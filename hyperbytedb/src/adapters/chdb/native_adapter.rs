@@ -43,8 +43,8 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use async_trait::async_trait;
-use chdb_rust::arrow_insert::insert_record_batch_direct;
 use chdb_rust::InsertOptions;
+use chdb_rust::arrow_insert::insert_record_batch_direct;
 use chdb_rust::format::OutputFormat;
 use metrics::{counter, histogram};
 use parking_lot::RwLock;
