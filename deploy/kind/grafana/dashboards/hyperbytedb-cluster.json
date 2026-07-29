@@ -2431,8 +2431,8 @@
             },
             {
               "editorMode": "code",
-              "expr": "hyperbytedb_flush_wal_read_seconds{instance=~\"$instance\", quantile=\"0.5\"}",
-              "legendFormat": "{{instance}} - wal read p50",
+              "expr": "hyperbytedb_flush_wal_read_seconds{instance=~\"$instance\", path=\"prepared\", quantile=\"0.5\"}",
+              "legendFormat": "{{instance}} - wal read prepared p50",
               "range": true,
               "refId": "B"
             },
@@ -2506,6 +2506,13 @@
               "legendFormat": "{{instance}} - arrow coalesce p50",
               "range": true,
               "refId": "N"
+            },
+            {
+              "editorMode": "code",
+              "expr": "hyperbytedb_flush_wal_read_seconds{instance=~\"$instance\", path=\"native\", quantile=\"0.5\"}",
+              "legendFormat": "{{instance}} - wal read native p50",
+              "range": true,
+              "refId": "P"
             },
             {
               "editorMode": "code",
@@ -2616,10 +2623,17 @@
             },
             {
               "editorMode": "code",
-              "expr": "hyperbytedb_flush_wal_read_seconds{instance=~\"$instance\", quantile=\"0.99\"}",
-              "legendFormat": "{{instance}} - wal read p50",
+              "expr": "hyperbytedb_flush_wal_read_seconds{instance=~\"$instance\", path=\"prepared\", quantile=\"0.99\"}",
+              "legendFormat": "{{instance}} - wal read prepared p99",
               "range": true,
               "refId": "B"
+            },
+            {
+              "editorMode": "code",
+              "expr": "hyperbytedb_flush_wal_read_seconds{instance=~\"$instance\", path=\"native\", quantile=\"0.99\"}",
+              "legendFormat": "{{instance}} - wal read native p99",
+              "range": true,
+              "refId": "P"
             },
             {
               "editorMode": "code",

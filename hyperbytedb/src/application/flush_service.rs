@@ -458,7 +458,11 @@ impl FlushServiceImpl {
             return Ok(());
         }
 
-        loop {
+        // Only read sequences captured at flush start (`snapshot_seq`). Entries
+        // appended mid-flush stay for the next tick; without this bound the
+        // prepared path would `continue` past the snapshot and fall through to a
+        // native `read_range` that always returns empty but still seeks RocksDB.
+        while cursor < snapshot_seq {
             let from_seq = cursor + 1;
 
             let wal_read_start = std::time::Instant::now();
@@ -477,7 +481,7 @@ impl FlushServiceImpl {
                 {
                     if !prepared.is_empty() {
                         let wal_read_elapsed = wal_read_start.elapsed();
-                        histogram!("hyperbytedb_flush_wal_read_seconds")
+                        histogram!("hyperbytedb_flush_wal_read_seconds", "path" => "prepared")
                             .record(wal_read_elapsed.as_secs_f64());
                         self.flush_prepared_chunk(
                             prepared,
@@ -498,7 +502,8 @@ impl FlushServiceImpl {
 
             let entries = self.wal.read_range(from_seq, native_limit).await?;
             let wal_read_elapsed = wal_read_start.elapsed();
-            histogram!("hyperbytedb_flush_wal_read_seconds").record(wal_read_elapsed.as_secs_f64());
+            histogram!("hyperbytedb_flush_wal_read_seconds", "path" => "native")
+                .record(wal_read_elapsed.as_secs_f64());
             if entries.is_empty() {
                 break;
             }
