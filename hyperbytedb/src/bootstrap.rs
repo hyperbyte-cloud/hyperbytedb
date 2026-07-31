@@ -186,6 +186,10 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         write_chdb,
         Some(metadata.clone()),
         config.chdb.schema_cache_max_entries,
+        config.chdb.insert_options(),
+        config
+            .chdb
+            .resolved_tag_low_cardinality_max(&config.cardinality),
     );
     match native_sink.warm_schemas_from_metadata().await {
         Ok(tables) => tracing::info!(

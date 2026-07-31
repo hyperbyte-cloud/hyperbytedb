@@ -24,8 +24,6 @@ spec:
     poolSize: 4
   flush:
     intervalSecs: 5
-    walSizeThresholdMb: 256
-    timeBucketDuration: "1h"
     maxPointsPerBatch: 100000
     walBatchSize: 128
     walBatchDelayUs: 0

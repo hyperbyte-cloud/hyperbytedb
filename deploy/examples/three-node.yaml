@@ -16,8 +16,6 @@ spec:
       size: 10Gi
   flush:
     intervalSecs: 10
-    walSizeThresholdMb: 64
-    timeBucketDuration: "1h"
   chdb:
     sessionDataPath: /var/lib/hyperbytedb/chdb
   retention:
