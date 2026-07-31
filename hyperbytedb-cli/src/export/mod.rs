@@ -96,6 +96,8 @@ pub async fn run_export(client: &HyperbytedbClient, opts: &ExportOptions) -> Res
     let tag_keys = list_tag_keys(client, &opts.database).await?;
     let time_filter = build_time_filter(&opts.start, &opts.end);
     let mut point_count = 0u64;
+    let total_measurements = measurements.len();
+    let mut skipped: Vec<(String, String)> = Vec::new();
 
     for m in measurements {
         let q = if time_filter.is_empty() {
@@ -106,6 +108,7 @@ pub async fn run_export(client: &HyperbytedbClient, opts: &ExportOptions) -> Res
 
         let resp = client.query(&q, &qopts).await?;
         if resp.has_errors() {
+            skipped.push((m, resp.format_errors()));
             continue;
         }
         let empty = HashSet::new();
@@ -137,6 +140,22 @@ pub async fn run_export(client: &HyperbytedbClient, opts: &ExportOptions) -> Res
             }
             _ => {}
         }
+    }
+
+    if !skipped.is_empty() {
+        eprintln!(
+            "export warning: skipped {} of {} measurement(s):",
+            skipped.len(),
+            total_measurements
+        );
+        for (measurement, err) in &skipped {
+            eprintln!("  {measurement}: {err}");
+        }
+        return Err(CliError::Export(format!(
+            "partial export: {} of {} measurements failed",
+            skipped.len(),
+            total_measurements
+        )));
     }
 
     eprintln!("export complete: {point_count} points");

@@ -1,13 +1,14 @@
-//! Proxy-local endpoints. These aren't proxied; they answer about the proxy
-//! itself.
+//! Proxy-local endpoints on the **admin listener** (`HYPERBYTEDB_PROXY_ADMIN_LISTEN`).
+//! These are not proxied; they answer about the proxy itself.
 //!
 //! - `GET /healthz`         — liveness, always 200 once the process is up.
 //! - `GET /readyz`          — readiness, 200 only when ≥1 backend is routable (Active and not excluded).
 //! - `GET /metrics`         — Prometheus exposition.
 //! - `GET /admin/backends`  — JSON dump of the current pool, for debugging.
+//! - `POST /admin/backends/{ip}/exclude|include` — operator-driven routing control.
+//! - `GET /admin/pool`      — pool status including exclusion flags.
 //!
-//! Routes are chosen so they can be allowlisted before the catch-all proxy
-//! handler, with no risk of colliding with a hyperbytedb path.
+//! The public listener exposes only `/write` and `/query`.
 
 use std::net::IpAddr;
 use std::sync::Arc;

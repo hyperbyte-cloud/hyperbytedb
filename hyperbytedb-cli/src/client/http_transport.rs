@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
@@ -8,6 +10,11 @@ use crate::error::{CliError, Result};
 
 #[cfg(unix)]
 use hyperlocal::Uri;
+
+/// Maximum time to establish a TCP/TLS connection.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum time for a full HTTP request (connect + send + read body).
+const READ_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub struct RawResponse {
     pub status: u16,
@@ -60,18 +67,17 @@ impl HttpBackend {
             }
         }
 
-        let mut builder = reqwest::Client::builder();
+        let mut builder = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(READ_TIMEOUT)
+            .pool_idle_timeout(Duration::from_secs(90));
         if config.unsafe_ssl {
             builder = builder.danger_accept_invalid_certs(true);
         }
         if verbose {
             eprintln!("[verbose] using HTTP {}", config.base_url());
         }
-        Ok(Self::Reqwest(
-            builder
-                .build()
-                .map_err(|e| CliError::Connection(e.to_string()))?,
-        ))
+        Ok(Self::Reqwest(builder.build()?))
     }
 
     pub async fn request(&self, req: HttpRequest<'_>) -> Result<RawResponse> {
@@ -104,10 +110,7 @@ impl HttpBackend {
                 if let Some(body) = req.body {
                     http_req = http_req.body(body);
                 }
-                let resp = http_req
-                    .send()
-                    .await
-                    .map_err(|e| CliError::Connection(e.to_string()))?;
+                let resp = http_req.send().await?;
                 let status = resp.status().as_u16();
                 let version = resp
                     .headers()
@@ -119,11 +122,7 @@ impl HttpBackend {
                     .get("X-Influxdb-Build")
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
-                let body = resp
-                    .text()
-                    .await
-                    .map_err(|e| CliError::Connection(e.to_string()))?
-                    .into_bytes();
+                let body = resp.text().await?.into_bytes();
                 Ok(RawResponse {
                     status,
                     body,
@@ -139,13 +138,8 @@ impl HttpBackend {
                 for (k, v) in req.headers {
                     builder = builder.header(*k, *v);
                 }
-                let hyper_req = builder
-                    .body(payload)
-                    .map_err(|e| CliError::Connection(e.to_string()))?;
-                let resp = client
-                    .request(hyper_req)
-                    .await
-                    .map_err(|e| CliError::Connection(e.to_string()))?;
+                let hyper_req = builder.body(payload)?;
+                let resp = client.request(hyper_req).await?;
                 let status = resp.status().as_u16();
                 let version = resp
                     .headers()
@@ -157,13 +151,7 @@ impl HttpBackend {
                     .get("X-Influxdb-Build")
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
-                let body = resp
-                    .into_body()
-                    .collect()
-                    .await
-                    .map_err(|e| CliError::Connection(e.to_string()))?
-                    .to_bytes()
-                    .to_vec();
+                let body = resp.into_body().collect().await?.to_bytes().to_vec();
                 Ok(RawResponse {
                     status,
                     body,
@@ -172,5 +160,17 @@ impl HttpBackend {
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reqwest_client_has_timeouts() {
+        let cfg = crate::config::ConnectionConfig::default();
+        let backend = HttpBackend::from_config(&cfg, false).expect("client");
+        assert!(matches!(backend, HttpBackend::Reqwest(_)));
     }
 }

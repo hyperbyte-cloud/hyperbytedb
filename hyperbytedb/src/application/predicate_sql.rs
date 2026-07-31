@@ -15,11 +15,16 @@ pub async fn build_predicate_sql(
     measurement: &str,
     cond: &Expr,
 ) -> Result<String, HyperbytedbError> {
-    let mapping = metadata
+    let meta = metadata
         .get_measurement(db, rp, measurement)
         .await?
-        .map(|m| ColumnMapping::from_measurement_meta(&m));
+        .ok_or_else(|| {
+            HyperbytedbError::QueryParse(format!(
+                "measurement \"{measurement}\" not found in database \"{db}\""
+            ))
+        })?;
+    let mapping = ColumnMapping::from_measurement_meta(&meta);
     let mut sql = String::new();
-    to_clickhouse::translate_condition_with_mapping(cond, mapping.as_ref(), &mut sql)?;
+    to_clickhouse::translate_condition(cond, &mapping, &mut sql)?;
     Ok(sql)
 }

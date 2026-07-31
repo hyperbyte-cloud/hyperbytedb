@@ -396,6 +396,7 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         drain_service,
         raft: None,
         auth_enabled: config.auth.enabled,
+        auth_allow_query_param_credentials: config.auth.allow_query_param_credentials,
         prometheus_handle: Some(prometheus_handle.clone()),
         statement_summary,
         statement_summary_require_auth: config.statement_summary.require_auth,

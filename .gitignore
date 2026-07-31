@@ -113,5 +113,5 @@ Desktop.ini
 .cursorrules
 .cursor/
 hyperbytedb-operator
-influx-multiplay
 chdb-rust
+docs/audits/

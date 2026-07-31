@@ -11,9 +11,11 @@ use crate::application::ingest_metadata::{
 use crate::application::line_protocol::{
     encode_points_to_line_protocol, parse_line_body_to_points_limited,
 };
-use crate::application::msgpack_ingest::parse_msgpack_body_to_points;
+use crate::application::msgpack_ingest::parse_msgpack_body_to_points_limited;
 use crate::application::replication_dispatch::dispatch_outbound_replication;
-use crate::application::wal_append::append_points_with_prepared;
+use crate::application::wal_append::{
+    ColumnarWalAppend, append_columnar_with_prepared, append_points_with_prepared,
+};
 use crate::config::{ReplicationConfig, ReplicationMode};
 use crate::domain::database::Precision;
 use crate::error::HyperbytedbError;
@@ -159,7 +161,10 @@ impl IngestionPort for PeerIngestionService {
         // Columnar fast path: decode once, metadata from batch, then expand for WAL/replication
         #[cfg(feature = "columnar-ingest")]
         if matches!(format, WritePayloadFormat::ColumnarMsgpack) {
-            let wire = crate::application::columnar_msgpack::decode_columnar_batch(body)?;
+            let wire = crate::application::columnar_msgpack::decode_columnar_batch_limited(
+                body,
+                self.max_points_per_request,
+            )?;
             if wire.values.is_empty() {
                 return Ok(());
             }
@@ -201,19 +206,24 @@ impl IngestionPort for PeerIngestionService {
                 .record((t3 - t2).as_secs_f64());
 
             let point_count = wire.values.len() as u64;
-            let points =
-                crate::application::columnar_msgpack::columnar_batch_to_points(&wire, precision)?;
             let precision_val = Precision::from_str_opt(precision);
-            let replication_body = encode_points_to_line_protocol(&points, precision_val)?;
+            let replication_body =
+                crate::application::columnar_msgpack::columnar_wire_to_line_protocol(
+                    &wire,
+                    precision_val,
+                )?;
 
-            let wal_seq = append_points_with_prepared(
+            let wal_seq = append_columnar_with_prepared(
                 self.wal.as_ref(),
                 self.sink.as_ref(),
-                db,
-                &retention_policy,
-                points,
-                self.node_id,
-                self.max_points_per_request,
+                &ColumnarWalAppend {
+                    db,
+                    rp: &retention_policy,
+                    wire: &wire,
+                    precision,
+                    origin_node_id: self.node_id,
+                    max_points_per_request: self.max_points_per_request,
+                },
             )
             .await?;
 
@@ -240,7 +250,9 @@ impl IngestionPort for PeerIngestionService {
             WritePayloadFormat::LineProtocol => {
                 parse_line_body_to_points_limited(body, precision, self.max_points_per_request)?
             }
-            WritePayloadFormat::Msgpack => parse_msgpack_body_to_points(body, precision)?,
+            WritePayloadFormat::Msgpack => {
+                parse_msgpack_body_to_points_limited(body, precision, self.max_points_per_request)?
+            }
             #[cfg(feature = "columnar-ingest")]
             WritePayloadFormat::ColumnarMsgpack => {
                 unreachable!("handled by fast path above")

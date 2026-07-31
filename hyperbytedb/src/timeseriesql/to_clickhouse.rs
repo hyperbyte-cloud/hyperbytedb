@@ -1,3 +1,4 @@
+use crate::domain::chdb_naming::QuotedTableName;
 use crate::domain::column_mapping::ColumnMapping;
 use crate::domain::rollup::{RollupCombine, aggregate_source_field_name, mean_rollup_column_names};
 use crate::error::HyperbytedbError;
@@ -95,7 +96,7 @@ pub fn validate_select_into(stmt: &SelectStatement) -> Result<(), HyperbytedbErr
 #[derive(Debug, Clone, Copy)]
 pub struct SeriesJoin<'a> {
     /// Backtick-quoted `<db>_<rp>_<measurement>_series` table name.
-    pub table: &'a str,
+    pub table: &'a QuotedTableName,
     /// Force the inline tag-rejoin view even when the query body references no
     /// tag. Set when tombstone predicates (spliced into WHERE post-translation)
     /// reference tag columns that must be present in the FROM source.
@@ -186,7 +187,7 @@ fn translate_inner(
         // Include GROUP BY tag columns in SELECT so they appear in the result
         // and can be used to split rows into separate InfluxDB series.
         for tag in gb.tag_dimensions() {
-            select_parts.push(select_tag_column_sql(tag, mapping));
+            select_parts.push(select_tag_column_sql(tag, mapping)?);
         }
     }
 
@@ -211,7 +212,7 @@ fn translate_inner(
     let projects_point_time =
         is_raw_select || (has_raw_transform && !has_group_by_time && !has_star);
     if projects_point_time {
-        select_parts.insert(0, quote_identifier("time"));
+        select_parts.insert(0, quote_phys_identifier("time"));
     }
 
     let field_strs: Vec<String> = stmt
@@ -226,7 +227,7 @@ fn translate_inner(
                 mapping,
             )
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<String>, HyperbytedbError>>()?;
     select_parts.extend(field_strs);
     write!(out, "{}", select_parts.join(", "))?;
 
@@ -258,7 +259,7 @@ fn translate_inner(
                 // Must match the SELECT expression: physical column name (handles the
                 // `__tag__` collision prefix). Previously emitted the logical name,
                 // which is wrong for collision-renamed tags.
-                gb_parts.push(group_by_tag_sql(tag, mapping));
+                gb_parts.push(group_by_tag_sql(tag, mapping)?);
             }
         }
 
@@ -300,7 +301,7 @@ fn translate_inner(
         // per-tag series is never filled — which surfaces as "no data" in Grafana.
         if do_fill && let Some(ref gb) = stmt.group_by {
             for tag in gb.tag_dimensions() {
-                write!(out, "{} ASC, ", group_by_tag_sql(tag, mapping))?;
+                write!(out, "{} ASC, ", group_by_tag_sql(tag, mapping)?)?;
             }
         }
 
@@ -340,19 +341,21 @@ fn translate_inner(
             match effective_fill {
                 // fill(previous): use INTERPOLATE to carry forward last known value
                 FillOption::Previous if !field_aliases.is_empty() => {
-                    let interp_cols: Vec<String> =
-                        field_aliases.iter().map(|a| quote_identifier(a)).collect();
+                    let interp_cols: Vec<String> = field_aliases
+                        .iter()
+                        .map(|a| quote_identifier(a))
+                        .collect::<Result<Vec<String>, HyperbytedbError>>()?;
                     write!(out, " INTERPOLATE ({})", interp_cols.join(", "))?;
                 }
                 // fill(linear): use INTERPOLATE with linear expressions
                 FillOption::Linear if !field_aliases.is_empty() => {
                     let interp_cols: Vec<String> = field_aliases
                         .iter()
-                        .map(|a| {
-                            let q = quote_identifier(a);
-                            format!("{q} AS {q}")
+                        .map(|a| -> Result<String, HyperbytedbError> {
+                            let q = quote_identifier(a)?;
+                            Ok(format!("{q} AS {q}"))
                         })
-                        .collect();
+                        .collect::<Result<Vec<String>, HyperbytedbError>>()?;
                     write!(out, " INTERPOLATE ({})", interp_cols.join(", "))?;
                 }
                 // fill(<number>): WITH FILL-generated rows get column defaults
@@ -362,8 +365,8 @@ fn translate_inner(
                 FillOption::Value(v) if !field_aliases.is_empty() => {
                     let interp_cols: Vec<String> = field_aliases
                         .iter()
-                        .map(|a| format!("{} AS {}", quote_identifier(a), format_float(v)))
-                        .collect();
+                        .map(|a| Ok(format!("{} AS {}", quote_identifier(a)?, format_float(v))))
+                        .collect::<Result<Vec<String>, HyperbytedbError>>()?;
                     write!(out, " INTERPOLATE ({})", interp_cols.join(", "))?;
                 }
                 _ => {}
@@ -385,8 +388,8 @@ fn translate_inner(
         // line so tombstone WHERE-splicing targets only the inner query.
         let mut order_parts: Vec<String> = tag_dims
             .iter()
-            .map(|t| format!("{} ASC", quote_identifier(t)))
-            .collect();
+            .map(|t| Ok(format!("{} ASC", quote_identifier(t)?)))
+            .collect::<Result<Vec<String>, HyperbytedbError>>()?;
         order_parts.push("__time DESC".to_string());
         out = format!(
             "SELECT * FROM (\n{out}\n) ORDER BY {}",
@@ -408,13 +411,13 @@ fn translate_inner(
         if !transform_aliases.is_empty() {
             let cond = transform_aliases
                 .iter()
-                .map(|a| format!("{} IS NOT NULL", quote_identifier(a)))
-                .collect::<Vec<_>>()
+                .map(|a| Ok(format!("{} IS NOT NULL", quote_identifier(a)?)))
+                .collect::<Result<Vec<String>, HyperbytedbError>>()?
                 .join(" OR ");
             let dir = if time_desc { "DESC" } else { "ASC" };
             out = format!(
                 "SELECT * FROM (\n{out}\n) WHERE {cond} ORDER BY {} {dir}",
-                quote_identifier("time")
+                quote_phys_identifier("time")
             );
         }
     }
@@ -426,7 +429,7 @@ fn translate_inner(
         let by_cols = tag_dims
             .iter()
             .map(|t| quote_identifier(t))
-            .collect::<Vec<_>>()
+            .collect::<Result<Vec<String>, HyperbytedbError>>()?
             .join(", ");
         let limit = stmt.limit.unwrap_or(0);
         match stmt.offset {
@@ -530,14 +533,14 @@ pub fn rename_time_bucket_alias(sql: &str) -> String {
 /// for the destination measurement schema.
 pub fn translate_select_into(
     stmt: &SelectStatement,
-    dest_table: &str,
+    dest_table: &QuotedTableName,
     source: &str,
     mapping: Option<&ColumnMapping>,
 ) -> Result<String, HyperbytedbError> {
     validate_select_into(stmt)?;
     let select_sql = translate_inner(stmt, source, mapping, None, None)?;
     let select_sql = rename_time_bucket_alias(&select_sql);
-    Ok(format!("INSERT INTO {}\n{}", dest_table, select_sql))
+    Ok(format!("INSERT INTO {dest_table}\n{select_sql}"))
 }
 
 fn translate_materialized_view_field(
@@ -550,12 +553,12 @@ fn translate_materialized_view_field(
     {
         let source = aggregate_source_field_name(func)?;
         let col = mapping.physical_select_identifier(&source);
-        let col_q = quote_identifier(&col);
+        let col_q = quote_phys_identifier(&col);
         let (sum_col, count_col) = mean_rollup_column_names(&source);
         return Ok(format!(
             "sum({col_q}) AS {}, count({col_q}) AS {}",
-            quote_identifier(&sum_col),
-            quote_identifier(&count_col)
+            quote_phys_identifier(&sum_col),
+            quote_phys_identifier(&count_col)
         ));
     }
     translate_field(field, false, 0.0, group_by, Some(mapping))
@@ -582,8 +585,8 @@ fn mapping_with_mv_aggregate_fields(mapping: &ColumnMapping, fields: &[Field]) -
 /// assigns a destination `series_id` via [`crate::domain::series::series_id_ch_sql`].
 pub fn translate_materialized_view_select(
     stmt: &SelectStatement,
-    source_fact: &str,
-    source_series: &str,
+    source_fact: &QuotedTableName,
+    source_series: &QuotedTableName,
     dest_measurement: &str,
     mapping: &ColumnMapping,
 ) -> Result<String, HyperbytedbError> {
@@ -614,7 +617,7 @@ pub fn translate_materialized_view_select(
     let series_id_expr = crate::domain::series::series_id_ch_sql_for_tags(
         dest_measurement,
         &grouped_tags,
-        |tag| quote_identifier(&mapping.tag_column_name(tag)),
+        |tag| quote_phys_identifier(&mapping.physical_tag_column_name(tag)),
         "s",
     );
 
@@ -632,10 +635,10 @@ pub fn translate_materialized_view_select(
         {
             let source = aggregate_source_field_name(func)?;
             let col = mapping.physical_select_identifier(&source);
-            let col_q = quote_identifier(&col);
+            let col_q = quote_phys_identifier(&col);
             let (sum_col, count_col) = mean_rollup_column_names(&source);
-            let sum_expr = format!("sum({col_q}) AS {}", quote_identifier(&sum_col));
-            let count_expr = format!("count({col_q}) AS {}", quote_identifier(&count_col));
+            let sum_expr = format!("sum({col_q}) AS {}", quote_phys_identifier(&sum_col));
+            let count_expr = format!("count({col_q}) AS {}", quote_phys_identifier(&count_col));
             field_expr_by_name.insert(sum_col.clone(), sum_expr);
             field_expr_by_name.insert(count_col.clone(), count_expr);
         } else {
@@ -662,7 +665,7 @@ pub fn translate_materialized_view_select(
     for tag in &grouped_tags {
         group_parts.push(format!(
             "s.{}",
-            quote_identifier(&mapping.tag_column_name(tag))
+            quote_phys_identifier(&mapping.physical_tag_column_name(tag))
         ));
     }
 
@@ -697,7 +700,7 @@ pub fn translate_materialized_view_select(
 /// that reflects the destination schema for correct physical column naming.
 pub fn translate_materialized_view_series_select(
     stmt: &SelectStatement,
-    source_series: &str,
+    source_series: &QuotedTableName,
     dest_measurement: &str,
     mapping: &ColumnMapping,
     dest_field_names: Option<&std::collections::HashSet<String>>,
@@ -728,22 +731,22 @@ pub fn translate_materialized_view_series_select(
             Some(dfn) => {
                 let fields: std::collections::HashSet<&str> =
                     dfn.iter().map(|s| s.as_str()).collect();
-                crate::domain::column_mapping::tag_column_name(tag, &fields)
+                crate::domain::chdb_naming::tag_column_name(tag, &fields)
             }
-            None => mapping.tag_column_name(tag),
+            None => mapping.physical_tag_column_name(tag),
         }
     };
 
     let series_id_expr = crate::domain::series::series_id_ch_sql_for_tags(
         dest_measurement,
         &grouped_tags,
-        |tag| quote_identifier(&tag_phys_name(tag)),
+        |tag| quote_phys_identifier(&tag_phys_name(tag)),
         "s",
     );
 
     let tag_cols: Vec<String> = grouped_tags
         .iter()
-        .map(|tag| format!("s.{}", quote_identifier(&tag_phys_name(tag))))
+        .map(|tag| format!("s.{}", quote_phys_identifier(&tag_phys_name(tag))))
         .collect();
 
     let mut select_parts = vec![format!("min({series_id_expr}) AS series_id")];
@@ -759,9 +762,9 @@ pub fn translate_materialized_view_series_select(
 /// `INSERT INTO <dest> SELECT ...` for one-time MV backfill of historical data.
 pub fn translate_materialized_view_backfill(
     stmt: &SelectStatement,
-    dest_table: &str,
-    source_fact: &str,
-    source_series: &str,
+    dest_table: &QuotedTableName,
+    source_fact: &QuotedTableName,
+    source_series: &QuotedTableName,
     dest_measurement: &str,
     mapping: &ColumnMapping,
 ) -> Result<String, HyperbytedbError> {
@@ -783,14 +786,14 @@ fn materialized_view_dest_insert_columns(
     stmt: &SelectStatement,
 ) -> Result<String, HyperbytedbError> {
     let mut cols = vec![
-        quote_identifier("time"),
-        quote_identifier("origin_node_id"),
-        quote_identifier("ingest_seq"),
-        quote_identifier("series_id"),
+        quote_phys_identifier("time"),
+        quote_phys_identifier("origin_node_id"),
+        quote_phys_identifier("ingest_seq"),
+        quote_phys_identifier("series_id"),
     ];
     let mut field_names = materialized_view_dest_field_names(stmt)?;
     field_names.sort();
-    cols.extend(field_names.into_iter().map(|n| quote_identifier(&n)));
+    cols.extend(field_names.into_iter().map(|n| quote_phys_identifier(&n)));
     Ok(cols.join(", "))
 }
 
@@ -820,8 +823,8 @@ fn materialized_view_dest_field_names(
 
 /// Full `CREATE MATERIALIZED VIEW ... TO ... AS SELECT ...` DDL for the fact MV.
 pub fn build_create_fact_materialized_view(
-    mv_name: &str,
-    dest_table: &str,
+    mv_name: &QuotedTableName,
+    dest_table: &QuotedTableName,
     select_sql: &str,
 ) -> String {
     format!("CREATE MATERIALIZED VIEW {mv_name} TO {dest_table} AS\n{select_sql}")
@@ -829,8 +832,8 @@ pub fn build_create_fact_materialized_view(
 
 /// Full `CREATE MATERIALIZED VIEW ... TO ... AS SELECT ...` for the series MV.
 pub fn build_create_series_materialized_view(
-    mv_name: &str,
-    dest_series: &str,
+    mv_name: &QuotedTableName,
+    dest_series: &QuotedTableName,
     select_sql: &str,
 ) -> String {
     format!("CREATE MATERIALIZED VIEW {mv_name} TO {dest_series} AS\n{select_sql}")
@@ -841,15 +844,15 @@ pub fn build_create_series_materialized_view(
 /// measurement's dimension table.
 pub fn translate_select_into_native(
     stmt: &SelectStatement,
-    dest_table: &str,
-    source_table: &str,
+    dest_table: &QuotedTableName,
+    source_table: &QuotedTableName,
     mapping: Option<&ColumnMapping>,
     series: Option<SeriesJoin<'_>>,
 ) -> Result<String, HyperbytedbError> {
     validate_select_into(stmt)?;
-    let select_sql = translate_inner(stmt, source_table, mapping, series, None)?;
+    let select_sql = translate_inner(stmt, source_table.as_str(), mapping, series, None)?;
     let select_sql = rename_time_bucket_alias(&select_sql);
-    Ok(format!("INSERT INTO {}\n{}", dest_table, select_sql))
+    Ok(format!("INSERT INTO {dest_table}\n{select_sql}"))
 }
 
 /// Like translate, but uses a custom source expression instead of file() - used for subqueries.
@@ -909,21 +912,21 @@ fn query_references_tag(stmt: &SelectStatement, m: &ColumnMapping) -> bool {
 /// `argMaxIf` can stitch a correct `available` from one row with a corrupt
 /// `used_percent` from another (e.g. async replication writing a second row
 /// for the same instant), which produces nonsense Grafana percentages.
-pub fn build_coalesced_fact_view(fact_table: &str, mapping: &ColumnMapping) -> String {
+pub fn build_coalesced_fact_view(fact_table: &QuotedTableName, mapping: &ColumnMapping) -> String {
     build_coalesced_fact_view_impl(fact_table, mapping, false)
 }
 
 /// Like [`build_coalesced_fact_view`], but preserves `ingest_seq` / `origin_node_id` for
 /// downstream aggregates (materialized view source dedup).
 pub fn build_coalesced_fact_view_with_row_meta(
-    fact_table: &str,
+    fact_table: &QuotedTableName,
     mapping: &ColumnMapping,
 ) -> String {
     build_coalesced_fact_view_impl(fact_table, mapping, true)
 }
 
 fn build_coalesced_fact_view_impl(
-    fact_table: &str,
+    fact_table: &QuotedTableName,
     mapping: &ColumnMapping,
     include_row_metadata: bool,
 ) -> String {
@@ -932,7 +935,7 @@ fn build_coalesced_fact_view_impl(
     let field_aggs: Vec<String> = field_cols
         .iter()
         .map(|f| {
-            let q = quote_identifier(f);
+            let q = quote_phys_identifier(f);
             let agg = match mapping.field_rollups.get(*f) {
                 Some(RollupCombine::Sum) => format!("sum({q})"),
                 Some(RollupCombine::Min) => format!("min({q})"),
@@ -974,7 +977,9 @@ fn build_from_source(
     stmt: &SelectStatement,
 ) -> String {
     let fact = match mapping {
-        Some(m) => build_coalesced_fact_view(fact_table, m),
+        Some(m) => {
+            build_coalesced_fact_view(&QuotedTableName::new_quoted(fact_table.to_string()), m)
+        }
         None => fact_table.to_string(),
     };
     let (Some(sj), Some(m)) = (series, mapping) else {
@@ -983,7 +988,11 @@ fn build_from_source(
     if !sj.force && !query_references_tag(stmt, m) {
         return fact;
     }
-    let mut tag_cols: Vec<String> = m.tag_keys.iter().map(|t| m.tag_column_name(t)).collect();
+    let mut tag_cols: Vec<String> = m
+        .tag_keys
+        .iter()
+        .map(|t| m.physical_tag_column_name(t))
+        .collect();
     if tag_cols.is_empty() {
         return fact;
     }
@@ -998,7 +1007,7 @@ fn build_from_source(
     tag_cols.sort();
     let projected = tag_cols
         .iter()
-        .map(|c| format!("s.{}", quote_identifier(c)))
+        .map(|c| format!("s.{}", quote_phys_identifier(c)))
         .collect::<Vec<_>>()
         .join(", ");
     format!(
@@ -1009,9 +1018,12 @@ fn build_from_source(
 
 /// GROUP BY expression for a tag: the physical column name, matching the SELECT
 /// side. Without a mapping, falls back to the logical name (unchanged behaviour).
-fn group_by_tag_sql(tag: &str, mapping: Option<&ColumnMapping>) -> String {
+fn group_by_tag_sql(
+    tag: &str,
+    mapping: Option<&ColumnMapping>,
+) -> Result<String, HyperbytedbError> {
     match mapping {
-        Some(m) => quote_identifier(&m.tag_column_name(tag)),
+        Some(m) => Ok(quote_phys_identifier(&m.physical_tag_column_name(tag))),
         None => quote_identifier(tag),
     }
 }
@@ -1044,15 +1056,22 @@ fn time_bucket_expr_on(
     }
 }
 
-fn select_tag_column_sql(tag: &str, mapping: Option<&ColumnMapping>) -> String {
+fn select_tag_column_sql(
+    tag: &str,
+    mapping: Option<&ColumnMapping>,
+) -> Result<String, HyperbytedbError> {
     let Some(m) = mapping else {
         return quote_identifier(tag);
     };
-    let phys = m.tag_column_name(tag);
+    let phys = m.physical_tag_column_name(tag);
     if phys == tag {
         quote_identifier(tag)
     } else {
-        format!("{} AS {}", quote_identifier(&phys), quote_identifier(tag))
+        Ok(format!(
+            "{} AS {}",
+            quote_phys_identifier(&phys),
+            quote_identifier(tag)?
+        ))
     }
 }
 
@@ -1069,7 +1088,7 @@ fn translate_field(
         .clone()
         .or_else(|| default_field_alias(&field.expr));
     Ok(match alias {
-        Some(a) => format!("{} AS {}", sql, quote_identifier(&a)),
+        Some(a) => format!("{} AS {}", sql, quote_identifier(&a)?),
         None => sql,
     })
 }
@@ -1126,13 +1145,13 @@ fn translate_field_expr(
             let col = mapping
                 .map(|m| m.physical_select_identifier(name))
                 .unwrap_or_else(|| name.clone());
-            Ok(quote_identifier(&col))
+            Ok(quote_phys_identifier(&col))
         }
         Expr::FieldRef { name, .. } => {
             let col = mapping
                 .map(|m| m.physical_select_identifier(name))
                 .unwrap_or_else(|| name.clone());
-            Ok(quote_identifier(&col))
+            Ok(quote_phys_identifier(&col))
         }
         Expr::Call(func) => translate_aggregate_call(func, use_fill, fill_value, group_by, mapping),
         Expr::BinaryExpr(be) => translate_binary_expr(be, use_fill, fill_value, group_by, mapping),
@@ -1198,8 +1217,8 @@ fn translate_aggregate_call(
                 && let Expr::Identifier(name) | Expr::FieldRef { name, .. } = arg
                 && let Some(mean_def) = m.mean_fields.get(name)
             {
-                let sum_q = quote_identifier(&mean_def.sum_col);
-                let count_q = quote_identifier(&mean_def.count_col);
+                let sum_q = quote_phys_identifier(&mean_def.sum_col);
+                let count_q = quote_phys_identifier(&mean_def.count_col);
                 return Ok(wrap_fill(format!(
                     "(sum({sum_q}) / nullIf(sum({count_q}), 0))"
                 )));
@@ -1300,7 +1319,7 @@ fn translate_aggregate_call(
         "DERIVATIVE" | "NON_NEGATIVE_DERIVATIVE" => {
             let field_arg = get_single_arg(func, &name_upper)?;
             let f = translate_field_or_nested(field_arg, group_by, mapping)?;
-            let window = build_window_clause(group_by, mapping);
+            let window = build_window_clause(group_by, mapping)?;
             let unit_nanos: i64 = if func.args.len() >= 2 {
                 match &func.args[1] {
                     Expr::DurationLiteral(d) => d.to_nanos(),
@@ -1326,7 +1345,7 @@ fn translate_aggregate_call(
         "DIFFERENCE" | "NON_NEGATIVE_DIFFERENCE" => {
             let arg = get_single_arg(func, &name_upper)?;
             let f = translate_field_or_nested(arg, group_by, mapping)?;
-            let window = build_window_clause(group_by, mapping);
+            let window = build_window_clause(group_by, mapping)?;
             let diff = format!("({f} - lagInFrame({f}, 1) {window})");
             if name_upper == "NON_NEGATIVE_DIFFERENCE" {
                 format!("if({diff} >= 0, {diff}, NULL)")
@@ -1355,11 +1374,11 @@ fn translate_aggregate_call(
                     .iter()
                     .map(|t| {
                         let phys = mapping
-                            .map(|m| m.tag_column_name(t))
+                            .map(|m| m.physical_tag_column_name(t))
                             .unwrap_or_else(|| t.to_string());
-                        quote_identifier(&phys)
+                        Ok(quote_phys_identifier(&phys))
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Result<Vec<String>, HyperbytedbError>>()?
                     .join(", ");
                 format!("PARTITION BY {p} ")
             };
@@ -1385,11 +1404,11 @@ fn translate_aggregate_call(
                     .iter()
                     .map(|t| {
                         let phys = mapping
-                            .map(|m| m.tag_column_name(t))
+                            .map(|m| m.physical_tag_column_name(t))
                             .unwrap_or_else(|| t.to_string());
-                        quote_identifier(&phys)
+                        Ok(quote_phys_identifier(&phys))
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Result<Vec<String>, HyperbytedbError>>()?
                     .join(", ");
                 format!("PARTITION BY {p} ")
             };
@@ -1400,7 +1419,7 @@ fn translate_aggregate_call(
         "ELAPSED" => {
             let _field_arg = get_single_arg(func, "ELAPSED")?;
             let time_ref = window_time_ref(group_by);
-            let window = build_window_clause(group_by, mapping);
+            let window = build_window_clause(group_by, mapping)?;
             let unit_nanos: i64 = if func.args.len() >= 2 {
                 match &func.args[1] {
                     Expr::DurationLiteral(d) => d.to_nanos(),
@@ -1437,7 +1456,7 @@ fn translate_aggregate_arg(
             let col = mapping
                 .map(|m| m.physical_select_identifier(name))
                 .unwrap_or_else(|| name.clone());
-            Ok(quote_identifier(&col))
+            Ok(quote_phys_identifier(&col))
         }
         Expr::Star => Ok("*".to_string()),
         _ => Err(HyperbytedbError::QueryParse(format!(
@@ -1476,24 +1495,29 @@ fn window_time_ref(group_by: Option<&GroupBy>) -> &'static str {
 /// Build the OVER (...) window clause for transform functions.
 /// Includes PARTITION BY for GROUP BY tag dimensions so that window
 /// functions (lagInFrame, etc.) operate within each series independently.
-fn build_window_clause(group_by: Option<&GroupBy>, mapping: Option<&ColumnMapping>) -> String {
+fn build_window_clause(
+    group_by: Option<&GroupBy>,
+    mapping: Option<&ColumnMapping>,
+) -> Result<String, HyperbytedbError> {
     let time_ref = window_time_ref(group_by);
     let partition_tags: Vec<&str> = group_by.map(|gb| gb.tag_dimensions()).unwrap_or_default();
 
     if partition_tags.is_empty() {
-        format!("OVER (ORDER BY {time_ref})")
+        Ok(format!("OVER (ORDER BY {time_ref})"))
     } else {
         let partition = partition_tags
             .iter()
             .map(|t| {
                 let phys = mapping
-                    .map(|m| m.tag_column_name(t))
+                    .map(|m| m.physical_tag_column_name(t))
                     .unwrap_or_else(|| t.to_string());
-                quote_identifier(&phys)
+                Ok(quote_phys_identifier(&phys))
             })
-            .collect::<Vec<_>>()
+            .collect::<Result<Vec<String>, HyperbytedbError>>()?
             .join(", ");
-        format!("OVER (PARTITION BY {partition} ORDER BY {time_ref})")
+        Ok(format!(
+            "OVER (PARTITION BY {partition} ORDER BY {time_ref})"
+        ))
     }
 }
 
@@ -1518,19 +1542,14 @@ fn get_two_args<'a>(
 
 /// Translate a WHERE condition expression to ClickHouse SQL.
 /// Used by the DELETE statement handler to serialize tombstone predicates.
-pub fn translate_condition(expr: &Expr, out: &mut String) -> Result<(), HyperbytedbError> {
-    translate_expr(expr, out, true, None)
-}
-
-/// Like [`translate_condition`] but resolves tag identifiers to their physical
-/// column names. Used to store tombstone predicates so the spliced WHERE clause
-/// matches the tag columns exposed by the series-rejoin inline view.
-pub fn translate_condition_with_mapping(
+/// Tag identifiers are resolved to their physical column names so the spliced
+/// WHERE clause matches the tag columns exposed by the series-rejoin inline view.
+pub fn translate_condition(
     expr: &Expr,
-    mapping: Option<&ColumnMapping>,
+    mapping: &ColumnMapping,
     out: &mut String,
 ) -> Result<(), HyperbytedbError> {
-    translate_expr(expr, out, true, mapping)
+    translate_expr(expr, out, true, Some(mapping))
 }
 
 fn tag_field_collision(m: &ColumnMapping, name: &str) -> bool {
@@ -1547,7 +1566,11 @@ fn is_where_literal(e: &Expr) -> bool {
     )
 }
 
-fn where_identifier_physical_name(m: &ColumnMapping, name: &str, other: &Expr) -> String {
+fn where_identifier_physical_name(
+    m: &ColumnMapping,
+    name: &str,
+    other: &Expr,
+) -> Result<String, HyperbytedbError> {
     if !tag_field_collision(m, name) {
         return quote_identifier(name);
     }
@@ -1555,8 +1578,10 @@ fn where_identifier_physical_name(m: &ColumnMapping, name: &str, other: &Expr) -
         Expr::IntegerLiteral(_) | Expr::FloatLiteral(_) | Expr::BooleanLiteral(_) => {
             quote_identifier(name)
         }
-        Expr::StringLiteral(_) | Expr::Regex(_) => quote_identifier(&m.tag_column_name(name)),
-        _ => quote_identifier(&m.tag_column_name(name)),
+        Expr::StringLiteral(_) | Expr::Regex(_) => {
+            Ok(quote_phys_identifier(&m.physical_tag_column_name(name)))
+        }
+        _ => Ok(quote_phys_identifier(&m.physical_tag_column_name(name))),
     }
 }
 
@@ -1570,31 +1595,31 @@ fn regex_match_column_name(
             typ: Some(FieldType::Tag),
         } => {
             let col = mapping
-                .map(|m| m.tag_column_name(name))
+                .map(|m| m.physical_tag_column_name(name))
                 .unwrap_or_else(|| name.clone());
-            Ok(quote_identifier(&col))
+            Ok(quote_phys_identifier(&col))
         }
         Expr::FieldRef {
             name,
             typ: Some(FieldType::Field),
-        } => Ok(quote_identifier(name)),
+        } => quote_identifier(name),
         Expr::FieldRef { name, typ: None } => {
             let col = mapping
-                .map(|m| m.tag_column_name(name))
+                .map(|m| m.physical_tag_column_name(name))
                 .unwrap_or_else(|| name.clone());
-            Ok(quote_identifier(&col))
+            Ok(quote_phys_identifier(&col))
         }
         Expr::Identifier(n) => {
             let col = if let Some(m) = mapping {
                 if tag_field_collision(m, n) {
-                    m.tag_column_name(n)
+                    m.physical_tag_column_name(n)
                 } else {
                     m.physical_select_identifier(n)
                 }
             } else {
                 n.clone()
             };
-            Ok(quote_identifier(&col))
+            Ok(quote_phys_identifier(&col))
         }
         _ => Err(HyperbytedbError::QueryParse(
             "regex operator =~ / !~ requires identifier and regex".to_string(),
@@ -1646,7 +1671,7 @@ fn try_translate_where_binary_expr(
     if !tag_field_collision(m, name) {
         return Ok(false);
     }
-    let col = where_identifier_physical_name(m, name, lit);
+    let col = where_identifier_physical_name(m, name, lit)?;
     if id_on_left {
         write!(out, "{}", col)?;
         write!(out, " {} ", binary_op_to_clickhouse(&be.op))?;
@@ -1672,36 +1697,40 @@ fn translate_expr(
             } else if in_where {
                 if let Some(m) = mapping {
                     if tag_field_collision(m, name) {
-                        write!(out, "{}", quote_identifier(&m.tag_column_name(name)))?;
+                        write!(
+                            out,
+                            "{}",
+                            quote_phys_identifier(&m.physical_tag_column_name(name))
+                        )?;
                     } else {
-                        write!(out, "{}", quote_identifier(name))?;
+                        write!(out, "{}", quote_identifier(name)?)?;
                     }
                 } else {
-                    write!(out, "{}", quote_identifier(name))?;
+                    write!(out, "{}", quote_identifier(name)?)?;
                 }
             } else {
-                write!(out, "{}", quote_identifier(name))?;
+                write!(out, "{}", quote_identifier(name)?)?;
             }
         }
         Expr::FieldRef { name, typ } => {
             let s = match typ {
                 Some(FieldType::Tag) => {
                     if let Some(m) = mapping {
-                        quote_identifier(&m.tag_column_name(name))
+                        quote_phys_identifier(&m.physical_tag_column_name(name))
                     } else {
-                        quote_identifier(name)
+                        quote_identifier(name)?
                     }
                 }
-                Some(FieldType::Field) => quote_identifier(name),
+                Some(FieldType::Field) => quote_identifier(name)?,
                 None => {
                     if let Some(m) = mapping {
                         if tag_field_collision(m, name) {
-                            quote_identifier(&m.tag_column_name(name))
+                            quote_phys_identifier(&m.physical_tag_column_name(name))
                         } else {
-                            quote_identifier(name)
+                            quote_identifier(name)?
                         }
                     } else {
-                        quote_identifier(name)
+                        quote_identifier(name)?
                     }
                 }
             };
@@ -1883,7 +1912,20 @@ fn binary_op_to_clickhouse(op: &BinaryOp) -> &'static str {
     }
 }
 
-fn quote_identifier(name: &str) -> String {
+fn quote_identifier(name: &str) -> Result<String, HyperbytedbError> {
+    if name.chars().any(char::is_control) {
+        return Err(HyperbytedbError::QueryParse(format!(
+            "identifier contains control characters: {name:?}"
+        )));
+    }
+    Ok(format!(
+        "\"{}\"",
+        name.replace('\\', "\\\\").replace('"', "\\\"")
+    ))
+}
+
+/// Quote a physical column name from [`crate::domain::chdb_naming`] (already sanitized).
+fn quote_phys_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
@@ -1971,8 +2013,8 @@ pub fn prepare_cq_select(
 /// `INSERT INTO <dest> SELECT ...` for a bounded CQ run against native tables.
 pub fn translate_bounded_cq_into(
     stmt: &SelectStatement,
-    dest_table: &str,
-    source_table: &str,
+    dest_table: &QuotedTableName,
+    source_table: &QuotedTableName,
     mapping: Option<&ColumnMapping>,
     series: Option<SeriesJoin<'_>>,
     start_nanos: i64,
@@ -1982,7 +2024,7 @@ pub fn translate_bounded_cq_into(
     let prepared = prepare_cq_select(stmt, start_nanos, end_nanos, false);
     let select_sql = translate_inner(
         &prepared,
-        source_table,
+        source_table.as_str(),
         mapping,
         series,
         Some((Some(start_nanos), Some(end_nanos))),
@@ -1994,15 +2036,24 @@ pub fn translate_bounded_cq_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::chdb_naming::QuotedTableName;
     use crate::timeseriesql::parser;
 
-    const TEST_TABLE: &str = "`mydb_autogen_cpu`";
-
-    fn translate_test(stmt: &SelectStatement) -> String {
-        translate_native_table(stmt, TEST_TABLE, None, None, None).unwrap()
+    fn test_table() -> QuotedTableName {
+        QuotedTableName::new_quoted("`mydb_autogen_cpu`".to_string())
     }
 
-    const SERIES_TABLE: &str = "`mydb_autogen_cpu_series`";
+    fn test_series_table() -> QuotedTableName {
+        QuotedTableName::new_quoted("`mydb_autogen_cpu_series`".to_string())
+    }
+
+    fn qname(s: &str) -> QuotedTableName {
+        QuotedTableName::new_quoted(s.to_string())
+    }
+
+    fn translate_test(stmt: &SelectStatement) -> String {
+        translate_native_table(stmt, test_table().as_str(), None, None, None).unwrap()
+    }
 
     /// Mapping with `host` as a tag and `usage_idle` as a field (no collision).
     fn cpu_mapping() -> ColumnMapping {
@@ -2013,14 +2064,15 @@ mod tests {
         }
     }
 
-    /// Translate with a series join available (force = false).
     fn translate_series(stmt: &SelectStatement, m: &ColumnMapping) -> String {
+        let table = test_table();
+        let series = test_series_table();
         translate_native_table(
             stmt,
-            TEST_TABLE,
+            table.as_str(),
             Some(m),
             Some(SeriesJoin {
-                table: SERIES_TABLE,
+                table: &series,
                 force: false,
                 tag_columns: &[],
             }),
@@ -2035,6 +2087,25 @@ mod tests {
             Statement::Select(s) => s,
             _ => panic!("expected SELECT statement"),
         }
+    }
+
+    #[test]
+    fn group_by_tag_uses_physical_column_name() {
+        let mut map = ColumnMapping::default();
+        map.tag_keys.insert("host-name".into());
+        map.field_names.insert("v".into());
+        let stmt = parse_select(r#"SELECT mean("v") FROM m GROUP BY time(1m), "host-name""#);
+        let sql = translate_series(&stmt, &map);
+        assert!(
+            sql.contains("\"host_name\""),
+            "tag with punctuation must map to sanitized physical column, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn quote_identifier_rejects_control_characters() {
+        assert!(quote_identifier("host\ninject").is_err());
+        assert!(quote_identifier("ok_name").is_ok());
     }
 
     #[test]
@@ -2196,9 +2267,14 @@ mod tests {
         );
         let min = 1_781_541_739_132_000_000i64;
         let max = 1_781_552_539_132_000_000i64;
-        let sql =
-            translate_native_table(&stmt, TEST_TABLE, None, None, Some((Some(min), Some(max))))
-                .unwrap();
+        let sql = translate_native_table(
+            &stmt,
+            test_table().as_str(),
+            None,
+            None,
+            Some((Some(min), Some(max))),
+        )
+        .unwrap();
         assert!(
             sql.contains("WITH FILL FROM toStartOfInterval(fromUnixTimestamp64Nano(1781541739132000000), INTERVAL 10 SECOND)"),
             "expected FROM bound aligned to bucket, got: {sql}"
@@ -2225,9 +2301,14 @@ mod tests {
         );
         let min = 1_781_541_730_000_000_000i64;
         let max = 1_781_541_790_000_000_000i64;
-        let sql =
-            translate_native_table(&stmt, TEST_TABLE, None, None, Some((Some(min), Some(max))))
-                .unwrap();
+        let sql = translate_native_table(
+            &stmt,
+            test_table().as_str(),
+            None,
+            None,
+            Some((Some(min), Some(max))),
+        )
+        .unwrap();
         assert!(
             sql.contains(
                 "WITH FILL FROM toStartOfInterval(fromUnixTimestamp64Nano(1781541730000000000) - INTERVAL 30 SECOND, INTERVAL 1 MINUTE) + INTERVAL 30 SECOND"
@@ -2352,7 +2433,8 @@ mod tests {
     fn test_select_into_does_not_default_fill() {
         // Writes must not insert synthetic NULL grid rows.
         let stmt = parse_select(r#"SELECT mean("value") INTO "dest" FROM "cpu" GROUP BY time(5m)"#);
-        let sql = translate_select_into(&stmt, "`dest`", "`src`", None).unwrap();
+        let sql =
+            translate_select_into(&stmt, &qname("`dest`"), test_table().as_str(), None).unwrap();
         assert!(
             !sql.contains("WITH FILL"),
             "SELECT INTO without fill() must not emit WITH FILL, got: {sql}"
@@ -2744,8 +2826,13 @@ mod tests {
     fn test_translate_select_into() {
         let q = r#"SELECT mean("value") INTO "cpu_1h" FROM "cpu" WHERE "host" = 'server01' GROUP BY time(1h), "host""#;
         let stmt = parse_select(q);
-        let sql = translate_select_into(&stmt, "`mydb_autogen_cpu_1h`", "`mydb_autogen_cpu`", None)
-            .unwrap();
+        let sql = translate_select_into(
+            &stmt,
+            &qname("`mydb_autogen_cpu_1h`"),
+            test_table().as_str(),
+            None,
+        )
+        .unwrap();
         assert!(sql.starts_with("INSERT INTO `mydb_autogen_cpu_1h`"));
         assert!(sql.contains("SELECT "));
         assert!(sql.contains("time"));
@@ -2759,7 +2846,9 @@ mod tests {
     fn test_select_into_requires_group_by_time() {
         let q = r#"SELECT mean("value") INTO "cpu_1h" FROM "cpu""#;
         let stmt = parse_select(q);
-        assert!(translate_select_into(&stmt, "`dest`", "`source`", None).is_err());
+        assert!(
+            translate_select_into(&stmt, &qname("`dest`"), test_table().as_str(), None).is_err()
+        );
     }
 
     #[test]
@@ -2769,8 +2858,8 @@ mod tests {
         let map = cpu_mapping();
         let sql = translate_materialized_view_select(
             &stmt,
-            "`mydb_autogen_cpu`",
-            "`mydb_autogen_cpu_series`",
+            &test_table(),
+            &test_series_table(),
             "cpu_5m",
             &map,
         )
@@ -2818,9 +2907,9 @@ mod tests {
         let map = cpu_mapping();
         let sql = translate_materialized_view_backfill(
             &stmt,
-            "`dest`",
-            "`source`",
-            "`source_series`",
+            &qname("`dest`"),
+            &qname("`source`"),
+            &qname("`source_series`"),
             "server_stats_1m",
             &map,
         )
@@ -2844,7 +2933,7 @@ mod tests {
         let mut map = cpu_mapping();
         map.field_rollups
             .insert("usage_idle".to_string(), RollupCombine::Sum);
-        let sql = build_coalesced_fact_view(TEST_TABLE, &map);
+        let sql = build_coalesced_fact_view(&test_table(), &map);
         assert!(
             sql.contains("sum(\"usage_idle\") AS \"usage_idle\""),
             "rollup fields should merge with sum(), got: {sql}"
@@ -2858,7 +2947,7 @@ mod tests {
     #[test]
     fn raw_fact_view_still_uses_argmax_without_rollups() {
         let map = cpu_mapping();
-        let sql = build_coalesced_fact_view(TEST_TABLE, &map);
+        let sql = build_coalesced_fact_view(&test_table(), &map);
         assert!(
             sql.contains("argMax(\"usage_idle\", `ingest_seq`)"),
             "raw measurements should keep argMax coalesce, got: {sql}"
@@ -2883,12 +2972,14 @@ mod tests {
             .insert("count_value".to_string(), RollupCombine::Sum);
 
         let stmt = parse_select(r#"SELECT mean("value") FROM cpu GROUP BY time(5m), "host""#);
+        let table = test_table();
+        let series = test_series_table();
         let sql = translate_native_table(
             &stmt,
-            TEST_TABLE,
+            table.as_str(),
             Some(&map),
             Some(SeriesJoin {
-                table: SERIES_TABLE,
+                table: &series,
                 force: false,
                 tag_columns: &[],
             }),
@@ -2907,12 +2998,14 @@ mod tests {
         let mut map = ColumnMapping::default();
         map.tag_keys.insert("cpu".into());
         map.field_names.insert("cpu".into());
+        let table = test_table();
+        let series = test_series_table();
         let sql = translate_native_table(
             &stmt,
-            TEST_TABLE,
+            table.as_str(),
             Some(&map),
             Some(SeriesJoin {
-                table: SERIES_TABLE,
+                table: &series,
                 force: false,
                 tag_columns: &[],
             }),
@@ -2968,12 +3061,14 @@ mod tests {
         ] {
             map.field_names.insert(f.into());
         }
+        let table = test_table();
+        let series = test_series_table();
         let sql = translate_native_table(
             &stmt,
-            TEST_TABLE,
+            table.as_str(),
             Some(&map),
             Some(SeriesJoin {
-                table: SERIES_TABLE,
+                table: &series,
                 force: false,
                 tag_columns: &[],
             }),
@@ -3055,12 +3150,14 @@ mod tests {
         // force=true (e.g. a tombstone references a tag) joins even a field-only body.
         let stmt = parse_select(r#"SELECT mean("usage_idle") FROM cpu WHERE time > 0"#);
         let m = cpu_mapping();
+        let table = test_table();
+        let series = test_series_table();
         let sql = translate_native_table(
             &stmt,
-            TEST_TABLE,
+            table.as_str(),
             Some(&m),
             Some(SeriesJoin {
-                table: SERIES_TABLE,
+                table: &series,
                 force: true,
                 tag_columns: &[],
             }),
@@ -3091,7 +3188,7 @@ mod tests {
 
         let sql = translate_materialized_view_series_select(
             &stmt,
-            "`source_series`",
+            &qname("`source_series`"),
             "dest",
             &src_mapping,
             Some(&dest_field_names),
@@ -3114,7 +3211,7 @@ mod tests {
 
         let sql = translate_materialized_view_series_select(
             &stmt,
-            "`source_series`",
+            &qname("`source_series`"),
             "dest",
             &src_mapping,
             None,
@@ -3352,7 +3449,8 @@ mod tests {
             fill: None,
             timezone: None,
         };
-        let inner_sql = translate_native_table(&inner, TEST_TABLE, None, None, None).unwrap();
+        let inner_sql =
+            translate_native_table(&inner, test_table().as_str(), None, None, None).unwrap();
         let inner_sql = rename_time_bucket_alias(&inner_sql);
         assert!(
             inner_sql.contains("AS time"),
@@ -3403,7 +3501,7 @@ mod tests {
         stmt.timezone = Some("America/New_York".to_string());
         let sql = translate_native_table(
             &stmt,
-            TEST_TABLE,
+            test_table().as_str(),
             None,
             None,
             Some((Some(1_000_000_000), Some(3_000_000_000))),
@@ -3437,6 +3535,6 @@ mod tests {
     }
 
     fn translate_test_tz(stmt: &SelectStatement) -> String {
-        translate_native_table(stmt, TEST_TABLE, None, None, None).unwrap()
+        translate_native_table(stmt, test_table().as_str(), None, None, None).unwrap()
     }
 }

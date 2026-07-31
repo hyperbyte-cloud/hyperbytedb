@@ -23,6 +23,10 @@ fn mutation_ack_key(peer_id: u64) -> Vec<u8> {
     format!("mutation_ack:{}", peer_id).into_bytes()
 }
 
+fn applied_mutation_key(origin_node_id: u64) -> Vec<u8> {
+    format!("applied_mutation:{}", origin_node_id).into_bytes()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MutationLogEntry {
     pub seq: u64,
@@ -49,10 +53,12 @@ impl ReplicationLog {
             ColumnFamilyDescriptor::new(HINTED_HANDOFF_CF, hh_opts),
         ];
 
-        let db = Arc::new(
-            DB::open_cf_descriptors(&opts, path, cfs)
-                .map_err(|e| HyperbytedbError::Internal(format!("replication log open: {e}")))?,
-        );
+        let db = Arc::new(DB::open_cf_descriptors(&opts, path, cfs).map_err(|e| {
+            HyperbytedbError::Internal(crate::error::ChainedError::with_context(
+                "replication log open",
+                e,
+            ))
+        })?);
 
         let mutation_seq = {
             let cf = db
@@ -79,10 +85,38 @@ impl ReplicationLog {
             max_seq
         };
 
+        let applied_mutation_seqs = {
+            let cf = db
+                .cf_handle(REPL_CF)
+                .ok_or_else(|| HyperbytedbError::Internal("replication CF not found".into()))?;
+            let prefix = b"applied_mutation:";
+            let iter = db.iterator_cf_opt(
+                &cf,
+                rocksdb::ReadOptions::default(),
+                IteratorMode::From(prefix, rocksdb::Direction::Forward),
+            );
+            let mut map = HashMap::new();
+            for (key, value) in iter.flatten() {
+                if !key.starts_with(prefix) {
+                    break;
+                }
+                if let Ok(k) = std::str::from_utf8(&key)
+                    && let Some(origin_str) = k.strip_prefix("applied_mutation:")
+                    && let Ok(origin) = origin_str.parse::<u64>()
+                    && value.len() == 8
+                {
+                    let mut arr = [0u8; 8];
+                    arr.copy_from_slice(&value);
+                    map.insert(origin, u64::from_be_bytes(arr));
+                }
+            }
+            map
+        };
+
         Ok(Self {
             db,
             mutation_seq: AtomicU64::new(mutation_seq),
-            applied_mutation_seqs: Mutex::new(HashMap::new()),
+            applied_mutation_seqs: Mutex::new(applied_mutation_seqs),
         })
     }
 
@@ -113,7 +147,12 @@ impl ReplicationLog {
         }
         self.db
             .put_cf(&cf, ack_key(peer_id), seq.to_be_bytes())
-            .map_err(|e| HyperbytedbError::Internal(format!("set_wal_ack: {e}")))?;
+            .map_err(|e| {
+                HyperbytedbError::Internal(crate::error::ChainedError::with_context(
+                    "set_wal_ack",
+                    e,
+                ))
+            })?;
         Ok(())
     }
 
@@ -130,7 +169,9 @@ impl ReplicationLog {
                 Ok(u64::from_be_bytes(arr))
             }
             Ok(None) => Ok(0),
-            Err(e) => Err(HyperbytedbError::Internal(format!("get_wal_ack: {e}"))),
+            Err(e) => Err(HyperbytedbError::Internal(
+                crate::error::ChainedError::with_context("get_wal_ack", e),
+            )),
         }
     }
 
@@ -193,11 +234,20 @@ impl ReplicationLog {
             seq,
             request: request.clone(),
         };
-        let value = serde_json::to_vec(&entry)
-            .map_err(|e| HyperbytedbError::Internal(format!("serialize mutation: {e}")))?;
+        let value = serde_json::to_vec(&entry).map_err(|e| {
+            HyperbytedbError::Internal(crate::error::ChainedError::with_context(
+                "serialize mutation",
+                e,
+            ))
+        })?;
         self.db
             .put_cf(&cf, mutation_log_key(seq), value)
-            .map_err(|e| HyperbytedbError::Internal(format!("append_mutation: {e}")))?;
+            .map_err(|e| {
+                HyperbytedbError::Internal(crate::error::ChainedError::with_context(
+                    "append_mutation",
+                    e,
+                ))
+            })?;
         Ok(seq)
     }
 
@@ -228,7 +278,10 @@ impl ReplicationLog {
                     break;
                 }
                 let entry: MutationLogEntry = serde_json::from_slice(&value).map_err(|e| {
-                    HyperbytedbError::Internal(format!("deserialize mutation: {e}"))
+                    HyperbytedbError::Internal(crate::error::ChainedError::with_context(
+                        "deserialize mutation",
+                        e,
+                    ))
                 })?;
                 results.push(entry);
             }
@@ -236,15 +289,32 @@ impl ReplicationLog {
         Ok(results)
     }
 
-    /// Set mutation ack for a peer.
+    /// Record mutation ack for a peer. Only advances forward; out-of-order acks
+    /// are ignored so concurrent replication cannot regress the watermark.
     pub fn set_mutation_ack(&self, peer_id: u64, seq: u64) -> Result<(), HyperbytedbError> {
         let cf = self
             .db
             .cf_handle(REPL_CF)
             .ok_or_else(|| HyperbytedbError::Internal("replication CF not found".into()))?;
+        let current = match self.db.get_cf(&cf, mutation_ack_key(peer_id)) {
+            Ok(Some(v)) => {
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&v);
+                u64::from_be_bytes(arr)
+            }
+            _ => 0,
+        };
+        if seq <= current {
+            return Ok(());
+        }
         self.db
             .put_cf(&cf, mutation_ack_key(peer_id), seq.to_be_bytes())
-            .map_err(|e| HyperbytedbError::Internal(format!("set_mutation_ack: {e}")))?;
+            .map_err(|e| {
+                HyperbytedbError::Internal(crate::error::ChainedError::with_context(
+                    "set_mutation_ack",
+                    e,
+                ))
+            })?;
         Ok(())
     }
 
@@ -261,7 +331,9 @@ impl ReplicationLog {
                 Ok(u64::from_be_bytes(arr))
             }
             Ok(None) => Ok(0),
-            Err(e) => Err(HyperbytedbError::Internal(format!("get_mutation_ack: {e}"))),
+            Err(e) => Err(HyperbytedbError::Internal(
+                crate::error::ChainedError::with_context("get_mutation_ack", e),
+            )),
         }
     }
 
@@ -302,25 +374,45 @@ impl ReplicationLog {
             .ok_or_else(|| HyperbytedbError::Internal("replication CF not found".into()))?;
         let from = mutation_log_key(0);
         let to = mutation_log_key(seq);
-        self.db
-            .delete_range_cf(&cf, &from, &to)
-            .map_err(|e| HyperbytedbError::Internal(format!("truncate_mutations: {e}")))?;
+        self.db.delete_range_cf(&cf, &from, &to).map_err(|e| {
+            HyperbytedbError::Internal(crate::error::ChainedError::with_context(
+                "truncate_mutations",
+                e,
+            ))
+        })?;
         Ok(())
     }
 
     /// Returns true if this mutation should be applied (not a duplicate).
     /// Returns false if it has already been applied (seq <= last seen for this origin).
-    pub fn check_and_record_mutation(&self, origin_node_id: u64, seq: u64) -> bool {
+    pub fn check_and_record_mutation(
+        &self,
+        origin_node_id: u64,
+        seq: u64,
+    ) -> Result<bool, HyperbytedbError> {
+        let cf = self
+            .db
+            .cf_handle(REPL_CF)
+            .ok_or_else(|| HyperbytedbError::Internal("replication CF not found".into()))?;
+
         let mut map = self
             .applied_mutation_seqs
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let last = map.entry(origin_node_id).or_insert(0);
         if seq > *last {
+            self.db
+                .put_cf(&cf, applied_mutation_key(origin_node_id), seq.to_be_bytes())
+                .map_err(|e| {
+                    HyperbytedbError::Internal(crate::error::ChainedError::with_context(
+                        "check_and_record_mutation",
+                        e,
+                    ))
+                })?;
             *last = seq;
-            true
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 
@@ -431,6 +523,19 @@ mod tests {
     }
 
     #[test]
+    fn test_mutation_ack_monotonic() {
+        let log = tmp_log();
+        log.set_mutation_ack(1, 50).unwrap();
+        assert_eq!(log.get_mutation_ack(1).unwrap(), 50);
+        log.set_mutation_ack(1, 30).unwrap();
+        assert_eq!(log.get_mutation_ack(1).unwrap(), 50);
+        log.set_mutation_ack(1, 50).unwrap();
+        assert_eq!(log.get_mutation_ack(1).unwrap(), 50);
+        log.set_mutation_ack(1, 60).unwrap();
+        assert_eq!(log.get_mutation_ack(1).unwrap(), 60);
+    }
+
+    #[test]
     fn test_mutation_ack() {
         let log = tmp_log();
         assert_eq!(log.get_mutation_ack(1).unwrap(), 0);
@@ -475,5 +580,27 @@ mod tests {
 
         assert_eq!(log.get_wal_ack(1).unwrap(), 0);
         assert_eq!(log.get_mutation_ack(1).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_mutation_dedup_persisted_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+
+        {
+            let log = ReplicationLog::open(path).unwrap();
+            assert!(log.check_and_record_mutation(42, 10).unwrap());
+            assert!(!log.check_and_record_mutation(42, 10).unwrap());
+            assert!(!log.check_and_record_mutation(42, 5).unwrap());
+            assert!(log.check_and_record_mutation(42, 11).unwrap());
+            assert!(log.check_and_record_mutation(99, 1).unwrap());
+        }
+
+        let log = ReplicationLog::open(path).unwrap();
+        assert!(!log.check_and_record_mutation(42, 10).unwrap());
+        assert!(!log.check_and_record_mutation(42, 11).unwrap());
+        assert!(log.check_and_record_mutation(42, 12).unwrap());
+        assert!(!log.check_and_record_mutation(99, 1).unwrap());
+        assert!(log.check_and_record_mutation(99, 2).unwrap());
     }
 }

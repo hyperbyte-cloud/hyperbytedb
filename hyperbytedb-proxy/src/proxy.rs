@@ -9,7 +9,9 @@
 //!    `max_retries` times.
 //! 4. On final failure surface 503 to the client.
 
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Instant;
 
 use axum::body::Body;
@@ -17,8 +19,12 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
+use futures::Stream;
+use futures::StreamExt;
+use futures::ready;
 use http_body_util::BodyExt;
 
+use crate::backend::InflightGuard;
 use crate::pool::BackendPool;
 
 /// Headers that hop-by-hop semantics (RFC 7230 §6.1) say we must not forward.
@@ -44,16 +50,18 @@ pub struct ProxyState {
 impl ProxyState {
     pub fn new(pool: Arc<BackendPool>) -> anyhow::Result<Self> {
         let cfg = pool.config();
-        let client = reqwest::Client::builder()
+        let mut client_builder = reqwest::Client::builder()
             .timeout(cfg.request_timeout)
             // Per-host pool sized to absorb a moderate burst without
             // re-handshaking; keep_alive_while_idle keeps connections warm
             // across the typical inter-request gap of a Grafana refresh.
             .pool_max_idle_per_host(64)
             .pool_idle_timeout(std::time::Duration::from_secs(90))
-            .tcp_nodelay(true)
-            .http2_prior_knowledge() // hyperbytedb supports h2; saves the upgrade
-            .build()?;
+            .tcp_nodelay(true);
+        if cfg.http2_prior_knowledge {
+            client_builder = client_builder.http2_prior_knowledge();
+        }
+        let client = client_builder.build()?;
         Ok(Self { pool, client })
     }
 }
@@ -64,14 +72,11 @@ pub async fn handle(State(state): State<ProxyState>, req: Request) -> Response {
     let cfg = state.pool.config();
 
     // Buffer the request body once. We may need to send it more than once if
-    // a backend returns a transient failure mid-restart.
-    //
-    // For very large writes this would be a regression — fortunately
-    // hyperbytedb's `/write` body cap is `server.max_body_size_bytes` (25 MiB
-    // by default), so buffering is bounded and predictable.
+    // a backend returns a transient failure mid-restart. Wrapped in `Arc` so
+    // retries clone a pointer, not the payload.
     let (parts, body) = req.into_parts();
     let body_bytes = match body.collect().await {
-        Ok(c) => c.to_bytes(),
+        Ok(c) => Arc::new(c.to_bytes()),
         Err(e) => {
             tracing::warn!(error = %e, "failed to read incoming request body");
             return error_response(StatusCode::BAD_REQUEST, "could not read request body");
@@ -111,7 +116,7 @@ pub async fn handle(State(state): State<ProxyState>, req: Request) -> Response {
     let mut current = first;
 
     loop {
-        let _guard = current.enter();
+        let guard = current.enter();
         let url = format!("{}{}", current.origin, path_query);
         tracing::debug!(
             attempt,
@@ -126,7 +131,7 @@ pub async fn handle(State(state): State<ProxyState>, req: Request) -> Response {
             &url,
             &parts.method,
             &parts.headers,
-            body_bytes.clone(),
+            Arc::clone(&body_bytes),
         )
         .await;
 
@@ -141,7 +146,7 @@ pub async fn handle(State(state): State<ProxyState>, req: Request) -> Response {
                 .increment(1);
                 metrics::histogram!("hyperbytedb_proxy_request_duration_seconds")
                     .record(started.elapsed().as_secs_f64());
-                return resp;
+                return attach_inflight_guard(resp, guard);
             }
             ForwardOutcome::Retryable { status, msg } => {
                 tracing::info!(
@@ -153,6 +158,8 @@ pub async fn handle(State(state): State<ProxyState>, req: Request) -> Response {
                 );
                 last_status = status;
                 last_err = msg;
+                // Attempt failed before a response was handed to the client.
+                drop(guard);
             }
             ForwardOutcome::Fatal(resp) => {
                 metrics::counter!(
@@ -160,7 +167,7 @@ pub async fn handle(State(state): State<ProxyState>, req: Request) -> Response {
                     "outcome" => "fatal",
                 )
                 .increment(1);
-                return resp;
+                return attach_inflight_guard(resp, guard);
             }
         }
 
@@ -217,7 +224,7 @@ async fn forward_once(
     url: &str,
     method: &http::Method,
     headers: &http::HeaderMap,
-    body: Bytes,
+    body: Arc<Bytes>,
 ) -> ForwardOutcome {
     let mut rb = client.request(method.clone(), url);
     for (name, value) in headers {
@@ -230,7 +237,7 @@ async fn forward_once(
         rb = rb.header(name, value);
     }
     if !body.is_empty() {
-        rb = rb.body(body);
+        rb = rb.body(body.as_ref().clone());
     }
 
     let resp = match rb.send().await {
@@ -248,30 +255,8 @@ async fn forward_once(
     let upstream_status =
         StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
-    // Buffer body so we can return it as a fixed-size axum body. Streaming
-    // would be nicer for large query results, but the simpler form keeps
-    // the retry-with-buffered-request path consistent.
-    let resp_headers = resp.headers().clone();
-    let body_bytes = match resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-            return ForwardOutcome::Retryable {
-                status: Some(upstream_status),
-                msg: Some(format!("response body read: {e}")),
-            };
-        }
-    };
-
-    // 503 with the well-known draining marker → another backend may serve us.
-    if upstream_status == StatusCode::SERVICE_UNAVAILABLE && looks_like_drain(&body_bytes) {
-        return ForwardOutcome::Retryable {
-            status: Some(upstream_status),
-            msg: Some("backend reports draining/syncing".into()),
-        };
-    }
-
     // 502/504 from the backend itself = transient infra problem upstream;
-    // try another node.
+    // try another node. Body is not needed for the retry decision.
     if matches!(upstream_status.as_u16(), 502 | 504,) {
         return ForwardOutcome::Retryable {
             status: Some(upstream_status),
@@ -279,29 +264,134 @@ async fn forward_once(
         };
     }
 
-    let mut out = Response::builder().status(upstream_status);
-    let out_headers = out.headers_mut().expect("response builder has headers map");
-    for (name, value) in resp_headers.iter() {
+    // 503 with the well-known draining marker → another backend may serve us.
+    // These envelopes are small JSON; buffer to inspect before deciding.
+    if upstream_status == StatusCode::SERVICE_UNAVAILABLE {
+        let resp_headers = resp.headers().clone();
+        let body_bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                return ForwardOutcome::Retryable {
+                    status: Some(upstream_status),
+                    msg: Some(format!("response body read: {e}")),
+                };
+            }
+        };
+        if looks_like_drain(&body_bytes) {
+            return ForwardOutcome::Retryable {
+                status: Some(upstream_status),
+                msg: Some("backend reports draining/syncing".into()),
+            };
+        }
+        let resp = build_buffered_response(upstream_status, &resp_headers, body_bytes);
+        return if upstream_status.is_client_error() {
+            ForwardOutcome::Fatal(resp)
+        } else {
+            ForwardOutcome::Ok(resp)
+        };
+    }
+
+    if upstream_status.is_client_error() {
+        let resp_headers = resp.headers().clone();
+        let body_bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                return ForwardOutcome::Retryable {
+                    status: Some(upstream_status),
+                    msg: Some(format!("response body read: {e}")),
+                };
+            }
+        };
+        return ForwardOutcome::Fatal(build_buffered_response(
+            upstream_status,
+            &resp_headers,
+            body_bytes,
+        ));
+    }
+
+    // Success and other non-retryable responses: stream upstream body through
+    // without buffering the full payload in proxy memory.
+    ForwardOutcome::Ok(build_streaming_response(upstream_status, resp))
+}
+
+fn build_buffered_response(
+    status: StatusCode,
+    resp_headers: &reqwest::header::HeaderMap,
+    body_bytes: Bytes,
+) -> Response {
+    let mut out = Response::builder().status(status);
+    copy_upstream_headers(
+        resp_headers,
+        out.headers_mut().expect("response builder has headers map"),
+    );
+    out.body(Body::from(body_bytes))
+        .expect("axum response body construction is infallible")
+}
+
+fn build_streaming_response(status: StatusCode, resp: reqwest::Response) -> Response {
+    let resp_headers = resp.headers().clone();
+    let mut out = Response::builder().status(status);
+    copy_upstream_headers(
+        &resp_headers,
+        out.headers_mut().expect("response builder has headers map"),
+    );
+    let stream = resp
+        .bytes_stream()
+        .map(|result| result.map_err(std::io::Error::other));
+    out.body(Body::from_stream(stream))
+        .expect("axum response body construction is infallible")
+}
+
+fn copy_upstream_headers(upstream: &reqwest::header::HeaderMap, out_headers: &mut http::HeaderMap) {
+    for (name, value) in upstream.iter() {
         if HOP_BY_HOP
             .iter()
             .any(|h| name.as_str().eq_ignore_ascii_case(h))
         {
             continue;
         }
-        out_headers.insert(
-            HeaderName::from_bytes(name.as_ref()).expect("valid hyper header name"),
-            value.clone(),
-        );
+        match HeaderName::from_bytes(name.as_ref()) {
+            Ok(header_name) => {
+                out_headers.insert(header_name, value.clone());
+            }
+            Err(_) => {
+                tracing::warn!(header = ?name, "skipping upstream header with invalid name");
+            }
+        }
     }
-    let resp = out
-        .body(Body::from(body_bytes))
-        .expect("axum response body construction is infallible");
+}
 
-    if upstream_status.is_client_error() {
-        // 4xx is the client's problem; don't burn retries.
-        ForwardOutcome::Fatal(resp)
-    } else {
-        ForwardOutcome::Ok(resp)
+/// Keep the backend inflight counter elevated until the response body is fully
+/// consumed (including streamed query results).
+fn attach_inflight_guard(resp: Response, guard: InflightGuard) -> Response {
+    let (parts, body) = resp.into_parts();
+    let stream = body
+        .into_data_stream()
+        .map(|result| result.map_err(std::io::Error::other));
+    let guarded = GuardedBodyStream {
+        inner: Box::pin(stream),
+        guard: Some(guard),
+    };
+    Response::from_parts(parts, Body::from_stream(guarded))
+}
+
+struct GuardedBodyStream {
+    inner: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
+    guard: Option<InflightGuard>,
+}
+
+impl Stream for GuardedBodyStream {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.as_mut().get_mut();
+        match ready!(this.inner.as_mut().poll_next(cx)) {
+            Some(item) => Poll::Ready(Some(item)),
+            None => {
+                this.guard.take();
+                Poll::Ready(None)
+            }
+        }
     }
 }
 
@@ -327,4 +417,12 @@ fn error_response(status: StatusCode, msg: &str) -> Response {
         msg.replace('"', "\\\"")
     );
     (status, [("content-type", "application/json")], body).into_response()
+}
+
+/// Reject paths outside the public InfluxDB v1 surface.
+pub async fn not_found() -> Response {
+    error_response(
+        StatusCode::NOT_FOUND,
+        "only /write and /query are exposed on the public listener",
+    )
 }

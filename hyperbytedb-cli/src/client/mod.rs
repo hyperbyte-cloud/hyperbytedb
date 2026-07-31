@@ -25,11 +25,13 @@ pub struct HyperbytedbClient {
 
 impl HyperbytedbClient {
     pub fn new(config: &ConnectionConfig, verbose: bool) -> Result<Self> {
+        let credentials = Credentials::from_config(config);
+        credentials.validate()?;
         Ok(Self {
             backend: Arc::new(HttpBackend::from_config(config, verbose)?),
             base: config.base_url(),
             config: config.clone(),
-            credentials: Credentials::from_config(config),
+            credentials,
             verbose,
         })
     }

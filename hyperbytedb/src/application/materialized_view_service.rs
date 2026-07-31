@@ -37,6 +37,10 @@ impl MaterializedViewService {
         }
     }
 
+    pub fn points_sink(&self) -> &Arc<dyn PointsSinkPort> {
+        &self.points_sink
+    }
+
     pub async fn create(
         &self,
         mv: &CreateMaterializedViewStatement,
@@ -86,8 +90,9 @@ impl MaterializedViewService {
             dest_db,
             dest_rp: dest_rp.clone(),
             dest_measurement,
-            ch_fact_mv_name: unquoted_fact_mv_name(&mv.database, &dest_rp, &mv.name),
-            ch_series_mv_name: unquoted_series_mv_name(&mv.database, &dest_rp, &mv.name),
+            ch_fact_mv_name: unquoted_fact_mv_name(&mv.database, &dest_rp, &mv.name).to_string(),
+            ch_series_mv_name: unquoted_series_mv_name(&mv.database, &dest_rp, &mv.name)
+                .to_string(),
             created_at: chrono::Utc::now().to_rfc3339(),
             backfill_on_create: mv.backfill_on_create,
         };
@@ -122,7 +127,8 @@ impl MaterializedViewService {
 
         let fact_mv = quoted_fact_mv_name(db, &def.dest_rp, name);
         let series_mv = quoted_series_mv_name(db, &def.dest_rp, name);
-        self.drop_ch_mv_objects(&fact_mv, &series_mv).await?;
+        self.drop_ch_mv_objects(fact_mv.as_str(), series_mv.as_str())
+            .await?;
 
         // Drop the destination fact + series tables to avoid orphaned tables.
         if let Err(e) = self
@@ -256,7 +262,8 @@ impl MaterializedViewService {
     ) -> Result<(), HyperbytedbError> {
         let fact_mv = quoted_fact_mv_name(&def.database, &def.dest_rp, &def.name);
         let series_mv = quoted_series_mv_name(&def.database, &def.dest_rp, &def.name);
-        self.drop_ch_mv_objects(&fact_mv, &series_mv).await
+        self.drop_ch_mv_objects(fact_mv.as_str(), series_mv.as_str())
+            .await
     }
 
     async fn reconcile_one(&self, def: &MaterializedViewDef) -> Result<bool, HyperbytedbError> {
@@ -408,7 +415,7 @@ impl MaterializedViewService {
                 .ensure_measurement_schema(&dest_db, &dest_rp, &dest_meta)
                 .await?;
 
-            self.drop_ch_mv_objects(&fact_mv_quoted, &series_mv_quoted)
+            self.drop_ch_mv_objects(fact_mv_quoted.as_str(), series_mv_quoted.as_str())
                 .await?;
 
             self.query_port.execute_sql(&create_fact_mv).await?;
@@ -438,7 +445,7 @@ impl MaterializedViewService {
                 &dest_rp,
                 &dest_measurement,
                 &dest_meta,
-                &dest_series,
+                dest_series.as_str(),
             )
             .await
             {
@@ -457,7 +464,7 @@ impl MaterializedViewService {
 
         if let Err(e) = result {
             let _ = self
-                .drop_ch_mv_objects(&fact_mv_quoted, &series_mv_quoted)
+                .drop_ch_mv_objects(fact_mv_quoted.as_str(), series_mv_quoted.as_str())
                 .await;
             let _ = self
                 .points_sink
@@ -503,8 +510,8 @@ pub fn def_from_statement(
         dest_db,
         dest_rp: dest_rp.to_string(),
         dest_measurement,
-        ch_fact_mv_name: unquoted_fact_mv_name(&mv.database, dest_rp, &mv.name),
-        ch_series_mv_name: unquoted_series_mv_name(&mv.database, dest_rp, &mv.name),
+        ch_fact_mv_name: unquoted_fact_mv_name(&mv.database, dest_rp, &mv.name).to_string(),
+        ch_series_mv_name: unquoted_series_mv_name(&mv.database, dest_rp, &mv.name).to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
         backfill_on_create: mv.backfill_on_create,
     })

@@ -12,6 +12,7 @@ use tokio::runtime::Runtime;
 pub fn test_config() -> ProxyConfig {
     ProxyConfig {
         listen_addr: "127.0.0.1:0".into(),
+        admin_listen_addr: "127.0.0.1:0".into(),
         backend_service: "bench.local".into(),
         backend_port: 8086,
         discovery_interval: Duration::from_secs(5),
@@ -23,6 +24,7 @@ pub fn test_config() -> ProxyConfig {
         max_retries: 2,
         shutdown_grace: Duration::from_secs(30),
         self_ip: None,
+        http2_prior_knowledge: false,
     }
 }
 

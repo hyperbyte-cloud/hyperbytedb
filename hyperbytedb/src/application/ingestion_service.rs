@@ -8,8 +8,10 @@ use crate::application::ingest_metadata::{
     IngestCardinalityLimits, IngestSchemaCache, prepare_batch_metadata, validate_point_count,
 };
 use crate::application::line_protocol::parse_line_body_to_points_limited;
-use crate::application::msgpack_ingest::parse_msgpack_body_to_points;
-use crate::application::wal_append::append_points_with_prepared;
+use crate::application::msgpack_ingest::parse_msgpack_body_to_points_limited;
+use crate::application::wal_append::{
+    ColumnarWalAppend, append_columnar_with_prepared, append_points_with_prepared,
+};
 use crate::domain::point::Point;
 use crate::error::HyperbytedbError;
 use crate::ports::ingestion::{IngestionPort, WritePayloadFormat};
@@ -111,7 +113,10 @@ impl IngestionPort for IngestionServiceImpl {
 
         #[cfg(feature = "columnar-ingest")]
         if matches!(format, WritePayloadFormat::ColumnarMsgpack) {
-            let wire = crate::application::columnar_msgpack::decode_columnar_batch(body)?;
+            let wire = crate::application::columnar_msgpack::decode_columnar_batch_limited(
+                body,
+                self.max_points_per_request,
+            )?;
             if wire.values.is_empty() {
                 return Ok(());
             }
@@ -153,9 +158,19 @@ impl IngestionPort for IngestionServiceImpl {
                 .record((t3 - t2).as_secs_f64());
 
             let point_count = wire.values.len() as u64;
-            let points =
-                crate::application::columnar_msgpack::columnar_batch_to_points(&wire, precision)?;
-            self.append_points(db, &retention_policy, points, 0).await?;
+            append_columnar_with_prepared(
+                self.wal.as_ref(),
+                self.sink.as_ref(),
+                &ColumnarWalAppend {
+                    db,
+                    rp: &retention_policy,
+                    wire: &wire,
+                    precision,
+                    origin_node_id: 0,
+                    max_points_per_request: self.max_points_per_request,
+                },
+            )
+            .await?;
 
             let t4 = std::time::Instant::now();
             histogram!("hyperbytedb_ingest_wal_append_seconds").record((t4 - t3).as_secs_f64());
@@ -171,7 +186,9 @@ impl IngestionPort for IngestionServiceImpl {
             WritePayloadFormat::LineProtocol => {
                 parse_line_body_to_points_limited(body, precision, self.max_points_per_request)?
             }
-            WritePayloadFormat::Msgpack => parse_msgpack_body_to_points(body, precision)?,
+            WritePayloadFormat::Msgpack => {
+                parse_msgpack_body_to_points_limited(body, precision, self.max_points_per_request)?
+            }
             #[cfg(feature = "columnar-ingest")]
             WritePayloadFormat::ColumnarMsgpack => {
                 unreachable!("handled by fast path above")

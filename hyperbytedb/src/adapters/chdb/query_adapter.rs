@@ -24,8 +24,9 @@ impl ChdbQueryAdapter {
     /// Used by tests, which create many adapters in one process; only the first
     /// one to actually run a query binds the singleton engine.
     pub fn new(data_path: &str) -> Result<Self, HyperbytedbError> {
-        std::fs::create_dir_all(data_path)
-            .map_err(|e| HyperbytedbError::Chdb(format!("failed to create chDB data dir: {e}")))?;
+        std::fs::create_dir_all(data_path).map_err(|e| {
+            HyperbytedbError::Chdb(format!("failed to create chDB data dir: {e}").into())
+        })?;
         tracing::info!(path = %data_path, "chDB connection pool will be built lazily on first query");
         Ok(Self {
             session: SharedSession::new(data_path),
@@ -71,11 +72,11 @@ impl QueryPort for ChdbQueryAdapter {
             pool.with_connection(|conn| {
                 execute_connection(conn, "SELECT 1", OutputFormat::JSONEachRow)
                     .map(|_| ())
-                    .map_err(|e| HyperbytedbError::Chdb(e.to_string()))
+                    .map_err(|e| HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e)))
             })
         })
         .await
-        .map_err(|e| HyperbytedbError::Internal(format!("chDB ping join error: {e}")))?
+        .map_err(|e| HyperbytedbError::Internal(format!("chDB ping join error: {e}").into()))?
     }
 
     async fn execute_sql(&self, sql: &str) -> Result<String, HyperbytedbError> {
@@ -98,7 +99,7 @@ impl QueryPort for ChdbQueryAdapter {
                 match qr {
                     Ok(result) => result
                         .data_utf8()
-                        .map_err(|e| HyperbytedbError::Chdb(e.to_string())),
+                        .map_err(|e| HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e))),
                     Err(e) => {
                         let msg = e.to_string();
                         if msg.contains("CANNOT_EXTRACT_TABLE_STRUCTURE")
@@ -110,14 +111,14 @@ impl QueryPort for ChdbQueryAdapter {
                             tracing::warn!(error = %msg, "chDB missing-table error, treating as empty result");
                             Ok(String::new())
                         } else {
-                            Err(HyperbytedbError::Chdb(msg))
+                            Err(HyperbytedbError::Chdb(msg.into()))
                         }
                     }
                 }
             })
         })
         .await
-        .map_err(|e| HyperbytedbError::Internal(format!("chDB task join error: {e}")))??;
+        .map_err(|e| HyperbytedbError::Internal(format!("chDB task join error: {e}").into()))??;
 
         tracing::debug!(result_len = result.len(), "chDB query completed");
         Ok(result)

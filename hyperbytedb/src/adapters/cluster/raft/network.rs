@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use openraft::BasicNode;
 use openraft::error::{NetworkError, RPCError, RaftError};
 use openraft::network::RPCOption;
@@ -12,25 +14,28 @@ use super::TypeConfig;
 /// HTTP-based Raft network transport using reqwest.
 pub struct Network {
     client: reqwest::Client,
+    default_timeout: Duration,
 }
 
 impl Default for Network {
     fn default() -> Self {
-        Self::new()
+        Self::new(10)
     }
 }
 
 impl Network {
-    pub fn new() -> Self {
+    pub fn new(default_timeout_secs: u64) -> Self {
+        let default_timeout = Duration::from_secs(default_timeout_secs);
         Self {
             // `Client::builder().build()` only fails if TLS init is broken,
             // in which case `Client::new()` (same default config) would also
             // be unusable. Fall back to defaults so we don't panic on a path
             // that's exercised on the hot bootstrap line.
             client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
+                .timeout(default_timeout)
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
+            default_timeout,
         }
     }
 }
@@ -42,6 +47,7 @@ impl RaftNetworkFactory<TypeConfig> for Network {
         NetworkConnection {
             addr: node.addr.clone(),
             client: self.client.clone(),
+            default_timeout: self.default_timeout,
         }
     }
 }
@@ -50,6 +56,7 @@ impl RaftNetworkFactory<TypeConfig> for Network {
 pub struct NetworkConnection {
     addr: String,
     client: reqwest::Client,
+    default_timeout: Duration,
 }
 
 impl NetworkConnection {
@@ -57,15 +64,23 @@ impl NetworkConnection {
         format!("http://{}{}", self.addr, path)
     }
 
+    fn effective_timeout(option: &RPCOption, default: Duration) -> Duration {
+        let ttl = option.hard_ttl();
+        if ttl.is_zero() { default } else { ttl }
+    }
+
     async fn post_json<Req: serde::Serialize, Resp: serde::de::DeserializeOwned>(
         &self,
         path: &str,
         req: &Req,
+        option: &RPCOption,
     ) -> Result<Resp, RPCError<u64, BasicNode, RaftError<u64>>> {
+        let timeout = Self::effective_timeout(option, self.default_timeout);
         let resp = self
             .client
             .post(self.url(path))
             .json(req)
+            .timeout(timeout)
             .send()
             .await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
@@ -90,12 +105,15 @@ impl NetworkConnection {
         &self,
         path: &str,
         req: &Req,
+        option: &RPCOption,
     ) -> Result<Resp, RPCError<u64, BasicNode, RaftError<u64, openraft::error::InstallSnapshotError>>>
     {
+        let timeout = Self::effective_timeout(option, self.default_timeout);
         let resp = self
             .client
             .post(self.url(path))
             .json(req)
+            .timeout(timeout)
             .send()
             .await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
@@ -121,28 +139,53 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
     async fn append_entries(
         &mut self,
         rpc: AppendEntriesRequest<TypeConfig>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
-        self.post_json("/internal/raft/append", &rpc).await
+        self.post_json("/internal/raft/append", &rpc, &option).await
     }
 
     async fn install_snapshot(
         &mut self,
         rpc: InstallSnapshotRequest<TypeConfig>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<
         InstallSnapshotResponse<u64>,
         RPCError<u64, BasicNode, RaftError<u64, openraft::error::InstallSnapshotError>>,
     > {
-        self.post_json_snapshot("/internal/raft/snapshot", &rpc)
+        self.post_json_snapshot("/internal/raft/snapshot", &rpc, &option)
             .await
     }
 
     async fn vote(
         &mut self,
         rpc: VoteRequest<u64>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<VoteResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
-        self.post_json("/internal/raft/vote", &rpc).await
+        self.post_json("/internal/raft/vote", &rpc, &option).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NetworkConnection;
+    use openraft::network::RPCOption;
+    use std::time::Duration;
+
+    #[test]
+    fn effective_timeout_uses_rpc_option_when_non_zero() {
+        let option = RPCOption::new(Duration::from_secs(5));
+        assert_eq!(
+            NetworkConnection::effective_timeout(&option, Duration::from_secs(10)),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn effective_timeout_falls_back_to_default_when_zero() {
+        let option = RPCOption::new(Duration::ZERO);
+        assert_eq!(
+            NetworkConnection::effective_timeout(&option, Duration::from_secs(10)),
+            Duration::from_secs(10)
+        );
     }
 }

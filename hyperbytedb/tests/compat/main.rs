@@ -28,7 +28,7 @@ use hyperbytedb::application::ingestion_service::IngestionServiceImpl;
 use hyperbytedb::application::query_service::QueryServiceImpl;
 use hyperbytedb::domain::point::Point;
 use hyperbytedb::domain::query_result::QueryResponse;
-use hyperbytedb::error::HyperbytedbError;
+use hyperbytedb::error::{ChainedError, HyperbytedbError};
 use hyperbytedb::ports::ingestion::{IngestionPort, WritePayloadFormat};
 use hyperbytedb::ports::metadata::MetadataPort;
 use hyperbytedb::ports::points_sink::{PointsSinkPort, WriteAck};
@@ -85,7 +85,8 @@ impl TestContext {
     /// Create a TestContext that uses chDB for queries.
     /// Fails if chDB is not available.
     pub fn new() -> Result<Self, HyperbytedbError> {
-        let tmpdir = tempfile::tempdir().map_err(|e| HyperbytedbError::Internal(e.to_string()))?;
+        let tmpdir = tempfile::tempdir()
+            .map_err(|e| HyperbytedbError::Internal(ChainedError::from_error(e)))?;
         let root = tmpdir.path();
 
         let wal_path = root.join("wal");
@@ -134,7 +135,8 @@ impl TestContext {
     /// Create a TestContext that uses a mock QueryPort (no chDB required).
     /// Use for metadata, DDL, ingestion, and error tests.
     pub fn new_no_chdb() -> Result<Self, HyperbytedbError> {
-        let tmpdir = tempfile::tempdir().map_err(|e| HyperbytedbError::Internal(e.to_string()))?;
+        let tmpdir = tempfile::tempdir()
+            .map_err(|e| HyperbytedbError::Internal(ChainedError::from_error(e)))?;
         let root = tmpdir.path();
 
         let wal_path = root.join("wal");

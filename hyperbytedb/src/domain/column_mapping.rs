@@ -86,6 +86,14 @@ impl ColumnMapping {
         let fields: HashSet<&str> = self.field_names.iter().map(|s| s.as_str()).collect();
         tag_column_name(tag_key, &fields)
     }
+
+    /// Physical (sanitized) series-table column name for a logical tag key.
+    #[must_use]
+    pub fn physical_tag_column_name(&self, tag_key: &str) -> String {
+        let fields: HashSet<&str> = self.field_names.iter().map(|s| s.as_str()).collect();
+        crate::domain::chdb_naming::tag_column_name(tag_key, &fields)
+    }
+
     /// SELECT / aggregate: prefer field column when tag and field share a name.
     #[must_use]
     pub fn physical_select_identifier(&self, name: &str) -> String {

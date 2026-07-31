@@ -88,8 +88,11 @@ Authentication configuration.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | boolean | `false` | Enable authentication on `/write` and `/query` |
+| `allow_query_param_credentials` | boolean | `false` | Accept InfluxDB v1-style `?u=` / `?p=` credentials on the query string |
 
-When enabled, `/write` and `/query` require valid credentials. Health/metrics and other public routes, plus **admin-only** internal/cluster APIs, are documented in **[Authentication](authentication.md)**.
+When enabled, `/write` and `/query` require valid credentials. By default, credentials must be sent via HTTP headers (`Authorization: Basic` or `Authorization: Token`); query-string passwords are disabled because they can leak into access logs, reverse-proxy logs, browser history, and `Referer` headers. Set `allow_query_param_credentials = true` only when you need InfluxDB v1 URL compatibility and accept that risk.
+
+Health/metrics and other public routes, plus **admin-only** internal/cluster APIs, are documented in **[Authentication](authentication.md)**.
 
 ---
 

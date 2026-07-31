@@ -1,5 +1,6 @@
 mod complete;
 mod meta;
+mod split;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -93,14 +94,10 @@ pub async fn run_repl(mut session: Session) -> Result<()> {
 }
 
 pub async fn execute_query(session: &Session, client: &HyperbytedbClient, q: &str) -> Result<()> {
-    let statements: Vec<&str> = q
-        .split(';')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
+    let statements = split::split_statements(q);
     let start = Instant::now();
 
-    for stmt in statements {
+    for stmt in &statements {
         let opts = QueryOptions {
             db: session.effective_database().map(|s| s.to_string()),
             retention_policy: session.retention_policy.clone(),
@@ -117,12 +114,12 @@ pub async fn execute_query(session: &Session, client: &HyperbytedbClient, q: &st
         };
 
         if session.format == crate::session::OutputFormat::Csv {
-            let raw = client.query_raw(stmt, &opts).await?;
+            let raw = client.query_raw(stmt.as_str(), &opts).await?;
             print!("{raw}");
             continue;
         }
 
-        let resp = client.query(stmt, &opts).await?;
+        let resp = client.query(stmt.as_str(), &opts).await?;
         if resp.has_errors() {
             return Err(CliError::Query(resp.format_errors()));
         }

@@ -227,6 +227,11 @@ pub fn parse_duration_text(input: &str) -> Result<Option<i64>, HyperbytedbError>
         let value: i64 = num_str
             .parse()
             .map_err(|_| HyperbytedbError::QueryParse(format!("invalid duration: {input}")))?;
+        if value < 0 {
+            return Err(HyperbytedbError::QueryParse(
+                "duration must not be negative".to_string(),
+            ));
+        }
 
         let mut matched = false;
         for (suffix, mult) in units {

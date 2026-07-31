@@ -2,7 +2,7 @@
 //!
 //! See: https://docs.influxdata.com/influxdb/v1/query_language/continuous_queries/
 
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, LocalResult, TimeZone, Utc};
 
 use crate::domain::continuous_query::ContinuousQueryDef;
 use crate::error::HyperbytedbError;
@@ -125,7 +125,10 @@ fn last_run_time(cq: &ContinuousQueryDef, fallback: DateTime<Utc>) -> DateTime<U
 }
 
 /// Compute the raw-data time window for a CQ execution at `now`.
-pub fn coverage_window(now: DateTime<Utc>, cq: &ContinuousQueryDef) -> CqWindow {
+pub fn coverage_window(
+    now: DateTime<Utc>,
+    cq: &ContinuousQueryDef,
+) -> Result<CqWindow, HyperbytedbError> {
     let meta = schedule_from_def(cq);
     coverage_window_from_meta(now, &meta)
 }
@@ -142,7 +145,10 @@ fn schedule_from_def(cq: &ContinuousQueryDef) -> ScheduleMeta {
     }
 }
 
-fn coverage_window_from_meta(now: DateTime<Utc>, meta: &ScheduleMeta) -> CqWindow {
+fn coverage_window_from_meta(
+    now: DateTime<Utc>,
+    meta: &ScheduleMeta,
+) -> Result<CqWindow, HyperbytedbError> {
     let offset = meta.group_by_offset_secs;
     let group_secs = meta.group_by_interval_secs as i64;
     let exec_secs = meta.execution_interval_secs as i64;
@@ -176,11 +182,20 @@ fn coverage_window_from_meta(now: DateTime<Utc>, meta: &ScheduleMeta) -> CqWindo
     window_from_unix(start, end)
 }
 
-fn window_from_unix(start_secs: i64, end_secs: i64) -> CqWindow {
-    CqWindow {
-        start: Utc.timestamp_opt(start_secs, 0).unwrap(),
-        end: Utc.timestamp_opt(end_secs, 0).unwrap(),
+fn unix_timestamp(secs: i64) -> Result<DateTime<Utc>, HyperbytedbError> {
+    match Utc.timestamp_opt(secs, 0) {
+        LocalResult::Single(dt) => Ok(dt),
+        LocalResult::None | LocalResult::Ambiguous(_, _) => Err(HyperbytedbError::Internal(
+            format!("invalid unix timestamp for CQ coverage window: {secs}s").into(),
+        )),
     }
+}
+
+fn window_from_unix(start_secs: i64, end_secs: i64) -> Result<CqWindow, HyperbytedbError> {
+    Ok(CqWindow {
+        start: unix_timestamp(start_secs)?,
+        end: unix_timestamp(end_secs)?,
+    })
 }
 
 fn group_by_interval_secs(
@@ -302,7 +317,7 @@ mod tests {
         assert_eq!(def.execution_interval_secs, 3600);
         assert_eq!(def.coverage_interval_secs, 3600);
 
-        let w = coverage_window(ts(8, 0), &def);
+        let w = coverage_window(ts(8, 0), &def).unwrap();
         assert_eq!(w.start, ts(7, 0));
         assert_eq!(w.end, ts(8, 0));
     }
@@ -315,7 +330,7 @@ mod tests {
         let def = def_from_cq(&cq);
         assert_eq!(def.group_by_offset_secs, 900);
 
-        let w = coverage_window(ts(8, 15), &def);
+        let w = coverage_window(ts(8, 15), &def).unwrap();
         assert_eq!(w.start, ts(7, 15));
         assert_eq!(w.end, ts(8, 15));
     }
@@ -329,7 +344,7 @@ mod tests {
         let def = def_from_cq(&cq);
         assert_eq!(def.execution_interval_secs, 1800);
 
-        let w = coverage_window(ts(8, 30), &def);
+        let w = coverage_window(ts(8, 30), &def).unwrap();
         assert_eq!(w.start, ts(8, 0));
         assert_eq!(w.end, ts(9, 0));
     }
@@ -344,7 +359,7 @@ mod tests {
         assert_eq!(def.execution_interval_secs, 1800);
         assert_eq!(def.resample_for_secs, Some(3600));
 
-        let w = coverage_window(ts(8, 0), &def);
+        let w = coverage_window(ts(8, 0), &def).unwrap();
         assert_eq!(w.start, ts(7, 0));
         assert_eq!(w.end, ts(8, 0));
     }
@@ -357,7 +372,7 @@ mod tests {
         );
         let def = def_from_cq(&cq);
 
-        let w = coverage_window(ts(9, 0), &def);
+        let w = coverage_window(ts(9, 0), &def).unwrap();
         assert_eq!(w.start, ts(7, 30));
         assert_eq!(w.end, ts(9, 0));
     }
@@ -374,7 +389,7 @@ mod tests {
 
         let mut def = def_from_cq(&cq);
         meta.apply_to(&mut def);
-        let w = coverage_window(ts(8, 0), &def);
+        let w = coverage_window(ts(8, 0), &def).unwrap();
         assert_eq!(w.end.timestamp() - w.start.timestamp(), 600);
     }
 

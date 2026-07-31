@@ -18,6 +18,7 @@ use axum::routing::{any, get, post};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::watch;
 use tower_http::trace::TraceLayer;
 
 use crate::admin::AdminState;
@@ -29,6 +30,15 @@ pub async fn run() -> Result<()> {
     init_tracing();
     let cfg = ProxyConfig::from_env()?;
     tracing::info!(?cfg, "hyperbytedb-proxy starting");
+    if cfg.http2_prior_knowledge {
+        tracing::warn!(
+            "HYPERBYTEDB_PROXY_HTTP2_PRIOR_KNOWLEDGE=true: upstream client requires \
+             cleartext HTTP/2; hyperbytedb pods use HTTP/1.1 unless you have enabled h2 \
+             elsewhere"
+        );
+    } else {
+        tracing::info!("upstream client uses HTTP/1.1 with ALPN negotiation (hyperbytedb default)");
+    }
 
     let prometheus_handle = PrometheusBuilder::new()
         .install_recorder()
@@ -52,9 +62,16 @@ pub async fn run() -> Result<()> {
         prometheus: Some(prometheus_handle),
     };
 
-    // Admin routes (kubelet probes, metrics, debug). Kept in a separate
-    // sub-router with no TraceLayer so a not-yet-warm /readyz returning 503
-    // doesn't show up as ERROR in the logs every 2s during startup.
+    // Public listener: InfluxDB v1 write/query only. Cluster/internal routes on
+    // hyperbytedb pods are never reachable through ingress aimed at this port.
+    let public_router = Router::new()
+        .route("/write", any(proxy::handle))
+        .route("/query", any(proxy::handle))
+        .fallback(proxy::not_found)
+        .with_state(proxy_state)
+        .layer(TraceLayer::new_for_http());
+
+    // Admin listener: kubelet probes, Prometheus, operator backend exclusion.
     let admin_router = Router::new()
         .route("/healthz", get(admin::healthz))
         .route("/readyz", get(admin::readyz))
@@ -65,41 +82,44 @@ pub async fn run() -> Result<()> {
         .route("/admin/pool", get(admin::pool_status))
         .with_state(admin_state);
 
-    // Order matters: admin routes first, then the catch-all proxy fallback.
-    // The TraceLayer only wraps the proxy fallback so admin probes stay quiet.
-    let app = admin_router.fallback_service(
-        Router::new()
-            .fallback(any(proxy::handle))
-            .with_state(proxy_state)
-            .layer(TraceLayer::new_for_http()),
-    );
-
-    let listener = TcpListener::bind(&cfg.listen_addr)
+    let public_listener = TcpListener::bind(&cfg.listen_addr)
         .await
-        .with_context(|| format!("bind {}", cfg.listen_addr))?;
-    tracing::info!(addr = %cfg.listen_addr, "proxy listening");
+        .with_context(|| format!("bind public listener {}", cfg.listen_addr))?;
+    tracing::info!(addr = %cfg.listen_addr, "public listener (write/query only)");
+
+    let admin_listener = TcpListener::bind(&cfg.admin_listen_addr)
+        .await
+        .with_context(|| format!("bind admin listener {}", cfg.admin_listen_addr))?;
+    tracing::info!(addr = %cfg.admin_listen_addr, "admin listener (probes/metrics/admin)");
 
     let shutdown_grace = cfg.shutdown_grace;
-    let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    tokio::spawn(async move {
         wait_for_shutdown_signal().await;
         tracing::info!(
             grace_secs = shutdown_grace.as_secs(),
-            "shutdown signal received; draining"
+            "shutdown signal received; draining in-flight requests"
         );
-        tokio::spawn(async move {
-            tokio::time::sleep(shutdown_grace).await;
-            tracing::warn!(
-                grace_secs = shutdown_grace.as_secs(),
-                "drain grace expired; forcing exit"
-            );
-            std::process::exit(0);
-        });
+        let _ = shutdown_tx.send(true);
     });
 
-    if let Err(e) = serve.await {
-        tracing::error!(error = %e, "proxy server error");
-        return Err(e.into());
-    }
+    let mut public_shutdown = shutdown_rx.clone();
+    let pool_for_drain = Arc::clone(&pool);
+    let public_serve =
+        axum::serve(public_listener, public_router).with_graceful_shutdown(async move {
+            let _ = public_shutdown.changed().await;
+            drain_inflight(&pool_for_drain, shutdown_grace).await;
+        });
+
+    let mut admin_shutdown = shutdown_rx;
+    let admin_serve =
+        axum::serve(admin_listener, admin_router).with_graceful_shutdown(async move {
+            let _ = admin_shutdown.changed().await;
+        });
+
+    tokio::try_join!(public_serve, admin_serve)?;
+
     tracing::info!("proxy shut down cleanly");
     Ok(())
 }
@@ -110,6 +130,28 @@ async fn wait_for_shutdown_signal() {
     tokio::select! {
         _ = sigterm.recv() => {}
         _ = sigint.recv() => {}
+    }
+}
+
+/// Poll aggregate backend inflight until zero or `grace` elapses.
+async fn drain_inflight(pool: &BackendPool, grace: std::time::Duration) {
+    let deadline = tokio::time::Instant::now() + grace;
+    loop {
+        let inflight = pool.total_inflight().await;
+        if inflight == 0 {
+            tracing::info!("all in-flight proxy requests drained");
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                grace_secs = grace.as_secs(),
+                inflight,
+                "drain grace expired with requests still in flight"
+            );
+            break;
+        }
+        tracing::debug!(inflight, "waiting for in-flight proxy requests to drain");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 

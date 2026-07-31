@@ -18,9 +18,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY ${TARGETARCH}/hyperbytedb-proxy /usr/local/bin/hyperbytedb-proxy
 
-EXPOSE 8086
+EXPOSE 8086 8087
 
 ENV HYPERBYTEDB_PROXY_LISTEN=0.0.0.0:8086 \
+    HYPERBYTEDB_PROXY_ADMIN_LISTEN=0.0.0.0:8087 \
     HYPERBYTEDB_PROXY_BACKEND_PORT=8086
 
 ENTRYPOINT ["/usr/local/bin/hyperbytedb-proxy"]

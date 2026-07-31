@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+use crate::domain::continuous_query::ContinuousQueryDef;
 use crate::domain::database::RetentionPolicy;
-use crate::ports::metadata::{ContinuousQueryDef, MaterializedViewDef};
+use crate::domain::materialized_view::MaterializedViewDef;
 use crate::timeseriesql::ast::RetentionPolicyChange;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

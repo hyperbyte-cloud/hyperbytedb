@@ -146,6 +146,7 @@ async fn start_auth_cluster_node(dir: &std::path::Path) -> AuthClusterNode {
         drain_service: None,
         raft: None,
         auth_enabled: true,
+        auth_allow_query_param_credentials: true,
         prometheus_handle: None,
         statement_summary: Some(Arc::new(StatementSummary::new(100))),
         statement_summary_require_auth: true,

@@ -319,7 +319,7 @@ impl SyncClient {
 
         if let Some(_db_name) = entry.key.strip_prefix("db:") {
             let db: Database = serde_json::from_slice(&entry.value)
-                .map_err(|e| HyperbytedbError::Metadata(format!("parse db: {e}")))?;
+                .map_err(|e| HyperbytedbError::Metadata(format!("parse db: {e}").into()))?;
             self.metadata.create_database(&db.name).await?;
             for rp in &db.retention_policies {
                 self.metadata
@@ -332,12 +332,12 @@ impl SyncClient {
                 let db = parts[1];
                 let rp = parts[2];
                 let meta: MeasurementMeta = serde_json::from_slice(&entry.value)
-                    .map_err(|e| HyperbytedbError::Metadata(format!("parse meas: {e}")))?;
+                    .map_err(|e| HyperbytedbError::Metadata(format!("parse meas: {e}").into()))?;
                 self.metadata.register_measurement(db, rp, &meta).await?;
             }
         } else if let Some(username) = entry.key.strip_prefix("user:") {
             let user: StoredUser = serde_json::from_slice(&entry.value)
-                .map_err(|e| HyperbytedbError::Metadata(format!("parse user: {e}")))?;
+                .map_err(|e| HyperbytedbError::Metadata(format!("parse user: {e}").into()))?;
             self.metadata
                 .create_user(username, &user.password_hash, user.admin)
                 .await?;
@@ -348,9 +348,10 @@ impl SyncClient {
                 let rp = parts[2];
                 let meas = parts[3];
                 let predicate = std::str::from_utf8(&entry.value).map_err(|e| {
-                    HyperbytedbError::Metadata(format!(
-                        "invalid UTF-8 in tombstone value for {db}/{rp}/{meas}: {e}"
-                    ))
+                    HyperbytedbError::Metadata(
+                        format!("invalid UTF-8 in tombstone value for {db}/{rp}/{meas}: {e}")
+                            .into(),
+                    )
                 })?;
                 self.metadata
                     .store_tombstone(db, rp, meas, predicate)
@@ -361,7 +362,7 @@ impl SyncClient {
             if parts.len() == 3 {
                 let db = parts[1];
                 let cq: ContinuousQueryDef = serde_json::from_slice(&entry.value)
-                    .map_err(|e| HyperbytedbError::Metadata(format!("parse cq: {e}")))?;
+                    .map_err(|e| HyperbytedbError::Metadata(format!("parse cq: {e}").into()))?;
                 self.metadata
                     .store_continuous_query(db, &cq.name, &cq)
                     .await?;
@@ -372,7 +373,7 @@ impl SyncClient {
                 let db = parts[1];
                 let mv: crate::ports::metadata::MaterializedViewDef =
                     serde_json::from_slice(&entry.value)
-                        .map_err(|e| HyperbytedbError::Metadata(format!("parse mv: {e}")))?;
+                        .map_err(|e| HyperbytedbError::Metadata(format!("parse mv: {e}").into()))?;
                 self.metadata
                     .store_materialized_view(db, &mv.name, &mv)
                     .await?;

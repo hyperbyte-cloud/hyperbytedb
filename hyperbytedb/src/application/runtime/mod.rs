@@ -44,34 +44,6 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
         })
     };
 
-    // Spawn retention enforcement service. Interval and toggle live in
-    // [retention] in config.toml — operator-driven via the
-    // HyperbytedbCluster CRD's `spec.retention` field. When disabled,
-    // we skip spawning entirely so the loop has zero footprint.
-    let retention_handle = if config.retention.enabled {
-        let retention_interval = config.retention.interval_duration();
-        if retention_interval == RetentionConfig::FALLBACK_INTERVAL
-            && config.retention.interval.trim() != "60s"
-        {
-            tracing::warn!(
-                configured = %config.retention.interval,
-                fallback_secs = retention_interval.as_secs(),
-                "retention.interval is invalid or zero, falling back to default"
-            );
-        }
-        let retention_service = Arc::new(RetentionService::new(
-            app_state.metadata.clone(),
-            app_state.query_port.clone(),
-        ));
-        let rx = service_shutdown_rx.clone();
-        Some(tokio::spawn(async move {
-            retention_service.run(retention_interval, rx).await;
-        }))
-    } else {
-        tracing::info!("retention service disabled by config");
-        None
-    };
-
     // Spawn uptime gauge updater
     let uptime_handle = {
         let rx = service_shutdown_rx.clone();
@@ -121,26 +93,31 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
     };
 
     // Run startup sync and initialize Raft if cluster mode is enabled.
-    let raft_instance = if let Some(ref c) = cluster {
-        let meta_port: Arc<dyn MetadataPort> = app_state.metadata.clone();
-        let wal_port: Arc<dyn WalPort> = app_state.wal.clone();
-        let sink_port: Arc<dyn PointsSinkPort> = app_state.points_sink.clone();
-        c.run_startup_sync(
-            &config.cluster,
-            &meta_port,
-            &wal_port,
-            Some(sink_port),
-            config.server.max_points_per_request,
-        )
-        .await?;
-        c.start_raft(
-            &config.cluster,
-            app_state.metadata.clone(),
-            app_state.mv_service.clone(),
-        )
-        .await
-    } else {
-        None
+    let raft_instance = match &cluster {
+        Some(c) => {
+            let meta_port: Arc<dyn MetadataPort> = app_state.metadata.clone();
+            let wal_port: Arc<dyn WalPort> = app_state.wal.clone();
+            let sink_port: Arc<dyn PointsSinkPort> = app_state.points_sink.clone();
+            c.run_startup_sync(
+                &config.cluster,
+                &meta_port,
+                &wal_port,
+                Some(sink_port),
+                config.server.max_points_per_request,
+            )
+            .await?;
+            Some(
+                c.start_raft(
+                    &config.cluster,
+                    app_state.metadata.clone(),
+                    app_state.mv_service.clone(),
+                    app_state.points_sink.clone(),
+                    app_state.wal.clone(),
+                )
+                .await?,
+            )
+        }
+        None => None,
     };
 
     // Wire Raft to PeerQueryService for consensus-based schema replication
@@ -194,6 +171,34 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
         tokio::spawn(async move {
             cq_service.run(Duration::from_secs(10), rx).await;
         })
+    };
+
+    // Retention enforcement runs on the Raft leader when cluster mode is
+    // enabled, otherwise the sole local instance (mirrors CQ service).
+    let retention_handle = if config.retention.enabled {
+        let retention_interval = config.retention.interval_duration();
+        if retention_interval == RetentionConfig::FALLBACK_INTERVAL
+            && config.retention.interval.trim() != "60s"
+        {
+            tracing::warn!(
+                configured = %config.retention.interval,
+                fallback_secs = retention_interval.as_secs(),
+                "retention.interval is invalid or zero, falling back to default"
+            );
+        }
+        let retention_service = Arc::new(RetentionService::new(
+            app_state.metadata.clone(),
+            app_state.query_port.clone(),
+            app_state.raft.clone(),
+            config.cluster.node_id,
+        ));
+        let rx = service_shutdown_rx.clone();
+        Some(tokio::spawn(async move {
+            retention_service.run(retention_interval, rx).await;
+        }))
+    } else {
+        tracing::info!("retention service disabled by config");
+        None
     };
 
     let disk_monitor_handle = if disk_config.enabled {
@@ -326,13 +331,14 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
             .await?;
     }
 
-    // ── Phase 2: API is down — drain if cluster mode ────────────────────
-    // The HTTP server has fully stopped; no new external requests will arrive.
-    // Flush the RocksDB WAL to physical media before drain, so all acknowledged
-    // writes are durable even if the process crashes during drain.
-    // Run the drain procedure so WAL is flushed and peers acknowledge replication
-    // before we tear down background services.
-    tracing::info!("API server stopped, flushing WAL to disk");
+    // ── Phase 2: API is down — stop background flush before drain ───────
+    tracing::info!("API server stopped, stopping background services before drain");
+    let _ = service_shutdown_tx.send(true);
+    if let Err(e) = flush_handle.await {
+        tracing::warn!(error = %e, "flush service task join error");
+    }
+
+    tracing::info!("flushing WAL to disk");
     if let Err(e) = shutdown_wal.flush_wal().await {
         tracing::error!(error = %e, "WAL flush before drain failed");
     }
@@ -359,11 +365,9 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
         }
     }
 
-    // ── Phase 3: Stop background services ───────────────────────────────
-    tracing::info!("stopping background services");
-    let _ = service_shutdown_tx.send(true);
+    // ── Phase 3: Stop remaining background services ─────────────────────
+    tracing::info!("stopping remaining background services");
 
-    flush_handle.await?;
     cq_handle.await?;
     if let Some(h) = disk_monitor_handle {
         h.await?;

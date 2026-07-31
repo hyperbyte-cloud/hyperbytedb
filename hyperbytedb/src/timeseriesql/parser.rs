@@ -109,7 +109,7 @@ fn parse_select(input: &str) -> Result<Statement, HyperbytedbError> {
 
     // Parse WHERE — strip any trailing fill(...) that Grafana may attach without GROUP BY
     if let Some(where_str) = parts.get("where") {
-        let (where_clean, standalone_fill) = strip_trailing_fill(where_str);
+        let (where_clean, standalone_fill) = strip_trailing_fill(where_str)?;
         stmt.condition = Some(parse_expr(&where_clean)?);
         if standalone_fill.is_some() {
             stmt.fill = standalone_fill;
@@ -199,10 +199,10 @@ struct ScannedChar {
 /// - parenthesis depth.
 ///
 /// The output has exactly one entry per input char, in order.
-fn scan_chars(input: &str) -> Vec<ScannedChar> {
+fn scan_chars(input: &str) -> Result<Vec<ScannedChar>, HyperbytedbError> {
     let chars: Vec<(usize, char)> = input.char_indices().collect();
     let mut out = Vec::with_capacity(chars.len());
-    let mut depth: i32 = 0;
+    let mut depth: u32 = 0;
     let mut i = 0usize;
     while i < chars.len() {
         let (idx, ch) = chars[i];
@@ -212,7 +212,7 @@ fn scan_chars(input: &str) -> Vec<ScannedChar> {
                 out.push(ScannedChar {
                     idx,
                     ch,
-                    depth,
+                    depth: depth as i32,
                     masked: true,
                 });
                 i += 1;
@@ -221,7 +221,7 @@ fn scan_chars(input: &str) -> Vec<ScannedChar> {
                     out.push(ScannedChar {
                         idx: jdx,
                         ch: c,
-                        depth,
+                        depth: depth as i32,
                         masked: true,
                     });
                     i += 1;
@@ -231,7 +231,7 @@ fn scan_chars(input: &str) -> Vec<ScannedChar> {
                         out.push(ScannedChar {
                             idx: kdx,
                             ch: k,
-                            depth,
+                            depth: depth as i32,
                             masked: true,
                         });
                         i += 1;
@@ -242,7 +242,7 @@ fn scan_chars(input: &str) -> Vec<ScannedChar> {
                             out.push(ScannedChar {
                                 idx: kdx,
                                 ch: k,
-                                depth,
+                                depth: depth as i32,
                                 masked: true,
                             });
                             i += 1;
@@ -256,7 +256,7 @@ fn scan_chars(input: &str) -> Vec<ScannedChar> {
                 out.push(ScannedChar {
                     idx,
                     ch,
-                    depth,
+                    depth: depth as i32,
                     masked: true,
                 });
                 i += 1;
@@ -265,7 +265,7 @@ fn scan_chars(input: &str) -> Vec<ScannedChar> {
                     out.push(ScannedChar {
                         idx: jdx,
                         ch: c,
-                        depth,
+                        depth: depth as i32,
                         masked: true,
                     });
                     i += 1;
@@ -274,7 +274,7 @@ fn scan_chars(input: &str) -> Vec<ScannedChar> {
                         out.push(ScannedChar {
                             idx: kdx,
                             ch: k,
-                            depth,
+                            depth: depth as i32,
                             masked: true,
                         });
                         i += 1;
@@ -287,18 +287,23 @@ fn scan_chars(input: &str) -> Vec<ScannedChar> {
                 out.push(ScannedChar {
                     idx,
                     ch,
-                    depth,
+                    depth: depth as i32,
                     masked: false,
                 });
                 depth += 1;
                 i += 1;
             }
             ')' => {
+                if depth == 0 {
+                    return Err(HyperbytedbError::QueryParse(format!(
+                        "unbalanced ')' in expression: {input}"
+                    )));
+                }
                 depth -= 1;
                 out.push(ScannedChar {
                     idx,
                     ch,
-                    depth,
+                    depth: depth as i32,
                     masked: false,
                 });
                 i += 1;
@@ -307,14 +312,19 @@ fn scan_chars(input: &str) -> Vec<ScannedChar> {
                 out.push(ScannedChar {
                     idx,
                     ch,
-                    depth,
+                    depth: depth as i32,
                     masked: false,
                 });
                 i += 1;
             }
         }
     }
-    out
+    if depth != 0 {
+        return Err(HyperbytedbError::QueryParse(format!(
+            "unclosed '(' in expression: {input}"
+        )));
+    }
+    Ok(out)
 }
 
 /// Whether a `/` at `chars[pos]` begins a regex literal rather than division.
@@ -443,7 +453,7 @@ fn split_clauses(
         ("TZ", "tz"),
     ];
 
-    let scan = scan_chars(input);
+    let scan = scan_chars(input)?;
     // (keyword, key, keyword start byte, value start byte)
     let mut found: Vec<(&str, &str, usize, usize)> = Vec::new();
     let mut i = 0;
@@ -496,7 +506,7 @@ fn parse_field_list(input: &str) -> Result<Vec<Field>, HyperbytedbError> {
         }]);
     }
 
-    let parts = split_top_level_commas(input);
+    let parts = split_top_level_commas(input)?;
     let mut fields = Vec::new();
 
     for part in parts {
@@ -507,8 +517,8 @@ fn parse_field_list(input: &str) -> Result<Vec<Field>, HyperbytedbError> {
     Ok(fields)
 }
 
-fn split_top_level_commas(input: &str) -> Vec<&str> {
-    let scan = scan_chars(input);
+fn split_top_level_commas(input: &str) -> Result<Vec<&str>, HyperbytedbError> {
+    let scan = scan_chars(input)?;
     let mut parts = Vec::new();
     let mut last = 0;
     for sc in &scan {
@@ -518,14 +528,14 @@ fn split_top_level_commas(input: &str) -> Vec<&str> {
         }
     }
     parts.push(&input[last..]);
-    parts
+    Ok(parts)
 }
 
 fn parse_field_expr(input: &str) -> Result<Field, HyperbytedbError> {
     let input = input.trim();
 
     // Check for AS alias
-    let scan = scan_chars(input);
+    let scan = scan_chars(input)?;
     let (expr_str, alias) = if let Some((pos, end)) = find_keyword_position(input, &scan, "AS") {
         let expr_part = input[..pos].trim();
         let alias_part = input[end..].trim().trim_matches('"');
@@ -585,7 +595,7 @@ pub fn parse_expr(input: &str) -> Result<Expr, HyperbytedbError> {
 }
 
 fn try_parse_logical_expr(input: &str) -> Result<Option<Expr>, HyperbytedbError> {
-    let scan = scan_chars(input);
+    let scan = scan_chars(input)?;
     // OR has the lowest precedence in InfluxQL, so split at OR first: the
     // operator split earliest ends up at the root of the tree and binds
     // loosest. Which OR occurrence is split at is semantically neutral.
@@ -616,7 +626,7 @@ fn try_parse_comparison_expr(input: &str) -> Result<Option<Expr>, HyperbytedbErr
         (">", BinaryOp::Gt),
     ];
 
-    let scan = scan_chars(input);
+    let scan = scan_chars(input)?;
     for (op_str, op) in &operators {
         if let Some(pos) = find_top_level_operator(input, &scan, op_str) {
             let left = parse_expr(&input[..pos])?;
@@ -645,7 +655,7 @@ fn try_parse_arithmetic_expr(input: &str) -> Result<Option<Expr>, HyperbytedbErr
         ],
     ];
 
-    let scan = scan_chars(input);
+    let scan = scan_chars(input)?;
     for level in levels {
         for sc in scan.iter().rev() {
             if sc.masked || sc.depth != 0 {
@@ -733,6 +743,11 @@ fn parse_atom(input: &str) -> Result<Expr, HyperbytedbError> {
         let rest = input[1..].trim();
         if rest.parse::<i64>().is_err() && rest.parse::<f64>().is_err() {
             let inner = parse_expr(rest)?;
+            if matches!(inner, Expr::DurationLiteral(_)) {
+                return Err(HyperbytedbError::QueryParse(
+                    "duration must not be negative".to_string(),
+                ));
+            }
             return Ok(Expr::BinaryExpr(Box::new(BinaryExpr {
                 left: Expr::IntegerLiteral(0),
                 op: BinaryOp::Sub,
@@ -784,7 +799,7 @@ fn parse_atom(input: &str) -> Result<Expr, HyperbytedbError> {
         let args = if args_str.trim().is_empty() {
             Vec::new()
         } else {
-            split_top_level_commas(args_str)
+            split_top_level_commas(args_str)?
                 .iter()
                 .map(|a| parse_expr(a))
                 .collect::<Result<Vec<_>, _>>()?
@@ -796,7 +811,7 @@ fn parse_atom(input: &str) -> Result<Expr, HyperbytedbError> {
     }
 
     // Duration literal: number followed by unit
-    if let Some(dur) = try_parse_duration(input) {
+    if let Some(dur) = try_parse_duration(input)? {
         return Ok(Expr::DurationLiteral(dur));
     }
 
@@ -814,7 +829,7 @@ fn parse_atom(input: &str) -> Result<Expr, HyperbytedbError> {
         return Ok(Expr::Identifier(name));
     }
 
-    let scan = scan_chars(input);
+    let scan = scan_chars(input)?;
 
     // Identifier with ::field or ::tag suffix
     if let Some(k) = (0..scan.len().saturating_sub(1)).find(|&k| {
@@ -850,7 +865,7 @@ fn parse_atom(input: &str) -> Result<Expr, HyperbytedbError> {
     Ok(Expr::Identifier(input.to_string()))
 }
 
-fn try_parse_duration(input: &str) -> Option<Duration> {
+fn try_parse_duration(input: &str) -> Result<Option<Duration>, HyperbytedbError> {
     let input = input.trim();
     let units = [
         ("ns", DurationUnit::Nanosecond),
@@ -869,13 +884,18 @@ fn try_parse_duration(input: &str) -> Option<Duration> {
         if let Some(num_str) = input.strip_suffix(suffix)
             && let Ok(value) = num_str.parse::<i64>()
         {
-            return Some(Duration {
+            if value < 0 {
+                return Err(HyperbytedbError::QueryParse(
+                    "duration must not be negative".to_string(),
+                ));
+            }
+            return Ok(Some(Duration {
                 value,
                 unit: unit.clone(),
-            });
+            }));
         }
     }
-    None
+    Ok(None)
 }
 
 fn parse_from_sources(input: &str) -> Result<Vec<MeasurementSource>, HyperbytedbError> {
@@ -892,7 +912,7 @@ fn parse_from_sources(input: &str) -> Result<Vec<MeasurementSource>, Hyperbytedb
         }
     }
 
-    let parts = split_top_level_commas(input);
+    let parts = split_top_level_commas(input)?;
     let mut sources = Vec::new();
 
     for part in parts {
@@ -917,7 +937,7 @@ fn parse_measurement(input: &str) -> Result<Measurement, HyperbytedbError> {
 
     // Fully qualified: "db"."rp"."measurement" or db.rp.measurement — split
     // on dots outside quotes so `FROM "app.requests"` stays one measurement.
-    let scan = scan_chars(input);
+    let scan = scan_chars(input)?;
     let mut parts: Vec<&str> = Vec::new();
     let mut last = 0;
     for sc in &scan {
@@ -996,7 +1016,7 @@ fn parse_group_by_clause(input: &str) -> Result<(GroupBy, Option<FillOption>), H
     let mut dims_str = input.to_string();
 
     // Check for fill() at end
-    let scan = scan_chars(input);
+    let scan = scan_chars(input)?;
     if let Some(fill_pos) = rfind_top_level_ci(input, &scan, "FILL(") {
         let fill_end = input[fill_pos..].find(')').map(|p| fill_pos + p + 1);
         if let Some(fill_end) = fill_end {
@@ -1006,7 +1026,7 @@ fn parse_group_by_clause(input: &str) -> Result<(GroupBy, Option<FillOption>), H
         }
     }
 
-    let parts = split_top_level_commas(&dims_str);
+    let parts = split_top_level_commas(&dims_str)?;
     let mut dimensions = Vec::new();
 
     for part in parts {
@@ -1020,13 +1040,13 @@ fn parse_group_by_clause(input: &str) -> Result<(GroupBy, Option<FillOption>), H
             && part.ends_with(')')
         {
             let args_str = &part[5..part.len() - 1];
-            let args = split_top_level_commas(args_str);
+            let args = split_top_level_commas(args_str)?;
 
-            let interval = try_parse_duration(args[0].trim()).ok_or_else(|| {
+            let interval = try_parse_duration(args[0].trim())?.ok_or_else(|| {
                 HyperbytedbError::QueryParse(format!("invalid duration in time(): {}", args[0]))
             })?;
             let offset = if args.len() > 1 {
-                Some(try_parse_duration(args[1].trim()).ok_or_else(|| {
+                Some(try_parse_duration(args[1].trim())?.ok_or_else(|| {
                     HyperbytedbError::QueryParse(format!("invalid offset in time(): {}", args[1]))
                 })?)
             } else {
@@ -1048,18 +1068,18 @@ fn parse_group_by_clause(input: &str) -> Result<(GroupBy, Option<FillOption>), H
 
 /// Strip a trailing `fill(...)` from a clause string (e.g. WHERE or ORDER BY)
 /// that Grafana may send even without a GROUP BY clause.
-fn strip_trailing_fill(input: &str) -> (String, Option<FillOption>) {
-    let scan = scan_chars(input);
+fn strip_trailing_fill(input: &str) -> Result<(String, Option<FillOption>), HyperbytedbError> {
+    let scan = scan_chars(input)?;
     if let Some(pos) = rfind_top_level_ci(input, &scan, "FILL(")
         && let Some(close) = input[pos..].find(')')
     {
         let fill_inner = &input[pos + 5..pos + close];
         let rest = input[..pos].trim().to_string();
         if let Ok(f) = parse_fill_option(fill_inner) {
-            return (rest, Some(f));
+            return Ok((rest, Some(f)));
         }
     }
-    (input.to_string(), None)
+    Ok((input.to_string(), None))
 }
 
 fn parse_fill_option(input: &str) -> Result<FillOption, HyperbytedbError> {
@@ -1955,6 +1975,28 @@ mod tests {
             gb.dimensions
                 .iter()
                 .any(|d| matches!(d, Dimension::Regex(r) if r == "host.*"))
+        );
+    }
+
+    #[test]
+    fn negative_durations_rejected_in_select() {
+        for q in [
+            "SELECT * FROM cpu GROUP BY time(-5m)",
+            "SELECT * FROM cpu WHERE time > now() - -1h",
+        ] {
+            assert!(
+                parse_query(q).is_err(),
+                "negative duration must be rejected: {q}"
+            );
+        }
+    }
+
+    #[test]
+    fn unbalanced_paren_rejected() {
+        let err = parse_query("SELECT * FROM cpu) WHERE host = 'a'").unwrap_err();
+        assert!(
+            err.to_string().contains("unbalanced"),
+            "expected unbalanced paren error, got: {err}"
         );
     }
 }

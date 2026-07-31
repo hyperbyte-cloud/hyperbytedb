@@ -27,7 +27,7 @@ pub fn coalesce_prepared_batches(
     let schema = template.batch.schema();
     let refs: Vec<&RecordBatch> = batches.iter().map(|b| b.batch.as_ref()).collect();
     let merged = concat_batches(&schema, refs)
-        .map_err(|e| HyperbytedbError::Internal(format!("concat prepared batches: {e}")))?;
+        .map_err(|e| HyperbytedbError::Internal(format!("concat prepared batches: {e}").into()))?;
 
     let min_time = batches.iter().map(|b| b.min_time).min().unwrap_or(0);
     let max_time = batches.iter().map(|b| b.max_time).max().unwrap_or(0);
@@ -65,8 +65,9 @@ fn merge_series_batches(
         _ => {
             let schema = batches[0].schema();
             let refs: Vec<&RecordBatch> = batches.iter().map(|b| b.as_ref()).collect();
-            let merged = concat_batches(&schema, refs)
-                .map_err(|e| HyperbytedbError::Internal(format!("concat series batches: {e}")))?;
+            let merged = concat_batches(&schema, refs).map_err(|e| {
+                HyperbytedbError::Internal(format!("concat series batches: {e}").into())
+            })?;
             Ok(Some(Arc::new(normalize_dictionary_columns(merged)?)))
         }
     }
@@ -100,10 +101,10 @@ fn normalize_dictionary_columns(batch: RecordBatch) -> Result<RecordBatch, Hyper
             DataType::Dictionary(_, value_type) => {
                 let target = col.data_type().clone();
                 let decoded = cast(col, value_type).map_err(|e| {
-                    HyperbytedbError::Internal(format!("decode dictionary column: {e}"))
+                    HyperbytedbError::Internal(format!("decode dictionary column: {e}").into())
                 })?;
                 let reencoded = cast(&decoded, &target).map_err(|e| {
-                    HyperbytedbError::Internal(format!("re-encode dictionary column: {e}"))
+                    HyperbytedbError::Internal(format!("re-encode dictionary column: {e}").into())
                 })?;
                 columns.push(reencoded);
             }
@@ -112,7 +113,7 @@ fn normalize_dictionary_columns(batch: RecordBatch) -> Result<RecordBatch, Hyper
     }
 
     RecordBatch::try_new(schema, columns)
-        .map_err(|e| HyperbytedbError::Internal(format!("rebuild series batch: {e}")))
+        .map_err(|e| HyperbytedbError::Internal(format!("rebuild series batch: {e}").into()))
 }
 
 #[cfg(test)]

@@ -271,7 +271,9 @@ pub async fn register_series_from_series_table(
         }
         let parts: Vec<&str> = line.split('\t').collect();
         let sid: u64 = parts[0].parse().map_err(|e| {
-            HyperbytedbError::Internal(format!("invalid series_id in {series_table_quoted}: {e}"))
+            HyperbytedbError::Internal(
+                format!("invalid series_id in {series_table_quoted}: {e}").into(),
+            )
         })?;
         let mut tags = BTreeMap::new();
         for (i, key) in tag_keys.iter().enumerate() {
@@ -376,12 +378,10 @@ pub async fn prepare_columnar_metadata(
         for (tag_key, tag_value) in &batch.tags {
             let count = metadata
                 .count_tag_values(db, rp, tag_key, Some(&batch.measurement))
-                .await
-                .unwrap_or(0);
+                .await?;
             let total = if metadata
                 .tag_value_is_known(db, rp, &batch.measurement, tag_key, tag_value)
-                .await
-                .unwrap_or(false)
+                .await?
             {
                 count
             } else {
@@ -599,8 +599,7 @@ pub async fn prepare_batch_metadata(
             for tag_key in tag_keys.iter() {
                 let count = metadata
                     .count_tag_values(db, rp, tag_key, Some(meas_name))
-                    .await
-                    .unwrap_or(0);
+                    .await?;
                 let new_values: std::collections::BTreeSet<&String> = points
                     .iter()
                     .filter(|p| p.measurement == *meas_name)
@@ -610,8 +609,7 @@ pub async fn prepare_batch_metadata(
                 for v in &new_values {
                     if !metadata
                         .tag_value_is_known(db, rp, meas_name, tag_key, v)
-                        .await
-                        .unwrap_or(false)
+                        .await?
                     {
                         novel.insert(v);
                     }

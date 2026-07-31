@@ -423,9 +423,9 @@ impl FlushServiceImpl {
         if any_failed {
             // Stop this flush cycle (retry next tick). Returning Err also prevents
             // drain() from looping forever on a persistently-failing chunk.
-            return Err(HyperbytedbError::Internal(
-                "prepared flush sink write failed; holding WAL for retry".into(),
-            ));
+            return Err(HyperbytedbError::Internal(crate::error::ChainedError::new(
+                "prepared flush sink write failed; holding WAL for retry",
+            )));
         }
 
         Ok(())
@@ -672,9 +672,9 @@ impl FlushServiceImpl {
             if any_failed {
                 // Stop this flush cycle (retry next tick). Returning Err also prevents
                 // drain() from looping forever on a persistently-failing chunk.
-                return Err(HyperbytedbError::Internal(
-                    "native flush sink write failed; holding WAL for retry".into(),
-                ));
+                return Err(HyperbytedbError::Internal(crate::error::ChainedError::new(
+                    "native flush sink write failed; holding WAL for retry",
+                )));
             }
         }
 
@@ -757,9 +757,9 @@ mod tests {
             _ingest_seq_base: u64,
             _points: &[Point],
         ) -> Result<WriteAck, HyperbytedbError> {
-            Err(HyperbytedbError::Internal(
-                "simulated chDB write failure".into(),
-            ))
+            Err(HyperbytedbError::Internal(crate::error::ChainedError::new(
+                "simulated chDB write failure",
+            )))
         }
     }
 

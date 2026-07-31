@@ -53,15 +53,15 @@ pub fn patch_ingest_seq(
         .iter()
         .position(|f| f.name() == "ingest_seq")
         .ok_or_else(|| {
-            crate::error::HyperbytedbError::Internal(
-                "prepared batch missing ingest_seq column".into(),
-            )
+            crate::error::HyperbytedbError::Internal(crate::error::ChainedError::new(
+                "prepared batch missing ingest_seq column",
+            ))
         })?;
 
     let seq_col = batch.column(ingest_idx);
     if seq_col.data_type() != &DataType::UInt64 {
         return Err(crate::error::HyperbytedbError::Internal(
-            "ingest_seq column has unexpected type".into(),
+            crate::error::ChainedError::new("ingest_seq column has unexpected type"),
         ));
     }
 
@@ -79,8 +79,9 @@ pub fn patch_ingest_seq(
     let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
     columns[ingest_idx] = Arc::new(UInt64Array::from(seqs));
 
-    let patched = RecordBatch::try_new(schema, columns)
-        .map_err(|e| crate::error::HyperbytedbError::Internal(format!("patch ingest_seq: {e}")))?;
+    let patched = RecordBatch::try_new(schema, columns).map_err(|e| {
+        crate::error::HyperbytedbError::Internal(format!("patch ingest_seq: {e}").into())
+    })?;
     Ok(Arc::new(patched))
 }
 

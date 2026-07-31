@@ -12,5 +12,5 @@ pub mod session;
 
 pub use client::HyperbytedbClient;
 pub use config::ConnectionConfig;
-pub use error::CliError;
+pub use error::{CliError, ConnectionError};
 pub use session::Session;
