@@ -68,8 +68,6 @@ fn default_wal_format() -> String {
 #[serde(deny_unknown_fields)]
 pub struct FlushConfig {
     pub interval_secs: u64,
-    pub wal_size_threshold_mb: u64,
-    pub time_bucket_duration: String,
     /// Max points per chDB insert batch. `0` uses [`default_max_points_per_batch`].
     #[serde(default = "default_max_points_per_batch")]
     pub max_points_per_batch: usize,
@@ -110,6 +108,10 @@ pub fn default_schema_cache_max_entries() -> usize {
     10_000
 }
 
+pub fn default_tag_low_cardinality_max() -> usize {
+    100_000
+}
+
 fn default_wal_batch_size() -> usize {
     64
 }
@@ -118,21 +120,74 @@ fn default_wal_batch_delay_us() -> u64 {
     200
 }
 
+fn default_insert_max_threads() -> u32 {
+    4
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChdbConfig {
     pub session_data_path: String,
-    /// Number of chDB connections opened to the same `session_data_path`.
-    /// Each connection has its own `ChdbClient` mutex, so flush inserts and
-    /// concurrent queries overlap when `pool_size > 1`. A second connection
-    /// to a *different* path still fails (process-global singleton per path).
-    /// Clamped to 1..=32. For best overlap, set `server.max_concurrent_queries`
-    /// ≥ `pool_size`.
+    /// Legacy: when non-zero and `query_pool_size` / `write_pool_size` are unset,
+    /// applies the same size to both pools.
+    #[serde(default)]
     pub pool_size: usize,
+    /// chDB connections for queries (`ChdbQueryAdapter`). When unset, uses
+    /// `pool_size` if non-zero, else 4. Clamped to 1..=128.
+    #[serde(default)]
+    pub query_pool_size: Option<usize>,
+    /// chDB connections for ingest/flush (`ChdbNativeAdapter`). When unset, uses
+    /// `pool_size` if non-zero, else 4. Clamped to 1..=128.
+    #[serde(default)]
+    pub write_pool_size: Option<usize>,
     /// Max `(db, rp, measurement)` entries in the chDB native adapter in-memory
     /// schema and series caches. Oldest entries are evicted (LRU).
     #[serde(default = "default_schema_cache_max_entries")]
     pub schema_cache_max_entries: usize,
+    /// ClickHouse `max_threads` for Arrow bulk inserts.
+    #[serde(default = "default_insert_max_threads")]
+    pub insert_max_threads: u32,
+    /// ClickHouse `min_insert_block_size_rows` for Arrow bulk inserts. `0` = engine default.
+    #[serde(default)]
+    pub insert_min_insert_block_size_rows: u64,
+    /// ClickHouse `max_insert_block_size` for Arrow bulk inserts. `0` = engine default.
+    #[serde(default)]
+    pub insert_max_insert_block_size: u64,
+    /// Max distinct tag values per key before DDL uses plain `String` instead of
+    /// `LowCardinality(String)`. When unset, uses
+    /// `[cardinality].max_tag_values_per_measurement`.
+    #[serde(default)]
+    pub tag_low_cardinality_max: Option<usize>,
+}
+
+impl ChdbConfig {
+    /// Maps insert tuning keys to chDB [`InsertOptions`] for the native adapter.
+    pub fn insert_options(&self) -> chdb_rust::InsertOptions {
+        chdb_rust::InsertOptions {
+            max_threads: Some(self.insert_max_threads),
+            max_insert_block_size: (self.insert_max_insert_block_size > 0)
+                .then_some(self.insert_max_insert_block_size),
+            min_insert_block_size_rows: (self.insert_min_insert_block_size_rows > 0)
+                .then_some(self.insert_min_insert_block_size_rows),
+        }
+    }
+
+    pub fn resolved_query_pool_size(&self) -> usize {
+        self.query_pool_size
+            .or((self.pool_size > 0).then_some(self.pool_size))
+            .unwrap_or(crate::adapters::chdb::connection_pool::DEFAULT_QUERY_POOL_SIZE)
+    }
+
+    pub fn resolved_write_pool_size(&self) -> usize {
+        self.write_pool_size
+            .or((self.pool_size > 0).then_some(self.pool_size))
+            .unwrap_or(crate::adapters::chdb::connection_pool::DEFAULT_WRITE_POOL_SIZE)
+    }
+
+    pub fn resolved_tag_low_cardinality_max(&self, cardinality: &CardinalityConfig) -> usize {
+        self.tag_low_cardinality_max
+            .unwrap_or(cardinality.max_tag_values_per_measurement)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -513,10 +568,6 @@ impl RetentionConfig {
     }
 }
 
-fn default_chdb_pool_size() -> usize {
-    crate::adapters::chdb::connection_pool::DEFAULT_POOL_SIZE
-}
-
 impl HyperbytedbConfig {
     pub fn load(config_path: Option<&str>) -> anyhow::Result<Self> {
         let mut figment = Figment::new().merge(Serialized::defaults(Self::defaults()));
@@ -552,8 +603,6 @@ impl HyperbytedbConfig {
             },
             flush: FlushConfig {
                 interval_secs: 10,
-                wal_size_threshold_mb: 64,
-                time_bucket_duration: "1h".to_string(),
                 max_points_per_batch: default_max_points_per_batch(),
                 wal_batch_size: default_wal_batch_size(),
                 wal_batch_delay_us: default_wal_batch_delay_us(),
@@ -562,8 +611,14 @@ impl HyperbytedbConfig {
             },
             chdb: ChdbConfig {
                 session_data_path: "./chdb_data".to_string(),
-                pool_size: default_chdb_pool_size(),
+                pool_size: 0,
+                query_pool_size: None,
+                write_pool_size: None,
                 schema_cache_max_entries: default_schema_cache_max_entries(),
+                insert_max_threads: default_insert_max_threads(),
+                insert_min_insert_block_size_rows: 0,
+                insert_max_insert_block_size: 0,
+                tag_low_cardinality_max: None,
             },
             auth: AuthConfig {
                 enabled: false,
@@ -769,6 +824,191 @@ mod retention_config_tests {
         let r: RetentionConfig = serde_json::from_str(r#"{"enabled":false}"#).expect("parse");
         assert!(!r.enabled);
         assert_eq!(r.interval, "12h");
+    }
+}
+
+#[cfg(test)]
+mod chdb_pool_config_tests {
+    use super::{
+        CardinalityConfig, ChdbConfig, default_insert_max_threads, default_tag_low_cardinality_max,
+    };
+    use chdb_rust::InsertOptions;
+
+    #[test]
+    fn split_pool_defaults_when_unset() {
+        let c = ChdbConfig {
+            session_data_path: "./chdb".into(),
+            pool_size: 0,
+            query_pool_size: None,
+            write_pool_size: None,
+            schema_cache_max_entries: 10_000,
+            insert_max_threads: default_insert_max_threads(),
+            insert_min_insert_block_size_rows: 0,
+            insert_max_insert_block_size: 0,
+            tag_low_cardinality_max: None,
+        };
+        assert_eq!(c.resolved_query_pool_size(), 4);
+        assert_eq!(c.resolved_write_pool_size(), 4);
+    }
+
+    #[test]
+    fn legacy_pool_size_applies_to_both() {
+        let c = ChdbConfig {
+            session_data_path: "./chdb".into(),
+            pool_size: 6,
+            query_pool_size: None,
+            write_pool_size: None,
+            schema_cache_max_entries: 10_000,
+            insert_max_threads: default_insert_max_threads(),
+            insert_min_insert_block_size_rows: 0,
+            insert_max_insert_block_size: 0,
+            tag_low_cardinality_max: None,
+        };
+        assert_eq!(c.resolved_query_pool_size(), 6);
+        assert_eq!(c.resolved_write_pool_size(), 6);
+    }
+
+    #[test]
+    fn explicit_split_overrides_pool_size() {
+        let c = ChdbConfig {
+            session_data_path: "./chdb".into(),
+            pool_size: 6,
+            query_pool_size: Some(64),
+            write_pool_size: Some(8),
+            schema_cache_max_entries: 10_000,
+            insert_max_threads: default_insert_max_threads(),
+            insert_min_insert_block_size_rows: 0,
+            insert_max_insert_block_size: 0,
+            tag_low_cardinality_max: None,
+        };
+        assert_eq!(c.resolved_query_pool_size(), 64);
+        assert_eq!(c.resolved_write_pool_size(), 8);
+    }
+
+    #[test]
+    fn deserializes_split_pools_from_toml() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let c: ChdbConfig = Figment::new()
+            .merge(Toml::string(
+                r#"
+                session_data_path = "./chdb"
+                query_pool_size = 32
+                write_pool_size = 4
+                "#,
+            ))
+            .extract()
+            .expect("parse");
+        assert_eq!(c.resolved_query_pool_size(), 32);
+        assert_eq!(c.resolved_write_pool_size(), 4);
+    }
+
+    #[test]
+    fn insert_options_maps_config_keys() {
+        let c = ChdbConfig {
+            session_data_path: "./chdb".into(),
+            pool_size: 0,
+            query_pool_size: None,
+            write_pool_size: None,
+            schema_cache_max_entries: 10_000,
+            insert_max_threads: 8,
+            insert_min_insert_block_size_rows: 100_000,
+            insert_max_insert_block_size: 0,
+            tag_low_cardinality_max: None,
+        };
+        assert_eq!(
+            c.insert_options(),
+            InsertOptions {
+                max_threads: Some(8),
+                min_insert_block_size_rows: Some(100_000),
+                max_insert_block_size: None,
+            }
+        );
+    }
+
+    #[test]
+    fn deserializes_insert_settings_from_toml() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let c: ChdbConfig = Figment::new()
+            .merge(Toml::string(
+                r#"
+                session_data_path = "./chdb"
+                insert_max_threads = 4
+                insert_min_insert_block_size_rows = 100000
+                insert_max_insert_block_size = 1048576
+                "#,
+            ))
+            .extract()
+            .expect("parse");
+        assert_eq!(
+            c.insert_options(),
+            InsertOptions {
+                max_threads: Some(4),
+                min_insert_block_size_rows: Some(100_000),
+                max_insert_block_size: Some(1_048_576),
+            }
+        );
+    }
+
+    #[test]
+    fn tag_low_cardinality_max_defaults_to_cardinality_limit() {
+        let c = ChdbConfig {
+            session_data_path: "./chdb".into(),
+            pool_size: 0,
+            query_pool_size: None,
+            write_pool_size: None,
+            schema_cache_max_entries: 10_000,
+            insert_max_threads: default_insert_max_threads(),
+            insert_min_insert_block_size_rows: 0,
+            insert_max_insert_block_size: 0,
+            tag_low_cardinality_max: None,
+        };
+        let cardinality = CardinalityConfig {
+            max_tag_values_per_measurement: 50_000,
+            max_measurements_per_database: 10_000,
+        };
+        assert_eq!(c.resolved_tag_low_cardinality_max(&cardinality), 50_000);
+    }
+
+    #[test]
+    fn tag_low_cardinality_max_explicit_override() {
+        let c = ChdbConfig {
+            session_data_path: "./chdb".into(),
+            pool_size: 0,
+            query_pool_size: None,
+            write_pool_size: None,
+            schema_cache_max_entries: 10_000,
+            insert_max_threads: default_insert_max_threads(),
+            insert_min_insert_block_size_rows: 0,
+            insert_max_insert_block_size: 0,
+            tag_low_cardinality_max: Some(25_000),
+        };
+        let cardinality = CardinalityConfig {
+            max_tag_values_per_measurement: 100_000,
+            max_measurements_per_database: 10_000,
+        };
+        assert_eq!(c.resolved_tag_low_cardinality_max(&cardinality), 25_000);
+    }
+
+    #[test]
+    fn deserializes_tag_low_cardinality_max_from_toml() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let c: ChdbConfig = Figment::new()
+            .merge(Toml::string(
+                r#"
+                session_data_path = "./chdb"
+                tag_low_cardinality_max = 75000
+                "#,
+            ))
+            .extract()
+            .expect("parse");
+        assert_eq!(c.tag_low_cardinality_max, Some(75_000));
+        assert_eq!(default_tag_low_cardinality_max(), 100_000);
     }
 }
 

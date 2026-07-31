@@ -66,12 +66,12 @@ use crate::error::HyperbytedbError;
 use crate::ports::metadata::MetadataPort;
 use crate::ports::points_sink::{PointsSinkPort, WriteAck};
 
-/// Above this many distinct values per tag key, ClickHouse
-/// `LowCardinality(String)` hurts more than it helps; use plain `String`.
-pub const TAG_LOW_CARDINALITY_MAX: usize = 100_000;
+/// Default threshold when no `[chdb].tag_low_cardinality_max` or cardinality
+/// config is available (e.g. unit tests constructing the adapter directly).
+pub const DEFAULT_TAG_LOW_CARDINALITY_MAX: usize = 100_000;
 
 /// Column kind for tags and fields. Tags use `LowCardinality(String)` only
-/// while distinct value count stays at or below [`TAG_LOW_CARDINALITY_MAX`].
+/// while distinct value count stays at or below the configured threshold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ColumnKind {
     TagLowCardinality,
@@ -133,8 +133,8 @@ fn table_schema_from_measurement_meta(
     )
 }
 
-fn tag_column_kind(distinct_values: usize) -> ColumnKind {
-    if distinct_values > TAG_LOW_CARDINALITY_MAX {
+fn tag_column_kind(distinct_values: usize, threshold: usize) -> ColumnKind {
+    if distinct_values > threshold {
         ColumnKind::TagString
     } else {
         ColumnKind::TagLowCardinality
@@ -233,6 +233,10 @@ pub struct ChdbNativeAdapter {
     /// serialization + re-parsing and is several times faster. Set
     /// `HYPERBYTEDB_DISABLE_ARROW_INSERT=1` to fall back to the SQL path.
     use_arrow: bool,
+    /// ClickHouse insert SETTINGS for Arrow bulk paths (from `[chdb]` config).
+    insert_options: InsertOptions,
+    /// Distinct tag values per key above which DDL uses plain `String`.
+    tag_low_cardinality_max: usize,
 }
 
 impl ChdbNativeAdapter {
@@ -245,6 +249,8 @@ impl ChdbNativeAdapter {
             session,
             metadata,
             crate::config::default_schema_cache_max_entries(),
+            InsertOptions::default_bulk(),
+            crate::config::default_tag_low_cardinality_max(),
         )
     }
 
@@ -252,6 +258,8 @@ impl ChdbNativeAdapter {
         session: SharedSession,
         metadata: Option<Arc<dyn MetadataPort>>,
         schema_cache_max_entries: usize,
+        insert_options: InsertOptions,
+        tag_low_cardinality_max: usize,
     ) -> Self {
         let cache_capacity = table_cache_capacity(schema_cache_max_entries);
         let use_arrow = std::env::var("HYPERBYTEDB_DISABLE_ARROW_INSERT").is_err();
@@ -264,6 +272,8 @@ impl ChdbNativeAdapter {
             ddl_locks: Arc::new(tokio::sync::Mutex::new(LruCache::new(cache_capacity))),
             cache_capacity,
             use_arrow,
+            insert_options,
+            tag_low_cardinality_max,
         }
     }
 
@@ -781,7 +791,7 @@ impl ChdbNativeAdapter {
                 };
             if !series_cached.materialized && !series_cached.columns.is_empty() {
                 // Warmed-from-metadata series table may still carry LowCardinality
-                // tags that have since crossed TAG_LOW_CARDINALITY_MAX.
+                // tags that have since crossed the configured threshold.
                 series_alters.extend(build_alter_reconcile_tag_strings(&series_table, &tag_phys));
             }
 
@@ -866,15 +876,12 @@ impl ChdbNativeAdapter {
             let batch = build_series_record_batch(ensured, &new_series)?;
             let pool = self.session.pool()?;
             let series_table = ensured.series_table.clone();
+            let insert_options = self.insert_options.clone();
             tokio::task::spawn_blocking(move || {
                 pool.with_connection(|conn| {
-                    insert_record_batch_direct(
-                        conn,
-                        &series_table,
-                        batch,
-                        InsertOptions::default_bulk(),
+                    insert_record_batch_direct(conn, &series_table, batch, insert_options).map_err(
+                        |e| HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e)),
                     )
-                    .map_err(|e| HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e)))
                 })
             })
             .await
@@ -911,7 +918,10 @@ impl ChdbNativeAdapter {
             let count = meta
                 .count_tag_values(db, rp, tag_key, Some(measurement))
                 .await?;
-            tag_kinds.insert(tag_key.clone(), tag_column_kind(count));
+            tag_kinds.insert(
+                tag_key.clone(),
+                tag_column_kind(count, self.tag_low_cardinality_max),
+            );
         }
         Ok(table_schema_from_measurement_meta(meas_meta, &tag_kinds))
     }
@@ -942,7 +952,7 @@ impl ChdbNativeAdapter {
                     // tag and did a metadata lookup per distinct value
                     // (O(rows) — the dominant flush cost for high-cardinality
                     // tags like `machine_id`). Auto LC->String promotion above
-                    // TAG_LOW_CARDINALITY_MAX still happens at first
+                    // the configured threshold still happens at first
                     // materialization and whenever a new tag *key* appears; an
                     // oversized LowCardinality column degrades gracefully rather
                     // than being written incorrectly.
@@ -954,7 +964,7 @@ impl ChdbNativeAdapter {
         let count = self
             .distinct_tag_value_count(db, rp, measurement, tag_key, points)
             .await?;
-        Ok(tag_column_kind(count))
+        Ok(tag_column_kind(count, self.tag_low_cardinality_max))
     }
 
     /// Distinct tag values for `(db, measurement, tag_key)` from metadata plus
@@ -1323,15 +1333,11 @@ impl ChdbNativeAdapter {
         let pool = self.session.pool()?;
         let series_table = ensured.series_table.clone();
         let batch = series_batch.clone();
+        let insert_options = self.insert_options.clone();
         tokio::task::spawn_blocking(move || {
             pool.with_connection(|conn| {
-                insert_record_batch_direct(
-                    conn,
-                    &series_table,
-                    batch,
-                    InsertOptions::default_bulk(),
-                )
-                .map_err(|e| HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e)))
+                insert_record_batch_direct(conn, &series_table, batch, insert_options)
+                    .map_err(|e| HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e)))
             })
         })
         .await
@@ -1426,12 +1432,12 @@ impl PointsSinkPort for ChdbNativeAdapter {
             let pool = self.session.pool()?;
             let table = ensured.table.clone();
             let insert_start = std::time::Instant::now();
+            let insert_options = self.insert_options.clone();
             tokio::task::spawn_blocking(move || {
                 pool.with_connection(|conn| {
-                    insert_record_batch_direct(conn, &table, batch, InsertOptions::default_bulk())
-                        .map_err(|e| {
-                            HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e))
-                        })
+                    insert_record_batch_direct(conn, &table, batch, insert_options).map_err(|e| {
+                        HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e))
+                    })
                 })
             })
             .await
@@ -1505,10 +1511,11 @@ impl PointsSinkPort for ChdbNativeAdapter {
         let table = batch.table_name.clone();
         let fact = Arc::new(padded);
         let insert_start = std::time::Instant::now();
+        let insert_options = self.insert_options.clone();
         tokio::task::spawn_blocking(move || {
             let batch = (*fact).clone();
             pool.with_connection(|conn| {
-                insert_record_batch_direct(conn, &table, batch, InsertOptions::default_bulk())
+                insert_record_batch_direct(conn, &table, batch, insert_options)
                     .map_err(|e| HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e)))
             })
         })
@@ -1789,8 +1796,8 @@ fn build_alter_add_series_columns(
 }
 
 /// After a metadata-only cache warm, existing MergeTree tables may still use
-/// `LowCardinality(String)` for tags that have since crossed
-/// [`TAG_LOW_CARDINALITY_MAX`]. `MODIFY` to `String` is safe when the column
+/// `LowCardinality(String)` for tags that have since crossed the configured
+/// low-cardinality threshold. `MODIFY` to `String` is safe when the column
 /// is already plain `String`.
 fn build_alter_reconcile_tag_strings(
     table: &str,
@@ -2460,13 +2467,14 @@ mod tests {
     }
 
     #[test]
-    fn tag_column_kind_switches_at_100k() {
+    fn tag_column_kind_switches_at_threshold() {
+        let threshold = DEFAULT_TAG_LOW_CARDINALITY_MAX;
         assert_eq!(
-            tag_column_kind(TAG_LOW_CARDINALITY_MAX),
+            tag_column_kind(threshold, threshold),
             ColumnKind::TagLowCardinality
         );
         assert_eq!(
-            tag_column_kind(TAG_LOW_CARDINALITY_MAX + 1),
+            tag_column_kind(threshold + 1, threshold),
             ColumnKind::TagString
         );
     }

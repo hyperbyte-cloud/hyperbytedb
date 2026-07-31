@@ -49,8 +49,6 @@ spec:
       storageClassName: fast-ssd
   flush:
     intervalSecs: 5
-    walSizeThresholdMb: 128
-    timeBucketDuration: "1h"
   chdb:
     sessionDataPath: /var/lib/hyperbytedb/chdb
   auth:
@@ -226,8 +224,6 @@ HyperbyteDB stores WAL, metadata, Raft state, and chDB session data on the per-r
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `intervalSecs` | int32 | `10` | How often the WAL is flushed to chDB |
-| `walSizeThresholdMb` | int32 | `64` | WAL size threshold that triggers an early flush |
-| `timeBucketDuration` | string | `1h` | Parquet time-bucket width (`1h` or `1d`) |
 | `maxPointsPerBatch` | int32 | `50000` | Max points per chDB insert batch (written to ConfigMap as `max_points_per_batch`) |
 | `walBatchSize` | int32 | `64` | WAL group-commit batch size (`0` disables) |
 | `walBatchDelayUs` | int64 | `200` | WAL group-commit delay in microseconds |

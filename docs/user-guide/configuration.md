@@ -61,8 +61,6 @@ Controls the background WAL-to-chDB flush pipeline.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `interval_secs` | integer | `10` | How often the flush service runs (seconds) |
-| `wal_size_threshold_mb` | integer | `64` | WAL size that triggers an immediate flush (MB) |
-| `time_bucket_duration` | string | `"1h"` | Time bucket granularity used when grouping WAL entries for flush |
 | `max_points_per_batch` | integer | `50000` | Max points per chDB insert batch (server clamps to 10k–500k; `0` uses the same default) |
 | `wal_batch_size` | integer | `64` | WAL group-commit: max entries to coalesce per write batch; `0` = disabled |
 | `wal_batch_delay_us` | integer | `200` | WAL group-commit: max microseconds to wait for more entries before flushing |
@@ -77,7 +75,14 @@ Embedded ClickHouse (chDB) query engine settings.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `session_data_path` | string | `"./chdb_data"` | chDB session state directory |
-| `pool_size` | integer | `4` | Number of chDB connections to the same `session_data_path`. Each connection has its own client mutex, so flush inserts and concurrent queries overlap when `pool_size > 1`. Clamped to 1–32. For best overlap, set `server.max_concurrent_queries` ≥ `pool_size`. |
+| `query_pool_size` | integer | `4` | chDB connections reserved for queries (`ChdbQueryAdapter`). Each connection has its own client mutex, so concurrent `spawn_blocking` query tasks overlap when > 1. Clamped to 1–128. For best overlap, set `server.max_concurrent_queries` ≥ `query_pool_size`. |
+| `write_pool_size` | integer | `4` | chDB connections reserved for ingest/flush (`ChdbNativeAdapter`), isolated from the query pool so heavy queries do not block inserts. Clamped to 1–128. |
+| `pool_size` | integer | `0` (unused) | **Legacy.** When non-zero and `query_pool_size` / `write_pool_size` are unset, applies the same size to both pools. Prefer explicit `query_pool_size` and `write_pool_size`. |
+| `schema_cache_max_entries` | integer | `10000` | Max `(db, rp, measurement)` entries in the chDB native adapter schema and series caches. Oldest entries are evicted (LRU). |
+| `insert_max_threads` | integer | `4` | ClickHouse `max_threads` for Arrow bulk inserts. Match CPU cores on the node. |
+| `insert_min_insert_block_size_rows` | integer | `0` (unset) | ClickHouse `min_insert_block_size_rows` for Arrow bulk inserts. Set to ~`max_points_per_batch` to avoid many small parts. `0` = engine default. |
+| `insert_max_insert_block_size` | integer | `0` (unset) | ClickHouse `max_insert_block_size` for Arrow bulk inserts (bytes). Caps part size for wide measurements. `0` = engine default. |
+| `tag_low_cardinality_max` | integer | *(linked)* | Max distinct tag values per key before DDL uses plain `String` instead of `LowCardinality(String)`. When unset, uses `[cardinality].max_tag_values_per_measurement`. High-cardinality tags (trace IDs, request IDs) should stay as plain `String`. |
 
 ---
 
@@ -239,7 +244,8 @@ interval_secs = 10
 
 [chdb]
 session_data_path = "./chdb_data"
-pool_size = 4
+query_pool_size = 4
+write_pool_size = 4
 
 [logging]
 level = "info"
@@ -266,6 +272,9 @@ interval_secs = 10
 
 [chdb]
 session_data_path = "/var/lib/hyperbytedb/chdb"
+query_pool_size = 32
+write_pool_size = 4
+schema_cache_max_entries = 10000
 
 [cluster]
 enabled = true
