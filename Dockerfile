@@ -29,7 +29,7 @@ WORKDIR /build
 # chdb-rust path dependency (`../../chdb-rust` from hyperbytedb/hyperbytedb).
 # Clone during the image build so `docker compose up` works without a local checkout.
 ARG CHDB_RUST_REPO=https://github.com/hyperbyte-cloud/chdb-rust.git
-ARG CHDB_RUST_REF=feat_arrow_insert
+ARG CHDB_RUST_REF=main
 RUN git clone --depth 1 --branch "${CHDB_RUST_REF}" "${CHDB_RUST_REPO}" /build/chdb-rust
 
 # Pinned toolchain spec must be in place before any cargo invocation so

@@ -16,7 +16,7 @@ WORKDIR /build
 
 # hyperbytedb workspace member depends on chdb-rust via path (`../../chdb-rust`).
 ARG CHDB_RUST_REPO=https://github.com/hyperbyte-cloud/chdb-rust.git
-ARG CHDB_RUST_REF=feat_arrow_insert
+ARG CHDB_RUST_REF=main
 RUN git clone --depth 1 --branch "${CHDB_RUST_REF}" "${CHDB_RUST_REPO}" /build/chdb-rust
 
 WORKDIR /build/hyperbytedb
