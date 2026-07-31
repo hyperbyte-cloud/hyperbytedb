@@ -41,21 +41,23 @@ pub async fn persist_default_database_metadata(
             match result {
                 Ok(qr) => qr
                     .data_utf8()
-                    .map_err(|e| HyperbytedbError::Chdb(e.to_string())),
-                Err(e) => Err(HyperbytedbError::Chdb(e.to_string())),
+                    .map_err(|e| HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e))),
+                Err(e) => Err(HyperbytedbError::Chdb(
+                    crate::error::ChainedError::from_error(e),
+                )),
             }
         })
     })
     .await
     .map_err(|e| {
-        HyperbytedbError::Internal(format!("chDB default database query join error: {e}"))
+        HyperbytedbError::Internal(format!("chDB default database query join error: {e}").into())
     })??;
 
     let uuid = raw.lines().next().unwrap_or_default().trim();
     if uuid.is_empty() {
-        return Err(HyperbytedbError::Chdb(
-            "default database uuid missing from system.databases".into(),
-        ));
+        return Err(HyperbytedbError::Chdb(crate::error::ChainedError::new(
+            "default database uuid missing from system.databases",
+        )));
     }
 
     write_default_database_sql(session_path, uuid)?;
@@ -74,16 +76,22 @@ pub async fn reload_persisted_tables(session: &SharedSession) -> Result<usize, H
     let mut attached = 0usize;
 
     for entry in fs::read_dir(&meta_dir).map_err(|e| {
-        HyperbytedbError::Chdb(format!(
-            "failed to read chDB metadata dir {}: {e}",
-            meta_dir.display()
-        ))
+        HyperbytedbError::Chdb(
+            format!(
+                "failed to read chDB metadata dir {}: {e}",
+                meta_dir.display()
+            )
+            .into(),
+        )
     })? {
         let entry = entry.map_err(|e| {
-            HyperbytedbError::Chdb(format!(
-                "failed to read chDB metadata entry in {}: {e}",
-                meta_dir.display()
-            ))
+            HyperbytedbError::Chdb(
+                format!(
+                    "failed to read chDB metadata entry in {}: {e}",
+                    meta_dir.display()
+                )
+                .into(),
+            )
         })?;
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) != Some("sql") {
@@ -97,10 +105,9 @@ pub async fn reload_persisted_tables(session: &SharedSession) -> Result<usize, H
         }
 
         let body = fs::read_to_string(&path).map_err(|e| {
-            HyperbytedbError::Chdb(format!(
-                "failed to read chDB table metadata {}: {e}",
-                path.display()
-            ))
+            HyperbytedbError::Chdb(
+                format!("failed to read chDB table metadata {}: {e}", path.display()).into(),
+            )
         })?;
         let sql = attach_sql_for_table(table_name, &body);
         tracing::debug!(table = %table_name, "attaching restored chDB table from on-disk metadata");
@@ -119,10 +126,13 @@ fn repair_atomic_default_symlink(session_path: &Path) -> Result<(), HyperbytedbE
     }
 
     let default_sql = fs::read_to_string(&default_sql_path).map_err(|e| {
-        HyperbytedbError::Chdb(format!(
-            "failed to read chDB database metadata {}: {e}",
-            default_sql_path.display()
-        ))
+        HyperbytedbError::Chdb(
+            format!(
+                "failed to read chDB database metadata {}: {e}",
+                default_sql_path.display()
+            )
+            .into(),
+        )
     })?;
     let Some(uuid) = parse_default_database_uuid(&default_sql) else {
         return Ok(());
@@ -130,34 +140,43 @@ fn repair_atomic_default_symlink(session_path: &Path) -> Result<(), HyperbytedbE
 
     let store_dir = store_path_for_uuid(session_path, uuid);
     if !store_dir.is_dir() {
-        return Err(HyperbytedbError::Chdb(format!(
-            "expected chDB store directory for default database uuid {uuid}: {}",
-            store_dir.display()
-        )));
+        return Err(HyperbytedbError::Chdb(
+            format!(
+                "expected chDB store directory for default database uuid {uuid}: {}",
+                store_dir.display()
+            )
+            .into(),
+        ));
     }
 
     fs::remove_dir_all(&default_meta).map_err(|e| {
-        HyperbytedbError::Chdb(format!(
-            "failed to remove chDB metadata dir {} before symlink repair: {e}",
-            default_meta.display()
-        ))
+        HyperbytedbError::Chdb(
+            format!(
+                "failed to remove chDB metadata dir {} before symlink repair: {e}",
+                default_meta.display()
+            )
+            .into(),
+        )
     })?;
 
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(&store_dir, &default_meta).map_err(|e| {
-            HyperbytedbError::Chdb(format!(
-                "failed to create chDB metadata symlink {} -> {}: {e}",
-                default_meta.display(),
-                store_dir.display()
-            ))
+            HyperbytedbError::Chdb(
+                format!(
+                    "failed to create chDB metadata symlink {} -> {}: {e}",
+                    default_meta.display(),
+                    store_dir.display()
+                )
+                .into(),
+            )
         })?;
     }
     #[cfg(not(unix))]
     {
-        return Err(HyperbytedbError::Chdb(
-            "chDB cold start metadata repair requires Unix symlinks".into(),
-        ));
+        return Err(HyperbytedbError::Chdb(crate::error::ChainedError::new(
+            "chDB cold start metadata repair requires Unix symlinks",
+        )));
     }
 
     tracing::info!(
@@ -171,22 +190,28 @@ fn repair_atomic_default_symlink(session_path: &Path) -> Result<(), HyperbytedbE
 fn write_default_database_sql(session_path: &Path, uuid: &str) -> Result<(), HyperbytedbError> {
     let default_sql = session_path.join("metadata/default.sql");
     let Some(parent) = default_sql.parent() else {
-        return Err(HyperbytedbError::Chdb(
-            "default.sql path has no parent directory".to_string(),
-        ));
+        return Err(HyperbytedbError::Chdb(crate::error::ChainedError::new(
+            "default.sql path has no parent directory",
+        )));
     };
     fs::create_dir_all(parent).map_err(|e| {
-        HyperbytedbError::Chdb(format!(
-            "failed to create chDB metadata dir {}: {e}",
-            parent.display()
-        ))
+        HyperbytedbError::Chdb(
+            format!(
+                "failed to create chDB metadata dir {}: {e}",
+                parent.display()
+            )
+            .into(),
+        )
     })?;
     let statement = format!("ATTACH DATABASE default ENGINE=Atomic UUID '{uuid}'\n");
     fs::write(&default_sql, statement).map_err(|e| {
-        HyperbytedbError::Chdb(format!(
-            "failed to write chDB database metadata {}: {e}",
-            default_sql.display()
-        ))
+        HyperbytedbError::Chdb(
+            format!(
+                "failed to write chDB database metadata {}: {e}",
+                default_sql.display()
+            )
+            .into(),
+        )
     })?;
     tracing::info!(
         path = %default_sql.display(),
@@ -243,13 +268,15 @@ async fn query_tab_separated(
             match result {
                 Ok(qr) => qr
                     .data_utf8()
-                    .map_err(|e| HyperbytedbError::Chdb(e.to_string())),
-                Err(e) => Err(HyperbytedbError::Chdb(e.to_string())),
+                    .map_err(|e| HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e))),
+                Err(e) => Err(HyperbytedbError::Chdb(
+                    crate::error::ChainedError::from_error(e),
+                )),
             }
         })
     })
     .await
-    .map_err(|e| HyperbytedbError::Internal(format!("chDB catalog query join error: {e}")))?
+    .map_err(|e| HyperbytedbError::Internal(format!("chDB catalog query join error: {e}").into()))?
 }
 
 async fn execute_statement(session: &SharedSession, sql: &str) -> Result<(), HyperbytedbError> {
@@ -259,11 +286,13 @@ async fn execute_statement(session: &SharedSession, sql: &str) -> Result<(), Hyp
         pool.with_connection(|conn| {
             execute_connection(conn, &sql, OutputFormat::TabSeparated)
                 .map(|_| ())
-                .map_err(|e| HyperbytedbError::Chdb(e.to_string()))
+                .map_err(|e| HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e)))
         })
     })
     .await
-    .map_err(|e| HyperbytedbError::Internal(format!("chDB catalog attach join error: {e}")))?
+    .map_err(|e| {
+        HyperbytedbError::Internal(format!("chDB catalog attach join error: {e}").into())
+    })?
 }
 
 #[cfg(test)]

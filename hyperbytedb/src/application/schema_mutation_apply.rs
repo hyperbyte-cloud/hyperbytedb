@@ -10,13 +10,28 @@ use crate::application::materialized_view_service::MaterializedViewService;
 use crate::domain::cluster::types::MutationRequest;
 use crate::error::HyperbytedbError;
 use crate::ports::metadata::MetadataPort;
+use crate::ports::points_sink::PointsSinkPort;
+use crate::ports::wal::WalPort;
+
+/// Dependencies required to apply schema mutations with full local side effects.
+pub struct SchemaMutationDeps<'a> {
+    pub metadata: &'a Arc<dyn MetadataPort>,
+    pub mv_service: Option<&'a MaterializedViewService>,
+    pub points_sink: Option<&'a Arc<dyn PointsSinkPort>>,
+    pub wal: Option<&'a Arc<dyn WalPort>>,
+}
 
 /// Apply a schema mutation locally, including chDB DDL where required.
 pub async fn apply_schema_mutation(
-    metadata: &Arc<dyn MetadataPort>,
-    mv_service: Option<&MaterializedViewService>,
+    deps: SchemaMutationDeps<'_>,
     mutation: MutationRequest,
 ) -> Result<(), HyperbytedbError> {
+    let SchemaMutationDeps {
+        metadata,
+        mv_service,
+        points_sink,
+        wal,
+    } = deps;
     match mutation {
         MutationRequest::CreateDatabase { name, rp } => {
             crate::adapters::cluster::raft::state_machine::apply_create_database(
@@ -24,7 +39,11 @@ pub async fn apply_schema_mutation(
             )
             .await
         }
-        MutationRequest::DropDatabase(name) => metadata.drop_database(&name).await,
+        MutationRequest::DropDatabase(name) => {
+            let sink = points_sink.or_else(|| mv_service.map(|mv| mv.points_sink()));
+            crate::application::database_drop::drop_database(metadata, mv_service, sink, wal, &name)
+                .await
+        }
         MutationRequest::CreateRetentionPolicy { db, rp } => {
             metadata.create_retention_policy(&db, rp).await
         }
@@ -40,7 +59,13 @@ pub async fn apply_schema_mutation(
         MutationRequest::SetPassword {
             username,
             password_hash,
-        } => metadata.create_user(&username, &password_hash, false).await,
+        } => {
+            let admin = match metadata.get_user(&username).await? {
+                Some(user) => user.admin,
+                None => false,
+            };
+            metadata.create_user(&username, &password_hash, admin).await
+        }
         MutationRequest::Delete {
             database,
             rp,

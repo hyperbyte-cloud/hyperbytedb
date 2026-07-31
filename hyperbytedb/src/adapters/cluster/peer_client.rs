@@ -175,15 +175,78 @@ impl PeerClient {
     }
 
     /// Fan out a line-protocol batch to all active peers (bounded queue + coalescing worker).
-    /// Non-blocking: if the outbound queue is full (a peer is down/slow) the batch is
-    /// dropped rather than stalling ingestion. Divergence is reconciled by anti-entropy
-    /// sync; async replication must never block the write path on an unhealthy peer.
-    pub fn replicate_write(self: &Arc<Self>, batch: OutboundReplicationBatch) {
+    /// Non-blocking: if the outbound queue is full, batches are enqueued to hinted-handoff
+    /// for each replication peer instead of being dropped.
+    pub fn replicate_write(
+        self: &Arc<Self>,
+        batch: OutboundReplicationBatch,
+    ) -> Result<(), HyperbytedbError> {
         self.start_outbound_processor();
-        if let Err(e) = self.outbound_tx.try_send(batch) {
-            tracing::error!(error = %e, "replication outbound queue full or closed; dropping batch");
-            counter!("hyperbytedb_replication_queue_drops_total").increment(1);
+        match self.outbound_tx.try_send(batch) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(batch)) => {
+                counter!("hyperbytedb_replication_queue_full_total").increment(1);
+                if self.hinted_handoff.is_none() {
+                    return Err(HyperbytedbError::Internal(
+                        "replication outbound queue full and hinted handoff is not configured"
+                            .into(),
+                    ));
+                }
+                let this = Arc::clone(self);
+                tokio::spawn(async move {
+                    if let Err(e) = this.enqueue_batch_to_hinted_handoff(batch).await {
+                        tracing::error!(
+                            error = %e,
+                            "replication outbound queue full and hinted handoff enqueue failed"
+                        );
+                        counter!("hyperbytedb_replication_queue_drops_total").increment(1);
+                    }
+                });
+                Ok(())
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                tracing::error!("replication outbound queue closed; dropping batch");
+                counter!("hyperbytedb_replication_queue_drops_total").increment(1);
+                Err(HyperbytedbError::Internal(
+                    "replication outbound queue closed".into(),
+                ))
+            }
         }
+    }
+
+    async fn enqueue_batch_to_hinted_handoff(
+        self: &Arc<Self>,
+        batch: OutboundReplicationBatch,
+    ) -> Result<(), HyperbytedbError> {
+        let hh = self
+            .hinted_handoff
+            .as_ref()
+            .ok_or_else(|| {
+                HyperbytedbError::Internal(
+                    "replication outbound queue full and hinted handoff is not configured".into(),
+                )
+            })?
+            .clone();
+
+        let peers = {
+            let m = self.membership.read().await;
+            m.replication_peers(self.node_id)
+                .into_iter()
+                .map(|n| n.node_id)
+                .collect::<Vec<_>>()
+        };
+
+        let hint = ReplicationHintPayload {
+            database: batch.database.clone(),
+            retention_policy: batch.retention_policy.clone(),
+            precision: batch.precision.clone(),
+            line_body: batch.body.clone(),
+        };
+
+        for peer_id in peers {
+            hh.enqueue_hint(peer_id, &hint)?;
+        }
+        Ok(())
     }
 
     async fn do_replicate_write(&self, job: &OutboundReplicationBatch) {
@@ -490,14 +553,11 @@ impl PeerClient {
         }
     }
 
-    async fn do_replicate_mutation(&self, req: &MutationRequest) {
-        let mutation_seq = match self.replication_log.append_mutation(req) {
-            Ok(seq) => seq,
-            Err(e) => {
-                tracing::error!(error = %e, "failed to log mutation");
-                return;
-            }
-        };
+    async fn do_replicate_mutation(&self, req: &MutationRequest) -> Result<(), HyperbytedbError> {
+        let mutation_seq = self.replication_log.append_mutation(req).map_err(|e| {
+            tracing::error!(error = %e, "failed to log mutation");
+            HyperbytedbError::Internal(format!("failed to log mutation: {e}").into())
+        })?;
 
         let peers = {
             let m = self.membership.read().await;
@@ -508,7 +568,7 @@ impl PeerClient {
         };
 
         if peers.is_empty() {
-            return;
+            return Ok(());
         }
 
         let wire_req = MutationReplicateRequest {
@@ -552,7 +612,7 @@ impl PeerClient {
                                 if let Ok(ack) = resp.json::<MutationReplicateResponse>().await {
                                     let _ = repl_log.set_mutation_ack(pid, ack.ack_seq);
                                 }
-                                break;
+                                return true;
                             }
                             Ok(resp) => {
                                 tracing::warn!(
@@ -578,7 +638,7 @@ impl PeerClient {
                                 "giving up mutation replication after {} attempts",
                                 max_attempts
                             );
-                            break;
+                            return false;
                         }
                         tokio::time::sleep(delay).await;
                         delay = (delay * 2).min(Duration::from_secs(30));
@@ -587,22 +647,40 @@ impl PeerClient {
             })
             .collect();
 
-        futures::future::join_all(futures).await;
+        let outcomes = futures::future::join_all(futures).await;
+        if outcomes.iter().any(|ok| !ok) {
+            return Err(HyperbytedbError::Internal(
+                "mutation replication failed for one or more peers".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Fan out a mutation to all active peers.
     pub fn replicate_mutation(self: &Arc<Self>, req: MutationRequest) {
         let this = Arc::clone(self);
         tokio::spawn(async move {
-            this.do_replicate_mutation(&req).await;
+            if let Err(e) = this.do_replicate_mutation(&req).await {
+                tracing::error!(error = %e, "background mutation replication failed");
+            }
         });
+    }
+
+    pub async fn replicate_mutation_sync(
+        self: &Arc<Self>,
+        req: MutationRequest,
+    ) -> Result<(), HyperbytedbError> {
+        self.do_replicate_mutation(&req).await
     }
 }
 
 #[async_trait::async_trait]
 impl ReplicationPort for PeerClient {
-    fn replicate_write(self: Arc<Self>, batch: OutboundReplicationBatch) {
-        PeerClient::replicate_write(&self, batch);
+    fn replicate_write(
+        self: Arc<Self>,
+        batch: OutboundReplicationBatch,
+    ) -> Result<(), HyperbytedbError> {
+        PeerClient::replicate_write(&self, batch)
     }
 
     async fn replicate_write_sync(
@@ -616,6 +694,13 @@ impl ReplicationPort for PeerClient {
 
     fn replicate_mutation(self: Arc<Self>, req: MutationRequest) {
         PeerClient::replicate_mutation(&self, req);
+    }
+
+    async fn replicate_mutation_sync(
+        self: Arc<Self>,
+        req: MutationRequest,
+    ) -> Result<(), HyperbytedbError> {
+        PeerClient::replicate_mutation_sync(&self, req).await
     }
 
     async fn active_peer_count(&self, self_node_id: u64) -> usize {

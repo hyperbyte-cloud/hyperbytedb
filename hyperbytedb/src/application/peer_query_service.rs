@@ -85,9 +85,28 @@ impl PeerQueryService {
             let cluster_req = ClusterRequest::SchemaMutation(Box::new(req));
             self.client_write_with_forward(raft, cluster_req).await
         } else {
-            self.replication_port.clone().replicate_mutation(req);
-            Ok(())
+            self.replication_port
+                .clone()
+                .replicate_mutation_sync(req)
+                .await
         }
+    }
+
+    async fn execute_inner_statement(
+        &self,
+        db: &str,
+        stmt_query: &str,
+        epoch: Option<&str>,
+        retention_policy: Option<&str>,
+        caller: Option<&crate::domain::user::StoredUser>,
+        statement_id: u32,
+    ) -> StatementResult {
+        execute_or_error(
+            self.inner
+                .execute_query(db, stmt_query, epoch, retention_policy, caller)
+                .await,
+            statement_id,
+        )
     }
 
     async fn client_write_with_forward(
@@ -102,11 +121,11 @@ impl PeerQueryService {
                     if resp.data.ok {
                         return Ok(());
                     }
-                    return Err(HyperbytedbError::Internal(
+                    return Err(HyperbytedbError::Internal(crate::error::ChainedError::new(
                         resp.data
                             .message
-                            .unwrap_or_else(|| "raft schema mutation apply failed".into()),
-                    ));
+                            .unwrap_or_else(|| "raft schema mutation apply failed".to_string()),
+                    )));
                 }
                 Err(e) => {
                     if let Some(forward) = e.forward_to_leader::<BasicNode>() {
@@ -136,15 +155,15 @@ impl PeerQueryService {
                         }
                     }
                     tracing::error!(error = %e, "failed to replicate mutation via raft");
-                    return Err(HyperbytedbError::Internal(format!(
-                        "raft replication failed: {e}"
-                    )));
+                    return Err(HyperbytedbError::Internal(
+                        format!("raft replication failed: {e}").into(),
+                    ));
                 }
             }
         }
-        Err(HyperbytedbError::Internal(
-            "raft replication failed after retries".into(),
-        ))
+        Err(HyperbytedbError::Internal(crate::error::ChainedError::new(
+            "raft replication failed after retries",
+        )))
     }
 
     async fn execute_raft_mutation(
@@ -232,17 +251,17 @@ fn resolve_leader_addr_with_lookup(
 
     let leader_id = forward.leader_id.or(fallback_leader_id);
     let leader_id = leader_id.ok_or_else(|| {
-        HyperbytedbError::Internal(
-            "raft replication failed: forward to leader but leader id is unknown".into(),
-        )
+        HyperbytedbError::Internal(crate::error::ChainedError::new(
+            "raft replication failed: forward to leader but leader id is unknown",
+        ))
     })?;
 
     raft_lookup(leader_id)
         .or_else(|| membership_lookup(leader_id))
         .ok_or_else(|| {
-            HyperbytedbError::Internal(format!(
-                "raft replication failed: leader {leader_id} has no known address"
-            ))
+            HyperbytedbError::Internal(
+                format!("raft replication failed: leader {leader_id} has no known address").into(),
+            )
         })
 }
 
@@ -261,36 +280,38 @@ async fn forward_client_write(
         .send()
         .await
         .map_err(|e| {
-            HyperbytedbError::Internal(format!(
-                "raft replication failed: forward to leader {url}: {e}"
-            ))
+            HyperbytedbError::Internal(
+                format!("raft replication failed: forward to leader {url}: {e}").into(),
+            )
         })?;
 
     let status = resp.status();
     let body_text = resp.text().await.map_err(|e| {
-        HyperbytedbError::Internal(format!(
-            "raft replication failed: read leader response: {e}"
-        ))
+        HyperbytedbError::Internal(
+            format!("raft replication failed: read leader response: {e}").into(),
+        )
     })?;
 
     if !status.is_success() {
-        return Err(HyperbytedbError::Internal(format!(
-            "raft replication failed: leader returned HTTP {status}: {body_text}"
-        )));
+        return Err(HyperbytedbError::Internal(
+            format!("raft replication failed: leader returned HTTP {status}: {body_text}").into(),
+        ));
     }
 
     let body: ClusterResponse = serde_json::from_str(&body_text).map_err(|e| {
-        HyperbytedbError::Internal(format!(
-            "raft replication failed: invalid leader response: {e}: {body_text}"
-        ))
+        HyperbytedbError::Internal(
+            format!("raft replication failed: invalid leader response: {e}: {body_text}").into(),
+        )
     })?;
 
     if body.ok {
         Ok(())
     } else {
-        Err(HyperbytedbError::Internal(body.message.unwrap_or_else(
-            || "raft leader rejected schema mutation".into(),
-        )))
+        Err(HyperbytedbError::Internal(
+            body.message
+                .unwrap_or_else(|| "raft leader rejected schema mutation".into())
+                .into(),
+        ))
     }
 }
 
@@ -445,8 +466,7 @@ async fn mutation_request_from_statement(
             password,
             admin,
         } => {
-            let password_hash =
-                crate::adapters::http::auth_middleware::hash_password(password).unwrap_or_default();
+            let password_hash = hash_password_for_replication(password)?;
             Ok(MutationRequest::CreateUser {
                 username: username.clone(),
                 password_hash,
@@ -455,8 +475,7 @@ async fn mutation_request_from_statement(
         }
         Statement::DropUser(username) => Ok(MutationRequest::DropUser(username.clone())),
         Statement::SetPassword { username, password } => {
-            let password_hash =
-                crate::adapters::http::auth_middleware::hash_password(password).unwrap_or_default();
+            let password_hash = hash_password_for_replication(password)?;
             Ok(MutationRequest::SetPassword {
                 username: username.clone(),
                 password_hash,
@@ -525,9 +544,9 @@ async fn mutation_request_from_statement(
             username: username.clone(),
             database: database.clone(),
         }),
-        _ => Err(HyperbytedbError::Internal(
-            "not a cluster mutation statement".into(),
-        )),
+        _ => Err(HyperbytedbError::Internal(crate::error::ChainedError::new(
+            "not a cluster mutation statement",
+        ))),
     }
 }
 
@@ -564,6 +583,11 @@ impl QueryService for PeerQueryService {
         retention_policy: Option<&str>,
         caller: Option<&crate::domain::user::StoredUser>,
     ) -> Result<QueryResponse, HyperbytedbError> {
+        let stmt_queries: Vec<String> = crate::timeseriesql::lexer::split_statements(query)?
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
         let stmts = crate::timeseriesql::parse(query)?;
 
         if !stmts.iter().any(is_cluster_mutation) {
@@ -577,6 +601,7 @@ impl QueryService for PeerQueryService {
         let use_raft = self.raft.get().is_some();
         for (i, stmt) in stmts.into_iter().enumerate() {
             let statement_id = i as u32;
+            let stmt_query = stmt_queries.get(i).map(String::as_str).unwrap_or(query);
             if use_raft && is_cluster_mutation(&stmt) {
                 results.push(
                     self.execute_raft_mutation(db, caller, statement_id, &stmt)
@@ -586,22 +611,16 @@ impl QueryService for PeerQueryService {
             }
             let result = match stmt {
                 Statement::CreateDatabase(ref stmt) => {
-                    let resp = self
-                        .inner
-                        .execute_query(db, query, epoch, retention_policy, caller)
+                    let mut result = self
+                        .execute_inner_statement(
+                            db,
+                            stmt_query,
+                            epoch,
+                            retention_policy,
+                            caller,
+                            statement_id,
+                        )
                         .await;
-                    let mut result = match resp {
-                        Ok(r) => r.results.into_iter().next().unwrap_or(StatementResult {
-                            statement_id,
-                            series: Some(vec![]),
-                            error: None,
-                        }),
-                        Err(e) => StatementResult {
-                            statement_id,
-                            series: None,
-                            error: Some(e.to_string()),
-                        },
-                    };
                     if result.error.is_none()
                         && let Err(e) = self
                             .replicate_mutation(MutationRequest::CreateDatabase {
@@ -615,22 +634,16 @@ impl QueryService for PeerQueryService {
                     result
                 }
                 Statement::DropDatabase(ref name) => {
-                    let resp = self
-                        .inner
-                        .execute_query(db, query, epoch, retention_policy, caller)
+                    let mut result = self
+                        .execute_inner_statement(
+                            db,
+                            stmt_query,
+                            epoch,
+                            retention_policy,
+                            caller,
+                            statement_id,
+                        )
                         .await;
-                    let mut result = match resp {
-                        Ok(r) => r.results.into_iter().next().unwrap_or(StatementResult {
-                            statement_id,
-                            series: Some(vec![]),
-                            error: None,
-                        }),
-                        Err(e) => StatementResult {
-                            statement_id,
-                            series: None,
-                            error: Some(e.to_string()),
-                        },
-                    };
                     if result.error.is_none()
                         && let Err(e) = self
                             .replicate_mutation(MutationRequest::DropDatabase(name.clone()))
@@ -641,22 +654,16 @@ impl QueryService for PeerQueryService {
                     result
                 }
                 Statement::Delete(ref del) => {
-                    let resp = self
-                        .inner
-                        .execute_query(db, query, epoch, retention_policy, caller)
+                    let mut result = self
+                        .execute_inner_statement(
+                            db,
+                            stmt_query,
+                            epoch,
+                            retention_policy,
+                            caller,
+                            statement_id,
+                        )
                         .await;
-                    let mut result = match resp {
-                        Ok(r) => r.results.into_iter().next().unwrap_or(StatementResult {
-                            statement_id,
-                            series: Some(vec![]),
-                            error: None,
-                        }),
-                        Err(e) => StatementResult {
-                            statement_id,
-                            series: None,
-                            error: Some(e.to_string()),
-                        },
-                    };
                     if result.error.is_none() {
                         let del_rp = if let Some(rp) = retention_policy {
                             rp.to_string()
@@ -684,22 +691,16 @@ impl QueryService for PeerQueryService {
                     result
                 }
                 Statement::CreateContinuousQuery(ref cq) => {
-                    let resp = self
-                        .inner
-                        .execute_query(db, query, epoch, retention_policy, caller)
+                    let mut result = self
+                        .execute_inner_statement(
+                            db,
+                            stmt_query,
+                            epoch,
+                            retention_policy,
+                            caller,
+                            statement_id,
+                        )
                         .await;
-                    let mut result = match resp {
-                        Ok(r) => r.results.into_iter().next().unwrap_or(StatementResult {
-                            statement_id,
-                            series: Some(vec![]),
-                            error: None,
-                        }),
-                        Err(e) => StatementResult {
-                            statement_id,
-                            series: None,
-                            error: Some(e.to_string()),
-                        },
-                    };
                     if result.error.is_none() {
                         let def = match ContinuousQueryDef::from_create(cq) {
                             Ok(def) => def,
@@ -726,22 +727,16 @@ impl QueryService for PeerQueryService {
                     ref name,
                     db: ref cq_db,
                 } => {
-                    let resp = self
-                        .inner
-                        .execute_query(db, query, epoch, retention_policy, caller)
+                    let mut result = self
+                        .execute_inner_statement(
+                            db,
+                            stmt_query,
+                            epoch,
+                            retention_policy,
+                            caller,
+                            statement_id,
+                        )
                         .await;
-                    let mut result = match resp {
-                        Ok(r) => r.results.into_iter().next().unwrap_or(StatementResult {
-                            statement_id,
-                            series: Some(vec![]),
-                            error: None,
-                        }),
-                        Err(e) => StatementResult {
-                            statement_id,
-                            series: None,
-                            error: Some(e.to_string()),
-                        },
-                    };
                     if result.error.is_none() {
                         let target_db = if cq_db.is_empty() { db } else { cq_db };
                         if let Err(e) = self
@@ -757,22 +752,16 @@ impl QueryService for PeerQueryService {
                     result
                 }
                 Statement::CreateMaterializedView(ref mv) => {
-                    let resp = self
-                        .inner
-                        .execute_query(db, query, epoch, retention_policy, caller)
+                    let mut result = self
+                        .execute_inner_statement(
+                            db,
+                            stmt_query,
+                            epoch,
+                            retention_policy,
+                            caller,
+                            statement_id,
+                        )
                         .await;
-                    let mut result = match resp {
-                        Ok(r) => r.results.into_iter().next().unwrap_or(StatementResult {
-                            statement_id,
-                            series: Some(vec![]),
-                            error: None,
-                        }),
-                        Err(e) => StatementResult {
-                            statement_id,
-                            series: None,
-                            error: Some(e.to_string()),
-                        },
-                    };
                     if result.error.is_none() {
                         let source_rp = match resolve_mv_source_rp(&self.metadata, mv).await {
                             Ok(rp) => rp,
@@ -808,22 +797,16 @@ impl QueryService for PeerQueryService {
                     ref name,
                     db: ref mv_db,
                 } => {
-                    let resp = self
-                        .inner
-                        .execute_query(db, query, epoch, retention_policy, caller)
+                    let mut result = self
+                        .execute_inner_statement(
+                            db,
+                            stmt_query,
+                            epoch,
+                            retention_policy,
+                            caller,
+                            statement_id,
+                        )
                         .await;
-                    let mut result = match resp {
-                        Ok(r) => r.results.into_iter().next().unwrap_or(StatementResult {
-                            statement_id,
-                            series: Some(vec![]),
-                            error: None,
-                        }),
-                        Err(e) => StatementResult {
-                            statement_id,
-                            series: None,
-                            error: Some(e.to_string()),
-                        },
-                    };
                     if result.error.is_none() {
                         let target_db = if mv_db.is_empty() { db } else { mv_db };
                         if let Err(e) = self
@@ -846,11 +829,16 @@ impl QueryService for PeerQueryService {
                     ref shard_duration,
                     is_default,
                 } => {
-                    let resp = self
-                        .inner
-                        .execute_query(db, query, epoch, retention_policy, caller)
+                    let mut result = self
+                        .execute_inner_statement(
+                            db,
+                            stmt_query,
+                            epoch,
+                            retention_policy,
+                            caller,
+                            statement_id,
+                        )
                         .await;
-                    let mut result = execute_or_error(resp, statement_id);
                     if result.error.is_none() {
                         let dur = duration
                             .as_ref()
@@ -881,11 +869,16 @@ impl QueryService for PeerQueryService {
                     result
                 }
                 Statement::DropRetentionPolicyStmt { ref name, ref db } => {
-                    let resp = self
-                        .inner
-                        .execute_query(db, query, epoch, retention_policy, caller)
+                    let mut result = self
+                        .execute_inner_statement(
+                            db,
+                            stmt_query,
+                            epoch,
+                            retention_policy,
+                            caller,
+                            statement_id,
+                        )
                         .await;
-                    let mut result = execute_or_error(resp, statement_id);
                     if result.error.is_none()
                         && let Err(e) = self
                             .replicate_mutation(MutationRequest::DropRetentionPolicy {
@@ -903,34 +896,46 @@ impl QueryService for PeerQueryService {
                     ref password,
                     admin,
                 } => {
-                    let resp = self
-                        .inner
-                        .execute_query(db, query, epoch, retention_policy, caller)
+                    let mut result = self
+                        .execute_inner_statement(
+                            db,
+                            stmt_query,
+                            epoch,
+                            retention_policy,
+                            caller,
+                            statement_id,
+                        )
                         .await;
-                    let mut result = execute_or_error(resp, statement_id);
                     if result.error.is_none() {
-                        let password_hash =
-                            crate::adapters::http::auth_middleware::hash_password(password)
-                                .unwrap_or_default();
-                        if let Err(e) = self
-                            .replicate_mutation(MutationRequest::CreateUser {
-                                username: username.clone(),
-                                password_hash,
-                                admin,
-                            })
-                            .await
-                        {
-                            result.error = Some(e.to_string());
+                        match hash_password_for_replication(password) {
+                            Ok(password_hash) => {
+                                if let Err(e) = self
+                                    .replicate_mutation(MutationRequest::CreateUser {
+                                        username: username.clone(),
+                                        password_hash,
+                                        admin,
+                                    })
+                                    .await
+                                {
+                                    result.error = Some(e.to_string());
+                                }
+                            }
+                            Err(e) => result.error = Some(e.to_string()),
                         }
                     }
                     result
                 }
                 Statement::DropUser(ref username) => {
-                    let resp = self
-                        .inner
-                        .execute_query(db, query, epoch, retention_policy, caller)
+                    let mut result = self
+                        .execute_inner_statement(
+                            db,
+                            stmt_query,
+                            epoch,
+                            retention_policy,
+                            caller,
+                            statement_id,
+                        )
                         .await;
-                    let mut result = execute_or_error(resp, statement_id);
                     if result.error.is_none()
                         && let Err(e) = self
                             .replicate_mutation(MutationRequest::DropUser(username.clone()))
@@ -944,23 +949,30 @@ impl QueryService for PeerQueryService {
                     ref username,
                     ref password,
                 } => {
-                    let resp = self
-                        .inner
-                        .execute_query(db, query, epoch, retention_policy, caller)
+                    let mut result = self
+                        .execute_inner_statement(
+                            db,
+                            stmt_query,
+                            epoch,
+                            retention_policy,
+                            caller,
+                            statement_id,
+                        )
                         .await;
-                    let mut result = execute_or_error(resp, statement_id);
                     if result.error.is_none() {
-                        let password_hash =
-                            crate::adapters::http::auth_middleware::hash_password(password)
-                                .unwrap_or_default();
-                        if let Err(e) = self
-                            .replicate_mutation(MutationRequest::SetPassword {
-                                username: username.clone(),
-                                password_hash,
-                            })
-                            .await
-                        {
-                            result.error = Some(e.to_string());
+                        match hash_password_for_replication(password) {
+                            Ok(password_hash) => {
+                                if let Err(e) = self
+                                    .replicate_mutation(MutationRequest::SetPassword {
+                                        username: username.clone(),
+                                        password_hash,
+                                    })
+                                    .await
+                                {
+                                    result.error = Some(e.to_string());
+                                }
+                            }
+                            Err(e) => result.error = Some(e.to_string()),
                         }
                     }
                     result
@@ -973,11 +985,16 @@ impl QueryService for PeerQueryService {
                     ref shard_duration,
                     is_default,
                 } => {
-                    let resp = self
-                        .inner
-                        .execute_query(db, query, epoch, retention_policy, caller)
+                    let mut result = self
+                        .execute_inner_statement(
+                            db,
+                            stmt_query,
+                            epoch,
+                            retention_policy,
+                            caller,
+                            statement_id,
+                        )
                         .await;
-                    let mut result = execute_or_error(resp, statement_id);
                     if result.error.is_none() {
                         let change = RetentionPolicyChange {
                             duration: duration.as_ref().map(|d| {
@@ -1005,11 +1022,16 @@ impl QueryService for PeerQueryService {
                     result
                 }
                 Statement::DropSeries(ref s) => {
-                    let resp = self
-                        .inner
-                        .execute_query(db, query, epoch, retention_policy, caller)
+                    let mut result = self
+                        .execute_inner_statement(
+                            db,
+                            stmt_query,
+                            epoch,
+                            retention_policy,
+                            caller,
+                            statement_id,
+                        )
                         .await;
-                    let mut result = execute_or_error(resp, statement_id);
                     if result.error.is_none() {
                         let target_db = s.database.as_deref().unwrap_or(db);
                         let measurement = s.from.as_ref().and_then(|n| match n {
@@ -1046,22 +1068,16 @@ impl QueryService for PeerQueryService {
                     ref name,
                     rp: ref stmt_rp,
                 } => {
-                    let resp = self
-                        .inner
-                        .execute_query(db, query, epoch, retention_policy, caller)
+                    let mut result = self
+                        .execute_inner_statement(
+                            db,
+                            stmt_query,
+                            epoch,
+                            retention_policy,
+                            caller,
+                            statement_id,
+                        )
                         .await;
-                    let mut result = match resp {
-                        Ok(r) => r.results.into_iter().next().unwrap_or(StatementResult {
-                            statement_id,
-                            series: Some(vec![]),
-                            error: None,
-                        }),
-                        Err(e) => StatementResult {
-                            statement_id,
-                            series: None,
-                            error: Some(e.to_string()),
-                        },
-                    };
                     if result.error.is_none() {
                         let dm_rp = if let Some(rp) = stmt_rp {
                             rp.clone()
@@ -1085,22 +1101,16 @@ impl QueryService for PeerQueryService {
                     ref username,
                     ref database,
                 } => {
-                    let resp = self
-                        .inner
-                        .execute_query(db, query, epoch, retention_policy, caller)
+                    let mut result = self
+                        .execute_inner_statement(
+                            db,
+                            stmt_query,
+                            epoch,
+                            retention_policy,
+                            caller,
+                            statement_id,
+                        )
                         .await;
-                    let mut result = match resp {
-                        Ok(r) => r.results.into_iter().next().unwrap_or(StatementResult {
-                            statement_id,
-                            series: Some(vec![]),
-                            error: None,
-                        }),
-                        Err(e) => StatementResult {
-                            statement_id,
-                            series: None,
-                            error: Some(e.to_string()),
-                        },
-                    };
                     if result.error.is_none()
                         && let Err(e) = self
                             .replicate_mutation(MutationRequest::Grant {
@@ -1117,22 +1127,16 @@ impl QueryService for PeerQueryService {
                     ref username,
                     ref database,
                 } => {
-                    let resp = self
-                        .inner
-                        .execute_query(db, query, epoch, retention_policy, caller)
+                    let mut result = self
+                        .execute_inner_statement(
+                            db,
+                            stmt_query,
+                            epoch,
+                            retention_policy,
+                            caller,
+                            statement_id,
+                        )
                         .await;
-                    let mut result = match resp {
-                        Ok(r) => r.results.into_iter().next().unwrap_or(StatementResult {
-                            statement_id,
-                            series: Some(vec![]),
-                            error: None,
-                        }),
-                        Err(e) => StatementResult {
-                            statement_id,
-                            series: None,
-                            error: Some(e.to_string()),
-                        },
-                    };
                     if result.error.is_none()
                         && let Err(e) = self
                             .replicate_mutation(MutationRequest::Revoke {
@@ -1146,15 +1150,15 @@ impl QueryService for PeerQueryService {
                     result
                 }
                 _ => {
-                    let resp = self
-                        .inner
-                        .execute_query(db, query, epoch, retention_policy, caller)
-                        .await?;
-                    resp.results.into_iter().next().unwrap_or(StatementResult {
+                    self.execute_inner_statement(
+                        db,
+                        stmt_query,
+                        epoch,
+                        retention_policy,
+                        caller,
                         statement_id,
-                        series: Some(vec![]),
-                        error: None,
-                    })
+                    )
+                    .await
                 }
             };
             results.push(result);
@@ -1170,6 +1174,11 @@ impl QueryService for PeerQueryService {
     ) -> Result<crate::ports::query::CqRunResult, HyperbytedbError> {
         self.inner.execute_continuous_query(cq, now).await
     }
+}
+
+fn hash_password_for_replication(password: &str) -> Result<String, HyperbytedbError> {
+    crate::adapters::http::auth_middleware::hash_password(password)
+        .map_err(|e| HyperbytedbError::Internal(crate::error::ChainedError::from_error(e)))
 }
 
 fn execute_or_error(

@@ -4,7 +4,10 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
+use crate::application::ingest_metadata::validate_point_count;
+use crate::application::msgpack_limits::peek_columnar_values_len;
 use crate::domain::column_mapping::tag_col_name_for_columnar;
 use crate::domain::database::Precision;
 use crate::domain::point::{FieldValue, Point};
@@ -36,6 +39,107 @@ pub fn decode_columnar_batch(body: &[u8]) -> Result<ColumnarMsgpackBatch, Hyperb
     })
 }
 
+/// Like [`decode_columnar_batch`] but rejects batches above `max_points` before
+/// allocating the `values` vector (`0` = default cap).
+pub fn decode_columnar_batch_limited(
+    body: &[u8],
+    max_points: usize,
+) -> Result<ColumnarMsgpackBatch, HyperbytedbError> {
+    if body.is_empty() {
+        return Err(HyperbytedbError::ColumnarMsgpackParse {
+            reason: "empty body".into(),
+        });
+    }
+    if let Some(count) = peek_columnar_values_len(body)? {
+        validate_point_count(count, max_points)?;
+    }
+    decode_columnar_batch(body)
+}
+
+/// Nanosecond timestamps for every row in a columnar batch.
+pub fn columnar_timestamps_ns(
+    wire: &ColumnarMsgpackBatch,
+    precision: Option<&str>,
+) -> Result<Vec<i64>, HyperbytedbError> {
+    let n = wire.values.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+
+    let precision_val = Precision::from_str_opt(precision);
+
+    if let Some(ref ts) = wire.timestamps {
+        if ts.len() != n {
+            return Err(HyperbytedbError::ColumnarMsgpackParse {
+                reason: format!(
+                    "timestamps length {} does not match values length {}",
+                    ts.len(),
+                    n
+                ),
+            });
+        }
+        return Ok(ts.iter().map(|t| precision_val.to_nanos(*t)).collect());
+    }
+
+    let now = chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .ok_or(HyperbytedbError::WallClockTimestampUnavailable)?;
+    Ok(vec![now; n])
+}
+
+/// Encode columnar wire data as line protocol without expanding to `Vec<Point>`.
+pub fn columnar_wire_to_line_protocol(
+    wire: &ColumnarMsgpackBatch,
+    precision: Precision,
+) -> Result<Vec<u8>, HyperbytedbError> {
+    if wire.field.is_empty() {
+        return Err(HyperbytedbError::ColumnarMsgpackParse {
+            reason: "field name must be non-empty".into(),
+        });
+    }
+    let n = wire.values.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+
+    let ts_raw: Vec<i64> = if let Some(ref ts) = wire.timestamps {
+        if ts.len() != n {
+            return Err(HyperbytedbError::ColumnarMsgpackParse {
+                reason: format!(
+                    "timestamps length {} does not match values length {}",
+                    ts.len(),
+                    n
+                ),
+            });
+        }
+        ts.clone()
+    } else {
+        let now = chrono::Utc::now()
+            .timestamp_nanos_opt()
+            .ok_or(HyperbytedbError::WallClockTimestampUnavailable)?;
+        let raw = precision.from_nanos(now);
+        vec![raw; n]
+    };
+
+    let mut tags = String::new();
+    for (k, v) in &wire.tags {
+        let _ = write!(tags, ",{k}={v}");
+    }
+
+    let mut out = String::with_capacity(n.saturating_mul(64 + tags.len() + wire.field.len()));
+    for (i, value) in wire.values.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let _ = write!(
+            out,
+            "{}{tags} {}={value} {}",
+            wire.measurement, wire.field, ts_raw[i]
+        );
+    }
+    Ok(out.into_bytes())
+}
+
 /// Parses columnar msgpack map into `Vec<Point>` (`precision` matches `/write` query param).
 pub fn parse_columnar_msgpack_to_points(
     body: &[u8],
@@ -64,25 +168,7 @@ pub fn columnar_batch_to_points(
         return Ok(Vec::new());
     }
 
-    let precision_val = Precision::from_str_opt(precision);
-
-    let ts_ns_vec: Vec<i64> = if let Some(ref ts) = wire.timestamps {
-        if ts.len() != n {
-            return Err(HyperbytedbError::ColumnarMsgpackParse {
-                reason: format!(
-                    "timestamps length {} does not match values length {}",
-                    ts.len(),
-                    n
-                ),
-            });
-        }
-        ts.iter().map(|t| precision_val.to_nanos(*t)).collect()
-    } else {
-        let now = chrono::Utc::now()
-            .timestamp_nanos_opt()
-            .ok_or(HyperbytedbError::WallClockTimestampUnavailable)?;
-        vec![now; n]
-    };
+    let ts_ns_vec = columnar_timestamps_ns(wire, precision)?;
 
     let mut points = Vec::with_capacity(n);
     for (i, v) in wire.values.iter().enumerate() {
@@ -118,25 +204,7 @@ pub fn columnar_batch_to_record_batch(
         });
     }
 
-    let precision_val = Precision::from_str_opt(precision);
-
-    let ts_ns: Vec<i64> = if let Some(ref ts) = wire.timestamps {
-        if ts.len() != n {
-            return Err(HyperbytedbError::ColumnarMsgpackParse {
-                reason: format!(
-                    "timestamps length {} does not match values length {}",
-                    ts.len(),
-                    n
-                ),
-            });
-        }
-        ts.iter().map(|t| precision_val.to_nanos(*t)).collect()
-    } else {
-        let now = chrono::Utc::now()
-            .timestamp_nanos_opt()
-            .ok_or(HyperbytedbError::WallClockTimestampUnavailable)?;
-        vec![now; n]
-    };
+    let ts_ns = columnar_timestamps_ns(wire, precision)?;
 
     let mut fields = vec![Field::new(
         "time",

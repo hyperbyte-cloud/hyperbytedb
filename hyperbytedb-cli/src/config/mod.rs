@@ -101,6 +101,11 @@ impl ConnectionConfig {
         env_override_opt(&mut self.password, "INFLUX_PASSWORD");
     }
 
+    /// Validate credential pairs after profile/env/CLI flags are merged.
+    pub fn validate_credentials(&self) -> Result<()> {
+        crate::client::Credentials::from_config(self).validate()
+    }
+
     pub fn base_url(&self) -> String {
         if self.socket.is_some() {
             return String::new();

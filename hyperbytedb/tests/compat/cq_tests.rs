@@ -322,7 +322,7 @@ async fn advanced_every_cq_recomputes_current_hour_bucket() {
     );
 
     let run_at = Utc.with_ymd_and_hms(2016, 8, 28, 8, 30, 0).unwrap();
-    let window = coverage_window(run_at, &cq);
+    let window = coverage_window(run_at, &cq).unwrap();
     assert_eq!(
         window.start,
         Utc.with_ymd_and_hms(2016, 8, 28, 8, 0, 0).unwrap()

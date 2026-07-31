@@ -95,21 +95,16 @@ impl ReplicationApplyQueue {
     ) -> Arc<Self> {
         let depth = depth.max(1);
         let num_workers = num_workers.max(1);
-        let (tx, rx) = mpsc::channel::<ApplyJob>(depth);
-        let rx = Arc::new(tokio::sync::Mutex::new(rx));
+        let (tx, mut rx) = mpsc::channel::<ApplyJob>(depth);
         let sem = Arc::new(Semaphore::new(num_workers));
         let schema_cache = Arc::new(IngestSchemaCache::new());
 
-        let dispatch_rx = rx.clone();
         let dispatch_sem = sem.clone();
         tokio::spawn(async move {
             loop {
-                let job = {
-                    let mut guard = dispatch_rx.lock().await;
-                    match guard.recv().await {
-                        Some(j) => j,
-                        None => break,
-                    }
+                let job = match rx.recv().await {
+                    Some(j) => j,
+                    None => break,
                 };
 
                 let permit = match dispatch_sem.clone().acquire_owned().await {

@@ -70,9 +70,11 @@ COPY --from=builder /artifacts/hyperbytedb-proxy /usr/local/bin/hyperbytedb-prox
 
 # Same default port as hyperbytedb itself: clients (Grafana, Telegraf) flip
 # their endpoint URL to point at the proxy Service with no port change.
-EXPOSE 8086
+# Admin/probes listen on 8087 and are not exposed on the client Service.
+EXPOSE 8086 8087
 
 ENV HYPERBYTEDB_PROXY_LISTEN=0.0.0.0:8086 \
+    HYPERBYTEDB_PROXY_ADMIN_LISTEN=0.0.0.0:8087 \
     HYPERBYTEDB_PROXY_BACKEND_PORT=8086
 
 ENTRYPOINT ["/usr/local/bin/hyperbytedb-proxy"]

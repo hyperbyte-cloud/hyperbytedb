@@ -146,7 +146,7 @@ impl BatchingWal {
                     for (enqueued_at, tx) in responses {
                         histogram!("hyperbytedb_wal_batcher_response_seconds")
                             .record(now.duration_since(enqueued_at).as_secs_f64());
-                        let _ = tx.send(Err(HyperbytedbError::Wal(msg.clone())));
+                        let _ = tx.send(Err(HyperbytedbError::Wal(msg.clone().into())));
                     }
                 }
                 Err(e) => {
@@ -154,7 +154,7 @@ impl BatchingWal {
                     for (enqueued_at, tx) in responses {
                         histogram!("hyperbytedb_wal_batcher_response_seconds")
                             .record(now.duration_since(enqueued_at).as_secs_f64());
-                        let _ = tx.send(Err(HyperbytedbError::Internal(msg.clone())));
+                        let _ = tx.send(Err(HyperbytedbError::Internal(msg.clone().into())));
                     }
                 }
             }
@@ -163,9 +163,9 @@ impl BatchingWal {
 
     async fn enqueue(&self, bundle: WalAppendBundle) -> Result<u64, HyperbytedbError> {
         if !self.writer_alive.load(Ordering::SeqCst) {
-            return Err(HyperbytedbError::Wal(
-                "WAL batcher writer unavailable".into(),
-            ));
+            return Err(HyperbytedbError::Wal(crate::error::ChainedError::new(
+                "WAL batcher writer unavailable",
+            )));
         }
 
         // Serialize the durable WAL value here — on the parallel request task —
@@ -174,14 +174,14 @@ impl BatchingWal {
         // time, so this is safe and moves the per-point serialization cost off
         // the writer (the measured ingest bottleneck). ArrowIpc still encodes
         // inline because its payload is patched with the assigned seq.
-        let pre_encoded = if self.inner.wal_format() == WalFormat::Bincode {
-            Some(
-                bincode::serialize(&bundle.entry)
-                    .map_err(|e| HyperbytedbError::Wal(e.to_string()))?,
-            )
-        } else {
-            None
-        };
+        let pre_encoded =
+            if self.inner.wal_format() == WalFormat::Bincode {
+                Some(bincode::serialize(&bundle.entry).map_err(|e| {
+                    HyperbytedbError::Wal(crate::error::ChainedError::from_error(e))
+                })?)
+            } else {
+                None
+            };
         let (tx, rx) = oneshot::channel();
         let req = BatchRequest {
             bundle,
@@ -203,10 +203,17 @@ impl BatchingWal {
             self.sender.send(req).await
         };
 
-        send_result.map_err(|_| HyperbytedbError::Wal("WAL batcher channel closed".into()))?;
+        send_result.map_err(|_| {
+            HyperbytedbError::Wal(crate::error::ChainedError::new(
+                "WAL batcher channel closed",
+            ))
+        })?;
 
-        rx.await
-            .map_err(|_| HyperbytedbError::Wal("WAL batcher dropped response".into()))?
+        rx.await.map_err(|_| {
+            HyperbytedbError::Wal(crate::error::ChainedError::new(
+                "WAL batcher dropped response",
+            ))
+        })?
     }
 }
 
@@ -265,6 +272,10 @@ impl WalPort for BatchingWal {
 
     async fn flush_wal(&self) -> Result<(), HyperbytedbError> {
         self.inner.flush_wal().await
+    }
+
+    async fn purge_database(&self, database: &str) -> Result<(), HyperbytedbError> {
+        self.inner.purge_database(database).await
     }
 }
 

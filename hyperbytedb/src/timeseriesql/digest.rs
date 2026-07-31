@@ -86,6 +86,9 @@ fn normalize_statement(stmt: &Statement) -> String {
         Statement::ShowMeasurements(s) => {
             out.push_str("show measurements");
             normalize_on_db(&mut out, &s.database);
+            if let Some(filter) = &s.measurement_filter {
+                normalize_key_selector(&mut out, "measurement", filter);
+            }
             normalize_show_tail(&mut out, &s.condition, &s.limit, &s.offset);
         }
         Statement::ShowTagKeys(s) => {
@@ -104,21 +107,7 @@ fn normalize_statement(stmt: &Statement) -> String {
                 out.push_str(" from ");
                 normalize_measurement(&mut out, m);
             }
-            match &s.tag_key {
-                TagKeySelector::All => out.push_str(" with key = *"),
-                TagKeySelector::Eq(k) => {
-                    write!(out, " with key = {}", k).ok();
-                }
-                TagKeySelector::Neq(k) => {
-                    write!(out, " with key != {}", k).ok();
-                }
-                TagKeySelector::Regex(r) => {
-                    write!(out, " with key =~ /{}/", r).ok();
-                }
-                TagKeySelector::In(keys) => {
-                    write!(out, " with key in ({})", keys.join(", ")).ok();
-                }
-            }
+            normalize_key_selector(&mut out, "key", &s.tag_key);
             normalize_show_tail(&mut out, &s.condition, &s.limit, &s.offset);
         }
         Statement::ShowFieldKeys(s) => {
@@ -208,6 +197,16 @@ fn normalize_statement(stmt: &Statement) -> String {
         }
     }
     out
+}
+
+fn normalize_key_selector(out: &mut String, label: &str, selector: &TagKeySelector) {
+    match selector {
+        TagKeySelector::All => write!(out, " with {label} = *").ok(),
+        TagKeySelector::Eq(k) => write!(out, " with {label} = {k}").ok(),
+        TagKeySelector::Neq(k) => write!(out, " with {label} != {k}").ok(),
+        TagKeySelector::Regex(r) => write!(out, " with {label} =~ /{r}/").ok(),
+        TagKeySelector::In(keys) => write!(out, " with {label} in ({})", keys.join(", ")).ok(),
+    };
 }
 
 fn normalize_on_db(out: &mut String, database: &Option<String>) {

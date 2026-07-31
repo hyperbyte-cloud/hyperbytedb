@@ -127,15 +127,23 @@ impl QueryServiceImpl {
         self
     }
 
+    async fn with_query_timeout<T>(
+        &self,
+        fut: impl std::future::Future<Output = Result<T, HyperbytedbError>>,
+    ) -> Result<T, HyperbytedbError> {
+        let timeout = std::time::Duration::from_secs(self.query_timeout_secs);
+        match tokio::time::timeout(timeout, fut).await {
+            Ok(result) => result,
+            Err(_) => Err(HyperbytedbError::QueryTimeout),
+        }
+    }
+
     /// Execute one InfluxDB v1-style continuous query run at `now`.
     pub async fn execute_continuous_query(
         &self,
         cq: &mut ContinuousQueryDef,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<CqRunResult, HyperbytedbError> {
-        use metrics::{counter, histogram};
-        use std::time::Instant;
-
         cq.normalize()?;
         if !should_run(now, cq) {
             return Err(HyperbytedbError::QueryParse(
@@ -143,8 +151,20 @@ impl QueryServiceImpl {
             ));
         }
 
+        self.with_query_timeout(self.execute_continuous_query_inner(cq, now))
+            .await
+    }
+
+    async fn execute_continuous_query_inner(
+        &self,
+        cq: &mut ContinuousQueryDef,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<CqRunResult, HyperbytedbError> {
+        use metrics::{counter, histogram};
+        use std::time::Instant;
+
         let started = Instant::now();
-        let window = coverage_window(now, cq);
+        let window = coverage_window(now, cq)?;
         let start_nanos = window.start.timestamp_nanos_opt().unwrap_or(0);
         let end_nanos = window.end.timestamp_nanos_opt().unwrap_or(0);
 
@@ -388,7 +408,6 @@ impl QueryService for QueryServiceImpl {
         retention_policy: Option<&str>,
         caller: Option<&crate::domain::user::StoredUser>,
     ) -> Result<QueryResponse, HyperbytedbError> {
-        let timeout = std::time::Duration::from_secs(self.query_timeout_secs);
         let caller_owned = caller.cloned();
         let fut = async {
             let stmts = crate::timeseriesql::parse(query)?;
@@ -455,10 +474,9 @@ impl QueryService for QueryServiceImpl {
             Ok(QueryResponse { results })
         };
 
-        match tokio::time::timeout(timeout, fut).await {
-            Ok(result) => result,
-            Err(_) => Err(HyperbytedbError::QueryTimeout),
-        }
+        // Fail the whole HTTP response on timeout; mutating statements executed before
+        // expiry remain committed (Influx-style best-effort batch semantics).
+        self.with_query_timeout(fut).await
     }
 
     async fn execute_continuous_query(
@@ -534,8 +552,9 @@ async fn execute_statement(
             let rp = resolve_retention_policy_for_select(svc.metadata.as_ref(), db, None, query_rp)
                 .await?;
             let names = list_measurements_for_rp(svc, db, &rp).await?;
+            let filtered = filter_names_by_selector(&names, s.measurement_filter.as_ref());
             let columns = vec!["name".to_string()];
-            let values: Vec<Vec<serde_json::Value>> = names
+            let values: Vec<Vec<serde_json::Value>> = filtered
                 .iter()
                 .map(|n| vec![serde_json::Value::String(n.clone())])
                 .collect();
@@ -628,25 +647,8 @@ async fn execute_statement(
                     .await?
             };
 
-            let matching_keys: Vec<String> = match &s.tag_key {
-                TagKeySelector::All => all_tag_keys,
-                TagKeySelector::Eq(k) => vec![k.clone()],
-                TagKeySelector::Neq(k) => all_tag_keys.into_iter().filter(|tk| tk != k).collect(),
-                TagKeySelector::Regex(pattern) => match regex::Regex::new(pattern) {
-                    Ok(re) => all_tag_keys
-                        .into_iter()
-                        .filter(|tk| re.is_match(tk))
-                        .collect(),
-                    Err(_) => vec![],
-                },
-                TagKeySelector::In(keys) => {
-                    let key_set: std::collections::HashSet<&String> = keys.iter().collect();
-                    all_tag_keys
-                        .into_iter()
-                        .filter(|tk| key_set.contains(tk))
-                        .collect()
-                }
-            };
+            let matching_keys: Vec<String> =
+                filter_names_by_selector(&all_tag_keys, Some(&s.tag_key));
 
             let mut all_values = Vec::new();
             for tag_key in &matching_keys {
@@ -744,51 +746,14 @@ async fn execute_statement(
             })
         }
         Statement::DropDatabase(name) => {
-            svc.metadata
-                .get_database(name)
-                .await?
-                .ok_or_else(|| HyperbytedbError::DatabaseNotFound(name.clone()))?;
-            // Snapshot measurements + retention policies before
-            // metadata drops them so the native sink can DROP TABLE
-            // each backing chDB table.
-            let to_drop: Vec<(String, String)> = {
-                let rps = svc
-                    .metadata
-                    .list_retention_policies(name)
-                    .await
-                    .unwrap_or_default();
-                let measurements = svc
-                    .metadata
-                    .list_measurements(name)
-                    .await
-                    .unwrap_or_default();
-                let mut pairs = Vec::with_capacity(rps.len() * measurements.len());
-                for rp in &rps {
-                    for m in &measurements {
-                        pairs.push((rp.name.clone(), m.clone()));
-                    }
-                }
-                pairs
-            };
-            if let Err(e) = svc.mv_service.drop_all_in_database(name).await {
-                tracing::warn!(
-                    db = name,
-                    error = %e,
-                    "failed to cascade-drop materialized views for database"
-                );
-            }
-            svc.metadata.drop_database(name).await?;
-            for (rp, m) in &to_drop {
-                if let Err(e) = svc.points_sink.drop_measurement(name, rp, m).await {
-                    tracing::warn!(
-                        db = name,
-                        rp = %rp,
-                        measurement = %m,
-                        error = %e,
-                        "failed to drop chDB native table during DROP DATABASE"
-                    );
-                }
-            }
+            crate::application::database_drop::drop_database(
+                &svc.metadata,
+                Some(&svc.mv_service),
+                Some(&svc.points_sink),
+                Some(&svc.wal),
+                name,
+            )
+            .await?;
             Ok(StatementResult {
                 statement_id,
                 series: Some(vec![]),
@@ -1248,7 +1213,9 @@ async fn execute_statement(
             admin,
         } => {
             let password_hash = crate::adapters::http::auth_middleware::hash_password(password)
-                .map_err(|e| HyperbytedbError::Internal(e.to_string()))?;
+                .map_err(|e| {
+                    HyperbytedbError::Internal(crate::error::ChainedError::from_error(e))
+                })?;
             svc.metadata
                 .create_user(username, &password_hash, *admin)
                 .await?;
@@ -1270,7 +1237,9 @@ async fn execute_statement(
             let existing = svc.metadata.get_user(username).await?;
             let is_admin = existing.map(|u| u.admin).unwrap_or(false);
             let password_hash = crate::adapters::http::auth_middleware::hash_password(password)
-                .map_err(|e| HyperbytedbError::Internal(e.to_string()))?;
+                .map_err(|e| {
+                    HyperbytedbError::Internal(crate::error::ChainedError::from_error(e))
+                })?;
             svc.metadata
                 .create_user(username, &password_hash, is_admin)
                 .await?;
@@ -1426,9 +1395,9 @@ fn parse_chdb_json_line(line: &str) -> Result<serde_json::Value, HyperbytedbErro
     if let Ok(v) = serde_json::from_str(&fixed) {
         return Ok(v);
     }
-    Err(HyperbytedbError::Internal(format!(
-        "chDB JSON line parse (after non-JSON float sanitize): {line:.256}"
-    )))
+    Err(HyperbytedbError::Internal(
+        format!("chDB JSON line parse (after non-JSON float sanitize): {line:.256}").into(),
+    ))
 }
 
 fn parse_json_each_row_to_series(
@@ -1865,7 +1834,7 @@ async fn execute_select_from_source(
                 select_with_expanded_group_by(select_stmt, &sub_tag_keys);
             let sub_sql = to_clickhouse::translate_native_table(
                 &sub_stmt_expanded,
-                &table,
+                table.as_str(),
                 sub_effective_mapping.as_ref(),
                 sub_series_join,
                 Some((time_min, time_max)),
@@ -1944,7 +1913,7 @@ async fn execute_measurement_query(
         });
     let mut sql = to_clickhouse::translate_native_table(
         &effective_stmt,
-        &table,
+        table.as_str(),
         effective_mapping.as_ref(),
         series_join,
         Some((time_min, time_max)),
@@ -1975,6 +1944,33 @@ fn select_with_expanded_group_by(
     let mut effective = stmt.clone();
     effective.group_by = Some(expanded_gb);
     (effective, resolved_tags)
+}
+
+/// Influx compat: invalid SHOW regex patterns yield no matches (empty series).
+fn filter_strings_by_show_regex(items: Vec<String>, pattern: &str) -> Vec<String> {
+    match Regex::new(pattern) {
+        Ok(re) => items.into_iter().filter(|s| re.is_match(s)).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn filter_names_by_selector(names: &[String], selector: Option<&TagKeySelector>) -> Vec<String> {
+    match selector {
+        None | Some(TagKeySelector::All) => names.to_vec(),
+        Some(TagKeySelector::Eq(k)) => names.iter().filter(|n| *n == k).cloned().collect(),
+        Some(TagKeySelector::Neq(k)) => names.iter().filter(|n| *n != k).cloned().collect(),
+        Some(TagKeySelector::Regex(pattern)) => {
+            filter_strings_by_show_regex(names.to_vec(), pattern)
+        }
+        Some(TagKeySelector::In(keys)) => {
+            let key_set: std::collections::HashSet<&String> = keys.iter().collect();
+            names
+                .iter()
+                .filter(|n| key_set.contains(n))
+                .cloned()
+                .collect()
+        }
+    }
 }
 
 fn regex_pattern_matches(pattern: &str) -> Box<dyn Fn(&str) -> bool + '_> {
@@ -2037,7 +2033,8 @@ async fn list_measurements_for_rp(
     let all = svc.metadata.list_measurements(db).await?;
     let mut names = Vec::new();
     for measurement in all {
-        let table = unquoted_table_name(db, rp, &measurement);
+        let table_ident = unquoted_table_name(db, rp, &measurement);
+        let table = table_ident.as_str();
         let sql = format!(
             "SELECT count() FROM system.tables WHERE database = 'default' AND name = '{table}' FORMAT TabSeparated"
         );
@@ -2083,7 +2080,7 @@ async fn tag_keys_from_series_table(
     let mut keys: Vec<String> = mapping
         .tag_keys
         .iter()
-        .filter(|logical| phys_cols.contains(&mapping.tag_column_name(logical)))
+        .filter(|logical| phys_cols.contains(&mapping.physical_tag_column_name(logical)))
         .cloned()
         .collect();
     keys.sort();
@@ -2114,7 +2111,7 @@ async fn tag_values_for_measurement(
     let Some(mapping) = mapping else {
         return Ok(Vec::new());
     };
-    let phys = mapping.tag_column_name(tag_key);
+    let phys = mapping.physical_tag_column_name(tag_key);
     if !series_table_columns(svc, db, rp, measurement)
         .await?
         .contains(&phys)
@@ -2145,7 +2142,8 @@ async fn fact_table_columns(
     measurement: &str,
 ) -> Result<Vec<String>, HyperbytedbError> {
     use crate::domain::chdb_naming::unquoted_table_name;
-    let table = unquoted_table_name(db, rp, measurement);
+    let table_ident = unquoted_table_name(db, rp, measurement);
+    let table = table_ident.as_str();
     let sql = format!(
         "SELECT name FROM system.columns WHERE table = '{}' AND name NOT IN ('series_id', 'time', 'origin_node_id', 'ingest_seq') FORMAT TabSeparated",
         table.replace('\'', "''")
@@ -2165,7 +2163,8 @@ async fn series_table_columns(
     rp: &str,
     measurement: &str,
 ) -> Result<std::collections::HashSet<String>, HyperbytedbError> {
-    let table = unquoted_series_table_name(db, rp, measurement);
+    let table_ident = unquoted_series_table_name(db, rp, measurement);
+    let table = table_ident.as_str();
     let sql = format!(
         "SELECT name FROM system.columns WHERE table = '{}' AND name != 'series_id' FORMAT TabSeparated",
         table.replace('\'', "''")
@@ -2489,5 +2488,22 @@ mod auth_tests {
             "mine",
             "ALTER RETENTION POLICY autogen ON mine DURATION 1h",
         );
+    }
+}
+
+#[cfg(test)]
+mod show_regex_tests {
+    use super::filter_strings_by_show_regex;
+
+    #[test]
+    fn invalid_show_regex_returns_empty() {
+        assert!(filter_strings_by_show_regex(vec!["host".into()], "[invalid").is_empty());
+    }
+
+    #[test]
+    fn valid_show_regex_filters() {
+        let keys = vec!["host".into(), "region".into()];
+        let out = filter_strings_by_show_regex(keys, "^ho");
+        assert_eq!(out, vec!["host".to_string()]);
     }
 }

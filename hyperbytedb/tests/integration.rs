@@ -102,6 +102,7 @@ fn setup(dir: &tempfile::TempDir) -> (Arc<AppState>, Arc<FlushServiceImpl>) {
         drain_service: None,
         raft: None,
         auth_enabled: false,
+        auth_allow_query_param_credentials: false,
         prometheus_handle: None,
         statement_summary: None,
         statement_summary_require_auth: true,
@@ -186,6 +187,7 @@ async fn test_auth_blocks_unauthenticated() {
         drain_service: None,
         raft: None,
         auth_enabled: true,
+        auth_allow_query_param_credentials: false,
         prometheus_handle: None,
         statement_summary: None,
         statement_summary_require_auth: true,
@@ -224,13 +226,23 @@ async fn test_auth_blocks_unauthenticated() {
         .unwrap();
     assert_eq!(
         resp.status(),
-        StatusCode::OK,
-        "Authenticated query should succeed"
+        StatusCode::UNAUTHORIZED,
+        "Query-param credentials should be rejected when allow_query_param_credentials is false"
     );
 
     let resp = client
         .get(format!("{url}/query"))
-        .query(&[("q", "SHOW DATABASES"), ("u", "admin"), ("p", "wrong")])
+        .query(&[("q", "SHOW DATABASES")])
+        .basic_auth("admin", Some("secret123"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "Basic auth should succeed");
+
+    let resp = client
+        .get(format!("{url}/query"))
+        .query(&[("q", "SHOW DATABASES")])
+        .basic_auth("admin", Some("wrong"))
         .send()
         .await
         .unwrap();
@@ -289,6 +301,7 @@ async fn test_cardinality_limit() {
         drain_service: None,
         raft: None,
         auth_enabled: false,
+        auth_allow_query_param_credentials: false,
         prometheus_handle: None,
         statement_summary: None,
         statement_summary_require_auth: true,
@@ -437,6 +450,7 @@ async fn test_metrics_endpoint() {
         drain_service: None,
         raft: None,
         auth_enabled: false,
+        auth_allow_query_param_credentials: false,
         prometheus_handle: Some(prometheus_handle),
         statement_summary: None,
         statement_summary_require_auth: true,
@@ -773,6 +787,7 @@ async fn test_rate_limiter_refills_and_denies() {
         drain_service: None,
         raft: None,
         auth_enabled: false,
+        auth_allow_query_param_credentials: false,
         prometheus_handle: Some(prometheus_handle),
         statement_summary: None,
         statement_summary_require_auth: true,
@@ -929,6 +944,7 @@ async fn test_cross_database_on_clause_requires_authorization() {
         drain_service: None,
         raft: None,
         auth_enabled: true,
+        auth_allow_query_param_credentials: true,
         prometheus_handle: None,
         statement_summary: None,
         statement_summary_require_auth: true,

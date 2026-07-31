@@ -34,7 +34,7 @@ impl ReplicationHintPayload {
         let rp = self.retention_policy.as_bytes();
         if db.len() > u32::MAX as usize || rp.len() > u32::MAX as usize {
             return Err(crate::error::HyperbytedbError::Internal(
-                "replication hint: db/rp name too long".into(),
+                crate::error::ChainedError::new("replication hint: db/rp name too long"),
             ));
         }
         let prec_bytes = self
@@ -44,12 +44,12 @@ impl ReplicationHintPayload {
             .unwrap_or_default();
         if prec_bytes.len() > u16::MAX as usize {
             return Err(crate::error::HyperbytedbError::Internal(
-                "replication hint: precision too long".into(),
+                crate::error::ChainedError::new("replication hint: precision too long"),
             ));
         }
         if self.line_body.len() > u64::MAX as usize {
             return Err(crate::error::HyperbytedbError::Internal(
-                "replication hint: body too large".into(),
+                crate::error::ChainedError::new("replication hint: body too large"),
             ));
         }
 
@@ -77,14 +77,16 @@ impl ReplicationHintPayload {
     pub fn decode_hint_value(data: &[u8]) -> Result<Self, crate::error::HyperbytedbError> {
         if data.len() < 4 || &data[0..4] != HH_MAGIC {
             return Err(crate::error::HyperbytedbError::Internal(
-                "replication hint: bad magic or unsupported legacy format".into(),
+                crate::error::ChainedError::new(
+                    "replication hint: bad magic or unsupported legacy format",
+                ),
             ));
         }
         let mut i = 4;
         let read_u32 = |buf: &[u8], i: &mut usize| -> Result<u32, crate::error::HyperbytedbError> {
             if *i + 4 > buf.len() {
                 return Err(crate::error::HyperbytedbError::Internal(
-                    "replication hint: truncated".into(),
+                    crate::error::ChainedError::new("replication hint: truncated"),
                 ));
             }
             let mut arr = [0u8; 4];
@@ -95,7 +97,7 @@ impl ReplicationHintPayload {
         let read_u16 = |buf: &[u8], i: &mut usize| -> Result<u16, crate::error::HyperbytedbError> {
             if *i + 2 > buf.len() {
                 return Err(crate::error::HyperbytedbError::Internal(
-                    "replication hint: truncated".into(),
+                    crate::error::ChainedError::new("replication hint: truncated"),
                 ));
             }
             let mut arr = [0u8; 2];
@@ -106,7 +108,7 @@ impl ReplicationHintPayload {
         let read_u64 = |buf: &[u8], i: &mut usize| -> Result<u64, crate::error::HyperbytedbError> {
             if *i + 8 > buf.len() {
                 return Err(crate::error::HyperbytedbError::Internal(
-                    "replication hint: truncated".into(),
+                    crate::error::ChainedError::new("replication hint: truncated"),
                 ));
             }
             let mut arr = [0u8; 8];
@@ -118,28 +120,32 @@ impl ReplicationHintPayload {
         let dlen = read_u32(data, &mut i)? as usize;
         if i + dlen > data.len() {
             return Err(crate::error::HyperbytedbError::Internal(
-                "replication hint: truncated db".into(),
+                crate::error::ChainedError::new("replication hint: truncated db"),
             ));
         }
         let database = std::str::from_utf8(&data[i..i + dlen])
-            .map_err(|e| crate::error::HyperbytedbError::Internal(e.to_string()))?
+            .map_err(|e| {
+                crate::error::HyperbytedbError::Internal(crate::error::ChainedError::from_error(e))
+            })?
             .to_string();
         i += dlen;
 
         let rlen = read_u32(data, &mut i)? as usize;
         if i + rlen > data.len() {
             return Err(crate::error::HyperbytedbError::Internal(
-                "replication hint: truncated rp".into(),
+                crate::error::ChainedError::new("replication hint: truncated rp"),
             ));
         }
         let retention_policy = std::str::from_utf8(&data[i..i + rlen])
-            .map_err(|e| crate::error::HyperbytedbError::Internal(e.to_string()))?
+            .map_err(|e| {
+                crate::error::HyperbytedbError::Internal(crate::error::ChainedError::from_error(e))
+            })?
             .to_string();
         i += rlen;
 
         if i >= data.len() {
             return Err(crate::error::HyperbytedbError::Internal(
-                "replication hint: missing flags".into(),
+                crate::error::ChainedError::new("replication hint: missing flags"),
             ));
         }
         let prec_flag = data[i];
@@ -150,18 +156,22 @@ impl ReplicationHintPayload {
                 let plen = read_u16(data, &mut i)? as usize;
                 if i + plen > data.len() {
                     return Err(crate::error::HyperbytedbError::Internal(
-                        "replication hint: truncated precision".into(),
+                        crate::error::ChainedError::new("replication hint: truncated precision"),
                     ));
                 }
                 let p = std::str::from_utf8(&data[i..i + plen])
-                    .map_err(|e| crate::error::HyperbytedbError::Internal(e.to_string()))?
+                    .map_err(|e| {
+                        crate::error::HyperbytedbError::Internal(
+                            crate::error::ChainedError::from_error(e),
+                        )
+                    })?
                     .to_string();
                 i += plen;
                 Some(p)
             }
             _ => {
                 return Err(crate::error::HyperbytedbError::Internal(
-                    "replication hint: bad precision flag".into(),
+                    crate::error::ChainedError::new("replication hint: bad precision flag"),
                 ));
             }
         };
@@ -169,7 +179,7 @@ impl ReplicationHintPayload {
         let blen = read_u64(data, &mut i)? as usize;
         if i + blen > data.len() {
             return Err(crate::error::HyperbytedbError::Internal(
-                "replication hint: truncated body".into(),
+                crate::error::ChainedError::new("replication hint: truncated body"),
             ));
         }
         let line_body = data[i..i + blen].to_vec();

@@ -266,7 +266,7 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("{e}");
+            eprintln!("{e:#}");
             ExitCode::from(1)
         }
     }
@@ -361,6 +361,7 @@ fn build_connection(cli: &Cli) -> hyperbytedb_cli::error::Result<ConnectionConfi
         conn.url_prefix = cli.url_prefix.clone();
     }
 
+    conn.validate_credentials()?;
     Ok(conn)
 }
 

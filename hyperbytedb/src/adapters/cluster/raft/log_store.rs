@@ -19,13 +19,15 @@ use rocksdb::{
 };
 
 use crate::application::materialized_view_service::MaterializedViewService;
+use crate::application::schema_mutation_apply::{self, SchemaMutationDeps};
 use crate::domain::cluster::membership::{NodeInfo, NodeState, SharedMembership};
 use crate::ports::metadata::MetadataPort;
+use crate::ports::points_sink::PointsSinkPort;
+use crate::ports::wal::WalPort;
 
 use super::TypeConfig;
 use super::state_machine::StateMachineData;
 use super::types::{ClusterRequest, ClusterResponse};
-use crate::application::schema_mutation_apply;
 
 const CF_META: &str = "meta";
 const CF_LOGS: &str = "logs";
@@ -92,6 +94,8 @@ pub struct RaftStore {
     shared_membership: SharedMembership,
     metadata: Option<Arc<dyn MetadataPort>>,
     mv_service: Option<Arc<MaterializedViewService>>,
+    points_sink: Option<Arc<dyn PointsSinkPort>>,
+    wal: Option<Arc<dyn WalPort>>,
 }
 
 impl RaftStore {
@@ -164,6 +168,8 @@ impl RaftStore {
             shared_membership,
             metadata: None,
             mv_service: None,
+            points_sink: None,
+            wal: None,
         })
     }
 
@@ -262,6 +268,16 @@ impl RaftStore {
         self
     }
 
+    pub fn with_points_sink(mut self, points_sink: Arc<dyn PointsSinkPort>) -> Self {
+        self.points_sink = Some(points_sink);
+        self
+    }
+
+    pub fn with_wal(mut self, wal: Arc<dyn WalPort>) -> Self {
+        self.wal = Some(wal);
+        self
+    }
+
     pub fn shared_membership(&self) -> &SharedMembership {
         &self.shared_membership
     }
@@ -279,6 +295,7 @@ impl RaftStore {
                 ))
             })?;
             db.put_cf(&cf, KEY_VOTE, &bytes).map_err(storage_io_err)?;
+            db.flush_wal(true).map_err(storage_io_err)?;
             Ok::<(), StorageError<u64>>(())
         })
         .await
@@ -304,6 +321,7 @@ impl RaftStore {
             })?;
             db.put_cf(&cf, KEY_LAST_PURGED, &bytes)
                 .map_err(storage_io_err)?;
+            db.flush_wal(true).map_err(storage_io_err)?;
             Ok(())
         })
         .await
@@ -451,6 +469,8 @@ impl RaftStorage<TypeConfig> for RaftStore {
             shared_membership: self.shared_membership.clone(),
             metadata: self.metadata.clone(),
             mv_service: self.mv_service.clone(),
+            points_sink: self.points_sink.clone(),
+            wal: self.wal.clone(),
         }
     }
 
@@ -481,6 +501,7 @@ impl RaftStorage<TypeConfig> for RaftStore {
                 batch.put_cf(&cf, u64_to_be(index), val);
             }
             db.write(batch).map_err(storage_io_err)?;
+            db.flush_wal(true).map_err(storage_io_err)?;
             Ok::<(), StorageError<u64>>(())
         })
         .await
@@ -532,6 +553,7 @@ impl RaftStorage<TypeConfig> for RaftStore {
             let to = u64_to_be(index + 1);
             db.delete_range_cf(&cf, &from, &to)
                 .map_err(storage_io_err)?;
+            db.flush_wal(true).map_err(storage_io_err)?;
             Ok::<(), StorageError<u64>>(())
         })
         .await
@@ -615,6 +637,8 @@ impl RaftStorage<TypeConfig> for RaftStore {
             shared_membership: self.shared_membership.clone(),
             metadata: self.metadata.clone(),
             mv_service: self.mv_service.clone(),
+            points_sink: self.points_sink.clone(),
+            wal: self.wal.clone(),
         }
     }
 
@@ -837,8 +861,12 @@ impl RaftStore {
             ClusterRequest::SchemaMutation(mutation) => {
                 if let Some(ref metadata) = self.metadata {
                     match schema_mutation_apply::apply_schema_mutation(
-                        metadata,
-                        self.mv_service.as_deref(),
+                        SchemaMutationDeps {
+                            metadata,
+                            mv_service: self.mv_service.as_deref(),
+                            points_sink: self.points_sink.as_ref(),
+                            wal: self.wal.as_ref(),
+                        },
                         *mutation,
                     )
                     .await

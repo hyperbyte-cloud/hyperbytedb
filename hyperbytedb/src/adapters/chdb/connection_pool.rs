@@ -35,18 +35,22 @@ pub struct ChdbConnectionPool {
 impl ChdbConnectionPool {
     /// Open `pool_size` connections to `data_path` (same `--path` for all).
     pub fn open(data_path: &str, pool_size: usize) -> Result<Self, HyperbytedbError> {
-        std::fs::create_dir_all(data_path)
-            .map_err(|e| HyperbytedbError::Chdb(format!("failed to create chDB data dir: {e}")))?;
+        std::fs::create_dir_all(data_path).map_err(|e| {
+            HyperbytedbError::Chdb(format!("failed to create chDB data dir: {e}").into())
+        })?;
 
         let pool_size = clamp_pool_size(pool_size);
         let path_arg = format!("--path={data_path}");
         let mut slots = Vec::with_capacity(pool_size);
         for i in 0..pool_size {
             let conn = Connection::open(&[&path_arg]).map_err(|e| {
-                HyperbytedbError::Chdb(format!(
-                    "failed to open chDB connection {} / {pool_size} at {data_path}: {e}",
-                    i + 1
-                ))
+                HyperbytedbError::Chdb(
+                    format!(
+                        "failed to open chDB connection {} / {pool_size} at {data_path}: {e}",
+                        i + 1
+                    )
+                    .into(),
+                )
             })?;
             slots.push(Mutex::new(conn));
         }

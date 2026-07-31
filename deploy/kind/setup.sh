@@ -481,14 +481,13 @@ show_access_info() {
     echo -e "${BOLD}════════════════════════════════════════════════${NC}"
     echo
     echo -e "  ${BOLD}Quick test:${NC}"
-    echo -e "    curl -s http://localhost:8086/ping            ${CYAN}# proxied to a backend${NC}"
-    echo -e "    curl -s http://localhost:8086/health          ${CYAN}# proxied to a backend${NC}"
-    echo -e "    curl -s http://localhost:8086/readyz          ${CYAN}# proxy itself${NC}"
-    echo -e "    curl -s http://localhost:8086/admin/backends  ${CYAN}# proxy view of backends${NC}"
+    echo -e "    curl -s 'http://localhost:8086/query?q=SHOW+DATABASES' ${CYAN}# public listener${NC}"
+    echo -e "    curl -s http://localhost:8087/readyz          ${CYAN}# proxy admin listener${NC}"
+    echo -e "    curl -s http://localhost:8087/admin/backends  ${CYAN}# proxy view of backends${NC}"
     echo
-    echo -e "  ${BOLD}Inspect cluster:${NC}"
+    echo -e "  ${BOLD}Inspect cluster (direct to DB pods, not via proxy):${NC}"
+    echo -e "    kubectl port-forward -n hyperbytedb pod/hyperbytedb-0 8086:8086"
     echo -e "    curl -s http://localhost:8086/cluster/metrics | jq ."
-    echo -e "    curl -s http://localhost:8086/internal/sync/manifest | jq ."
     echo
     echo -e "  ${BOLD}Run load test:${NC}"
     echo -e "    bash scripts/load.sh cluster 127.0.0.1 8086"

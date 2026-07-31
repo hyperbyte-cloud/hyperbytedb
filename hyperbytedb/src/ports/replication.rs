@@ -18,7 +18,10 @@ pub struct OutboundReplicationBatch {
 /// Outbound write/mutation replication to cluster peers.
 #[async_trait]
 pub trait ReplicationPort: Send + Sync {
-    fn replicate_write(self: Arc<Self>, batch: OutboundReplicationBatch);
+    fn replicate_write(
+        self: Arc<Self>,
+        batch: OutboundReplicationBatch,
+    ) -> Result<(), HyperbytedbError>;
 
     async fn replicate_write_sync(
         self: Arc<Self>,
@@ -28,6 +31,11 @@ pub trait ReplicationPort: Send + Sync {
     ) -> Result<(), HyperbytedbError>;
 
     fn replicate_mutation(self: Arc<Self>, req: MutationRequest);
+
+    async fn replicate_mutation_sync(
+        self: Arc<Self>,
+        req: MutationRequest,
+    ) -> Result<(), HyperbytedbError>;
 
     async fn active_peer_count(&self, self_node_id: u64) -> usize;
 }

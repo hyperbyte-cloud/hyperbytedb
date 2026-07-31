@@ -120,6 +120,7 @@ impl HttpTestContext {
             drain_service: None,
             raft: None,
             auth_enabled: false,
+            auth_allow_query_param_credentials: false,
             prometheus_handle: None,
             statement_summary: None,
             statement_summary_require_auth: true,

@@ -139,8 +139,8 @@ Global flags work before or after subcommands (e.g. `hyperbytedb-cli query -host
 |----------|-------------|
 | `HYPERBYTEDB_HOST` | Server URL |
 | `HYPERBYTEDB_DATABASE` | Default database |
-| `HYPERBYTEDB_USERNAME` | Username |
-| `HYPERBYTEDB_PASSWORD` | Password |
+| `HYPERBYTEDB_USERNAME` | Username (must be paired with password) |
+| `HYPERBYTEDB_PASSWORD` | Password (must be paired with username) |
 | `HYPERBYTEDB_CLI_CONFIG` | Path to config file |
 | `HYPERBYTEDB_CLI_HISTORY` | REPL history file (default `~/.hyperbytedb_history`) |
 
@@ -162,6 +162,10 @@ username = "reader"
 ```
 
 Use `--profile prod` to select a profile. Passwords should be supplied via environment variables or prompts, not stored in the config file.
+
+### Authentication
+
+The CLI sends credentials via the HTTP `Authorization: Basic …` header (never as `u`/`p` query parameters). **Both username and password are required when either is set** — InfluxDB v1’s token-style `Authorization: Token username:` (username without password) is not supported. Supply `-password` (or `-p ""` to prompt), set `HYPERBYTEDB_PASSWORD`, or use the REPL `auth` command. Anonymous access works when neither credential is configured.
 
 ---
 
@@ -190,7 +194,7 @@ These are handled locally and are **not** sent to `/query`:
 | `history` | History hint (use up-arrow) |
 | `exit`, `quit` | Exit shell |
 
-Any other input is TimeseriesQL. Semicolon-separated statements run in sequence.
+Any other input is TimeseriesQL. Semicolon-separated statements run in sequence; semicolons inside single- or double-quoted strings and regex literals do not split the batch.
 
 ---
 

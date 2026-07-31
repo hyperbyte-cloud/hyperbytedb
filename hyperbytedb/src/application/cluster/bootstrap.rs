@@ -118,12 +118,9 @@ impl ClusterBootstrap {
             self.peer_addrs.clone(),
         );
 
-        let has_data = metadata
-            .list_databases()
-            .await
-            .map(|dbs| !dbs.is_empty())
-            .unwrap_or(false);
-        let wal_seq = wal.last_sequence().await.unwrap_or(0);
+        let dbs = metadata.list_databases().await?;
+        let has_data = !dbs.is_empty();
+        let wal_seq = wal.last_sequence().await?;
 
         const MAX_RETRIES: u32 = 5;
         let is_new_node = !has_data && wal_seq == 0;
@@ -237,19 +234,20 @@ impl ClusterBootstrap {
         config: &ClusterConfig,
         metadata: Arc<dyn MetadataPort>,
         mv_service: Arc<crate::application::materialized_view_service::MaterializedViewService>,
-    ) -> Option<HyperbytedbRaft> {
+        points_sink: Arc<dyn PointsSinkPort>,
+        wal: Arc<dyn WalPort>,
+    ) -> anyhow::Result<HyperbytedbRaft> {
         use crate::adapters::cluster::raft::log_store::RaftStore;
         use crate::adapters::cluster::raft::network::Network;
         use openraft::Config as RaftConfig;
         use openraft::storage::Adaptor;
 
-        let raft_store = match RaftStore::open(&config.raft_dir, self.membership.clone()) {
-            Ok(store) => store.with_metadata(metadata).with_mv_service(mv_service),
-            Err(e) => {
-                tracing::error!(error = %e, "failed to open raft store");
-                return None;
-            }
-        };
+        let raft_store = RaftStore::open(&config.raft_dir, self.membership.clone())
+            .map_err(|e| anyhow::anyhow!("failed to open raft store: {e}"))?
+            .with_metadata(metadata)
+            .with_mv_service(mv_service)
+            .with_points_sink(points_sink)
+            .with_wal(wal);
         // Push the persisted Raft membership into the data-plane SharedMembership
         // BEFORE handing the store to openraft. Without this, a restarted leader's
         // log is fully applied so no Membership entries replay during catch-up
@@ -260,27 +258,23 @@ impl ClusterBootstrap {
             .await;
         let (log_store, state_machine) = Adaptor::<TypeConfig, RaftStore>::new(raft_store);
 
-        let network = Network::new();
+        let network = Network::new(config.raft_rpc_timeout_secs);
 
-        let raft_config = match (RaftConfig {
-            heartbeat_interval: config.raft_heartbeat_interval_ms.unwrap_or(1000),
-            election_timeout_min: config.raft_election_timeout_ms.unwrap_or(1000),
-            election_timeout_max: config.raft_election_timeout_ms.unwrap_or(1000) * 2,
-            snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(
-                config.raft_snapshot_threshold.unwrap_or(1000) as u64,
-            ),
-            ..Default::default()
-        })
-        .validate()
-        {
-            Ok(c) => Arc::new(c),
-            Err(e) => {
-                tracing::error!(error = %e, "invalid raft config; cluster will not start");
-                return None;
-            }
-        };
+        let raft_config = Arc::new(
+            (RaftConfig {
+                heartbeat_interval: config.raft_heartbeat_interval_ms.unwrap_or(1000),
+                election_timeout_min: config.raft_election_timeout_ms.unwrap_or(1000),
+                election_timeout_max: config.raft_election_timeout_ms.unwrap_or(1000) * 2,
+                snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(
+                    config.raft_snapshot_threshold.unwrap_or(1000) as u64,
+                ),
+                ..Default::default()
+            })
+            .validate()
+            .map_err(|e| anyhow::anyhow!("invalid raft config: {e}"))?,
+        );
 
-        match HyperbytedbRaft::new(
+        let raft = HyperbytedbRaft::new(
             config.node_id,
             raft_config,
             network,
@@ -288,31 +282,25 @@ impl ClusterBootstrap {
             state_machine,
         )
         .await
-        {
-            Ok(raft) => {
-                tracing::info!(
-                    node_id = config.node_id,
-                    "raft consensus engine initialized"
-                );
+        .map_err(|e| anyhow::anyhow!("failed to initialize raft: {e}"))?;
 
-                if config.node_id == 1 {
-                    use std::collections::BTreeMap;
-                    let mut members = BTreeMap::new();
-                    members.insert(
-                        config.node_id,
-                        openraft::BasicNode::new(config.cluster_addr.clone()),
-                    );
-                    if let Err(e) = raft.initialize(members).await {
-                        tracing::debug!(error = %e, "raft already initialized (expected on restart)");
-                    }
-                }
+        tracing::info!(
+            node_id = config.node_id,
+            "raft consensus engine initialized"
+        );
 
-                Some(raft)
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "failed to initialize raft");
-                None
+        if config.node_id == 1 {
+            use std::collections::BTreeMap;
+            let mut members = BTreeMap::new();
+            members.insert(
+                config.node_id,
+                openraft::BasicNode::new(config.cluster_addr.clone()),
+            );
+            if let Err(e) = raft.initialize(members).await {
+                tracing::debug!(error = %e, "raft already initialized (expected on restart)");
             }
         }
+
+        Ok(raft)
     }
 }

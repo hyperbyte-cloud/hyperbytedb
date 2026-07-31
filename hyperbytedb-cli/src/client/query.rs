@@ -167,6 +167,15 @@ impl HyperbytedbClient {
     }
 
     pub async fn query_raw(&self, q: &str, opts: &QueryOptions) -> Result<String> {
+        let resp = if q.len() > 2048 {
+            self.query_raw_post(q, opts).await?
+        } else {
+            self.query_raw_get(q, opts).await?
+        };
+        self.finish_query_raw(resp)
+    }
+
+    async fn query_raw_get(&self, q: &str, opts: &QueryOptions) -> Result<super::RawResponse> {
         let query = self.build_query_string(q, opts)?;
         let mut headers = self.accept_header(opts.format);
         for (k, v) in self.auth_headers() {
@@ -176,10 +185,37 @@ impl HyperbytedbClient {
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
+        self.request("GET", "/query", &query, &header_refs, None)
+            .await
+    }
 
-        let resp = self
-            .request("GET", "/query", &query, &header_refs, None)
-            .await?;
+    async fn query_raw_post(&self, q: &str, opts: &QueryOptions) -> Result<super::RawResponse> {
+        let body_pairs = self.build_body_pairs(q, opts)?;
+        let encoded =
+            serde_urlencoded::to_string(&body_pairs).map_err(|e| CliError::Query(e.to_string()))?;
+        let mut headers = vec![(
+            "Content-Type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        )];
+        headers.extend(self.accept_header(opts.format));
+        for (k, v) in self.auth_headers() {
+            headers.push((k, v));
+        }
+        let header_refs: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        self.request(
+            "POST",
+            "/query",
+            "",
+            &header_refs,
+            Some(encoded.into_bytes()),
+        )
+        .await
+    }
+
+    fn finish_query_raw(&self, resp: super::RawResponse) -> Result<String> {
         if !(200..300).contains(&resp.status) {
             let body = String::from_utf8_lossy(&resp.body);
             return Err(CliError::from_status(

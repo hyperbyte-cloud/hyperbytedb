@@ -232,8 +232,9 @@ impl RocksDbMetadata {
         let cfs = vec![ColumnFamilyDescriptor::new(META_CF, cf_opts)];
 
         let db = Arc::new(
-            rocksdb::DB::open_cf_descriptors(&opts, path, cfs)
-                .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?,
+            rocksdb::DB::open_cf_descriptors(&opts, path, cfs).map_err(|e| {
+                HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+            })?,
         );
 
         Ok(Self {
@@ -253,30 +254,48 @@ impl RocksDbMetadata {
     }
 }
 
+async fn meta_blocking<T, F>(f: F) -> Result<T, HyperbytedbError>
+where
+    F: FnOnce() -> Result<T, HyperbytedbError> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f).await.map_err(|e| {
+        HyperbytedbError::Metadata(crate::error::ChainedError::with_context(
+            "metadata task panicked",
+            e,
+        ))
+    })?
+}
+
 #[async_trait]
 impl MetadataPort for RocksDbMetadata {
     async fn create_database(&self, name: &str) -> Result<(), HyperbytedbError> {
-        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
-            HyperbytedbError::Metadata("metadata column family not found".to_string())
-        })?;
+        let rdb = self.db.clone();
+        let name_owned = name.to_string();
         let key = db_key(name);
-        if self
-            .db
-            .get_cf(&cf, &key)
-            .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?
-            .is_some()
-        {
-            return Ok(());
-        }
         let db = Database::new(name);
         let value = serde_json::to_vec(&DbValue {
             database: db.clone(),
         })
-        .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-        self.db
-            .put_cf(&cf, key, value)
-            .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-        self.db_cache.write().insert(name.to_string(), db);
+        .map_err(|e| HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e)))?;
+        meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            if rdb
+                .get_cf(&cf, &key)
+                .map_err(|e| HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e)))?
+                .is_some()
+            {
+                return Ok(());
+            }
+            rdb.put_cf(&cf, key, value).map_err(|e| {
+                HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+            })?;
+            Ok(())
+        })
+        .await?;
+        self.db_cache.write().insert(name_owned, db);
         Ok(())
     }
 
@@ -324,18 +343,24 @@ impl MetadataPort for RocksDbMetadata {
             r.is_default = r.name == db_obj.default_rp;
         }
 
-        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
-            HyperbytedbError::Metadata("metadata column family not found".to_string())
-        })?;
+        let rdb = self.db.clone();
+        let db_name = stmt.name.clone();
         let key = db_key(&stmt.name);
         let value = serde_json::to_vec(&DbValue {
             database: db_obj.clone(),
         })
-        .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-        self.db
-            .put_cf(&cf, key, value)
-            .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-        self.db_cache.write().insert(stmt.name.clone(), db_obj);
+        .map_err(|e| HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e)))?;
+        meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            rdb.put_cf(&cf, key, value).map_err(|e| {
+                HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+            })?;
+            Ok(())
+        })
+        .await?;
+        self.db_cache.write().insert(db_name, db_obj);
         Ok(())
     }
 
@@ -380,18 +405,24 @@ impl MetadataPort for RocksDbMetadata {
             }
         }
 
-        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
-            HyperbytedbError::Metadata("metadata column family not found".to_string())
-        })?;
+        let rdb = self.db.clone();
+        let db_name = db.to_string();
         let key = db_key(db);
         let value = serde_json::to_vec(&DbValue {
             database: db_obj.clone(),
         })
-        .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-        self.db
-            .put_cf(&cf, key, value)
-            .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-        self.db_cache.write().insert(db.to_string(), db_obj);
+        .map_err(|e| HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e)))?;
+        meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            rdb.put_cf(&cf, key, value).map_err(|e| {
+                HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+            })?;
+            Ok(())
+        })
+        .await?;
+        self.db_cache.write().insert(db_name, db_obj);
         Ok(())
     }
 
@@ -408,7 +439,7 @@ impl MetadataPort for RocksDbMetadata {
         let meas_filter = measurement.map(str::to_string);
         let removed = tokio::task::spawn_blocking(move || {
             let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
-                HyperbytedbError::Metadata("metadata column family not found".to_string())
+                HyperbytedbError::Metadata("metadata column family not found".into())
             })?;
             let prefix = if let Some(ref m) = meas_filter {
                 format!("series:{db_s}:{rp_s}:{m}:")
@@ -423,7 +454,9 @@ impl MetadataPort for RocksDbMetadata {
             );
             let mut keys_to_delete = Vec::new();
             for item in iter {
-                let (key, _) = item.map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+                let (key, _) = item.map_err(|e| {
+                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                })?;
                 if !key.starts_with(pbytes) {
                     break;
                 }
@@ -431,13 +464,19 @@ impl MetadataPort for RocksDbMetadata {
             }
             let count = keys_to_delete.len();
             for key in keys_to_delete {
-                rdb.delete_cf(&cf, key)
-                    .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+                rdb.delete_cf(&cf, key).map_err(|e| {
+                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                })?;
             }
             Ok::<usize, HyperbytedbError>(count)
         })
         .await
-        .map_err(|e| HyperbytedbError::Metadata(format!("metadata task panicked: {e}")))??;
+        .map_err(|e| {
+            HyperbytedbError::Metadata(crate::error::ChainedError::with_context(
+                "metadata task panicked",
+                e,
+            ))
+        })??;
 
         {
             let mut cache = self.series_known.write();
@@ -453,34 +492,39 @@ impl MetadataPort for RocksDbMetadata {
     }
 
     async fn drop_database(&self, name: &str) -> Result<(), HyperbytedbError> {
-        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
-            HyperbytedbError::Metadata("metadata column family not found".to_string())
-        })?;
-        let db_prefix = format!("db:{}", name);
-        let meas_prefix = format!("meas:{}:", name);
-        let tag_prefix = format!("tag_val:{}:", name);
-        let series_db_prefix = format!("series:{}:", name);
+        let rdb = self.db.clone();
+        let name_owned = name.to_string();
+        meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            let db_prefix = format!("db:{}", name_owned);
+            let meas_prefix = format!("meas:{}:", name_owned);
+            let tag_prefix = format!("tag_val:{}:", name_owned);
+            let series_db_prefix = format!("series:{}:", name_owned);
 
-        let iter =
-            self.db
-                .iterator_cf_opt(&cf, rocksdb::ReadOptions::default(), IteratorMode::Start);
-        let mut to_delete = Vec::new();
-        for item in iter {
-            if let Ok((key, _)) = item
-                && let Ok(k) = std::str::from_utf8(&key)
-                && (k.starts_with(&db_prefix)
-                    || k.starts_with(&meas_prefix)
-                    || k.starts_with(&tag_prefix)
-                    || k.starts_with(&series_db_prefix))
-            {
-                to_delete.push(key.to_vec());
+            let iter =
+                rdb.iterator_cf_opt(&cf, rocksdb::ReadOptions::default(), IteratorMode::Start);
+            let mut to_delete = Vec::new();
+            for item in iter {
+                if let Ok((key, _)) = item
+                    && let Ok(k) = std::str::from_utf8(&key)
+                    && (k.starts_with(&db_prefix)
+                        || k.starts_with(&meas_prefix)
+                        || k.starts_with(&tag_prefix)
+                        || k.starts_with(&series_db_prefix))
+                {
+                    to_delete.push(key.to_vec());
+                }
             }
-        }
-        for k in to_delete {
-            self.db
-                .delete_cf(&cf, k)
-                .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-        }
+            for k in to_delete {
+                rdb.delete_cf(&cf, k).map_err(|e| {
+                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                })?;
+            }
+            Ok(())
+        })
+        .await?;
         self.db_cache.write().remove(name);
         {
             let prefix = format!("{}:", name);
@@ -495,6 +539,7 @@ impl MetadataPort for RocksDbMetadata {
             self.tag_count_cache
                 .write()
                 .retain(|k, _| !k.starts_with(&count_prefix));
+            let series_db_prefix = format!("series:{}:", name);
             self.series_known
                 .write()
                 .retain(|k| !k.starts_with(&series_db_prefix));
@@ -507,27 +552,34 @@ impl MetadataPort for RocksDbMetadata {
     }
 
     async fn list_databases(&self) -> Result<Vec<Database>, HyperbytedbError> {
-        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
-            HyperbytedbError::Metadata("metadata column family not found".to_string())
-        })?;
-        let mut dbs = Vec::new();
-        let prefix = b"db:";
-        let iter = self.db.iterator_cf_opt(
-            &cf,
-            rocksdb::ReadOptions::default(),
-            IteratorMode::From(prefix, rocksdb::Direction::Forward),
-        );
+        let rdb = self.db.clone();
+        meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            let mut dbs = Vec::new();
+            let prefix = b"db:";
+            let iter = rdb.iterator_cf_opt(
+                &cf,
+                rocksdb::ReadOptions::default(),
+                IteratorMode::From(prefix, rocksdb::Direction::Forward),
+            );
 
-        for item in iter {
-            let (key, value) = item.map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-            if !key.starts_with(prefix) {
-                break;
+            for item in iter {
+                let (key, value) = item.map_err(|e| {
+                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                })?;
+                if !key.starts_with(prefix) {
+                    break;
+                }
+                let v: DbValue = serde_json::from_slice(&value).map_err(|e| {
+                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                })?;
+                dbs.push(v.database);
             }
-            let v: DbValue = serde_json::from_slice(&value)
-                .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-            dbs.push(v.database);
-        }
-        Ok(dbs)
+            Ok(dbs)
+        })
+        .await
     }
 
     async fn get_database(&self, name: &str) -> Result<Option<Database>, HyperbytedbError> {
@@ -542,20 +594,28 @@ impl MetadataPort for RocksDbMetadata {
         let name_owned = name.to_string();
         let result = tokio::task::spawn_blocking(move || {
             let cf = db.cf_handle(META_CF).ok_or_else(|| {
-                HyperbytedbError::Metadata("metadata column family not found".to_string())
+                HyperbytedbError::Metadata("metadata column family not found".into())
             })?;
             match db.get_cf(&cf, key) {
                 Ok(Some(v)) => {
-                    let dv: DbValue = serde_json::from_slice(&v)
-                        .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+                    let dv: DbValue = serde_json::from_slice(&v).map_err(|e| {
+                        HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                    })?;
                     Ok(Some(dv.database))
                 }
                 Ok(None) => Ok(None),
-                Err(e) => Err(HyperbytedbError::Metadata(e.to_string())),
+                Err(e) => Err(HyperbytedbError::Metadata(
+                    crate::error::ChainedError::from_error(e),
+                )),
             }
         })
         .await
-        .map_err(|e| HyperbytedbError::Metadata(format!("metadata task panicked: {e}")))?;
+        .map_err(|e| {
+            HyperbytedbError::Metadata(crate::error::ChainedError::with_context(
+                "metadata task panicked",
+                e,
+            ))
+        })?;
         if let Ok(Some(ref database)) = result {
             self.db_cache.write().insert(name_owned, database.clone());
         }
@@ -585,18 +645,24 @@ impl MetadataPort for RocksDbMetadata {
             }
         }
 
-        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
-            HyperbytedbError::Metadata("metadata column family not found".to_string())
-        })?;
+        let rdb = self.db.clone();
+        let db_name = db.to_string();
         let key = db_key(db);
         let value = serde_json::to_vec(&DbValue {
             database: db_opt.clone(),
         })
-        .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-        self.db
-            .put_cf(&cf, key, value)
-            .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-        self.db_cache.write().insert(db.to_string(), db_opt);
+        .map_err(|e| HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e)))?;
+        meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            rdb.put_cf(&cf, key, value).map_err(|e| {
+                HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+            })?;
+            Ok(())
+        })
+        .await?;
+        self.db_cache.write().insert(db_name, db_opt);
         Ok(())
     }
 
@@ -616,18 +682,24 @@ impl MetadataPort for RocksDbMetadata {
                 .unwrap_or_else(|| "autogen".to_string());
         }
 
-        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
-            HyperbytedbError::Metadata("metadata column family not found".to_string())
-        })?;
+        let rdb = self.db.clone();
+        let db_name = db.to_string();
         let key = db_key(db);
         let value = serde_json::to_vec(&DbValue {
             database: db_obj.clone(),
         })
-        .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-        self.db
-            .put_cf(&cf, key, value)
-            .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-        self.db_cache.write().insert(db.to_string(), db_obj);
+        .map_err(|e| HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e)))?;
+        meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            rdb.put_cf(&cf, key, value).map_err(|e| {
+                HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+            })?;
+            Ok(())
+        })
+        .await?;
+        self.db_cache.write().insert(db_name, db_obj);
         Ok(())
     }
 
@@ -660,17 +732,23 @@ impl MetadataPort for RocksDbMetadata {
         let rdb = self.db.clone();
         let key = meas_key(db, rp, &measurement.name);
         let value = serde_json::to_vec(measurement)
-            .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+            .map_err(|e| HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e)))?;
         tokio::task::spawn_blocking(move || {
             let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
-                HyperbytedbError::Metadata("metadata column family not found".to_string())
+                HyperbytedbError::Metadata("metadata column family not found".into())
             })?;
-            rdb.put_cf(&cf, key, value)
-                .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+            rdb.put_cf(&cf, key, value).map_err(|e| {
+                HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+            })?;
             Ok::<(), HyperbytedbError>(())
         })
         .await
-        .map_err(|e| HyperbytedbError::Metadata(format!("metadata task panicked: {e}")))??;
+        .map_err(|e| {
+            HyperbytedbError::Metadata(crate::error::ChainedError::with_context(
+                "metadata task panicked",
+                e,
+            ))
+        })??;
         self.meas_cache
             .write()
             .insert(cache_key, measurement.clone());
@@ -698,20 +776,28 @@ impl MetadataPort for RocksDbMetadata {
         let key = meas_key(db, rp, name);
         let result = tokio::task::spawn_blocking(move || {
             let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
-                HyperbytedbError::Metadata("metadata column family not found".to_string())
+                HyperbytedbError::Metadata("metadata column family not found".into())
             })?;
             match rdb.get_cf(&cf, key) {
                 Ok(Some(v)) => {
-                    let m: MeasurementMeta = serde_json::from_slice(&v)
-                        .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+                    let m: MeasurementMeta = serde_json::from_slice(&v).map_err(|e| {
+                        HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                    })?;
                     Ok(Some(m))
                 }
                 Ok(None) => Ok(None),
-                Err(e) => Err(HyperbytedbError::Metadata(e.to_string())),
+                Err(e) => Err(HyperbytedbError::Metadata(
+                    crate::error::ChainedError::from_error(e),
+                )),
             }
         })
         .await
-        .map_err(|e| HyperbytedbError::Metadata(format!("metadata task panicked: {e}")))?;
+        .map_err(|e| {
+            HyperbytedbError::Metadata(crate::error::ChainedError::with_context(
+                "metadata task panicked",
+                e,
+            ))
+        })?;
         if let Ok(Some(ref m)) = result {
             self.meas_cache.write().insert(cache_key, m.clone());
         }
@@ -729,32 +815,40 @@ impl MetadataPort for RocksDbMetadata {
             }
         }
 
-        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
-            HyperbytedbError::Metadata("metadata column family not found".to_string())
-        })?;
-        let mut names = Vec::new();
-        let prefix = meas_prefix(db);
-        let iter = self.db.iterator_cf_opt(
-            &cf,
-            rocksdb::ReadOptions::default(),
-            IteratorMode::From(prefix.as_slice(), rocksdb::Direction::Forward),
-        );
+        let rdb = self.db.clone();
+        let db_owned = db.to_string();
+        let names = meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            let mut names = Vec::new();
+            let prefix = meas_prefix(&db_owned);
+            let iter = rdb.iterator_cf_opt(
+                &cf,
+                rocksdb::ReadOptions::default(),
+                IteratorMode::From(prefix.as_slice(), rocksdb::Direction::Forward),
+            );
 
-        for item in iter {
-            let (key, _) = item.map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-            if !key.starts_with(&prefix) {
-                break;
+            for item in iter {
+                let (key, _) = item.map_err(|e| {
+                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                })?;
+                if !key.starts_with(&prefix) {
+                    break;
+                }
+                let rest = &key[prefix.len()..];
+                if let Ok(s) = std::str::from_utf8(rest) {
+                    // Key format: meas:{db}:{rp}:{name}, prefix strips meas:{db}:
+                    // so rest = "{rp}:{name}". Extract the last component as name.
+                    let name = s.split(':').next_back().unwrap_or(s);
+                    names.push(name.to_string());
+                }
             }
-            let rest = &key[prefix.len()..];
-            if let Ok(s) = std::str::from_utf8(rest) {
-                // Key format: meas:{db}:{rp}:{name}, prefix strips meas:{db}:
-                // so rest = "{rp}:{name}". Extract the last component as name.
-                let name = s.split(':').next_back().unwrap_or(s);
-                names.push(name.to_string());
-            }
-        }
-        names.sort();
-        names.dedup();
+            names.sort();
+            names.dedup();
+            Ok(names)
+        })
+        .await?;
 
         self.meas_list_cache
             .write()
@@ -767,28 +861,36 @@ impl MetadataPort for RocksDbMetadata {
         db: &str,
         rp: &str,
     ) -> Result<Vec<String>, HyperbytedbError> {
-        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
-            HyperbytedbError::Metadata("metadata column family not found".to_string())
-        })?;
-        let mut names = Vec::new();
-        let prefix = meas_rp_prefix(db, rp);
-        let iter = self.db.iterator_cf_opt(
-            &cf,
-            rocksdb::ReadOptions::default(),
-            IteratorMode::From(prefix.as_slice(), rocksdb::Direction::Forward),
-        );
-        for item in iter {
-            let (key, _) = item.map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-            if !key.starts_with(&prefix) {
-                break;
+        let rdb = self.db.clone();
+        let db_owned = db.to_string();
+        let rp_owned = rp.to_string();
+        meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            let mut names = Vec::new();
+            let prefix = meas_rp_prefix(&db_owned, &rp_owned);
+            let iter = rdb.iterator_cf_opt(
+                &cf,
+                rocksdb::ReadOptions::default(),
+                IteratorMode::From(prefix.as_slice(), rocksdb::Direction::Forward),
+            );
+            for item in iter {
+                let (key, _) = item.map_err(|e| {
+                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                })?;
+                if !key.starts_with(&prefix) {
+                    break;
+                }
+                let rest = &key[prefix.len()..];
+                if let Ok(s) = std::str::from_utf8(rest) {
+                    names.push(s.to_string());
+                }
             }
-            let rest = &key[prefix.len()..];
-            if let Ok(s) = std::str::from_utf8(rest) {
-                names.push(s.to_string());
-            }
-        }
-        names.sort();
-        Ok(names)
+            names.sort();
+            Ok(names)
+        })
+        .await
     }
 
     async fn check_field_types(
@@ -861,50 +963,60 @@ impl MetadataPort for RocksDbMetadata {
         tag_key: &str,
         measurement: Option<&str>,
     ) -> Result<Vec<String>, HyperbytedbError> {
-        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
-            HyperbytedbError::Metadata("metadata column family not found".to_string())
-        })?;
-        let mut values: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let prefix = tag_val_prefix(db, rp, measurement);
-        let iter = self.db.iterator_cf_opt(
-            &cf,
-            rocksdb::ReadOptions::default(),
-            IteratorMode::From(prefix.as_slice(), rocksdb::Direction::Forward),
-        );
+        let rdb = self.db.clone();
+        let db_owned = db.to_string();
+        let rp_owned = rp.to_string();
+        let tag_key_owned = tag_key.to_string();
+        let meas_filter = measurement.map(str::to_string);
+        meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            let mut values: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let prefix = tag_val_prefix(&db_owned, &rp_owned, meas_filter.as_deref());
+            let iter = rdb.iterator_cf_opt(
+                &cf,
+                rocksdb::ReadOptions::default(),
+                IteratorMode::From(prefix.as_slice(), rocksdb::Direction::Forward),
+            );
 
-        for item in iter {
-            let (key, _) = item.map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            let rest = &key[prefix.len()..];
-            if let Ok(s) = std::str::from_utf8(rest) {
-                // Key format: tag_val:{db}:{rp}:{meas}:{tag_key}:{tag_value}
-                // When meas is Some: prefix = tag_val:{db}:{rp}:{meas}:, rest = "{tag_key}:{tag_value}"
-                // When meas is None: prefix = tag_val:{db}:{rp}:, rest = "{meas}:{tag_key}:{tag_value}"
-                let (k, v) = if measurement.is_some() {
-                    let parts: Vec<&str> = s.splitn(2, ':').collect();
-                    if parts.len() == 2 {
-                        (parts[0], parts[1])
+            for item in iter {
+                let (key, _) = item.map_err(|e| {
+                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                })?;
+                if !key.starts_with(&prefix) {
+                    break;
+                }
+                let rest = &key[prefix.len()..];
+                if let Ok(s) = std::str::from_utf8(rest) {
+                    // Key format: tag_val:{db}:{rp}:{meas}:{tag_key}:{tag_value}
+                    // When meas is Some: prefix = tag_val:{db}:{rp}:{meas}:, rest = "{tag_key}:{tag_value}"
+                    // When meas is None: prefix = tag_val:{db}:{rp}:, rest = "{meas}:{tag_key}:{tag_value}"
+                    let (k, v) = if meas_filter.is_some() {
+                        let parts: Vec<&str> = s.splitn(2, ':').collect();
+                        if parts.len() == 2 {
+                            (parts[0], parts[1])
+                        } else {
+                            continue;
+                        }
                     } else {
-                        continue;
+                        let parts: Vec<&str> = s.splitn(3, ':').collect();
+                        if parts.len() == 3 {
+                            (parts[1], parts[2])
+                        } else {
+                            continue;
+                        }
+                    };
+                    if k == tag_key_owned {
+                        values.insert(v.to_string());
                     }
-                } else {
-                    let parts: Vec<&str> = s.splitn(3, ':').collect();
-                    if parts.len() == 3 {
-                        (parts[1], parts[2])
-                    } else {
-                        continue;
-                    }
-                };
-                if k == tag_key {
-                    values.insert(v.to_string());
                 }
             }
-        }
-        let mut result: Vec<_> = values.into_iter().collect();
-        result.sort();
-        Ok(result)
+            let mut result: Vec<_> = values.into_iter().collect();
+            result.sort();
+            Ok(result)
+        })
+        .await
     }
 
     async fn count_tag_values(
@@ -958,7 +1070,7 @@ impl MetadataPort for RocksDbMetadata {
         let rdb = self.db.clone();
         let counts = tokio::task::spawn_blocking(move || {
             let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
-                HyperbytedbError::Metadata("metadata column family not found".to_string())
+                HyperbytedbError::Metadata("metadata column family not found".into())
             })?;
             let prefix = b"tag_val:";
             let iter = rdb.iterator_cf_opt(
@@ -968,7 +1080,9 @@ impl MetadataPort for RocksDbMetadata {
             );
             let mut counts: HashMap<String, usize> = HashMap::new();
             for item in iter {
-                let (key, _) = item.map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+                let (key, _) = item.map_err(|e| {
+                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                })?;
                 if !key.starts_with(prefix) {
                     break;
                 }
@@ -982,7 +1096,12 @@ impl MetadataPort for RocksDbMetadata {
             Ok::<HashMap<String, usize>, HyperbytedbError>(counts)
         })
         .await
-        .map_err(|e| HyperbytedbError::Metadata(format!("metadata task panicked: {e}")))??;
+        .map_err(|e| {
+            HyperbytedbError::Metadata(crate::error::ChainedError::with_context(
+                "metadata task panicked",
+                e,
+            ))
+        })??;
 
         let warmed = counts.len();
         *self.tag_count_cache.write() = counts;
@@ -1008,8 +1127,9 @@ impl MetadataPort for RocksDbMetadata {
                 if cache.contains(&k) {
                     continue;
                 }
-                let value = serde_json::to_vec(tags)
-                    .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+                let value = serde_json::to_vec(tags).map_err(|e| {
+                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                })?;
                 out.push((k, value));
             }
             out
@@ -1021,18 +1141,24 @@ impl MetadataPort for RocksDbMetadata {
         let entries = novel.clone();
         tokio::task::spawn_blocking(move || {
             let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
-                HyperbytedbError::Metadata("metadata column family not found".to_string())
+                HyperbytedbError::Metadata("metadata column family not found".into())
             })?;
             let mut batch = rocksdb::WriteBatch::default();
             for (key, value) in &entries {
                 batch.put_cf(&cf, key.as_bytes(), value);
             }
-            rdb.write(batch)
-                .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+            rdb.write(batch).map_err(|e| {
+                HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+            })?;
             Ok::<(), HyperbytedbError>(())
         })
         .await
-        .map_err(|e| HyperbytedbError::Metadata(format!("metadata task panicked: {e}")))??;
+        .map_err(|e| {
+            HyperbytedbError::Metadata(crate::error::ChainedError::with_context(
+                "metadata task panicked",
+                e,
+            ))
+        })??;
         {
             let mut cache = self.series_known.write();
             for (k, _) in &novel {
@@ -1052,7 +1178,7 @@ impl MetadataPort for RocksDbMetadata {
         let prefix = series_prefix(db, rp, measurement);
         tokio::task::spawn_blocking(move || {
             let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
-                HyperbytedbError::Metadata("metadata column family not found".to_string())
+                HyperbytedbError::Metadata("metadata column family not found".into())
             })?;
             let pbytes = prefix.as_bytes();
             let iter = rdb.iterator_cf_opt(
@@ -1062,7 +1188,9 @@ impl MetadataPort for RocksDbMetadata {
             );
             let mut out = Vec::new();
             for item in iter {
-                let (key, value) = item.map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+                let (key, value) = item.map_err(|e| {
+                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                })?;
                 if !key.starts_with(pbytes) {
                     break;
                 }
@@ -1072,14 +1200,21 @@ impl MetadataPort for RocksDbMetadata {
                 let Ok(id) = u64::from_str_radix(&s[prefix.len()..], 16) else {
                     continue;
                 };
-                let tags: BTreeMap<String, String> = serde_json::from_slice(&value)
-                    .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+                let tags: BTreeMap<String, String> =
+                    serde_json::from_slice(&value).map_err(|e| {
+                        HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                    })?;
                 out.push((id, tags));
             }
             Ok::<Vec<(u64, BTreeMap<String, String>)>, HyperbytedbError>(out)
         })
         .await
-        .map_err(|e| HyperbytedbError::Metadata(format!("metadata task panicked: {e}")))?
+        .map_err(|e| {
+            HyperbytedbError::Metadata(crate::error::ChainedError::with_context(
+                "metadata task panicked",
+                e,
+            ))
+        })?
     }
 
     /// Key-only variant of [`Self::list_series`]: parses the `series_id` out of
@@ -1096,7 +1231,7 @@ impl MetadataPort for RocksDbMetadata {
         let prefix = series_prefix(db, rp, measurement);
         tokio::task::spawn_blocking(move || {
             let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
-                HyperbytedbError::Metadata("metadata column family not found".to_string())
+                HyperbytedbError::Metadata("metadata column family not found".into())
             })?;
             let pbytes = prefix.as_bytes();
             let iter = rdb.iterator_cf_opt(
@@ -1106,7 +1241,9 @@ impl MetadataPort for RocksDbMetadata {
             );
             let mut out = Vec::new();
             for item in iter {
-                let (key, _) = item.map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+                let (key, _) = item.map_err(|e| {
+                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                })?;
                 if !key.starts_with(pbytes) {
                     break;
                 }
@@ -1121,14 +1258,19 @@ impl MetadataPort for RocksDbMetadata {
             Ok::<Vec<u64>, HyperbytedbError>(out)
         })
         .await
-        .map_err(|e| HyperbytedbError::Metadata(format!("metadata task panicked: {e}")))?
+        .map_err(|e| {
+            HyperbytedbError::Metadata(crate::error::ChainedError::with_context(
+                "metadata task panicked",
+                e,
+            ))
+        })?
     }
 
     async fn warm_series(&self) -> Result<usize, HyperbytedbError> {
         let rdb = self.db.clone();
         let keys = tokio::task::spawn_blocking(move || {
             let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
-                HyperbytedbError::Metadata("metadata column family not found".to_string())
+                HyperbytedbError::Metadata("metadata column family not found".into())
             })?;
             let prefix = b"series:";
             let iter = rdb.iterator_cf_opt(
@@ -1138,7 +1280,9 @@ impl MetadataPort for RocksDbMetadata {
             );
             let mut keys: HashSet<String> = HashSet::new();
             for item in iter {
-                let (key, _) = item.map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+                let (key, _) = item.map_err(|e| {
+                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                })?;
                 if !key.starts_with(prefix) {
                     break;
                 }
@@ -1149,7 +1293,12 @@ impl MetadataPort for RocksDbMetadata {
             Ok::<HashSet<String>, HyperbytedbError>(keys)
         })
         .await
-        .map_err(|e| HyperbytedbError::Metadata(format!("metadata task panicked: {e}")))??;
+        .map_err(|e| {
+            HyperbytedbError::Metadata(crate::error::ChainedError::with_context(
+                "metadata task panicked",
+                e,
+            ))
+        })??;
 
         let warmed = keys.len();
         *self.series_known.write() = keys;
@@ -1200,18 +1349,24 @@ impl MetadataPort for RocksDbMetadata {
         let keys = novel.clone();
         tokio::task::spawn_blocking(move || {
             let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
-                HyperbytedbError::Metadata("metadata column family not found".to_string())
+                HyperbytedbError::Metadata("metadata column family not found".into())
             })?;
             let mut batch = rocksdb::WriteBatch::default();
             for key in &keys {
                 batch.put_cf(&cf, key.as_bytes(), b"1");
             }
-            rdb.write(batch)
-                .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+            rdb.write(batch).map_err(|e| {
+                HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+            })?;
             Ok::<(), HyperbytedbError>(())
         })
         .await
-        .map_err(|e| HyperbytedbError::Metadata(format!("metadata task panicked: {e}")))??;
+        .map_err(|e| {
+            HyperbytedbError::Metadata(crate::error::ChainedError::with_context(
+                "metadata task panicked",
+                e,
+            ))
+        })??;
         {
             let mut cache = self.tag_known.write();
             for k in &novel {
@@ -1272,8 +1427,9 @@ impl MetadataPort for RocksDbMetadata {
                             && existing.mean_fields == merged.mean_fields
                 );
                 if needs_write {
-                    let value = serde_json::to_vec(&merged)
-                        .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+                    let value = serde_json::to_vec(&merged).map_err(|e| {
+                        HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                    })?;
                     meas_updates.push((cache_key, value, merged));
                 }
             }
@@ -1304,7 +1460,7 @@ impl MetadataPort for RocksDbMetadata {
 
         tokio::task::spawn_blocking(move || {
             let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
-                HyperbytedbError::Metadata("metadata column family not found".to_string())
+                HyperbytedbError::Metadata("metadata column family not found".into())
             })?;
             let mut batch = rocksdb::WriteBatch::default();
             for (key, value) in &meas_keys {
@@ -1313,12 +1469,18 @@ impl MetadataPort for RocksDbMetadata {
             for key in &tag_keys {
                 batch.put_cf(&cf, key.as_bytes(), b"1");
             }
-            rdb.write(batch)
-                .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+            rdb.write(batch).map_err(|e| {
+                HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+            })?;
             Ok::<(), HyperbytedbError>(())
         })
         .await
-        .map_err(|e| HyperbytedbError::Metadata(format!("metadata task panicked: {e}")))??;
+        .map_err(|e| {
+            HyperbytedbError::Metadata(crate::error::ChainedError::with_context(
+                "metadata task panicked",
+                e,
+            ))
+        })??;
 
         // Phase 3: update caches
         if !meas_updates.is_empty() {
@@ -1359,9 +1521,8 @@ impl MetadataPort for RocksDbMetadata {
         password_hash: &str,
         admin: bool,
     ) -> Result<(), HyperbytedbError> {
-        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
-            HyperbytedbError::Metadata("metadata column family not found".to_string())
-        })?;
+        let rdb = self.db.clone();
+        let username_owned = username.to_string();
         let key = user_key(username);
         let user = StoredUser {
             password_hash: password_hash.to_string(),
@@ -1369,23 +1530,35 @@ impl MetadataPort for RocksDbMetadata {
             created_at: chrono::Utc::now().to_rfc3339(),
             privileges: Default::default(),
         };
-        let value =
-            serde_json::to_vec(&user).map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-        self.db
-            .put_cf(&cf, key, value)
-            .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-        self.user_cache.write().insert(username.to_string(), user);
+        let value = serde_json::to_vec(&user)
+            .map_err(|e| HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e)))?;
+        meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            rdb.put_cf(&cf, key, value).map_err(|e| {
+                HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+            })?;
+            Ok(())
+        })
+        .await?;
+        self.user_cache.write().insert(username_owned, user);
         Ok(())
     }
 
     async fn drop_user(&self, username: &str) -> Result<(), HyperbytedbError> {
-        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
-            HyperbytedbError::Metadata("metadata column family not found".to_string())
-        })?;
+        let rdb = self.db.clone();
         let key = user_key(username);
-        self.db
-            .delete_cf(&cf, key)
-            .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+        meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            rdb.delete_cf(&cf, key).map_err(|e| {
+                HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+            })?;
+            Ok(())
+        })
+        .await?;
         self.user_cache.write().remove(username);
         Ok(())
     }
@@ -1397,45 +1570,60 @@ impl MetadataPort for RocksDbMetadata {
                 return Ok(Some(user.clone()));
             }
         }
-        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
-            HyperbytedbError::Metadata("metadata column family not found".to_string())
-        })?;
+        let rdb = self.db.clone();
         let key = user_key(username);
-        match self.db.get_cf(&cf, key) {
-            Ok(Some(v)) => {
-                let user: StoredUser = serde_json::from_slice(&v)
-                    .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-                self.user_cache
-                    .write()
-                    .insert(username.to_string(), user.clone());
-                Ok(Some(user))
+        let username_owned = username.to_string();
+        let result = meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            match rdb.get_cf(&cf, key) {
+                Ok(Some(v)) => {
+                    let user: StoredUser = serde_json::from_slice(&v).map_err(|e| {
+                        HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                    })?;
+                    Ok(Some(user))
+                }
+                Ok(None) => Ok(None),
+                Err(e) => Err(HyperbytedbError::Metadata(
+                    crate::error::ChainedError::from_error(e),
+                )),
             }
-            Ok(None) => Ok(None),
-            Err(e) => Err(HyperbytedbError::Metadata(e.to_string())),
+        })
+        .await?;
+        if let Some(ref user) = result {
+            self.user_cache.write().insert(username_owned, user.clone());
         }
+        Ok(result)
     }
 
     async fn list_users(&self) -> Result<Vec<String>, HyperbytedbError> {
-        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
-            HyperbytedbError::Metadata("metadata column family not found".to_string())
-        })?;
-        let prefix = user_prefix();
-        let iter = self.db.iterator_cf_opt(
-            &cf,
-            rocksdb::ReadOptions::default(),
-            IteratorMode::From(prefix.as_slice(), rocksdb::Direction::Forward),
-        );
-        let mut names = Vec::new();
-        for item in iter {
-            let (key, _) = item.map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-            if !key.starts_with(&prefix) {
-                break;
+        let rdb = self.db.clone();
+        meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            let prefix = user_prefix();
+            let iter = rdb.iterator_cf_opt(
+                &cf,
+                rocksdb::ReadOptions::default(),
+                IteratorMode::From(prefix.as_slice(), rocksdb::Direction::Forward),
+            );
+            let mut names = Vec::new();
+            for item in iter {
+                let (key, _) = item.map_err(|e| {
+                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                })?;
+                if !key.starts_with(&prefix) {
+                    break;
+                }
+                if let Ok(s) = std::str::from_utf8(&key[prefix.len()..]) {
+                    names.push(s.to_string());
+                }
             }
-            if let Ok(s) = std::str::from_utf8(&key[prefix.len()..]) {
-                names.push(s.to_string());
-            }
-        }
-        Ok(names)
+            Ok(names)
+        })
+        .await
     }
 
     async fn grant_privilege(
@@ -1444,21 +1632,26 @@ impl MetadataPort for RocksDbMetadata {
         database: &str,
         privilege: crate::domain::user::DatabasePrivilege,
     ) -> Result<(), HyperbytedbError> {
-        let mut user = self
-            .get_user(username)
-            .await?
-            .ok_or_else(|| HyperbytedbError::Internal(format!("user not found: {username}")))?;
-        user.privileges.insert(database.to_string(), privilege);
-        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
-            HyperbytedbError::Metadata("metadata column family not found".to_string())
+        let mut user = self.get_user(username).await?.ok_or_else(|| {
+            HyperbytedbError::Internal(format!("user not found: {username}").into())
         })?;
+        user.privileges.insert(database.to_string(), privilege);
+        let rdb = self.db.clone();
+        let username_owned = username.to_string();
         let key = user_key(username);
-        let value =
-            serde_json::to_vec(&user).map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-        self.db
-            .put_cf(&cf, key, value)
-            .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-        self.user_cache.write().insert(username.to_string(), user);
+        let value = serde_json::to_vec(&user)
+            .map_err(|e| HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e)))?;
+        meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            rdb.put_cf(&cf, key, value).map_err(|e| {
+                HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+            })?;
+            Ok(())
+        })
+        .await?;
+        self.user_cache.write().insert(username_owned, user);
         Ok(())
     }
 
@@ -1467,21 +1660,26 @@ impl MetadataPort for RocksDbMetadata {
         username: &str,
         database: &str,
     ) -> Result<(), HyperbytedbError> {
-        let mut user = self
-            .get_user(username)
-            .await?
-            .ok_or_else(|| HyperbytedbError::Internal(format!("user not found: {username}")))?;
-        user.privileges.remove(database);
-        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
-            HyperbytedbError::Metadata("metadata column family not found".to_string())
+        let mut user = self.get_user(username).await?.ok_or_else(|| {
+            HyperbytedbError::Internal(format!("user not found: {username}").into())
         })?;
+        user.privileges.remove(database);
+        let rdb = self.db.clone();
+        let username_owned = username.to_string();
         let key = user_key(username);
-        let value =
-            serde_json::to_vec(&user).map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-        self.db
-            .put_cf(&cf, key, value)
-            .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-        self.user_cache.write().insert(username.to_string(), user);
+        let value = serde_json::to_vec(&user)
+            .map_err(|e| HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e)))?;
+        meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            rdb.put_cf(&cf, key, value).map_err(|e| {
+                HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+            })?;
+            Ok(())
+        })
+        .await?;
+        self.user_cache.write().insert(username_owned, user);
         Ok(())
     }
 
@@ -1491,42 +1689,51 @@ impl MetadataPort for RocksDbMetadata {
         rp: &str,
         name: &str,
     ) -> Result<(), HyperbytedbError> {
-        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
-            HyperbytedbError::Metadata("metadata column family not found".to_string())
-        })?;
+        let rdb = self.db.clone();
+        let db_owned = db.to_string();
+        let name_owned = name.to_string();
         let key = meas_key(db, rp, name);
-        self.db
-            .delete_cf(&cf, key)
-            .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+        let series_to_delete = meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            rdb.delete_cf(&cf, key).map_err(|e| {
+                HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+            })?;
 
-        // Sweep series rows for this measurement across all retention policies.
-        // The series key is rp-scoped (`series:{db}:{rp}:{meas}:{id}`) so we
-        // can't form a measurement-only prefix; scan `series:{db}:` and filter.
-        let series_db_prefix = format!("series:{}:", db);
-        let mut series_to_delete = Vec::new();
-        let iter = self.db.iterator_cf_opt(
-            &cf,
-            rocksdb::ReadOptions::default(),
-            IteratorMode::From(series_db_prefix.as_bytes(), rocksdb::Direction::Forward),
-        );
-        for item in iter {
-            let (key, _) = item.map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-            if !key.starts_with(series_db_prefix.as_bytes()) {
-                break;
+            // Sweep series rows for this measurement across all retention policies.
+            // The series key is rp-scoped (`series:{db}:{rp}:{meas}:{id}`) so we
+            // can't form a measurement-only prefix; scan `series:{db}:` and filter.
+            let series_db_prefix = format!("series:{}:", db_owned);
+            let mut series_to_delete = Vec::new();
+            let iter = rdb.iterator_cf_opt(
+                &cf,
+                rocksdb::ReadOptions::default(),
+                IteratorMode::From(series_db_prefix.as_bytes(), rocksdb::Direction::Forward),
+            );
+            for item in iter {
+                let (key, _) = item.map_err(|e| {
+                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                })?;
+                if !key.starts_with(series_db_prefix.as_bytes()) {
+                    break;
+                }
+                if let Ok(s) = std::str::from_utf8(&key)
+                    && let Some((kdb, _rp, kmeas, _id)) = parse_series_storage_key(s)
+                    && kdb == db_owned
+                    && kmeas == name_owned
+                {
+                    series_to_delete.push((key.to_vec(), s.to_string()));
+                }
             }
-            if let Ok(s) = std::str::from_utf8(&key)
-                && let Some((kdb, _rp, kmeas, _id)) = parse_series_storage_key(s)
-                && kdb == db
-                && kmeas == name
-            {
-                series_to_delete.push((key.to_vec(), s.to_string()));
+            for (k, _) in &series_to_delete {
+                rdb.delete_cf(&cf, k).map_err(|e| {
+                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                })?;
             }
-        }
-        for (k, _) in &series_to_delete {
-            self.db
-                .delete_cf(&cf, k)
-                .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-        }
+            Ok(series_to_delete)
+        })
+        .await?;
 
         let cache_key = format!("{}:{}:{}", db, rp, name);
         self.meas_cache.write().remove(&cache_key);
@@ -1558,14 +1765,20 @@ impl MetadataPort for RocksDbMetadata {
         measurement: &str,
         predicate_sql: &str,
     ) -> Result<String, HyperbytedbError> {
-        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
-            HyperbytedbError::Metadata("metadata column family not found".to_string())
-        })?;
+        let rdb = self.db.clone();
         let id = uuid::Uuid::new_v4().to_string();
         let key = format!("tombstone:{}:{}:{}:{}", db, rp, measurement, id);
-        self.db
-            .put_cf(&cf, key.as_bytes(), predicate_sql.as_bytes())
-            .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+        let predicate = predicate_sql.as_bytes().to_vec();
+        meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            rdb.put_cf(&cf, key.as_bytes(), &predicate).map_err(|e| {
+                HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+            })?;
+            Ok(())
+        })
+        .await?;
         let tomb_key = format!("{}:{}:{}", db, rp, measurement);
         self.tombstone_cache.write().remove(&tomb_key);
         Ok(id)
@@ -1585,28 +1798,38 @@ impl MetadataPort for RocksDbMetadata {
             }
         }
 
-        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
-            HyperbytedbError::Metadata("metadata column family not found".to_string())
-        })?;
-        let prefix = format!("tombstone:{}:{}:{}:", db, rp, measurement);
-        let prefix_bytes = prefix.as_bytes();
-        let iter = self.db.iterator_cf_opt(
-            &cf,
-            rocksdb::ReadOptions::default(),
-            IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward),
-        );
-        let mut results = Vec::new();
-        for item in iter {
-            let (key, value) = item.map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-            if !key.starts_with(prefix_bytes) {
-                break;
+        let rdb = self.db.clone();
+        let db_owned = db.to_string();
+        let rp_owned = rp.to_string();
+        let meas_owned = measurement.to_string();
+        let results = meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            let prefix = format!("tombstone:{}:{}:{}:", db_owned, rp_owned, meas_owned);
+            let prefix_bytes = prefix.as_bytes();
+            let iter = rdb.iterator_cf_opt(
+                &cf,
+                rocksdb::ReadOptions::default(),
+                IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward),
+            );
+            let mut results = Vec::new();
+            for item in iter {
+                let (key, value) = item.map_err(|e| {
+                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                })?;
+                if !key.starts_with(prefix_bytes) {
+                    break;
+                }
+                let id = std::str::from_utf8(&key[prefix.len()..])
+                    .unwrap_or("")
+                    .to_string();
+                let predicate = std::str::from_utf8(&value).unwrap_or("").to_string();
+                results.push((id, predicate));
             }
-            let id = std::str::from_utf8(&key[prefix.len()..])
-                .unwrap_or("")
-                .to_string();
-            let predicate = std::str::from_utf8(&value).unwrap_or("").to_string();
-            results.push((id, predicate));
-        }
+            Ok(results)
+        })
+        .await?;
 
         self.tombstone_cache
             .write()
@@ -1615,36 +1838,44 @@ impl MetadataPort for RocksDbMetadata {
     }
 
     async fn remove_tombstone(&self, db: &str, tombstone_id: &str) -> Result<(), HyperbytedbError> {
-        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
-            HyperbytedbError::Metadata("metadata column family not found".to_string())
-        })?;
-        let prefix = format!("tombstone:{}:", db);
-        let prefix_bytes = prefix.as_bytes();
-        let iter = self.db.iterator_cf_opt(
-            &cf,
-            rocksdb::ReadOptions::default(),
-            IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward),
-        );
-        for item in iter {
-            let (key, _) = item.map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-            if !key.starts_with(prefix_bytes) {
-                break;
-            }
-            if let Ok(k) = std::str::from_utf8(&key)
-                && k.ends_with(tombstone_id)
-            {
-                self.db
-                    .delete_cf(&cf, &key)
-                    .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-                // Invalidate all tombstone cache entries for this db
-                {
-                    let prefix = format!("{}:", db);
-                    self.tombstone_cache
-                        .write()
-                        .retain(|k, _| !k.starts_with(&prefix));
+        let rdb = self.db.clone();
+        let db_owned = db.to_string();
+        let tombstone_id_owned = tombstone_id.to_string();
+        let removed = meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            let prefix = format!("tombstone:{}:", db_owned);
+            let prefix_bytes = prefix.as_bytes();
+            let iter = rdb.iterator_cf_opt(
+                &cf,
+                rocksdb::ReadOptions::default(),
+                IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward),
+            );
+            for item in iter {
+                let (key, _) = item.map_err(|e| {
+                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                })?;
+                if !key.starts_with(prefix_bytes) {
+                    break;
                 }
-                return Ok(());
+                if let Ok(k) = std::str::from_utf8(&key)
+                    && k.ends_with(&tombstone_id_owned)
+                {
+                    rdb.delete_cf(&cf, &key).map_err(|e| {
+                        HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                    })?;
+                    return Ok(true);
+                }
             }
+            Ok(false)
+        })
+        .await?;
+        if removed {
+            let prefix = format!("{}:", db);
+            self.tombstone_cache
+                .write()
+                .retain(|k, _| !k.starts_with(&prefix));
         }
         Ok(())
     }
@@ -1655,15 +1886,20 @@ impl MetadataPort for RocksDbMetadata {
         name: &str,
         definition: &ContinuousQueryDef,
     ) -> Result<(), HyperbytedbError> {
-        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
-            HyperbytedbError::Metadata("metadata column family not found".to_string())
-        })?;
+        let rdb = self.db.clone();
         let key = format!("cq:{}:{}", db, name);
         let value = serde_json::to_vec(definition)
-            .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-        self.db
-            .put_cf(&cf, key.as_bytes(), value)
-            .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+            .map_err(|e| HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e)))?;
+        meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            rdb.put_cf(&cf, key.as_bytes(), value).map_err(|e| {
+                HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+            })?;
+            Ok(())
+        })
+        .await?;
         *self.cq_cache.write() = None;
         Ok(())
     }
@@ -1673,46 +1909,61 @@ impl MetadataPort for RocksDbMetadata {
         db: &str,
         name: &str,
     ) -> Result<Option<ContinuousQueryDef>, HyperbytedbError> {
-        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
-            HyperbytedbError::Metadata("metadata column family not found".to_string())
-        })?;
+        let rdb = self.db.clone();
         let key = format!("cq:{}:{}", db, name);
-        match self.db.get_cf(&cf, key.as_bytes()) {
-            Ok(Some(v)) => {
-                let def: ContinuousQueryDef = serde_json::from_slice(&v)
-                    .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-                Ok(Some(def))
+        meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            match rdb.get_cf(&cf, key.as_bytes()) {
+                Ok(Some(v)) => {
+                    let def: ContinuousQueryDef = serde_json::from_slice(&v).map_err(|e| {
+                        HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                    })?;
+                    Ok(Some(def))
+                }
+                Ok(None) => Ok(None),
+                Err(e) => Err(HyperbytedbError::Metadata(
+                    crate::error::ChainedError::from_error(e),
+                )),
             }
-            Ok(None) => Ok(None),
-            Err(e) => Err(HyperbytedbError::Metadata(e.to_string())),
-        }
+        })
+        .await
     }
 
     async fn list_continuous_queries(
         &self,
         db: &str,
     ) -> Result<Vec<ContinuousQueryDef>, HyperbytedbError> {
-        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
-            HyperbytedbError::Metadata("metadata column family not found".to_string())
-        })?;
-        let prefix = format!("cq:{}:", db);
-        let prefix_bytes = prefix.as_bytes();
-        let iter = self.db.iterator_cf_opt(
-            &cf,
-            rocksdb::ReadOptions::default(),
-            IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward),
-        );
-        let mut results = Vec::new();
-        for item in iter {
-            let (key, value) = item.map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-            if !key.starts_with(prefix_bytes) {
-                break;
+        let rdb = self.db.clone();
+        let db_owned = db.to_string();
+        meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            let prefix = format!("cq:{}:", db_owned);
+            let prefix_bytes = prefix.as_bytes();
+            let iter = rdb.iterator_cf_opt(
+                &cf,
+                rocksdb::ReadOptions::default(),
+                IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward),
+            );
+            let mut results = Vec::new();
+            for item in iter {
+                let (key, value) = item.map_err(|e| {
+                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                })?;
+                if !key.starts_with(prefix_bytes) {
+                    break;
+                }
+                let def: ContinuousQueryDef = serde_json::from_slice(&value).map_err(|e| {
+                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                })?;
+                results.push(def);
             }
-            let def: ContinuousQueryDef = serde_json::from_slice(&value)
-                .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-            results.push(def);
-        }
-        Ok(results)
+            Ok(results)
+        })
+        .await
     }
 
     async fn list_all_continuous_queries(
@@ -1725,38 +1976,51 @@ impl MetadataPort for RocksDbMetadata {
             }
         }
 
-        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
-            HyperbytedbError::Metadata("metadata column family not found".to_string())
-        })?;
-        let prefix = b"cq:";
-        let iter = self.db.iterator_cf_opt(
-            &cf,
-            rocksdb::ReadOptions::default(),
-            IteratorMode::From(prefix, rocksdb::Direction::Forward),
-        );
-        let mut results = Vec::new();
-        for item in iter {
-            let (key, value) = item.map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-            if !key.starts_with(prefix) {
-                break;
+        let rdb = self.db.clone();
+        let results = meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            let prefix = b"cq:";
+            let iter = rdb.iterator_cf_opt(
+                &cf,
+                rocksdb::ReadOptions::default(),
+                IteratorMode::From(prefix, rocksdb::Direction::Forward),
+            );
+            let mut results = Vec::new();
+            for item in iter {
+                let (key, value) = item.map_err(|e| {
+                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                })?;
+                if !key.starts_with(prefix) {
+                    break;
+                }
+                let def: ContinuousQueryDef = serde_json::from_slice(&value).map_err(|e| {
+                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                })?;
+                results.push(def);
             }
-            let def: ContinuousQueryDef = serde_json::from_slice(&value)
-                .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-            results.push(def);
-        }
+            Ok(results)
+        })
+        .await?;
 
         *self.cq_cache.write() = Some(results.clone());
         Ok(results)
     }
 
     async fn drop_continuous_query(&self, db: &str, name: &str) -> Result<(), HyperbytedbError> {
-        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
-            HyperbytedbError::Metadata("metadata column family not found".to_string())
-        })?;
+        let rdb = self.db.clone();
         let key = format!("cq:{}:{}", db, name);
-        self.db
-            .delete_cf(&cf, key.as_bytes())
-            .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+        meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            rdb.delete_cf(&cf, key.as_bytes()).map_err(|e| {
+                HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+            })?;
+            Ok(())
+        })
+        .await?;
         *self.cq_cache.write() = None;
         Ok(())
     }
@@ -1767,15 +2031,20 @@ impl MetadataPort for RocksDbMetadata {
         name: &str,
         definition: &MaterializedViewDef,
     ) -> Result<(), HyperbytedbError> {
-        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
-            HyperbytedbError::Metadata("metadata column family not found".to_string())
-        })?;
+        let rdb = self.db.clone();
         let key = format!("mv:{}:{}", db, name);
         let value = serde_json::to_vec(definition)
-            .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-        self.db
-            .put_cf(&cf, key.as_bytes(), value)
-            .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+            .map_err(|e| HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e)))?;
+        meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            rdb.put_cf(&cf, key.as_bytes(), value).map_err(|e| {
+                HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+            })?;
+            Ok(())
+        })
+        .await?;
         *self.mv_cache.write() = None;
         Ok(())
     }
@@ -1785,46 +2054,61 @@ impl MetadataPort for RocksDbMetadata {
         db: &str,
         name: &str,
     ) -> Result<Option<MaterializedViewDef>, HyperbytedbError> {
-        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
-            HyperbytedbError::Metadata("metadata column family not found".to_string())
-        })?;
+        let rdb = self.db.clone();
         let key = format!("mv:{}:{}", db, name);
-        match self.db.get_cf(&cf, key.as_bytes()) {
-            Ok(Some(v)) => {
-                let def: MaterializedViewDef = serde_json::from_slice(&v)
-                    .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-                Ok(Some(def))
+        meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            match rdb.get_cf(&cf, key.as_bytes()) {
+                Ok(Some(v)) => {
+                    let def: MaterializedViewDef = serde_json::from_slice(&v).map_err(|e| {
+                        HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                    })?;
+                    Ok(Some(def))
+                }
+                Ok(None) => Ok(None),
+                Err(e) => Err(HyperbytedbError::Metadata(
+                    crate::error::ChainedError::from_error(e),
+                )),
             }
-            Ok(None) => Ok(None),
-            Err(e) => Err(HyperbytedbError::Metadata(e.to_string())),
-        }
+        })
+        .await
     }
 
     async fn list_materialized_views(
         &self,
         db: &str,
     ) -> Result<Vec<MaterializedViewDef>, HyperbytedbError> {
-        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
-            HyperbytedbError::Metadata("metadata column family not found".to_string())
-        })?;
-        let prefix = format!("mv:{}:", db);
-        let prefix_bytes = prefix.as_bytes();
-        let iter = self.db.iterator_cf_opt(
-            &cf,
-            rocksdb::ReadOptions::default(),
-            IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward),
-        );
-        let mut results = Vec::new();
-        for item in iter {
-            let (key, value) = item.map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-            if !key.starts_with(prefix_bytes) {
-                break;
+        let rdb = self.db.clone();
+        let db_owned = db.to_string();
+        meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            let prefix = format!("mv:{}:", db_owned);
+            let prefix_bytes = prefix.as_bytes();
+            let iter = rdb.iterator_cf_opt(
+                &cf,
+                rocksdb::ReadOptions::default(),
+                IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward),
+            );
+            let mut results = Vec::new();
+            for item in iter {
+                let (key, value) = item.map_err(|e| {
+                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                })?;
+                if !key.starts_with(prefix_bytes) {
+                    break;
+                }
+                let def: MaterializedViewDef = serde_json::from_slice(&value).map_err(|e| {
+                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                })?;
+                results.push(def);
             }
-            let def: MaterializedViewDef = serde_json::from_slice(&value)
-                .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-            results.push(def);
-        }
-        Ok(results)
+            Ok(results)
+        })
+        .await
     }
 
     async fn list_all_materialized_views(
@@ -1837,38 +2121,51 @@ impl MetadataPort for RocksDbMetadata {
             }
         }
 
-        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
-            HyperbytedbError::Metadata("metadata column family not found".to_string())
-        })?;
-        let prefix = b"mv:";
-        let iter = self.db.iterator_cf_opt(
-            &cf,
-            rocksdb::ReadOptions::default(),
-            IteratorMode::From(prefix, rocksdb::Direction::Forward),
-        );
-        let mut results = Vec::new();
-        for item in iter {
-            let (key, value) = item.map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-            if !key.starts_with(prefix) {
-                break;
+        let rdb = self.db.clone();
+        let results = meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            let prefix = b"mv:";
+            let iter = rdb.iterator_cf_opt(
+                &cf,
+                rocksdb::ReadOptions::default(),
+                IteratorMode::From(prefix, rocksdb::Direction::Forward),
+            );
+            let mut results = Vec::new();
+            for item in iter {
+                let (key, value) = item.map_err(|e| {
+                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                })?;
+                if !key.starts_with(prefix) {
+                    break;
+                }
+                let def: MaterializedViewDef = serde_json::from_slice(&value).map_err(|e| {
+                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                })?;
+                results.push(def);
             }
-            let def: MaterializedViewDef = serde_json::from_slice(&value)
-                .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
-            results.push(def);
-        }
+            Ok(results)
+        })
+        .await?;
 
         *self.mv_cache.write() = Some(results.clone());
         Ok(results)
     }
 
     async fn drop_materialized_view(&self, db: &str, name: &str) -> Result<(), HyperbytedbError> {
-        let cf = self.db.cf_handle(META_CF).ok_or_else(|| {
-            HyperbytedbError::Metadata("metadata column family not found".to_string())
-        })?;
+        let rdb = self.db.clone();
         let key = format!("mv:{}:{}", db, name);
-        self.db
-            .delete_cf(&cf, key.as_bytes())
-            .map_err(|e| HyperbytedbError::Metadata(e.to_string()))?;
+        meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            rdb.delete_cf(&cf, key.as_bytes()).map_err(|e| {
+                HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+            })?;
+            Ok(())
+        })
+        .await?;
         *self.mv_cache.write() = None;
         Ok(())
     }

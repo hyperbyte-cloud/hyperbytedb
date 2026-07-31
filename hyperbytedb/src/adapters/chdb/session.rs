@@ -92,7 +92,9 @@ impl SharedSession {
         });
         match res {
             Ok(p) => Ok(Arc::clone(p)),
-            Err(msg) => Err(HyperbytedbError::Chdb(msg.clone())),
+            Err(msg) => Err(HyperbytedbError::Chdb(crate::error::ChainedError::new(
+                msg.clone(),
+            ))),
         }
     }
 

@@ -74,6 +74,12 @@ pub trait WalPort: Send + Sync {
     async fn truncate_before(&self, sequence: u64) -> Result<(), HyperbytedbError>;
     async fn last_sequence(&self) -> Result<u64, HyperbytedbError>;
 
+    /// Remove all durable and in-memory WAL entries for `database`.
+    async fn purge_database(&self, database: &str) -> Result<(), HyperbytedbError> {
+        let _ = database;
+        Ok(())
+    }
+
     /// Flush (fsync) the RocksDB WAL to physical media.
     /// Default no-op for non-RocksDB implementations.
     async fn flush_wal(&self) -> Result<(), HyperbytedbError> {

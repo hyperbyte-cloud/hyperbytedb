@@ -1,10 +1,56 @@
 use serde_json::Value;
 use thiserror::Error;
 
+/// Transport-layer failure (HTTP client, socket, body read).
+#[derive(Debug, Error)]
+pub enum ConnectionError {
+    #[error(transparent)]
+    Reqwest(#[from] reqwest::Error),
+
+    #[error(transparent)]
+    Hyper(#[from] hyper::Error),
+
+    #[error("{0}")]
+    Other(String),
+}
+
+impl ConnectionError {
+    pub fn is_timeout(&self) -> bool {
+        match self {
+            Self::Reqwest(e) => e.is_timeout(),
+            _ => false,
+        }
+    }
+}
+
+impl From<reqwest::Error> for CliError {
+    fn from(e: reqwest::Error) -> Self {
+        Self::Connection(e.into())
+    }
+}
+
+impl From<hyper::Error> for CliError {
+    fn from(e: hyper::Error) -> Self {
+        Self::Connection(e.into())
+    }
+}
+
+impl From<hyper::http::Error> for CliError {
+    fn from(e: hyper::http::Error) -> Self {
+        Self::Connection(ConnectionError::Other(e.to_string()))
+    }
+}
+
+impl From<hyper_util::client::legacy::Error> for CliError {
+    fn from(e: hyper_util::client::legacy::Error) -> Self {
+        Self::Connection(ConnectionError::Other(e.to_string()))
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum CliError {
-    #[error("connection failed: {0}")]
-    Connection(String),
+    #[error("connection failed")]
+    Connection(#[from] ConnectionError),
 
     #[error("authentication failed: {0}")]
     Auth(String),
@@ -140,5 +186,12 @@ mod tests {
         );
         assert!(matches!(err, CliError::Http { status: 400, .. }));
         assert_eq!(err.to_string(), "HTTP 400: query parse: missing GROUP BY");
+    }
+
+    #[test]
+    fn connection_error_has_source() {
+        let cli_err = CliError::Connection(ConnectionError::Other("refused".into()));
+        let debug = format!("{cli_err:?}");
+        assert!(debug.contains("Connection"));
     }
 }
