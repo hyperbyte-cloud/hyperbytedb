@@ -11,7 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 WORKSPACE="${GITHUB_WORKSPACE:-${REPO_ROOT}}"
 CHDB_RUST_REPO="${CHDB_RUST_REPO:-https://github.com/hyperbyte-cloud/chdb-rust.git}"
-CHDB_RUST_REF="${CHDB_RUST_REF:-feat_arrow_insert}"
+CHDB_RUST_REF="${CHDB_RUST_REF:-main}"
 DEST="$(dirname "${WORKSPACE}")/chdb-rust"
 
 echo "Checking out ${CHDB_RUST_REPO} @ ${CHDB_RUST_REF} -> ${DEST}"

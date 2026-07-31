@@ -10,7 +10,7 @@ set -euo pipefail
 : "${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
 
 CHDB_RUST_REPO="${CHDB_RUST_REPO:-https://github.com/hyperbyte-cloud/chdb-rust.git}"
-CHDB_RUST_REF="${CHDB_RUST_REF:-feat_arrow_insert}"
+CHDB_RUST_REF="${CHDB_RUST_REF:-main}"
 DEST="$(dirname "${GITHUB_WORKSPACE}")/chdb-rust"
 
 echo "Checking out ${CHDB_RUST_REPO} @ ${CHDB_RUST_REF} -> ${DEST}"
