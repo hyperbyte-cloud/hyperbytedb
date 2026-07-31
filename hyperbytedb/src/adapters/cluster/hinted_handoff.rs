@@ -73,13 +73,18 @@ impl HintedHandoff {
         if self.max_hints_per_peer > 0 {
             let count = self.pending_count(peer_id)?;
             if count >= self.max_hints_per_peer {
-                tracing::warn!(
-                    peer_id = peer_id,
-                    count = count,
-                    limit = self.max_hints_per_peer,
-                    "hinted handoff queue full for peer, dropping oldest hint"
-                );
-                self.drop_oldest(peer_id)?;
+                metrics::counter!(
+                    "hyperbytedb_hinted_handoff_rejected_total",
+                    "peer_id" => peer_id.to_string()
+                )
+                .increment(1);
+                return Err(HyperbytedbError::Internal(
+                    format!(
+                        "hinted handoff queue full for peer {peer_id} ({count}/{})",
+                        self.max_hints_per_peer
+                    )
+                    .into(),
+                ));
             }
         }
 
@@ -88,7 +93,7 @@ impl HintedHandoff {
         let value = payload.encode_hint_value()?;
         self.db
             .put_cf(&cf, key, value)
-            .map_err(|e| HyperbytedbError::Internal(format!("enqueue hint: {e}")))?;
+            .map_err(|e| HyperbytedbError::Internal(format!("enqueue hint: {e}").into()))?;
 
         metrics::counter!("hyperbytedb_hinted_handoff_enqueued_total", "peer_id" => peer_id.to_string())
             .increment(1);
@@ -205,29 +210,6 @@ impl HintedHandoff {
         }
         Ok(count)
     }
-
-    fn drop_oldest(&self, peer_id: u64) -> Result<(), HyperbytedbError> {
-        let cf = self
-            .db
-            .cf_handle(HH_CF)
-            .ok_or_else(|| HyperbytedbError::Internal("hinted_handoff CF not found".into()))?;
-
-        let prefix = hh_peer_prefix(peer_id);
-        let iter = self.db.iterator_cf_opt(
-            &cf,
-            rocksdb::ReadOptions::default(),
-            IteratorMode::From(&prefix, rocksdb::Direction::Forward),
-        );
-
-        if let Some(Ok((key, _))) = iter.into_iter().next()
-            && key.starts_with(&prefix)
-        {
-            self.db
-                .delete_cf(&cf, &key)
-                .map_err(|e| HyperbytedbError::Internal(format!("drop oldest hint: {e}")))?;
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -293,17 +275,23 @@ mod tests {
     }
 
     #[test]
-    fn max_hints_drops_oldest() {
+    fn max_hints_rejects_when_full() {
         let dir = tempfile::tempdir().unwrap();
         let repl = ReplicationLog::open(dir.path()).unwrap();
         let hh = HintedHandoff::new(repl.db().clone(), 3).unwrap();
 
-        for i in 0..5 {
+        for i in 0..3 {
             hh.enqueue_hint(1, &make_payload(&format!("db{i}")))
                 .unwrap();
         }
         assert_eq!(hh.pending_count(1).unwrap(), 3);
-        let drained = hh.drain(1, 10).unwrap();
-        assert_eq!(drained[0].database, "db2");
+        let err = hh
+            .enqueue_hint(1, &make_payload("db_overflow"))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("hinted handoff queue full"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(hh.pending_count(1).unwrap(), 3);
     }
 }

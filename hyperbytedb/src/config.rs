@@ -5,6 +5,7 @@ use figment::{
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct HyperbytedbConfig {
     pub server: ServerConfig,
     pub storage: StorageConfig,
@@ -24,6 +25,7 @@ pub struct HyperbytedbConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RateLimitConfig {
     pub enabled: bool,
     /// Maximum requests per second per endpoint (`/write` and `/query` each get
@@ -32,6 +34,7 @@ pub struct RateLimitConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub bind_address: String,
     pub port: u16,
@@ -48,6 +51,7 @@ pub struct ServerConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     pub wal_dir: String,
     pub meta_dir: String,
@@ -61,6 +65,7 @@ fn default_wal_format() -> String {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct FlushConfig {
     pub interval_secs: u64,
     pub wal_size_threshold_mb: u64,
@@ -114,6 +119,7 @@ fn default_wal_batch_delay_us() -> u64 {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChdbConfig {
     pub session_data_path: String,
     /// Number of chDB connections opened to the same `session_data_path`.
@@ -130,17 +136,24 @@ pub struct ChdbConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CardinalityConfig {
     pub max_tag_values_per_measurement: usize,
     pub max_measurements_per_database: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     pub enabled: bool,
+    /// InfluxDB v1-style `?u=` / `?p=` credentials on the query string.
+    /// Disabled by default: passwords can leak into access logs and Referer headers.
+    #[serde(default)]
+    pub allow_query_param_credentials: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterConfig {
     pub enabled: bool,
     pub node_id: u64,
@@ -199,6 +212,9 @@ pub struct ClusterConfig {
     pub raft_election_timeout_ms: Option<u64>,
     /// Number of log entries since last snapshot before a new snapshot is taken (default: 1000).
     pub raft_snapshot_threshold: Option<u32>,
+    /// Default HTTP timeout for outbound Raft RPCs when no per-RPC deadline is supplied (seconds).
+    #[serde(default = "default_raft_rpc_timeout_secs")]
+    pub raft_rpc_timeout_secs: u64,
     /// Per-node replication mode and tuning. When the entire `[cluster.replication]`
     /// block is omitted, the resolved mode is `async`, exactly preserving today's
     /// fire-and-forget behavior.
@@ -233,6 +249,7 @@ impl ReplicationMode {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplicationConfig {
     #[serde(default)]
     pub mode: ReplicationMode,
@@ -256,6 +273,7 @@ impl Default for ReplicationConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct SyncQuorumConfig {
     /// Number of peer acks required for `sync_quorum`. The local WAL append
     /// always happens before fan-out, so self-durability is implicit and the
@@ -339,6 +357,10 @@ fn default_replication_truncate_stale_peer_multiplier() -> u64 {
     2
 }
 
+fn default_raft_rpc_timeout_secs() -> u64 {
+    10
+}
+
 impl ClusterConfig {
     pub fn peer_list(&self) -> Vec<String> {
         if self.peers.is_empty() {
@@ -364,12 +386,14 @@ impl ClusterConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     pub level: String,
     pub format: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct StatementSummaryConfig {
     pub enabled: bool,
     pub max_entries: usize,
@@ -383,6 +407,7 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiskConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -418,6 +443,7 @@ impl Default for DiskConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct HintedHandoffConfig {
     pub enabled: bool,
     /// Maximum queued hints per unreachable peer before oldest are dropped.
@@ -434,6 +460,7 @@ pub struct HintedHandoffConfig {
 /// only how often that scan runs; the per-policy `duration` is metadata
 /// stored alongside each retention policy (`CREATE/ALTER RETENTION POLICY`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetentionConfig {
     /// When `false`, the retention enforcement loop is not spawned and
     /// expired data stays in chDB until removed manually or via DDL.
@@ -538,7 +565,10 @@ impl HyperbytedbConfig {
                 pool_size: default_chdb_pool_size(),
                 schema_cache_max_entries: default_schema_cache_max_entries(),
             },
-            auth: AuthConfig { enabled: false },
+            auth: AuthConfig {
+                enabled: false,
+                allow_query_param_credentials: false,
+            },
             cardinality: CardinalityConfig {
                 max_tag_values_per_measurement: 100_000,
                 max_measurements_per_database: 10_000,
@@ -566,6 +596,7 @@ impl HyperbytedbConfig {
                 raft_heartbeat_interval_ms: None,
                 raft_election_timeout_ms: None,
                 raft_snapshot_threshold: None,
+                raft_rpc_timeout_secs: default_raft_rpc_timeout_secs(),
                 replication: ReplicationConfig::default(),
             },
             logging: LoggingConfig {
@@ -594,7 +625,29 @@ impl HyperbytedbConfig {
 
 #[cfg(test)]
 mod replication_config_tests {
-    use super::{ReplicationConfig, ReplicationMode, SyncQuorumMinAcks, SyncQuorumMinAcksKeyword};
+    use super::{
+        ReplicationConfig, ReplicationMode, ServerConfig, SyncQuorumMinAcks,
+        SyncQuorumMinAcksKeyword,
+    };
+
+    #[test]
+    fn rejects_unknown_server_config_field() {
+        let err = serde_json::from_str::<ServerConfig>(
+            r#"{
+                "bind_address": "0.0.0.0",
+                "port": 8086,
+                "max_body_size_bytes": 1,
+                "request_timeout_secs": 30,
+                "query_timeout_secs": 30,
+                "max_concurrent_queries": 0,
+                "tls_enabled": false,
+                "tls_cert_path": "",
+                "tls_key_path": "",
+                "timout_secs": 30
+            }"#,
+        );
+        assert!(err.is_err(), "unknown section keys should be rejected");
+    }
 
     #[test]
     fn replication_defaults_to_async_when_block_missing() {
@@ -746,6 +799,7 @@ mod replicate_body_limit_tests {
             raft_heartbeat_interval_ms: None,
             raft_election_timeout_ms: None,
             raft_snapshot_threshold: None,
+            raft_rpc_timeout_secs: super::default_raft_rpc_timeout_secs(),
             replication: super::ReplicationConfig::default(),
         }
     }

@@ -206,25 +206,31 @@ pub async fn handle_replicate_mutation(
 
     if origin != 0
         && let Some(ref rl) = state.replication_log
-        && !rl.check_and_record_mutation(origin, sender_seq)
     {
-        tracing::debug!(
-            origin_node_id = origin,
-            seq = sender_seq,
-            "skipping duplicate mutation"
-        );
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({"ok": true, "ack_seq": sender_seq})),
-        );
+        match rl.check_and_record_mutation(origin, sender_seq) {
+            Ok(false) => {
+                tracing::debug!(
+                    origin_node_id = origin,
+                    seq = sender_seq,
+                    "skipping duplicate mutation"
+                );
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({"ok": true, "ack_seq": sender_seq})),
+                );
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to record mutation dedup state");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "internal error recording mutation"})),
+                );
+            }
+            Ok(true) => {}
+        }
     }
 
-    let result = apply_mutation(
-        &state.metadata,
-        Some(state.mv_service.as_ref()),
-        req.mutation,
-    )
-    .await;
+    let result = apply_mutation(&state, req.mutation).await;
 
     match result {
         Ok(()) => (
@@ -490,12 +496,19 @@ pub async fn handle_drain(State(state): State<Arc<AppState>>) -> impl IntoRespon
 }
 
 async fn apply_mutation(
-    metadata: &Arc<dyn MetadataPort>,
-    mv_service: Option<&crate::application::materialized_view_service::MaterializedViewService>,
+    state: &Arc<crate::adapters::http::router::AppState>,
     req: MutationRequest,
 ) -> Result<(), crate::error::HyperbytedbError> {
-    crate::application::schema_mutation_apply::apply_schema_mutation(metadata, mv_service, req)
-        .await
+    crate::application::schema_mutation_apply::apply_schema_mutation(
+        crate::application::schema_mutation_apply::SchemaMutationDeps {
+            metadata: &state.metadata,
+            mv_service: Some(state.mv_service.as_ref()),
+            points_sink: Some(&state.points_sink),
+            wal: Some(&state.wal),
+        },
+        req,
+    )
+    .await
 }
 
 async fn build_metadata_snapshot(
@@ -507,8 +520,9 @@ async fn build_metadata_snapshot(
     for db in &databases {
         entries.push(MetadataEntry {
             key: format!("db:{}", db.name),
-            value: serde_json::to_vec(db)
-                .map_err(|e| crate::error::HyperbytedbError::Metadata(e.to_string()))?,
+            value: serde_json::to_vec(db).map_err(|e| {
+                crate::error::HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+            })?,
         });
 
         let rps = metadata.list_retention_policies(&db.name).await?;
@@ -520,8 +534,11 @@ async fn build_metadata_snapshot(
                 if let Some(meta) = metadata.get_measurement(&db.name, &rp.name, meas).await? {
                     entries.push(MetadataEntry {
                         key: format!("meas:{}:{}:{}", db.name, rp.name, meas),
-                        value: serde_json::to_vec(&meta)
-                            .map_err(|e| crate::error::HyperbytedbError::Metadata(e.to_string()))?,
+                        value: serde_json::to_vec(&meta).map_err(|e| {
+                            crate::error::HyperbytedbError::Metadata(
+                                crate::error::ChainedError::from_error(e),
+                            )
+                        })?,
                     });
                 }
 
@@ -539,8 +556,11 @@ async fn build_metadata_snapshot(
         for cq in cqs {
             entries.push(MetadataEntry {
                 key: format!("cq:{}:{}", db.name, cq.name),
-                value: serde_json::to_vec(&cq)
-                    .map_err(|e| crate::error::HyperbytedbError::Metadata(e.to_string()))?,
+                value: serde_json::to_vec(&cq).map_err(|e| {
+                    crate::error::HyperbytedbError::Metadata(
+                        crate::error::ChainedError::from_error(e),
+                    )
+                })?,
             });
         }
 
@@ -548,8 +568,11 @@ async fn build_metadata_snapshot(
         for mv in mvs {
             entries.push(MetadataEntry {
                 key: format!("mv:{}:{}", db.name, mv.name),
-                value: serde_json::to_vec(&mv)
-                    .map_err(|e| crate::error::HyperbytedbError::Metadata(e.to_string()))?,
+                value: serde_json::to_vec(&mv).map_err(|e| {
+                    crate::error::HyperbytedbError::Metadata(
+                        crate::error::ChainedError::from_error(e),
+                    )
+                })?,
             });
         }
     }
@@ -559,8 +582,11 @@ async fn build_metadata_snapshot(
         if let Some(u) = metadata.get_user(&user).await? {
             entries.push(MetadataEntry {
                 key: format!("user:{}", user),
-                value: serde_json::to_vec(&u)
-                    .map_err(|e| crate::error::HyperbytedbError::Metadata(e.to_string()))?,
+                value: serde_json::to_vec(&u).map_err(|e| {
+                    crate::error::HyperbytedbError::Metadata(
+                        crate::error::ChainedError::from_error(e),
+                    )
+                })?,
             });
         }
     }

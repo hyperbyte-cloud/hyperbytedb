@@ -37,11 +37,12 @@ use std::sync::Arc;
 
 use lru::LruCache;
 
+use arrow::array::Array;
 use arrow::array::{
-    ArrayRef, DictionaryArray, Float64Builder, Int32Array, Int64Builder, RecordBatch, StringArray,
-    StringBuilder, TimestampNanosecondArray, UInt8Builder, UInt64Array, UInt64Builder,
+    ArrayRef, DictionaryArray, Float64Array, Float64Builder, Int32Array, Int64Builder, RecordBatch,
+    StringArray, StringBuilder, TimestampNanosecondArray, UInt8Builder, UInt64Array, UInt64Builder,
 };
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::datatypes::{DataType, Field, Int32Type, Schema, TimeUnit};
 use async_trait::async_trait;
 use chdb_rust::InsertOptions;
 use chdb_rust::arrow_insert::insert_record_batch_direct;
@@ -351,16 +352,18 @@ impl ChdbNativeAdapter {
                 let result =
                     execute_connection(conn, sql, chdb_rust::format::OutputFormat::TabSeparated);
                 match result {
-                    Ok(qr) => qr
-                        .data_utf8()
-                        .map_err(|e| HyperbytedbError::Chdb(e.to_string())),
-                    Err(e) => Err(HyperbytedbError::Chdb(e.to_string())),
+                    Ok(qr) => qr.data_utf8().map_err(|e| {
+                        HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e))
+                    }),
+                    Err(e) => Err(HyperbytedbError::Chdb(
+                        crate::error::ChainedError::from_error(e),
+                    )),
                 }
             })
         })
         .await
         .map_err(|e| {
-            HyperbytedbError::Internal(format!("chDB materialization sync join error: {e}"))
+            HyperbytedbError::Internal(format!("chDB materialization sync join error: {e}").into())
         })??;
 
         let attached: HashSet<String> = raw
@@ -379,7 +382,7 @@ impl ChdbNativeAdapter {
         for key in keys {
             let fact = unquoted_table_name(&key.db, &key.rp, &key.measurement);
             let series = unquoted_series_table_name(&key.db, &key.rp, &key.measurement);
-            if attached.contains(&fact)
+            if attached.contains(fact.as_str())
                 && fact_writers.get_mut(&key).is_some_and(|schema| {
                     if !schema.materialized {
                         schema.materialized = true;
@@ -391,7 +394,7 @@ impl ChdbNativeAdapter {
             {
                 synced += 1;
             }
-            if attached.contains(&series)
+            if attached.contains(series.as_str())
                 && let Some(schema) = series_writers.get_mut(&key)
                 && !schema.materialized
             {
@@ -445,8 +448,8 @@ impl ChdbNativeAdapter {
     /// True if `series_id` is already registered (dimension row inserted +
     /// persisted) for this table.
     fn series_known(&self, key: &TableKey, sid: u64) -> bool {
-        let mut map = self.known_series.write();
-        map.get(key).is_some_and(|s| s.contains(&sid))
+        let map = self.known_series.read();
+        map.peek(key).is_some_and(|s| s.contains(&sid))
     }
 
     /// Record `series_id`s as registered for this table.
@@ -458,6 +461,30 @@ impl ChdbNativeAdapter {
         if let Some(set) = map.get_mut(key) {
             set.extend(ids);
         }
+    }
+
+    /// Persist newly-flushed series + tag metadata durably before updating the
+    /// in-memory dedup cache.
+    async fn persist_new_series_metadata(
+        &self,
+        key: &TableKey,
+        entries: &[(u64, BTreeMap<String, String>)],
+    ) -> Result<(), HyperbytedbError> {
+        let Some(meta) = &self.metadata else {
+            return Ok(());
+        };
+        if entries.is_empty() {
+            return Ok(());
+        }
+        meta.register_series_batch(&key.db, &key.rp, &key.measurement, entries)
+            .await?;
+        let mut tag_pairs: Vec<(String, String)> = Vec::new();
+        for (_, tags) in entries {
+            for (k, v) in tags {
+                tag_pairs.push((k.clone(), v.clone()));
+            }
+        }
+        backfill_tag_metadata(meta, &key.db, &key.rp, &key.measurement, tag_pairs).await
     }
 
     async fn ddl_mutex(&self, key: &TableKey) -> Arc<tokio::sync::Mutex<()>> {
@@ -483,9 +510,9 @@ impl ChdbNativeAdapter {
                 let result =
                     execute_connection(conn, &sql, chdb_rust::format::OutputFormat::TabSeparated);
                 match result {
-                    Ok(qr) => qr
-                        .data_utf8()
-                        .map_err(|e| HyperbytedbError::Chdb(e.to_string())),
+                    Ok(qr) => qr.data_utf8().map_err(|e| {
+                        HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e))
+                    }),
                     Err(e) => {
                         let msg = e.to_string();
                         if msg.contains("doesn't exist")
@@ -494,14 +521,16 @@ impl ChdbNativeAdapter {
                         {
                             Ok(String::new())
                         } else {
-                            Err(HyperbytedbError::Chdb(msg))
+                            Err(HyperbytedbError::Chdb(crate::error::ChainedError::new(msg)))
                         }
                     }
                 }
             })
         })
         .await
-        .map_err(|e| HyperbytedbError::Internal(format!("chDB describe join error: {e}")))??;
+        .map_err(|e| {
+            HyperbytedbError::Internal(format!("chDB describe join error: {e}").into())
+        })??;
 
         let skip = ["time", "origin_node_id", "ingest_seq", "series_id"];
         let mut out = HashMap::new();
@@ -539,7 +568,7 @@ impl ChdbNativeAdapter {
         let pool = self.session.pool()?;
         tokio::task::spawn_blocking(move || run_sync(&pool, &sql))
             .await
-            .map_err(|e| HyperbytedbError::Internal(format!("chDB DDL join error: {e}")))?
+            .map_err(|e| HyperbytedbError::Internal(format!("chDB DDL join error: {e}").into()))?
     }
 
     /// Compute the union of tag keys across `points`, then ensure the
@@ -550,8 +579,12 @@ impl ChdbNativeAdapter {
         key: &TableKey,
         points: &[P],
     ) -> Result<EnsuredTable, HyperbytedbError> {
-        let table = quoted_table_name(&key.db, &key.rp, &key.measurement);
-        let series_table = quoted_series_table_name(&key.db, &key.rp, &key.measurement);
+        let table = quoted_table_name(&key.db, &key.rp, &key.measurement)
+            .as_str()
+            .to_string();
+        let series_table = quoted_series_table_name(&key.db, &key.rp, &key.measurement)
+            .as_str()
+            .to_string();
         let table_unquoted = unquoted_table_name(&key.db, &key.rp, &key.measurement);
 
         // Discover required columns from this batch. A fixed-schema telemetry
@@ -694,59 +727,67 @@ impl ChdbNativeAdapter {
             });
         }
 
-        // Slow path: serialise DDL on this table (both fact + series).
+        // Slow path: serialise DDL planning on this table (both fact + series).
+        // Hold the mutex only while reading caches and building statements; release
+        // before chDB I/O so slow DDL does not block other flush tasks.
         let ddl_lock = self.ddl_mutex(key).await;
-        let _guard = ddl_lock.lock().await;
+        let (create_fact, create_series, ddl_stmts) = {
+            let _guard = ddl_lock.lock().await;
 
-        // Re-read caches under the DDL lock; another writer may have already
-        // added the columns we needed while we were waiting.
-        let cached = {
-            let mut guard = self.schemas.write();
-            schema_cache_get(&mut guard, key)
-        }
-        .unwrap_or_default();
-        let series_cached = {
-            let mut guard = self.series_schemas.write();
-            schema_cache_get(&mut guard, key)
-        }
-        .unwrap_or_default();
+            // Re-read caches under the DDL lock; another writer may have already
+            // added the columns we needed while we were waiting.
+            let cached = {
+                let mut guard = self.schemas.write();
+                schema_cache_get(&mut guard, key)
+            }
+            .unwrap_or_default();
+            let series_cached = {
+                let mut guard = self.series_schemas.write();
+                schema_cache_get(&mut guard, key)
+            }
+            .unwrap_or_default();
 
-        // Fact table: fields only. ALTERs run only against an already-existing
-        // table (materialized) or a warmed-from-metadata entry; a cold CREATE
-        // already includes every field, so no redundant ADD COLUMN.
-        let create_fact = if !cached.materialized {
-            Some(build_create_table_sql(&table, &field_phys, None))
-        } else {
-            None
-        };
-        let mut fact_alters = if cached.materialized || !cached.columns.is_empty() {
-            let mut alters = build_alter_add_field_columns(&table, &cached, &field_phys);
-            alters.extend(build_alter_reconcile_field_widening(
-                &table,
-                &cached,
-                &field_phys,
-            ));
-            alters
-        } else {
-            Vec::new()
-        };
+            // Fact table: fields only. ALTERs run only against an already-existing
+            // table (materialized) or a warmed-from-metadata entry; a cold CREATE
+            // already includes every field, so no redundant ADD COLUMN.
+            let create_fact = if !cached.materialized {
+                Some(build_create_table_sql(&table, &field_phys, None))
+            } else {
+                None
+            };
+            let mut fact_alters = if cached.materialized || !cached.columns.is_empty() {
+                let mut alters = build_alter_add_field_columns(&table, &cached, &field_phys);
+                alters.extend(build_alter_reconcile_field_widening(
+                    &table,
+                    &cached,
+                    &field_phys,
+                ));
+                alters
+            } else {
+                Vec::new()
+            };
 
-        // Series (dimension) table: tag columns only.
-        let create_series = if !series_cached.materialized {
-            Some(build_create_series_table_sql(&series_table, &tag_phys))
-        } else {
-            None
+            // Series (dimension) table: tag columns only.
+            let create_series = if !series_cached.materialized {
+                Some(build_create_series_table_sql(&series_table, &tag_phys))
+            } else {
+                None
+            };
+            let mut series_alters =
+                if series_cached.materialized || !series_cached.columns.is_empty() {
+                    build_alter_add_series_columns(&series_table, &series_cached, &tag_phys)
+                } else {
+                    Vec::new()
+                };
+            if !series_cached.materialized && !series_cached.columns.is_empty() {
+                // Warmed-from-metadata series table may still carry LowCardinality
+                // tags that have since crossed TAG_LOW_CARDINALITY_MAX.
+                series_alters.extend(build_alter_reconcile_tag_strings(&series_table, &tag_phys));
+            }
+
+            fact_alters.append(&mut series_alters);
+            (create_fact, create_series, fact_alters)
         };
-        let mut series_alters = if series_cached.materialized || !series_cached.columns.is_empty() {
-            build_alter_add_series_columns(&series_table, &series_cached, &tag_phys)
-        } else {
-            Vec::new()
-        };
-        if !series_cached.materialized && !series_cached.columns.is_empty() {
-            // Warmed-from-metadata series table may still carry LowCardinality
-            // tags that have since crossed TAG_LOW_CARDINALITY_MAX.
-            series_alters.extend(build_alter_reconcile_tag_strings(&series_table, &tag_phys));
-        }
 
         if let Some(sql) = create_fact {
             tracing::debug!(table = %table_unquoted, "creating chDB native fact table");
@@ -756,28 +797,30 @@ impl ChdbNativeAdapter {
             tracing::debug!(table = %table_unquoted, "creating chDB native series table");
             self.execute(sql).await?;
         }
-        fact_alters.append(&mut series_alters);
-        for stmt in fact_alters {
+        for stmt in ddl_stmts {
             tracing::debug!(table = %table_unquoted, alter = %stmt, "altering chDB native table");
             self.execute(stmt).await?;
         }
 
         // Update the fact cache (fields) and series cache (tags).
         {
-            let mut writers = self.schemas.write();
-            let entry = schema_cache_entry(&mut writers, key);
-            for (_, phys, d) in &field_phys {
-                entry.columns.insert(phys.clone(), ColumnKind::Field(*d));
+            let _guard = ddl_lock.lock().await;
+            {
+                let mut writers = self.schemas.write();
+                let entry = schema_cache_entry(&mut writers, key);
+                for (_, phys, d) in &field_phys {
+                    entry.columns.insert(phys.clone(), ColumnKind::Field(*d));
+                }
+                entry.materialized = true;
             }
-            entry.materialized = true;
-        }
-        {
-            let mut writers = self.series_schemas.write();
-            let entry = schema_cache_entry(&mut writers, key);
-            for (_, phys, kind) in &tag_phys {
-                entry.columns.insert(phys.clone(), *kind);
+            {
+                let mut writers = self.series_schemas.write();
+                let entry = schema_cache_entry(&mut writers, key);
+                for (_, phys, kind) in &tag_phys {
+                    entry.columns.insert(phys.clone(), *kind);
+                }
+                entry.materialized = true;
             }
-            entry.materialized = true;
         }
 
         if let Err(e) = catalog::persist_default_database_metadata(&self.session).await {
@@ -831,51 +874,26 @@ impl ChdbNativeAdapter {
                         batch,
                         InsertOptions::default_bulk(),
                     )
-                    .map_err(|e| HyperbytedbError::Chdb(e.to_string()))
+                    .map_err(|e| HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e)))
                 })
             })
             .await
             .map_err(|e| {
-                HyperbytedbError::Internal(format!("chDB series insert join error: {e}"))
+                HyperbytedbError::Internal(format!("chDB series insert join error: {e}").into())
             })??;
         } else {
             let sql = build_series_insert_sql(ensured, &new_series);
             self.execute(sql).await?;
         }
 
-        // Mark known first so concurrent/subsequent flushes skip the insert.
+        let entries: Vec<(u64, BTreeMap<String, String>)> = new_series
+            .iter()
+            .map(|(id, p)| (*id, p.tags.clone()))
+            .collect();
+        self.persist_new_series_metadata(key, &entries).await?;
+        // Mark known only after durable metadata write succeeds so concurrent
+        // flushes cannot skip re-registration when RocksDB persist fails.
         self.mark_series(key, new_series.iter().map(|(id, _)| *id));
-
-        // Persist to the metadata layer (local-deterministic, never via Raft).
-        // Non-fatal: the dimension rows are already in chDB; on persist failure
-        // a post-restart warm simply re-registers (idempotent).
-        if let Some(meta) = &self.metadata {
-            let entries: Vec<(u64, BTreeMap<String, String>)> = new_series
-                .iter()
-                .map(|(id, p)| (*id, p.tags.clone()))
-                .collect();
-            if let Err(e) = meta
-                .register_series_batch(&key.db, &key.rp, &key.measurement, &entries)
-                .await
-            {
-                tracing::warn!(error = %e, "failed to persist series metadata; re-registers after restart");
-            } else {
-                let mut tag_pairs: Vec<(String, String)> = Vec::new();
-                for (_, p) in &new_series {
-                    for (k, v) in &p.tags {
-                        tag_pairs.push((k.clone(), v.clone()));
-                    }
-                }
-                if let Err(e) =
-                    backfill_tag_metadata(meta, &key.db, &key.rp, &key.measurement, tag_pairs).await
-                {
-                    tracing::warn!(
-                        error = %e,
-                        "failed to backfill tag metadata from flushed series"
-                    );
-                }
-            }
-        }
 
         Ok(())
     }
@@ -959,20 +977,24 @@ impl ChdbNativeAdapter {
             return Ok(values.len());
         };
 
+        let batch_values: HashSet<String> = points
+            .iter()
+            .filter_map(|p| p.borrow().tags.get(tag_key).cloned())
+            .collect();
+
         let base = meta
             .count_tag_values(db, rp, tag_key, Some(measurement))
             .await?;
-        let mut novel: HashSet<String> = HashSet::new();
-        for p in points {
-            if let Some(v) = p.borrow().tags.get(tag_key)
-                && !meta
-                    .tag_value_is_known(db, rp, measurement, tag_key, v)
-                    .await?
+        let mut novel = 0usize;
+        for v in &batch_values {
+            if !meta
+                .tag_value_is_known(db, rp, measurement, tag_key, v)
+                .await?
             {
-                novel.insert(v.clone());
+                novel += 1;
             }
         }
-        Ok(base + novel.len())
+        Ok(base + novel)
     }
 
     /// Create fact + `_series` tables for `meta` when they do not yet exist.
@@ -987,8 +1009,10 @@ impl ChdbNativeAdapter {
             rp: rp.to_string(),
             measurement: meta.name.clone(),
         };
-        let table = quoted_table_name(db, rp, &meta.name);
-        let series_table = quoted_series_table_name(db, rp, &meta.name);
+        let table = quoted_table_name(db, rp, &meta.name).as_str().to_string();
+        let series_table = quoted_series_table_name(db, rp, &meta.name)
+            .as_str()
+            .to_string();
 
         let field_name_set: HashSet<&str> = meta.field_types.keys().map(String::as_str).collect();
         let tag_phys: Vec<(String, String, ColumnKind)> = meta
@@ -1025,45 +1049,64 @@ impl ChdbNativeAdapter {
         }
 
         let ddl_lock = self.ddl_mutex(&key).await;
-        let _guard = ddl_lock.lock().await;
+        let (create_fact, create_series) = {
+            let _guard = ddl_lock.lock().await;
 
-        let cached = {
-            let mut guard = self.schemas.write();
-            schema_cache_get(&mut guard, &key)
-        }
-        .unwrap_or_default();
-        let series_cached = {
-            let mut guard = self.series_schemas.write();
-            schema_cache_get(&mut guard, &key)
-        }
-        .unwrap_or_default();
+            let cached = {
+                let mut guard = self.schemas.write();
+                schema_cache_get(&mut guard, &key)
+            }
+            .unwrap_or_default();
+            let series_cached = {
+                let mut guard = self.series_schemas.write();
+                schema_cache_get(&mut guard, &key)
+            }
+            .unwrap_or_default();
 
-        if !cached.materialized {
-            let sql = build_create_table_sql(&table, &field_phys, summing_columns_from_meta(meta));
+            let create_fact = if !cached.materialized {
+                Some(build_create_table_sql(
+                    &table,
+                    &field_phys,
+                    summing_columns_from_meta(meta),
+                ))
+            } else {
+                None
+            };
+            let create_series = if !series_cached.materialized {
+                Some(build_create_series_table_sql(&series_table, &tag_phys))
+            } else {
+                None
+            };
+            (create_fact, create_series)
+        };
+
+        if let Some(sql) = create_fact {
             tracing::debug!(table = %meta.name, "creating chDB native fact table for MV destination");
             self.execute(sql).await?;
         }
-        if !series_cached.materialized {
-            let sql = build_create_series_table_sql(&series_table, &tag_phys);
+        if let Some(sql) = create_series {
             tracing::debug!(table = %meta.name, "creating chDB native series table for MV destination");
             self.execute(sql).await?;
         }
 
         {
-            let mut writers = self.schemas.write();
-            let entry = schema_cache_entry(&mut writers, &key);
-            for (_, phys, d) in &field_phys {
-                entry.columns.insert(phys.clone(), ColumnKind::Field(*d));
+            let _guard = ddl_lock.lock().await;
+            {
+                let mut writers = self.schemas.write();
+                let entry = schema_cache_entry(&mut writers, &key);
+                for (_, phys, d) in &field_phys {
+                    entry.columns.insert(phys.clone(), ColumnKind::Field(*d));
+                }
+                entry.materialized = true;
             }
-            entry.materialized = true;
-        }
-        {
-            let mut writers = self.series_schemas.write();
-            let entry = schema_cache_entry(&mut writers, &key);
-            for (_, phys, kind) in &tag_phys {
-                entry.columns.insert(phys.clone(), *kind);
+            {
+                let mut writers = self.series_schemas.write();
+                let entry = schema_cache_entry(&mut writers, &key);
+                for (_, phys, kind) in &tag_phys {
+                    entry.columns.insert(phys.clone(), *kind);
+                }
+                entry.materialized = true;
             }
-            entry.materialized = true;
         }
 
         if let Err(e) = catalog::persist_default_database_metadata(&self.session).await {
@@ -1118,6 +1161,95 @@ impl ChdbNativeAdapter {
             retention_policy: rp.to_string(),
             origin_node_id,
             measurements,
+        })
+    }
+
+    /// Build a prepared WAL slot directly from a columnar wire batch, avoiding
+    /// intermediate `Vec<Point>` expansion on the ingest hot path.
+    #[cfg(feature = "columnar-ingest")]
+    pub async fn build_prepared_wal_slot_from_columnar(
+        &self,
+        db: &str,
+        rp: &str,
+        origin_node_id: u64,
+        wire: &crate::application::columnar_msgpack::ColumnarMsgpackBatch,
+        precision: Option<&str>,
+    ) -> Result<crate::domain::prepared_wal::PreparedWalSlot, HyperbytedbError> {
+        use crate::application::columnar_msgpack::columnar_timestamps_ns;
+        use crate::domain::prepared_wal::{PreparedMeasurementBatch, PreparedWalSlot};
+        use crate::domain::series::series_id;
+
+        if wire.field.is_empty() {
+            return Err(HyperbytedbError::ColumnarMsgpackParse {
+                reason: "field name must be non-empty".into(),
+            });
+        }
+
+        let n = wire.values.len();
+        if n == 0 {
+            return Ok(PreparedWalSlot {
+                database: db.to_string(),
+                retention_policy: rp.to_string(),
+                origin_node_id,
+                measurements: Vec::new(),
+            });
+        }
+
+        let rep = columnar_representative_point(wire, precision)?;
+        let key = TableKey {
+            db: db.to_string(),
+            rp: rp.to_string(),
+            measurement: wire.measurement.clone(),
+        };
+        let ensured = self.ensure_table(&key, std::slice::from_ref(&rep)).await?;
+        let sid = series_id(&wire.measurement, &wire.tags);
+        let ts_ns = columnar_timestamps_ns(wire, precision)?;
+
+        let mut min_time = i64::MAX;
+        let mut max_time = i64::MIN;
+        for &t in &ts_ns {
+            min_time = min_time.min(t);
+            max_time = max_time.max(t);
+        }
+
+        let origins = vec![origin_node_id; n];
+        let sids = vec![sid; n];
+        let seqs: Vec<u64> = (0..n).map(|i| i as u64).collect();
+        let batch = build_columnar_fact_record_batch(
+            &ensured,
+            &ts_ns,
+            &origins,
+            &seqs,
+            &sids,
+            &wire.field,
+            &wire.values,
+        )?;
+
+        let new_series_batch = if self.series_known(&key, sid) {
+            None
+        } else if self.use_arrow {
+            Some(Arc::new(build_series_record_batch(
+                &ensured,
+                &[(sid, &rep)],
+            )?))
+        } else {
+            None
+        };
+
+        Ok(PreparedWalSlot {
+            database: db.to_string(),
+            retention_policy: rp.to_string(),
+            origin_node_id,
+            measurements: vec![PreparedMeasurementBatch {
+                measurement: wire.measurement.clone(),
+                table_name: ensured.table.clone(),
+                series_table_name: ensured.series_table.clone(),
+                batch: Arc::new(batch),
+                row_count: n,
+                min_time,
+                max_time,
+                new_series_batch,
+            }],
         })
     }
 
@@ -1199,22 +1331,27 @@ impl ChdbNativeAdapter {
                     batch,
                     InsertOptions::default_bulk(),
                 )
-                .map_err(|e| HyperbytedbError::Chdb(e.to_string()))
+                .map_err(|e| HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e)))
             })
         })
         .await
-        .map_err(|e| HyperbytedbError::Internal(format!("chDB series insert join error: {e}")))??;
+        .map_err(|e| {
+            HyperbytedbError::Internal(format!("chDB series insert join error: {e}").into())
+        })??;
 
         if series_batch.num_rows() > 0 {
+            let entries = series_entries_from_batch(series_batch, &ensured.tag_phys)?;
+            self.persist_new_series_metadata(key, &entries).await?;
             let sid_col = series_batch
                 .column(0)
                 .as_any()
                 .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| HyperbytedbError::Internal("series batch sid col".into()))?;
-            let ids: Vec<u64> = (0..series_batch.num_rows())
-                .map(|i| sid_col.value(i))
-                .collect();
-            self.mark_series(key, ids.iter().copied());
+                .ok_or_else(|| {
+                    HyperbytedbError::Internal(crate::error::ChainedError::new(
+                        "series batch sid col",
+                    ))
+                })?;
+            self.mark_series(key, (0..series_batch.num_rows()).map(|i| sid_col.value(i)));
         }
         Ok(())
     }
@@ -1292,12 +1429,14 @@ impl PointsSinkPort for ChdbNativeAdapter {
             tokio::task::spawn_blocking(move || {
                 pool.with_connection(|conn| {
                     insert_record_batch_direct(conn, &table, batch, InsertOptions::default_bulk())
-                        .map_err(|e| HyperbytedbError::Chdb(e.to_string()))
+                        .map_err(|e| {
+                            HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e))
+                        })
                 })
             })
             .await
             .map_err(|e| {
-                HyperbytedbError::Internal(format!("chDB arrow insert join error: {e}"))
+                HyperbytedbError::Internal(format!("chDB arrow insert join error: {e}").into())
             })??;
             histogram!("hyperbytedb_flush_sink_chdb_insert_seconds")
                 .record(insert_start.elapsed().as_secs_f64());
@@ -1345,26 +1484,21 @@ impl PointsSinkPort for ChdbNativeAdapter {
             measurement: batch.measurement.clone(),
         };
 
+        // Re-align legacy sparse prepared batches (pre-coalesce WAL entries)
+        // to the current metadata-driven table schema before insert.
+        let ensured = self.ensure_table::<Point>(&key, &[]).await?;
+
         if let Some(ref series_batch) = batch.new_series_batch {
-            let ensured = EnsuredTable {
-                table: batch.table_name.clone(),
-                series_table: batch.series_table_name.clone(),
-                tag_phys: Vec::new(),
-                field_phys: Vec::new(),
-            };
             self.insert_prepared_series(&key, &ensured, series_batch)
                 .await?;
         }
 
         if !self.use_arrow {
-            return Err(HyperbytedbError::Internal(
-                "prepared batch path requires Arrow inserts".into(),
-            ));
+            return Err(HyperbytedbError::Internal(crate::error::ChainedError::new(
+                "prepared batch path requires Arrow inserts",
+            )));
         }
 
-        // Re-align legacy sparse prepared batches (pre-coalesce WAL entries)
-        // to the current metadata-driven table schema before insert.
-        let ensured = self.ensure_table::<Point>(&key, &[]).await?;
         let padded = pad_record_batch_to_ensured(&batch.batch, &ensured)?;
 
         let pool = self.session.pool()?;
@@ -1375,11 +1509,13 @@ impl PointsSinkPort for ChdbNativeAdapter {
             let batch = (*fact).clone();
             pool.with_connection(|conn| {
                 insert_record_batch_direct(conn, &table, batch, InsertOptions::default_bulk())
-                    .map_err(|e| HyperbytedbError::Chdb(e.to_string()))
+                    .map_err(|e| HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e)))
             })
         })
         .await
-        .map_err(|e| HyperbytedbError::Internal(format!("chDB prepared insert join: {e}")))??;
+        .map_err(|e| {
+            HyperbytedbError::Internal(format!("chDB prepared insert join: {e}").into())
+        })??;
         histogram!("hyperbytedb_flush_sink_chdb_insert_seconds", "path" => "prepared")
             .record(insert_start.elapsed().as_secs_f64());
 
@@ -1398,6 +1534,19 @@ impl PointsSinkPort for ChdbNativeAdapter {
         points: &[Point],
     ) -> Result<crate::domain::prepared_wal::PreparedWalSlot, HyperbytedbError> {
         self.build_prepared_wal_slot(db, rp, origin_node_id, points)
+            .await
+    }
+
+    #[cfg(feature = "columnar-ingest")]
+    async fn build_prepared_wal_slot_from_columnar(
+        &self,
+        db: &str,
+        rp: &str,
+        origin_node_id: u64,
+        wire: &crate::application::columnar_msgpack::ColumnarMsgpackBatch,
+        precision: Option<&str>,
+    ) -> Result<crate::domain::prepared_wal::PreparedWalSlot, HyperbytedbError> {
+        self.build_prepared_wal_slot_from_columnar(db, rp, origin_node_id, wire, precision)
             .await
     }
 
@@ -1426,8 +1575,10 @@ impl PointsSinkPort for ChdbNativeAdapter {
             rp: rp.to_string(),
             measurement: measurement.to_string(),
         };
-        let table = quoted_table_name(db, rp, measurement);
-        let series_table = quoted_series_table_name(db, rp, measurement);
+        let table = quoted_table_name(db, rp, measurement).as_str().to_string();
+        let series_table = quoted_series_table_name(db, rp, measurement)
+            .as_str()
+            .to_string();
         self.execute(format!("DROP TABLE IF EXISTS {table}"))
             .await?;
         self.execute(format!("DROP TABLE IF EXISTS {series_table}"))
@@ -1444,7 +1595,7 @@ fn run_sync(pool: &ChdbConnectionPool, sql: &str) -> Result<(), HyperbytedbError
     pool.with_connection(|conn| {
         execute_connection(conn, sql, OutputFormat::JSONEachRow)
             .map(|_| ())
-            .map_err(|e| HyperbytedbError::Chdb(e.to_string()))
+            .map_err(|e| HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e)))
     })
 }
 
@@ -1689,7 +1840,7 @@ fn pad_record_batch_to_ensured(
 
     for name in fixed {
         let idx = schema.index_of(name).map_err(|e| {
-            HyperbytedbError::Internal(format!("prepared batch missing {name}: {e}"))
+            HyperbytedbError::Internal(format!("prepared batch missing {name}: {e}").into())
         })?;
         fields.push(schema.field(idx).clone());
         columns.push(batch.column(idx).clone());
@@ -1705,7 +1856,7 @@ fn pad_record_batch_to_ensured(
     }
 
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-        .map_err(|e| HyperbytedbError::Internal(format!("pad prepared RecordBatch: {e}")))
+        .map_err(|e| HyperbytedbError::Internal(format!("pad prepared RecordBatch: {e}").into()))
 }
 
 /// Arrow logical type for a tag column, aligned with [`ColumnKind::ch_column_type`].
@@ -1750,7 +1901,9 @@ fn build_series_tag_column(
             let dict =
                 DictionaryArray::try_new(Int32Array::from(keys), Arc::new(dictionary_values))
                     .map_err(|e| {
-                        HyperbytedbError::Internal(format!("build dictionary tag column: {e}"))
+                        HyperbytedbError::Internal(
+                            format!("build dictionary tag column: {e}").into(),
+                        )
                     })?;
             Ok(Arc::new(dict))
         }
@@ -1760,6 +1913,47 @@ fn build_series_tag_column(
                 b.append_value(v);
             }
             Ok(Arc::new(b.finish()))
+        }
+    }
+}
+
+/// All-null column for a field of the given type discriminant.
+fn null_field_column(disc: u8, n: usize) -> ArrayRef {
+    match disc {
+        1 => {
+            let mut b = Int64Builder::with_capacity(n);
+            for _ in 0..n {
+                b.append_null();
+            }
+            Arc::new(b.finish())
+        }
+        2 => {
+            let mut b = UInt64Builder::with_capacity(n);
+            for _ in 0..n {
+                b.append_null();
+            }
+            Arc::new(b.finish())
+        }
+        3 => {
+            let mut b = StringBuilder::new();
+            for _ in 0..n {
+                b.append_null();
+            }
+            Arc::new(b.finish())
+        }
+        4 => {
+            let mut b = UInt8Builder::with_capacity(n);
+            for _ in 0..n {
+                b.append_null();
+            }
+            Arc::new(b.finish())
+        }
+        _ => {
+            let mut b = Float64Builder::with_capacity(n);
+            for _ in 0..n {
+                b.append_null();
+            }
+            Arc::new(b.finish())
         }
     }
 }
@@ -1833,6 +2027,77 @@ fn build_field_column<P: Borrow<Point>>(points: &[P], logical: &str, disc: u8) -
 /// schema, with per-row `origins` and `sids` (parallel to `points`). Columns are
 /// `time`, `origin_node_id`, `ingest_seq`, `series_id`, then the field columns
 /// (nullable). Returns the batch plus the observed `(min_time, max_time)`.
+#[cfg(feature = "columnar-ingest")]
+fn columnar_representative_point(
+    wire: &crate::application::columnar_msgpack::ColumnarMsgpackBatch,
+    precision: Option<&str>,
+) -> Result<Point, HyperbytedbError> {
+    use crate::application::columnar_msgpack::columnar_timestamps_ns;
+
+    let ts = columnar_timestamps_ns(wire, precision)?;
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        wire.field.clone(),
+        FieldValue::Float(wire.values.first().copied().unwrap_or(0.0)),
+    );
+    Ok(Point {
+        measurement: wire.measurement.clone(),
+        tags: wire.tags.clone(),
+        fields,
+        timestamp: ts.first().copied().unwrap_or(0),
+    })
+}
+
+#[cfg(feature = "columnar-ingest")]
+fn build_columnar_fact_record_batch(
+    ensured: &EnsuredTable,
+    ts_ns: &[i64],
+    origins: &[u64],
+    seqs: &[u64],
+    sids: &[u64],
+    field_logical: &str,
+    values: &[f64],
+) -> Result<RecordBatch, HyperbytedbError> {
+    let n = values.len();
+    debug_assert_eq!(ts_ns.len(), n);
+    debug_assert_eq!(origins.len(), n);
+    debug_assert_eq!(seqs.len(), n);
+    debug_assert_eq!(sids.len(), n);
+
+    let mut fields: Vec<Field> = Vec::with_capacity(4 + ensured.field_phys.len());
+    fields.push(Field::new(
+        "time",
+        DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+        false,
+    ));
+    fields.push(Field::new("origin_node_id", DataType::UInt64, false));
+    fields.push(Field::new("ingest_seq", DataType::UInt64, false));
+    fields.push(Field::new("series_id", DataType::UInt64, false));
+    for (_, phys, disc) in &ensured.field_phys {
+        fields.push(Field::new(phys, field_arrow_type(*disc), true));
+    }
+
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(fields.len());
+    columns.push(Arc::new(
+        TimestampNanosecondArray::from(ts_ns.to_vec()).with_timezone("UTC"),
+    ));
+    columns.push(Arc::new(UInt64Array::from(origins.to_vec())));
+    columns.push(Arc::new(UInt64Array::from(seqs.to_vec())));
+    columns.push(Arc::new(UInt64Array::from(sids.to_vec())));
+
+    for (logical, _, disc) in &ensured.field_phys {
+        if logical == field_logical && *disc == 0 {
+            columns.push(Arc::new(Float64Array::from(values.to_vec())));
+        } else {
+            columns.push(null_field_column(*disc, n));
+        }
+    }
+
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|e| {
+        HyperbytedbError::Internal(format!("build columnar Arrow RecordBatch: {e}").into())
+    })
+}
+
 fn build_record_batch<P: Borrow<Point>>(
     ensured: &EnsuredTable,
     origins: &[u64],
@@ -1881,7 +2146,7 @@ fn build_record_batch<P: Borrow<Point>>(
     }
 
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-        .map_err(|e| HyperbytedbError::Internal(format!("build Arrow RecordBatch: {e}")))?;
+        .map_err(|e| HyperbytedbError::Internal(format!("build Arrow RecordBatch: {e}").into()))?;
     Ok((batch, min_time, max_time))
 }
 
@@ -1907,8 +2172,66 @@ fn build_series_record_batch(
         columns.push(build_series_tag_column(new_series, logical, *kind)?);
     }
 
-    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-        .map_err(|e| HyperbytedbError::Internal(format!("build series Arrow RecordBatch: {e}")))
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|e| {
+        HyperbytedbError::Internal(format!("build series Arrow RecordBatch: {e}").into())
+    })
+}
+
+/// Read a tag column value from a series dimension batch row.
+fn arrow_tag_value_at_row(col: &ArrayRef, row: usize) -> String {
+    if col.is_null(row) {
+        return String::new();
+    }
+    if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+        return arr.value(row).to_string();
+    }
+    if let Some(dict) = col.as_any().downcast_ref::<DictionaryArray<Int32Type>>() {
+        let keys = dict.keys();
+        if let Some(values) = dict.values().as_any().downcast_ref::<StringArray>() {
+            return values.value(keys.value(row) as usize).to_string();
+        }
+    }
+    String::new()
+}
+
+/// Decode `(series_id, logical tags)` from a prepared series `RecordBatch`.
+type SeriesTagEntries = Vec<(u64, BTreeMap<String, String>)>;
+
+fn series_entries_from_batch(
+    batch: &RecordBatch,
+    tag_phys: &[(String, String, ColumnKind)],
+) -> Result<SeriesTagEntries, HyperbytedbError> {
+    let n = batch.num_rows();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let schema = batch.schema();
+    let sid_col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| {
+            HyperbytedbError::Internal(crate::error::ChainedError::new("series batch sid col"))
+        })?;
+
+    let mut entries = Vec::with_capacity(n);
+    for row in 0..n {
+        let sid = sid_col.value(row);
+        let mut tags = BTreeMap::new();
+        for (logical, phys, _) in tag_phys {
+            let idx = schema.index_of(phys).map_err(|e| {
+                HyperbytedbError::Internal(
+                    format!("series batch missing tag column {phys}: {e}").into(),
+                )
+            })?;
+            tags.insert(
+                logical.clone(),
+                arrow_tag_value_at_row(batch.column(idx), row),
+            );
+        }
+        entries.push((sid, tags));
+    }
+    Ok(entries)
 }
 
 fn build_insert_sql(
@@ -2484,6 +2807,39 @@ mod tests {
         assert!(sql.contains("(`series_id`, `host`)"));
         assert!(sql.contains(&format!("({}, 'a')", id1)));
         assert!(sql.contains(&format!("({}, 'b')", id2)));
+    }
+
+    #[test]
+    fn series_entries_from_batch_decodes_logical_tags() {
+        let ensured = EnsuredTable {
+            table: "`db_rp_m`".to_string(),
+            series_table: "`db_rp_m_series`".to_string(),
+            tag_phys: vec![
+                (
+                    "host".to_string(),
+                    "host".to_string(),
+                    ColumnKind::TagLowCardinality,
+                ),
+                (
+                    "region".to_string(),
+                    "region".to_string(),
+                    ColumnKind::TagString,
+                ),
+            ],
+            field_phys: vec![],
+        };
+        let p1 = make_point(0, &[("host", "a"), ("region", "us")], &[]);
+        let p2 = make_point(0, &[("host", "b"), ("region", "eu")], &[]);
+        let batch =
+            build_series_record_batch(&ensured, &[(1u64, &p1), (2u64, &p2)]).expect("batch");
+
+        let entries = series_entries_from_batch(&batch, &ensured.tag_phys).expect("entries");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, 1);
+        assert_eq!(entries[0].1.get("host"), Some(&"a".to_string()));
+        assert_eq!(entries[0].1.get("region"), Some(&"us".to_string()));
+        assert_eq!(entries[1].0, 2);
+        assert_eq!(entries[1].1.get("host"), Some(&"b".to_string()));
     }
 
     #[test]

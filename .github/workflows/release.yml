@@ -35,7 +35,7 @@ env:
   SCCACHE_DIR: ${{ github.workspace }}/.cache/sccache
   SCCACHE_CACHE_SIZE: 10G
   CHDB_RUST_REPO: https://github.com/hyperbyte-cloud/chdb-rust.git
-  CHDB_RUST_REF: feat_arrow_insert
+  CHDB_RUST_REF: main
   REGISTRY: ghcr.io
   IMAGE_NAME: hyperbyte-cloud/hyperbytedb
   PROXY_IMAGE_NAME: hyperbyte-cloud/hyperbytedb-proxy

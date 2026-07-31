@@ -53,6 +53,21 @@ pub trait PointsSinkPort: Send + Sync {
         ))
     }
 
+    /// Build a prepared WAL slot directly from a columnar wire batch.
+    #[cfg(feature = "columnar-ingest")]
+    async fn build_prepared_wal_slot_from_columnar(
+        &self,
+        _db: &str,
+        _rp: &str,
+        _origin_node_id: u64,
+        _wire: &crate::application::columnar_msgpack::ColumnarMsgpackBatch,
+        _precision: Option<&str>,
+    ) -> Result<PreparedWalSlot, HyperbytedbError> {
+        Err(HyperbytedbError::Internal(
+            "columnar prepared WAL build not supported".into(),
+        ))
+    }
+
     async fn drop_measurement(
         &self,
         db: &str,

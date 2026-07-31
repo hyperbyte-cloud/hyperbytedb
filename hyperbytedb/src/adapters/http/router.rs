@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use axum::http::StatusCode;
 use axum::{
     Router,
     extract::DefaultBodyLimit,
@@ -8,7 +9,7 @@ use axum::{
     routing::{get, post},
 };
 use tower::ServiceBuilder;
-use tower_http::trace::TraceLayer;
+use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
 
 use crate::adapters::cluster::peer_client::PeerClient;
 use crate::adapters::cluster::raft::HyperbytedbRaft;
@@ -45,6 +46,8 @@ pub struct AppState {
     pub drain_service: Option<Arc<DrainService>>,
     pub raft: Option<HyperbytedbRaft>,
     pub auth_enabled: bool,
+    /// When false (default), `?u=` / `?p=` query credentials are ignored.
+    pub auth_allow_query_param_credentials: bool,
     pub prometheus_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     pub statement_summary: Option<Arc<StatementSummary>>,
     /// When true and auth is enabled, `/api/v1/statements` requires credentials.
@@ -70,7 +73,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let auth_state = state.clone();
     let body_limit = state.max_body_size_bytes;
     let replicate_body_limit = state.replicate_body_limit_bytes;
-    let _timeout_duration = std::time::Duration::from_secs(state.request_timeout_secs);
+    let timeout_duration = std::time::Duration::from_secs(state.request_timeout_secs);
 
     let mut statements_router = Router::new().route(
         "/api/v1/statements",
@@ -221,9 +224,26 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     };
 
     router
-        .layer(ServiceBuilder::new().layer(middleware::map_response(
-            http_middleware::add_version_headers,
-        )))
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            ServiceBuilder::new()
+                .layer(middleware::map_response(
+                    http_middleware::add_version_headers,
+                ))
+                .layer(TimeoutLayer::with_status_code(
+                    StatusCode::REQUEST_TIMEOUT,
+                    timeout_duration,
+                )),
+        )
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
+                tracing::span!(
+                    tracing::Level::DEBUG,
+                    "request",
+                    method = %request.method(),
+                    path = %request.uri().path(),
+                    version = ?request.version(),
+                )
+            }),
+        )
         .with_state(state)
 }

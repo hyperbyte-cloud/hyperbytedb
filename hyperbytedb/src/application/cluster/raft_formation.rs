@@ -4,6 +4,39 @@ use std::time::Duration;
 
 use crate::adapters::http::router::AppState;
 use crate::domain::cluster::membership::{NodeInfo, NodeState};
+use openraft::BasicNode;
+use openraft::RaftMetrics;
+
+/// Returns true when every non-leader peer in `peer_ids` has replicated the
+/// leader's current log tail (per Raft replication metrics).
+fn learners_caught_up(
+    metrics: &RaftMetrics<u64, BasicNode>,
+    peer_ids: &BTreeSet<u64>,
+    leader_id: u64,
+) -> bool {
+    let target_index = metrics.last_log_index.unwrap_or(0);
+    let learner_ids: Vec<u64> = peer_ids
+        .iter()
+        .copied()
+        .filter(|id| *id != leader_id)
+        .collect();
+    if learner_ids.is_empty() {
+        return true;
+    }
+
+    let replication = match &metrics.replication {
+        Some(r) => r,
+        None => return false,
+    };
+
+    learner_ids
+        .iter()
+        .all(|learner_id| match replication.get(learner_id) {
+            Some(Some(matched)) => matched.index >= target_index,
+            Some(None) => target_index == 0,
+            None => false,
+        })
+}
 
 /// Background task that forms the Raft cluster from the static peer list.
 ///
@@ -136,24 +169,35 @@ pub async fn run_raft_cluster_formation(
             }
         }
 
-        // ── Phase 2 & 3: Promote when all peers discovered ──────────
+        // ── Phase 2 & 3: Promote when all peers discovered and caught up ──
         if discovered_ids.len() >= expected_size {
-            match raft.change_membership(discovered_ids.clone(), false).await {
-                Ok(_) => {
-                    tracing::info!(
-                        voters = ?discovered_ids,
-                        "raft membership promotion succeeded"
-                    );
-                    break;
+            let metrics = raft.metrics().borrow().clone();
+            if learners_caught_up(&metrics, &discovered_ids, node_id) {
+                match raft.change_membership(discovered_ids.clone(), false).await {
+                    Ok(_) => {
+                        tracing::info!(
+                            voters = ?discovered_ids,
+                            "raft membership promotion succeeded"
+                        );
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            error = %e,
+                            attempt = attempt,
+                            discovered = ?discovered_ids,
+                            "membership promotion not ready yet"
+                        );
+                    }
                 }
-                Err(e) => {
-                    tracing::debug!(
-                        error = %e,
-                        attempt = attempt,
-                        discovered = ?discovered_ids,
-                        "membership promotion not ready yet (learners catching up)"
-                    );
-                }
+            } else {
+                tracing::debug!(
+                    attempt = attempt,
+                    discovered = ?discovered_ids,
+                    last_log_index = ?metrics.last_log_index,
+                    replication = ?metrics.replication,
+                    "waiting for learners to catch up before promotion"
+                );
             }
         } else {
             tracing::debug!(

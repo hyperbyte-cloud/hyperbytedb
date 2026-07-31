@@ -8,6 +8,11 @@ use serde_json::Value;
 use crate::client::QueryResponse;
 use crate::session::OutputFormat;
 
+/// Minimum table width for column output. `ContentArrangement::Dynamic` falls back
+/// to a vertical character stack on very narrow terminals, which breaks both
+/// readability and string-based tests/assertions.
+const MIN_TABLE_WIDTH: u16 = 80;
+
 struct DisplayStyle {
     color: bool,
 }
@@ -48,7 +53,10 @@ pub fn format_json(response: &QueryResponse, pretty: bool) -> String {
 }
 
 pub fn format_column(response: &QueryResponse) -> String {
-    let style = DisplayStyle::detect();
+    format_column_with_style(response, DisplayStyle::detect())
+}
+
+fn format_column_with_style(response: &QueryResponse, style: DisplayStyle) -> String {
     let mut out = String::new();
 
     for (result_idx, result) in response.results.iter().enumerate() {
@@ -84,7 +92,8 @@ pub fn format_column(response: &QueryResponse) -> String {
             let mut table = Table::new();
             table
                 .load_preset(UTF8_NO_BORDERS)
-                .set_content_arrangement(ContentArrangement::Dynamic);
+                .set_content_arrangement(ContentArrangement::Dynamic)
+                .set_width(MIN_TABLE_WIDTH);
             table.set_header(
                 series
                     .columns
@@ -147,7 +156,8 @@ fn format_series_header(
             .into_iter()
             .map(|(key, value)| {
                 if style.color {
-                    format!("\x1b[1;36m{key}\x1b[0m\x1b[2;36m={value}\x1b[0m")
+                    // Keep `key=value` contiguous so copy/paste and tests stay stable.
+                    format!("\x1b[36m{key}={value}\x1b[0m")
                 } else {
                     format!("{key}={value}")
                 }
@@ -275,7 +285,7 @@ mod tests {
                 error: None,
             }],
         };
-        let out = format_column(&resp);
+        let out = format_column_with_style(&resp, DisplayStyle { color: false });
         assert!(out.contains("cpu"));
         assert!(out.contains("host=srv1"));
         assert!(out.contains("42"));

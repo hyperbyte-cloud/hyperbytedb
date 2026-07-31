@@ -13,10 +13,7 @@ pub async fn dispatch_outbound_replication(
     batch: OutboundReplicationBatch,
 ) -> Result<(), HyperbytedbError> {
     match replication_config.mode {
-        ReplicationMode::Async => {
-            replication.replicate_write(batch);
-            Ok(())
-        }
+        ReplicationMode::Async => replication.replicate_write(batch),
         ReplicationMode::SyncQuorum => {
             let peer_count = replication.active_peer_count(node_id).await;
             let min_acks: SyncQuorumMinAcks = replication_config.sync_quorum.min_acks;

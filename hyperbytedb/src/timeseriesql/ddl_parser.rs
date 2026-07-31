@@ -72,19 +72,12 @@ fn parse_show(cur: &mut TokenCursor<'_>) -> Result<Statement, HyperbytedbError> 
                 cur.bump();
                 let mut stmt = ShowMeasurementsStatement {
                     database: parse_optional_on_db(cur)?,
+                    measurement_filter: None,
                     condition: None,
                     limit: None,
                     offset: None,
                 };
-                // Previously this clause was silently dropped, listing every
-                // measurement unfiltered. Reject loudly until implemented.
-                if cur.match_keyword("WITH") {
-                    return Err(HyperbytedbError::QueryParse(
-                        "SHOW MEASUREMENTS WITH MEASUREMENT is not supported; \
-                         use a WHERE clause instead"
-                            .to_string(),
-                    ));
-                }
+                stmt.measurement_filter = parse_with_measurement(cur)?;
                 parse_show_tail(
                     cur,
                     &mut stmt.database,
@@ -851,32 +844,141 @@ fn parse_measurement_name(cur: &mut TokenCursor<'_>) -> Result<MeasurementName, 
     Ok(m.name)
 }
 
+fn parse_with_measurement(
+    cur: &mut TokenCursor<'_>,
+) -> Result<Option<TagKeySelector>, HyperbytedbError> {
+    if cur.match_keyword("WITH") {
+        cur.expect_keyword("MEASUREMENT")?;
+        Ok(Some(parse_key_selector(cur)?))
+    } else {
+        Ok(None)
+    }
+}
+
 fn parse_with_key(cur: &mut TokenCursor<'_>) -> Result<TagKeySelector, HyperbytedbError> {
     if cur.match_keyword("WITH") {
         cur.expect_keyword("KEY")?;
-        if matches!(
-            cur.peek(),
-            Some(Token {
-                kind: TokenKind::Eq,
-                ..
-            })
-        ) {
-            cur.bump();
-        }
-        if matches!(
-            cur.peek(),
-            Some(Token {
-                kind: TokenKind::Star,
-                ..
-            })
-        ) {
-            cur.bump();
-            return Ok(TagKeySelector::All);
-        }
-        let key = cur.take_ident()?;
-        return Ok(TagKeySelector::Eq(key));
+        parse_key_selector(cur)
+    } else {
+        Ok(TagKeySelector::All)
     }
-    Ok(TagKeySelector::All)
+}
+
+fn parse_key_selector(cur: &mut TokenCursor<'_>) -> Result<TagKeySelector, HyperbytedbError> {
+    if matches!(
+        cur.peek(),
+        Some(Token {
+            kind: TokenKind::Eq,
+            ..
+        })
+    ) {
+        cur.bump();
+    }
+
+    if matches!(
+        cur.peek(),
+        Some(Token {
+            kind: TokenKind::Star,
+            ..
+        })
+    ) {
+        cur.bump();
+        return Ok(TagKeySelector::All);
+    }
+
+    if matches!(
+        cur.peek(),
+        Some(Token {
+            kind: TokenKind::Ne,
+            ..
+        })
+    ) {
+        cur.bump();
+        return Ok(TagKeySelector::Neq(cur.take_ident()?));
+    }
+
+    if matches!(
+        cur.peek(),
+        Some(Token {
+            kind: TokenKind::MatchRegex,
+            ..
+        })
+    ) {
+        cur.bump();
+        return Ok(TagKeySelector::Regex(take_regex_token(cur)?));
+    }
+
+    if cur.match_keyword("IN") {
+        return Ok(TagKeySelector::In(parse_ident_list(cur)?));
+    }
+
+    Ok(TagKeySelector::Eq(cur.take_ident()?))
+}
+
+fn take_regex_token(cur: &mut TokenCursor<'_>) -> Result<String, HyperbytedbError> {
+    match cur.bump() {
+        Some(Token {
+            kind: TokenKind::Regex(p),
+            ..
+        }) => Ok(p),
+        Some(t) => Err(HyperbytedbError::QueryParse(format!(
+            "expected regex literal, found {:?}",
+            t.kind
+        ))),
+        None => Err(HyperbytedbError::QueryParse(
+            "expected regex literal, found EOF".to_string(),
+        )),
+    }
+}
+
+fn parse_ident_list(cur: &mut TokenCursor<'_>) -> Result<Vec<String>, HyperbytedbError> {
+    match cur.peek() {
+        Some(Token {
+            kind: TokenKind::LParen,
+            ..
+        }) => {
+            cur.bump();
+            let mut keys = Vec::new();
+            loop {
+                if matches!(
+                    cur.peek(),
+                    Some(Token {
+                        kind: TokenKind::RParen,
+                        ..
+                    })
+                ) {
+                    cur.bump();
+                    break;
+                }
+                if !keys.is_empty() {
+                    match cur.peek() {
+                        Some(Token {
+                            kind: TokenKind::Comma,
+                            ..
+                        }) => {
+                            cur.bump();
+                        }
+                        Some(t) => {
+                            return Err(HyperbytedbError::QueryParse(format!(
+                                "expected comma in IN list, found {:?}",
+                                t.kind
+                            )));
+                        }
+                        None => {
+                            return Err(HyperbytedbError::QueryParse(
+                                "unclosed IN list".to_string(),
+                            ));
+                        }
+                    }
+                }
+                keys.push(cur.take_ident()?);
+            }
+            Ok(keys)
+        }
+        _ => Err(HyperbytedbError::QueryParse(
+            "expected '(' after IN".to_string(),
+        )),
+    }
 }
 
 fn parse_duration_token(cur: &mut TokenCursor<'_>) -> Result<Duration, HyperbytedbError> {
@@ -1221,13 +1323,61 @@ mod tests {
     }
 
     #[test]
+    fn show_measurements_with_measurement_filter() {
+        let stmt = parse_ddl_statement("SHOW MEASUREMENTS WITH MEASUREMENT =~ /cpu/").unwrap();
+        match stmt {
+            Statement::ShowMeasurements(s) => {
+                assert!(matches!(
+                    s.measurement_filter,
+                    Some(TagKeySelector::Regex(ref p)) if p == "cpu"
+                ));
+            }
+            other => panic!("expected ShowMeasurements, got {other:?}"),
+        }
+        let stmt = parse_ddl_statement(r#"SHOW MEASUREMENTS WITH MEASUREMENT = "cpu""#).unwrap();
+        match stmt {
+            Statement::ShowMeasurements(s) => {
+                assert!(matches!(
+                    s.measurement_filter,
+                    Some(TagKeySelector::Eq(ref n)) if n == "cpu"
+                ));
+            }
+            other => panic!("expected ShowMeasurements, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn show_tag_values_with_key_operators() {
+        let stmt = parse_ddl_statement(r#"SHOW TAG VALUES FROM cpu WITH KEY != "host""#).unwrap();
+        match stmt {
+            Statement::ShowTagValues(s) => {
+                assert!(matches!(s.tag_key, TagKeySelector::Neq(ref k) if k == "host"));
+            }
+            other => panic!("expected ShowTagValues, got {other:?}"),
+        }
+        let stmt = parse_ddl_statement(r#"SHOW TAG VALUES FROM cpu WITH KEY =~ /^host/"#).unwrap();
+        match stmt {
+            Statement::ShowTagValues(s) => {
+                assert!(matches!(s.tag_key, TagKeySelector::Regex(ref p) if p == "^host"));
+            }
+            other => panic!("expected ShowTagValues, got {other:?}"),
+        }
+        let stmt =
+            parse_ddl_statement(r#"SHOW TAG VALUES FROM cpu WITH KEY IN ("host", "region")"#)
+                .unwrap();
+        match stmt {
+            Statement::ShowTagValues(s) => {
+                assert!(
+                    matches!(s.tag_key, TagKeySelector::In(ref keys) if keys == &["host", "region"])
+                );
+            }
+            other => panic!("expected ShowTagValues, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn trailing_garbage_rejected() {
         assert!(parse_ddl_statement("DROP DATABASE foo bar baz").is_err());
-        let err = parse_ddl_statement("SHOW MEASUREMENTS WITH MEASUREMENT =~ /cpu/").unwrap_err();
-        assert!(
-            err.to_string().contains("not supported"),
-            "WITH MEASUREMENT must fail loudly, got: {err}"
-        );
     }
 
     #[test]

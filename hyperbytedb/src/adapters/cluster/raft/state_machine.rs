@@ -35,5 +35,14 @@ pub async fn apply_schema_mutation(
     metadata: &Arc<dyn MetadataPort>,
     mutation: MutationRequest,
 ) -> Result<(), crate::error::HyperbytedbError> {
-    crate::application::schema_mutation_apply::apply_schema_mutation(metadata, None, mutation).await
+    crate::application::schema_mutation_apply::apply_schema_mutation(
+        crate::application::schema_mutation_apply::SchemaMutationDeps {
+            metadata,
+            mv_service: None,
+            points_sink: None,
+            wal: None,
+        },
+        mutation,
+    )
+    .await
 }

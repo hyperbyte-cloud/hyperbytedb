@@ -104,6 +104,12 @@ impl WalArrowCache {
         gauge!(ENTRIES_GAUGE).set(map.len() as f64);
     }
 
+    pub fn purge_database(&self, database: &str) {
+        let mut map = self.entries.write();
+        map.retain(|_, slot| slot.database != database);
+        gauge!(ENTRIES_GAUGE).set(map.len() as f64);
+    }
+
     pub fn len(&self) -> usize {
         self.entries.read().len()
     }

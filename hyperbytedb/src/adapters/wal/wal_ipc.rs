@@ -21,46 +21,60 @@ fn write_string(w: &mut Vec<u8>, s: &str) -> Result<(), HyperbytedbError> {
         return Err(HyperbytedbError::Wal("WAL string too long".into()));
     }
     w.write_all(&(bytes.len() as u16).to_le_bytes())
-        .map_err(|e| HyperbytedbError::Wal(e.to_string()))?;
+        .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
     w.write_all(bytes)
-        .map_err(|e| HyperbytedbError::Wal(e.to_string()))?;
+        .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
     Ok(())
 }
 
 fn read_string(r: &mut Cursor<&[u8]>) -> Result<String, HyperbytedbError> {
     let mut len_buf = [0u8; 2];
     r.read_exact(&mut len_buf)
-        .map_err(|e| HyperbytedbError::Wal(e.to_string()))?;
+        .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
     let len = u16::from_le_bytes(len_buf) as usize;
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)
-        .map_err(|e| HyperbytedbError::Wal(e.to_string()))?;
-    String::from_utf8(buf).map_err(|e| HyperbytedbError::Wal(e.to_string()))
+        .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
+    String::from_utf8(buf)
+        .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))
 }
 
 fn encode_record_batch(batch: &RecordBatch) -> Result<Vec<u8>, HyperbytedbError> {
     let mut buf = Vec::new();
     {
-        let mut writer = StreamWriter::try_new(&mut buf, &batch.schema())
-            .map_err(|e| HyperbytedbError::Wal(format!("IPC encode: {e}")))?;
-        writer
-            .write(batch)
-            .map_err(|e| HyperbytedbError::Wal(format!("IPC encode write: {e}")))?;
-        writer
-            .finish()
-            .map_err(|e| HyperbytedbError::Wal(format!("IPC encode finish: {e}")))?;
+        let mut writer = StreamWriter::try_new(&mut buf, &batch.schema()).map_err(|e| {
+            HyperbytedbError::Wal(crate::error::ChainedError::with_context("IPC encode", e))
+        })?;
+        writer.write(batch).map_err(|e| {
+            HyperbytedbError::Wal(crate::error::ChainedError::with_context(
+                "IPC encode write",
+                e,
+            ))
+        })?;
+        writer.finish().map_err(|e| {
+            HyperbytedbError::Wal(crate::error::ChainedError::with_context(
+                "IPC encode finish",
+                e,
+            ))
+        })?;
     }
     Ok(buf)
 }
 
 fn decode_record_batch(bytes: &[u8]) -> Result<Arc<RecordBatch>, HyperbytedbError> {
     let cursor = Cursor::new(bytes);
-    let mut reader = StreamReader::try_new(cursor, None)
-        .map_err(|e| HyperbytedbError::Wal(format!("IPC decode: {e}")))?;
+    let mut reader = StreamReader::try_new(cursor, None).map_err(|e| {
+        HyperbytedbError::Wal(crate::error::ChainedError::with_context("IPC decode", e))
+    })?;
     let batch = reader
         .next()
         .transpose()
-        .map_err(|e| HyperbytedbError::Wal(format!("IPC decode batch: {e}")))?
+        .map_err(|e| {
+            HyperbytedbError::Wal(crate::error::ChainedError::with_context(
+                "IPC decode batch",
+                e,
+            ))
+        })?
         .ok_or_else(|| HyperbytedbError::Wal("IPC stream empty".into()))?;
     Ok(Arc::new(batch))
 }
@@ -104,7 +118,7 @@ pub fn encode_prepared_slot(
     let legacy = legacy_entry
         .map(bincode::serialize)
         .transpose()
-        .map_err(|e| HyperbytedbError::Wal(e.to_string()))?
+        .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?
         .unwrap_or_default();
     out.extend_from_slice(&(legacy.len() as u32).to_le_bytes());
     if !legacy.is_empty() {
@@ -122,9 +136,9 @@ pub fn decode_prepared_slot(
     }
     let version = bytes[4];
     if version != VERSION {
-        return Err(HyperbytedbError::Wal(format!(
-            "unsupported prepared WAL version {version}"
-        )));
+        return Err(HyperbytedbError::Wal(
+            format!("unsupported prepared WAL version {version}").into(),
+        ));
     }
 
     let mut cursor = Cursor::new(&bytes[5..]);
@@ -133,13 +147,13 @@ pub fn decode_prepared_slot(
     let mut origin_buf = [0u8; 8];
     cursor
         .read_exact(&mut origin_buf)
-        .map_err(|e| HyperbytedbError::Wal(e.to_string()))?;
+        .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
     let origin_node_id = u64::from_le_bytes(origin_buf);
 
     let mut mc_buf = [0u8; 4];
     cursor
         .read_exact(&mut mc_buf)
-        .map_err(|e| HyperbytedbError::Wal(e.to_string()))?;
+        .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
     let measurement_count = u32::from_le_bytes(mc_buf) as usize;
 
     let mut measurements = Vec::with_capacity(measurement_count);
@@ -151,61 +165,63 @@ pub fn decode_prepared_slot(
         let mut rc_buf = [0u8; 4];
         cursor
             .read_exact(&mut rc_buf)
-            .map_err(|e| HyperbytedbError::Wal(e.to_string()))?;
+            .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
         let row_count = u32::from_le_bytes(rc_buf) as usize;
 
         let mut time_buf = [0u8; 8];
         cursor
             .read_exact(&mut time_buf)
-            .map_err(|e| HyperbytedbError::Wal(e.to_string()))?;
+            .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
         let min_time = i64::from_le_bytes(time_buf);
         cursor
             .read_exact(&mut time_buf)
-            .map_err(|e| HyperbytedbError::Wal(e.to_string()))?;
+            .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
         let max_time = i64::from_le_bytes(time_buf);
 
         let mut len_buf = [0u8; 4];
         cursor
             .read_exact(&mut len_buf)
-            .map_err(|e| HyperbytedbError::Wal(e.to_string()))?;
+            .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
         let fact_len = u32::from_le_bytes(len_buf) as usize;
         let remaining = cursor
             .get_ref()
             .len()
             .saturating_sub(cursor.position() as usize);
         if fact_len > remaining {
-            return Err(HyperbytedbError::Wal(format!(
-                "invalid fact_ipc length {fact_len} (only {remaining} bytes remaining)"
-            )));
+            return Err(HyperbytedbError::Wal(
+                format!("invalid fact_ipc length {fact_len} (only {remaining} bytes remaining)")
+                    .into(),
+            ));
         }
         let mut fact_ipc = vec![0u8; fact_len];
         cursor
             .read_exact(&mut fact_ipc)
-            .map_err(|e| HyperbytedbError::Wal(e.to_string()))?;
+            .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
         let batch = decode_record_batch(&fact_ipc)?;
 
         cursor
             .read_exact(&mut len_buf)
-            .map_err(|e| HyperbytedbError::Wal(e.to_string()))?;
+            .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
         let series_len = u32::from_le_bytes(len_buf) as usize;
-        let new_series_batch = if series_len > 0 {
-            let remaining = cursor
-                .get_ref()
-                .len()
-                .saturating_sub(cursor.position() as usize);
-            if series_len > remaining {
-                return Err(HyperbytedbError::Wal(format!(
+        let new_series_batch =
+            if series_len > 0 {
+                let remaining = cursor
+                    .get_ref()
+                    .len()
+                    .saturating_sub(cursor.position() as usize);
+                if series_len > remaining {
+                    return Err(HyperbytedbError::Wal(format!(
                     "invalid series_ipc length {series_len} (only {remaining} bytes remaining)"
-                )));
-            }
-            let mut series_ipc = vec![0u8; series_len];
-            cursor
-                .read_exact(&mut series_ipc)
-                .map_err(|e| HyperbytedbError::Wal(e.to_string()))?;
-            Some(decode_record_batch(&series_ipc)?)
-        } else {
-            None
-        };
+                ).into()));
+                }
+                let mut series_ipc = vec![0u8; series_len];
+                cursor.read_exact(&mut series_ipc).map_err(|e| {
+                    HyperbytedbError::Wal(crate::error::ChainedError::from_error(e))
+                })?;
+                Some(decode_record_batch(&series_ipc)?)
+            } else {
+                None
+            };
 
         measurements.push(PreparedMeasurementBatch {
             measurement,
@@ -221,26 +237,31 @@ pub fn decode_prepared_slot(
 
     cursor
         .read_exact(&mut mc_buf)
-        .map_err(|e| HyperbytedbError::Wal(e.to_string()))?;
+        .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
     let legacy_len = u32::from_le_bytes(mc_buf) as usize;
-    let legacy_entry = if legacy_len > 0 {
-        let remaining = cursor
-            .get_ref()
-            .len()
-            .saturating_sub(cursor.position() as usize);
-        if legacy_len > remaining {
-            return Err(HyperbytedbError::Wal(format!(
+    let legacy_entry =
+        if legacy_len > 0 {
+            let remaining = cursor
+                .get_ref()
+                .len()
+                .saturating_sub(cursor.position() as usize);
+            if legacy_len > remaining {
+                return Err(HyperbytedbError::Wal(format!(
                 "invalid legacy entry length {legacy_len} (only {remaining} bytes remaining)"
-            )));
-        }
-        let mut legacy = vec![0u8; legacy_len];
-        cursor
-            .read_exact(&mut legacy)
-            .map_err(|e| HyperbytedbError::Wal(e.to_string()))?;
-        Some(bincode::deserialize(&legacy).map_err(|e| HyperbytedbError::Wal(e.to_string()))?)
-    } else {
-        None
-    };
+            ).into()));
+            }
+            let mut legacy = vec![0u8; legacy_len];
+            cursor
+                .read_exact(&mut legacy)
+                .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
+            Some(
+                bincode::deserialize(&legacy).map_err(|e| {
+                    HyperbytedbError::Wal(crate::error::ChainedError::from_error(e))
+                })?,
+            )
+        } else {
+            None
+        };
 
     Ok((
         PreparedWalSlot {
@@ -259,9 +280,8 @@ pub fn encode_wal_value(
     entry: &WalEntry,
 ) -> Result<Vec<u8>, HyperbytedbError> {
     match format {
-        WalFormat::Bincode => {
-            bincode::serialize(entry).map_err(|e| HyperbytedbError::Wal(e.to_string()))
-        }
+        WalFormat::Bincode => bincode::serialize(entry)
+            .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e))),
         WalFormat::ArrowIpc => {
             let slot = slot.ok_or_else(|| {
                 HyperbytedbError::Wal("arrow IPC WAL requires prepared slot".into())
@@ -277,8 +297,8 @@ pub fn decode_wal_value(
 ) -> Result<(Option<PreparedWalSlot>, WalEntry), HyperbytedbError> {
     match format {
         WalFormat::Bincode => {
-            let entry: WalEntry =
-                bincode::deserialize(bytes).map_err(|e| HyperbytedbError::Wal(e.to_string()))?;
+            let entry: WalEntry = bincode::deserialize(bytes)
+                .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
             Ok((None, entry))
         }
         WalFormat::ArrowIpc => {

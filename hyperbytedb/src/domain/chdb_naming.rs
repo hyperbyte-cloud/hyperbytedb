@@ -13,8 +13,73 @@
 //! column names for each measurement.
 
 use std::collections::HashSet;
+use std::fmt;
 
 use crate::domain::column_mapping::tag_column_name as map_tag_column_name;
+use crate::error::HyperbytedbError;
+
+/// Sanitized unquoted ClickHouse identifier (`[A-Za-z0-9_]`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SanitizedIdent(String);
+
+impl SanitizedIdent {
+    /// Sanitize arbitrary input into a valid ClickHouse identifier.
+    #[must_use]
+    pub fn sanitize(input: &str) -> Self {
+        Self(sanitise_ident(input))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Backtick-quoted form suitable for splicing into SQL.
+    #[must_use]
+    pub fn quoted(&self) -> QuotedTableName {
+        QuotedTableName::new_quoted(quote_backticks(self.as_str()))
+    }
+}
+
+impl fmt::Display for SanitizedIdent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Backtick-quoted table or object name safe to splice into generated SQL.
+///
+/// Construct only via [`quoted_table_name`], [`quoted_series_table_name`], or
+/// related helpers in this module — do not build from raw user input elsewhere.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct QuotedTableName(String);
+
+impl QuotedTableName {
+    pub(crate) fn new_quoted(s: String) -> Self {
+        Self(s)
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for QuotedTableName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Reject control characters in identifiers before quoting.
+fn reject_control_chars(ident: &str) -> Result<(), HyperbytedbError> {
+    if ident.chars().any(char::is_control) {
+        return Err(HyperbytedbError::QueryParse(format!(
+            "identifier contains control characters: {ident:?}"
+        )));
+    }
+    Ok(())
+}
 
 /// Replace every byte that isn't `[A-Za-z0-9_]` with `_` and prefix
 /// `_` if the result starts with a digit. Empty input becomes `_`.
@@ -39,13 +104,13 @@ fn sanitise_ident(input: &str) -> String {
 /// Build the unquoted table identifier for a `(db, rp, measurement)`
 /// tuple, using `db_rp_measurement` after sanitisation.
 #[must_use]
-pub fn unquoted_table_name(db: &str, rp: &str, measurement: &str) -> String {
-    format!(
+pub fn unquoted_table_name(db: &str, rp: &str, measurement: &str) -> SanitizedIdent {
+    SanitizedIdent(format!(
         "{}_{}_{}",
         sanitise_ident(db),
         sanitise_ident(rp),
         sanitise_ident(measurement)
-    )
+    ))
 }
 
 /// Quote an identifier with backticks, escaping embedded backticks.
@@ -57,52 +122,64 @@ pub fn quote_backticks(ident: &str) -> String {
     format!("`{escaped}`")
 }
 
+/// Like [`quote_backticks`], but rejects control characters first.
+pub fn quote_backticks_validated(ident: &str) -> Result<String, HyperbytedbError> {
+    reject_control_chars(ident)?;
+    Ok(quote_backticks(ident))
+}
+
 /// Backtick-quoted, sanitised table name suitable for splicing into
 /// `CREATE TABLE`, `INSERT INTO`, `DROP TABLE`, and `FROM` clauses.
 #[must_use]
-pub fn quoted_table_name(db: &str, rp: &str, measurement: &str) -> String {
-    quote_backticks(&unquoted_table_name(db, rp, measurement))
+pub fn quoted_table_name(db: &str, rp: &str, measurement: &str) -> QuotedTableName {
+    unquoted_table_name(db, rp, measurement).quoted()
 }
 
 /// Unquoted name of the per-measurement series (tag dimension) table:
 /// `<db>_<rp>_<measurement>_series`. The `_series` suffix is appended after
 /// sanitisation (it is already valid `[A-Za-z0-9_]`).
 #[must_use]
-pub fn unquoted_series_table_name(db: &str, rp: &str, measurement: &str) -> String {
-    format!("{}_series", unquoted_table_name(db, rp, measurement))
+pub fn unquoted_series_table_name(db: &str, rp: &str, measurement: &str) -> SanitizedIdent {
+    SanitizedIdent(format!(
+        "{}_series",
+        unquoted_table_name(db, rp, measurement).0
+    ))
 }
 
 /// Backtick-quoted series (tag dimension) table name. See
 /// [`unquoted_series_table_name`].
 #[must_use]
-pub fn quoted_series_table_name(db: &str, rp: &str, measurement: &str) -> String {
-    quote_backticks(&unquoted_series_table_name(db, rp, measurement))
+pub fn quoted_series_table_name(db: &str, rp: &str, measurement: &str) -> QuotedTableName {
+    unquoted_series_table_name(db, rp, measurement).quoted()
 }
 
 /// Unquoted ClickHouse object name for a fact-table materialized view:
 /// `<db>_<rp>_<mv_name>_mv`.
 #[must_use]
-pub fn unquoted_fact_mv_name(db: &str, rp: &str, mv_name: &str) -> String {
-    format!("{}_mv", unquoted_table_name(db, rp, mv_name))
+pub fn unquoted_fact_mv_name(db: &str, rp: &str, mv_name: &str) -> SanitizedIdent {
+    SanitizedIdent(format!("{}_mv", unquoted_table_name(db, rp, mv_name).0))
 }
 
 /// Backtick-quoted fact MV object name.
 #[must_use]
-pub fn quoted_fact_mv_name(db: &str, rp: &str, mv_name: &str) -> String {
-    quote_backticks(&unquoted_fact_mv_name(db, rp, mv_name))
+pub fn quoted_fact_mv_name(db: &str, rp: &str, mv_name: &str) -> QuotedTableName {
+    unquoted_fact_mv_name(db, rp, mv_name).quoted()
 }
 
 /// Unquoted ClickHouse object name for a series-dimension MV:
 /// `<db>_<rp>_<mv_name>_series_mv`.
 #[must_use]
-pub fn unquoted_series_mv_name(db: &str, rp: &str, mv_name: &str) -> String {
-    format!("{}_series_mv", unquoted_table_name(db, rp, mv_name))
+pub fn unquoted_series_mv_name(db: &str, rp: &str, mv_name: &str) -> SanitizedIdent {
+    SanitizedIdent(format!(
+        "{}_series_mv",
+        unquoted_table_name(db, rp, mv_name).0
+    ))
 }
 
 /// Backtick-quoted series MV object name.
 #[must_use]
-pub fn quoted_series_mv_name(db: &str, rp: &str, mv_name: &str) -> String {
-    quote_backticks(&unquoted_series_mv_name(db, rp, mv_name))
+pub fn quoted_series_mv_name(db: &str, rp: &str, mv_name: &str) -> QuotedTableName {
+    unquoted_series_mv_name(db, rp, mv_name).quoted()
 }
 
 /// Resolve the physical column name for a tag key, taking field-name
@@ -145,11 +222,11 @@ mod tests {
     #[test]
     fn quoted_table_name_matches_db_rp_measurement() {
         assert_eq!(
-            quoted_table_name("mydb", "autogen", "cpu"),
+            quoted_table_name("mydb", "autogen", "cpu").as_str(),
             "`mydb_autogen_cpu`"
         );
         assert_eq!(
-            quoted_table_name("my-db", "autogen", "cpu.load"),
+            quoted_table_name("my-db", "autogen", "cpu.load").as_str(),
             "`my_db_autogen_cpu_load`"
         );
     }
@@ -160,13 +237,19 @@ mod tests {
     }
 
     #[test]
+    fn quote_backticks_validated_rejects_control_chars() {
+        assert!(quote_backticks_validated("a\nb").is_err());
+        assert!(quote_backticks_validated("ok_name").is_ok());
+    }
+
+    #[test]
     fn series_table_name_appends_suffix() {
         assert_eq!(
-            quoted_series_table_name("mydb", "autogen", "cpu"),
+            quoted_series_table_name("mydb", "autogen", "cpu").as_str(),
             "`mydb_autogen_cpu_series`"
         );
         assert_eq!(
-            quoted_series_table_name("my-db", "autogen", "cpu.load"),
+            quoted_series_table_name("my-db", "autogen", "cpu.load").as_str(),
             "`my_db_autogen_cpu_load_series`"
         );
     }

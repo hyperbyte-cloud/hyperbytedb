@@ -121,6 +121,7 @@ pub struct RetentionPolicyChange {
 #[derive(Debug, Clone)]
 pub struct ShowMeasurementsStatement {
     pub database: Option<String>,
+    pub measurement_filter: Option<TagKeySelector>,
     pub condition: Option<Expr>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,

@@ -226,7 +226,12 @@ async fn handle_query_impl(
             .execute_query(db, &q, epoch, rp, caller)
             .await
             .map_err(|e| {
-            tracing::error!(query = %q, db = db, error = %e, "query execution failed");
+            tracing::error!(
+                query = %crate::timeseriesql::digest::redact_credentials(&q),
+                db = db,
+                error = %e,
+                "query execution failed"
+            );
             counter!("hyperbytedb_query_errors_total", "db" => db.to_string(), "stmt_type" => stmt_type_label, "stmt_normalized" => normalized_query.to_string(), "stmt_digest" => digest_hex.to_string()).increment(1);
             e
         })?;
@@ -286,9 +291,9 @@ async fn handle_query_impl(
         } else {
             let json = if pretty {
                 serde_json::to_string_pretty(&result)
-                    .map_err(|e| HyperbytedbError::Internal(e.to_string()))?
+                    .map_err(|e| HyperbytedbError::Internal(crate::error::ChainedError::from_error(e)))?
             } else {
-                serde_json::to_string(&result).map_err(|e| HyperbytedbError::Internal(e.to_string()))?
+                serde_json::to_string(&result).map_err(|e| HyperbytedbError::Internal(crate::error::ChainedError::from_error(e)))?
             };
             (StatusCode::OK, [("Content-Type", "application/json")], json).into_response()
         };

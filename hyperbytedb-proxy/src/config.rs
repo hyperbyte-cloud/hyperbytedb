@@ -7,11 +7,18 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
+/// Default admin bind when `HYPERBYTEDB_PROXY_ADMIN_LISTEN` is unset.
+pub const DEFAULT_ADMIN_LISTEN: &str = "0.0.0.0:8087";
+
 /// All knobs the proxy understands.
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
-    /// `host:port` we bind for client traffic _and_ admin endpoints.
+    /// `host:port` for client-facing InfluxDB v1 traffic (`/write`, `/query` only).
     pub listen_addr: String,
+
+    /// `host:port` for proxy-local admin: probes, metrics, `/admin/*`.
+    /// Not exposed on the client Service; reachable via pod IP or loopback.
+    pub admin_listen_addr: String,
 
     /// DNS name that resolves to one A record per backend pod (typically a
     /// Kubernetes headless Service: `<cluster>-headless.<ns>.svc.cluster.local`).
@@ -57,6 +64,12 @@ pub struct ProxyConfig {
     /// that would otherwise let the proxy proxy to itself and infinitely
     /// recurse until the pod OOMs.
     pub self_ip: Option<IpAddr>,
+
+    /// When true, the upstream `reqwest` client uses HTTP/2 prior knowledge
+    /// (no ALPN upgrade). HyperbyteDB pods speak HTTP/1.1 via `axum::serve`
+    /// today, so this defaults to `false`. Enable only when every backend is
+    /// known to accept cleartext HTTP/2.
+    pub http2_prior_knowledge: bool,
 }
 
 impl ProxyConfig {
@@ -65,6 +78,7 @@ impl ProxyConfig {
     pub fn from_env() -> Result<Self> {
         Ok(Self {
             listen_addr: env_or("HYPERBYTEDB_PROXY_LISTEN", "0.0.0.0:8086"),
+            admin_listen_addr: env_or("HYPERBYTEDB_PROXY_ADMIN_LISTEN", DEFAULT_ADMIN_LISTEN),
             backend_service: env_required("HYPERBYTEDB_PROXY_BACKEND_SERVICE")?,
             backend_port: env_u32("HYPERBYTEDB_PROXY_BACKEND_PORT", 8086)? as u16,
             discovery_interval: Duration::from_secs(env_u32(
@@ -93,6 +107,7 @@ impl ProxyConfig {
                 30,
             )? as u64),
             self_ip: env_optional_ip("HYPERBYTEDB_PROXY_SELF_IP")?,
+            http2_prior_knowledge: env_bool("HYPERBYTEDB_PROXY_HTTP2_PRIOR_KNOWLEDGE", false)?,
         })
     }
 }
@@ -122,5 +137,34 @@ fn env_u32(key: &str, default: u32) -> Result<u32> {
             .parse::<u32>()
             .with_context(|| format!("env var {key}={v} is not a valid u32")),
         Err(_) => Ok(default),
+    }
+}
+
+fn env_bool(key: &str, default: bool) -> Result<bool> {
+    match env::var(key) {
+        Ok(v) if v.is_empty() => Ok(default),
+        Ok(v) => match v.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => Err(anyhow::anyhow!("env var {key}={v} is not a valid bool")),
+        },
+        Err(_) => Ok(default),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_admin_listen_is_separate_from_public() {
+        assert_eq!(DEFAULT_ADMIN_LISTEN, "0.0.0.0:8087");
+    }
+
+    #[test]
+    fn http2_prior_knowledge_defaults_false() {
+        let v = env_bool("HYPERBYTEDB_PROXY_HTTP2_PRIOR_KNOWLEDGE_TEST_UNSET", false)
+            .expect("parse bool");
+        assert!(!v);
     }
 }

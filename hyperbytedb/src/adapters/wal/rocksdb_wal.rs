@@ -162,7 +162,7 @@ impl RocksDbWal {
         ];
 
         let db = DB::open_cf_descriptors(&opts, path, cfs)
-            .map_err(|e| HyperbytedbError::Wal(e.to_string()))?;
+            .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
 
         Self::migrate_legacy_entries(&db)?;
 
@@ -176,19 +176,27 @@ impl RocksDbWal {
         let seq = {
             let wal_cf = db
                 .cf_handle(WAL_CF)
-                .ok_or_else(|| HyperbytedbError::Wal("wal column family not found".to_string()))?;
+                .ok_or_else(|| HyperbytedbError::Wal("wal column family not found".into()))?;
             let mut iter = db.iterator_cf(&wal_cf, IteratorMode::End);
             match iter.next() {
                 Some(Ok((key, _))) if key.len() == 8 => be_bytes_to_u64(&key),
-                Some(Err(e)) => return Err(HyperbytedbError::Wal(e.to_string())),
+                Some(Err(e)) => {
+                    return Err(HyperbytedbError::Wal(
+                        crate::error::ChainedError::from_error(e),
+                    ));
+                }
                 _ => {
                     let wal_meta_cf = db.cf_handle(WAL_META_CF).ok_or_else(|| {
-                        HyperbytedbError::Wal("wal_meta column family not found".to_string())
+                        HyperbytedbError::Wal("wal_meta column family not found".into())
                     })?;
                     match db.get_cf(&wal_meta_cf, LAST_SEQ_KEY) {
                         Ok(Some(v)) if v.len() == 8 => be_bytes_to_u64(&v),
                         Ok(_) => 0,
-                        Err(e) => return Err(HyperbytedbError::Wal(e.to_string())),
+                        Err(e) => {
+                            return Err(HyperbytedbError::Wal(
+                                crate::error::ChainedError::from_error(e),
+                            ));
+                        }
                     }
                 }
             }
@@ -225,7 +233,7 @@ impl RocksDbWal {
     fn migrate_legacy_entries(db: &DB) -> Result<(), HyperbytedbError> {
         let wal_cf = db
             .cf_handle(WAL_CF)
-            .ok_or_else(|| HyperbytedbError::Wal("wal column family not found".to_string()))?;
+            .ok_or_else(|| HyperbytedbError::Wal("wal column family not found".into()))?;
 
         #[derive(serde::Deserialize)]
         struct LegacyWalEntry {
@@ -244,7 +252,8 @@ impl RocksDbWal {
         );
 
         for item in iter {
-            let (key, value) = item.map_err(|e| HyperbytedbError::Wal(e.to_string()))?;
+            let (key, value) =
+                item.map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
 
             if bincode::deserialize::<WalEntry>(&value).is_ok() {
                 continue;
@@ -253,8 +262,12 @@ impl RocksDbWal {
                 continue;
             }
 
-            let legacy: LegacyWalEntry = bincode::deserialize(&value)
-                .map_err(|e| HyperbytedbError::Wal(format!("corrupt WAL entry: {e}")))?;
+            let legacy: LegacyWalEntry = bincode::deserialize(&value).map_err(|e| {
+                HyperbytedbError::Wal(crate::error::ChainedError::with_context(
+                    "corrupt WAL entry",
+                    e,
+                ))
+            })?;
 
             let upgraded = WalEntry {
                 database: legacy.database,
@@ -263,8 +276,12 @@ impl RocksDbWal {
                 origin_node_id: 0,
             };
 
-            let new_value = bincode::serialize(&upgraded)
-                .map_err(|e| HyperbytedbError::Wal(format!("re-serialize WAL entry: {e}")))?;
+            let new_value = bincode::serialize(&upgraded).map_err(|e| {
+                HyperbytedbError::Wal(crate::error::ChainedError::with_context(
+                    "re-serialize WAL entry",
+                    e,
+                ))
+            })?;
 
             batch.put_cf(&wal_cf, &key, &new_value);
             migrated += 1;
@@ -272,7 +289,7 @@ impl RocksDbWal {
 
         if migrated > 0 {
             db.write(batch)
-                .map_err(|e| HyperbytedbError::Wal(e.to_string()))?;
+                .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
             tracing::info!(migrated, "migrated legacy WAL entries to current schema");
         }
 
@@ -373,7 +390,7 @@ fn write_bundle_batch(
     }
 
     db.write(wb)
-        .map_err(|e| HyperbytedbError::Wal(e.to_string()))?;
+        .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
 
     if arrow_wal_enabled {
         for (wal_seq, slot) in seqs.iter().zip(prepared_slots) {
@@ -415,7 +432,12 @@ impl WalPort for RocksDbWal {
             )
         })
         .await
-        .map_err(|e| HyperbytedbError::Wal(format!("WAL append task panicked: {e}")))?;
+        .map_err(|e| {
+            HyperbytedbError::Wal(crate::error::ChainedError::with_context(
+                "WAL append task panicked",
+                e,
+            ))
+        })?;
 
         match result {
             Ok(seqs) => {
@@ -469,17 +491,15 @@ impl WalPort for RocksDbWal {
         from: u64,
         max_entries: usize,
     ) -> Result<Vec<(u64, WalEntry)>, HyperbytedbError> {
-        // RocksDB is the source of truth; reads always go to disk. (The former
-        // in-memory `WalMemoryCache` was removed: the prepared flush path uses
-        // the Arrow cache, never this, so it only ever grew unbounded while WAL
-        // truncation was held behind a lagging peer's replication ack.)
         let db = self.db.clone();
         let wal_format = self.wal_format;
+        let arrow_cache = self.arrow_cache.clone();
+        let arrow_wal_enabled = self.arrow_wal_enabled;
 
         tokio::task::spawn_blocking(move || {
             let wal_cf = db
                 .cf_handle(WAL_CF)
-                .ok_or_else(|| HyperbytedbError::Wal("wal column family not found".to_string()))?;
+                .ok_or_else(|| HyperbytedbError::Wal("wal column family not found".into()))?;
 
             let mut results = Vec::new();
             let start_key = u64_to_be_bytes(from);
@@ -491,16 +511,31 @@ impl WalPort for RocksDbWal {
                 if results.len() >= max_entries {
                     break;
                 }
-                let (key, value) = item.map_err(|e| HyperbytedbError::Wal(e.to_string()))?;
+                let (key, value) = item.map_err(|e| {
+                    HyperbytedbError::Wal(crate::error::ChainedError::from_error(e))
+                })?;
+                if key.len() != 8 {
+                    return Err(HyperbytedbError::Wal(
+                        format!("invalid WAL key length: expected 8, got {}", key.len()).into(),
+                    ));
+                }
                 let seq = be_bytes_to_u64(&key);
-                let (_, entry) = wal_ipc::decode_wal_value(wal_format, &value)?;
+                let (prepared, entry) = wal_ipc::decode_wal_value(wal_format, &value)?;
+                if arrow_wal_enabled && let Some(slot) = prepared {
+                    arrow_cache.insert(seq, slot);
+                }
                 results.push((seq, entry));
             }
 
             Ok(results)
         })
         .await
-        .map_err(|e| HyperbytedbError::Wal(format!("WAL read task panicked: {e}")))?
+        .map_err(|e| {
+            HyperbytedbError::Wal(crate::error::ChainedError::with_context(
+                "WAL read task panicked",
+                e,
+            ))
+        })?
     }
 
     async fn truncate_before(&self, sequence: u64) -> Result<(), HyperbytedbError> {
@@ -514,10 +549,10 @@ impl WalPort for RocksDbWal {
         tokio::task::spawn_blocking(move || {
             let wal_cf = db
                 .cf_handle(WAL_CF)
-                .ok_or_else(|| HyperbytedbError::Wal("wal column family not found".to_string()))?;
-            let wal_meta_cf = db.cf_handle(WAL_META_CF).ok_or_else(|| {
-                HyperbytedbError::Wal("wal_meta column family not found".to_string())
-            })?;
+                .ok_or_else(|| HyperbytedbError::Wal("wal column family not found".into()))?;
+            let wal_meta_cf = db
+                .cf_handle(WAL_META_CF)
+                .ok_or_else(|| HyperbytedbError::Wal("wal_meta column family not found".into()))?;
 
             let from = u64_to_be_bytes(0);
             let to = u64_to_be_bytes(sequence);
@@ -525,11 +560,16 @@ impl WalPort for RocksDbWal {
             batch.delete_range_cf(&wal_cf, &from, &to);
             batch.put_cf(&wal_meta_cf, LAST_SEQ_KEY, u64_to_be_bytes(last_seq));
             db.write(batch)
-                .map_err(|e| HyperbytedbError::Wal(e.to_string()))?;
+                .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
             Ok(())
         })
         .await
-        .map_err(|e| HyperbytedbError::Wal(format!("WAL truncate task panicked: {e}")))?
+        .map_err(|e| {
+            HyperbytedbError::Wal(crate::error::ChainedError::with_context(
+                "WAL truncate task panicked",
+                e,
+            ))
+        })?
     }
 
     async fn last_sequence(&self) -> Result<u64, HyperbytedbError> {
@@ -540,10 +580,59 @@ impl WalPort for RocksDbWal {
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
             db.flush_wal(true)
-                .map_err(|e| HyperbytedbError::Wal(e.to_string()))
+                .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))
         })
         .await
-        .map_err(|e| HyperbytedbError::Wal(format!("WAL flush panicked: {e}")))?
+        .map_err(|e| {
+            HyperbytedbError::Wal(crate::error::ChainedError::with_context(
+                "WAL flush panicked",
+                e,
+            ))
+        })?
+    }
+
+    async fn purge_database(&self, database: &str) -> Result<(), HyperbytedbError> {
+        self.arrow_cache.purge_database(database);
+        let db = self.db.clone();
+        let wal_format = self.wal_format;
+        let database = database.to_string();
+        tokio::task::spawn_blocking(move || {
+            let wal_cf = db
+                .cf_handle(WAL_CF)
+                .ok_or_else(|| HyperbytedbError::Wal("wal column family not found".into()))?;
+
+            let mut batch = WriteBatch::default();
+            let iter = db.iterator_cf_opt(
+                &wal_cf,
+                rocksdb::ReadOptions::default(),
+                IteratorMode::Start,
+            );
+            for item in iter {
+                let (key, value) = item.map_err(|e| {
+                    HyperbytedbError::Wal(crate::error::ChainedError::from_error(e))
+                })?;
+                if key.len() != 8 {
+                    continue;
+                }
+                let (_, entry) = wal_ipc::decode_wal_value(wal_format, &value)?;
+                if entry.database == database {
+                    batch.delete_cf(&wal_cf, key);
+                }
+            }
+            if !batch.is_empty() {
+                db.write(batch).map_err(|e| {
+                    HyperbytedbError::Wal(crate::error::ChainedError::from_error(e))
+                })?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| {
+            HyperbytedbError::Wal(crate::error::ChainedError::with_context(
+                "WAL purge task panicked",
+                e,
+            ))
+        })?
     }
 }
 
@@ -675,5 +764,33 @@ mod tests {
         )
         .unwrap();
         assert_absolute_seqs(&append_and_take(&wal).await);
+    }
+
+    #[tokio::test]
+    async fn purge_database_removes_matching_wal_entries_and_cache() {
+        let tmp = TempDir::new().unwrap();
+        let wal = RocksDbWal::open(tmp.path()).unwrap();
+
+        let mut other = test_entry();
+        other.database = "keep".into();
+        wal.append(other).await.unwrap();
+        wal.append_bundle(WalAppendBundle {
+            entry: test_entry(),
+            prepared: Some(relative_slot()),
+        })
+        .await
+        .unwrap();
+
+        wal.purge_database("db").await.unwrap();
+
+        let remaining = wal.read_from(1).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].1.database, "keep");
+        assert!(
+            wal.take_prepared_range(1, u64::MAX, 10)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

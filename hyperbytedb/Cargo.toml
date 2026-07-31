@@ -24,10 +24,11 @@ tokio = { version = "1", features = [
 
 # Line protocol parsing (from InfluxDB IOx)
 influxdb-line-protocol = "2"
+rmp = "0.8"
 rmp-serde = "1.3"
 
-# Arrow (columnar msgpack ingest uses RecordBatch for validation benchmarks)
-arrow = { version = "54", features = ["ipc"] }
+# Arrow (columnar msgpack ingest + chDB RecordBatch inserts; must match chdb-rust)
+arrow = { version = "59", features = ["ipc"] }
 
 # chdb — local checkout: provides the Arrow C Data Interface insert path
 # (`arrow_insert`, `Session::connection`) that the published 1.4.0 provides.

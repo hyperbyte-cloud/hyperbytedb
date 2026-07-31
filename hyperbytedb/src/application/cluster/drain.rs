@@ -80,7 +80,9 @@ impl DrainService {
         loop {
             if start.elapsed() > max_wait {
                 tracing::warn!("timed out waiting for replication acks");
-                break;
+                return Err(HyperbytedbError::Internal(crate::error::ChainedError::new(
+                    "timed out waiting for peer replication acks during drain",
+                )));
             }
 
             let peers = {

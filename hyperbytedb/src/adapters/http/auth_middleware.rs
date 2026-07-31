@@ -37,7 +37,8 @@ pub async fn auth_layer(
         return next.run(request).await;
     }
 
-    let credentials = extract_credentials(&headers, &query);
+    let credentials =
+        extract_credentials(&headers, &query, state.auth_allow_query_param_credentials);
 
     match credentials {
         Some((user, pass)) => match state.auth.authenticate_user(&user, &pass).await {
@@ -54,9 +55,14 @@ pub async fn auth_layer(
     }
 }
 
-fn extract_credentials(headers: &HeaderMap, query: &AuthParams) -> Option<(String, String)> {
-    // 1. Query parameters
-    if let (Some(u), Some(p)) = (&query.u, &query.p)
+fn extract_credentials(
+    headers: &HeaderMap,
+    query: &AuthParams,
+    allow_query_params: bool,
+) -> Option<(String, String)> {
+    // 1. Query parameters (opt-in; see `[auth] allow_query_param_credentials`)
+    if allow_query_params
+        && let (Some(u), Some(p)) = (&query.u, &query.p)
         && !u.is_empty()
     {
         return Some((u.clone(), p.clone()));
@@ -103,7 +109,8 @@ pub async fn internal_auth_layer(
         return next.run(request).await;
     }
 
-    let credentials = extract_credentials(&headers, &query);
+    let credentials =
+        extract_credentials(&headers, &query, state.auth_allow_query_param_credentials);
 
     match credentials {
         Some((user, pass)) => match state.auth.authenticate_user(&user, &pass).await {
@@ -166,7 +173,53 @@ pub fn hash_password(password: &str) -> Result<String, crate::error::Hyperbytedb
     let hash = Argon2::default()
         .hash_password(password.as_bytes(), &salt)
         .map_err(|e| {
-            crate::error::HyperbytedbError::Internal(format!("password hash failed: {e}"))
+            crate::error::HyperbytedbError::Internal(format!("password hash failed: {e}").into())
         })?;
     Ok(hash.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    fn auth_params(u: &str, p: &str) -> AuthParams {
+        AuthParams {
+            u: Some(u.to_string()),
+            p: Some(p.to_string()),
+        }
+    }
+
+    #[test]
+    fn query_params_ignored_when_not_allowed() {
+        let headers = HeaderMap::new();
+        let query = auth_params("admin", "secret");
+        assert!(extract_credentials(&headers, &query, false).is_none());
+    }
+
+    #[test]
+    fn query_params_used_when_allowed() {
+        let headers = HeaderMap::new();
+        let query = auth_params("admin", "secret");
+        assert_eq!(
+            extract_credentials(&headers, &query, true),
+            Some(("admin".to_string(), "secret".to_string()))
+        );
+    }
+
+    #[test]
+    fn basic_auth_works_when_query_params_disallowed() {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode("admin:secret");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Basic {encoded}")).unwrap(),
+        );
+        let query = AuthParams::default();
+        assert_eq!(
+            extract_credentials(&headers, &query, false),
+            Some(("admin".to_string(), "secret".to_string()))
+        );
+    }
 }

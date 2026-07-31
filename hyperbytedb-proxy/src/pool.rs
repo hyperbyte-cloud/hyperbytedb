@@ -124,6 +124,13 @@ impl BackendPool {
         self.excluded.read().await.contains(ip)
     }
 
+    /// Sum of in-flight proxied requests across all backends. Used during
+    /// graceful shutdown to wait for active forwards to finish.
+    pub async fn total_inflight(&self) -> usize {
+        let snap = self.snapshot().await;
+        snap.iter().map(|b| b.inflight()).sum()
+    }
+
     /// JSON-serializable snapshot of the pool for `GET /admin/pool`.
     pub async fn pool_status(&self) -> Vec<BackendStatus> {
         let snap = self.snapshot().await;

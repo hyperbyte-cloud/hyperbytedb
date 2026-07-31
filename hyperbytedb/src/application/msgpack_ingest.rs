@@ -8,6 +8,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+use crate::application::ingest_metadata::validate_point_count;
+use crate::application::msgpack_limits::peek_top_level_array_len;
 use crate::domain::database::Precision;
 use crate::domain::point::{FieldValue, Point};
 use crate::error::HyperbytedbError;
@@ -26,9 +28,22 @@ pub fn parse_msgpack_body_to_points(
     body: &[u8],
     precision: Option<&str>,
 ) -> Result<Vec<Point>, HyperbytedbError> {
+    parse_msgpack_body_to_points_limited(body, precision, 0)
+}
+
+/// Like [`parse_msgpack_body_to_points`] but rejects batches above `max_points`
+/// before deserializing point maps (`0` = default cap).
+pub fn parse_msgpack_body_to_points_limited(
+    body: &[u8],
+    precision: Option<&str>,
+    max_points: usize,
+) -> Result<Vec<Point>, HyperbytedbError> {
     if body.is_empty() {
         return Ok(Vec::new());
     }
+
+    let count = peek_top_level_array_len(body)?;
+    validate_point_count(count, max_points)?;
 
     let wire: Vec<MsgpackPointWire> =
         rmp_serde::from_slice(body).map_err(|e| HyperbytedbError::MsgpackParse {
