@@ -879,13 +879,9 @@ impl ChdbNativeAdapter {
             let insert_options = self.insert_options.clone();
             tokio::task::spawn_blocking(move || {
                 pool.with_connection(|conn| {
-                    insert_record_batch_direct(
-                        conn,
-                        &series_table,
-                        batch,
-                        insert_options,
+                    insert_record_batch_direct(conn, &series_table, batch, insert_options).map_err(
+                        |e| HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e)),
                     )
-                    .map_err(|e| HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e)))
                 })
             })
             .await
@@ -968,10 +964,7 @@ impl ChdbNativeAdapter {
         let count = self
             .distinct_tag_value_count(db, rp, measurement, tag_key, points)
             .await?;
-        Ok(tag_column_kind(
-            count,
-            self.tag_low_cardinality_max,
-        ))
+        Ok(tag_column_kind(count, self.tag_low_cardinality_max))
     }
 
     /// Distinct tag values for `(db, measurement, tag_key)` from metadata plus
@@ -1343,13 +1336,8 @@ impl ChdbNativeAdapter {
         let insert_options = self.insert_options.clone();
         tokio::task::spawn_blocking(move || {
             pool.with_connection(|conn| {
-                insert_record_batch_direct(
-                    conn,
-                    &series_table,
-                    batch,
-                    insert_options,
-                )
-                .map_err(|e| HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e)))
+                insert_record_batch_direct(conn, &series_table, batch, insert_options)
+                    .map_err(|e| HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e)))
             })
         })
         .await
@@ -1447,10 +1435,9 @@ impl PointsSinkPort for ChdbNativeAdapter {
             let insert_options = self.insert_options.clone();
             tokio::task::spawn_blocking(move || {
                 pool.with_connection(|conn| {
-                    insert_record_batch_direct(conn, &table, batch, insert_options)
-                        .map_err(|e| {
-                            HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e))
-                        })
+                    insert_record_batch_direct(conn, &table, batch, insert_options).map_err(|e| {
+                        HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e))
+                    })
                 })
             })
             .await
