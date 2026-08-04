@@ -118,6 +118,22 @@ impl ShardMap {
     }
 }
 
+/// JSON-safe shard map for HTTP responses (`HashMap` keys are not valid JSON object keys).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardMapJson {
+    pub map_version: u64,
+    pub spaces: Vec<MeasurementShardSpace>,
+}
+
+impl From<&ShardMap> for ShardMapJson {
+    fn from(map: &ShardMap) -> Self {
+        Self {
+            map_version: map.map_version,
+            spaces: map.spaces.values().cloned().collect(),
+        }
+    }
+}
+
 /// Per-region stats reported by store nodes to the Raft leader (PD-lite).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RegionHeartbeat {

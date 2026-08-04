@@ -84,8 +84,8 @@ fn flag_off_shard_map_is_empty() {
 fn region_series_id_predicate_injection() {
     let sql = "SELECT * FROM t\nWHERE time > 0".to_string();
     let out = inject_region_series_id_predicate(sql, 10, 20);
-    assert!(out.contains("t.`series_id` >= 10"));
-    assert!(out.contains("t.`series_id` < 20"));
+    assert!(out.contains("`series_id` >= 10"));
+    assert!(out.contains("`series_id` < 20"));
 }
 
 #[test]

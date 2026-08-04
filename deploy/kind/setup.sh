@@ -30,10 +30,15 @@ OPERATOR_IMAGE="hyperbytedb-operator:local"
 #   helm  — install the published chart from GHCR; no local checkout needed
 # Override with --operator=<local|helm> or OPERATOR_SOURCE=<local|helm>.
 OPERATOR_SOURCE="${OPERATOR_SOURCE:-local}"
+# Perf mode: 4-worker kind cluster, 4-replica CR, no proxy/monitoring.
+PERF_MODE="${PERF_MODE:-false}"
+SKIP_MONITORING="${SKIP_MONITORING:-false}"
+SKIP_PROXY="${SKIP_PROXY:-false}"
 # Helm-mode chart reference + version. Empty version => latest.
 OPERATOR_HELM_CHART="${OPERATOR_HELM_CHART:-oci://ghcr.io/hyperbyte-cloud/charts/hyperbytedb-operator}"
 OPERATOR_HELM_VERSION="${OPERATOR_HELM_VERSION:-}"
 OPERATOR_RELEASE="hyperbytedb-operator"
+HYPERBYTEDB_REPLICAS=2
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -73,6 +78,9 @@ Commands:
 
 Options:
   --no-build              Skip Docker image build (use existing images)
+  --perf                  4-worker kind + perf sharded CR; skip proxy & monitoring
+  --skip-monitoring       Skip prometheus/grafana/loki/tempo/alloy deploy
+  --skip-proxy            Skip hyperbytedb-proxy image build
   --operator=<src>        Where to get the operator: 'local' (build from
                           \$OPERATOR_DIR, default) or 'helm' (install the
                           published chart from GHCR — no local checkout needed)
@@ -175,7 +183,9 @@ build_operator_image() {
 load_images() {
     header "Loading images into Kind cluster"
     kind load docker-image "$HYPERBYTEDB_IMAGE" --name "$CLUSTER_NAME"
-    kind load docker-image "$PROXY_IMAGE" --name "$CLUSTER_NAME"
+    if [[ "$SKIP_PROXY" != true ]]; then
+        kind load docker-image "$PROXY_IMAGE" --name "$CLUSTER_NAME"
+    fi
     if [[ "$OPERATOR_SOURCE" == "local" ]]; then
         kind load docker-image "$OPERATOR_IMAGE" --name "$CLUSTER_NAME"
     fi
@@ -188,6 +198,10 @@ create_host_data_dirs() {
     log "Creating host data directories for direct disk I/O"
     mkdir -p /tmp/hyperbytedb-data/worker-0
     mkdir -p /tmp/hyperbytedb-data/worker-1
+    if [[ "$PERF_MODE" == true ]]; then
+        mkdir -p /tmp/hyperbytedb-data/worker-2
+        mkdir -p /tmp/hyperbytedb-data/worker-3
+    fi
 }
 
 configure_local_path_provisioner() {
@@ -206,7 +220,11 @@ create_cluster() {
     fi
     header "Creating Kind cluster"
     create_host_data_dirs
-    kind create cluster --config "$SCRIPT_DIR/kind-config.yaml"
+    local kind_cfg="$SCRIPT_DIR/kind-config.yaml"
+    if [[ "$PERF_MODE" == true ]]; then
+        kind_cfg="$SCRIPT_DIR/kind-config-4worker.yaml"
+    fi
+    kind create cluster --config "$kind_cfg"
     configure_local_path_provisioner
     log "Cluster '$CLUSTER_NAME' created (using host path for storage)"
 }
@@ -275,8 +293,17 @@ deploy_operator_helm() {
 }
 
 deploy_hyperbytedb_cr() {
-    log "Creating HyperbytedbCluster CR (3-node cluster)"
-    kubectl apply -f "$MANIFESTS_DIR/hyperbytedb-cr.yaml"
+    local cr="$MANIFESTS_DIR/hyperbytedb-cr.yaml"
+    local replicas=2
+    if [[ "$PERF_MODE" == true ]]; then
+        cr="$MANIFESTS_DIR/hyperbytedb-cr-perf-sharded.yaml"
+        replicas=4
+        log "Creating HyperbytedbCluster CR (4-node perf sharded cluster)"
+    else
+        log "Creating HyperbytedbCluster CR (3-node cluster)"
+    fi
+    kubectl apply -f "$cr"
+    HYPERBYTEDB_REPLICAS="$replicas"
 }
 
 deploy_hyperbytedb_nodeport() {
@@ -513,7 +540,11 @@ cmd_up() {
 
     if [[ "$skip_build" == false ]]; then
         build_hyperbytedb_image
-        build_proxy_image
+        if [[ "$SKIP_PROXY" != true ]]; then
+            build_proxy_image
+        else
+            info "Skipping hyperbytedb-proxy image build (--skip-proxy / --perf)"
+        fi
         if [[ "$OPERATOR_SOURCE" == "local" ]]; then
             build_operator_image
         else
@@ -535,14 +566,18 @@ cmd_up() {
 
     deploy_hyperbytedb_cr
     deploy_hyperbytedb_nodeport
-    deploy_grafana_dashboard_configmap
-    deploy_kube_state_metrics
-    deploy_telegraf
-    deploy_prometheus
-    deploy_loki
-    deploy_tempo
-    deploy_alloy_logs
-    deploy_grafana
+    if [[ "$SKIP_MONITORING" != true ]]; then
+        deploy_grafana_dashboard_configmap
+        deploy_kube_state_metrics
+        deploy_telegraf
+        deploy_prometheus
+        deploy_loki
+        deploy_tempo
+        deploy_alloy_logs
+        deploy_grafana
+    else
+        info "Skipping monitoring stack (--skip-monitoring / --perf)"
+    fi
 
     # When the cluster already existed, pods won't pick up the new image
     # automatically since the tag hasn't changed. Force a rolling restart.
@@ -567,15 +602,17 @@ cmd_up() {
     fi
 
     header "Waiting for workloads"
-    wait_for_statefulset hyperbytedb 2 300
-    verify_tempo_traces
-    wait_for_rollout deployment kube-state-metrics 120s
-    wait_for_rollout deployment telegraf 120s
-    wait_for_rollout deployment prometheus 120s
-    wait_for_rollout deployment loki 120s
-    wait_for_rollout deployment tempo 180s
-    wait_for_rollout deployment alloy-logs 180s
-    wait_for_rollout deployment grafana 120s
+    wait_for_statefulset hyperbytedb "$HYPERBYTEDB_REPLICAS" 600
+    if [[ "$SKIP_MONITORING" != true ]]; then
+        verify_tempo_traces
+        wait_for_rollout deployment kube-state-metrics 120s
+        wait_for_rollout deployment telegraf 120s
+        wait_for_rollout deployment prometheus 120s
+        wait_for_rollout deployment loki 120s
+        wait_for_rollout deployment tempo 180s
+        wait_for_rollout deployment alloy-logs 180s
+        wait_for_rollout deployment grafana 120s
+    fi
 
     show_status
     show_access_info
@@ -615,7 +652,7 @@ cmd_rebuild() {
     if [[ -n "$sts_name" ]]; then
         kubectl rollout restart statefulset/"$sts_name" -n "$NAMESPACE"
     fi
-    wait_for_statefulset hyperbytedb 2 300
+    wait_for_statefulset hyperbytedb "$HYPERBYTEDB_REPLICAS" 600
     show_status
     log "Rebuild complete."
 }
@@ -638,6 +675,17 @@ parse_global_flags() {
     REMAINING_ARGS=()
     for arg in "$@"; do
         case "$arg" in
+            --perf)
+                PERF_MODE=true
+                SKIP_MONITORING=true
+                SKIP_PROXY=true
+                ;;
+            --skip-monitoring)
+                SKIP_MONITORING=true
+                ;;
+            --skip-proxy)
+                SKIP_PROXY=true
+                ;;
             --operator=*)
                 OPERATOR_SOURCE="${arg#--operator=}"
                 ;;

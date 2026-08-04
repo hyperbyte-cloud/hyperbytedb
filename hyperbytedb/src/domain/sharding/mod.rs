@@ -10,6 +10,6 @@ pub use ops::{apply_shard_map_op, ShardMapOp};
 pub use query_merge::merge_query_results;
 pub use types::{
     MeasurementKey, MeasurementShardSpace, RegionHeartbeat, ShardBootstrapRequest, ShardEpoch,
-    ShardMap, ShardMetadataKind, ShardMetadataRequest, ShardQueryRequest, ShardDeleteRequest,
-    ShardRegion, ShardTransferRequest, ShardWriteRequest,
+    ShardMap, ShardMapJson, ShardMetadataKind, ShardMetadataRequest, ShardQueryRequest,
+    ShardDeleteRequest, ShardRegion, ShardTransferRequest, ShardWriteRequest,
 };

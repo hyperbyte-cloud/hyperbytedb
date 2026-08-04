@@ -272,9 +272,9 @@ async fn verify_replication_peer(
     if guard.get_node(origin_node_id).is_some() {
         Ok(())
     } else {
-        Err(HyperbytedbError::Internal(format!(
-            "replicate apply rejected: unknown origin peer {origin_node_id}"
-        )))
+        Err(HyperbytedbError::Internal(
+            format!("replicate apply rejected: unknown origin peer {origin_node_id}").into(),
+        ))
     }
 }
 

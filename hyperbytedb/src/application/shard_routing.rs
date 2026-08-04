@@ -40,13 +40,18 @@ pub async fn ensure_measurement_bootstrapped(
     is_raft_leader: bool,
     leader_addr: Option<&str>,
 ) -> Result<(), HyperbytedbError> {
-    let map = ctx.shard_map.snapshot().await?;
-    if map.space(db, rp, measurement).is_some() {
+    let timeout = Duration::from_millis(ctx.config.bootstrap_timeout_ms);
+    if measurement_bootstrapped(ctx, db, rp, measurement).await? {
         return Ok(());
     }
 
     if is_raft_leader {
-        bootstrap_measurement_local(ctx, db, rp, measurement).await?;
+        let op = build_bootstrap_op(ctx, db, rp, measurement).await?;
+        if let Some(addr) = leader_addr {
+            propose_shard_map_op_via_raft(addr, op).await?;
+        } else {
+            bootstrap_measurement_local(ctx, db, rp, measurement).await?;
+        }
     } else if let Some(addr) = leader_addr {
         let url = format!("http://{addr}/internal/shard/bootstrap");
         let req = ShardBootstrapRequest {
@@ -54,7 +59,6 @@ pub async fn ensure_measurement_bootstrapped(
             rp: rp.to_string(),
             measurement: measurement.to_string(),
         };
-        let timeout = Duration::from_millis(ctx.config.bootstrap_timeout_ms);
         let resp = ctx
             .peer_client
             .http_client()
@@ -76,17 +80,48 @@ pub async fn ensure_measurement_bootstrapped(
         ));
     }
 
-    let map = ctx.shard_map.snapshot().await?;
-    ctx.location_cache.refresh_from_map(&map);
-    Ok(())
+    wait_for_measurement_bootstrapped(ctx, db, rp, measurement, timeout).await
 }
 
-pub async fn bootstrap_measurement_local(
+async fn measurement_bootstrapped(
     ctx: &ShardRoutingContext,
     db: &str,
     rp: &str,
     measurement: &str,
+) -> Result<bool, HyperbytedbError> {
+    let map = ctx.shard_map.snapshot().await?;
+    Ok(map.space(db, rp, measurement).is_some())
+}
+
+async fn wait_for_measurement_bootstrapped(
+    ctx: &ShardRoutingContext,
+    db: &str,
+    rp: &str,
+    measurement: &str,
+    timeout: Duration,
 ) -> Result<(), HyperbytedbError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let map = ctx.shard_map.snapshot().await?;
+        if map.space(db, rp, measurement).is_some() {
+            ctx.location_cache.refresh_from_map(&map);
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(HyperbytedbError::ShardMap(
+                "bootstrap replication timeout".into(),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+pub async fn build_bootstrap_op(
+    ctx: &ShardRoutingContext,
+    db: &str,
+    rp: &str,
+    measurement: &str,
+) -> Result<ShardMapOp, HyperbytedbError> {
     let peers = select_bootstrap_peers(ctx).await?;
     if peers.is_empty() {
         return Err(HyperbytedbError::ClusterUnavailable(
@@ -103,10 +138,22 @@ pub async fn bootstrap_measurement_local(
         primary,
         last_split_at: 0,
     };
-    let op = ShardMapOp::BootstrapMeasurement {
+    Ok(ShardMapOp::BootstrapMeasurement {
         key: MeasurementKey::new(db, rp, measurement),
         region,
-    };
+    })
+}
+
+pub async fn bootstrap_measurement_local(
+    ctx: &ShardRoutingContext,
+    db: &str,
+    rp: &str,
+    measurement: &str,
+) -> Result<(), HyperbytedbError> {
+    if measurement_bootstrapped(ctx, db, rp, measurement).await? {
+        return Ok(());
+    }
+    let op = build_bootstrap_op(ctx, db, rp, measurement).await?;
     ctx.shard_map.apply_op(op).await?;
     Ok(())
 }

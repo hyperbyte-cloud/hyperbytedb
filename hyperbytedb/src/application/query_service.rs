@@ -1671,7 +1671,7 @@ fn series_results_to_json_each_row(series: &[SeriesResult]) -> Result<String, Hy
             }
             lines.push(
                 serde_json::to_string(&obj)
-                    .map_err(|e| HyperbytedbError::Internal(e.to_string()))?,
+                    .map_err(|e| HyperbytedbError::Internal(e.to_string().into()))?,
             );
         }
     }
@@ -2098,7 +2098,7 @@ async fn execute_sharded_measurement_query(
     });
     let mut sql = to_clickhouse::translate_native_table(
         &effective_stmt,
-        &table,
+        table.as_str(),
         effective_mapping.as_ref(),
         series_join,
         Some((time_min, time_max)),
@@ -2146,12 +2146,11 @@ async fn execute_sharded_measurement_query(
                 .await
                 .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
             if !resp.status().is_success() {
-                return Err(HyperbytedbError::Internal(format!(
-                    "shard query failed: {}",
-                    resp.status()
-                )));
+                return Err(HyperbytedbError::Internal(
+                    format!("shard query failed: {}", resp.status()).into(),
+                ));
             }
-            let raw = resp.text().await.map_err(|e| HyperbytedbError::Internal(e.to_string()))?;
+            let raw = resp.text().await.map_err(|e| HyperbytedbError::Internal(e.to_string().into()))?;
             parse_json_each_row_to_series(&raw, measurement, epoch, &resolved_group_by_tags)?
         };
         if !series.is_empty() {

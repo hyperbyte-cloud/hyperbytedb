@@ -5,10 +5,11 @@ pub fn inject_region_series_id_predicate(sql: String, start: u64, end: u64) -> S
     if start == 0 && end == u64::MAX {
         return sql;
     }
+    // Use unqualified `series_id`: native-table SQL has no `t` alias unless a series join wraps the FROM clause.
     let predicate = if end == u64::MAX {
-        format!("t.`series_id` >= {start}")
+        format!("`series_id` >= {start}")
     } else {
-        format!("t.`series_id` >= {start} AND t.`series_id` < {end}")
+        format!("`series_id` >= {start} AND `series_id` < {end}")
     };
     inject_and_predicate(sql, &predicate)
 }

@@ -26,10 +26,10 @@ pub struct RocksDbShardMap {
 impl RocksDbShardMap {
     pub fn open(meta_dir: &Path, enabled: bool, node_id: u64) -> Result<Self, HyperbytedbError> {
         let path = meta_dir.join("shard_map");
-        std::fs::create_dir_all(&path).map_err(|e| HyperbytedbError::Storage(e.to_string()))?;
+        std::fs::create_dir_all(&path).map_err(|e| HyperbytedbError::Storage(e.to_string().into()))?;
         let mut opts = Options::default();
         opts.create_if_missing(true);
-        let db = DB::open(&opts, &path).map_err(|e| HyperbytedbError::Storage(e.to_string()))?;
+        let db = DB::open(&opts, &path).map_err(|e| HyperbytedbError::Storage(e.to_string().into()))?;
         let db = Arc::new(db);
         let cache = load_map(&db)?;
         Ok(Self {
@@ -48,14 +48,14 @@ impl RocksDbShardMap {
     ) -> Result<(), HyperbytedbError> {
         self.db
             .put(heartbeat_key(region_id, node_id), payload)
-            .map_err(|e| HyperbytedbError::Storage(e.to_string()))
+            .map_err(|e| HyperbytedbError::Storage(e.to_string().into()))
     }
 
     pub fn list_heartbeats(&self) -> Result<Vec<(u64, u64, Vec<u8>)>, HyperbytedbError> {
         let prefix = HEARTBEAT_PREFIX.as_bytes();
         let mut out = Vec::new();
         for item in self.db.iterator(IteratorMode::From(prefix, rocksdb::Direction::Forward)) {
-            let (key, value) = item.map_err(|e| HyperbytedbError::Storage(e.to_string()))?;
+            let (key, value) = item.map_err(|e| HyperbytedbError::Storage(e.to_string().into()))?;
             if !key.starts_with(prefix) {
                 break;
             }
@@ -77,7 +77,7 @@ impl RocksDbShardMap {
 }
 
 fn load_map(db: &DB) -> Result<ShardMap, HyperbytedbError> {
-    match db.get(SHARD_MAP_KEY).map_err(|e| HyperbytedbError::Storage(e.to_string()))? {
+    match db.get(SHARD_MAP_KEY).map_err(|e| HyperbytedbError::Storage(e.to_string().into()))? {
         Some(bytes) => {
             let persisted: PersistedShardMap = serde_json::from_slice(&bytes)
                 .map_err(|e| HyperbytedbError::ShardMap(e.to_string()))?;
@@ -91,7 +91,7 @@ fn persist_map(db: &DB, map: &ShardMap) -> Result<(), HyperbytedbError> {
     let bytes = serde_json::to_vec(&PersistedShardMap::from(map))
         .map_err(|e| HyperbytedbError::ShardMap(e.to_string()))?;
     db.put(SHARD_MAP_KEY, bytes)
-        .map_err(|e| HyperbytedbError::Storage(e.to_string()))
+        .map_err(|e| HyperbytedbError::Storage(e.to_string().into()))
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]

@@ -6,15 +6,18 @@ use axum::response::IntoResponse;
 use axum::Json;
 use metrics::counter;
 
+use crate::adapters::cluster::raft::types::ClusterRequest;
 use crate::application::ingest_metadata::prepare_batch_metadata;
 use crate::application::line_protocol::parse_line_body_to_points_limited;
 use crate::application::replication_dispatch::dispatch_outbound_replication;
-use crate::application::shard_routing::{bootstrap_measurement_local, region_peer_targets};
+use crate::application::shard_routing::{
+    bootstrap_measurement_local, build_bootstrap_op, region_peer_targets,
+};
 use crate::application::wal_append::append_points_with_prepared;
 use crate::application::shard_query::inject_region_series_id_predicate;
 use crate::application::shard_transfer::apply_transfer;
 use crate::domain::sharding::{
-    RegionHeartbeat, ShardBootstrapRequest, ShardDeleteRequest, ShardMap, ShardMetadataKind,
+    RegionHeartbeat, ShardBootstrapRequest, ShardDeleteRequest, ShardMapJson, ShardMetadataKind,
     ShardMetadataRequest, ShardQueryRequest, ShardTransferPayload, ShardWriteRequest,
 };
 use crate::ports::replication::OutboundReplicationBatch;
@@ -33,6 +36,12 @@ pub async fn handle_shard_bootstrap(
         )
             .into_response();
     };
+
+    if let Ok(map) = ctx.shard_map.snapshot().await {
+        if map.space(&req.db, &req.rp, &req.measurement).is_some() {
+            return (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response();
+        }
+    }
 
     if let Some(ref raft) = state.raft {
         let metrics = raft.metrics().borrow().clone();
@@ -80,6 +89,41 @@ pub async fn handle_shard_bootstrap(
             )
                 .into_response();
         }
+
+        match build_bootstrap_op(ctx, &req.db, &req.rp, &req.measurement).await {
+            Ok(op) => match raft
+                .client_write(ClusterRequest::ShardMapMutation(Box::new(op)))
+                .await
+            {
+                Ok(_) => {
+                    if let Ok(map) = ctx.shard_map.snapshot().await {
+                        state.shard_location_cache.refresh_from_map(&map);
+                    }
+                    return (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response();
+                }
+                Err(e) => {
+                    if let Ok(map) = ctx.shard_map.snapshot().await {
+                        if map.space(&req.db, &req.rp, &req.measurement).is_some() {
+                            state.shard_location_cache.refresh_from_map(&map);
+                            return (StatusCode::OK, Json(serde_json::json!({"ok": true})))
+                                .into_response();
+                        }
+                    }
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": e.to_string()})),
+                    )
+                        .into_response();
+                }
+            },
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+                    .into_response();
+            }
+        }
     }
 
     match bootstrap_measurement_local(ctx, &req.db, &req.rp, &req.measurement).await {
@@ -99,10 +143,14 @@ pub async fn handle_shard_bootstrap(
 
 pub async fn handle_shard_map(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let Some(shard_map) = state.shard_map.as_ref() else {
-        return Json(ShardMap::default()).into_response();
+        return Json(ShardMapJson {
+            map_version: 0,
+            spaces: Vec::new(),
+        })
+        .into_response();
     };
     match shard_map.snapshot().await {
-        Ok(map) => Json(map).into_response(),
+        Ok(map) => Json(ShardMapJson::from(&map)).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),

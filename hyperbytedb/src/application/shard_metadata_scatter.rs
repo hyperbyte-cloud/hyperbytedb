@@ -48,14 +48,13 @@ async fn fetch_remote_metadata(
         .await
         .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
     if !resp.status().is_success() {
-        return Err(HyperbytedbError::Internal(format!(
-            "metadata scatter failed: {}",
-            resp.status()
-        )));
+        return Err(HyperbytedbError::Internal(
+            format!("metadata scatter failed: {}", resp.status()).into(),
+        ));
     }
     resp.json()
         .await
-        .map_err(|e| HyperbytedbError::Internal(e.to_string()))
+        .map_err(|e| HyperbytedbError::Internal(e.to_string().into()))
 }
 
 pub async fn scatter_tag_keys(
