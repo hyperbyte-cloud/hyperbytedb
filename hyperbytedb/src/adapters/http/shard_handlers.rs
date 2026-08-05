@@ -10,9 +10,8 @@ use crate::adapters::cluster::raft::types::ClusterRequest;
 use crate::application::ingest_metadata::prepare_batch_metadata;
 use crate::application::line_protocol::parse_line_body_to_points_limited;
 use crate::application::replication_dispatch::dispatch_outbound_replication;
-use crate::application::shard_routing::{
-    bootstrap_measurement_local, build_bootstrap_op, region_peer_targets,
-};
+use crate::application::shard_peer_resolution::active_region_peer_targets;
+use crate::application::shard_routing::{bootstrap_measurement_local, build_bootstrap_op};
 use crate::application::wal_append::append_points_with_prepared;
 use crate::application::shard_query::inject_region_series_id_predicate;
 use crate::application::shard_transfer::apply_transfer;
@@ -37,30 +36,35 @@ pub async fn handle_shard_bootstrap(
             .into_response();
     };
 
-    if let Ok(map) = ctx.shard_map.snapshot().await {
-        if map.space(&req.db, &req.rp, &req.measurement).is_some() {
-            return (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response();
-        }
+    if let Ok(map) = ctx.shard_map.snapshot().await
+        && map.space(&req.db, &req.rp, &req.measurement).is_some()
+    {
+        return (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response();
     }
 
     if let Some(ref raft) = state.raft {
         let metrics = raft.metrics().borrow().clone();
         if metrics.current_leader != Some(state.node_id) {
-            if let Some(leader) = metrics.current_leader {
-                if let Some(m) = state.membership.as_ref() {
-                    let membership = m.read().await;
-                    if let Some(node) = membership.get_node(leader) {
-                        let url = format!("http://{}/internal/shard/bootstrap", node.addr);
-                        match state
-                            .peer_client
-                            .as_ref()
-                            .unwrap()
-                            .http_client()
-                            .post(&url)
-                            .json(&req)
-                            .send()
-                            .await
-                        {
+            if let Some(leader) = metrics.current_leader
+                && let Some(m) = state.membership.as_ref()
+            {
+                let membership = m.read().await;
+                if let Some(node) = membership.get_node(leader) {
+                    let url = format!("http://{}/internal/shard/bootstrap", node.addr);
+                    let Some(pc) = state.peer_client.as_ref() else {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::json!({"error": "peer client unavailable"})),
+                        )
+                            .into_response();
+                    };
+                    match pc
+                        .http_client()
+                        .post(&url)
+                        .json(&req)
+                        .send()
+                        .await
+                    {
                             Ok(resp) if resp.status().is_success() => {
                                 return (StatusCode::OK, Json(serde_json::json!({"ok": true})))
                                     .into_response();
@@ -80,7 +84,6 @@ pub async fn handle_shard_bootstrap(
                                     .into_response();
                             }
                         }
-                    }
                 }
             }
             return (
@@ -102,12 +105,12 @@ pub async fn handle_shard_bootstrap(
                     return (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response();
                 }
                 Err(e) => {
-                    if let Ok(map) = ctx.shard_map.snapshot().await {
-                        if map.space(&req.db, &req.rp, &req.measurement).is_some() {
-                            state.shard_location_cache.refresh_from_map(&map);
-                            return (StatusCode::OK, Json(serde_json::json!({"ok": true})))
-                                .into_response();
-                        }
+                    if let Ok(map) = ctx.shard_map.snapshot().await
+                        && map.space(&req.db, &req.rp, &req.measurement).is_some()
+                    {
+                        state.shard_location_cache.refresh_from_map(&map);
+                        return (StatusCode::OK, Json(serde_json::json!({"ok": true})))
+                            .into_response();
                     }
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -266,7 +269,9 @@ pub async fn handle_shard_write(
     };
 
     if let Some(pc) = state.peer_client.as_ref() {
-        let targets = region_peer_targets(&region, state.node_id);
+        let membership = pc.membership().read().await;
+        let targets = active_region_peer_targets(&region, state.node_id, &membership);
+        drop(membership);
         let batch = OutboundReplicationBatch {
             database: req.db,
             retention_policy: req.rp,
@@ -476,7 +481,7 @@ pub async fn handle_shard_metadata(
         }
     }
 
-    let result = match req.kind {
+    match req.kind {
         ShardMetadataKind::TagKeys => {
             match state
                 .metadata
@@ -525,8 +530,7 @@ pub async fn handle_shard_metadata(
                     .into_response(),
             }
         }
-    };
-    result
+    }
 }
 
 pub async fn handle_shard_delete(

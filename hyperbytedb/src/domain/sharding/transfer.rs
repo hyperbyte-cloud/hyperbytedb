@@ -29,6 +29,7 @@ pub struct ShardTransferPayload {
 }
 
 impl ShardTransferPayload {
+    #[allow(clippy::too_many_arguments)]
     pub fn push(
         db: impl Into<String>,
         rp: impl Into<String>,

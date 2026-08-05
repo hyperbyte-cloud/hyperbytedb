@@ -223,6 +223,28 @@ pub trait MetadataPort: Send + Sync {
             .collect())
     }
 
+    /// Count series whose `series_id` lies in `[start, end)`.
+    ///
+    /// Default implementation scans all IDs; RocksDB overrides with a bounded scan.
+    async fn count_series_ids_in_range(
+        &self,
+        db: &str,
+        rp: &str,
+        measurement: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<u64, HyperbytedbError> {
+        if start == 0 && end == u64::MAX {
+            return Ok(self.list_series_ids(db, rp, measurement).await?.len() as u64);
+        }
+        Ok(self
+            .list_series_ids(db, rp, measurement)
+            .await?
+            .into_iter()
+            .filter(|id| *id >= start && *id < end)
+            .count() as u64)
+    }
+
     /// Resolve a single `series_id` to its tag set.
     async fn get_series(
         &self,

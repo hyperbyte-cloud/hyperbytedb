@@ -100,19 +100,23 @@ pub async fn run_leader_replication_monitor(
                 .set(wal_gap as f64);
 
             let mut region_lag = false;
-            if let Some(ref local_db) = local_manifest.databases.first() {
+            if let Some(local_db) = local_manifest.databases.first() {
                 for local_meas in &local_db.measurements {
-                    if let Some(peer_db) = peer_manifest
+                    let Some(peer_db) = peer_manifest
                         .databases
                         .iter()
                         .find(|d| d.name == local_db.name)
-                    {
-                        if let Some(peer_meas) = peer_db
-                            .measurements
-                            .iter()
-                            .find(|m| m.name == local_meas.name && m.rp == local_meas.rp)
-                        {
-                            for rw in &local_meas.region_watermarks {
+                    else {
+                        continue;
+                    };
+                    let Some(peer_meas) = peer_db
+                        .measurements
+                        .iter()
+                        .find(|m| m.name == local_meas.name && m.rp == local_meas.rp)
+                    else {
+                        continue;
+                    };
+                    for rw in &local_meas.region_watermarks {
                                 let peer_wm = peer_meas
                                     .region_watermarks
                                     .iter()
@@ -129,8 +133,6 @@ pub async fn run_leader_replication_monitor(
                                     .set(rw.wal_watermark.saturating_sub(peer_wm) as f64);
                                 }
                             }
-                        }
-                    }
                 }
             }
 

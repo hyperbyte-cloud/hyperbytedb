@@ -58,6 +58,18 @@ pub struct ShardingConfig {
     /// Timeout for synchronous bootstrap RPC to the Raft leader.
     #[serde(default = "default_shard_bootstrap_timeout_ms")]
     pub bootstrap_timeout_ms: u64,
+    /// Hard cap on regions per measurement (safety guard against runaway splits).
+    #[serde(default = "default_max_regions_per_measurement")]
+    pub max_regions_per_measurement: usize,
+    /// Seconds a region primary may stay non-Active before Raft leader proposes TransferPrimary.
+    #[serde(default = "default_primary_failover_after_secs")]
+    pub primary_failover_after_secs: u64,
+    /// Per-candidate HTTP timeout for sharded scatter (queries, metadata, forwards).
+    #[serde(default = "default_scatter_peer_timeout_ms")]
+    pub scatter_peer_timeout_ms: u64,
+    /// Max Active peers tried per region per scatter request.
+    #[serde(default = "default_scatter_max_peer_attempts")]
+    pub scatter_max_peer_attempts: usize,
 }
 
 impl Default for ShardingConfig {
@@ -73,8 +85,17 @@ impl Default for ShardingConfig {
             heartbeat_interval_secs: default_shard_heartbeat_interval_secs(),
             load_split_qps_threshold: 0,
             bootstrap_timeout_ms: default_shard_bootstrap_timeout_ms(),
+            max_regions_per_measurement: default_max_regions_per_measurement(),
+            primary_failover_after_secs: default_primary_failover_after_secs(),
+            scatter_peer_timeout_ms: default_scatter_peer_timeout_ms(),
+            scatter_max_peer_attempts: default_scatter_max_peer_attempts(),
         }
+
     }
+}
+
+fn default_max_regions_per_measurement() -> usize {
+    128
 }
 
 fn default_sharding_replication_factor() -> usize {
@@ -109,6 +130,18 @@ fn default_shard_bootstrap_timeout_ms() -> u64 {
     5000
 }
 
+fn default_primary_failover_after_secs() -> u64 {
+    60
+}
+
+fn default_scatter_peer_timeout_ms() -> u64 {
+    5000
+}
+
+fn default_scatter_max_peer_attempts() -> usize {
+    3
+}
+
 impl HyperbytedbConfig {
     /// Validate cross-field constraints after Figment merge.
     pub fn validate(&self) -> Result<(), String> {
@@ -120,6 +153,24 @@ impl HyperbytedbConfig {
         }
         if self.sharding.replication_factor == 0 {
             return Err("sharding.replication_factor must be >= 1".into());
+        }
+        if self.sharding.enabled {
+            if self.sharding.region_merge_series >= self.sharding.region_split_series {
+                return Err(
+                    "sharding.region_merge_series must be < sharding.region_split_series".into(),
+                );
+            }
+            if self.sharding.region_split_series >= self.sharding.region_max_series {
+                return Err(
+                    "sharding.region_split_series must be < sharding.region_max_series".into(),
+                );
+            }
+            if self.sharding.max_regions_per_measurement == 0 {
+                return Err("sharding.max_regions_per_measurement must be >= 1".into());
+            }
+            if self.sharding.scatter_max_peer_attempts == 0 {
+                return Err("sharding.scatter_max_peer_attempts must be >= 1".into());
+            }
         }
         Ok(())
     }

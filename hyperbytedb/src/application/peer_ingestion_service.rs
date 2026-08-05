@@ -14,8 +14,8 @@ use crate::application::line_protocol::{
 use crate::application::msgpack_ingest::parse_msgpack_body_to_points_limited;
 use crate::application::replication_dispatch::dispatch_outbound_replication;
 use crate::application::shard_routing::{
-    ensure_measurement_bootstrapped, forward_shard_write, partition_points, region_peer_targets,
-    ShardRoutingContext,
+    ensure_measurement_bootstrapped, forward_shard_write_to_region, partition_points,
+    region_replication_targets, ShardRoutingContext,
 };
 use crate::application::wal_append::{
     ColumnarWalAppend, append_columnar_with_prepared, append_points_with_prepared,
@@ -149,7 +149,9 @@ impl PeerIngestionService {
         points: Vec<crate::domain::point::Point>,
         _replication_body: Vec<u8>,
     ) -> Result<(), HyperbytedbError> {
-        let ctx = self.shard_routing.as_ref().expect("sharding ctx");
+        let ctx = self.shard_routing.as_ref().ok_or_else(|| {
+            HyperbytedbError::Internal("sharding context missing on ingest path".into())
+        })?;
         let mut measurements = std::collections::HashSet::new();
         for p in &points {
             measurements.insert(p.measurement.clone());
@@ -169,6 +171,10 @@ impl PeerIngestionService {
 
         let buckets = partition_points(ctx, db, rp, &points).await?;
         let precision_val = Precision::from_str_opt(precision);
+
+        for fwd_points in buckets.forward.values() {
+            forward_shard_write_to_region(ctx, db, rp, precision, fwd_points).await?;
+        }
 
         if !buckets.local.is_empty() {
             let local_points = buckets.local.clone();
@@ -200,7 +206,7 @@ impl PeerIngestionService {
                 .location_cache
                 .locate(&map, db, rp, &local_points[0].measurement, sid)
                 .ok_or_else(|| HyperbytedbError::ShardMap("no region".into()))?;
-            let targets = region_peer_targets(&region, self.node_id);
+            let targets = region_replication_targets(ctx, &region).await;
             self.dispatch_replication(OutboundReplicationBatch {
                 database: db.to_string(),
                 retention_policy: rp.to_string(),
@@ -212,9 +218,6 @@ impl PeerIngestionService {
             .await?;
         }
 
-        for (primary, fwd_points) in buckets.forward {
-            forward_shard_write(ctx, primary, db, rp, precision, &fwd_points).await?;
-        }
         Ok(())
     }
 

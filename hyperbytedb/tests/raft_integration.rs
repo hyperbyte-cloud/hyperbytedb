@@ -92,6 +92,9 @@ async fn start_cluster_node_with_listener(
         Some(sink.clone()),
         IngestCardinalityLimits::default(),
         0,
+        false,
+        node_id,
+        Some(shared_membership.clone()),
     ));
 
     let flush = Arc::new(FlushServiceImpl::new(wal.clone(), 0, sink.clone()));
@@ -159,6 +162,7 @@ async fn start_cluster_node_with_listener(
         shard_location_cache: Arc::new(hyperbytedb::domain::sharding::ShardLocationCache::new()),
         shard_routing: None,
         shard_scheduler: None,
+        region_cursors: None,
         ingest_cardinality: IngestCardinalityLimits::default(),
         cluster_replication: ReplicationConfig::default(),
     });
@@ -369,6 +373,7 @@ async fn test_cluster_endpoints_without_peers() {
         shard_location_cache: Arc::new(hyperbytedb::domain::sharding::ShardLocationCache::new()),
         shard_routing: None,
         shard_scheduler: None,
+        region_cursors: None,
         ingest_cardinality: IngestCardinalityLimits::default(),
         cluster_replication: ReplicationConfig::default(),
     });

@@ -150,27 +150,27 @@ impl RetentionService {
                 };
 
                 for meas in &measurements {
-                    if self.sharding_enabled {
-                        if let Some(ref sm) = self.shard_map {
-                            match sm.snapshot().await {
-                                Ok(map) => {
-                                    if let Some(space) = map.space(&db.name, &rp.name, meas) {
-                                        let is_primary = space
-                                            .regions
-                                            .iter()
-                                            .any(|r| r.primary == self.node_id);
-                                        if !is_primary {
-                                            continue;
-                                        }
+                    if self.sharding_enabled
+                        && let Some(ref sm) = self.shard_map
+                    {
+                        match sm.snapshot().await {
+                            Ok(map) => {
+                                if let Some(space) = map.space(&db.name, &rp.name, meas) {
+                                    let is_primary = space
+                                        .regions
+                                        .iter()
+                                        .any(|r| r.primary == self.node_id);
+                                    if !is_primary {
+                                        continue;
                                     }
                                 }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "retention: shard map snapshot failed, skipping measurement"
-                                    );
-                                    continue;
-                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "retention: shard map snapshot failed, skipping measurement"
+                                );
+                                continue;
                             }
                         }
                     }

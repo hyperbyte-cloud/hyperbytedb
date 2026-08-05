@@ -166,7 +166,7 @@ pub async fn push_region_transfer(
         region.region_id,
         region.start,
         region.end,
-        region.epoch.clone(),
+        region.epoch,
         body,
         source_node_id,
     );
@@ -189,6 +189,7 @@ pub async fn push_region_transfer(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_region_transfer(
     peer_client: &Arc<crate::adapters::cluster::peer_client::PeerClient>,
     metadata: &Arc<dyn MetadataPort>,

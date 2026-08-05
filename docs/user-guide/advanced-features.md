@@ -48,9 +48,17 @@ No initialization step is required. Nodes begin replicating as soon as they star
 ### Important considerations
 
 - Replication is **asynchronous and best-effort**. If a peer is down, the write succeeds locally but the peer misses it until anti-entropy or hinted handoff delivers it.
-- There is no distributed query fan-out. Each node queries its own embedded chDB tables.
+- There is no distributed query fan-out **unless series sharding is enabled** (`[sharding] enabled = true`). With the default full-copy cluster, each node queries its own embedded chDB tables.
 - Schema mutations (CREATE DATABASE, DROP DATABASE, DELETE, etc.) are replicated via Raft for consistent ordering.
 - Hinted handoff stores writes for unreachable peers and replays them on reconnection.
+
+### Series sharding (experimental)
+
+When `[sharding] enabled = true` on all cluster nodes, measurements are partitioned by `series_id` into regions with primary/replica peers. Any Active node can accept reads and writes — the coordinator scatters queries and forwards writes to region owners. This replaces full-copy write replication for sharded measurements with region-scoped replication.
+
+**Requirements:** enable on a **new** cluster before ingesting data; `[cluster] enabled = true`; identical sharding config on every node. Materialized views are not supported.
+
+See [Configuration — sharding](configuration.md#sharding) and [Deep Dive: Clustering — Series Sharding](../deep-dive/deep-dive-clustering.md#15-series-sharding-experimental).
 
 ---
 

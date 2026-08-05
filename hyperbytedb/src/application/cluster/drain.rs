@@ -152,7 +152,7 @@ impl DrainService {
                     key: space.key.clone(),
                     region_id: region.region_id,
                     new_primary,
-                    epoch: region.epoch.clone(),
+                    epoch: region.epoch,
                 };
                 raft.client_write(ClusterRequest::ShardMapMutation(Box::new(tp)))
                     .await
@@ -163,7 +163,7 @@ impl DrainService {
                     region_id: region.region_id,
                     from_peer: self.node_id,
                     to_peer: new_primary,
-                    epoch: region.epoch.clone(),
+                    epoch: region.epoch,
                 };
                 raft.client_write(ClusterRequest::ShardMapMutation(Box::new(mp)))
                     .await

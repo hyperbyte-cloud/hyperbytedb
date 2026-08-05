@@ -13,6 +13,7 @@ use crate::domain::sharding::RegionHeartbeat;
 use crate::ports::metadata::MetadataPort;
 use crate::ports::sharding::ShardMapPort;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_region_heartbeat_reporter(
     node_id: u64,
     peer_client: Arc<PeerClient>,
@@ -77,9 +78,14 @@ async fn report_once(
                 continue;
             }
             let series_count = metadata
-                .list_series_ids(&space.key.db, &space.key.rp, &space.key.measurement)
+                .count_series_ids_in_range(
+                    &space.key.db,
+                    &space.key.rp,
+                    &space.key.measurement,
+                    region.start,
+                    region.end,
+                )
                 .await
-                .map(|ids| ids.len() as u64)
                 .unwrap_or(0);
             let hb = RegionHeartbeat {
                 region_id: region.region_id,

@@ -36,7 +36,11 @@ Shared terminology used across HyperbyteDB documentation.
 | **Replication Log** | RocksDB-backed store tracking WAL and mutation acknowledgements from peers. Used for safe WAL truncation in cluster mode. |
 | **Retention Policy (RP)** | Configuration that controls how long data is kept. Each database has one or more RPs. The default RP is `autogen` with infinite duration. |
 | **RocksDB** | Embedded key-value store. Used for the WAL (durable write log), metadata store, replication log, and Raft state. |
+| **Region (shard)** | A contiguous `series_id` range `[start, end)` for a measurement, with a primary and replica peers. Sharded clusters partition each measurement into one or more regions. |
+| **Scatter-gather** | Query pattern used when `[sharding] enabled = true`: the coordinator fans out region-scoped sub-queries to Active peers and merges results. |
 | **Series** | A unique combination of measurement name and tag set. Each series has its own time-ordered sequence of field values. |
+| **series_id** | Stable 64-bit hash of a series (measurement + tags). Used to route writes and queries to the correct shard region. |
+| **Shard map** | Cluster-wide map of `(db, rp, measurement) → regions`, replicated via Raft. Drives write routing, query scatter, split/merge, and primary failover. |
 | **Statement Summary** | Ring buffer tracking recently executed TimeseriesQL statements with query digest, latency, and error status. Exposed via `GET /api/v1/statements`. |
 | **Tag** | A key-value pair in a data point used for indexing and grouping. Tags are always strings. Stored in metadata for SHOW TAG queries. |
 | **Tombstone** | A metadata record created by DELETE statements. Marks data for exclusion at query time. |

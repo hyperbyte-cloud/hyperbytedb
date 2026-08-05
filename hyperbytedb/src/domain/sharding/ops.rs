@@ -262,7 +262,7 @@ mod tests {
                 region_id: 1,
                 from_peer: 1,
                 to_peer: 2,
-                epoch: region.epoch.clone(),
+                epoch: region.epoch,
             },
         )
         .unwrap();
@@ -291,7 +291,7 @@ mod tests {
                 key,
                 region_id: 1,
                 new_primary: 2,
-                epoch: region.epoch.clone(),
+                epoch: region.epoch,
             },
         )
         .unwrap();

@@ -102,6 +102,9 @@ async fn start_auth_cluster_node(dir: &std::path::Path) -> AuthClusterNode {
         Some(sink.clone()),
         IngestCardinalityLimits::default(),
         0,
+        false,
+        1,
+        Some(shared_membership.clone()),
     ));
 
     let base_query_service: Arc<dyn hyperbytedb::adapters::http::router::QueryService> =
@@ -167,6 +170,7 @@ async fn start_auth_cluster_node(dir: &std::path::Path) -> AuthClusterNode {
         shard_location_cache: Arc::new(hyperbytedb::domain::sharding::ShardLocationCache::new()),
         shard_routing: None,
         shard_scheduler: None,
+        region_cursors: None,
         ingest_cardinality: IngestCardinalityLimits::default(),
         cluster_replication: ReplicationConfig::default(),
     });

@@ -7,7 +7,6 @@
 //! These tests use a mock QueryPort (no chDB required) for metadata and DDL
 //! operations. Tests requiring SELECT query execution are marked `#[ignore]`.
 
-use hyperbytedb::config::ReplicationConfig;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -15,7 +14,6 @@ use axum::http::StatusCode;
 use hyperbytedb::adapters::http::router::{AppState, QueryService, build_router};
 use hyperbytedb::adapters::metadata::rocksdb_meta::RocksDbMetadata;
 use hyperbytedb::adapters::wal::rocksdb_wal::RocksDbWal;
-use hyperbytedb::application::ingest_metadata::IngestCardinalityLimits;
 use hyperbytedb::application::flush_service::FlushServiceImpl;
 use hyperbytedb::application::ingestion_service::IngestionServiceImpl;
 use hyperbytedb::application::materialized_view_service::MaterializedViewService;
@@ -136,6 +134,14 @@ impl HttpTestContext {
             rate_limiter: None,
             wal_batcher_alive: None,
             disk_read_only: None,
+            sharding_enabled: false,
+            shard_map: None,
+            shard_location_cache: Arc::new(hyperbytedb::domain::sharding::ShardLocationCache::new()),
+            shard_routing: None,
+            shard_scheduler: None,
+        region_cursors: None,
+            ingest_cardinality: hyperbytedb::application::ingest_metadata::IngestCardinalityLimits::default(),
+            cluster_replication: hyperbytedb::config::ReplicationConfig::default(),
         });
 
         let app = build_router(state);

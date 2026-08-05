@@ -756,7 +756,11 @@ Uses the default Argon2id variant with parameters from the stored hash.
 
 ### Model
 
-HyperbyteDB uses **master-master (peer-to-peer) replication** for data writes, with **Raft consensus** (via `openraft`) for schema mutations. Every node accepts reads and writes. Data writes are replicated asynchronously to all peers. Schema-mutating operations (CREATE/DROP DATABASE, DELETE, user/CQ/RP management) are routed through Raft to ensure consistent ordering across the cluster. For a comprehensive treatment, see [Deep Dive: Clustering](../deep-dive/deep-dive-clustering.md).
+HyperbyteDB uses **master-master (peer-to-peer) replication** for data writes, with **Raft consensus** (via `openraft`) for schema mutations. Every node accepts reads and writes. Data writes are replicated asynchronously to all peers. Schema-mutating operations (CREATE/DROP DATABASE, DELETE, user/CQ/RP management) are routed through Raft to ensure consistent ordering across the cluster.
+
+When **`[sharding] enabled = true`** (experimental), full-copy replication is replaced by **region-scoped** replication and scatter-gather queries for sharded measurements. See [Deep Dive: Clustering — Series Sharding](../deep-dive/deep-dive-clustering.md#15-series-sharding-experimental).
+
+For a comprehensive treatment of the default cluster model, see [Deep Dive: Clustering](../deep-dive/deep-dive-clustering.md).
 
 ### Replicated operations
 

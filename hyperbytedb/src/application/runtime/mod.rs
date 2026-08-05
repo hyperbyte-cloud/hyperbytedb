@@ -172,12 +172,12 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
 
     // Shard scheduler (leader-only PD-lite) and periodic region heartbeats.
     let shard_scheduler_handle = if config.sharding.enabled {
-        if let (Some(raft), Some(map)) = (&raft_instance, &rocks_shard_map) {
+        if let (Some(raft), Some(map), Some(membership)) =
+            (&raft_instance, &rocks_shard_map, &membership)
+        {
             let scheduler = Arc::new(crate::application::shard_scheduler::ShardScheduler::new(
                 map.clone(),
-                membership
-                    .clone()
-                    .expect("sharding requires cluster membership"),
+                membership.clone(),
                 raft.clone(),
                 peer_client.clone(),
                 app_state.metadata.clone(),
@@ -189,10 +189,9 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
             ));
             app_state.shard_scheduler = Some(scheduler.clone());
 
-            if let (Some(sr), Some(pc), Some(m), Some(rl)) = (
+            if let (Some(sr), Some(pc), Some(rl)) = (
                 app_state.shard_routing.as_ref(),
                 peer_client.as_ref(),
-                &membership,
                 &app_state.replication_log,
             ) {
                 use crate::application::cluster::drain::DrainService;
@@ -201,7 +200,7 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
                 app_state.drain_service = Some(Arc::new(
                     DrainService::new(
                         config.cluster.node_id,
-                        m.clone(),
+                        membership.clone(),
                         flush_for_drain,
                         rl.clone(),
                         app_state.wal.clone(),
@@ -226,7 +225,7 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
                 let map = map.clone();
                 let meta = app_state.metadata.clone();
                 let raft = raft.clone();
-                let m = membership.clone().expect("sharding requires membership");
+                let m = membership.clone();
                 let hb_interval =
                     Duration::from_secs(config.sharding.heartbeat_interval_secs.max(1));
                 let hb_rx = service_shutdown_rx.clone();

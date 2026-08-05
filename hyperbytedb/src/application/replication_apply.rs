@@ -77,6 +77,7 @@ impl ReplicationApplyQueue {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn with_sink_and_sharding(
         depth: usize,
         metadata: Arc<dyn crate::ports::metadata::MetadataPort>,

@@ -50,10 +50,10 @@ impl RaftLeaderCallbacks {
         let Some(ref membership) = self.membership else {
             return;
         };
-        if let Ok(guard) = membership.try_read() {
-            if let Some(node) = guard.get_node(leader_id) {
-                *self.leader_addr.write() = Some(node.addr.clone());
-            }
+        if let Ok(guard) = membership.try_read()
+            && let Some(node) = guard.get_node(leader_id)
+        {
+            *self.leader_addr.write() = Some(node.addr.clone());
         }
     }
 

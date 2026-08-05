@@ -226,6 +226,32 @@ If nodes have different membership views, check network partitions and ensure al
 
 ---
 
+## Series sharding (experimental)
+
+Applies when `[sharding] enabled = true` on all cluster nodes.
+
+### Queries fail with peer unreachable or empty results after a node outage
+
+1. **Confirm membership:** Scatter only targets `Active` peers. A node marked `Disconnected` or failing `/health` is skipped.
+   ```bash
+   curl -s http://node1:8086/cluster/metrics | jq '.membership'
+   ```
+2. **Check scatter metrics:** `hyperbytedb_shard_scatter_fallback_total{kind="query"}` increases when queries succeed via a replica after primary failure. Sustained `PeerUnreachable` errors usually mean no Active peers remain for a region.
+3. **Wait for primary failover:** After `primary_failover_after_secs`, the Raft leader proposes `TransferPrimary`. Watch `hyperbytedb_shard_primary_failover_total`.
+4. **Verify identical sharding config** on every node (`enabled`, `replication_factor`, timeouts).
+
+### Writes succeed but data missing on an expected node
+
+With sharding, each series belongs to one region. Writes to any node are forwarded to region owners — data is **not** replicated to every cluster node. Inspect region peers via `/internal/shard/map` or cluster metrics.
+
+### DELETE not cleaning up on all nodes
+
+Physical delete fan-out requires an **Active primary** for each region. During primary outage, tombstones are stored but `/internal/shard/delete` cleanup may wait until failover completes.
+
+**Reference:** [Deep Dive: Clustering — Series Sharding](../deep-dive/deep-dive-clustering.md#15-series-sharding-experimental).
+
+---
+
 ## HTTP 429 (rate limit exceeded)
 
 **Symptom:** Clients receive `429 Too Many Requests` with body `rate limit exceeded, try again later` on `/write` or `/query`.

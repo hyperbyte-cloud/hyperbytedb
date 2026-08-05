@@ -97,12 +97,23 @@ async fn probe_peers(self_id: u64, membership: &SharedMembership, client: &reqwe
     let futures: Vec<_> = peers
         .iter()
         .map(|(peer_id, addr, _state)| {
-            let url = format!("http://{}/ping", addr);
+            let health_url = format!("http://{addr}/health");
+            let ping_url = format!("http://{addr}/ping");
             let client = client.clone();
             let pid = *peer_id;
             async move {
-                let ok = client.get(&url).send().await.is_ok();
-                (pid, ok)
+                let health_ok = client
+                    .get(&health_url)
+                    .send()
+                    .await
+                    .map(|r| r.status().is_success())
+                    .unwrap_or(false);
+                let ping_ok = if health_ok {
+                    true
+                } else {
+                    client.get(&ping_url).send().await.is_ok()
+                };
+                (pid, health_ok, ping_ok)
             }
         })
         .collect();
@@ -112,8 +123,8 @@ async fn probe_peers(self_id: u64, membership: &SharedMembership, client: &reqwe
     let now = chrono::Utc::now().timestamp();
     let mut m = membership.write().await;
 
-    for (pid, reachable) in results {
-        if reachable {
+    for (pid, health_ok, ping_ok) in results {
+        if health_ok {
             m.update_heartbeat(pid, now);
 
             if let Some(node) = m.get_node(pid)
@@ -122,6 +133,9 @@ async fn probe_peers(self_id: u64, membership: &SharedMembership, client: &reqwe
                 tracing::info!(peer_id = pid, "peer reconnected, marking active");
                 m.set_state(pid, NodeState::Active);
             }
+        } else if ping_ok {
+            // Reachable but not ready for traffic (Syncing/Draining/etc.).
+            m.update_heartbeat(pid, now);
         } else {
             let should_disconnect = m
                 .get_node(pid)

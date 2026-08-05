@@ -23,9 +23,12 @@ It does not mean every deployment size has been tested — see [Resource Sizing]
 | Single-node                 | Durable after WAL fsync                                   | Reads from chDB after flush  | Restart required for upgrades; drain before shutdown         |
 | Cluster (async replication) | Acknowledged after local WAL append; eventual consistency | Each node reads its own chDB | Peer unreachable → hinted handoff; schema mutations via Raft |
 | Cluster (sync_quorum)       | Acknowledged after local WAL append + W-of-N peer acks    | Each node reads its own chDB | Configured via `[cluster.replication] mode = "sync_quorum"`  |
+| Cluster (series sharding)   | Local WAL for owned regions; forwards to region peers     | Scatter-gather across regions | Experimental; requires `[sharding] enabled = true` on all nodes |
 
 
-There is no distributed query fan-out. Each node queries its own embedded chDB tables.
+When sharding is enabled, clients may connect to **any Active node** for reads and writes — the coordinator forwards or scatters as needed. Replica reads are eventually consistent. See [Deep Dive: Clustering](../deep-dive/deep-dive-clustering.md#15-series-sharding-experimental).
+
+Without sharding, there is no distributed query fan-out. Each node queries its own embedded chDB tables.
 Clients should balance reads across nodes or use the hyperbytedb-proxy for HTTP load balancing.
 
 ## What We Commit To Fixing

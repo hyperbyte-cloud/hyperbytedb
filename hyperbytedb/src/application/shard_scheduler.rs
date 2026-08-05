@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -7,9 +8,10 @@ use tokio::sync::watch;
 use crate::adapters::cluster::peer_client::PeerClient;
 use crate::adapters::cluster::raft::HyperbytedbRaft;
 use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
+use crate::application::shard_peer_resolution::is_active_peer;
 use crate::application::shard_transfer::run_region_transfer;
 use crate::config::ShardingConfig;
-use crate::domain::cluster::membership::SharedMembership;
+use crate::domain::cluster::membership::{NodeState, SharedMembership};
 use crate::domain::sharding::{
     MeasurementKey, ShardEpoch, ShardMapOp, ShardRegion,
 };
@@ -18,6 +20,8 @@ use crate::ports::metadata::MetadataPort;
 use crate::ports::points_sink::PointsSinkPort;
 use crate::ports::sharding::ShardMapPort;
 use crate::ports::wal::WalPort;
+
+type RegionHeartbeatRow = (u64, u64, u64, u64, u64);
 
 pub struct ShardScheduler {
     shard_map: Arc<RocksDbShardMap>,
@@ -30,8 +34,14 @@ pub struct ShardScheduler {
     node_id: u64,
     config: ShardingConfig,
     max_points_per_request: usize,
-    heartbeats: tokio::sync::RwLock<Vec<(u64, u64, u64, u64, u64)>>, // region, node, series, bytes, qps
+    heartbeats: tokio::sync::RwLock<Vec<RegionHeartbeatRow>>,
     in_flight_ops: tokio::sync::RwLock<usize>,
+    /// (db, rp, measurement, region_id) -> unix secs when primary first seen unhealthy
+    unhealthy_primaries: tokio::sync::RwLock<HashMap<(String, String, String, u64), u64>>,
+    #[cfg(test)]
+    test_force_leader: bool,
+    #[cfg(test)]
+    test_propose_sink: Option<Arc<std::sync::Mutex<Vec<ShardMapOp>>>>,
 }
 
 impl ShardScheduler {
@@ -61,7 +71,39 @@ impl ShardScheduler {
             max_points_per_request,
             heartbeats: tokio::sync::RwLock::new(Vec::new()),
             in_flight_ops: tokio::sync::RwLock::new(0),
+            unhealthy_primaries: tokio::sync::RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            test_force_leader: false,
+            #[cfg(test)]
+            test_propose_sink: None,
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_test_force_leader(mut self, v: bool) -> Self {
+        self.test_force_leader = v;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_test_propose_sink(mut self, sink: Arc<std::sync::Mutex<Vec<ShardMapOp>>>) -> Self {
+        self.test_propose_sink = Some(sink);
+        self
+    }
+
+    #[cfg(test)]
+    pub async fn tick_once_for_test(&self) -> Result<(), HyperbytedbError> {
+        self.tick().await
+    }
+
+    #[cfg(test)]
+    pub async fn try_failover_for_test(
+        &self,
+        key: &MeasurementKey,
+        region: &ShardRegion,
+        now: u64,
+    ) -> Result<(), HyperbytedbError> {
+        self.try_failover_unhealthy_primary(key, region, now).await
     }
 
     pub async fn record_heartbeat(
@@ -78,6 +120,10 @@ impl ShardScheduler {
     }
 
     fn is_leader(&self) -> bool {
+        #[cfg(test)]
+        if self.test_force_leader {
+            return true;
+        }
         let metrics = self.raft.metrics().borrow().clone();
         metrics.current_leader == Some(self.node_id)
     }
@@ -131,7 +177,15 @@ impl ShardScheduler {
             .as_secs();
         let hb = self.heartbeats.read().await.clone();
 
-        for (_key, space) in &map.spaces {
+        for (key, space) in &map.spaces {
+            metrics::gauge!(
+                "hyperbytedb_shard_regions",
+                "db" => key.db.clone(),
+                "rp" => key.rp.clone(),
+                "measurement" => key.measurement.clone(),
+            )
+            .set(space.regions.len() as f64);
+
             for (idx, region) in space.regions.iter().enumerate() {
                 let stats = hb
                     .iter()
@@ -143,16 +197,12 @@ impl ShardScheduler {
                     continue;
                 }
 
-                if series_count > self.config.region_max_series {
-                    let key = space.key.clone();
-                    let region = region.clone();
-                    if self.try_split(&key, &region, series_count).await.is_ok() {
-                        self.release_op_slot().await;
-                        continue;
-                    }
-                } else if series_count > self.config.region_split_series
-                    && now.saturating_sub(region.last_split_at) >= self.config.split_merge_interval_secs
-                {
+                let should_split = series_count > self.config.region_max_series
+                    || (series_count > self.config.region_split_series
+                        && now.saturating_sub(region.last_split_at)
+                            >= self.config.split_merge_interval_secs);
+
+                if should_split {
                     let key = space.key.clone();
                     let region = region.clone();
                     if self.try_split(&key, &region, series_count).await.is_ok() {
@@ -203,9 +253,69 @@ impl ShardScheduler {
                     tracing::debug!(error = %e, region_id = region.region_id, "rebalance skipped");
                 }
 
+                if let Err(e) = self
+                    .try_failover_unhealthy_primary(&space.key, region, now)
+                    .await
+                {
+                    tracing::debug!(error = %e, region_id = region.region_id, "failover skipped");
+                }
+
                 self.release_op_slot().await;
             }
         }
+        Ok(())
+    }
+
+    async fn try_failover_unhealthy_primary(
+        &self,
+        key: &MeasurementKey,
+        region: &ShardRegion,
+        now: u64,
+    ) -> Result<(), HyperbytedbError> {
+        let map_key = (
+            key.db.clone(),
+            key.rp.clone(),
+            key.measurement.clone(),
+            region.region_id,
+        );
+
+        let membership = self.membership.read().await;
+        let primary_unhealthy = !is_active_peer(&membership, region.primary);
+        drop(membership);
+
+        if !primary_unhealthy {
+            self.unhealthy_primaries.write().await.remove(&map_key);
+            return Ok(());
+        }
+
+        let first_seen = {
+            let mut unhealthy = self.unhealthy_primaries.write().await;
+            *unhealthy.entry(map_key.clone()).or_insert(now)
+        };
+
+        if now.saturating_sub(first_seen) < self.config.primary_failover_after_secs {
+            return Ok(());
+        }
+
+        let new_primary = pick_alternate_primary(&self.membership, region, self.node_id).await;
+        let Some(new_primary) = new_primary else {
+            counter!(
+                "hyperbytedb_shard_primary_failover_skipped_total",
+                "reason" => "no_alternate"
+            )
+            .increment(1);
+            return Ok(());
+        };
+
+        let op = ShardMapOp::TransferPrimary {
+            key: key.clone(),
+            region_id: region.region_id,
+            new_primary,
+            epoch: region.epoch,
+        };
+        self.propose(op).await?;
+        counter!("hyperbytedb_shard_primary_failover_total").increment(1);
+        self.unhealthy_primaries.write().await.remove(&map_key);
         Ok(())
     }
 
@@ -213,12 +323,35 @@ impl ShardScheduler {
         &self,
         key: &MeasurementKey,
         region: &ShardRegion,
-        _series_count: u64,
+        series_count: u64,
     ) -> Result<(), HyperbytedbError> {
         if region.end.saturating_sub(region.start) <= 1 {
             return Ok(());
         }
+        let map = self.shard_map.snapshot().await?;
+        if let Some(space) = map.space(&key.db, &key.rp, &key.measurement)
+            && space.regions.len() >= self.config.max_regions_per_measurement
+        {
+            tracing::warn!(
+                region_id = region.region_id,
+                series_count,
+                start = region.start,
+                end = region.end,
+                region_count = space.regions.len(),
+                max_regions = self.config.max_regions_per_measurement,
+                "shard split refused: region cap reached"
+            );
+            return Ok(());
+        }
         let split_key = region.start + (region.end - region.start) / 2;
+        tracing::info!(
+            region_id = region.region_id,
+            series_count,
+            start = region.start,
+            end = region.end,
+            split_key,
+            "proposing shard region split"
+        );
         let mut left = region.clone();
         left.end = split_key;
         left.epoch = left.epoch.bump_version();
@@ -367,7 +500,7 @@ impl ShardScheduler {
             key: key.clone(),
             region_id: region.region_id,
             new_primary,
-            epoch: region.epoch.clone(),
+            epoch: region.epoch,
         };
         self.propose(op).await?;
         counter!("hyperbytedb_shard_rebalances_total").increment(1);
@@ -375,6 +508,11 @@ impl ShardScheduler {
     }
 
     async fn propose(&self, op: ShardMapOp) -> Result<(), HyperbytedbError> {
+        #[cfg(test)]
+        if let Some(sink) = &self.test_propose_sink {
+            sink.lock().unwrap().push(op);
+            return Ok(());
+        }
         use crate::adapters::cluster::raft::types::ClusterRequest;
         let req = ClusterRequest::ShardMapMutation(Box::new(op));
         self.raft
@@ -406,12 +544,244 @@ async fn pick_alternate_primary(
         .peers
         .iter()
         .copied()
-        .find(|id| *id != region.primary && *id != self_id && m.get_node(*id).is_some())
-        .or_else(|| {
-            region
-                .peers
-                .iter()
-                .copied()
-                .find(|id| *id != region.primary && m.get_node(*id).is_some())
-        })
+        .find(|id| peer_is_active_alternate(&m, region, *id, self_id))
+}
+
+fn peer_is_active_alternate(
+    membership: &crate::domain::cluster::membership::ClusterMembership,
+    region: &ShardRegion,
+    peer_id: u64,
+    self_id: u64,
+) -> bool {
+    peer_id != region.primary
+        && peer_id != self_id
+        && membership
+            .get_node(peer_id)
+            .is_some_and(|n| n.state == NodeState::Active)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::cluster::membership::{ClusterMembership, NodeInfo, new_shared};
+    use crate::domain::sharding::ShardEpoch;
+
+    fn node(id: u64, state: NodeState) -> NodeInfo {
+        NodeInfo {
+            node_id: id,
+            addr: format!("127.0.0.1:{id}"),
+            state,
+            joined_at: 0,
+            last_heartbeat: 0,
+            needs_sync: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn pick_alternate_primary_requires_active_peer() {
+        let mut m = ClusterMembership::new();
+        m.add_node(node(1, NodeState::Disconnected));
+        m.add_node(node(2, NodeState::Active));
+        m.add_node(node(3, NodeState::Draining));
+        let membership = new_shared(m);
+
+        let region = ShardRegion {
+            region_id: 1,
+            start: 0,
+            end: u64::MAX,
+            epoch: ShardEpoch::default(),
+            peers: vec![1, 2, 3],
+            primary: 1,
+            last_split_at: 0,
+        };
+
+        assert_eq!(pick_alternate_primary(&membership, &region, 99).await, Some(2));
+    }
+
+    #[tokio::test]
+    async fn pick_alternate_primary_none_when_only_primary_in_membership() {
+        let mut m = ClusterMembership::new();
+        m.add_node(node(2, NodeState::Active));
+        let membership = new_shared(m);
+
+        let region = ShardRegion {
+            region_id: 1,
+            start: 0,
+            end: u64::MAX,
+            epoch: ShardEpoch::default(),
+            peers: vec![1, 2],
+            primary: 1,
+            last_split_at: 0,
+        };
+
+        // Peer 2 is active but self_id excludes it; peer 1 is not in membership.
+        assert_eq!(pick_alternate_primary(&membership, &region, 2).await, None);
+    }
+
+    #[tokio::test]
+    async fn pick_alternate_primary_none_when_no_active_alternate() {
+        let mut m = ClusterMembership::new();
+        m.add_node(node(1, NodeState::Disconnected));
+        m.add_node(node(2, NodeState::Leaving));
+        let membership = new_shared(m);
+
+        let region = ShardRegion {
+            region_id: 1,
+            start: 0,
+            end: u64::MAX,
+            epoch: ShardEpoch::default(),
+            peers: vec![1, 2],
+            primary: 1,
+            last_split_at: 0,
+        };
+
+        assert_eq!(pick_alternate_primary(&membership, &region, 99).await, None);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn try_failover_proposes_transfer_primary() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use crate::adapters::chdb::native_adapter::ChdbNativeAdapter;
+        use crate::adapters::chdb::query_adapter::ChdbQueryAdapter;
+        use crate::adapters::chdb::session::SharedSession;
+        use crate::adapters::metadata::rocksdb_meta::RocksDbMetadata;
+        use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
+        use crate::adapters::wal::rocksdb_wal::RocksDbWal;
+        use crate::application::cluster::bootstrap::ClusterBootstrap;
+        use crate::application::materialized_view_service::MaterializedViewService;
+        use crate::domain::sharding::{MeasurementKey, ShardLocationCache, ShardMapOp};
+        use crate::ports::points_sink::PointsSinkPort;
+
+        let dir = tempfile::tempdir().unwrap();
+        let meta_dir = dir.path().join("meta");
+        let wal_dir = dir.path().join("wal");
+        let chdb_dir = dir.path().join("chdb");
+        for p in [&meta_dir, &wal_dir, &chdb_dir] {
+            std::fs::create_dir_all(p).unwrap();
+        }
+
+        let chdb = SharedSession::new_eager(chdb_dir.to_str().unwrap(), 1).unwrap();
+        let chdb_adapter = Arc::new(ChdbQueryAdapter::from_shared(chdb.clone(), 0));
+        let sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(chdb));
+        let wal = Arc::new(RocksDbWal::open(&wal_dir).unwrap());
+        let metadata = Arc::new(RocksDbMetadata::open(&meta_dir).unwrap());
+        let mv_service = Arc::new(MaterializedViewService::new(
+            metadata.clone(),
+            chdb_adapter,
+            sink.clone(),
+        ));
+
+        let mut cluster_cfg = crate::config::HyperbytedbConfig::load(None).unwrap().cluster;
+        cluster_cfg.enabled = true;
+        cluster_cfg.node_id = 1;
+        cluster_cfg.cluster_addr = "127.0.0.1:18086".into();
+        cluster_cfg.replication_log_dir = dir.path().join("repl").to_string_lossy().into();
+        cluster_cfg.raft_dir = dir.path().join("raft").to_string_lossy().into();
+        cluster_cfg.raft_heartbeat_interval_ms = Some(200);
+        cluster_cfg.raft_election_timeout_ms = Some(500);
+
+        let bootstrap = ClusterBootstrap::init(&cluster_cfg, 1000).unwrap();
+
+        let shard_map = Arc::new(RocksDbShardMap::open(&meta_dir, true, 1).unwrap());
+        let location_cache = Arc::new(ShardLocationCache::new());
+        let raft = bootstrap
+            .start_raft(
+                &cluster_cfg,
+                metadata.clone(),
+                mv_service,
+                sink.clone(),
+                wal.clone(),
+                Some((shard_map.clone(), location_cache.clone())),
+            )
+            .await
+            .unwrap();
+
+        {
+            let mut m = bootstrap.membership.write().await;
+            m.add_node(node(2, NodeState::Active));
+        }
+
+        {
+            let mut m = bootstrap.membership.write().await;
+            m.add_node(node(2, NodeState::Active));
+        }
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let key = MeasurementKey::new("db", "autogen", "cpu");
+        let region = ShardRegion {
+            region_id: 1,
+            start: 0,
+            end: u64::MAX,
+            epoch: ShardEpoch::default(),
+            peers: vec![1, 2],
+            primary: 1,
+            last_split_at: 0,
+        };
+        shard_map
+            .apply_op(ShardMapOp::BootstrapMeasurement {
+                key: key.clone(),
+                region: region.clone(),
+            })
+            .await
+            .unwrap();
+
+        let sharding = ShardingConfig {
+            primary_failover_after_secs: 1,
+            ..Default::default()
+        };
+
+        let proposals = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let scheduler = ShardScheduler::new(
+            shard_map,
+            bootstrap.membership.clone(),
+            raft,
+            None,
+            metadata,
+            wal,
+            Some(sink),
+            99,
+            sharding,
+            0,
+        )
+        .with_test_force_leader(true)
+        .with_test_propose_sink(proposals.clone());
+
+        bootstrap.membership.write().await.set_state(1, NodeState::Disconnected);
+        {
+            let mut m = bootstrap.membership.write().await;
+            if m.get_node(2).is_none() {
+                m.add_node(node(2, NodeState::Active));
+            }
+            assert!(m.get_node(2).is_some(), "peer 2 must be in membership");
+        }
+        assert_eq!(
+            pick_alternate_primary(&bootstrap.membership, &region, 99).await,
+            Some(2)
+        );
+
+        scheduler
+            .try_failover_for_test(&key, &region, 100)
+            .await
+            .unwrap();
+        scheduler
+            .try_failover_for_test(&key, &region, 102)
+            .await
+            .unwrap();
+
+        let captured = proposals.lock().unwrap();
+        assert!(
+            !captured.is_empty(),
+            "no proposals captured: {captured:?}"
+        );
+        assert!(
+            captured.iter().any(|op| matches!(
+                op,
+                ShardMapOp::TransferPrimary { new_primary: 2, .. }
+            ))
+        );
+    }
 }

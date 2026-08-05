@@ -252,6 +252,98 @@ impl RocksDbMetadata {
             mv_cache: RwLock::new(None),
         })
     }
+
+    async fn scan_series_ids(
+        &self,
+        db: &str,
+        rp: &str,
+        measurement: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<u64>, HyperbytedbError> {
+        let rdb = self.db.clone();
+        let prefix = series_prefix(db, rp, measurement);
+        meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            let pbytes = prefix.as_bytes();
+            let iter = rdb.iterator_cf_opt(
+                &cf,
+                rocksdb::ReadOptions::default(),
+                IteratorMode::From(pbytes, rocksdb::Direction::Forward),
+            );
+            let mut out = Vec::new();
+            for item in iter {
+                let (key, _) = item.map_err(|e| {
+                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                })?;
+                if !key.starts_with(pbytes) {
+                    break;
+                }
+                let Ok(s) = std::str::from_utf8(&key) else {
+                    continue;
+                };
+                let Ok(id) = u64::from_str_radix(&s[prefix.len()..], 16) else {
+                    continue;
+                };
+                if id >= end {
+                    break;
+                }
+                if id >= start {
+                    out.push(id);
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn count_series_ids_blocking(
+        &self,
+        db: &str,
+        rp: &str,
+        measurement: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<u64, HyperbytedbError> {
+        let rdb = self.db.clone();
+        let prefix = series_prefix(db, rp, measurement);
+        meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            let pbytes = prefix.as_bytes();
+            let iter = rdb.iterator_cf_opt(
+                &cf,
+                rocksdb::ReadOptions::default(),
+                IteratorMode::From(pbytes, rocksdb::Direction::Forward),
+            );
+            let mut count = 0u64;
+            for item in iter {
+                let (key, _) = item.map_err(|e| {
+                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                })?;
+                if !key.starts_with(pbytes) {
+                    break;
+                }
+                let Ok(s) = std::str::from_utf8(&key) else {
+                    continue;
+                };
+                let Ok(id) = u64::from_str_radix(&s[prefix.len()..], 16) else {
+                    continue;
+                };
+                if id >= end {
+                    break;
+                }
+                if id >= start {
+                    count = count.saturating_add(1);
+                }
+            }
+            Ok(count)
+        })
+        .await
+    }
 }
 
 async fn meta_blocking<T, F>(f: F) -> Result<T, HyperbytedbError>
@@ -1227,43 +1319,25 @@ impl MetadataPort for RocksDbMetadata {
         rp: &str,
         measurement: &str,
     ) -> Result<Vec<u64>, HyperbytedbError> {
-        let rdb = self.db.clone();
-        let prefix = series_prefix(db, rp, measurement);
-        tokio::task::spawn_blocking(move || {
-            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
-                HyperbytedbError::Metadata("metadata column family not found".into())
-            })?;
-            let pbytes = prefix.as_bytes();
-            let iter = rdb.iterator_cf_opt(
-                &cf,
-                rocksdb::ReadOptions::default(),
-                IteratorMode::From(pbytes, rocksdb::Direction::Forward),
-            );
-            let mut out = Vec::new();
-            for item in iter {
-                let (key, _) = item.map_err(|e| {
-                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
-                })?;
-                if !key.starts_with(pbytes) {
-                    break;
-                }
-                let Ok(s) = std::str::from_utf8(&key) else {
-                    continue;
-                };
-                let Ok(id) = u64::from_str_radix(&s[prefix.len()..], 16) else {
-                    continue;
-                };
-                out.push(id);
-            }
-            Ok::<Vec<u64>, HyperbytedbError>(out)
-        })
-        .await
-        .map_err(|e| {
-            HyperbytedbError::Metadata(crate::error::ChainedError::with_context(
-                "metadata task panicked",
-                e,
-            ))
-        })?
+        self.scan_series_ids(db, rp, measurement, 0, u64::MAX).await
+    }
+
+    async fn count_series_ids_in_range(
+        &self,
+        db: &str,
+        rp: &str,
+        measurement: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<u64, HyperbytedbError> {
+        if start == 0 && end == u64::MAX {
+            return self
+                .list_series_ids(db, rp, measurement)
+                .await
+                .map(|ids| ids.len() as u64);
+        }
+        self.count_series_ids_blocking(db, rp, measurement, start, end)
+            .await
     }
 
     async fn warm_series(&self) -> Result<usize, HyperbytedbError> {

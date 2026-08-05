@@ -297,15 +297,16 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
     };
 
     let shard_routing = if config.sharding.enabled {
-        peer_client.as_ref().map(|pc| {
-            Arc::new(ShardRoutingContext {
-                shard_map: rocks_shard_map.clone().expect("sharding enabled"),
+        match (peer_client.as_ref(), rocks_shard_map.clone()) {
+            (Some(pc), Some(shard_map)) => Some(Arc::new(ShardRoutingContext {
+                shard_map,
                 location_cache: shard_location_cache.clone(),
                 config: config.sharding.clone(),
                 node_id: config.cluster.node_id,
                 peer_client: pc.clone(),
-            })
-        })
+            })),
+            _ => None,
+        }
     } else {
         None
     };
@@ -356,10 +357,8 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
                 max_points_per_request,
                 config.cluster.replication.clone(),
             );
-        if let Some(ref sr) = shard_routing {
-            let callbacks = raft_leader_callbacks
-                .clone()
-                .expect("sharding requires leader callbacks");
+        if let (Some(sr), Some(callbacks)) = (shard_routing.as_ref(), raft_leader_callbacks.clone())
+        {
             let cb_leader = callbacks.clone();
             let cb_addr = callbacks;
             svc = svc.with_sharding(

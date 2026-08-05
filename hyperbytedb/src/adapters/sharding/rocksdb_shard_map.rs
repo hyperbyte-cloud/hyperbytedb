@@ -20,7 +20,7 @@ pub struct RocksDbShardMap {
     db: Arc<DB>,
     cache: RwLock<ShardMap>,
     enabled: bool,
-    node_id: u64,
+    _node_id: u64,
 }
 
 impl RocksDbShardMap {
@@ -36,7 +36,7 @@ impl RocksDbShardMap {
             db,
             cache: RwLock::new(cache),
             enabled,
-            node_id,
+            _node_id: node_id,
         })
     }
 

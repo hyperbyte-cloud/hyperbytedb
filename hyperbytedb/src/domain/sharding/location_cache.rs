@@ -6,6 +6,7 @@ use super::types::{MeasurementKey, ShardEpoch, ShardMap, ShardRegion};
 #[derive(Debug, Clone)]
 struct CachedRegion {
     region: ShardRegion,
+    #[allow(dead_code)] // reserved for future stale-entry eviction
     map_version: u64,
 }
 
@@ -27,8 +28,20 @@ impl ShardLocationCache {
         Self::default()
     }
 
+    fn read_inner(&self) -> std::sync::RwLockReadGuard<'_, CacheInner> {
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn write_inner(&self) -> std::sync::RwLockWriteGuard<'_, CacheInner> {
+        self.inner
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn refresh_from_map(&self, map: &ShardMap) {
-        let mut inner = self.inner.write().expect("cache lock");
+        let mut inner = self.write_inner();
         if map.map_version >= inner.map_version {
             inner.map_version = map.map_version;
             inner.by_series.clear();
@@ -36,12 +49,12 @@ impl ShardLocationCache {
     }
 
     pub fn invalidate_all(&self) {
-        let mut inner = self.inner.write().expect("cache lock");
+        let mut inner = self.write_inner();
         inner.by_series.clear();
     }
 
     pub fn invalidate_measurement(&self, key: &MeasurementKey) {
-        let mut inner = self.inner.write().expect("cache lock");
+        let mut inner = self.write_inner();
         inner.by_series.retain(|(db, rp, meas, _), _| {
             !(db == &key.db && rp == &key.rp && meas == &key.measurement)
         });
@@ -56,21 +69,21 @@ impl ShardLocationCache {
         series_id: u64,
     ) -> Option<ShardRegion> {
         {
-            let inner = self.inner.read().expect("cache lock");
-            if inner.map_version == map.map_version {
-                if let Some(cached) = inner.by_series.get(&(
+            let inner = self.read_inner();
+            if inner.map_version == map.map_version
+                && let Some(cached) = inner.by_series.get(&(
                     db.to_string(),
                     rp.to_string(),
                     measurement.to_string(),
                     series_id,
-                )) {
-                    return Some(cached.region.clone());
-                }
+                ))
+            {
+                return Some(cached.region.clone());
             }
         }
 
         let region = map.locate(db, rp, measurement, series_id)?.clone();
-        let mut inner = self.inner.write().expect("cache lock");
+        let mut inner = self.write_inner();
         inner.map_version = map.map_version;
         inner.by_series.insert(
             (
@@ -88,7 +101,7 @@ impl ShardLocationCache {
     }
 
     pub fn check_epoch(&self, db: &str, rp: &str, measurement: &str, series_id: u64, epoch: ShardEpoch) -> bool {
-        let inner = self.inner.read().expect("cache lock");
+        let inner = self.read_inner();
         inner
             .by_series
             .get(&(
@@ -116,6 +129,7 @@ mod tests {
             peers: vec![1, 2, 3],
             primary: 1,
             last_split_at: 0,
+        health: Default::default(),
         }
     }
 
