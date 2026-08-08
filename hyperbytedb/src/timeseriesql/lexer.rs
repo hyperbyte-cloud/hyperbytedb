@@ -5,7 +5,7 @@
 
 use crate::error::HyperbytedbError;
 use crate::timeseriesql::ast::{Duration, DurationUnit};
-use crate::timeseriesql::scan::{is_regex_start_at, scan_chars, ScannedChar};
+use crate::timeseriesql::scan::{ScannedChar, is_regex_start_at, scan_chars};
 
 /// Lexer token with source span.
 #[derive(Debug, Clone, PartialEq)]
@@ -106,12 +106,7 @@ pub fn split_statements(input: &str) -> Result<Vec<String>, HyperbytedbError> {
 }
 
 /// Match an ASCII keyword at scan index `si` when it is not inside a masked span.
-fn matches_unmasked_keyword_at(
-    input: &str,
-    scan: &[ScannedChar],
-    si: usize,
-    kw: &str,
-) -> bool {
+fn matches_unmasked_keyword_at(input: &str, scan: &[ScannedChar], si: usize, kw: &str) -> bool {
     let sc = &scan[si];
     if sc.masked || sc.depth != 0 {
         return false;
@@ -1036,7 +1031,11 @@ mod tests {
     #[test]
     fn split_statements_does_not_treat_quoted_begin_as_block_open() {
         let stmts = split_statements("SELECT 'BEGIN'; SHOW DATABASES").unwrap();
-        assert_eq!(stmts.len(), 2, "quoted BEGIN must not suppress splitting: {stmts:?}");
+        assert_eq!(
+            stmts.len(),
+            2,
+            "quoted BEGIN must not suppress splitting: {stmts:?}"
+        );
         assert_eq!(stmts[0], "SELECT 'BEGIN'");
         assert_eq!(stmts[1], "SHOW DATABASES");
     }
