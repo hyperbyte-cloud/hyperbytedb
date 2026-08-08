@@ -98,10 +98,7 @@ pub fn split_statements(input: &str) -> Result<Vec<String>, HyperbytedbError> {
             begin_depth -= 1;
         }
 
-        if c == ';'
-            && begin_depth == 0
-            && sc.is_some_and(|sc| !sc.masked && sc.depth == 0)
-        {
+        if c == ';' && begin_depth == 0 && sc.is_some_and(|sc| !sc.masked && sc.depth == 0) {
             let slice = input[start..i].trim();
             if !slice.is_empty() {
                 statements.push(slice.to_string());

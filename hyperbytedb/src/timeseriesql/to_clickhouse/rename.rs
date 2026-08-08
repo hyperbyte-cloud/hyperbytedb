@@ -12,11 +12,7 @@ pub fn rename_time_bucket_alias(sql: &str) -> String {
         if pos < last {
             continue;
         }
-        let prev = if pos == 0 {
-            None
-        } else {
-            Some(bytes[pos - 1])
-        };
+        let prev = if pos == 0 { None } else { Some(bytes[pos - 1]) };
         let next = bytes.get(pos + "__time".len()).copied();
         let exact_quoted = matches!(
             (prev, next),

@@ -9,6 +9,9 @@ Cargo.lock.bk
 # Python virtual environment
 .venv/
 
+# Git worktrees
+.worktrees/
+
 # IDE/editor/devtool files
 /.vscode/
 /.idea/

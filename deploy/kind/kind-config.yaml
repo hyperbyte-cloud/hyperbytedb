@@ -15,6 +15,9 @@ nodes:
       - containerPort: 30000
         hostPort: 13000
         protocol: TCP
+      - containerPort: 30001
+        hostPort: 13001
+        protocol: TCP
   - role: worker
     extraMounts:
       - hostPath: /tmp/hyperbytedb-data/worker-0

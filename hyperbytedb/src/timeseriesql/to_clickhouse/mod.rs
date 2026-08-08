@@ -13,8 +13,8 @@ mod time_bounds;
 #[cfg(test)]
 mod tests;
 
-pub use time_bounds::extract_time_bounds;
 pub use rename::rename_time_bucket_alias;
+pub use time_bounds::extract_time_bounds;
 
 pub use coalesce::{build_coalesced_fact_view, build_coalesced_fact_view_with_row_meta};
 pub use conditions::translate_condition;
@@ -25,7 +25,8 @@ pub use materialized_view::{
     translate_materialized_view_series_select, translate_select_into, translate_select_into_native,
 };
 pub use select::{
-    select_has_true_aggregate, select_output_field_name, translate_native_table, translate_with_source,
+    select_has_true_aggregate, select_output_field_name, translate_native_table,
+    translate_with_source,
 };
 
 /// `SELECT ... INTO` requires `GROUP BY time(<interval>)` so results are bucketed

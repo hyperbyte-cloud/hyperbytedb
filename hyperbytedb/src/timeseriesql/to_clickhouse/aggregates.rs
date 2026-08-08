@@ -394,7 +394,10 @@ pub(super) fn build_window_clause(
     }
 }
 
-pub(super) fn get_single_arg<'a>(func: &'a FunctionCall, name: &str) -> Result<&'a Expr, HyperbytedbError> {
+pub(super) fn get_single_arg<'a>(
+    func: &'a FunctionCall,
+    name: &str,
+) -> Result<&'a Expr, HyperbytedbError> {
     func.args.first().ok_or_else(|| {
         HyperbytedbError::QueryParse(format!("{} requires exactly one argument", name))
     })

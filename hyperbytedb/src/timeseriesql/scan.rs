@@ -350,7 +350,13 @@ mod tests {
     fn regex_after_match_operator_is_masked() {
         let input = "=~ /foo/";
         let scan = scan_chars(input).unwrap();
-        assert!(scan.iter().all(|sc| sc.ch == '/' || sc.ch == 'f' || sc.ch == 'o' || sc.ch == '~' || sc.ch == '=' || sc.masked || sc.ch.is_whitespace()));
+        assert!(scan.iter().all(|sc| sc.ch == '/'
+            || sc.ch == 'f'
+            || sc.ch == 'o'
+            || sc.ch == '~'
+            || sc.ch == '='
+            || sc.masked
+            || sc.ch.is_whitespace()));
         let slashes: Vec<_> = scan.iter().filter(|sc| sc.ch == '/').collect();
         assert_eq!(slashes.len(), 2);
         assert!(slashes.iter().all(|sc| sc.masked));

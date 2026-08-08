@@ -12,7 +12,7 @@ use super::select::{
     select_output_field_name, time_bucket_expr_on, translate_field, translate_inner,
 };
 use super::time_bounds::is_time_epoch_comparison;
-use super::{validate_select_into, SeriesJoin};
+use super::{SeriesJoin, validate_select_into};
 
 /// Wrap a translated SELECT as `INSERT INTO <dest> SELECT ...`, renaming `__time` to `time`
 /// for the destination measurement schema.
@@ -50,7 +50,10 @@ pub(super) fn translate_materialized_view_field(
 }
 
 /// Ensure coalesced MV source rows expose every field referenced in the SELECT.
-pub(super) fn mapping_with_mv_aggregate_fields(mapping: &ColumnMapping, fields: &[Field]) -> ColumnMapping {
+pub(super) fn mapping_with_mv_aggregate_fields(
+    mapping: &ColumnMapping,
+    fields: &[Field],
+) -> ColumnMapping {
     let mut expanded = mapping.clone();
     for field in fields {
         if let Expr::Call(func) = &field.expr

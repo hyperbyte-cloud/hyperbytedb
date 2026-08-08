@@ -4,12 +4,12 @@ use crate::error::HyperbytedbError;
 use crate::timeseriesql::ast::*;
 use std::fmt::Write;
 
+use super::SeriesJoin;
 use super::aggregates::{
     expr_contains_aggregate, expr_contains_raw_transform, translate_aggregate_call,
     translate_binary_expr,
 };
 use super::coalesce::build_coalesced_fact_view;
-use super::SeriesJoin;
 use super::conditions::{
     format_float, nanos_to_ch_timestamp, quote_identifier, quote_phys_identifier, quote_string,
     translate_expr,
@@ -616,4 +616,3 @@ pub(super) fn translate_field_expr(
 pub fn select_has_true_aggregate(stmt: &SelectStatement) -> bool {
     stmt.fields.iter().any(|f| expr_contains_aggregate(&f.expr))
 }
-

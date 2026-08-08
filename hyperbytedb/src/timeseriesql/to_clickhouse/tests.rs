@@ -6,19 +6,19 @@ use crate::timeseriesql::parser;
 
 fn test_table() -> QuotedTableName {
     QuotedTableName::new_quoted("`mydb_autogen_cpu`".to_string())
-    }
+}
 
 fn test_series_table() -> QuotedTableName {
     QuotedTableName::new_quoted("`mydb_autogen_cpu_series`".to_string())
-    }
+}
 
 fn qname(s: &str) -> QuotedTableName {
     QuotedTableName::new_quoted(s.to_string())
-    }
+}
 
 fn translate_test(stmt: &SelectStatement) -> String {
     translate_native_table(stmt, test_table().as_str(), None, None, None).unwrap()
-    }
+}
 
 /// Mapping with `host` as a tag and `usage_idle` as a field (no collision).
 fn cpu_mapping() -> ColumnMapping {
@@ -27,7 +27,7 @@ fn cpu_mapping() -> ColumnMapping {
         field_names: ["usage_idle"].into_iter().map(String::from).collect(),
         ..Default::default()
     }
-    }
+}
 
 fn translate_series(stmt: &SelectStatement, m: &ColumnMapping) -> String {
     let table = test_table();
@@ -44,7 +44,7 @@ fn translate_series(stmt: &SelectStatement, m: &ColumnMapping) -> String {
         None,
     )
     .unwrap()
-    }
+}
 
 fn parse_select(q: &str) -> SelectStatement {
     let stmts = parser::parse_query(q).unwrap();
@@ -52,7 +52,7 @@ fn parse_select(q: &str) -> SelectStatement {
         Statement::Select(s) => s,
         _ => panic!("expected SELECT statement"),
     }
-    }
+}
 
 #[test]
 fn group_by_tag_uses_physical_column_name() {
@@ -65,13 +65,13 @@ fn group_by_tag_uses_physical_column_name() {
         sql.contains("\"host_name\""),
         "tag with punctuation must map to sanitized physical column, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn quote_identifier_rejects_control_characters() {
     assert!(quote_identifier("host\ninject").is_err());
     assert!(quote_identifier("ok_name").is_ok());
-    }
+}
 
 #[test]
 fn test_select_star() {
@@ -79,14 +79,14 @@ fn test_select_star() {
     let sql = translate_test(&stmt);
     assert!(sql.contains("SELECT *"));
     assert!(sql.contains("FROM `mydb_autogen_cpu`"));
-    }
+}
 
 #[test]
 fn test_mean() {
     let stmt = parse_select(r#"SELECT mean("value") FROM cpu"#);
     let sql = translate_test(&stmt);
     assert!(sql.contains("avg(\"value\")"));
-    }
+}
 
 #[test]
 fn test_median_count_sum_min_max() {
@@ -99,7 +99,7 @@ fn test_median_count_sum_min_max() {
     assert!(sql.contains("sum(\"x\")"));
     assert!(sql.contains("min(\"x\")"));
     assert!(sql.contains("max(\"x\")"));
-    }
+}
 
 #[test]
 fn test_first_last() {
@@ -107,7 +107,7 @@ fn test_first_last() {
     let sql = translate_test(&stmt);
     assert!(sql.contains("argMin(\"v\", time)"));
     assert!(sql.contains("argMax(\"v\", time)"));
-    }
+}
 
 #[test]
 fn test_percentile() {
@@ -115,12 +115,11 @@ fn test_percentile() {
     let sql = translate_test(&stmt);
     // Nearest-rank sample percentile, matching InfluxQL.
     assert!(sql.contains("quantileExactLow(0.95)(\"value\")"));
-    }
+}
 
 #[test]
 fn test_spread_stddev_mode_distinct() {
-    let stmt =
-        parse_select(r#"SELECT spread("v"), stddev("v"), mode("v"), distinct("v") FROM m"#);
+    let stmt = parse_select(r#"SELECT spread("v"), stddev("v"), mode("v"), distinct("v") FROM m"#);
     let sql = translate_test(&stmt);
     assert!(sql.contains("(max(\"v\") - min(\"v\"))"));
     // InfluxQL stddev is sample stddev.
@@ -130,7 +129,7 @@ fn test_spread_stddev_mode_distinct() {
     // distinct() must stay valid inside GROUP BY time(); SELECT DISTINCT is not.
     assert!(sql.contains("arrayJoin(groupUniqArray(\"v\"))"));
     assert!(!sql.contains("DISTINCT \"v\""));
-    }
+}
 
 #[test]
 fn test_count_distinct() {
@@ -140,7 +139,7 @@ fn test_count_distinct() {
         sql.contains("uniqExact(\"v\")"),
         "count(distinct(v)) should translate to uniqExact, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn test_distinct_with_group_by_time_is_valid_expression() {
@@ -151,12 +150,11 @@ fn test_distinct_with_group_by_time_is_valid_expression() {
         "distinct(v) must be an expression usable with GROUP BY time, got: {sql}"
     );
     assert!(!sql.contains("DISTINCT "), "got: {sql}");
-    }
+}
 
 #[test]
 fn test_where_time_and_tag() {
-    let stmt =
-        parse_select(r#"SELECT * FROM cpu WHERE "host" = 'server01' AND time > now() - 1h"#);
+    let stmt = parse_select(r#"SELECT * FROM cpu WHERE "host" = 'server01' AND time > now() - 1h"#);
     let sql = translate_test(&stmt);
     assert!(sql.contains("WHERE"));
     assert!(sql.contains("host"));
@@ -164,7 +162,7 @@ fn test_where_time_and_tag() {
     assert!(sql.contains("time"));
     assert!(sql.contains("now64()"));
     assert!(sql.contains("INTERVAL 1 HOUR"));
-    }
+}
 
 #[test]
 fn test_where_regex() {
@@ -172,7 +170,7 @@ fn test_where_regex() {
     let sql = translate_test(&stmt);
     assert!(sql.contains("match"));
     assert!(sql.contains("us-.*"));
-    }
+}
 
 #[test]
 fn test_group_by_time() {
@@ -180,7 +178,7 @@ fn test_group_by_time() {
     let sql = translate_test(&stmt);
     assert!(sql.contains("GROUP BY"));
     assert!(sql.contains("toStartOfInterval(time, INTERVAL 5 MINUTE)"));
-    }
+}
 
 #[test]
 fn test_group_by_time_with_offset() {
@@ -189,12 +187,11 @@ fn test_group_by_time_with_offset() {
     assert!(sql.contains(
         "toStartOfInterval(time - INTERVAL 15 MINUTE, INTERVAL 1 HOUR) + INTERVAL 15 MINUTE"
     ));
-    }
+}
 
 #[test]
 fn test_group_by_time_and_tags() {
-    let stmt =
-        parse_select(r#"SELECT mean("value") FROM cpu GROUP BY time(5m), "host", "region""#);
+    let stmt = parse_select(r#"SELECT mean("value") FROM cpu GROUP BY time(5m), "host", "region""#);
     let sql = translate_test(&stmt);
     assert!(sql.contains("toStartOfInterval(time, INTERVAL 5 MINUTE)"));
     assert!(sql.contains("\"host\""));
@@ -211,7 +208,7 @@ fn test_group_by_time_and_tags() {
         "SELECT must include tag columns, got: {}",
         select_line
     );
-    }
+}
 
 #[test]
 fn test_fill_null() {
@@ -223,7 +220,7 @@ fn test_fill_null() {
     );
     assert!(sql.contains("avg(\"value\")"));
     assert!(sql.contains("WITH FILL STEP INTERVAL 5 MINUTE"));
-    }
+}
 
 #[test]
 fn test_fill_null_with_time_bounds_uses_from_to() {
@@ -254,7 +251,7 @@ fn test_fill_null_with_time_bounds_uses_from_to() {
         sql.contains("STEP INTERVAL 10 SECOND"),
         "expected STEP after FROM/TO, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn test_fill_grid_anchors_use_group_by_time_offset() {
@@ -286,7 +283,7 @@ fn test_fill_grid_anchors_use_group_by_time_offset() {
         ),
         "TO anchor must apply the GROUP BY time offset and extend one step, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn test_fill_with_group_by_tag_orders_tag_before_time() {
@@ -294,9 +291,8 @@ fn test_fill_with_group_by_tag_orders_tag_before_time() {
     // time-fill column so ClickHouse fills each tag group independently.
     // Otherwise WITH FILL emits gap rows with an empty tag value (a phantom
     // all-NULL series) and never fills the real per-tag series.
-    let stmt = parse_select(
-        r#"SELECT mean("usage_idle") FROM cpu GROUP BY time(10s), "host" fill(null)"#,
-    );
+    let stmt =
+        parse_select(r#"SELECT mean("usage_idle") FROM cpu GROUP BY time(10s), "host" fill(null)"#);
     let sql = translate_series(&stmt, &cpu_mapping());
     assert!(
         sql.contains(
@@ -304,7 +300,7 @@ fn test_fill_with_group_by_tag_orders_tag_before_time() {
         ),
         "tag must precede the time-fill column in ORDER BY, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn test_raw_select_projects_time_and_orders_ascending() {
@@ -320,7 +316,7 @@ fn test_raw_select_projects_time_and_orders_ascending() {
         sql.contains("ORDER BY time ASC"),
         "raw select defaults to time ASC, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn test_group_by_time_defaults_to_order_by_time_ascending() {
@@ -330,7 +326,7 @@ fn test_group_by_time_defaults_to_order_by_time_ascending() {
         sql.contains("ORDER BY toStartOfInterval(time, INTERVAL 5 MINUTE) ASC"),
         "GROUP BY time defaults to time ASC, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn test_aggregate_without_group_by_time_has_no_order_by() {
@@ -339,7 +335,7 @@ fn test_aggregate_without_group_by_time_has_no_order_by() {
     let sql = translate_test(&stmt);
     assert!(!sql.contains("ORDER BY"), "got: {sql}");
     assert!(!sql.contains("\"time\""), "no raw time column, got: {sql}");
-    }
+}
 
 #[test]
 fn test_select_star_orders_by_time_without_duplicate_time() {
@@ -347,7 +343,7 @@ fn test_select_star_orders_by_time_without_duplicate_time() {
     let sql = translate_test(&stmt);
     assert!(sql.starts_with("SELECT *"), "got: {sql}");
     assert!(sql.contains("ORDER BY time ASC"), "got: {sql}");
-    }
+}
 
 #[test]
 fn test_fill_value() {
@@ -361,19 +357,18 @@ fn test_fill_value() {
         sql.contains("INTERPOLATE (\"mean_value\" AS 0)"),
         "fill(N) must INTERPOLATE generated rows with N, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn test_fill_value_interpolates_every_field_alias() {
-    let stmt = parse_select(
-        r#"SELECT mean("a") AS x, max("b") AS y FROM m GROUP BY time(1m) fill(100)"#,
-    );
+    let stmt =
+        parse_select(r#"SELECT mean("a") AS x, max("b") AS y FROM m GROUP BY time(1m) fill(100)"#);
     let sql = translate_test(&stmt);
     assert!(
         sql.contains("INTERPOLATE (\"x\" AS 100, \"y\" AS 100)"),
         "fill(100) must INTERPOLATE all field aliases, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn test_missing_fill_defaults_to_fill_null() {
@@ -392,19 +387,18 @@ fn test_missing_fill_defaults_to_fill_null() {
         !sql.contains("INTERPOLATE"),
         "default fill must not interpolate, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn test_select_into_does_not_default_fill() {
     // Writes must not insert synthetic NULL grid rows.
     let stmt = parse_select(r#"SELECT mean("value") INTO "dest" FROM "cpu" GROUP BY time(5m)"#);
-    let sql =
-        translate_select_into(&stmt, &qname("`dest`"), test_table().as_str(), None).unwrap();
+    let sql = translate_select_into(&stmt, &qname("`dest`"), test_table().as_str(), None).unwrap();
     assert!(
         !sql.contains("WITH FILL"),
         "SELECT INTO without fill() must not emit WITH FILL, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn test_order_by_time_desc_with_fill_wraps_ascending_fill() {
@@ -427,7 +421,7 @@ fn test_order_by_time_desc_with_fill_wraps_ascending_fill() {
         sql.contains(") ORDER BY __time DESC"),
         "outer must re-order descending, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn test_order_by_time_desc_with_fill_and_tags_orders_tags_first() {
@@ -439,7 +433,7 @@ fn test_order_by_time_desc_with_fill_and_tags_orders_tags_first() {
         sql.contains(") ORDER BY \"host\" ASC, __time DESC"),
         "outer ordering must keep tags first, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn test_fill_none() {
@@ -447,7 +441,7 @@ fn test_fill_none() {
     let sql = translate_test(&stmt);
     assert!(!sql.contains("ifNull"));
     assert!(!sql.contains("WITH FILL"));
-    }
+}
 
 #[test]
 fn test_limit_offset() {
@@ -455,7 +449,7 @@ fn test_limit_offset() {
     let sql = translate_test(&stmt);
     assert!(sql.contains("LIMIT 10"));
     assert!(sql.contains("OFFSET 5"));
-    }
+}
 
 #[test]
 fn test_order_by_desc() {
@@ -464,7 +458,7 @@ fn test_order_by_desc() {
     let sql = translate_test(&stmt);
     assert!(sql.contains("ORDER BY"));
     assert!(sql.contains("DESC"));
-    }
+}
 
 #[test]
 fn test_derivative() {
@@ -482,7 +476,7 @@ fn test_derivative() {
         !sql.contains("PARTITION BY"),
         "no tags = no PARTITION BY, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn test_non_negative_derivative() {
@@ -501,7 +495,7 @@ fn test_non_negative_derivative() {
         sql.contains("toFloat64"),
         "expected toFloat64 time conversion, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn test_difference() {
@@ -509,7 +503,7 @@ fn test_difference() {
     let sql = translate_test(&stmt);
     assert!(sql.contains("lagInFrame"));
     assert!(!sql.contains("if("));
-    }
+}
 
 #[test]
 fn test_nested_aggregate_in_derivative() {
@@ -546,7 +540,7 @@ fn test_nested_aggregate_in_derivative() {
         select_line.contains("\"host\""),
         "expected host in SELECT, got: {select_line}"
     );
-    }
+}
 
 #[test]
 fn test_derivative_with_nested_first() {
@@ -563,7 +557,7 @@ fn test_derivative_with_nested_first() {
         sql.contains("ORDER BY __time"),
         "expected ORDER BY __time, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn test_moving_average() {
@@ -577,7 +571,7 @@ fn test_moving_average() {
         "moving_average must gate on a full window, got: {sql}"
     );
     assert!(sql.contains(">= 5"), "window-full check, got: {sql}");
-    }
+}
 
 #[test]
 fn test_cumulative_sum() {
@@ -585,7 +579,7 @@ fn test_cumulative_sum() {
     let sql = translate_test(&stmt);
     assert!(sql.contains("sum(\"value\") OVER"));
     assert!(sql.contains("ROWS UNBOUNDED PRECEDING"));
-    }
+}
 
 #[test]
 fn test_elapsed() {
@@ -599,7 +593,7 @@ fn test_elapsed() {
         sql.contains("toFloat64"),
         "expected toFloat64 time conversion, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn test_fill_previous() {
@@ -611,19 +605,18 @@ fn test_fill_previous() {
     assert!(sql.contains("INTERPOLATE"));
     assert!(sql.contains("\"avg_val\""));
     assert!(!sql.contains("ifNull"));
-    }
+}
 
 #[test]
 fn test_fill_linear() {
-    let stmt = parse_select(
-        r#"SELECT mean("value") AS avg_val FROM cpu GROUP BY time(5m) fill(linear)"#,
-    );
+    let stmt =
+        parse_select(r#"SELECT mean("value") AS avg_val FROM cpu GROUP BY time(5m) fill(linear)"#);
     let sql = translate_test(&stmt);
     assert!(sql.contains("WITH FILL STEP INTERVAL 5 MINUTE"));
     assert!(sql.contains("INTERPOLATE"));
     assert!(sql.contains("\"avg_val\" AS \"avg_val\""));
     assert!(!sql.contains("ifNull"));
-    }
+}
 
 #[test]
 fn test_grafana_tag_annotation() {
@@ -640,7 +633,7 @@ fn test_grafana_tag_annotation() {
         !sql.contains("::tag"),
         "should not contain ::tag, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn test_epoch_ms_time_comparison() {
@@ -660,7 +653,7 @@ fn test_epoch_ms_time_comparison() {
         !sql.contains("INTERVAL"),
         "should not use INTERVAL for epoch timestamps, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn test_epoch_ns_time_comparison() {
@@ -670,7 +663,7 @@ fn test_epoch_ns_time_comparison() {
         sql.contains("fromUnixTimestamp64Nano(1772462462777000000)"),
         "bare integer should become nanosecond timestamp, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn test_non_negative_derivative_with_multiple_tags() {
@@ -706,7 +699,7 @@ fn test_non_negative_derivative_with_multiple_tags() {
         sql.contains("AS \"Writes\""),
         "expected Writes alias, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn test_difference_with_tags_has_partition_by() {
@@ -718,7 +711,7 @@ fn test_difference_with_tags_has_partition_by() {
         sql.contains(r#"PARTITION BY "host", "region""#),
         "difference window must PARTITION BY tags, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn test_moving_average_with_tags_has_partition_by() {
@@ -730,19 +723,18 @@ fn test_moving_average_with_tags_has_partition_by() {
         sql.contains(r#"PARTITION BY "host""#),
         "moving_average window must PARTITION BY tags, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn test_cumulative_sum_with_tags_has_partition_by() {
-    let stmt = parse_select(
-        r#"SELECT cumulative_sum(mean("value")) FROM cpu GROUP BY time(10s), "host""#,
-    );
+    let stmt =
+        parse_select(r#"SELECT cumulative_sum(mean("value")) FROM cpu GROUP BY time(10s), "host""#);
     let sql = translate_test(&stmt);
     assert!(
         sql.contains(r#"PARTITION BY "host""#),
         "cumulative_sum window must PARTITION BY tags, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn test_non_negative_difference_divided_by_constant() {
@@ -764,7 +756,7 @@ fn test_non_negative_difference_divided_by_constant() {
         !sql.contains("NON_NEGATIVE_DIFFERENCE"),
         "should not contain raw TimeseriesQL function name in output SQL, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn test_derivative_unit_conversion() {
@@ -774,7 +766,7 @@ fn test_derivative_unit_conversion() {
         sql.contains("/ 0.001"),
         "1ms unit should divide time diff by 0.001 seconds, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn test_relative_time_still_uses_interval() {
@@ -785,7 +777,7 @@ fn test_relative_time_still_uses_interval() {
         sql.contains("INTERVAL 1 HOUR"),
         "relative duration should stay as interval, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn test_translate_select_into() {
@@ -805,16 +797,14 @@ fn test_translate_select_into() {
     assert!(sql.contains("avg(\"value\")"));
     assert!(sql.contains("GROUP BY"));
     assert!(sql.contains("toStartOfInterval(time, INTERVAL 1 HOUR)"));
-    }
+}
 
 #[test]
 fn test_select_into_requires_group_by_time() {
     let q = r#"SELECT mean("value") INTO "cpu_1h" FROM "cpu""#;
     let stmt = parse_select(q);
-    assert!(
-        translate_select_into(&stmt, &qname("`dest`"), test_table().as_str(), None).is_err()
-    );
-    }
+    assert!(translate_select_into(&stmt, &qname("`dest`"), test_table().as_str(), None).is_err());
+}
 
 #[test]
 fn test_translate_materialized_view_select() {
@@ -842,9 +832,7 @@ fn test_translate_materialized_view_select() {
         "MV source should coalesce duplicate raw rows before aggregating"
     );
     assert!(
-        sql.contains(
-            "FROM (SELECT `series_id`, `time`, max(`ingest_seq`) AS `_mv_src_ingest_seq`"
-        ),
+        sql.contains("FROM (SELECT `series_id`, `time`, max(`ingest_seq`) AS `_mv_src_ingest_seq`"),
         "MV should read from coalesced source subquery, got: {sql}"
     );
     assert!(
@@ -863,7 +851,7 @@ fn test_translate_materialized_view_select() {
         count_pos,
         sum_pos
     );
-    }
+}
 
 #[test]
 fn materialized_view_backfill_orders_insert_columns_by_physical_name() {
@@ -889,7 +877,7 @@ fn materialized_view_backfill_orders_insert_columns_by_physical_name() {
         sql.contains("SELECT \"time\", \"origin_node_id\", \"ingest_seq\", \"series_id\", \"cpu\", \"maxplayers\", \"players\"\nFROM ("),
         "backfill outer SELECT must match INSERT column order, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn rollup_fact_view_uses_sum_for_additive_fields() {
@@ -907,7 +895,7 @@ fn rollup_fact_view_uses_sum_for_additive_fields() {
         !sql.contains("argMax(\"usage_idle\""),
         "rollup sum fields must not use argMax, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn raw_fact_view_still_uses_argmax_without_rollups() {
@@ -917,7 +905,7 @@ fn raw_fact_view_still_uses_argmax_without_rollups() {
         sql.contains("argMax(\"usage_idle\", `ingest_seq`)"),
         "raw measurements should keep argMax coalesce, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn mean_on_rollup_measurement_rewrites_to_sum_over_count() {
@@ -955,7 +943,7 @@ fn mean_on_rollup_measurement_rewrites_to_sum_over_count() {
         sql.contains("sum(\"sum_value\") / nullIf(sum(\"count_value\"), 0)"),
         "expected weighted mean rewrite, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn test_tag_field_collision_uses_column_mapping() {
@@ -989,7 +977,7 @@ fn test_tag_field_collision_uses_column_mapping() {
         sql.contains("GROUP BY \"__tag__cpu\""),
         "GROUP BY must use the physical tag column to match SELECT, got: {sql}"
     );
-    }
+}
 
 // --- series_id layout: tag resolution via the dimension-table inline view ---
 
@@ -1007,7 +995,7 @@ fn series_field_only_query_has_no_join() {
         "field-only query should collapse duplicate rows by ingest_seq, got: {sql}"
     );
     assert!(sql.contains("FROM `mydb_autogen_cpu`"), "got: {sql}");
-    }
+}
 
 #[test]
 fn telegraf_cpu_multi_field_query_coalesces_partial_rows() {
@@ -1053,7 +1041,7 @@ fn telegraf_cpu_multi_field_query_coalesces_partial_rows() {
         sql.contains("toStartOfInterval(time, INTERVAL 2 SECOND)"),
         "got: {sql}"
     );
-    }
+}
 
 #[test]
 fn series_where_tag_filter_joins_dimension() {
@@ -1069,7 +1057,7 @@ fn series_where_tag_filter_joins_dimension() {
     );
     // The tag predicate resolves against the joined view's tag column.
     assert!(sql.contains("\"host\" = 'h1'"), "got: {sql}");
-    }
+}
 
 #[test]
 fn series_group_by_all_tags_expands_to_measurement_tags() {
@@ -1083,7 +1071,7 @@ fn series_group_by_all_tags_expands_to_measurement_tags() {
     assert!(sql.contains("\"host\""), "got: {sql}");
     assert!(sql.contains("\"region\""), "got: {sql}");
     assert!(!sql.contains("`*`"), "got: {sql}");
-    }
+}
 
 #[test]
 fn series_group_by_tag_projects_and_groups_physical() {
@@ -1097,7 +1085,7 @@ fn series_group_by_tag_projects_and_groups_physical() {
     );
     assert!(sql.contains("GROUP BY"), "got: {sql}");
     assert!(sql.contains("avg(\"usage_idle\")"), "got: {sql}");
-    }
+}
 
 #[test]
 fn series_view_exposes_only_tag_columns_from_dimension() {
@@ -1108,7 +1096,7 @@ fn series_view_exposes_only_tag_columns_from_dimension() {
         sql.contains("SELECT t.*, s.\"host\", s.\"region\""),
         "view should re-attach tag columns, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn series_force_join_without_tag_reference() {
@@ -1133,7 +1121,7 @@ fn series_force_join_without_tag_reference() {
         sql.contains("ANY LEFT JOIN"),
         "force should join, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn mv_series_select_uses_dest_field_names_for_tag_prefix() {
@@ -1164,7 +1152,7 @@ fn mv_series_select_uses_dest_field_names_for_tag_prefix() {
         sql.contains("__tag__host"),
         "tag 'host' should be prefixed when dest has colliding field, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn mv_series_select_uses_source_names_when_no_dest_field_names() {
@@ -1193,7 +1181,7 @@ fn mv_series_select_uses_source_names_when_no_dest_field_names() {
         !sql.contains("__tag__host"),
         "tag 'host' should NOT be prefixed without dest_field_names, got: {sql}"
     );
-    }
+}
 
 // --- per-series LIMIT/OFFSET (InfluxQL points-per-series semantics) ---
 
@@ -1210,7 +1198,7 @@ fn test_limit_with_group_by_tag_uses_limit_by() {
         !sql.contains("\nLIMIT 3\n") && !sql.ends_with("\nLIMIT 3"),
         "no global LIMIT alongside LIMIT BY, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn test_limit_offset_with_group_by_tags_uses_limit_by() {
@@ -1223,7 +1211,7 @@ fn test_limit_offset_with_group_by_tags_uses_limit_by() {
         "OFFSET with tag grouping must be per series, got: {sql}"
     );
     assert!(!sql.contains("\nOFFSET"), "got: {sql}");
-    }
+}
 
 #[test]
 fn test_limit_without_tags_stays_global() {
@@ -1232,7 +1220,7 @@ fn test_limit_without_tags_stays_global() {
     assert!(sql.contains("\nLIMIT 4"), "got: {sql}");
     assert!(sql.contains("\nOFFSET 1"), "got: {sql}");
     assert!(!sql.contains(" BY ("), "got: {sql}");
-    }
+}
 
 // --- raw (non-aggregate) SELECT with GROUP BY tag ---
 
@@ -1255,7 +1243,7 @@ fn test_raw_select_with_group_by_tag_has_no_sql_group_by() {
         "raw select keeps time first, got: {select_line}"
     );
     assert!(sql.contains("ORDER BY time ASC"), "got: {sql}");
-    }
+}
 
 // --- per-point window transforms without GROUP BY time ---
 
@@ -1281,7 +1269,7 @@ fn test_difference_without_group_by_time_projects_time_and_orders() {
         sql.contains(") WHERE \"difference_value\" IS NOT NULL"),
         "leading NULL transform rows must be filtered, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn test_transform_with_group_by_tag_partitions_without_sql_group_by() {
@@ -1295,17 +1283,16 @@ fn test_transform_with_group_by_tag_partitions_without_sql_group_by() {
         sql.contains("PARTITION BY \"host\""),
         "transform must still partition per series, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn test_transform_with_group_by_time_keeps_grid_nulls() {
     // GROUP BY time + fill keeps the filled grid (Grafana relies on the
     // NULL rows); no NULL-filtering wrapper.
-    let stmt =
-        parse_select(r#"SELECT difference(mean("v")) FROM m GROUP BY time(1m) fill(null)"#);
+    let stmt = parse_select(r#"SELECT difference(mean("v")) FROM m GROUP BY time(1m) fill(null)"#);
     let sql = translate_test(&stmt);
     assert!(!sql.starts_with("SELECT * FROM (\n"), "got: {sql}");
-    }
+}
 
 // --- tag compared to numeric literal ---
 
@@ -1321,7 +1308,7 @@ fn test_tag_numeric_comparison_is_constant_false() {
         !sql.contains("\"host\" = 3"),
         "must not emit a string/number comparison, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn test_tag_string_comparison_is_unaffected() {
@@ -1329,7 +1316,7 @@ fn test_tag_string_comparison_is_unaffected() {
     let sql = translate_series(&stmt, &cpu_mapping());
     assert!(sql.contains("\"host\" = '3'"), "got: {sql}");
     assert!(!sql.contains("1 = 0"), "got: {sql}");
-    }
+}
 
 #[test]
 fn test_field_numeric_comparison_is_unaffected() {
@@ -1337,7 +1324,7 @@ fn test_field_numeric_comparison_is_unaffected() {
     let sql = translate_series(&stmt, &cpu_mapping());
     assert!(sql.contains("\"usage_idle\" > 3"), "got: {sql}");
     assert!(!sql.contains("1 = 0"), "got: {sql}");
-    }
+}
 
 // --- subquery source: inner GROUP BY time must expose `time` ---
 
@@ -1419,7 +1406,7 @@ fn test_subquery_source_bucket_column_composes() {
         "outer buckets the inner `time` column, got: {outer_sql}"
     );
     assert!(outer_sql.contains("max(\"x\")"), "got: {outer_sql}");
-    }
+}
 
 // --- tz() flows into bucketing and fill anchors ---
 
@@ -1451,7 +1438,7 @@ fn test_timezone_in_bucket_expr_and_fill_anchors() {
         sql.contains("GROUP BY toStartOfInterval(time, INTERVAL 1 DAY, 'America/New_York')"),
         "GROUP BY must match the SELECT bucket expression, got: {sql}"
     );
-    }
+}
 
 #[test]
 fn test_timezone_string_is_escaped() {
@@ -1462,8 +1449,8 @@ fn test_timezone_string_is_escaped() {
         sql.contains("'bad\\'zone'"),
         "timezone must go through quote_string escaping, got: {sql}"
     );
-    }
+}
 
 fn translate_test_tz(stmt: &SelectStatement) -> String {
     translate_native_table(stmt, test_table().as_str(), None, None, None).unwrap()
-    }
+}
