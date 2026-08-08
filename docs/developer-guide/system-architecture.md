@@ -449,7 +449,16 @@ All queries use `OutputFormat::JSONEachRow` — one JSON object per result row. 
 
 The query language module is `src/timeseriesql/` (Influx-compatible TimeseriesQL).
 
-The parser is a **hand-rolled recursive descent parser** (no parser generator). It lives in `src/timeseriesql/parser.rs`.
+Parsing uses **two statement grammars** on top of a shared masking scanner (`scan.rs`):
+
+| Path | Module | Mechanism |
+|------|--------|-----------|
+| `SELECT` | `parser.rs` | Clause scanner finds `FROM`/`WHERE`/… keywords; expression parser for fields and predicates |
+| DDL/SHOW | `ddl_parser.rs` + `lexer.rs` | Token stream + `TokenCursor` for keyword-sequence statements |
+
+Both paths share `scan.rs` for quote/regex/paren masking and `lexer::split_statements` for multi-statement input. DDL `WHERE` clauses and CQ/MV inner queries delegate to `parser::parse_expr`.
+
+The SELECT expression parser is **hand-rolled recursive descent** (no parser generator).
 
 ### Parse flow
 
@@ -527,6 +536,10 @@ Key AST nodes (in `src/timeseriesql/ast.rs`):
 - `GroupBy` — list of `Dimension` (Time, Tag, Regex)
 - `FillOption` — Null, None, Previous, Linear, Value(f64)
 - `Measurement` — optional database, optional RP, name or regex
+
+**SLIMIT/SOFFSET:** Parsed into the AST but not translated to ClickHouse SQL. The query service applies series-level pagination after merging result series (`query_service.rs`).
+
+**Time bounds for fill:** `extract_time_bounds` (in `to_clickhouse/time_bounds.rs`) derives min/max epoch nanoseconds from WHERE clauses for WITH FILL grid anchoring. AND predicates intersect bounds; OR predicates use the envelope of disjuncts only when every branch defines that side (min and/or max); if any OR branch lacks a time predicate, or any branch is missing a lower or upper cap, the corresponding bound is omitted (conservative).
 
 ---
 

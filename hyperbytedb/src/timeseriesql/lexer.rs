@@ -5,6 +5,7 @@
 
 use crate::error::HyperbytedbError;
 use crate::timeseriesql::ast::{Duration, DurationUnit};
+use crate::timeseriesql::scan::{is_regex_start_at, scan_chars, scanned_at};
 
 /// Lexer token with source span.
 #[derive(Debug, Clone, PartialEq)]
@@ -71,93 +72,44 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, HyperbytedbError> {
     Ok(tokens)
 }
 
-/// Split multi-statement input on `;` outside quotes and BEGIN…END blocks.
+/// Split multi-statement input on `;` outside quotes, regex literals, and
+/// BEGIN…END blocks.
 pub fn split_statements(input: &str) -> Result<Vec<String>, HyperbytedbError> {
+    let scan = scan_chars(input)?;
     let mut statements = Vec::new();
     let mut start = 0usize;
+    let mut begin_depth = 0i32;
     let mut i = 0usize;
     let bytes = input.as_bytes();
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut in_regex = false;
-    let mut begin_depth = 0i32;
-    // Last significant (non-whitespace) char outside string/regex literals,
-    // used to decide whether a `/` is in operand position (regex start).
-    let mut prev_sig: Option<char> = None;
 
     while i < bytes.len() {
         let c = bytes[i] as char;
-
-        if in_regex {
-            if c == '\\' {
-                i += 2;
-                continue;
-            }
-            if c == '/' {
-                in_regex = false;
-                prev_sig = Some('/');
-            }
-            i += 1;
-            continue;
-        }
-        if in_single {
-            if c == '\'' {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                    i += 2;
-                    continue;
-                }
-                in_single = false;
-                prev_sig = Some('\'');
-            }
-            i += 1;
-            continue;
-        }
-        if in_double {
-            if c == '"' {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
-                    i += 2;
-                    continue;
-                }
-                in_double = false;
-                prev_sig = Some('"');
-            }
-            i += 1;
-            continue;
-        }
+        let sc = scanned_at(&scan, i);
 
         let at_word_boundary = i == 0 || !is_ident_continue(bytes[i - 1] as char);
 
-        match c {
-            '\'' => in_single = true,
-            '"' => in_double = true,
-            // `/` in operand position (after `=~`, `!~`, `(`, `,` or `=`)
-            // starts a regex literal; a `;` inside it must not split.
-            '/' if matches!(prev_sig, Some('~') | Some('(') | Some(',') | Some('=')) => {
-                in_regex = true;
-            }
-            ';' if begin_depth == 0 => {
-                let slice = input[start..i].trim();
-                if !slice.is_empty() {
-                    statements.push(slice.to_string());
-                }
-                start = i + 1;
-            }
-            _ if is_ident_start(c) && at_word_boundary && matches_keyword_at(input, i, "BEGIN") => {
-                begin_depth += 1
-            }
-            _ if is_ident_start(c)
-                && at_word_boundary
-                && begin_depth > 0
-                && matches_keyword_at(input, i, "END") =>
-            {
-                begin_depth -= 1;
-            }
-            _ => {}
+        if is_ident_start(c) && at_word_boundary && matches_keyword_at(input, i, "BEGIN") {
+            begin_depth += 1;
+        } else if is_ident_start(c)
+            && at_word_boundary
+            && begin_depth > 0
+            && matches_keyword_at(input, i, "END")
+        {
+            begin_depth -= 1;
         }
-        if !c.is_whitespace() {
-            prev_sig = Some(c);
+
+        if c == ';'
+            && begin_depth == 0
+            && sc.is_some_and(|sc| !sc.masked && sc.depth == 0)
+        {
+            let slice = input[start..i].trim();
+            if !slice.is_empty() {
+                statements.push(slice.to_string());
+            }
+            start = i + 1;
         }
-        i += 1;
+
+        i += c.len_utf8();
     }
 
     let tail = input[start..].trim();
@@ -401,9 +353,6 @@ struct Lexer<'a> {
     input: &'a str,
     chars: Vec<(usize, char)>,
     pos: usize,
-    /// Kind of the previously emitted token, used to decide whether a `/`
-    /// begins a regex literal (operand position after `=~`/`!~`) or division.
-    last_kind: Option<TokenKind>,
 }
 
 impl<'a> Lexer<'a> {
@@ -412,7 +361,6 @@ impl<'a> Lexer<'a> {
             input,
             chars: input.char_indices().collect(),
             pos: 0,
-            last_kind: None,
         }
     }
 
@@ -439,9 +387,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn next_token(&mut self) -> Result<Token, HyperbytedbError> {
-        let tok = self.scan_token()?;
-        self.last_kind = Some(tok.kind.clone());
-        Ok(tok)
+        self.scan_token()
     }
 
     fn scan_token(&mut self) -> Result<Token, HyperbytedbError> {
@@ -592,15 +538,7 @@ impl<'a> Lexer<'a> {
             '\'' => self.read_string_lit(start),
             '"' => self.read_ident_quoted(start),
             '/' => {
-                // A `/` only starts a regex literal in operand position, i.e.
-                // immediately after a regex-match operator. Anywhere else it is
-                // division; treating every `/` as a regex made a lone `/` (e.g.
-                // arithmetic in a WHERE clause) abort tokenization of the whole
-                // statement.
-                if matches!(
-                    self.last_kind,
-                    Some(TokenKind::MatchRegex) | Some(TokenKind::NotMatchRegex)
-                ) {
+                if is_regex_start_at(self.input, start) {
                     self.read_regex(start)
                 } else {
                     self.bump_char();
@@ -993,6 +931,28 @@ mod tests {
     }
 
     #[test]
+    fn regex_measurement_after_from_keyword() {
+        let toks = tokenize("SHOW SERIES FROM /^cpu/").unwrap();
+        assert!(
+            toks.iter()
+                .any(|t| matches!(&t.kind, TokenKind::Regex(r) if r == "^cpu")),
+            "FROM /^cpu/ must tokenize as regex measurement: {toks:?}"
+        );
+    }
+
+    #[test]
+    fn split_and_tokenize_agree_on_regex_measurement() {
+        let input = "SHOW SERIES FROM /^cpu/; SHOW DATABASES";
+        let stmts = split_statements(input).unwrap();
+        assert_eq!(stmts.len(), 2);
+        let toks = tokenize(&stmts[0]).unwrap();
+        assert!(
+            toks.iter()
+                .any(|t| matches!(&t.kind, TokenKind::Regex(r) if r == "^cpu"))
+        );
+    }
+
+    #[test]
     fn regex_swallows_keyword_like_content() {
         // The inner LIMIT belongs to the regex; only the trailing one is a
         // keyword token.
@@ -1029,5 +989,22 @@ mod tests {
         .unwrap();
         assert_eq!(stmts.len(), 2);
         assert!(stmts[0].ends_with("END"));
+    }
+
+    #[test]
+    fn split_statements_ignores_semicolon_inside_parens() {
+        let stmts = split_statements("SELECT * FROM t WHERE x IN (1; 2); SHOW DATABASES").unwrap();
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0], "SELECT * FROM t WHERE x IN (1; 2)");
+        assert_eq!(stmts[1], "SHOW DATABASES");
+    }
+
+    #[test]
+    fn split_statements_fails_on_unclosed_paren_in_batch() {
+        let err = split_statements("SELECT ( FROM cpu; SHOW DATABASES").unwrap_err();
+        assert!(
+            err.to_string().contains("unclosed"),
+            "expected unclosed paren error, got: {err}"
+        );
     }
 }
