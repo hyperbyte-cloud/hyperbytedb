@@ -5,7 +5,7 @@
 
 use crate::error::HyperbytedbError;
 use crate::timeseriesql::ast::{Duration, DurationUnit};
-use crate::timeseriesql::scan::{is_regex_start_at, scan_chars, scanned_at};
+use crate::timeseriesql::scan::{is_regex_start_at, scan_chars, ScannedChar};
 
 /// Lexer token with source span.
 #[derive(Debug, Clone, PartialEq)]
@@ -79,34 +79,23 @@ pub fn split_statements(input: &str) -> Result<Vec<String>, HyperbytedbError> {
     let mut statements = Vec::new();
     let mut start = 0usize;
     let mut begin_depth = 0i32;
-    let mut i = 0usize;
-    let bytes = input.as_bytes();
 
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-        let sc = scanned_at(&scan, i);
-
-        let at_word_boundary = i == 0 || !is_ident_continue(bytes[i - 1] as char);
-
-        if is_ident_start(c) && at_word_boundary && matches_keyword_at(input, i, "BEGIN") {
-            begin_depth += 1;
-        } else if is_ident_start(c)
-            && at_word_boundary
-            && begin_depth > 0
-            && matches_keyword_at(input, i, "END")
-        {
-            begin_depth -= 1;
+    for (si, sc) in scan.iter().enumerate() {
+        if !sc.masked && sc.depth == 0 {
+            if matches_unmasked_keyword_at(input, &scan, si, "BEGIN") {
+                begin_depth += 1;
+            } else if begin_depth > 0 && matches_unmasked_keyword_at(input, &scan, si, "END") {
+                begin_depth -= 1;
+            }
         }
 
-        if c == ';' && begin_depth == 0 && sc.is_some_and(|sc| !sc.masked && sc.depth == 0) {
-            let slice = input[start..i].trim();
+        if sc.ch == ';' && begin_depth == 0 && !sc.masked && sc.depth == 0 {
+            let slice = input[start..sc.idx].trim();
             if !slice.is_empty() {
                 statements.push(slice.to_string());
             }
-            start = i + 1;
+            start = sc.idx + sc.ch.len_utf8();
         }
-
-        i += c.len_utf8();
     }
 
     let tail = input[start..].trim();
@@ -116,15 +105,39 @@ pub fn split_statements(input: &str) -> Result<Vec<String>, HyperbytedbError> {
     Ok(statements)
 }
 
-fn matches_keyword_at(input: &str, start: usize, kw: &str) -> bool {
-    // Byte-wise compare: slicing `rest[..kw.len()]` panics when a multibyte
-    // char straddles the boundary (e.g. an identifier containing `ﬁ`).
-    let rest = input.as_bytes().get(start..);
-    let Some(rest) = rest else { return false };
-    if rest.len() < kw.len() || !rest[..kw.len()].eq_ignore_ascii_case(kw.as_bytes()) {
+/// Match an ASCII keyword at scan index `si` when it is not inside a masked span.
+fn matches_unmasked_keyword_at(
+    input: &str,
+    scan: &[ScannedChar],
+    si: usize,
+    kw: &str,
+) -> bool {
+    let sc = &scan[si];
+    if sc.masked || sc.depth != 0 {
         return false;
     }
-    !matches!(rest.get(kw.len()), Some(b) if is_ident_continue(*b as char))
+    if si > 0 {
+        let prev = scan[si - 1].ch;
+        if prev.is_alphanumeric() || prev == '_' {
+            return false;
+        }
+    }
+
+    let start = sc.idx;
+    let bytes = input.as_bytes();
+    if start + kw.len() > bytes.len()
+        || !bytes[start..start + kw.len()].eq_ignore_ascii_case(kw.as_bytes())
+    {
+        return false;
+    }
+
+    if start + kw.len() < bytes.len() {
+        let next = bytes[start + kw.len()] as char;
+        if next.is_alphanumeric() || next == '_' {
+            return false;
+        }
+    }
+    true
 }
 
 /// Sum compound duration text (e.g. `1h30m`, `0`, `INF`) to nanoseconds.
@@ -1003,5 +1016,28 @@ mod tests {
             err.to_string().contains("unclosed"),
             "expected unclosed paren error, got: {err}"
         );
+    }
+
+    #[test]
+    fn split_statements_ignores_begin_end_inside_string_literals() {
+        let stmts = split_statements(
+            "CREATE CONTINUOUS QUERY cq ON db BEGIN SELECT * FROM m WHERE msg = 'BEGIN; END'; END; SHOW DATABASES",
+        )
+        .unwrap();
+        assert_eq!(
+            stmts.len(),
+            2,
+            "BEGIN/END substrings inside quoted literals must not affect block depth: {stmts:?}"
+        );
+        assert!(stmts[0].contains("'BEGIN; END'"));
+        assert_eq!(stmts[1], "SHOW DATABASES");
+    }
+
+    #[test]
+    fn split_statements_does_not_treat_quoted_begin_as_block_open() {
+        let stmts = split_statements("SELECT 'BEGIN'; SHOW DATABASES").unwrap();
+        assert_eq!(stmts.len(), 2, "quoted BEGIN must not suppress splitting: {stmts:?}");
+        assert_eq!(stmts[0], "SELECT 'BEGIN'");
+        assert_eq!(stmts[1], "SHOW DATABASES");
     }
 }

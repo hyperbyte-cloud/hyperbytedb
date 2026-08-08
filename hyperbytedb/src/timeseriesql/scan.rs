@@ -330,11 +330,6 @@ pub fn split_top_level_commas(input: &str) -> Result<Vec<&str>, HyperbytedbError
     Ok(parts)
 }
 
-/// Scan entry covering `byte_pos`, if any.
-pub fn scanned_at(scan: &[ScannedChar], byte_pos: usize) -> Option<&ScannedChar> {
-    scan.iter().rev().find(|sc| sc.idx <= byte_pos)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
