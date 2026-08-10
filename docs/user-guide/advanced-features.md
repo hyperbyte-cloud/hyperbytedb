@@ -155,6 +155,19 @@ DROP MATERIALIZED VIEW "mv_cpu_1h" ON "mydb"
 | Backfill | Re-scans window each run | Opt-in on CREATE (`WITH BACKFILL`); then incremental |
 | Engine | WAL writeback | ClickHouse MV |
 
+### Materialized views with series sharding
+
+When `[sharding] enabled = true`, `CREATE MATERIALIZED VIEW` is supported with the same TimeseriesQL syntax as non-sharded clusters. Behavior differences:
+
+- **Incremental rollups** fire on each node's locally ingested source writes (writes are already region-scoped by `series_id` routing).
+- **Queries against a materialized destination** scatter to **all regions** and merge partial rollup rows on the coordinator. This is required for correct global aggregates, including tag-subset `GROUP BY` (for example `GROUP BY time(1m), "host"` when the source has additional tags).
+- **`WITH BACKFILL`** scans each source region separately (via `/internal/shard/mv-backfill`) before installing ClickHouse MV objects, so historical data from every region is included.
+- Both source and destination measurements are registered in the shard map on create.
+
+Use minute-aligned timestamps in tests and queries when grouping by `time(1m)` — the destination stores bucket start times, not raw point timestamps.
+
+See [Deep Dive: Clustering — Materialized views](../deep-dive/deep-dive-clustering.md#materialized-views) for implementation details.
+
 ---
 
 ### User authentication

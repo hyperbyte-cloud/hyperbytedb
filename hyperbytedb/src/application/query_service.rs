@@ -8,12 +8,18 @@ use regex::Regex;
 use crate::application::line_protocol::encode_points_to_line_protocol;
 use crate::application::materialized_view_service::MaterializedViewService;
 use crate::application::replication_dispatch::dispatch_outbound_replication;
-use crate::application::shard_metadata_scatter::{scatter_series_keys, scatter_tag_keys, scatter_tag_values};
+use crate::application::shard_metadata_scatter::{
+    scatter_series_keys, scatter_tag_keys, scatter_tag_values,
+};
+use crate::application::shard_peer_resolution::{
+    RegionTargetRole, ScatterKind, is_active_peer, peer_addr,
+};
 use crate::application::shard_query::inject_region_series_id_predicate;
-use crate::application::shard_peer_resolution::{RegionTargetRole, ScatterKind};
-use crate::application::shard_query_routing::select_regions_for_query;
+use crate::application::shard_query_routing::{
+    select_regions_for_materialized_dest, select_regions_for_query,
+};
 use crate::application::shard_routing::{
-    reload_region, scatter_delete_to_regions, scatter_to_region_peers, ShardRoutingContext,
+    ShardRoutingContext, reload_region, scatter_delete_to_regions, scatter_to_region_peers,
 };
 use crate::config::ReplicationConfig;
 use crate::domain::chdb_naming::{
@@ -23,8 +29,11 @@ use crate::domain::column_mapping::{ColumnMapping, measurement_meta_fingerprint}
 use crate::domain::continuous_query::ContinuousQueryDef;
 use crate::domain::cq_schedule::{coverage_window, should_run};
 use crate::domain::database::Precision;
+use crate::domain::measurement::MeasurementMeta;
 use crate::domain::query_result::{QueryResponse, SeriesResult, StatementResult};
-use crate::domain::sharding::query_merge::merge_sharded_query_results;
+use crate::domain::sharding::query_merge::{
+    merge_materialized_rollup_results, merge_sharded_query_results,
+};
 use crate::domain::sharding::{ShardQueryRequest, ShardRegion};
 use crate::error::HyperbytedbError;
 use crate::ports::metadata::MetadataPort;
@@ -33,6 +42,7 @@ use crate::ports::replication::{OutboundReplicationBatch, ReplicationPort};
 use crate::ports::sharding::ShardMapPort;
 use crate::timeseriesql::ast::*;
 use crate::timeseriesql::to_clickhouse;
+use crate::timeseriesql::to_clickhouse::select_has_true_aggregate;
 
 /// Max `(database, measurement)` entries in the query-side column mapping cache.
 const COLUMN_MAPPING_CACHE_MAX: usize = 4096;
@@ -91,6 +101,25 @@ impl QueryServiceImpl {
     #[must_use]
     pub fn with_sharding(mut self, ctx: Arc<ShardRoutingContext>) -> Self {
         self.shard_routing = Some(ctx);
+        self
+    }
+
+    #[must_use]
+    pub fn with_materialized_view_sharding(
+        mut self,
+        ctx: Arc<ShardRoutingContext>,
+        is_leader: Arc<dyn Fn() -> bool + Send + Sync>,
+        leader_addr: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    ) -> Self {
+        self.shard_routing = Some(ctx.clone());
+        self.mv_service = Arc::new(
+            MaterializedViewService::new(
+                self.metadata.clone(),
+                self.query_port.clone(),
+                self.points_sink.clone(),
+            )
+            .with_sharding(ctx, is_leader, leader_addr),
+        );
         self
     }
 
@@ -661,11 +690,9 @@ async fn execute_statement(
                 resolve_retention_policy_for_select(svc.metadata.as_ref(), db, None, query_rp)
                     .await?;
 
-            let all_tag_keys = if let (Some(ctx), Some(m), Some(name)) = (
-                svc.shard_routing.as_ref(),
-                s.from.as_ref(),
-                measurement,
-            ) {
+            let all_tag_keys = if let (Some(ctx), Some(m), Some(name)) =
+                (svc.shard_routing.as_ref(), s.from.as_ref(), measurement)
+            {
                 let query_db = m.database.as_deref().unwrap_or(db);
                 let rp = if m.retention_policy.is_some() {
                     resolve_retention_policy(
@@ -709,11 +736,9 @@ async fn execute_statement(
                     let tag_key = tag_key.clone();
                     let default_rp = default_rp_for_values.clone();
                     async move {
-                        let values_list = if let (Some(ctx), Some(m), Some(name)) = (
-                            svc.shard_routing.as_ref(),
-                            s.from.as_ref(),
-                            measurement,
-                        ) {
+                        let values_list = if let (Some(ctx), Some(m), Some(name)) =
+                            (svc.shard_routing.as_ref(), s.from.as_ref(), measurement)
+                        {
                             let query_db = m.database.as_deref().unwrap_or(db);
                             let rp = if m.retention_policy.is_some() {
                                 resolve_retention_policy(
@@ -964,14 +989,8 @@ async fn execute_statement(
             let mut values = Vec::new();
             for meas in &measurements {
                 if let Some(ctx) = svc.shard_routing.as_ref() {
-                    for key in scatter_series_keys(
-                        ctx,
-                        svc.metadata.as_ref(),
-                        query_db,
-                        &rp,
-                        meas,
-                    )
-                    .await?
+                    for key in
+                        scatter_series_keys(ctx, svc.metadata.as_ref(), query_db, &rp, meas).await?
                     {
                         values.push(vec![serde_json::Value::String(key)]);
                     }
@@ -1153,12 +1172,6 @@ async fn execute_statement(
             })
         }
         Statement::CreateMaterializedView(mv) => {
-            if svc.shard_routing.is_some() {
-                return Err(HyperbytedbError::QueryParse(
-                    "CREATE MATERIALIZED VIEW is not supported when series sharding is enabled"
-                        .to_string(),
-                ));
-            }
             svc.metadata
                 .get_database(&mv.database)
                 .await?
@@ -2036,12 +2049,9 @@ async fn execute_select_from_source(
                 }
                 let inner_json = series_results_to_json_each_row(&inner)?;
                 let escaped = escape_clickhouse_string_literal(&inner_json);
-                let sub_source_sql =
-                    format!("(SELECT * FROM format(JSONEachRow, '{escaped}'))");
-                let outer_sql = to_clickhouse::translate_with_source(
-                    &select_stmt_expanded,
-                    &sub_source_sql,
-                )?;
+                let sub_source_sql = format!("(SELECT * FROM format(JSONEachRow, '{escaped}'))");
+                let outer_sql =
+                    to_clickhouse::translate_with_source(&select_stmt_expanded, &sub_source_sql)?;
                 let raw = svc.query_port.execute_sql(&outer_sql).await?;
                 return parse_json_each_row_to_series(
                     &raw,
@@ -2087,12 +2097,29 @@ async fn execute_measurement_query(
 ) -> Result<Vec<SeriesResult>, HyperbytedbError> {
     if let Some(ctx) = &svc.shard_routing {
         return execute_sharded_measurement_query(
-            svc, ctx, db, rp, measurement, stmt, time_min, time_max, epoch, group_by_tags,
+            svc,
+            ctx,
+            db,
+            rp,
+            measurement,
+            stmt,
+            time_min,
+            time_max,
+            epoch,
+            group_by_tags,
         )
         .await;
     }
     execute_local_measurement_query(
-        svc, db, rp, measurement, stmt, time_min, time_max, epoch, group_by_tags,
+        svc,
+        db,
+        rp,
+        measurement,
+        stmt,
+        time_min,
+        time_max,
+        epoch,
+        group_by_tags,
     )
     .await
 }
@@ -2110,6 +2137,7 @@ async fn query_sharded_region(
     t_max: i64,
     epoch: Option<&str>,
     resolved_group_by_tags: &[String],
+    materialized_meta: Option<&MeasurementMeta>,
 ) -> Result<Vec<SeriesResult>, HyperbytedbError> {
     match try_query_sharded_region(
         svc,
@@ -2123,6 +2151,7 @@ async fn query_sharded_region(
         t_max,
         epoch,
         resolved_group_by_tags,
+        materialized_meta,
     )
     .await
     {
@@ -2140,6 +2169,7 @@ async fn query_sharded_region(
                 t_max,
                 epoch,
                 resolved_group_by_tags,
+                materialized_meta,
             )
             .await
         }
@@ -2160,7 +2190,26 @@ async fn try_query_sharded_region(
     t_max: i64,
     epoch: Option<&str>,
     resolved_group_by_tags: &[String],
+    materialized_meta: Option<&MeasurementMeta>,
 ) -> Result<Vec<SeriesResult>, HyperbytedbError> {
+    if let Some(meta) = materialized_meta {
+        return query_materialized_region_all_peers(
+            svc,
+            ctx,
+            db,
+            rp,
+            measurement,
+            region,
+            region_sql,
+            t_min,
+            t_max,
+            epoch,
+            resolved_group_by_tags,
+            meta,
+        )
+        .await;
+    }
+
     if region.peers.contains(&ctx.node_id) {
         let raw = svc.query_port.execute_sql(region_sql).await?;
         return parse_json_each_row_to_series(&raw, measurement, epoch, resolved_group_by_tags);
@@ -2180,37 +2229,145 @@ async fn try_query_sharded_region(
     };
 
     let region_id = region.region_id;
-    let raw = scatter_to_region_peers(ctx, region, RegionTargetRole::Read, ScatterKind::Query, |peer_id, addr, timeout| {
-        let req = req.clone();
-        let addr = addr.to_string();
-        async move {
-            let url = format!("http://{addr}/internal/shard/query");
-            let resp = ctx
-                .peer_client
-                .http_client()
-                .post(&url)
-                .json(&req)
-                .timeout(timeout)
-                .send()
-                .await
-                .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
-            if resp.status() == reqwest::StatusCode::CONFLICT {
-                return Err(HyperbytedbError::StaleShardEpoch { region_id });
+    let raw = scatter_to_region_peers(
+        ctx,
+        region,
+        RegionTargetRole::Read,
+        ScatterKind::Query,
+        |peer_id, addr, timeout| {
+            let req = req.clone();
+            let addr = addr.to_string();
+            async move {
+                let url = format!("http://{addr}/internal/shard/query");
+                let resp = ctx
+                    .peer_client
+                    .http_client()
+                    .post(&url)
+                    .json(&req)
+                    .timeout(timeout)
+                    .send()
+                    .await
+                    .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
+                if resp.status() == reqwest::StatusCode::CONFLICT {
+                    return Err(HyperbytedbError::StaleShardEpoch { region_id });
+                }
+                if !resp.status().is_success() {
+                    return Err(HyperbytedbError::PeerUnreachable(format!(
+                        "shard query to peer {peer_id} failed: {}",
+                        resp.status()
+                    )));
+                }
+                resp.text()
+                    .await
+                    .map_err(|e| HyperbytedbError::Internal(e.to_string().into()))
             }
-            if !resp.status().is_success() {
-                return Err(HyperbytedbError::PeerUnreachable(format!(
-                    "shard query to peer {peer_id} failed: {}",
-                    resp.status()
-                )));
-            }
-            resp.text()
-                .await
-                .map_err(|e| HyperbytedbError::Internal(e.to_string().into()))
-        }
-    })
+        },
+    )
     .await?;
 
     parse_json_each_row_to_series(&raw, measurement, epoch, resolved_group_by_tags)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn query_materialized_region_all_peers(
+    svc: &QueryServiceImpl,
+    ctx: &ShardRoutingContext,
+    db: &str,
+    rp: &str,
+    measurement: &str,
+    region: &ShardRegion,
+    region_sql: &str,
+    t_min: i64,
+    t_max: i64,
+    epoch: Option<&str>,
+    resolved_group_by_tags: &[String],
+    meta: &MeasurementMeta,
+) -> Result<Vec<SeriesResult>, HyperbytedbError> {
+    let req = ShardQueryRequest {
+        db: db.to_string(),
+        rp: rp.to_string(),
+        measurement: measurement.to_string(),
+        epoch: region.epoch,
+        region_id: region.region_id,
+        time_min: t_min,
+        time_max: t_max,
+        series_id_start: 0,
+        series_id_end: 0,
+        select_sql: region_sql.to_string(),
+    };
+
+    let membership = ctx.peer_client.membership().read().await;
+    let peer_ids: Vec<u64> = region
+        .peers
+        .iter()
+        .copied()
+        .filter(|id| is_active_peer(&membership, *id))
+        .collect();
+    drop(membership);
+
+    let timeout = std::time::Duration::from_millis(ctx.config.scatter_peer_timeout_ms.max(1));
+    let mut parts = Vec::new();
+
+    for peer_id in peer_ids {
+        if peer_id == ctx.node_id {
+            let raw = svc.query_port.execute_sql(region_sql).await?;
+            let series =
+                parse_json_each_row_to_series(&raw, measurement, epoch, resolved_group_by_tags)?;
+            if !series.is_empty() {
+                parts.push(QueryResponse::single(0, series));
+            }
+            continue;
+        }
+
+        let membership = ctx.peer_client.membership().read().await;
+        let Some(addr) = peer_addr(&membership, peer_id) else {
+            continue;
+        };
+        drop(membership);
+        let url = format!("http://{addr}/internal/shard/query");
+        let resp = ctx
+            .peer_client
+            .http_client()
+            .post(&url)
+            .json(&req)
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
+        if resp.status() == reqwest::StatusCode::CONFLICT {
+            return Err(HyperbytedbError::StaleShardEpoch {
+                region_id: region.region_id,
+            });
+        }
+        if !resp.status().is_success() {
+            return Err(HyperbytedbError::PeerUnreachable(format!(
+                "materialized shard query to peer {peer_id} failed: {}",
+                resp.status()
+            )));
+        }
+        let raw = resp
+            .text()
+            .await
+            .map_err(|e| HyperbytedbError::Internal(e.to_string().into()))?;
+        let series =
+            parse_json_each_row_to_series(&raw, measurement, epoch, resolved_group_by_tags)?;
+        if !series.is_empty() {
+            parts.push(QueryResponse::single(0, series));
+        }
+    }
+
+    if parts.is_empty() {
+        return Ok(Vec::new());
+    }
+    if parts.len() == 1 {
+        return Ok(parts
+            .pop()
+            .and_then(|p| p.results.into_iter().next())
+            .and_then(|r| r.series)
+            .unwrap_or_default());
+    }
+    let merged = merge_materialized_rollup_results(parts, meta);
+    Ok(merged.results[0].series.clone().unwrap_or_default())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2231,11 +2388,22 @@ async fn execute_sharded_measurement_query(
         Some(s) => s,
         None => {
             return execute_local_measurement_query(
-                svc, db, rp, measurement, stmt, time_min, time_max, epoch, group_by_tags,
+                svc,
+                db,
+                rp,
+                measurement,
+                stmt,
+                time_min,
+                time_max,
+                epoch,
+                group_by_tags,
             )
             .await;
         }
     };
+
+    let measurement_meta = svc.metadata.get_measurement(db, rp, measurement).await?;
+    let is_materialized_dest = measurement_meta.as_ref().is_some_and(|m| m.materialized);
 
     let column_mapping = svc.column_mapping_for(db, rp, measurement).await?;
     let tag_keys = tag_keys_from_mapping(column_mapping.as_ref());
@@ -2243,16 +2411,19 @@ async fn execute_sharded_measurement_query(
     let tombstones = svc.metadata.list_tombstones(db, rp, measurement).await?;
     let table = quoted_table_name(db, rp, measurement);
     let series_table = quoted_series_table_name(db, rp, measurement);
-    let effective_mapping = reconcile_column_mapping(svc, db, rp, measurement, column_mapping).await?;
+    let effective_mapping =
+        reconcile_column_mapping(svc, db, rp, measurement, column_mapping).await?;
     let series_tag_columns: Vec<String> = series_table_columns(svc, db, rp, measurement)
         .await?
         .into_iter()
         .collect();
-    let series_join = effective_mapping.as_ref().map(|_| to_clickhouse::SeriesJoin {
-        table: &series_table,
-        force: !tombstones.is_empty(),
-        tag_columns: &series_tag_columns,
-    });
+    let series_join = effective_mapping
+        .as_ref()
+        .map(|_| to_clickhouse::SeriesJoin {
+            table: &series_table,
+            force: !tombstones.is_empty(),
+            tag_columns: &series_tag_columns,
+        });
     let mut sql = to_clickhouse::translate_native_table(
         &effective_stmt,
         table.as_str(),
@@ -2265,7 +2436,11 @@ async fn execute_sharded_measurement_query(
     let t_min = time_min.unwrap_or(i64::MIN);
     let t_max = time_max.unwrap_or(i64::MAX);
 
-    let region_selection = select_regions_for_query(space, measurement, &effective_stmt);
+    let region_selection = if is_materialized_dest {
+        select_regions_for_materialized_dest(space)
+    } else {
+        select_regions_for_query(space, measurement, &effective_stmt)
+    };
     let selected_regions = region_selection.regions(space);
     tracing::debug!(
         db,
@@ -2290,9 +2465,14 @@ async fn execute_sharded_measurement_query(
     )
     .set(selected_regions.len() as f64);
 
+    let materialized_meta_ref = measurement_meta.as_ref().filter(|_| is_materialized_dest);
+
     let region_futures = selected_regions.into_iter().map(|region| {
-        let region_sql =
-            inject_region_series_id_predicate(sql.clone(), region.start, region.end);
+        let region_sql = if is_materialized_dest {
+            sql.clone()
+        } else {
+            inject_region_series_id_predicate(sql.clone(), region.start, region.end)
+        };
         query_sharded_region(
             svc,
             ctx,
@@ -2305,6 +2485,7 @@ async fn execute_sharded_measurement_query(
             t_max,
             epoch,
             &resolved_group_by_tags,
+            materialized_meta_ref,
         )
     });
     let region_results = futures::future::try_join_all(region_futures).await?;
@@ -2318,16 +2499,25 @@ async fn execute_sharded_measurement_query(
     if parts.is_empty() {
         return Ok(Vec::new());
     }
-    if parts.len() == 1 {
+    if parts.len() == 1 && !is_materialized_dest {
         let Some(part) = parts.pop() else {
             return Ok(Vec::new());
         };
-        return Ok(part.results[0]
-            .series
-            .clone()
-            .unwrap_or_default());
+        return Ok(part.results[0].series.clone().unwrap_or_default());
     }
-    let merged = merge_sharded_query_results(parts, &effective_stmt);
+    let merged = if is_materialized_dest {
+        let meta = measurement_meta.ok_or_else(|| {
+            HyperbytedbError::Internal("materialized destination missing metadata".into())
+        })?;
+        let combined = merge_materialized_rollup_results(parts, &meta);
+        if select_has_true_aggregate(&effective_stmt) {
+            merge_sharded_query_results(vec![combined], &effective_stmt)
+        } else {
+            combined
+        }
+    } else {
+        merge_sharded_query_results(parts, &effective_stmt)
+    };
     Ok(merged.results[0].series.clone().unwrap_or_default())
 }
 

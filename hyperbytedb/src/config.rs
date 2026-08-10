@@ -90,7 +90,6 @@ impl Default for ShardingConfig {
             scatter_peer_timeout_ms: default_scatter_peer_timeout_ms(),
             scatter_max_peer_attempts: default_scatter_max_peer_attempts(),
         }
-
     }
 }
 

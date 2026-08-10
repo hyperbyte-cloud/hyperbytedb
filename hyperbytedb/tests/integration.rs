@@ -14,8 +14,8 @@ use hyperbytedb::adapters::chdb::session::SharedSession;
 use hyperbytedb::adapters::http::router::{AppState, build_router};
 use hyperbytedb::adapters::metadata::rocksdb_meta::RocksDbMetadata;
 use hyperbytedb::adapters::wal::rocksdb_wal::RocksDbWal;
-use hyperbytedb::application::ingest_metadata::IngestCardinalityLimits;
 use hyperbytedb::application::flush_service::FlushServiceImpl;
+use hyperbytedb::application::ingest_metadata::IngestCardinalityLimits;
 use hyperbytedb::application::ingestion_service::IngestionServiceImpl;
 use hyperbytedb::application::materialized_view_service::MaterializedViewService;
 use hyperbytedb::application::query_service::QueryServiceImpl;
@@ -124,7 +124,6 @@ fn setup(dir: &tempfile::TempDir) -> (Arc<AppState>, Arc<FlushServiceImpl>) {
         shard_location_cache: Arc::new(hyperbytedb::domain::sharding::ShardLocationCache::new()),
         shard_routing: None,
         shard_scheduler: None,
-        region_cursors: None,
         ingest_cardinality: IngestCardinalityLimits::default(),
         cluster_replication: ReplicationConfig::default(),
     });
@@ -218,7 +217,6 @@ async fn test_auth_blocks_unauthenticated() {
         shard_location_cache: Arc::new(hyperbytedb::domain::sharding::ShardLocationCache::new()),
         shard_routing: None,
         shard_scheduler: None,
-        region_cursors: None,
         ingest_cardinality: IngestCardinalityLimits::default(),
         cluster_replication: ReplicationConfig::default(),
     });
@@ -341,7 +339,6 @@ async fn test_cardinality_limit() {
         shard_location_cache: Arc::new(hyperbytedb::domain::sharding::ShardLocationCache::new()),
         shard_routing: None,
         shard_scheduler: None,
-        region_cursors: None,
         ingest_cardinality: IngestCardinalityLimits::default(),
         cluster_replication: ReplicationConfig::default(),
     });
@@ -499,7 +496,6 @@ async fn test_metrics_endpoint() {
         shard_location_cache: Arc::new(hyperbytedb::domain::sharding::ShardLocationCache::new()),
         shard_routing: None,
         shard_scheduler: None,
-        region_cursors: None,
         ingest_cardinality: IngestCardinalityLimits::default(),
         cluster_replication: ReplicationConfig::default(),
     });
@@ -845,7 +841,6 @@ async fn test_rate_limiter_refills_and_denies() {
         shard_location_cache: Arc::new(hyperbytedb::domain::sharding::ShardLocationCache::new()),
         shard_routing: None,
         shard_scheduler: None,
-        region_cursors: None,
         ingest_cardinality: IngestCardinalityLimits::default(),
         cluster_replication: ReplicationConfig::default(),
     });
@@ -1011,7 +1006,6 @@ async fn test_cross_database_on_clause_requires_authorization() {
         shard_location_cache: Arc::new(hyperbytedb::domain::sharding::ShardLocationCache::new()),
         shard_routing: None,
         shard_scheduler: None,
-        region_cursors: None,
         ingest_cardinality: IngestCardinalityLimits::default(),
         cluster_replication: ReplicationConfig::default(),
     });

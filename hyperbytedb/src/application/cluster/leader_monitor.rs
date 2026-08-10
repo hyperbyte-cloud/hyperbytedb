@@ -49,20 +49,23 @@ pub async fn run_leader_replication_monitor(
         };
 
         // Get local manifest as the baseline (WAL watermark + catalog).
-        let local_manifest =
-            match sync_manifest::build_manifest(
-                node_id,
-                &state.metadata,
-                &state.wal,
-                state.shard_map.as_ref().map(|m| m.as_ref() as &dyn crate::ports::sharding::ShardMapPort),
-            )
-            .await {
-                Ok(m) => m,
-                Err(e) => {
-                    tracing::debug!(error = %e, "leader monitor: could not build local manifest");
-                    continue;
-                }
-            };
+        let local_manifest = match sync_manifest::build_manifest(
+            node_id,
+            &state.metadata,
+            &state.wal,
+            state
+                .shard_map
+                .as_ref()
+                .map(|m| m.as_ref() as &dyn crate::ports::sharding::ShardMapPort),
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::debug!(error = %e, "leader monitor: could not build local manifest");
+                continue;
+            }
+        };
 
         let peers = {
             let m = membership.read().await;
@@ -117,22 +120,22 @@ pub async fn run_leader_replication_monitor(
                         continue;
                     };
                     for rw in &local_meas.region_watermarks {
-                                let peer_wm = peer_meas
-                                    .region_watermarks
-                                    .iter()
-                                    .find(|p| p.region_id == rw.region_id)
-                                    .map(|p| p.wal_watermark)
-                                    .unwrap_or(0);
-                                if rw.wal_watermark.saturating_sub(peer_wm) > 0 {
-                                    region_lag = true;
-                                    metrics::gauge!(
-                                        "hyperbytedb_shard_region_lag_wal_seq",
-                                        "peer_id" => peer_id.to_string(),
-                                        "region_id" => rw.region_id.to_string()
-                                    )
-                                    .set(rw.wal_watermark.saturating_sub(peer_wm) as f64);
-                                }
-                            }
+                        let peer_wm = peer_meas
+                            .region_watermarks
+                            .iter()
+                            .find(|p| p.region_id == rw.region_id)
+                            .map(|p| p.wal_watermark)
+                            .unwrap_or(0);
+                        if rw.wal_watermark.saturating_sub(peer_wm) > 0 {
+                            region_lag = true;
+                            metrics::gauge!(
+                                "hyperbytedb_shard_region_lag_wal_seq",
+                                "peer_id" => peer_id.to_string(),
+                                "region_id" => rw.region_id.to_string()
+                            )
+                            .set(rw.wal_watermark.saturating_sub(peer_wm) as f64);
+                        }
+                    }
                 }
             }
 

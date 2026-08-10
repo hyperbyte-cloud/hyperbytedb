@@ -5,7 +5,9 @@ use std::collections::BTreeSet;
 use futures::future::try_join_all;
 
 use crate::application::shard_peer_resolution::{RegionTargetRole, ScatterKind};
-use crate::application::shard_routing::{reload_region, scatter_to_region_peers, ShardRoutingContext};
+use crate::application::shard_routing::{
+    ShardRoutingContext, reload_region, scatter_to_region_peers,
+};
 use crate::domain::sharding::{ShardMetadataKind, ShardMetadataRequest, ShardRegion};
 use crate::error::HyperbytedbError;
 use crate::ports::metadata::MetadataPort;
@@ -88,9 +90,7 @@ pub async fn scatter_tag_keys(
 ) -> Result<Vec<String>, HyperbytedbError> {
     let map = ctx.shard_map.snapshot().await?;
     let Some(space) = map.space(db, rp, measurement) else {
-        return metadata
-            .list_tag_keys(db, rp, Some(measurement))
-            .await;
+        return metadata.list_tag_keys(db, rp, Some(measurement)).await;
     };
 
     let mut keys = BTreeSet::new();
@@ -99,10 +99,7 @@ pub async fn scatter_tag_keys(
         .iter()
         .any(|region| region.peers.contains(&ctx.node_id));
     if has_local_peer {
-        for k in metadata
-            .list_tag_keys(db, rp, Some(measurement))
-            .await?
-        {
+        for k in metadata.list_tag_keys(db, rp, Some(measurement)).await? {
             keys.insert(k);
         }
     }
@@ -113,14 +110,7 @@ pub async fn scatter_tag_keys(
         .filter(|region| !region.peers.contains(&ctx.node_id))
         .collect();
     let remote_parts = try_join_all(remote_regions.iter().map(|region| {
-        fetch_remote_metadata(
-            ctx,
-            db,
-            rp,
-            measurement,
-            region,
-            ShardMetadataKind::TagKeys,
-        )
+        fetch_remote_metadata(ctx, db, rp, measurement, region, ShardMetadataKind::TagKeys)
     }))
     .await?;
     for part in remote_parts {
@@ -227,14 +217,7 @@ pub async fn scatter_series_keys(
         .filter(|region| !region.peers.contains(&ctx.node_id))
         .collect();
     let remote_parts = try_join_all(remote_regions.iter().map(|region| {
-        fetch_remote_metadata(
-            ctx,
-            db,
-            rp,
-            measurement,
-            region,
-            ShardMetadataKind::Series,
-        )
+        fetch_remote_metadata(ctx, db, rp, measurement, region, ShardMetadataKind::Series)
     }))
     .await?;
     for part in remote_parts {

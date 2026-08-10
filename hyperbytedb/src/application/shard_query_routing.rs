@@ -72,6 +72,15 @@ pub fn select_regions_for_query<'a>(
     }
 }
 
+/// Materialized view destinations store region-local partial rollups. Coordinators
+/// must query every region and merge results.
+#[must_use]
+pub fn select_regions_for_materialized_dest<'a>(
+    _space: &'a MeasurementShardSpace,
+) -> RegionSelection<'a> {
+    RegionSelection::All
+}
+
 /// Extract routable series_id values from a WHERE clause, if the predicate is exact enough.
 fn routable_series_ids(measurement: &str, condition: Option<&Expr>) -> Option<Vec<u64>> {
     let expr = condition?;
@@ -148,8 +157,10 @@ fn collect_or_tag_values(
 ) -> bool {
     match expr {
         Expr::BinaryExpr(be) => match be.op {
-            BinaryOp::Or => collect_or_tag_values(&be.left, tag_name, values)
-                && collect_or_tag_values(&be.right, tag_name, values),
+            BinaryOp::Or => {
+                collect_or_tag_values(&be.left, tag_name, values)
+                    && collect_or_tag_values(&be.right, tag_name, values)
+            }
             BinaryOp::Eq => {
                 let Some((tag, value)) = parse_tag_string_eq(&be.left, &be.right) else {
                     return false;
@@ -215,7 +226,6 @@ mod tests {
                     peers: vec![1],
                     primary: 1,
                     last_split_at: 0,
-                health: Default::default(),
                 },
                 ShardRegion {
                     region_id: 2,
@@ -225,7 +235,6 @@ mod tests {
                     peers: vec![1],
                     primary: 1,
                     last_split_at: 0,
-                health: Default::default(),
                 },
                 ShardRegion {
                     region_id: 3,
@@ -235,7 +244,6 @@ mod tests {
                     peers: vec![1],
                     primary: 1,
                     last_split_at: 0,
-                health: Default::default(),
                 },
                 ShardRegion {
                     region_id: 4,
@@ -245,7 +253,6 @@ mod tests {
                     peers: vec![1],
                     primary: 1,
                     last_split_at: 0,
-                health: Default::default(),
                 },
             ],
         }
@@ -339,5 +346,16 @@ mod tests {
         let stmt = select_stmt(r#"SELECT value FROM metrics WHERE host = 'a' OR region = 'b'"#);
         let sel = select_regions_for_query(&space, "metrics", &stmt);
         assert!(matches!(sel, RegionSelection::All));
+    }
+
+    #[test]
+    fn materialized_dest_selects_all_regions() {
+        let space = four_region_space();
+        let stmt = select_stmt(r#"SELECT mean(value) FROM metrics WHERE host = 's50000'"#);
+        let sel = select_regions_for_materialized_dest(&space);
+        assert!(matches!(sel, RegionSelection::All));
+        assert_eq!(sel.region_count(space.regions.len()), 4);
+        // Narrowing WHERE on a materialized dest must not reduce fan-out.
+        let _ = stmt;
     }
 }

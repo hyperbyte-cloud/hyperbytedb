@@ -49,10 +49,7 @@ impl ShardMapOp {
 }
 
 /// Apply `op` to an in-memory map snapshot (used by Raft apply and unit tests).
-pub fn apply_shard_map_op(
-    map: &mut super::types::ShardMap,
-    op: ShardMapOp,
-) -> Result<(), String> {
+pub fn apply_shard_map_op(map: &mut super::types::ShardMap, op: ShardMapOp) -> Result<(), String> {
     map.map_version = map.map_version.saturating_add(1);
     match op {
         ShardMapOp::BootstrapMeasurement { key, region } => {
@@ -295,9 +292,6 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(
-            map.spaces.values().next().unwrap().regions[0].primary,
-            2
-        );
+        assert_eq!(map.spaces.values().next().unwrap().regions[0].primary, 2);
     }
 }

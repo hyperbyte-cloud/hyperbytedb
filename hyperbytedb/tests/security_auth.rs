@@ -170,7 +170,6 @@ async fn start_auth_cluster_node(dir: &std::path::Path) -> AuthClusterNode {
         shard_location_cache: Arc::new(hyperbytedb::domain::sharding::ShardLocationCache::new()),
         shard_routing: None,
         shard_scheduler: None,
-        region_cursors: None,
         ingest_cardinality: IngestCardinalityLimits::default(),
         cluster_replication: ReplicationConfig::default(),
     });

@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use crate::domain::measurement::MeasurementMeta;
 use crate::domain::query_result::{QueryResponse, SeriesResult};
-use crate::domain::rollup::{rollup_combine_from_field, RollupCombine};
+use crate::domain::rollup::{RollupCombine, rollup_combine_from_field};
 use crate::timeseriesql::ast::{Expr, SelectStatement};
 use crate::timeseriesql::to_clickhouse::{select_has_true_aggregate, select_output_field_name};
 
@@ -19,7 +20,11 @@ pub fn merge_query_results(mut parts: Vec<QueryResponse>) -> QueryResponse {
         return QueryResponse::empty(0);
     }
 
-    let statement_id = parts[0].results.first().map(|r| r.statement_id).unwrap_or(0);
+    let statement_id = parts[0]
+        .results
+        .first()
+        .map(|r| r.statement_id)
+        .unwrap_or(0);
     let mut merged: HashMap<String, SeriesResult> = HashMap::new();
 
     for part in parts {
@@ -61,6 +66,98 @@ pub fn merge_sharded_query_results(
         return merge_query_results(parts);
     }
     merge_aggregate_parts(parts, stmt)
+}
+
+/// Merge partial materialized-view destination rows from multiple shard regions.
+pub fn merge_materialized_rollup_results(
+    parts: Vec<QueryResponse>,
+    meta: &MeasurementMeta,
+) -> QueryResponse {
+    if parts.is_empty() {
+        return QueryResponse::empty(0);
+    }
+    if parts.len() == 1 {
+        if let Some(part) = parts.into_iter().next() {
+            return part;
+        }
+        return QueryResponse::empty(0);
+    }
+
+    let statement_id = parts[0]
+        .results
+        .first()
+        .map(|r| r.statement_id)
+        .unwrap_or(0);
+    let rules = rollup_merge_rules(meta);
+    merge_rows_with_rules(parts, statement_id, &rules)
+}
+
+fn rollup_merge_rules(meta: &MeasurementMeta) -> HashMap<String, ColumnMerge> {
+    let mut rules = HashMap::new();
+    for (col, combine) in &meta.field_rollups {
+        let merge = match combine {
+            RollupCombine::Sum => ColumnMerge::Sum,
+            RollupCombine::Min => ColumnMerge::Min,
+            RollupCombine::Max => ColumnMerge::Max,
+            RollupCombine::First => ColumnMerge::First,
+            RollupCombine::Last => ColumnMerge::Last,
+        };
+        rules.insert(col.clone(), merge);
+    }
+    rules
+}
+
+fn merge_rows_with_rules(
+    parts: Vec<QueryResponse>,
+    statement_id: u32,
+    rules: &HashMap<String, ColumnMerge>,
+) -> QueryResponse {
+    let mut rows: HashMap<String, (SeriesResult, Vec<Value>)> = HashMap::new();
+
+    for part in parts {
+        for stmt_result in part.results {
+            let Some(series_list) = stmt_result.series else {
+                continue;
+            };
+            for series in series_list {
+                for row in &series.values {
+                    let key = series_row_key(&series, row);
+                    rows.entry(key)
+                        .and_modify(|(_, merged_row)| {
+                            *merged_row = merge_row(&series.columns, rules, merged_row, row);
+                        })
+                        .or_insert_with(|| (series.clone(), row.clone()));
+                }
+            }
+        }
+    }
+
+    let mut by_series: HashMap<String, SeriesResult> = HashMap::new();
+    for (_, (series, row)) in rows {
+        let series_key = format!(
+            "{}:{:?}",
+            series.name,
+            series.tags.as_ref().map(|t| {
+                let mut pairs: Vec<_> = t.iter().collect();
+                pairs.sort_by_key(|(k, _)| *k);
+                pairs
+            })
+        );
+        by_series
+            .entry(series_key)
+            .and_modify(|existing| existing.values.push(row.clone()))
+            .or_insert_with(|| SeriesResult {
+                name: series.name.clone(),
+                tags: series.tags.clone(),
+                columns: series.columns.clone(),
+                values: vec![row],
+                partial: series.partial,
+            });
+    }
+
+    let mut series: Vec<SeriesResult> = by_series.into_values().collect();
+    series.sort_by(|a, b| a.name.cmp(&b.name));
+    QueryResponse::single(statement_id, series)
 }
 
 #[derive(Clone, Copy)]
@@ -142,12 +239,7 @@ fn json_sum(left: &Value, right: &Value) -> Value {
     json!(l + r)
 }
 
-fn merge_values(
-    left: &Value,
-    right: &Value,
-    rule: ColumnMerge,
-    mean_count: &mut u64,
-) -> Value {
+fn merge_values(left: &Value, right: &Value, rule: ColumnMerge, mean_count: &mut u64) -> Value {
     match rule {
         ColumnMerge::Passthrough | ColumnMerge::First => left.clone(),
         ColumnMerge::Last => right.clone(),
@@ -207,58 +299,14 @@ fn merge_aggregate_parts(parts: Vec<QueryResponse>, stmt: &SelectStatement) -> Q
         return QueryResponse::empty(0);
     }
 
-    let statement_id = parts[0].results.first().map(|r| r.statement_id).unwrap_or(0);
+    let statement_id = parts[0]
+        .results
+        .first()
+        .map(|r| r.statement_id)
+        .unwrap_or(0);
     let rules = column_merge_rules(stmt);
 
-    // row_key -> (SeriesResult template, merged row)
-    let mut rows: HashMap<String, (SeriesResult, Vec<Value>)> = HashMap::new();
-
-    for part in parts {
-        for stmt_result in part.results {
-            let Some(series_list) = stmt_result.series else {
-                continue;
-            };
-            for series in series_list {
-                for row in &series.values {
-                    let key = series_row_key(&series, row);
-                    rows.entry(key)
-                        .and_modify(|(_, merged_row)| {
-                            *merged_row =
-                                merge_row(&series.columns, &rules, merged_row, row);
-                        })
-                        .or_insert_with(|| (series.clone(), row.clone()));
-                }
-            }
-        }
-    }
-
-    // Group merged rows back into series buckets by name+tags.
-    let mut by_series: HashMap<String, SeriesResult> = HashMap::new();
-    for (_, (series, row)) in rows {
-        let series_key = format!(
-            "{}:{:?}",
-            series.name,
-            series.tags.as_ref().map(|t| {
-                let mut pairs: Vec<_> = t.iter().collect();
-                pairs.sort_by_key(|(k, _)| *k);
-                pairs
-            })
-        );
-        by_series
-            .entry(series_key)
-            .and_modify(|existing| existing.values.push(row.clone()))
-            .or_insert_with(|| SeriesResult {
-                name: series.name.clone(),
-                tags: series.tags.clone(),
-                columns: series.columns.clone(),
-                values: vec![row],
-                partial: series.partial,
-            });
-    }
-
-    let mut series: Vec<SeriesResult> = by_series.into_values().collect();
-    series.sort_by(|a, b| a.name.cmp(&b.name));
-    QueryResponse::single(statement_id, series)
+    merge_rows_with_rules(parts, statement_id, &rules)
 }
 
 #[cfg(test)]
@@ -390,5 +438,136 @@ mod tests {
         assert_eq!(series.len(), 1);
         assert_eq!(series[0].values.len(), 1);
         assert_eq!(series[0].values[0][1], json!(10));
+    }
+
+    fn mv_meta_sum() -> MeasurementMeta {
+        MeasurementMeta {
+            name: "cpu_5m".into(),
+            field_types: HashMap::from([("total".into(), 0)]),
+            tag_keys: vec!["host".into()],
+            field_rollups: HashMap::from([("total".into(), RollupCombine::Sum)]),
+            mean_fields: HashMap::new(),
+            materialized: true,
+            materialized_rp: Some("autogen".into()),
+        }
+    }
+
+    #[test]
+    fn merge_materialized_sums_partials_with_same_time_and_tags() {
+        let partial = |n: i64| {
+            QueryResponse::single(
+                0,
+                vec![SeriesResult {
+                    name: "cpu_5m".into(),
+                    tags: Some(HashMap::from([("host".into(), "a".into())])),
+                    columns: vec!["time".into(), "total".into()],
+                    values: vec![vec![json!(1000), json!(n)]],
+                    partial: None,
+                }],
+            )
+        };
+        let merged =
+            merge_materialized_rollup_results(vec![partial(3), partial(7)], &mv_meta_sum());
+        let series = merged.results[0].series.as_ref().unwrap();
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].values.len(), 1);
+        assert_eq!(series[0].values[0][1], json!(10));
+    }
+
+    #[test]
+    fn merge_materialized_keeps_distinct_tag_sets_separate() {
+        let a = QueryResponse::single(
+            0,
+            vec![SeriesResult {
+                name: "cpu_5m".into(),
+                tags: Some(HashMap::from([("host".into(), "a".into())])),
+                columns: vec!["time".into(), "total".into()],
+                values: vec![vec![json!(1000), json!(1)]],
+                partial: None,
+            }],
+        );
+        let b = QueryResponse::single(
+            0,
+            vec![SeriesResult {
+                name: "cpu_5m".into(),
+                tags: Some(HashMap::from([("host".into(), "b".into())])),
+                columns: vec!["time".into(), "total".into()],
+                values: vec![vec![json!(1000), json!(2)]],
+                partial: None,
+            }],
+        );
+        let merged = merge_materialized_rollup_results(vec![a, b], &mv_meta_sum());
+        assert_eq!(merged.results[0].series.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn merge_materialized_mean_storage_sums_sum_and_count_columns() {
+        let meta = MeasurementMeta {
+            name: "cpu_5m".into(),
+            field_types: HashMap::from([("sum_value".into(), 0), ("count_value".into(), 0)]),
+            tag_keys: vec!["host".into()],
+            field_rollups: HashMap::from([
+                ("sum_value".into(), RollupCombine::Sum),
+                ("count_value".into(), RollupCombine::Sum),
+            ]),
+            mean_fields: HashMap::from([(
+                "value".into(),
+                crate::domain::rollup::MeanRollupField {
+                    sum_col: "sum_value".into(),
+                    count_col: "count_value".into(),
+                },
+            )]),
+            materialized: true,
+            materialized_rp: Some("autogen".into()),
+        };
+        let partial = |sum: i64, count: i64| {
+            QueryResponse::single(
+                0,
+                vec![SeriesResult {
+                    name: "cpu_5m".into(),
+                    tags: Some(HashMap::from([("host".into(), "a".into())])),
+                    columns: vec!["time".into(), "sum_value".into(), "count_value".into()],
+                    values: vec![vec![json!(1000), json!(sum), json!(count)]],
+                    partial: None,
+                }],
+            )
+        };
+        let merged = merge_materialized_rollup_results(vec![partial(10, 2), partial(20, 3)], &meta);
+        let row = &merged.results[0].series.as_ref().unwrap()[0].values[0];
+        assert_eq!(row[1], json!(30));
+        assert_eq!(row[2], json!(5));
+    }
+
+    #[test]
+    fn merge_materialized_min_max() {
+        let meta = MeasurementMeta {
+            name: "cpu_5m".into(),
+            field_types: HashMap::from([("min_v".into(), 0), ("max_v".into(), 0)]),
+            tag_keys: vec![],
+            field_rollups: HashMap::from([
+                ("min_v".into(), RollupCombine::Min),
+                ("max_v".into(), RollupCombine::Max),
+            ]),
+            mean_fields: HashMap::new(),
+            materialized: true,
+            materialized_rp: None,
+        };
+        let partial = |min_v: f64, max_v: f64| {
+            QueryResponse::single(
+                0,
+                vec![SeriesResult {
+                    name: "cpu_5m".into(),
+                    tags: None,
+                    columns: vec!["time".into(), "min_v".into(), "max_v".into()],
+                    values: vec![vec![json!(1000), json!(min_v), json!(max_v)]],
+                    partial: None,
+                }],
+            )
+        };
+        let merged =
+            merge_materialized_rollup_results(vec![partial(5.0, 20.0), partial(3.0, 25.0)], &meta);
+        let row = &merged.results[0].series.as_ref().unwrap()[0].values[0];
+        assert_eq!(row[1], json!(3.0));
+        assert_eq!(row[2], json!(25.0));
     }
 }

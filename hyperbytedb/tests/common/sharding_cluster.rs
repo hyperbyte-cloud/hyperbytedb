@@ -29,9 +29,10 @@ use hyperbytedb::domain::cluster::membership::{
     ClusterMembership, NodeInfo, NodeState, SharedMembership, new_shared,
 };
 use hyperbytedb::domain::sharding::{
-    MeasurementKey, ShardEpoch, ShardLocationCache, ShardMapOp, ShardRegion,
+    MeasurementKey, ShardEpoch, ShardLocationCache, ShardMapOp, ShardRegion, ShardTransferPayload,
 };
 use hyperbytedb::ports::points_sink::PointsSinkPort;
+use hyperbytedb::ports::query::QueryPort;
 use hyperbytedb::ports::sharding::ShardMapPort;
 use tokio::sync::watch;
 
@@ -43,6 +44,7 @@ pub struct ShardedTestNode {
     pub shard_map: Arc<RocksDbShardMap>,
     pub location_cache: Arc<ShardLocationCache>,
     pub membership: SharedMembership,
+    pub query_port: Arc<ChdbQueryAdapter>,
     flush: Arc<FlushServiceImpl>,
     handle: tokio::task::JoinHandle<()>,
     shutdown: Option<watch::Sender<bool>>,
@@ -120,7 +122,8 @@ pub async fn start_sharded_node(
     let metadata = Arc::new(RocksDbMetadata::open(&meta_dir).unwrap());
     let chdb_adapter = Arc::new(ChdbQueryAdapter::from_shared(chdb.clone(), 0));
     let sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(chdb));
-    let flush: Arc<FlushServiceImpl> = Arc::new(FlushServiceImpl::new(wal.clone(), 0, sink.clone()));
+    let flush: Arc<FlushServiceImpl> =
+        Arc::new(FlushServiceImpl::new(wal.clone(), 0, sink.clone()));
 
     let addr = listener.local_addr().unwrap().to_string();
     let url = format!("http://{addr}");
@@ -159,22 +162,8 @@ pub async fn start_sharded_node(
         Some(shared_membership.clone()),
     ));
 
-    let mut base_query = QueryServiceImpl::new(
-        chdb_adapter.clone(),
-        metadata.clone(),
-        wal.clone(),
-        30,
-        sink.clone(),
-    )
-    .with_sharding(shard_routing.clone());
-    base_query = base_query.with_cluster_replication(
-        peer_client.clone(),
-        node_id,
-        opts.replication.clone(),
-    );
-    let base_query: Arc<dyn QueryService> = Arc::new(base_query);
-
-    let is_leader: Arc<dyn Fn() -> bool + Send + Sync> = if let Some(ref cb) = opts.leader_callbacks {
+    let is_leader: Arc<dyn Fn() -> bool + Send + Sync> = if let Some(ref cb) = opts.leader_callbacks
+    {
         let cb = cb.clone();
         Arc::new(move || cb.is_leader())
     } else {
@@ -188,6 +177,23 @@ pub async fn start_sharded_node(
             Arc::new(|| None)
         };
 
+    let mut base_query = QueryServiceImpl::new(
+        chdb_adapter.clone(),
+        metadata.clone(),
+        wal.clone(),
+        30,
+        sink.clone(),
+    )
+    .with_sharding(shard_routing.clone());
+    base_query =
+        base_query.with_cluster_replication(peer_client.clone(), node_id, opts.replication.clone());
+    base_query = base_query.with_materialized_view_sharding(
+        shard_routing.clone(),
+        is_leader.clone(),
+        leader_addr.clone(),
+    );
+    let base_query: Arc<dyn QueryService> = Arc::new(base_query);
+
     let ingestion: Arc<dyn hyperbytedb::ports::ingestion::IngestionPort> = Arc::new(
         PeerIngestionService::with_replication_and_sink(
             wal.clone(),
@@ -199,7 +205,11 @@ pub async fn start_sharded_node(
             0,
             opts.replication.clone(),
         )
-        .with_sharding(shard_routing.clone(), is_leader, leader_addr),
+        .with_sharding(
+            shard_routing.clone(),
+            is_leader.clone(),
+            leader_addr.clone(),
+        ),
     );
 
     let query: Arc<dyn QueryService> = Arc::new(PeerQueryService::new(
@@ -217,11 +227,10 @@ pub async fn start_sharded_node(
         metadata: metadata.clone(),
         wal: wal.clone(),
         points_sink: sink.clone(),
-        mv_service: Arc::new(MaterializedViewService::new(
-            metadata.clone(),
-            chdb_adapter.clone(),
-            sink.clone(),
-        )),
+        mv_service: Arc::new(
+            MaterializedViewService::new(metadata.clone(), chdb_adapter.clone(), sink.clone())
+                .with_sharding(shard_routing.clone(), is_leader, leader_addr),
+        ),
         auth: Arc::new(hyperbytedb::adapters::auth::MetadataAuthAdapter::new(
             metadata.clone(),
         )),
@@ -250,7 +259,6 @@ pub async fn start_sharded_node(
         shard_location_cache: location_cache.clone(),
         shard_routing: Some(shard_routing),
         shard_scheduler: None,
-        region_cursors: None,
         ingest_cardinality: IngestCardinalityLimits::default(),
         cluster_replication: opts.replication.clone(),
     });
@@ -269,10 +277,31 @@ pub async fn start_sharded_node(
         shard_map,
         location_cache,
         membership: shared_membership,
+        query_port: chdb_adapter,
         flush,
         handle,
         shutdown: Some(shutdown_tx),
     }
+}
+
+pub async fn start_sharded_pair_cluster(
+    dir: &Path,
+    opts: ShardedClusterOptions,
+) -> [ShardedTestNode; 2] {
+    let chdb_dir = dir.join("chdb-shared");
+    std::fs::create_dir_all(&chdb_dir).unwrap();
+    let chdb = SharedSession::new_eager(chdb_dir.to_str().unwrap(), 1).unwrap();
+
+    let l1 = bind_ephemeral().await;
+    let l2 = bind_ephemeral().await;
+    let a1 = l1.local_addr().unwrap().to_string();
+    let a2 = l2.local_addr().unwrap().to_string();
+
+    let membership = build_shared_membership(&[(1, a1), (2, a2)]);
+
+    let n1 = start_sharded_node(dir, 1, l1, membership.clone(), &opts, chdb.clone()).await;
+    let n2 = start_sharded_node(dir, 2, l2, membership.clone(), &opts, chdb).await;
+    [n1, n2]
 }
 
 pub async fn start_sharded_three_node_cluster(
@@ -314,7 +343,6 @@ pub async fn bootstrap_region_on_all_nodes(
         peers,
         primary,
         last_split_at: 0,
-    health: Default::default(),
     };
     let op = ShardMapOp::BootstrapMeasurement {
         key: MeasurementKey::new(db, rp, measurement),
@@ -349,10 +377,19 @@ pub async fn create_db(client: &reqwest::Client, url: &str, db: &str) {
         .send()
         .await
         .unwrap();
-    assert!(resp.status().is_success(), "create db failed: {}", resp.status());
+    assert!(
+        resp.status().is_success(),
+        "create db failed: {}",
+        resp.status()
+    );
 }
 
-pub async fn write_line(client: &reqwest::Client, url: &str, db: &str, line: &str) -> reqwest::Response {
+pub async fn write_line(
+    client: &reqwest::Client,
+    url: &str,
+    db: &str,
+    line: &str,
+) -> reqwest::Response {
     client
         .post(format!("{url}/write"))
         .query(&[("db", db)])
@@ -362,10 +399,110 @@ pub async fn write_line(client: &reqwest::Client, url: &str, db: &str, line: &st
         .unwrap()
 }
 
-pub async fn query_sql(client: &reqwest::Client, url: &str, db: &str, q: &str) -> reqwest::Response {
+pub async fn query_sql(
+    client: &reqwest::Client,
+    url: &str,
+    db: &str,
+    q: &str,
+) -> reqwest::Response {
     client
         .get(format!("{url}/query"))
         .query(&[("db", db), ("q", q)])
+        .send()
+        .await
+        .unwrap()
+}
+
+pub async fn chdb_row_count(query_port: &dyn QueryPort, table: &str) -> u64 {
+    query_port
+        .execute_sql(&format!(
+            "SELECT count() AS c FROM `{table}` FORMAT JSONEachRow"
+        ))
+        .await
+        .unwrap()
+        .lines()
+        .next()
+        .and_then(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .and_then(|v| v.get("c").and_then(|c| c.as_u64()))
+        .unwrap_or(0)
+}
+
+pub async fn wait_for_show_materialized_view(
+    client: &reqwest::Client,
+    url: &str,
+    db: &str,
+    mv_name: &str,
+) -> bool {
+    for _ in 0..50 {
+        let resp = query_sql(client, url, db, "SHOW MATERIALIZED VIEWS").await;
+        if resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            if body.contains(mv_name) {
+                return true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+pub async fn wait_for_chdb_mv_object(
+    client: &reqwest::Client,
+    url: &str,
+    mv_name_substr: &str,
+) -> bool {
+    let chdb_sql = format!(
+        "SELECT name FROM system.tables WHERE database = 'default' AND name LIKE '%{mv_name_substr}%' FORMAT TabSeparated"
+    );
+    for _ in 0..50 {
+        let resp = client
+            .post(format!("{url}/api/v1/chdb"))
+            .json(&serde_json::json!({ "q": chdb_sql }))
+            .send()
+            .await;
+        if let Ok(resp) = resp
+            && resp.status().is_success()
+        {
+            let body = resp.text().await.unwrap_or_default();
+            if body.contains(mv_name_substr) {
+                return true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+pub async fn optimize_chdb_table(query_port: &dyn QueryPort, table: &str) {
+    let _ = query_port
+        .execute_sql(&format!("OPTIMIZE TABLE `{table}` FINAL"))
+        .await;
+}
+
+pub async fn wait_for_chdb_row_count_at_most(
+    query_port: &dyn QueryPort,
+    table: &str,
+    max_rows: u64,
+) -> bool {
+    for _ in 0..50 {
+        optimize_chdb_table(query_port, table).await;
+        let count = chdb_row_count(query_port, table).await;
+        if count <= max_rows {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+pub async fn post_shard_transfer(
+    client: &reqwest::Client,
+    url: &str,
+    payload: &ShardTransferPayload,
+) -> reqwest::Response {
+    client
+        .post(format!("{url}/internal/shard/transfer"))
+        .json(payload)
         .send()
         .await
         .unwrap()

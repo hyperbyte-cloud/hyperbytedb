@@ -24,7 +24,9 @@ use serial_test::serial;
 use tokio::sync::watch;
 
 fn test_cluster_config(dir: &std::path::Path, addr: &str) -> ClusterConfig {
-    let mut cfg = hyperbytedb::config::HyperbytedbConfig::load(None).unwrap().cluster;
+    let mut cfg = hyperbytedb::config::HyperbytedbConfig::load(None)
+        .unwrap()
+        .cluster;
     cfg.enabled = true;
     cfg.node_id = 1;
     cfg.cluster_addr = addr.to_string();
@@ -88,7 +90,6 @@ async fn primary_failover_updates_shard_map_after_unhealthy_timeout() {
         peers: vec![1, 2],
         primary: 1,
         last_split_at: 0,
-    health: Default::default(),
     };
     let op = ShardMapOp::BootstrapMeasurement {
         key: MeasurementKey::new("sharddb", "autogen", "cpu"),

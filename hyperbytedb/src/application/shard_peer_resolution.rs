@@ -53,10 +53,7 @@ pub fn resolve_region_peers(
     let mut seen = HashSet::with_capacity(region.peers.len());
 
     let mut push = |id: u64| {
-        if seen.insert(id)
-            && region.peers.contains(&id)
-            && is_active_peer(membership, id)
-        {
+        if seen.insert(id) && region.peers.contains(&id) && is_active_peer(membership, id) {
             out.push(id);
         }
     };
@@ -115,7 +112,6 @@ mod tests {
             peers: peers.to_vec(),
             primary,
             last_split_at: 0,
-        health: Default::default(),
         }
     }
 
@@ -130,7 +126,11 @@ mod tests {
     #[test]
     fn self_preferred_when_active() {
         let r = region(2, &[1, 2, 3]);
-        let m = membership(&[(1, NodeState::Active), (2, NodeState::Active), (3, NodeState::Active)]);
+        let m = membership(&[
+            (1, NodeState::Active),
+            (2, NodeState::Active),
+            (3, NodeState::Active),
+        ]);
         let peers = resolve_region_peers(&r, 1, &m, RegionTargetRole::Read);
         assert_eq!(peers, vec![1, 2, 3]);
     }
@@ -158,7 +158,11 @@ mod tests {
     #[test]
     fn active_region_peer_targets_excludes_self() {
         let r = region(1, &[1, 2, 3]);
-        let m = membership(&[(1, NodeState::Active), (2, NodeState::Active), (3, NodeState::Disconnected)]);
+        let m = membership(&[
+            (1, NodeState::Active),
+            (2, NodeState::Active),
+            (3, NodeState::Disconnected),
+        ]);
         let targets = active_region_peer_targets(&r, 1, &m);
         assert_eq!(targets, vec![2]);
     }

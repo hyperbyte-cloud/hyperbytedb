@@ -54,7 +54,11 @@ pub struct MeasurementKey {
 }
 
 impl MeasurementKey {
-    pub fn new(db: impl Into<String>, rp: impl Into<String>, measurement: impl Into<String>) -> Self {
+    pub fn new(
+        db: impl Into<String>,
+        rp: impl Into<String>,
+        measurement: impl Into<String>,
+    ) -> Self {
         Self {
             db: db.into(),
             rp: rp.into(),
@@ -72,9 +76,7 @@ pub struct MeasurementShardSpace {
 
 impl MeasurementShardSpace {
     pub fn locate(&self, series_id: u64) -> Option<&ShardRegion> {
-        self.regions
-            .iter()
-            .find(|r| r.contains(series_id))
+        self.regions.iter().find(|r| r.contains(series_id))
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -84,7 +86,10 @@ impl MeasurementShardSpace {
         let mut sorted = self.regions.clone();
         sorted.sort_by_key(|r| r.start);
         if sorted[0].start != 0 {
-            return Err(format!("first region must start at 0, got {}", sorted[0].start));
+            return Err(format!(
+                "first region must start at 0, got {}",
+                sorted[0].start
+            ));
         }
         for w in sorted.windows(2) {
             if w[0].end != w[1].start {
@@ -108,7 +113,13 @@ pub struct ShardMap {
 }
 
 impl ShardMap {
-    pub fn locate(&self, db: &str, rp: &str, measurement: &str, series_id: u64) -> Option<&ShardRegion> {
+    pub fn locate(
+        &self,
+        db: &str,
+        rp: &str,
+        measurement: &str,
+        series_id: u64,
+    ) -> Option<&ShardRegion> {
         let key = MeasurementKey::new(db, rp, measurement);
         self.spaces.get(&key)?.locate(series_id)
     }
@@ -214,4 +225,24 @@ pub struct ShardTransferRequest {
     pub start: u64,
     pub end: u64,
     pub epoch: ShardEpoch,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MvBackfillPhase {
+    Fact,
+    Series,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardMvBackfillRequest {
+    pub db: String,
+    pub rp: String,
+    pub epoch: ShardEpoch,
+    pub region_id: u64,
+    pub phase: MvBackfillPhase,
+    pub sql: String,
+    pub dest_db: String,
+    pub dest_rp: String,
+    pub dest_measurement: String,
 }

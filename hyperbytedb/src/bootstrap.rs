@@ -6,6 +6,7 @@ use crate::adapters::chdb::session::SharedSession;
 use crate::adapters::http::rate_limit;
 use crate::adapters::http::router::AppState;
 use crate::adapters::metadata::rocksdb_meta::RocksDbMetadata;
+use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
 use crate::adapters::wal::batching_wal::BatchingWal;
 use crate::adapters::wal::rocksdb_wal::{RocksDbWal, RocksDbWalOptions};
 use crate::application::cluster::bootstrap::ClusterBootstrap;
@@ -17,9 +18,8 @@ use crate::application::ingestion_service::IngestionServiceImpl;
 use crate::application::query_service::QueryServiceImpl;
 use crate::application::raft_leader_callbacks::{RaftLeaderCallbacks, SharedRaftLeaderCallbacks};
 use crate::application::replication_apply::ReplicationApplyQueue;
-use crate::application::statement_summary::StatementSummary;
-use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
 use crate::application::shard_routing::ShardRoutingContext;
+use crate::application::statement_summary::StatementSummary;
 use crate::config::HyperbytedbConfig;
 use crate::domain::sharding::ShardLocationCache;
 use crate::ports::metadata::MetadataPort;
@@ -246,25 +246,6 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
     }
     let points_sink: Arc<dyn PointsSinkPort> = Arc::new(native_sink);
 
-    let mv_service = Arc::new(
-        crate::application::materialized_view_service::MaterializedViewService::new(
-            metadata.clone(),
-            chdb.clone(),
-            points_sink.clone(),
-        ),
-    );
-    match mv_service.reconcile_all().await {
-        Ok(n) if n > 0 => tracing::info!(
-            reconciled = n,
-            "reconciled materialized view DDL from metadata"
-        ),
-        Ok(_) => {}
-        Err(e) => tracing::warn!(
-            error = %e,
-            "failed to reconcile materialized views from metadata"
-        ),
-    }
-
     let auth: Arc<dyn crate::ports::auth::AuthPort> =
         Arc::new(MetadataAuthAdapter::new(metadata.clone()));
 
@@ -321,6 +302,37 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
             None
         };
 
+    let mv_service = {
+        let mut svc = crate::application::materialized_view_service::MaterializedViewService::new(
+            metadata.clone(),
+            chdb.clone(),
+            points_sink.clone(),
+        );
+        if let (Some(sr), Some(callbacks)) =
+            (shard_routing.as_ref(), raft_leader_callbacks.as_ref())
+        {
+            let cb_leader = callbacks.clone();
+            let cb_addr = callbacks.clone();
+            svc = svc.with_sharding(
+                sr.clone(),
+                Arc::new(move || cb_leader.is_leader()),
+                Arc::new(move || cb_addr.leader_addr()),
+            );
+        }
+        Arc::new(svc)
+    };
+    match mv_service.reconcile_all().await {
+        Ok(n) if n > 0 => tracing::info!(
+            reconciled = n,
+            "reconciled materialized view DDL from metadata"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(
+            error = %e,
+            "failed to reconcile materialized views from metadata"
+        ),
+    }
+
     let base_query_service: Arc<dyn QueryService> = {
         let mut qs = QueryServiceImpl::new(
             chdb.clone(),
@@ -337,7 +349,17 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
                 config.cluster.replication.clone(),
             );
         }
-        if let Some(ref sr) = shard_routing {
+        if let (Some(sr), Some(callbacks)) =
+            (shard_routing.as_ref(), raft_leader_callbacks.as_ref())
+        {
+            let cb_leader = callbacks.clone();
+            let cb_addr = callbacks.clone();
+            qs = qs.with_materialized_view_sharding(
+                sr.clone(),
+                Arc::new(move || cb_leader.is_leader()),
+                Arc::new(move || cb_addr.leader_addr()),
+            );
+        } else if let Some(sr) = shard_routing.as_ref() {
             qs = qs.with_sharding(sr.clone());
         }
         Arc::new(qs)
@@ -430,11 +452,7 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
                 );
         }
         if config.sharding.enabled {
-            fs = fs.with_sharding(
-                true,
-                Some(shard_map.clone()),
-                config.cluster.node_id,
-            );
+            fs = fs.with_sharding(true, Some(shard_map.clone()), config.cluster.node_id);
         }
         Arc::new(fs)
     };

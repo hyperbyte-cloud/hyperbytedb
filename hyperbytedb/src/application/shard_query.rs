@@ -2,14 +2,28 @@
 
 /// Inject `series_id` range filter `[start, end)` into translated ClickHouse SQL.
 pub fn inject_region_series_id_predicate(sql: String, start: u64, end: u64) -> String {
+    inject_region_series_id_predicate_with_alias(sql, start, end, None)
+}
+
+/// Like [`inject_region_series_id_predicate`], but qualify the fact-table column
+/// (for example `t.`series_id`` in materialized-view SELECT bodies).
+pub fn inject_region_series_id_predicate_with_alias(
+    sql: String,
+    start: u64,
+    end: u64,
+    fact_alias: Option<&str>,
+) -> String {
     if start == 0 && end == u64::MAX {
         return sql;
     }
-    // Use unqualified `series_id`: native-table SQL has no `t` alias unless a series join wraps the FROM clause.
+    let series_col = match fact_alias {
+        Some(alias) => format!("{alias}.`series_id`"),
+        None => "`series_id`".to_string(),
+    };
     let predicate = if end == u64::MAX {
-        format!("`series_id` >= {start}")
+        format!("{series_col} >= {start}")
     } else {
-        format!("`series_id` >= {start} AND `series_id` < {end}")
+        format!("{series_col} >= {start} AND {series_col} < {end}")
     };
     inject_and_predicate(sql, &predicate)
 }
@@ -63,5 +77,13 @@ mod tests {
         let out = inject_region_series_id_predicate(sql, 10, 100);
         assert!(out.contains("series_id` >= 10"));
         assert!(out.contains("series_id` < 100"));
+    }
+
+    #[test]
+    fn injects_series_id_range_with_fact_alias() {
+        let sql = "SELECT time FROM src AS t\nGROUP BY time".to_string();
+        let out = inject_region_series_id_predicate_with_alias(sql, 10, 100, Some("t"));
+        assert!(out.contains("t.`series_id` >= 10"));
+        assert!(out.contains("t.`series_id` < 100"));
     }
 }

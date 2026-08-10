@@ -189,8 +189,7 @@ impl SyncClient {
                     }
                     let primary_addr = {
                         let m = self.membership.read().await;
-                        m.get_node(region.primary)
-                            .map(|n| n.addr.clone())
+                        m.get_node(region.primary).map(|n| n.addr.clone())
                     };
                     if let Some(addr) = primary_addr {
                         applied += self.wal_catchup(&addr, local_wal_seq).await?;

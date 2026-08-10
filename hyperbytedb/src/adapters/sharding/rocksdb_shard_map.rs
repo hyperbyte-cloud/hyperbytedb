@@ -1,11 +1,11 @@
 use async_trait::async_trait;
 use parking_lot::RwLock;
-use rocksdb::{IteratorMode, Options, DB};
+use rocksdb::{DB, IteratorMode, Options};
 use serde_json;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::domain::sharding::{apply_shard_map_op, ShardMap, ShardMapOp, ShardRegion};
+use crate::domain::sharding::{ShardMap, ShardMapOp, ShardRegion, apply_shard_map_op};
 use crate::error::HyperbytedbError;
 use crate::ports::sharding::ShardMapPort;
 
@@ -26,10 +26,12 @@ pub struct RocksDbShardMap {
 impl RocksDbShardMap {
     pub fn open(meta_dir: &Path, enabled: bool, node_id: u64) -> Result<Self, HyperbytedbError> {
         let path = meta_dir.join("shard_map");
-        std::fs::create_dir_all(&path).map_err(|e| HyperbytedbError::Storage(e.to_string().into()))?;
+        std::fs::create_dir_all(&path)
+            .map_err(|e| HyperbytedbError::Storage(e.to_string().into()))?;
         let mut opts = Options::default();
         opts.create_if_missing(true);
-        let db = DB::open(&opts, &path).map_err(|e| HyperbytedbError::Storage(e.to_string().into()))?;
+        let db =
+            DB::open(&opts, &path).map_err(|e| HyperbytedbError::Storage(e.to_string().into()))?;
         let db = Arc::new(db);
         let cache = load_map(&db)?;
         Ok(Self {
@@ -54,7 +56,10 @@ impl RocksDbShardMap {
     pub fn list_heartbeats(&self) -> Result<Vec<(u64, u64, Vec<u8>)>, HyperbytedbError> {
         let prefix = HEARTBEAT_PREFIX.as_bytes();
         let mut out = Vec::new();
-        for item in self.db.iterator(IteratorMode::From(prefix, rocksdb::Direction::Forward)) {
+        for item in self
+            .db
+            .iterator(IteratorMode::From(prefix, rocksdb::Direction::Forward))
+        {
             let (key, value) = item.map_err(|e| HyperbytedbError::Storage(e.to_string().into()))?;
             if !key.starts_with(prefix) {
                 break;
@@ -62,14 +67,8 @@ impl RocksDbShardMap {
             let s = String::from_utf8_lossy(&key);
             let rest = s.strip_prefix(HEARTBEAT_PREFIX).unwrap_or("");
             let mut parts = rest.split(':');
-            let region_id: u64 = parts
-                .next()
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(0);
-            let node_id: u64 = parts
-                .next()
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(0);
+            let region_id: u64 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+            let node_id: u64 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
             out.push((region_id, node_id, value.to_vec()));
         }
         Ok(out)
@@ -77,7 +76,10 @@ impl RocksDbShardMap {
 }
 
 fn load_map(db: &DB) -> Result<ShardMap, HyperbytedbError> {
-    match db.get(SHARD_MAP_KEY).map_err(|e| HyperbytedbError::Storage(e.to_string().into()))? {
+    match db
+        .get(SHARD_MAP_KEY)
+        .map_err(|e| HyperbytedbError::Storage(e.to_string().into()))?
+    {
         Some(bytes) => {
             let persisted: PersistedShardMap = serde_json::from_slice(&bytes)
                 .map_err(|e| HyperbytedbError::ShardMap(e.to_string()))?;

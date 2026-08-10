@@ -70,9 +70,7 @@ impl ShardMapPort for DisabledShardMap {
     }
 
     async fn apply_op(&self, _op: ShardMapOp) -> Result<ShardMap, HyperbytedbError> {
-        Err(HyperbytedbError::Internal(
-            "sharding is disabled".into(),
-        ))
+        Err(HyperbytedbError::Internal("sharding is disabled".into()))
     }
 
     async fn node_owns_measurement(

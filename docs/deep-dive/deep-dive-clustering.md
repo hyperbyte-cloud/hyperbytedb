@@ -558,6 +558,7 @@ Step 5: Set node state to Leaving
 | `/internal/shard/metadata` | POST | Region-scoped SHOW TAG KEYS/VALUES/SERIES |
 | `/internal/shard/delete` | POST | Physical delete cleanup for a region |
 | `/internal/shard/transfer` | POST | Receive WAL export during region transfer |
+| `/internal/shard/mv-backfill` | POST | Apply region-scoped MV historical backfill SQL |
 | `/internal/shard/heartbeat` | POST | Region stats report to the Raft leader |
 | `/internal/shard/map` | GET | Read-only shard map snapshot |
 
@@ -693,6 +694,20 @@ Remote DELETE cleanup waits for an Active primary; use drain or wait for automat
 - **Drain** performs `TransferPrimary` + transfer + `MovePeer` for regions where the draining node is primary.
 - **Sync manifests** include per-region WAL watermarks; join sync pulls from region primaries where the joining node is a peer.
 
+### Materialized views
+
+When sharding is enabled, materialized views use the same per-node ClickHouse MV model as non-sharded clusters, with three extra behaviors:
+
+1. **Incremental triggers stay local.** Source writes are already routed by `series_id` region, so each node installs fact + series ClickHouse MVs that fire on locally ingested source rows. No cross-region predicate is injected into MV SQL.
+
+2. **Destination queries fan out to all regions and all Active peers in each region.** Materialized destination measurements store **region-local partial rollups**. Coordinators select every region in the dest shard map (no `series_id` predicate), query every Active peer in each region via `/internal/shard/query`, then merge partial rows with SummingMergeTree semantics (`merge_materialized_rollup_results`). Tag-subset `GROUP BY` (for example `GROUP BY time(1m), "host"`) relies on this merge at read time.
+
+3. **`WITH BACKFILL` scatters before MV DDL.** On `CREATE MATERIALIZED VIEW ... WITH BACKFILL`, the leader ensures dest schema, inserts historical fact + series rows per source region through `/internal/shard/mv-backfill` (with region `series_id` predicates), then installs ClickHouse MV objects without dropping the backfilled destination tables.
+
+On create, both source and destination measurements are bootstrapped into the shard map. MV definitions replicate through Raft like other schema mutations; each node reconciles local ClickHouse MV objects on startup.
+
+After a **region transfer**, destination partial rows sourced from transferred `series_id` ranges are purged on the ACK phase so stale rollups do not linger on vacated peers.
+
 ### Metrics
 
 | Metric | Type | Description |
@@ -712,10 +727,10 @@ Remote DELETE cleanup waits for an Active primary; use drain or wait for automat
 | `hyperbytedb_shard_scatter_peer_attempts` | histogram | Peer attempts per scatter request |
 | `hyperbytedb_shard_primary_failover_total` | counter | Automatic `TransferPrimary` on unhealthy primary |
 | `hyperbytedb_shard_primary_failover_skipped_total{reason}` | counter | Failover skipped |
+| `hyperbytedb_shard_mv_backfill_regions_total` | counter | Source regions backfilled during sharded MV create |
 
 ### Limitations
 
 - Enable sharding only on **new clusters**; in-place conversion from full-copy replication is not supported.
-- **Materialized views** are rejected when sharding is enabled.
 - **Proxy** load balancing is not shard-aware; any Active node can coordinate scatter-gather queries and write forwards.
 - **sync_quorum** replication semantics apply to the coordinator's local WAL append; sharded write forwards use region-scoped async replication to region peers.

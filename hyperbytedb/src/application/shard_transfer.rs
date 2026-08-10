@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use metrics::counter;
 
-use crate::application::ingest_metadata::{prepare_batch_metadata, IngestCardinalityLimits};
+use crate::application::ingest_metadata::{IngestCardinalityLimits, prepare_batch_metadata};
 use crate::application::line_protocol::parse_line_body_to_points_limited;
 use crate::application::wal_append::append_points_with_prepared;
 use crate::domain::series::series_id_for_point;
@@ -45,15 +45,7 @@ pub async fn apply_transfer_push(
         max_tag_values_per_measurement: 0,
         max_measurements_per_database: 0,
     };
-    prepare_batch_metadata(
-        metadata,
-        &req.db,
-        &req.rp,
-        &filtered,
-        limits,
-        None,
-    )
-    .await?;
+    prepare_batch_metadata(metadata, &req.db, &req.rp, &filtered, limits, None).await?;
 
     append_points_with_prepared(
         wal.as_ref(),
@@ -71,6 +63,7 @@ pub async fn apply_transfer(
     metadata: &Arc<dyn MetadataPort>,
     wal: &Arc<dyn WalPort>,
     sink: Option<&Arc<dyn PointsSinkPort>>,
+    mv_service: Option<&crate::application::materialized_view_service::MaterializedViewService>,
     node_id: u64,
     req: &ShardTransferPayload,
     max_points: usize,
@@ -80,8 +73,34 @@ pub async fn apply_transfer(
             apply_transfer_push(metadata, wal, sink, node_id, req, max_points).await?;
         }
         TransferPhase::Ack => {
-            drop_region_data(metadata, sink, &req.db, &req.rp, &req.measurement, req.start, req.end)
-                .await?;
+            if let Some(mv) = mv_service
+                && let Err(e) = mv
+                    .purge_dest_partials_after_source_transfer(
+                        &req.db,
+                        &req.rp,
+                        &req.measurement,
+                        req.start,
+                        req.end,
+                    )
+                    .await
+            {
+                tracing::warn!(
+                    db = %req.db,
+                    measurement = %req.measurement,
+                    error = %e,
+                    "MV dest purge after transfer failed"
+                );
+            }
+            drop_region_data(
+                metadata,
+                sink,
+                &req.db,
+                &req.rp,
+                &req.measurement,
+                req.start,
+                req.end,
+            )
+            .await?;
         }
     }
     Ok(())

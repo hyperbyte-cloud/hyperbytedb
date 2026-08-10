@@ -12,9 +12,7 @@ use crate::application::shard_peer_resolution::is_active_peer;
 use crate::application::shard_transfer::run_region_transfer;
 use crate::config::ShardingConfig;
 use crate::domain::cluster::membership::{NodeState, SharedMembership};
-use crate::domain::sharding::{
-    MeasurementKey, ShardEpoch, ShardMapOp, ShardRegion,
-};
+use crate::domain::sharding::{MeasurementKey, ShardEpoch, ShardMapOp, ShardRegion};
 use crate::error::HyperbytedbError;
 use crate::ports::metadata::MetadataPort;
 use crate::ports::points_sink::PointsSinkPort;
@@ -128,11 +126,7 @@ impl ShardScheduler {
         metrics.current_leader == Some(self.node_id)
     }
 
-    pub async fn run(
-        &self,
-        interval: Duration,
-        mut shutdown_rx: watch::Receiver<bool>,
-    ) {
+    pub async fn run(&self, interval: Duration, mut shutdown_rx: watch::Receiver<bool>) {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -225,11 +219,7 @@ impl ShardScheduler {
                             >= self.config.split_merge_interval_secs
                     {
                         let key = space.key.clone();
-                        if self
-                            .try_merge(&key, region, right.clone())
-                            .await
-                            .is_ok()
-                        {
+                        if self.try_merge(&key, region, right.clone()).await.is_ok() {
                             self.release_op_slot().await;
                             continue;
                         }
@@ -365,7 +355,8 @@ impl ShardScheduler {
         right.start = split_key;
         right.epoch = ShardEpoch::default().bump_version();
         right.last_split_at = left.last_split_at;
-        if let Some(new_primary) = pick_alternate_primary(&self.membership, region, self.node_id).await
+        if let Some(new_primary) =
+            pick_alternate_primary(&self.membership, region, self.node_id).await
         {
             right.primary = new_primary;
         }
@@ -595,7 +586,10 @@ mod tests {
             last_split_at: 0,
         };
 
-        assert_eq!(pick_alternate_primary(&membership, &region, 99).await, Some(2));
+        assert_eq!(
+            pick_alternate_primary(&membership, &region, 99).await,
+            Some(2)
+        );
     }
 
     #[tokio::test]
@@ -674,7 +668,9 @@ mod tests {
             sink.clone(),
         ));
 
-        let mut cluster_cfg = crate::config::HyperbytedbConfig::load(None).unwrap().cluster;
+        let mut cluster_cfg = crate::config::HyperbytedbConfig::load(None)
+            .unwrap()
+            .cluster;
         cluster_cfg.enabled = true;
         cluster_cfg.node_id = 1;
         cluster_cfg.cluster_addr = "127.0.0.1:18086".into();
@@ -750,7 +746,11 @@ mod tests {
         .with_test_force_leader(true)
         .with_test_propose_sink(proposals.clone());
 
-        bootstrap.membership.write().await.set_state(1, NodeState::Disconnected);
+        bootstrap
+            .membership
+            .write()
+            .await
+            .set_state(1, NodeState::Disconnected);
         {
             let mut m = bootstrap.membership.write().await;
             if m.get_node(2).is_none() {
@@ -773,15 +773,11 @@ mod tests {
             .unwrap();
 
         let captured = proposals.lock().unwrap();
+        assert!(!captured.is_empty(), "no proposals captured: {captured:?}");
         assert!(
-            !captured.is_empty(),
-            "no proposals captured: {captured:?}"
-        );
-        assert!(
-            captured.iter().any(|op| matches!(
-                op,
-                ShardMapOp::TransferPrimary { new_primary: 2, .. }
-            ))
+            captured
+                .iter()
+                .any(|op| matches!(op, ShardMapOp::TransferPrimary { new_primary: 2, .. }))
         );
     }
 }

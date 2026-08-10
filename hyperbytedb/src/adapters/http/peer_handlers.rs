@@ -407,7 +407,10 @@ pub async fn handle_sync_manifest(State(state): State<Arc<AppState>>) -> impl In
         state.node_id,
         &state.metadata,
         &state.wal,
-        state.shard_map.as_ref().map(|m| m.as_ref() as &dyn crate::ports::sharding::ShardMapPort),
+        state
+            .shard_map
+            .as_ref()
+            .map(|m| m.as_ref() as &dyn crate::ports::sharding::ShardMapPort),
     )
     .await
     {

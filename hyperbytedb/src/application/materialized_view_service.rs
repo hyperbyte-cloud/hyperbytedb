@@ -1,6 +1,10 @@
 use std::sync::Arc;
 
 use crate::application::ingest_metadata::register_series_from_series_table;
+use crate::application::shard_routing::{ShardRoutingContext, ensure_measurement_bootstrapped};
+use crate::application::sharded_mv_backfill::{
+    MeasurementShardRef, ShardedMvBackfillPlan, ShardedMvBackfillPorts, scatter_mv_backfill,
+};
 use crate::domain::chdb_naming::{
     quoted_fact_mv_name, quoted_series_mv_name, quoted_series_table_name, quoted_table_name,
     unquoted_fact_mv_name, unquoted_series_mv_name,
@@ -22,6 +26,9 @@ pub struct MaterializedViewService {
     metadata: Arc<dyn MetadataPort>,
     query_port: Arc<dyn QueryPort>,
     points_sink: Arc<dyn PointsSinkPort>,
+    shard_routing: Option<Arc<ShardRoutingContext>>,
+    is_raft_leader: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    raft_leader_addr: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
 }
 
 impl MaterializedViewService {
@@ -34,7 +41,27 @@ impl MaterializedViewService {
             metadata,
             query_port,
             points_sink,
+            shard_routing: None,
+            is_raft_leader: None,
+            raft_leader_addr: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_sharding(
+        mut self,
+        ctx: Arc<ShardRoutingContext>,
+        is_leader: Arc<dyn Fn() -> bool + Send + Sync>,
+        leader_addr: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    ) -> Self {
+        self.shard_routing = Some(ctx);
+        self.is_raft_leader = Some(is_leader);
+        self.raft_leader_addr = Some(leader_addr);
+        self
+    }
+
+    pub fn shard_routing(&self) -> Option<&Arc<ShardRoutingContext>> {
+        self.shard_routing.as_ref()
     }
 
     pub fn points_sink(&self) -> &Arc<dyn PointsSinkPort> {
@@ -57,9 +84,6 @@ impl MaterializedViewService {
             )));
         }
 
-        self.materialize_ddl(mv, true, mv.backfill_on_create)
-            .await?;
-
         let (source_db, source_rp_opt, source_measurement) =
             extract_source(&mv.query, &mv.database)?;
         let (dest_db, dest_rp_opt, dest_measurement) = extract_dest(&mv.query, &mv.database)?;
@@ -79,6 +103,40 @@ impl MaterializedViewService {
                 .await
                 .unwrap_or_else(|_| "autogen".to_string()),
         };
+
+        self.bootstrap_sharded_measurements(
+            &source_db,
+            &source_rp,
+            &source_measurement,
+            &dest_db,
+            &dest_rp,
+            &dest_measurement,
+        )
+        .await?;
+
+        if mv.backfill_on_create && self.shard_routing.is_some() {
+            self.run_sharded_backfill(
+                mv,
+                MeasurementShardRef {
+                    db: &source_db,
+                    rp: &source_rp,
+                    measurement: &source_measurement,
+                },
+                MeasurementShardRef {
+                    db: &dest_db,
+                    rp: &dest_rp,
+                    measurement: &dest_measurement,
+                },
+            )
+            .await?;
+        }
+
+        let run_local_backfill = mv.backfill_on_create && self.shard_routing.is_none();
+        let sharded_backfill_done = mv.backfill_on_create && self.shard_routing.is_some();
+        // Sharded scatter backfill runs before DDL; do not drop the destination it just filled.
+        let reset_destination = !sharded_backfill_done;
+        self.materialize_ddl(mv, reset_destination, run_local_backfill)
+            .await?;
 
         let def = MaterializedViewDef {
             name: mv.name.clone(),
@@ -474,6 +532,210 @@ impl MaterializedViewService {
         }
 
         Ok(())
+    }
+
+    async fn bootstrap_sharded_measurements(
+        &self,
+        source_db: &str,
+        source_rp: &str,
+        source_measurement: &str,
+        dest_db: &str,
+        dest_rp: &str,
+        dest_measurement: &str,
+    ) -> Result<(), HyperbytedbError> {
+        let Some(ctx) = self.shard_routing.as_ref() else {
+            return Ok(());
+        };
+        let is_leader = self.is_raft_leader.as_ref().map(|f| f()).unwrap_or(true);
+        let leader_addr = self.raft_leader_addr.as_ref().and_then(|f| f());
+
+        ensure_measurement_bootstrapped(
+            ctx,
+            source_db,
+            source_rp,
+            source_measurement,
+            is_leader,
+            leader_addr.as_deref(),
+        )
+        .await?;
+        ensure_measurement_bootstrapped(
+            ctx,
+            dest_db,
+            dest_rp,
+            dest_measurement,
+            is_leader,
+            leader_addr.as_deref(),
+        )
+        .await
+    }
+
+    /// Remove destination rollup rows on this node that were produced from source
+    /// series in the transferred `[start, end)` range.
+    pub async fn purge_dest_partials_after_source_transfer(
+        &self,
+        db: &str,
+        rp: &str,
+        source_measurement: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<(), HyperbytedbError> {
+        let mvs = self.metadata.list_materialized_views(db).await?;
+        for def in mvs {
+            if def.source_db != db
+                || def.source_rp != rp
+                || def.source_measurement != source_measurement
+            {
+                continue;
+            }
+
+            let mv = CreateMaterializedViewStatement {
+                name: def.name.clone(),
+                database: def.database.clone(),
+                query: parse_mv_select(&def.query_text)?,
+                raw_query: def.query_text.clone(),
+                backfill_on_create: false,
+            };
+
+            let source_meta = match self
+                .metadata
+                .get_measurement(db, rp, source_measurement)
+                .await?
+            {
+                Some(m) => m,
+                None => continue,
+            };
+
+            let source_mapping =
+                crate::domain::column_mapping::ColumnMapping::from_measurement_meta(&source_meta);
+            let mut tag_keys: Vec<String> = source_meta.tag_keys.to_vec();
+            tag_keys.sort();
+            let (effective_query, _) = if let Some(ref gb) = mv.query.group_by {
+                let (expanded_gb, _) = gb.expand_all_tags(&tag_keys);
+                let mut q = mv.query.clone();
+                q.group_by = Some(expanded_gb);
+                (q, ())
+            } else {
+                (mv.query.clone(), ())
+            };
+
+            let source_fact = quoted_table_name(db, rp, source_measurement);
+            let source_series = quoted_series_table_name(db, rp, source_measurement);
+            let dest_fact = quoted_table_name(&def.dest_db, &def.dest_rp, &def.dest_measurement);
+
+            let select_sql = to_clickhouse::translate_materialized_view_select(
+                &effective_query,
+                &source_fact,
+                &source_series,
+                &def.dest_measurement,
+                &source_mapping,
+            )?;
+            let keys_sql = format!("SELECT time, series_id FROM (\n{select_sql}\n)");
+            let keys_sql =
+                crate::application::shard_query::inject_region_series_id_predicate_with_alias(
+                    keys_sql,
+                    start,
+                    end,
+                    Some("t"),
+                );
+            let delete_sql =
+                format!("ALTER TABLE {dest_fact} DELETE WHERE (time, series_id) IN ({keys_sql})");
+
+            if let Err(e) = self.query_port.execute_sql(&delete_sql).await {
+                tracing::warn!(
+                    mv = %def.name,
+                    db = %db,
+                    error = %e,
+                    "failed to purge stale MV destination rows after source transfer"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn run_sharded_backfill(
+        &self,
+        mv: &CreateMaterializedViewStatement,
+        source: MeasurementShardRef<'_>,
+        dest: MeasurementShardRef<'_>,
+    ) -> Result<(), HyperbytedbError> {
+        let Some(ctx) = self.shard_routing.as_ref() else {
+            return Ok(());
+        };
+
+        let source_meta = self
+            .metadata
+            .get_measurement(source.db, source.rp, source.measurement)
+            .await?
+            .ok_or_else(|| {
+                HyperbytedbError::QueryParse(format!(
+                    "source measurement \"{}\" not found in database \"{}\"",
+                    source.measurement, source.db
+                ))
+            })?;
+
+        let mut dest_meta = dest_measurement_meta(&mv.query, &source_meta)?;
+        dest_meta.materialized_rp = Some(dest.rp.to_string());
+
+        self.points_sink
+            .ensure_measurement_schema(dest.db, dest.rp, &dest_meta)
+            .await?;
+        self.metadata
+            .register_measurement(dest.db, dest.rp, &dest_meta)
+            .await?;
+
+        let source_mapping =
+            crate::domain::column_mapping::ColumnMapping::from_measurement_meta(&source_meta);
+        let mut tag_keys: Vec<String> = source_meta.tag_keys.to_vec();
+        tag_keys.sort();
+        let (effective_query, _) = if let Some(ref gb) = mv.query.group_by {
+            let (expanded_gb, _) = gb.expand_all_tags(&tag_keys);
+            let mut q = mv.query.clone();
+            q.group_by = Some(expanded_gb);
+            (q, ())
+        } else {
+            (mv.query.clone(), ())
+        };
+
+        let source_fact = quoted_table_name(source.db, source.rp, source.measurement);
+        let source_series = quoted_series_table_name(source.db, source.rp, source.measurement);
+        let dest_fact = quoted_table_name(dest.db, dest.rp, dest.measurement);
+        let dest_series = quoted_series_table_name(dest.db, dest.rp, dest.measurement);
+
+        let backfill_fact = to_clickhouse::translate_materialized_view_backfill(
+            &effective_query,
+            &dest_fact,
+            &source_fact,
+            &source_series,
+            dest.measurement,
+            &source_mapping,
+        )?;
+
+        let dest_field_names: std::collections::HashSet<String> =
+            dest_meta.field_types.keys().cloned().collect();
+        let series_select = to_clickhouse::translate_materialized_view_series_select(
+            &effective_query,
+            &source_series,
+            dest.measurement,
+            &source_mapping,
+            Some(&dest_field_names),
+        )?;
+        let series_backfill = format!("INSERT INTO {dest_series}\n{series_select}");
+
+        scatter_mv_backfill(
+            ctx,
+            ShardedMvBackfillPorts {
+                query_port: &self.query_port,
+                points_sink: &self.points_sink,
+                metadata: &self.metadata,
+            },
+            ShardedMvBackfillPlan {
+                source,
+                dest,
+                fact_sql: &backfill_fact,
+                series_sql: &series_backfill,
+            },
+        )
+        .await
     }
 
     async fn drop_ch_mv_objects(

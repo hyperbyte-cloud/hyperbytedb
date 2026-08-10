@@ -712,7 +712,11 @@ impl ReplicationPort for PeerClient {
         PeerClient::replicate_write_sync(&self, batch, required_acks, timeout).await
     }
 
-    fn replicate_mutation(self: Arc<Self>, req: MutationRequest, target_node_ids: Option<Vec<u64>>) {
+    fn replicate_mutation(
+        self: Arc<Self>,
+        req: MutationRequest,
+        target_node_ids: Option<Vec<u64>>,
+    ) {
         PeerClient::replicate_mutation(&self, req, target_node_ids);
     }
 

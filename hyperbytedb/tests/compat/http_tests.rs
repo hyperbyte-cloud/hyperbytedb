@@ -139,8 +139,8 @@ impl HttpTestContext {
             shard_location_cache: Arc::new(hyperbytedb::domain::sharding::ShardLocationCache::new()),
             shard_routing: None,
             shard_scheduler: None,
-        region_cursors: None,
-            ingest_cardinality: hyperbytedb::application::ingest_metadata::IngestCardinalityLimits::default(),
+            ingest_cardinality:
+                hyperbytedb::application::ingest_metadata::IngestCardinalityLimits::default(),
             cluster_replication: hyperbytedb::config::ReplicationConfig::default(),
         });
 

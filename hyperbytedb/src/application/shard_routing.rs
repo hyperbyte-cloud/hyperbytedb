@@ -11,16 +11,16 @@ use crate::adapters::cluster::peer_client::PeerClient;
 use crate::adapters::cluster::raft::types::{ClusterRequest, ClusterResponse};
 use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
 use crate::application::shard_peer_resolution::{
-    active_region_peer_targets, is_active_peer, peer_addr, resolve_region_peers, RegionTargetRole,
-    ScatterKind,
+    RegionTargetRole, ScatterKind, active_region_peer_targets, is_active_peer, peer_addr,
+    resolve_region_peers,
 };
 use crate::config::ShardingConfig;
 use crate::domain::point::Point;
 use crate::domain::series::series_id_for_point;
+use crate::domain::sharding::ShardLocationCache;
 use crate::domain::sharding::{
     MeasurementKey, ShardBootstrapRequest, ShardEpoch, ShardMapOp, ShardRegion, ShardWriteRequest,
 };
-use crate::domain::sharding::ShardLocationCache;
 use crate::error::HyperbytedbError;
 use crate::ports::metadata::MetadataPort;
 use crate::ports::sharding::ShardMapPort;
@@ -122,7 +122,13 @@ pub async fn reload_region(
     refresh_location_cache(ctx).await?;
     let map = ctx.shard_map.snapshot().await?;
     map.space(db, rp, measurement)
-        .and_then(|space| space.regions.iter().find(|r| r.region_id == region_id).cloned())
+        .and_then(|space| {
+            space
+                .regions
+                .iter()
+                .find(|r| r.region_id == region_id)
+                .cloned()
+        })
         .ok_or_else(|| HyperbytedbError::ShardMap("region missing after refresh".into()))
 }
 
@@ -368,38 +374,44 @@ async fn try_forward_shard_write_to_region(
     let region_id = region.region_id;
     let meas_owned = meas.clone();
 
-    scatter_to_region_peers(ctx, &region, RegionTargetRole::Write, ScatterKind::Write, |peer_id, addr, timeout| {
-        let req = req.clone();
-        let addr = addr.to_string();
-        let db = db.to_string();
-        let rp = rp.to_string();
-        let meas = meas_owned.clone();
-        async move {
-            let url = format!("http://{addr}/internal/shard/write");
-            let resp = ctx
-                .peer_client
-                .http_client()
-                .post(&url)
-                .json(&req)
-                .timeout(timeout)
-                .send()
-                .await
-                .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
+    scatter_to_region_peers(
+        ctx,
+        &region,
+        RegionTargetRole::Write,
+        ScatterKind::Write,
+        |peer_id, addr, timeout| {
+            let req = req.clone();
+            let addr = addr.to_string();
+            let db = db.to_string();
+            let rp = rp.to_string();
+            let meas = meas_owned.clone();
+            async move {
+                let url = format!("http://{addr}/internal/shard/write");
+                let resp = ctx
+                    .peer_client
+                    .http_client()
+                    .post(&url)
+                    .json(&req)
+                    .timeout(timeout)
+                    .send()
+                    .await
+                    .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
 
-            if resp.status() == reqwest::StatusCode::CONFLICT {
-                ctx.location_cache
-                    .invalidate_measurement(&MeasurementKey::new(&db, &rp, &meas));
-                return Err(HyperbytedbError::StaleShardEpoch { region_id });
+                if resp.status() == reqwest::StatusCode::CONFLICT {
+                    ctx.location_cache
+                        .invalidate_measurement(&MeasurementKey::new(&db, &rp, &meas));
+                    return Err(HyperbytedbError::StaleShardEpoch { region_id });
+                }
+                if !resp.status().is_success() {
+                    return Err(HyperbytedbError::PeerUnreachable(format!(
+                        "forward write to peer {peer_id} failed: {}",
+                        resp.status()
+                    )));
+                }
+                Ok(())
             }
-            if !resp.status().is_success() {
-                return Err(HyperbytedbError::PeerUnreachable(format!(
-                    "forward write to peer {peer_id} failed: {}",
-                    resp.status()
-                )));
-            }
-            Ok(())
-        }
-    })
+        },
+    )
     .await
 }
 
@@ -529,12 +541,12 @@ pub async fn scatter_delete_to_regions(
 
 #[cfg(test)]
 mod scatter_tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use axum::Router;
     use axum::http::StatusCode;
     use axum::routing::post;
-    use axum::Router;
     use tokio::task::JoinHandle;
 
     use crate::adapters::cluster::peer_client::PeerClient;
@@ -543,7 +555,7 @@ mod scatter_tests {
     use crate::application::shard_peer_resolution::{RegionTargetRole, ScatterKind};
     use crate::config::ShardingConfig;
     use crate::domain::cluster::membership::{
-        ClusterMembership, NodeInfo, NodeState, new_shared, SharedMembership,
+        ClusterMembership, NodeInfo, NodeState, SharedMembership, new_shared,
     };
     use crate::domain::sharding::{ShardEpoch, ShardRegion};
     use crate::error::HyperbytedbError;
@@ -561,10 +573,7 @@ mod scatter_tests {
         }
     }
 
-    async fn spawn_mock_peer(
-        status: StatusCode,
-        body: &'static str,
-    ) -> (String, JoinHandle<()>) {
+    async fn spawn_mock_peer(status: StatusCode, body: &'static str) -> (String, JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let app = Router::new().route(
@@ -712,7 +721,10 @@ mod scatter_tests {
         .await
         .unwrap_err();
 
-        assert!(matches!(err, HyperbytedbError::StaleShardEpoch { region_id: 1 }));
+        assert!(matches!(
+            err,
+            HyperbytedbError::StaleShardEpoch { region_id: 1 }
+        ));
         h1.abort();
         h2.abort();
     }

@@ -29,15 +29,11 @@ impl ShardLocationCache {
     }
 
     fn read_inner(&self) -> std::sync::RwLockReadGuard<'_, CacheInner> {
-        self.inner
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
+        self.inner.read().unwrap_or_else(|e| e.into_inner())
     }
 
     fn write_inner(&self) -> std::sync::RwLockWriteGuard<'_, CacheInner> {
-        self.inner
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
+        self.inner.write().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn refresh_from_map(&self, map: &ShardMap) {
@@ -100,7 +96,14 @@ impl ShardLocationCache {
         Some(region)
     }
 
-    pub fn check_epoch(&self, db: &str, rp: &str, measurement: &str, series_id: u64, epoch: ShardEpoch) -> bool {
+    pub fn check_epoch(
+        &self,
+        db: &str,
+        rp: &str,
+        measurement: &str,
+        series_id: u64,
+        epoch: ShardEpoch,
+    ) -> bool {
         let inner = self.read_inner();
         inner
             .by_series
@@ -117,7 +120,7 @@ impl ShardLocationCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::sharding::ops::{apply_shard_map_op, ShardMapOp};
+    use crate::domain::sharding::ops::{ShardMapOp, apply_shard_map_op};
     use crate::domain::sharding::types::ShardEpoch;
 
     fn sample_region(id: u64, start: u64, end: u64) -> ShardRegion {
@@ -129,7 +132,6 @@ mod tests {
             peers: vec![1, 2, 3],
             primary: 1,
             last_split_at: 0,
-        health: Default::default(),
         }
     }
 
@@ -147,9 +149,7 @@ mod tests {
         .unwrap();
 
         let cache = ShardLocationCache::new();
-        let r = cache
-            .locate(&map, "db", "rp", "cpu", 42)
-            .expect("located");
+        let r = cache.locate(&map, "db", "rp", "cpu", 42).expect("located");
         assert_eq!(r.region_id, 1);
         assert!(r.contains(42));
     }

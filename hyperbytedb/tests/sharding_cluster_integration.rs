@@ -8,7 +8,8 @@ use serial_test::serial;
 #[serial(chdb)]
 async fn query_scatter_falls_back_when_primary_unreachable() {
     let dir = tempfile::tempdir().unwrap();
-    let mut nodes = start_sharded_three_node_cluster(dir.path(), ShardedClusterOptions::default()).await;
+    let mut nodes =
+        start_sharded_three_node_cluster(dir.path(), ShardedClusterOptions::default()).await;
     bootstrap_region_on_all_nodes(&nodes, "sharddb", "autogen", "cpu", vec![1, 2], 1).await;
 
     let client = reqwest::Client::new();
@@ -27,21 +28,20 @@ async fn query_scatter_falls_back_when_primary_unreachable() {
 
     stop_node(&mut nodes[0]);
 
-    let resp = query_sql(
-        &client,
-        &nodes[2].url,
-        "sharddb",
-        "SELECT value FROM cpu",
-    )
-    .await;
-    assert!(resp.status().is_success(), "scatter query failed: {}", resp.status());
+    let resp = query_sql(&client, &nodes[2].url, "sharddb", "SELECT value FROM cpu").await;
+    assert!(
+        resp.status().is_success(),
+        "scatter query failed: {}",
+        resp.status()
+    );
 }
 
 #[tokio::test]
 #[serial(chdb)]
 async fn write_forwards_to_active_replica_when_primary_down() {
     let dir = tempfile::tempdir().unwrap();
-    let mut nodes = start_sharded_three_node_cluster(dir.path(), ShardedClusterOptions::default()).await;
+    let mut nodes =
+        start_sharded_three_node_cluster(dir.path(), ShardedClusterOptions::default()).await;
     bootstrap_region_on_all_nodes(&nodes, "sharddb", "autogen", "cpu", vec![1, 2], 1).await;
 
     let client = reqwest::Client::new();
@@ -58,27 +58,29 @@ async fn write_forwards_to_active_replica_when_primary_down() {
         "cpu,host=b value=2 2000000000",
     )
     .await;
-    assert!(resp.status().is_success(), "write failed: {}", resp.status());
+    assert!(
+        resp.status().is_success(),
+        "write failed: {}",
+        resp.status()
+    );
 
     flush_node(&nodes[1]).await;
 
-    let q = query_sql(
-        &client,
-        &nodes[1].url,
-        "sharddb",
-        "SHOW MEASUREMENTS",
-    )
-    .await;
+    let q = query_sql(&client, &nodes[1].url, "sharddb", "SHOW MEASUREMENTS").await;
     assert!(q.status().is_success(), "query failed: {}", q.status());
     let body = q.text().await.unwrap();
-    assert!(body.contains("cpu"), "expected measurement on replica: {body}");
+    assert!(
+        body.contains("cpu"),
+        "expected measurement on replica: {body}"
+    );
 }
 
 #[tokio::test]
 #[serial(chdb)]
 async fn scatter_returns_error_when_all_peers_unreachable() {
     let dir = tempfile::tempdir().unwrap();
-    let mut nodes = start_sharded_three_node_cluster(dir.path(), ShardedClusterOptions::default()).await;
+    let mut nodes =
+        start_sharded_three_node_cluster(dir.path(), ShardedClusterOptions::default()).await;
     bootstrap_region_on_all_nodes(&nodes, "sharddb", "autogen", "cpu", vec![1], 1).await;
 
     let client = reqwest::Client::new();
@@ -86,13 +88,7 @@ async fn scatter_returns_error_when_all_peers_unreachable() {
 
     stop_node(&mut nodes[0]);
 
-    let resp = query_sql(
-        &client,
-        &nodes[1].url,
-        "sharddb",
-        "SELECT value FROM cpu",
-    )
-    .await;
+    let resp = query_sql(&client, &nodes[1].url, "sharddb", "SELECT value FROM cpu").await;
     assert!(!resp.status().is_success());
 }
 
@@ -100,7 +96,8 @@ async fn scatter_returns_error_when_all_peers_unreachable() {
 #[serial(chdb)]
 async fn internal_shard_query_handler_serves_region_sql() {
     let dir = tempfile::tempdir().unwrap();
-    let nodes = start_sharded_three_node_cluster(dir.path(), ShardedClusterOptions::default()).await;
+    let nodes =
+        start_sharded_three_node_cluster(dir.path(), ShardedClusterOptions::default()).await;
     bootstrap_region_on_all_nodes(&nodes, "sharddb", "autogen", "cpu", vec![1, 2], 1).await;
 
     let client = reqwest::Client::new();
@@ -135,5 +132,8 @@ async fn internal_shard_query_handler_serves_region_sql() {
         .unwrap();
     let status = resp.status();
     let body = resp.text().await.unwrap();
-    assert!(status.is_success(), "internal query failed: {status} {body}");
+    assert!(
+        status.is_success(),
+        "internal query failed: {status} {body}"
+    );
 }

@@ -3,23 +3,21 @@
 use std::sync::Arc;
 
 use hyperbytedb::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
-use hyperbytedb::application::shard_query::inject_region_series_id_predicate;
-use hyperbytedb::application::shard_query_routing::{
-    select_regions_for_query, RegionSelection,
-};
 use hyperbytedb::application::shard_peer_resolution::{
-    active_region_peer_targets, is_active_peer, resolve_region_peers, RegionTargetRole,
+    RegionTargetRole, active_region_peer_targets, is_active_peer, resolve_region_peers,
 };
-use hyperbytedb::domain::cluster::membership::{ClusterMembership, NodeInfo, NodeState};
+use hyperbytedb::application::shard_query::inject_region_series_id_predicate;
+use hyperbytedb::application::shard_query_routing::{RegionSelection, select_regions_for_query};
 use hyperbytedb::config::HyperbytedbConfig;
+use hyperbytedb::domain::cluster::membership::{ClusterMembership, NodeInfo, NodeState};
 use hyperbytedb::domain::point::Point;
-use hyperbytedb::domain::sharding::{
-    ops::apply_shard_map_op, MeasurementKey, ShardEpoch, ShardLocationCache, ShardMap, ShardMapOp,
-    ShardRegion,
-};
 use hyperbytedb::domain::series::{series_id, series_id_for_point};
-use hyperbytedb::timeseriesql::parser::parse_query;
+use hyperbytedb::domain::sharding::{
+    MeasurementKey, ShardEpoch, ShardLocationCache, ShardMap, ShardMapOp, ShardRegion,
+    ops::apply_shard_map_op,
+};
 use hyperbytedb::ports::sharding::ShardMapPort;
+use hyperbytedb::timeseriesql::parser::parse_query;
 use serial_test::serial;
 
 #[test]
@@ -48,7 +46,6 @@ async fn location_cache_locates_after_bootstrap() {
         peers: vec![1, 2, 3],
         primary: 1,
         last_split_at: 0,
-    health: Default::default(),
     };
     map_store
         .apply_op(ShardMapOp::BootstrapMeasurement {
@@ -108,7 +105,6 @@ fn split_op_divides_region_range() {
         peers: vec![1, 2],
         primary: 1,
         last_split_at: 0,
-    health: Default::default(),
     };
     let mut map = ShardMap::default();
     apply_shard_map_op(
@@ -155,7 +151,6 @@ fn merge_op_consolidates_adjacent_regions() {
         peers: vec![1, 2],
         primary: 1,
         last_split_at: 0,
-    health: Default::default(),
     };
     let right = ShardRegion {
         region_id: 2,
@@ -165,7 +160,6 @@ fn merge_op_consolidates_adjacent_regions() {
         peers: vec![1, 2],
         primary: 1,
         last_split_at: 0,
-    health: Default::default(),
     };
     let mut map = ShardMap::default();
     apply_shard_map_op(
@@ -180,7 +174,6 @@ fn merge_op_consolidates_adjacent_regions() {
                 peers: vec![1, 2],
                 primary: 1,
                 last_split_at: 0,
-            health: Default::default(),
             },
         },
     )
@@ -204,7 +197,6 @@ fn merge_op_consolidates_adjacent_regions() {
         peers: vec![1, 2],
         primary: 1,
         last_split_at: 0,
-    health: Default::default(),
     };
     apply_shard_map_op(
         &mut map,
@@ -232,7 +224,6 @@ fn four_region_space() -> hyperbytedb::domain::sharding::MeasurementShardSpace {
                 peers: vec![1],
                 primary: 1,
                 last_split_at: 0,
-            health: Default::default(),
             },
             ShardRegion {
                 region_id: 2,
@@ -242,7 +233,6 @@ fn four_region_space() -> hyperbytedb::domain::sharding::MeasurementShardSpace {
                 peers: vec![1],
                 primary: 1,
                 last_split_at: 0,
-            health: Default::default(),
             },
             ShardRegion {
                 region_id: 3,
@@ -252,7 +242,6 @@ fn four_region_space() -> hyperbytedb::domain::sharding::MeasurementShardSpace {
                 peers: vec![1],
                 primary: 1,
                 last_split_at: 0,
-            health: Default::default(),
             },
             ShardRegion {
                 region_id: 4,
@@ -262,7 +251,6 @@ fn four_region_space() -> hyperbytedb::domain::sharding::MeasurementShardSpace {
                 peers: vec![1],
                 primary: 1,
                 last_split_at: 0,
-            health: Default::default(),
             },
         ],
     }
@@ -286,7 +274,10 @@ fn region_selection_equality_where_hits_single_region() {
 #[test]
 fn region_selection_count_without_where_uses_all_regions() {
     let space = four_region_space();
-    let stmt = match parse_query("SELECT count(value) FROM metrics").unwrap().remove(0) {
+    let stmt = match parse_query("SELECT count(value) FROM metrics")
+        .unwrap()
+        .remove(0)
+    {
         hyperbytedb::timeseriesql::ast::Statement::Select(s) => s,
         _ => panic!("expected select"),
     };
@@ -342,7 +333,6 @@ fn resolve_region_peers_skips_disconnected_primary() {
         peers: vec![1, 2, 3],
         primary: 1,
         last_split_at: 0,
-    health: Default::default(),
     };
     let membership = sample_membership(&[
         (1, NodeState::Disconnected),
@@ -364,7 +354,6 @@ fn active_replication_targets_skip_disconnected_peers() {
         peers: vec![1, 2, 3],
         primary: 1,
         last_split_at: 0,
-    health: Default::default(),
     };
     let membership = sample_membership(&[
         (1, NodeState::Active),

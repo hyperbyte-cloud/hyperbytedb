@@ -187,9 +187,22 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
         if state.sharding_enabled {
             cluster_router = cluster_router
-                .route("/internal/shard/bootstrap", post(shard_handlers::handle_shard_bootstrap))
-                .route("/internal/shard/write", post(shard_handlers::handle_shard_write))
-                .route("/internal/shard/query", post(shard_handlers::handle_shard_query))
+                .route(
+                    "/internal/shard/bootstrap",
+                    post(shard_handlers::handle_shard_bootstrap),
+                )
+                .route(
+                    "/internal/shard/write",
+                    post(shard_handlers::handle_shard_write),
+                )
+                .route(
+                    "/internal/shard/query",
+                    post(shard_handlers::handle_shard_query),
+                )
+                .route(
+                    "/internal/shard/mv-backfill",
+                    post(shard_handlers::handle_shard_mv_backfill),
+                )
                 .route(
                     "/internal/shard/heartbeat",
                     post(shard_handlers::handle_shard_heartbeat),

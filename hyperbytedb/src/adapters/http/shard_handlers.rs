@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use metrics::counter;
 
 use crate::adapters::cluster::raft::types::ClusterRequest;
@@ -11,13 +11,15 @@ use crate::application::ingest_metadata::prepare_batch_metadata;
 use crate::application::line_protocol::parse_line_body_to_points_limited;
 use crate::application::replication_dispatch::dispatch_outbound_replication;
 use crate::application::shard_peer_resolution::active_region_peer_targets;
-use crate::application::shard_routing::{bootstrap_measurement_local, build_bootstrap_op};
-use crate::application::wal_append::append_points_with_prepared;
 use crate::application::shard_query::inject_region_series_id_predicate;
+use crate::application::shard_routing::{bootstrap_measurement_local, build_bootstrap_op};
 use crate::application::shard_transfer::apply_transfer;
+use crate::application::sharded_mv_backfill::apply_mv_backfill_sql;
+use crate::application::wal_append::append_points_with_prepared;
 use crate::domain::sharding::{
     RegionHeartbeat, ShardBootstrapRequest, ShardDeleteRequest, ShardMapJson, ShardMetadataKind,
-    ShardMetadataRequest, ShardQueryRequest, ShardTransferPayload, ShardWriteRequest,
+    ShardMetadataRequest, ShardMvBackfillRequest, ShardQueryRequest, ShardTransferPayload,
+    ShardWriteRequest,
 };
 use crate::ports::replication::OutboundReplicationBatch;
 use crate::ports::sharding::ShardMapPort;
@@ -58,32 +60,26 @@ pub async fn handle_shard_bootstrap(
                         )
                             .into_response();
                     };
-                    match pc
-                        .http_client()
-                        .post(&url)
-                        .json(&req)
-                        .send()
-                        .await
-                    {
-                            Ok(resp) if resp.status().is_success() => {
-                                return (StatusCode::OK, Json(serde_json::json!({"ok": true})))
-                                    .into_response();
-                            }
-                            Ok(resp) => {
-                                return (
-                                    StatusCode::BAD_GATEWAY,
-                                    Json(serde_json::json!({"error": resp.status().to_string()})),
-                                )
-                                    .into_response();
-                            }
-                            Err(e) => {
-                                return (
-                                    StatusCode::BAD_GATEWAY,
-                                    Json(serde_json::json!({"error": e.to_string()})),
-                                )
-                                    .into_response();
-                            }
+                    match pc.http_client().post(&url).json(&req).send().await {
+                        Ok(resp) if resp.status().is_success() => {
+                            return (StatusCode::OK, Json(serde_json::json!({"ok": true})))
+                                .into_response();
                         }
+                        Ok(resp) => {
+                            return (
+                                StatusCode::BAD_GATEWAY,
+                                Json(serde_json::json!({"error": resp.status().to_string()})),
+                            )
+                                .into_response();
+                        }
+                        Err(e) => {
+                            return (
+                                StatusCode::BAD_GATEWAY,
+                                Json(serde_json::json!({"error": e.to_string()})),
+                            )
+                                .into_response();
+                        }
+                    }
                 }
             }
             return (
@@ -353,6 +349,61 @@ pub async fn handle_shard_query(
     }
 }
 
+pub async fn handle_shard_mv_backfill(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ShardMvBackfillRequest>,
+) -> impl IntoResponse {
+    if let Some(ctx) = state.shard_routing.as_ref() {
+        let map = match ctx.shard_map.snapshot().await {
+            Ok(m) => m,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+                    .into_response();
+            }
+        };
+        let region = map.spaces.values().find_map(|s| {
+            s.regions
+                .iter()
+                .find(|r| r.region_id == req.region_id)
+                .cloned()
+        });
+        let Some(region) = region else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "region not found"})),
+            )
+                .into_response();
+        };
+        if region.epoch != req.epoch {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "stale epoch"})),
+            )
+                .into_response();
+        }
+        if !region.peers.contains(&state.node_id) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "not owner"})),
+            )
+                .into_response();
+        }
+    }
+
+    match apply_mv_backfill_sql(&state.points_sink, &state.metadata, &state.query_port, &req).await
+    {
+        Ok(()) => (StatusCode::NO_CONTENT, ()).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 pub async fn handle_shard_heartbeat(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RegionHeartbeat>,
@@ -419,6 +470,7 @@ pub async fn handle_shard_transfer(
         &state.metadata,
         &state.wal,
         Some(&state.points_sink),
+        Some(state.mv_service.as_ref()),
         state.node_id,
         &req,
         state.max_points_per_request,

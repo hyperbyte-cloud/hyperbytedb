@@ -14,8 +14,8 @@ use crate::application::line_protocol::{
 use crate::application::msgpack_ingest::parse_msgpack_body_to_points_limited;
 use crate::application::replication_dispatch::dispatch_outbound_replication;
 use crate::application::shard_routing::{
-    ensure_measurement_bootstrapped, forward_shard_write_to_region, partition_points,
-    region_replication_targets, ShardRoutingContext,
+    ShardRoutingContext, ensure_measurement_bootstrapped, forward_shard_write_to_region,
+    partition_points, region_replication_targets,
 };
 use crate::application::wal_append::{
     ColumnarWalAppend, append_columnar_with_prepared, append_points_with_prepared,

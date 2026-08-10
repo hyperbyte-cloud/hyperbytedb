@@ -24,10 +24,7 @@ pub async fn build_manifest(
     } else {
         None
     };
-    let shard_map_version = shard_snapshot
-        .as_ref()
-        .map(|m| m.map_version)
-        .unwrap_or(0);
+    let shard_map_version = shard_snapshot.as_ref().map(|m| m.map_version).unwrap_or(0);
 
     let mut db_manifests = Vec::new();
     for db in &databases {
