@@ -2,6 +2,10 @@ use crate::error::HyperbytedbError;
 use crate::timeseriesql::ast::*;
 use crate::timeseriesql::ddl_parser;
 use crate::timeseriesql::lexer;
+use crate::timeseriesql::scan::{
+    find_keyword_position, find_top_level_operator, match_keyword_at, rfind_top_level_ci,
+    scan_chars, split_top_level_commas,
+};
 
 pub fn parse_query(input: &str) -> Result<Vec<Statement>, HyperbytedbError> {
     let input = input.trim();
@@ -173,266 +177,6 @@ fn parse_select(input: &str) -> Result<Statement, HyperbytedbError> {
     Ok(Statement::Select(stmt))
 }
 
-/// Per-character scan info produced by [`scan_chars`].
-#[derive(Debug, Clone, Copy)]
-struct ScannedChar {
-    /// Byte offset of the character in the original input (valid for slicing).
-    idx: usize,
-    ch: char,
-    /// Paren depth: 0 for top-level characters (the outermost parens
-    /// themselves included), > 0 strictly inside parentheses.
-    depth: i32,
-    /// True when the character is part of a single-quoted string, a
-    /// double-quoted identifier, or a regex literal (delimiters included).
-    masked: bool,
-}
-
-/// Masking scanner shared by all SELECT-parsing string primitives.
-///
-/// Walks the ORIGINAL string char by char (never an uppercased copy, whose
-/// byte offsets can diverge for chars like `ı`/`ﬁ`) and tracks:
-/// - single-quoted string literals, honoring both `\'` and `''` escapes,
-/// - double-quoted identifiers (`""` escape) as an independent state — a
-///   quote char inside the other quote kind does not toggle,
-/// - regex literals `/.../` (with `\/` escape), distinguished from division
-///   by [`slash_is_regex_start`],
-/// - parenthesis depth.
-///
-/// The output has exactly one entry per input char, in order.
-fn scan_chars(input: &str) -> Result<Vec<ScannedChar>, HyperbytedbError> {
-    let chars: Vec<(usize, char)> = input.char_indices().collect();
-    let mut out = Vec::with_capacity(chars.len());
-    let mut depth: u32 = 0;
-    let mut i = 0usize;
-    while i < chars.len() {
-        let (idx, ch) = chars[i];
-        match ch {
-            '\'' | '"' => {
-                let quote = ch;
-                out.push(ScannedChar {
-                    idx,
-                    ch,
-                    depth: depth as i32,
-                    masked: true,
-                });
-                i += 1;
-                while i < chars.len() {
-                    let (jdx, c) = chars[i];
-                    out.push(ScannedChar {
-                        idx: jdx,
-                        ch: c,
-                        depth: depth as i32,
-                        masked: true,
-                    });
-                    i += 1;
-                    if quote == '\'' && c == '\\' && i < chars.len() {
-                        // Backslash escape (`\'`, `\\`) inside a string literal.
-                        let (kdx, k) = chars[i];
-                        out.push(ScannedChar {
-                            idx: kdx,
-                            ch: k,
-                            depth: depth as i32,
-                            masked: true,
-                        });
-                        i += 1;
-                    } else if c == quote {
-                        if i < chars.len() && chars[i].1 == quote {
-                            // Doubled-quote escape: '' or "".
-                            let (kdx, k) = chars[i];
-                            out.push(ScannedChar {
-                                idx: kdx,
-                                ch: k,
-                                depth: depth as i32,
-                                masked: true,
-                            });
-                            i += 1;
-                        } else {
-                            break;
-                        }
-                    }
-                }
-            }
-            '/' if slash_is_regex_start(&chars, i) => {
-                out.push(ScannedChar {
-                    idx,
-                    ch,
-                    depth: depth as i32,
-                    masked: true,
-                });
-                i += 1;
-                while i < chars.len() {
-                    let (jdx, c) = chars[i];
-                    out.push(ScannedChar {
-                        idx: jdx,
-                        ch: c,
-                        depth: depth as i32,
-                        masked: true,
-                    });
-                    i += 1;
-                    if c == '\\' && i < chars.len() {
-                        let (kdx, k) = chars[i];
-                        out.push(ScannedChar {
-                            idx: kdx,
-                            ch: k,
-                            depth: depth as i32,
-                            masked: true,
-                        });
-                        i += 1;
-                    } else if c == '/' {
-                        break;
-                    }
-                }
-            }
-            '(' => {
-                out.push(ScannedChar {
-                    idx,
-                    ch,
-                    depth: depth as i32,
-                    masked: false,
-                });
-                depth += 1;
-                i += 1;
-            }
-            ')' => {
-                if depth == 0 {
-                    return Err(HyperbytedbError::QueryParse(format!(
-                        "unbalanced ')' in expression: {input}"
-                    )));
-                }
-                depth -= 1;
-                out.push(ScannedChar {
-                    idx,
-                    ch,
-                    depth: depth as i32,
-                    masked: false,
-                });
-                i += 1;
-            }
-            _ => {
-                out.push(ScannedChar {
-                    idx,
-                    ch,
-                    depth: depth as i32,
-                    masked: false,
-                });
-                i += 1;
-            }
-        }
-    }
-    if depth != 0 {
-        return Err(HyperbytedbError::QueryParse(format!(
-            "unclosed '(' in expression: {input}"
-        )));
-    }
-    Ok(out)
-}
-
-/// Whether a `/` at `chars[pos]` begins a regex literal rather than division.
-/// Division follows an operand (identifier, number, `)` or a quoted value);
-/// a regex follows start-of-input, an operator/comma/open paren, or a clause
-/// keyword that puts the slash in operand position (`FROM /re/`,
-/// `GROUP BY /re/`).
-fn slash_is_regex_start(chars: &[(usize, char)], pos: usize) -> bool {
-    let mut j = pos;
-    while j > 0 && chars[j - 1].1.is_whitespace() {
-        j -= 1;
-    }
-    if j == 0 {
-        return true;
-    }
-    let prev = chars[j - 1].1;
-    if matches!(prev, ')' | '"' | '\'') {
-        return false;
-    }
-    if prev.is_alphanumeric() || prev == '_' {
-        let end = j;
-        let mut start = j;
-        while start > 0 && (chars[start - 1].1.is_alphanumeric() || chars[start - 1].1 == '_') {
-            start -= 1;
-        }
-        let word: String = chars[start..end].iter().map(|&(_, c)| c).collect();
-        return ["FROM", "WHERE", "BY", "AND", "OR"]
-            .iter()
-            .any(|kw| word.eq_ignore_ascii_case(kw));
-    }
-    true
-}
-
-fn is_keyword_boundary_before(c: char) -> bool {
-    c.is_whitespace() || matches!(c, ')' | '\'' | '"')
-}
-
-fn is_keyword_boundary_after(c: char) -> bool {
-    c.is_whitespace() || matches!(c, '(' | '\'' | '"' | '/')
-}
-
-/// Match an ASCII `keyword` ("LIMIT", "GROUP BY", …) at scan index `i`,
-/// case-insensitively on the original string. Two-word keywords accept any
-/// whitespace run between the words. Only unmasked, top-level (paren depth 0)
-/// text matches, and the keyword must be delimited by whitespace, a paren, or
-/// a quote on either side (so `(a=1)AND(b=2)` works). Returns the matched
-/// byte range `(start, end)`.
-fn match_keyword_at(
-    input: &str,
-    scan: &[ScannedChar],
-    i: usize,
-    keyword: &str,
-) -> Option<(usize, usize)> {
-    let sc = scan[i];
-    if sc.masked || sc.depth != 0 {
-        return None;
-    }
-    if i > 0 && !is_keyword_boundary_before(scan[i - 1].ch) {
-        return None;
-    }
-
-    let bytes = input.as_bytes();
-    let mut words = keyword.split_ascii_whitespace();
-    let first = words.next()?;
-    let start = sc.idx;
-    if start + first.len() > bytes.len()
-        || !bytes[start..start + first.len()].eq_ignore_ascii_case(first.as_bytes())
-    {
-        return None;
-    }
-    // The matched region is ASCII, so scan indices advance one per byte.
-    let mut j = i + first.len();
-    for word in words {
-        let ws_start = j;
-        while j < scan.len() && scan[j].ch.is_whitespace() {
-            j += 1;
-        }
-        if j == ws_start || j >= scan.len() {
-            return None;
-        }
-        let word_start = scan[j].idx;
-        if word_start + word.len() > bytes.len()
-            || !bytes[word_start..word_start + word.len()].eq_ignore_ascii_case(word.as_bytes())
-        {
-            return None;
-        }
-        j += word.len();
-    }
-    if j < scan.len() && !is_keyword_boundary_after(scan[j].ch) {
-        return None;
-    }
-    let end = if j < scan.len() {
-        scan[j].idx
-    } else {
-        input.len()
-    };
-    Some((start, end))
-}
-
-/// Byte range of the first top-level occurrence of `keyword` in `input`.
-fn find_keyword_position(
-    input: &str,
-    scan: &[ScannedChar],
-    keyword: &str,
-) -> Option<(usize, usize)> {
-    (0..scan.len()).find_map(|i| match_keyword_at(input, scan, i, keyword))
-}
-
 /// Split a SELECT body into clause segments using case-insensitive keyword
 /// matching on the original string. Keywords inside strings, quoted
 /// identifiers, regex literals, or parentheses (subqueries) are ignored.
@@ -515,20 +259,6 @@ fn parse_field_list(input: &str) -> Result<Vec<Field>, HyperbytedbError> {
     }
 
     Ok(fields)
-}
-
-fn split_top_level_commas(input: &str) -> Result<Vec<&str>, HyperbytedbError> {
-    let scan = scan_chars(input)?;
-    let mut parts = Vec::new();
-    let mut last = 0;
-    for sc in &scan {
-        if sc.ch == ',' && !sc.masked && sc.depth == 0 {
-            parts.push(&input[last..sc.idx]);
-            last = sc.idx + 1;
-        }
-    }
-    parts.push(&input[last..]);
-    Ok(parts)
 }
 
 fn parse_field_expr(input: &str) -> Result<Field, HyperbytedbError> {
@@ -690,38 +420,6 @@ fn try_parse_arithmetic_expr(input: &str) -> Result<Option<Expr>, HyperbytedbErr
         }
     }
     Ok(None)
-}
-
-/// Find the first top-level (unmasked, paren depth 0) occurrence of a
-/// symbolic operator, refusing matches that are part of a longer operator
-/// (`=` inside `>=`/`!=`/`=~`, `<` inside `<=`/`<>`, `>` inside `>=`/`<>`).
-fn find_top_level_operator(input: &str, scan: &[ScannedChar], op: &str) -> Option<usize> {
-    let bytes = input.as_bytes();
-    let op_bytes = op.as_bytes();
-    for sc in scan {
-        if sc.masked || sc.depth != 0 {
-            continue;
-        }
-        let i = sc.idx;
-        if i + op_bytes.len() > bytes.len() || &bytes[i..i + op_bytes.len()] != op_bytes {
-            continue;
-        }
-        let prev = i.checked_sub(1).map(|p| bytes[p]);
-        let next = bytes.get(i + op_bytes.len()).copied();
-        let standalone = match op {
-            "=" => {
-                !matches!(prev, Some(b'!' | b'<' | b'>' | b'='))
-                    && !matches!(next, Some(b'~' | b'='))
-            }
-            "<" => !matches!(next, Some(b'=' | b'>')),
-            ">" => !matches!(prev, Some(b'<')) && !matches!(next, Some(b'=')),
-            _ => true,
-        };
-        if standalone {
-            return Some(i);
-        }
-    }
-    None
 }
 
 fn parse_atom(input: &str) -> Result<Expr, HyperbytedbError> {
@@ -983,32 +681,6 @@ fn unquote(s: &str) -> String {
     } else {
         s.to_string()
     }
-}
-
-/// Byte offset of the last unmasked, top-level, ASCII-case-insensitive
-/// occurrence of `needle` that does not continue an identifier.
-fn rfind_top_level_ci(input: &str, scan: &[ScannedChar], needle: &str) -> Option<usize> {
-    let bytes = input.as_bytes();
-    let needle_bytes = needle.as_bytes();
-    for (k, sc) in scan.iter().enumerate().rev() {
-        if sc.masked || sc.depth != 0 {
-            continue;
-        }
-        let i = sc.idx;
-        if i + needle_bytes.len() > bytes.len()
-            || !bytes[i..i + needle_bytes.len()].eq_ignore_ascii_case(needle_bytes)
-        {
-            continue;
-        }
-        if k > 0 {
-            let prev = scan[k - 1].ch;
-            if prev.is_alphanumeric() || prev == '_' || prev == '"' {
-                continue;
-            }
-        }
-        return Some(i);
-    }
-    None
 }
 
 fn parse_group_by_clause(input: &str) -> Result<(GroupBy, Option<FillOption>), HyperbytedbError> {
@@ -1850,9 +1522,6 @@ mod tests {
             other => panic!("expected BinaryExpr, got {:?}", other),
         }
 
-        // Goes through parse_select directly: lexer::split_statements (out of
-        // scope for the parser fix) still has a byte-boundary panic on this
-        // input (`rest[..kw.len()]` at lexer.rs:138).
         let s = match parse_select(r#"SELECT "ﬁx" FROM cpu"#).unwrap() {
             Statement::Select(s) => s,
             other => panic!("expected SELECT, got {:?}", other),
@@ -1862,6 +1531,36 @@ mod tests {
             other => panic!("expected identifier, got {:?}", other),
         }
         assert_eq!(s.from[0].name_str(), Some("cpu"));
+    }
+
+    #[test]
+    fn test_parse_query_multibyte_quoted_identifier() {
+        let stmts = parse_query(r#"SELECT "ﬁx" FROM cpu"#).unwrap();
+        match &stmts[0] {
+            Statement::Select(s) => {
+                match &s.fields[0].expr {
+                    Expr::Identifier(name) => assert_eq!(name, "ﬁx"),
+                    other => panic!("expected identifier, got {:?}", other),
+                }
+                assert_eq!(s.from[0].name_str(), Some("cpu"));
+            }
+            other => panic!("expected SELECT, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_slimit_soffset() {
+        let s = select_stmt("SELECT * FROM cpu SLIMIT 10 SOFFSET 5");
+        assert_eq!(s.slimit, Some(10));
+        assert_eq!(s.soffset, Some(5));
+    }
+
+    #[test]
+    fn test_parse_limit_and_slimit_together() {
+        let s = select_stmt("SELECT * FROM cpu LIMIT 100 SLIMIT 10");
+        assert_eq!(s.limit, Some(100));
+        assert_eq!(s.slimit, Some(10));
+        assert!(s.soffset.is_none());
     }
 
     #[test]

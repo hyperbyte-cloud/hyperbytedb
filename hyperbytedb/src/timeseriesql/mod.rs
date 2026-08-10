@@ -3,6 +3,7 @@ pub mod ddl_parser;
 pub mod digest;
 pub mod lexer;
 pub mod parser;
+pub(crate) mod scan;
 pub mod to_clickhouse;
 
 use crate::error::HyperbytedbError;
