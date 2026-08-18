@@ -41,6 +41,8 @@ pub struct ShardedTestNode {
     pub addr: String,
     pub node_id: u64,
     pub wal: Arc<RocksDbWal>,
+    pub metadata: Arc<RocksDbMetadata>,
+    pub points_sink: Arc<dyn PointsSinkPort>,
     pub shard_map: Arc<RocksDbShardMap>,
     pub location_cache: Arc<ShardLocationCache>,
     pub membership: SharedMembership,
@@ -148,6 +150,7 @@ pub async fn start_sharded_node(
         config: opts.sharding.clone(),
         node_id,
         peer_client: peer_client.clone(),
+        region_write_stats: Arc::new(hyperbytedb::application::runtime::RegionWriteStats::new()),
     });
 
     let replication_apply = Some(ReplicationApplyQueue::with_sink_and_sharding(
@@ -274,6 +277,8 @@ pub async fn start_sharded_node(
         addr,
         node_id,
         wal,
+        metadata,
+        points_sink: sink,
         shard_map,
         location_cache,
         membership: shared_membership,

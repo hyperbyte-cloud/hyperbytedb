@@ -45,6 +45,7 @@ async fn bootstrap_two_regions(nodes: &[ShardedTestNode], db: &str, rp: &str, me
         key: MeasurementKey::new(db, rp, measurement),
         region_id: 1,
         split_key: mid,
+        epoch: ShardEpoch::default(),
         left: region_a,
         right: region_b,
     };
@@ -416,6 +417,9 @@ async fn sharded_mv_transfer_purge_dest_partials() {
         phase: TransferPhase::Ack,
         body: None,
         source_node_id: nodes[0].node_id,
+        transfer_id: 1,
+        seq: 0,
+        done: true,
     };
     let resp = post_shard_transfer(&client, &nodes[0].url, &ack).await;
     assert!(

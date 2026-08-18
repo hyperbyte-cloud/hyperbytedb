@@ -172,34 +172,30 @@ impl PeerQueryService {
         caller: Option<&crate::domain::user::StoredUser>,
         statement_id: u32,
         stmt: &Statement,
-    ) -> StatementResult {
+    ) -> Result<StatementResult, HyperbytedbError> {
         if let Some(user) = caller
             && let Err(e) = check_authorization(user, db, stmt)
         {
-            return StatementResult {
+            return Ok(StatementResult {
                 statement_id,
                 series: None,
                 error: Some(e.to_string()),
-            };
+            });
         }
         match mutation_request_from_statement(stmt, db, &self.metadata).await {
-            Ok(req) => match self.replicate_mutation(req).await {
-                Ok(()) => StatementResult {
+            Ok(req) => {
+                self.replicate_mutation(req).await?;
+                Ok(StatementResult {
                     statement_id,
                     series: Some(vec![]),
                     error: None,
-                },
-                Err(e) => StatementResult {
-                    statement_id,
-                    series: None,
-                    error: Some(e.to_string()),
-                },
-            },
-            Err(e) => StatementResult {
+                })
+            }
+            Err(e) => Ok(StatementResult {
                 statement_id,
                 series: None,
                 error: Some(e.to_string()),
-            },
+            }),
         }
     }
 }
@@ -605,13 +601,13 @@ impl QueryService for PeerQueryService {
             if use_raft && is_cluster_mutation(&stmt) {
                 results.push(
                     self.execute_raft_mutation(db, caller, statement_id, &stmt)
-                        .await,
+                        .await?,
                 );
                 continue;
             }
             let result = match stmt {
                 Statement::CreateDatabase(ref stmt) => {
-                    let mut result = self
+                    let result = self
                         .execute_inner_statement(
                             db,
                             stmt_query,
@@ -621,20 +617,17 @@ impl QueryService for PeerQueryService {
                             statement_id,
                         )
                         .await;
-                    if result.error.is_none()
-                        && let Err(e) = self
-                            .replicate_mutation(MutationRequest::CreateDatabase {
-                                name: stmt.name.clone(),
-                                rp: retention_policy_from_create(stmt),
-                            })
-                            .await
-                    {
-                        result.error = Some(e.to_string());
+                    if result.error.is_none() {
+                        self.replicate_mutation(MutationRequest::CreateDatabase {
+                            name: stmt.name.clone(),
+                            rp: retention_policy_from_create(stmt),
+                        })
+                        .await?;
                     }
                     result
                 }
                 Statement::DropDatabase(ref name) => {
-                    let mut result = self
+                    let result = self
                         .execute_inner_statement(
                             db,
                             stmt_query,
@@ -644,17 +637,14 @@ impl QueryService for PeerQueryService {
                             statement_id,
                         )
                         .await;
-                    if result.error.is_none()
-                        && let Err(e) = self
-                            .replicate_mutation(MutationRequest::DropDatabase(name.clone()))
-                            .await
-                    {
-                        result.error = Some(e.to_string());
+                    if result.error.is_none() {
+                        self.replicate_mutation(MutationRequest::DropDatabase(name.clone()))
+                            .await?;
                     }
                     result
                 }
                 Statement::Delete(ref del) => {
-                    let mut result = self
+                    let result = self
                         .execute_inner_statement(
                             db,
                             stmt_query,
@@ -676,17 +666,13 @@ impl QueryService for PeerQueryService {
                         } else {
                             String::new()
                         };
-                        if let Err(e) = self
-                            .replicate_mutation(MutationRequest::Delete {
-                                database: db.to_string(),
-                                rp: del_rp,
-                                measurement: del.from.clone(),
-                                predicate_sql,
-                            })
-                            .await
-                        {
-                            result.error = Some(e.to_string());
-                        }
+                        self.replicate_mutation(MutationRequest::Delete {
+                            database: db.to_string(),
+                            rp: del_rp,
+                            measurement: del.from.clone(),
+                            predicate_sql,
+                        })
+                        .await?;
                     }
                     result
                 }
@@ -710,16 +696,12 @@ impl QueryService for PeerQueryService {
                                 continue;
                             }
                         };
-                        if let Err(e) = self
-                            .replicate_mutation(MutationRequest::CreateContinuousQuery {
-                                database: cq.database.clone(),
-                                name: cq.name.clone(),
-                                definition: def,
-                            })
-                            .await
-                        {
-                            result.error = Some(e.to_string());
-                        }
+                        self.replicate_mutation(MutationRequest::CreateContinuousQuery {
+                            database: cq.database.clone(),
+                            name: cq.name.clone(),
+                            definition: def,
+                        })
+                        .await?;
                     }
                     result
                 }
@@ -727,7 +709,7 @@ impl QueryService for PeerQueryService {
                     ref name,
                     db: ref cq_db,
                 } => {
-                    let mut result = self
+                    let result = self
                         .execute_inner_statement(
                             db,
                             stmt_query,
@@ -739,15 +721,11 @@ impl QueryService for PeerQueryService {
                         .await;
                     if result.error.is_none() {
                         let target_db = if cq_db.is_empty() { db } else { cq_db };
-                        if let Err(e) = self
-                            .replicate_mutation(MutationRequest::DropContinuousQuery {
-                                database: target_db.to_string(),
-                                name: name.clone(),
-                            })
-                            .await
-                        {
-                            result.error = Some(e.to_string());
-                        }
+                        self.replicate_mutation(MutationRequest::DropContinuousQuery {
+                            database: target_db.to_string(),
+                            name: name.clone(),
+                        })
+                        .await?;
                     }
                     result
                 }
@@ -779,16 +757,13 @@ impl QueryService for PeerQueryService {
                                 continue;
                             }
                         };
-                        if let Ok(def) = def_from_statement(mv, &source_rp, &dest_rp)
-                            && let Err(e) = self
-                                .replicate_mutation(MutationRequest::CreateMaterializedView {
-                                    database: mv.database.clone(),
-                                    name: mv.name.clone(),
-                                    definition: def,
-                                })
-                                .await
-                        {
-                            result.error = Some(e.to_string());
+                        if let Ok(def) = def_from_statement(mv, &source_rp, &dest_rp) {
+                            self.replicate_mutation(MutationRequest::CreateMaterializedView {
+                                database: mv.database.clone(),
+                                name: mv.name.clone(),
+                                definition: def,
+                            })
+                            .await?;
                         }
                     }
                     result
@@ -797,7 +772,7 @@ impl QueryService for PeerQueryService {
                     ref name,
                     db: ref mv_db,
                 } => {
-                    let mut result = self
+                    let result = self
                         .execute_inner_statement(
                             db,
                             stmt_query,
@@ -809,15 +784,11 @@ impl QueryService for PeerQueryService {
                         .await;
                     if result.error.is_none() {
                         let target_db = if mv_db.is_empty() { db } else { mv_db };
-                        if let Err(e) = self
-                            .replicate_mutation(MutationRequest::DropMaterializedView {
-                                database: target_db.to_string(),
-                                name: name.clone(),
-                            })
-                            .await
-                        {
-                            result.error = Some(e.to_string());
-                        }
+                        self.replicate_mutation(MutationRequest::DropMaterializedView {
+                            database: target_db.to_string(),
+                            name: name.clone(),
+                        })
+                        .await?;
                     }
                     result
                 }
@@ -829,7 +800,7 @@ impl QueryService for PeerQueryService {
                     ref shard_duration,
                     is_default,
                 } => {
-                    let mut result = self
+                    let result = self
                         .execute_inner_statement(
                             db,
                             stmt_query,
@@ -856,20 +827,16 @@ impl QueryService for PeerQueryService {
                             replication_factor: replication,
                             is_default,
                         };
-                        if let Err(e) = self
-                            .replicate_mutation(MutationRequest::CreateRetentionPolicy {
-                                db: db.clone(),
-                                rp,
-                            })
-                            .await
-                        {
-                            result.error = Some(e.to_string());
-                        }
+                        self.replicate_mutation(MutationRequest::CreateRetentionPolicy {
+                            db: db.clone(),
+                            rp,
+                        })
+                        .await?;
                     }
                     result
                 }
                 Statement::DropRetentionPolicyStmt { ref name, ref db } => {
-                    let mut result = self
+                    let result = self
                         .execute_inner_statement(
                             db,
                             stmt_query,
@@ -879,15 +846,12 @@ impl QueryService for PeerQueryService {
                             statement_id,
                         )
                         .await;
-                    if result.error.is_none()
-                        && let Err(e) = self
-                            .replicate_mutation(MutationRequest::DropRetentionPolicy {
-                                db: db.clone(),
-                                name: name.clone(),
-                            })
-                            .await
-                    {
-                        result.error = Some(e.to_string());
+                    if result.error.is_none() {
+                        self.replicate_mutation(MutationRequest::DropRetentionPolicy {
+                            db: db.clone(),
+                            name: name.clone(),
+                        })
+                        .await?;
                     }
                     result
                 }
@@ -909,16 +873,12 @@ impl QueryService for PeerQueryService {
                     if result.error.is_none() {
                         match hash_password_for_replication(password) {
                             Ok(password_hash) => {
-                                if let Err(e) = self
-                                    .replicate_mutation(MutationRequest::CreateUser {
-                                        username: username.clone(),
-                                        password_hash,
-                                        admin,
-                                    })
-                                    .await
-                                {
-                                    result.error = Some(e.to_string());
-                                }
+                                self.replicate_mutation(MutationRequest::CreateUser {
+                                    username: username.clone(),
+                                    password_hash,
+                                    admin,
+                                })
+                                .await?;
                             }
                             Err(e) => result.error = Some(e.to_string()),
                         }
@@ -926,7 +886,7 @@ impl QueryService for PeerQueryService {
                     result
                 }
                 Statement::DropUser(ref username) => {
-                    let mut result = self
+                    let result = self
                         .execute_inner_statement(
                             db,
                             stmt_query,
@@ -936,12 +896,9 @@ impl QueryService for PeerQueryService {
                             statement_id,
                         )
                         .await;
-                    if result.error.is_none()
-                        && let Err(e) = self
-                            .replicate_mutation(MutationRequest::DropUser(username.clone()))
-                            .await
-                    {
-                        result.error = Some(e.to_string());
+                    if result.error.is_none() {
+                        self.replicate_mutation(MutationRequest::DropUser(username.clone()))
+                            .await?;
                     }
                     result
                 }
@@ -962,15 +919,11 @@ impl QueryService for PeerQueryService {
                     if result.error.is_none() {
                         match hash_password_for_replication(password) {
                             Ok(password_hash) => {
-                                if let Err(e) = self
-                                    .replicate_mutation(MutationRequest::SetPassword {
-                                        username: username.clone(),
-                                        password_hash,
-                                    })
-                                    .await
-                                {
-                                    result.error = Some(e.to_string());
-                                }
+                                self.replicate_mutation(MutationRequest::SetPassword {
+                                    username: username.clone(),
+                                    password_hash,
+                                })
+                                .await?;
                             }
                             Err(e) => result.error = Some(e.to_string()),
                         }
@@ -985,7 +938,7 @@ impl QueryService for PeerQueryService {
                     ref shard_duration,
                     is_default,
                 } => {
-                    let mut result = self
+                    let result = self
                         .execute_inner_statement(
                             db,
                             stmt_query,
@@ -1008,21 +961,17 @@ impl QueryService for PeerQueryService {
                             shard_duration: shard_duration.clone(),
                             is_default,
                         };
-                        if let Err(e) = self
-                            .replicate_mutation(MutationRequest::AlterRetentionPolicy {
-                                db: db.clone(),
-                                name: name.clone(),
-                                change,
-                            })
-                            .await
-                        {
-                            result.error = Some(e.to_string());
-                        }
+                        self.replicate_mutation(MutationRequest::AlterRetentionPolicy {
+                            db: db.clone(),
+                            name: name.clone(),
+                            change,
+                        })
+                        .await?;
                     }
                     result
                 }
                 Statement::DropSeries(ref s) => {
-                    let mut result = self
+                    let result = self
                         .execute_inner_statement(
                             db,
                             stmt_query,
@@ -1050,17 +999,13 @@ impl QueryService for PeerQueryService {
                         } else {
                             String::new()
                         };
-                        if let Err(e) = self
-                            .replicate_mutation(MutationRequest::DropSeries {
-                                database: target_db.to_string(),
-                                rp: ds_rp,
-                                measurement,
-                                predicate_sql,
-                            })
-                            .await
-                        {
-                            result.error = Some(e.to_string());
-                        }
+                        self.replicate_mutation(MutationRequest::DropSeries {
+                            database: target_db.to_string(),
+                            rp: ds_rp,
+                            measurement,
+                            predicate_sql,
+                        })
+                        .await?;
                     }
                     result
                 }
@@ -1068,7 +1013,7 @@ impl QueryService for PeerQueryService {
                     ref name,
                     rp: ref stmt_rp,
                 } => {
-                    let mut result = self
+                    let result = self
                         .execute_inner_statement(
                             db,
                             stmt_query,
@@ -1084,16 +1029,12 @@ impl QueryService for PeerQueryService {
                         } else {
                             self.metadata.get_default_rp(db).await?
                         };
-                        if let Err(e) = self
-                            .replicate_mutation(MutationRequest::DropMeasurement {
-                                database: db.to_string(),
-                                rp: dm_rp,
-                                name: name.clone(),
-                            })
-                            .await
-                        {
-                            result.error = Some(e.to_string());
-                        }
+                        self.replicate_mutation(MutationRequest::DropMeasurement {
+                            database: db.to_string(),
+                            rp: dm_rp,
+                            name: name.clone(),
+                        })
+                        .await?;
                     }
                     result
                 }
@@ -1101,7 +1042,7 @@ impl QueryService for PeerQueryService {
                     ref username,
                     ref database,
                 } => {
-                    let mut result = self
+                    let result = self
                         .execute_inner_statement(
                             db,
                             stmt_query,
@@ -1111,15 +1052,12 @@ impl QueryService for PeerQueryService {
                             statement_id,
                         )
                         .await;
-                    if result.error.is_none()
-                        && let Err(e) = self
-                            .replicate_mutation(MutationRequest::Grant {
-                                username: username.clone(),
-                                database: database.clone(),
-                            })
-                            .await
-                    {
-                        result.error = Some(e.to_string());
+                    if result.error.is_none() {
+                        self.replicate_mutation(MutationRequest::Grant {
+                            username: username.clone(),
+                            database: database.clone(),
+                        })
+                        .await?;
                     }
                     result
                 }
@@ -1127,7 +1065,7 @@ impl QueryService for PeerQueryService {
                     ref username,
                     ref database,
                 } => {
-                    let mut result = self
+                    let result = self
                         .execute_inner_statement(
                             db,
                             stmt_query,
@@ -1137,15 +1075,12 @@ impl QueryService for PeerQueryService {
                             statement_id,
                         )
                         .await;
-                    if result.error.is_none()
-                        && let Err(e) = self
-                            .replicate_mutation(MutationRequest::Revoke {
-                                username: username.clone(),
-                                database: database.clone(),
-                            })
-                            .await
-                    {
-                        result.error = Some(e.to_string());
+                    if result.error.is_none() {
+                        self.replicate_mutation(MutationRequest::Revoke {
+                            username: username.clone(),
+                            database: database.clone(),
+                        })
+                        .await?;
                     }
                     result
                 }

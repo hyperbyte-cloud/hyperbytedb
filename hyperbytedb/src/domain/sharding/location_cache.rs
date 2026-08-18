@@ -4,10 +4,18 @@ use std::sync::RwLock;
 use super::types::{MeasurementKey, ShardEpoch, ShardMap, ShardRegion};
 
 #[derive(Debug, Clone)]
-struct CachedRegion {
-    region: ShardRegion,
-    #[allow(dead_code)] // reserved for future stale-entry eviction
+struct CachedMeasurement {
     map_version: u64,
+    regions: Vec<ShardRegion>,
+}
+
+fn locate_in_regions(regions: &[ShardRegion], series_id: u64) -> Option<&ShardRegion> {
+    if regions.is_empty() {
+        return None;
+    }
+    let idx = regions.partition_point(|r| r.start <= series_id);
+    let region = regions.get(idx.checked_sub(1)?)?;
+    region.contains(series_id).then_some(region)
 }
 
 /// In-memory cache for shard routing (TiDB RegionCache analogue).
@@ -19,8 +27,8 @@ pub struct ShardLocationCache {
 #[derive(Debug, Default)]
 struct CacheInner {
     map_version: u64,
-    /// `(db, rp, measurement, series_id)` → region snapshot
-    by_series: HashMap<(String, String, String, u64), CachedRegion>,
+    /// `(db, rp, measurement)` → sorted region ranges
+    by_measurement: HashMap<(String, String, String), CachedMeasurement>,
 }
 
 impl ShardLocationCache {
@@ -36,24 +44,52 @@ impl ShardLocationCache {
         self.inner.write().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn measurement_key(db: &str, rp: &str, measurement: &str) -> (String, String, String) {
+        (db.to_string(), rp.to_string(), measurement.to_string())
+    }
+
     pub fn refresh_from_map(&self, map: &ShardMap) {
         let mut inner = self.write_inner();
-        if map.map_version >= inner.map_version {
-            inner.map_version = map.map_version;
-            inner.by_series.clear();
+        inner.map_version = inner.map_version.max(map.map_version);
+        for space in map.spaces.values() {
+            let key = Self::measurement_key(&space.key.db, &space.key.rp, &space.key.measurement);
+            inner.by_measurement.insert(
+                key,
+                CachedMeasurement {
+                    map_version: map.map_version,
+                    regions: space.regions.clone(),
+                },
+            );
+        }
+    }
+
+    pub fn refresh_measurement(&self, map: &ShardMap, key: &MeasurementKey) {
+        let mut inner = self.write_inner();
+        inner.map_version = inner.map_version.max(map.map_version);
+        let cache_key = Self::measurement_key(&key.db, &key.rp, &key.measurement);
+        if let Some(space) = map.space(&key.db, &key.rp, &key.measurement) {
+            inner.by_measurement.insert(
+                cache_key,
+                CachedMeasurement {
+                    map_version: map.map_version,
+                    regions: space.regions.clone(),
+                },
+            );
+        } else {
+            inner.by_measurement.remove(&cache_key);
         }
     }
 
     pub fn invalidate_all(&self) {
         let mut inner = self.write_inner();
-        inner.by_series.clear();
+        inner.by_measurement.clear();
     }
 
     pub fn invalidate_measurement(&self, key: &MeasurementKey) {
         let mut inner = self.write_inner();
-        inner.by_series.retain(|(db, rp, meas, _), _| {
-            !(db == &key.db && rp == &key.rp && meas == &key.measurement)
-        });
+        inner
+            .by_measurement
+            .remove(&Self::measurement_key(&key.db, &key.rp, &key.measurement));
     }
 
     pub fn locate(
@@ -64,56 +100,50 @@ impl ShardLocationCache {
         measurement: &str,
         series_id: u64,
     ) -> Option<ShardRegion> {
+        let cache_key = Self::measurement_key(db, rp, measurement);
         {
             let inner = self.read_inner();
-            if inner.map_version == map.map_version
-                && let Some(cached) = inner.by_series.get(&(
-                    db.to_string(),
-                    rp.to_string(),
-                    measurement.to_string(),
-                    series_id,
-                ))
+            if let Some(cached) = inner.by_measurement.get(&cache_key)
+                && cached.map_version == map.map_version
+                && let Some(region) = locate_in_regions(&cached.regions, series_id)
             {
-                return Some(cached.region.clone());
+                return Some(region.clone());
             }
         }
 
         let region = map.locate(db, rp, measurement, series_id)?.clone();
         let mut inner = self.write_inner();
-        inner.map_version = map.map_version;
-        inner.by_series.insert(
-            (
-                db.to_string(),
-                rp.to_string(),
-                measurement.to_string(),
-                series_id,
-            ),
-            CachedRegion {
-                region: region.clone(),
-                map_version: map.map_version,
-            },
-        );
+        if let Some(space) = map.space(db, rp, measurement) {
+            inner.map_version = inner.map_version.max(map.map_version);
+            inner.by_measurement.insert(
+                cache_key,
+                CachedMeasurement {
+                    map_version: map.map_version,
+                    regions: space.regions.clone(),
+                },
+            );
+        }
         Some(region)
     }
 
     pub fn check_epoch(
         &self,
+        map: &ShardMap,
         db: &str,
         rp: &str,
         measurement: &str,
         series_id: u64,
         epoch: ShardEpoch,
     ) -> bool {
+        let cache_key = Self::measurement_key(db, rp, measurement);
         let inner = self.read_inner();
-        inner
-            .by_series
-            .get(&(
-                db.to_string(),
-                rp.to_string(),
-                measurement.to_string(),
-                series_id,
-            ))
-            .is_some_and(|c| c.region.epoch == epoch)
+        if let Some(cached) = inner.by_measurement.get(&cache_key)
+            && cached.map_version == map.map_version
+        {
+            return locate_in_regions(&cached.regions, series_id).is_some_and(|r| r.epoch == epoch);
+        }
+        map.locate(db, rp, measurement, series_id)
+            .is_some_and(|r| r.epoch == epoch)
     }
 }
 
@@ -174,6 +204,7 @@ mod tests {
                 key: key.clone(),
                 region_id: 1,
                 split_key,
+                epoch: ShardEpoch::default(),
                 left: sample_region(1, 0, split_key),
                 right: sample_region(2, split_key, u64::MAX),
             },
@@ -193,6 +224,64 @@ mod tests {
         assert_eq!(
             cache
                 .locate(&map, "db", "rp", "cpu", u64::MAX - 1)
+                .unwrap()
+                .region_id,
+            2
+        );
+    }
+
+    #[test]
+    fn refresh_measurement_invalidates_only_one_measurement() {
+        let mut map_a = ShardMap::default();
+        let key_a = MeasurementKey::new("db", "rp", "cpu");
+        apply_shard_map_op(
+            &mut map_a,
+            ShardMapOp::BootstrapMeasurement {
+                key: key_a.clone(),
+                region: sample_region(1, 0, u64::MAX),
+            },
+        )
+        .unwrap();
+
+        let mut map_b = map_a.clone();
+        let key_b = MeasurementKey::new("db", "rp", "mem");
+        apply_shard_map_op(
+            &mut map_b,
+            ShardMapOp::BootstrapMeasurement {
+                key: key_b.clone(),
+                region: sample_region(2, 0, u64::MAX),
+            },
+        )
+        .unwrap();
+
+        let cache = ShardLocationCache::new();
+        cache.refresh_from_map(&map_b);
+
+        let split_key = 1u64 << 62;
+        apply_shard_map_op(
+            &mut map_b,
+            ShardMapOp::Split {
+                key: key_a.clone(),
+                region_id: 1,
+                split_key,
+                epoch: ShardEpoch::default(),
+                left: sample_region(1, 0, split_key),
+                right: sample_region(3, split_key, u64::MAX),
+            },
+        )
+        .unwrap();
+        cache.refresh_measurement(&map_b, &key_a);
+
+        assert_eq!(
+            cache
+                .locate(&map_b, "db", "rp", "cpu", split_key)
+                .unwrap()
+                .region_id,
+            3
+        );
+        assert_eq!(
+            cache
+                .locate(&map_b, "db", "rp", "mem", 99)
                 .unwrap()
                 .region_id,
             2

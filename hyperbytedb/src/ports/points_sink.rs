@@ -92,4 +92,17 @@ pub trait PointsSinkPort: Send + Sync {
     async fn refresh_schema_cache(&self) -> Result<(), HyperbytedbError> {
         Ok(())
     }
+
+    /// Delete flushed fact and series rows whose `series_id` lies in `[start, end)`.
+    async fn delete_series_id_range(
+        &self,
+        db: &str,
+        rp: &str,
+        measurement: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<(), HyperbytedbError> {
+        let _ = (db, rp, measurement, start, end);
+        Ok(())
+    }
 }

@@ -82,7 +82,7 @@ fn flag_off_shard_map_is_empty() {
     let dir = tempfile::tempdir().unwrap();
     let map = RocksDbShardMap::open(dir.path(), false, 1).unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let snapshot: ShardMap = rt.block_on(map.snapshot()).unwrap();
+    let snapshot = rt.block_on(map.snapshot()).unwrap();
     assert!(snapshot.spaces.is_empty());
 }
 
@@ -127,6 +127,7 @@ fn split_op_divides_region_range() {
             key,
             region_id: 1,
             split_key,
+            epoch: ShardEpoch::default(),
             left,
             right,
         },
@@ -184,6 +185,7 @@ fn merge_op_consolidates_adjacent_regions() {
             key: key.clone(),
             region_id: 1,
             split_key,
+            epoch: ShardEpoch::default(),
             left: left.clone(),
             right: right.clone(),
         },
@@ -204,6 +206,7 @@ fn merge_op_consolidates_adjacent_regions() {
             key,
             left_region_id: 1,
             right_region_id: 2,
+            epoch: left.epoch,
             merged,
         },
     )

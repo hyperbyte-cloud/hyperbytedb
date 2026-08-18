@@ -26,6 +26,44 @@ pub async fn apply_schema_mutation(
     deps: SchemaMutationDeps<'_>,
     mutation: MutationRequest,
 ) -> Result<(), HyperbytedbError> {
+    let op = schema_mutation_op_label(&mutation);
+    let result = apply_schema_mutation_inner(deps, mutation).await;
+    if result.is_ok() {
+        metrics::counter!(
+            "hyperbytedb_schema_mutations_applied_total",
+            "op" => op,
+        )
+        .increment(1);
+    }
+    result
+}
+
+fn schema_mutation_op_label(mutation: &MutationRequest) -> &'static str {
+    match mutation {
+        MutationRequest::CreateDatabase { .. } => "create_database",
+        MutationRequest::DropDatabase(_) => "drop_database",
+        MutationRequest::CreateRetentionPolicy { .. } => "create_retention_policy",
+        MutationRequest::DropRetentionPolicy { .. } => "drop_retention_policy",
+        MutationRequest::CreateUser { .. } => "create_user",
+        MutationRequest::DropUser(_) => "drop_user",
+        MutationRequest::SetPassword { .. } => "set_password",
+        MutationRequest::Delete { .. } => "delete",
+        MutationRequest::CreateContinuousQuery { .. } => "create_continuous_query",
+        MutationRequest::DropContinuousQuery { .. } => "drop_continuous_query",
+        MutationRequest::CreateMaterializedView { .. } => "create_materialized_view",
+        MutationRequest::DropMaterializedView { .. } => "drop_materialized_view",
+        MutationRequest::AlterRetentionPolicy { .. } => "alter_retention_policy",
+        MutationRequest::DropSeries { .. } => "drop_series",
+        MutationRequest::DropMeasurement { .. } => "drop_measurement",
+        MutationRequest::Grant { .. } => "grant",
+        MutationRequest::Revoke { .. } => "revoke",
+    }
+}
+
+async fn apply_schema_mutation_inner(
+    deps: SchemaMutationDeps<'_>,
+    mutation: MutationRequest,
+) -> Result<(), HyperbytedbError> {
     let SchemaMutationDeps {
         metadata,
         mv_service,

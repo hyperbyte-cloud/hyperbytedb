@@ -12,6 +12,8 @@ pub enum ShardMapOp {
         key: MeasurementKey,
         region_id: u64,
         split_key: u64,
+        #[serde(default)]
+        epoch: ShardEpoch,
         left: ShardRegion,
         right: ShardRegion,
     },
@@ -19,6 +21,8 @@ pub enum ShardMapOp {
         key: MeasurementKey,
         left_region_id: u64,
         right_region_id: u64,
+        #[serde(default)]
+        epoch: ShardEpoch,
         merged: ShardRegion,
     },
     MovePeer {
@@ -26,12 +30,14 @@ pub enum ShardMapOp {
         region_id: u64,
         from_peer: u64,
         to_peer: u64,
+        #[serde(default)]
         epoch: ShardEpoch,
     },
     TransferPrimary {
         key: MeasurementKey,
         region_id: u64,
         new_primary: u64,
+        #[serde(default)]
         epoch: ShardEpoch,
     },
 }
@@ -48,6 +54,10 @@ impl ShardMapOp {
     }
 }
 
+fn sort_space_regions(space: &mut super::types::MeasurementShardSpace) {
+    space.regions.sort_by_key(|r| r.start);
+}
+
 /// Apply `op` to an in-memory map snapshot (used by Raft apply and unit tests).
 pub fn apply_shard_map_op(map: &mut super::types::ShardMap, op: ShardMapOp) -> Result<(), String> {
     map.map_version = map.map_version.saturating_add(1);
@@ -59,10 +69,12 @@ pub fn apply_shard_map_op(map: &mut super::types::ShardMap, op: ShardMapOp) -> R
                     key.db, key.rp, key.measurement
                 ));
             }
-            let space = super::types::MeasurementShardSpace {
+            map.next_region_id = map.next_region_id.max(region.region_id.saturating_add(1));
+            let mut space = super::types::MeasurementShardSpace {
                 key: key.clone(),
                 regions: vec![region],
             };
+            sort_space_regions(&mut space);
             space.validate()?;
             map.spaces.insert(key, space);
         }
@@ -70,6 +82,7 @@ pub fn apply_shard_map_op(map: &mut super::types::ShardMap, op: ShardMapOp) -> R
             key,
             region_id,
             split_key,
+            epoch,
             left,
             right,
         } => {
@@ -83,6 +96,9 @@ pub fn apply_shard_map_op(map: &mut super::types::ShardMap, op: ShardMapOp) -> R
                 .position(|r| r.region_id == region_id)
                 .ok_or_else(|| format!("unknown region_id {region_id}"))?;
             let old = &space.regions[idx];
+            if old.epoch != epoch {
+                return Err("stale epoch on Split".into());
+            }
             if split_key <= old.start || split_key >= old.end {
                 return Err(format!(
                     "split_key {split_key} not inside region [{}, {})",
@@ -92,14 +108,17 @@ pub fn apply_shard_map_op(map: &mut super::types::ShardMap, op: ShardMapOp) -> R
             if left.end != split_key || right.start != split_key {
                 return Err("split regions must meet at split_key".into());
             }
+            map.next_region_id = map.next_region_id.max(right.region_id.saturating_add(1));
             space.regions[idx] = left;
             space.regions.insert(idx + 1, right);
+            sort_space_regions(space);
             space.validate()?;
         }
         ShardMapOp::Merge {
             key,
             left_region_id,
             right_region_id,
+            epoch,
             merged,
         } => {
             let space = map
@@ -111,6 +130,10 @@ pub fn apply_shard_map_op(map: &mut super::types::ShardMap, op: ShardMapOp) -> R
                 .iter()
                 .position(|r| r.region_id == left_region_id)
                 .ok_or_else(|| format!("unknown left region {left_region_id}"))?;
+            let left_epoch = space.regions[li].epoch;
+            if left_epoch != epoch {
+                return Err("stale epoch on Merge".into());
+            }
             let ri = space
                 .regions
                 .iter()
@@ -121,6 +144,7 @@ pub fn apply_shard_map_op(map: &mut super::types::ShardMap, op: ShardMapOp) -> R
             }
             space.regions.remove(ri);
             space.regions[li] = merged;
+            sort_space_regions(space);
             space.validate()?;
         }
         ShardMapOp::MovePeer {
@@ -153,6 +177,7 @@ pub fn apply_shard_map_op(map: &mut super::types::ShardMap, op: ShardMapOp) -> R
             if region.primary == from_peer {
                 region.primary = to_peer;
             }
+            sort_space_regions(space);
         }
         ShardMapOp::TransferPrimary {
             key,
@@ -177,6 +202,7 @@ pub fn apply_shard_map_op(map: &mut super::types::ShardMap, op: ShardMapOp) -> R
             }
             region.primary = new_primary;
             region.epoch = epoch.bump_conf_ver();
+            sort_space_regions(space);
         }
     }
     Ok(())
@@ -220,6 +246,7 @@ mod tests {
                 key: key.clone(),
                 region_id: 1,
                 split_key,
+                epoch: ShardEpoch::default(),
                 left: left.clone(),
                 right: right.clone(),
             },
@@ -232,6 +259,7 @@ mod tests {
                 key,
                 left_region_id: 1,
                 right_region_id: 2,
+                epoch: left.epoch,
                 merged,
             },
         )
@@ -267,6 +295,43 @@ mod tests {
         assert_eq!(r.primary, 2);
         assert!(!r.peers.contains(&1));
         assert!(r.peers.contains(&2));
+    }
+
+    #[test]
+    fn apply_keeps_regions_sorted_by_start() {
+        let key = MeasurementKey::new("db", "autogen", "cpu");
+        let mut map = ShardMap::default();
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::BootstrapMeasurement {
+                key: key.clone(),
+                region: sample_region(1, 0, u64::MAX, 1),
+            },
+        )
+        .unwrap();
+        let split_key = 1u64 << 40;
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::Split {
+                key,
+                region_id: 1,
+                split_key,
+                epoch: ShardEpoch::default(),
+                left: sample_region(1, 0, split_key, 1),
+                right: sample_region(2, split_key, u64::MAX, 1),
+            },
+        )
+        .unwrap();
+        let starts: Vec<u64> = map
+            .spaces
+            .values()
+            .next()
+            .unwrap()
+            .regions
+            .iter()
+            .map(|r| r.start)
+            .collect();
+        assert_eq!(starts, vec![0, split_key]);
     }
 
     #[test]

@@ -8,7 +8,7 @@ use crate::error::HyperbytedbError;
 pub trait ShardMapPort: Send + Sync {
     fn enabled(&self) -> bool;
 
-    async fn snapshot(&self) -> Result<ShardMap, HyperbytedbError>;
+    async fn snapshot(&self) -> Result<Arc<ShardMap>, HyperbytedbError>;
 
     async fn locate(
         &self,
@@ -46,8 +46,8 @@ impl ShardMapPort for DisabledShardMap {
         false
     }
 
-    async fn snapshot(&self) -> Result<ShardMap, HyperbytedbError> {
-        Ok(ShardMap::default())
+    async fn snapshot(&self) -> Result<Arc<ShardMap>, HyperbytedbError> {
+        Ok(Arc::new(ShardMap::default()))
     }
 
     async fn locate(

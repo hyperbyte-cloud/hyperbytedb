@@ -16,7 +16,10 @@ use crate::ports::metadata::MetadataPort;
 use crate::ports::points_sink::PointsSinkPort;
 use crate::ports::wal::WalPort;
 
+mod region_write_stats;
 mod shard_heartbeat;
+
+pub use region_write_stats::RegionWriteStats;
 
 pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
     let bootstrapped = build_services(&config).await?;
@@ -182,6 +185,7 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
                 peer_client.clone(),
                 app_state.metadata.clone(),
                 app_state.wal.clone(),
+                Some(app_state.query_port.clone()),
                 Some(app_state.points_sink.clone()),
                 config.cluster.node_id,
                 config.sharding.clone(),
@@ -210,13 +214,14 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
                         pc.clone(),
                         app_state.metadata.clone(),
                         app_state.points_sink.clone(),
+                        app_state.query_port.clone(),
                         raft.clone(),
                         config.server.max_points_per_request,
                     ),
                 ));
             }
 
-            let interval = Duration::from_secs(config.sharding.heartbeat_interval_secs.max(1) * 6);
+            let interval = Duration::from_secs(config.sharding.heartbeat_interval_secs.max(1));
             let rx = service_shutdown_rx.clone();
             let sched = scheduler.clone();
             let hb_handle = {
@@ -224,6 +229,14 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
                 let node_id = config.cluster.node_id;
                 let map = map.clone();
                 let meta = app_state.metadata.clone();
+                let query_port = app_state.query_port.clone();
+                let region_write_stats = app_state
+                    .shard_routing
+                    .as_ref()
+                    .map(|sr| sr.region_write_stats.clone())
+                    .unwrap_or_else(|| {
+                        Arc::new(crate::application::runtime::RegionWriteStats::new())
+                    });
                 let raft = raft.clone();
                 let m = membership.clone();
                 let hb_interval =
@@ -238,6 +251,8 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
                             map,
                             raft,
                             meta,
+                            query_port,
+                            region_write_stats,
                             hb_interval,
                             hb_rx,
                         )

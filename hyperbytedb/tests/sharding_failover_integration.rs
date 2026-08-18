@@ -113,6 +113,7 @@ async fn primary_failover_updates_shard_map_after_unhealthy_timeout() {
         None,
         metadata,
         wal,
+        None,
         Some(sink),
         1,
         sharding,

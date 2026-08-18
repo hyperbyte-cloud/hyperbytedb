@@ -8,6 +8,8 @@ use crate::domain::sharding::ShardRegion;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegionTargetRole {
     Read,
+    /// Aggregate queries must read from the region primary for authoritative totals.
+    PrimaryRead,
     Write,
     Replicate,
 }
@@ -57,6 +59,17 @@ pub fn resolve_region_peers(
             out.push(id);
         }
     };
+
+    if matches!(_role, RegionTargetRole::PrimaryRead) {
+        if region.peers.contains(&region.primary) && is_active_peer(membership, region.primary) {
+            return vec![region.primary];
+        }
+        push(region.primary);
+        for id in &region.peers {
+            push(*id);
+        }
+        return out;
+    }
 
     push(self_id);
     push(region.primary);
@@ -165,5 +178,17 @@ mod tests {
         ]);
         let targets = active_region_peer_targets(&r, 1, &m);
         assert_eq!(targets, vec![2]);
+    }
+
+    #[test]
+    fn primary_read_returns_only_primary_when_active() {
+        let r = region(1, &[1, 2, 3]);
+        let m = membership(&[
+            (1, NodeState::Active),
+            (2, NodeState::Active),
+            (3, NodeState::Active),
+        ]);
+        let peers = resolve_region_peers(&r, 2, &m, RegionTargetRole::PrimaryRead);
+        assert_eq!(peers, vec![1]);
     }
 }

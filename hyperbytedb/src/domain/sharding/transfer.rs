@@ -26,6 +26,15 @@ pub struct ShardTransferPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<Vec<u8>>,
     pub source_node_id: u64,
+    /// Correlates Push chunks and the final Ack for one transfer attempt.
+    #[serde(default)]
+    pub transfer_id: u64,
+    /// Monotonic chunk index within `transfer_id` (Push only).
+    #[serde(default)]
+    pub seq: u64,
+    /// True on the last Push chunk, or on Ack.
+    #[serde(default)]
+    pub done: bool,
 }
 
 impl ShardTransferPayload {
@@ -40,6 +49,9 @@ impl ShardTransferPayload {
         epoch: ShardEpoch,
         body: Vec<u8>,
         source_node_id: u64,
+        transfer_id: u64,
+        seq: u64,
+        done: bool,
     ) -> Self {
         Self {
             db: db.into(),
@@ -52,6 +64,38 @@ impl ShardTransferPayload {
             phase: TransferPhase::Push,
             body: Some(body),
             source_node_id,
+            transfer_id,
+            seq,
+            done,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn ack(
+        db: impl Into<String>,
+        rp: impl Into<String>,
+        measurement: impl Into<String>,
+        region_id: u64,
+        start: u64,
+        end: u64,
+        epoch: ShardEpoch,
+        source_node_id: u64,
+        transfer_id: u64,
+    ) -> Self {
+        Self {
+            db: db.into(),
+            rp: rp.into(),
+            measurement: measurement.into(),
+            region_id,
+            start,
+            end,
+            epoch,
+            phase: TransferPhase::Ack,
+            body: None,
+            source_node_id,
+            transfer_id,
+            seq: 0,
+            done: true,
         }
     }
 }

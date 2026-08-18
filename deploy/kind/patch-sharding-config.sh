@@ -1,28 +1,43 @@
 #!/usr/bin/env bash
-# Patch hyperbytedb-config with sharding settings for perf tests.
-# Scale the operator to 0 first so it does not revert the ConfigMap.
+# Patch hyperbytedb-config with sharding settings for Kind split/perf tests.
+# The HyperbytedbCluster CRD does not yet expose a sharding spec; patch the
+# operator-generated ConfigMap so [sharding].enabled survives without scaling
+# the operator to 0 permanently.
+#
+# When using low split thresholds (e.g. region_split_series=5), you must also set
+# region_merge_series < region_split_series or hyperbytedb fails config validation.
 set -euo pipefail
 
 KUBE_CTX="${KUBE_CTX:-kind-hyperbytedb}"
 NS="${NS:-hyperbytedb}"
+# Low thresholds for split testing; override via env for perf runs.
+REGION_SPLIT_SERIES="${REGION_SPLIT_SERIES:-5}"
+REGION_MAX_SERIES="${REGION_MAX_SERIES:-10}"
+REGION_MERGE_SERIES="${REGION_MERGE_SERIES:-2}"
 
 kubectl --context "$KUBE_CTX" -n "$NS" scale deployment/hyperbytedb-operator --replicas=0 2>/dev/null || true
 
 kubectl --context "$KUBE_CTX" -n "$NS" get configmap hyperbytedb-config -o yaml > /tmp/hbd-config.yaml
-python3 << 'PY'
+export REGION_SPLIT_SERIES REGION_MAX_SERIES REGION_MERGE_SERIES
+python3 << PY
+import os
 import yaml
+
+region_split = int(os.environ["REGION_SPLIT_SERIES"])
+region_max = int(os.environ["REGION_MAX_SERIES"])
+region_merge = int(os.environ["REGION_MERGE_SERIES"])
 
 with open("/tmp/hbd-config.yaml") as f:
     cm = yaml.safe_load(f)
 
 toml = cm["data"]["config.toml"]
-sharding_block = """
+sharding_block = f"""
 [sharding]
 enabled = true
 replication_factor = 2
-region_split_series = 10000
-region_max_series = 11000
-region_merge_series = 2000
+region_split_series = {region_split}
+region_max_series = {region_max}
+region_merge_series = {region_merge}
 split_merge_interval_secs = 30
 schedule_limit = 4
 heartbeat_interval_secs = 10

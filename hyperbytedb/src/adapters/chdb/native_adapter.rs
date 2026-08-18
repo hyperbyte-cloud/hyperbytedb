@@ -1571,6 +1571,30 @@ impl PointsSinkPort for ChdbNativeAdapter {
         Ok(())
     }
 
+    async fn delete_series_id_range(
+        &self,
+        db: &str,
+        rp: &str,
+        measurement: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<(), HyperbytedbError> {
+        use crate::domain::chdb_naming::{quoted_series_table_name, quoted_table_name};
+
+        let fact = quoted_table_name(db, rp, measurement);
+        let series = quoted_series_table_name(db, rp, measurement);
+        let range = if end == u64::MAX {
+            format!("series_id >= {start}")
+        } else {
+            format!("series_id >= {start} AND series_id < {end}")
+        };
+        self.execute(format!("ALTER TABLE {fact} DELETE WHERE {range}"))
+            .await?;
+        self.execute(format!("ALTER TABLE {series} DELETE WHERE {range}"))
+            .await?;
+        Ok(())
+    }
+
     async fn drop_measurement(
         &self,
         db: &str,

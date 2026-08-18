@@ -1,0 +1,45 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: hyperbytedb
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30086
+        hostPort: 18086
+        protocol: TCP
+      - containerPort: 30090
+        hostPort: 19090
+        protocol: TCP
+      - containerPort: 30000
+        hostPort: 13000
+        protocol: TCP
+  - role: worker
+    extraMounts:
+      - hostPath: /tmp/hyperbytedb-data/worker-0
+        containerPath: /data/hyperbytedb
+        propagation: None
+  - role: worker
+    extraMounts:
+      - hostPath: /tmp/hyperbytedb-data/worker-1
+        containerPath: /data/hyperbytedb
+        propagation: None
+  - role: worker
+    extraMounts:
+      - hostPath: /tmp/hyperbytedb-data/worker-2
+        containerPath: /data/hyperbytedb
+        propagation: None
+  - role: worker
+    extraMounts:
+      - hostPath: /tmp/hyperbytedb-data/worker-3
+        containerPath: /data/hyperbytedb
+        propagation: None
+  - role: worker
+    extraMounts:
+      - hostPath: /tmp/hyperbytedb-data/worker-4
+        containerPath: /data/hyperbytedb
+        propagation: None
+  - role: worker
+    extraMounts:
+      - hostPath: /tmp/hyperbytedb-data/worker-5
+        containerPath: /data/hyperbytedb
+        propagation: None

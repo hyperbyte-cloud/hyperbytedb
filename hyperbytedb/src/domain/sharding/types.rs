@@ -32,6 +32,7 @@ pub struct ShardRegion {
     pub start: u64,
     /// Exclusive upper bound.
     pub end: u64,
+    #[serde(default)]
     pub epoch: ShardEpoch,
     pub peers: Vec<u64>,
     pub primary: u64,
@@ -76,7 +77,12 @@ pub struct MeasurementShardSpace {
 
 impl MeasurementShardSpace {
     pub fn locate(&self, series_id: u64) -> Option<&ShardRegion> {
-        self.regions.iter().find(|r| r.contains(series_id))
+        if self.regions.is_empty() {
+            return None;
+        }
+        let idx = self.regions.partition_point(|r| r.start <= series_id);
+        let region = self.regions.get(idx.checked_sub(1)?)?;
+        region.contains(series_id).then_some(region)
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -109,7 +115,14 @@ impl MeasurementShardSpace {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShardMap {
     pub map_version: u64,
+    /// Monotonic allocator for new region IDs (initialized from max on load).
+    #[serde(default = "default_next_region_id")]
+    pub next_region_id: u64,
     pub spaces: HashMap<MeasurementKey, MeasurementShardSpace>,
+}
+
+fn default_next_region_id() -> u64 {
+    1
 }
 
 impl ShardMap {
@@ -133,6 +146,8 @@ impl ShardMap {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardMapJson {
     pub map_version: u64,
+    #[serde(default = "default_next_region_id")]
+    pub next_region_id: u64,
     pub spaces: Vec<MeasurementShardSpace>,
 }
 
@@ -140,8 +155,47 @@ impl From<&ShardMap> for ShardMapJson {
     fn from(map: &ShardMap) -> Self {
         Self {
             map_version: map.map_version,
+            next_region_id: map.next_region_id,
             spaces: map.spaces.values().cloned().collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod locate_tests {
+    use super::*;
+
+    fn region(id: u64, start: u64, end: u64) -> ShardRegion {
+        ShardRegion {
+            region_id: id,
+            start,
+            end,
+            epoch: ShardEpoch::default(),
+            peers: vec![1],
+            primary: 1,
+            last_split_at: 0,
+        }
+    }
+
+    #[test]
+    fn shard_region_deserializes_without_epoch() {
+        let json = r#"{"region_id":1,"start":0,"end":100,"peers":[1],"primary":1}"#;
+        let region: ShardRegion = serde_json::from_str(json).unwrap();
+        assert_eq!(region.epoch, ShardEpoch::default());
+    }
+
+    #[test]
+    fn locate_uses_binary_search_on_sorted_starts() {
+        let split = 1u64 << 32;
+        let space = MeasurementShardSpace {
+            key: MeasurementKey::new("db", "rp", "cpu"),
+            regions: vec![region(1, 0, split), region(2, split, u64::MAX)],
+        };
+        assert_eq!(space.locate(0).unwrap().region_id, 1);
+        assert_eq!(space.locate(split - 1).unwrap().region_id, 1);
+        assert_eq!(space.locate(split).unwrap().region_id, 2);
+        assert_eq!(space.locate(u64::MAX - 1).unwrap().region_id, 2);
+        assert!(space.locate(u64::MAX).is_none());
     }
 }
 
@@ -149,9 +203,13 @@ impl From<&ShardMap> for ShardMapJson {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RegionHeartbeat {
     pub region_id: u64,
+    /// Store node that produced this heartbeat (region peer, not necessarily Raft leader).
+    #[serde(default)]
+    pub node_id: u64,
     pub series_count: u64,
     pub approx_bytes: u64,
     pub write_qps: u64,
+    #[serde(default)]
     pub epoch: ShardEpoch,
 }
 

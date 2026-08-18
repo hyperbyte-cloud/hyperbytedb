@@ -690,8 +690,47 @@ Remote DELETE cleanup waits for an Active primary; use drain or wait for automat
 
 ### Transfer and lifecycle
 
-- After split, the scheduler runs **region transfer** (WAL export + `/internal/shard/transfer`) to move vacated `series_id` ranges to new primaries.
-- **Drain** performs `TransferPrimary` + transfer + `MovePeer` for regions where the draining node is primary.
+Region transfers move vacated `series_id` ranges **before** split/map mutations commit so clients never read an empty new owner:
+
+1. **Push** — source exports WAL tail + flushed chDB rows in chunked `/internal/shard/transfer` payloads (`transfer_id`, `seq`, `done`).
+2. **Split / rebalance / merge** — Raft commits the shard-map change (epoch CAS on Split/Merge).
+3. **Ack** — source sends Ack to the destination primary; destination purges stale materialized-view partials for the vacated range.
+4. **Drop** — source deletes range-scoped series metadata and issues chDB `DELETE` for the vacated fact/series tables.
+
+The scheduler holds a **per-region operator lock** while split/merge/rebalance/failover/transfer runs; `schedule_limit` counts live operators, not per-tick slots.
+
+- **Drain** performs transfer, `TransferPrimary`, then `MovePeer` (re-reads epoch after primary transfer).
+- **Sync manifests** include per-region WAL watermarks; failover prefers the most caught-up Active peer (leader eligible).
+
+### Region heartbeats
+
+Store nodes report to the Raft leader via `/internal/shard/heartbeat`:
+
+| Field | Meaning |
+|-------|---------|
+| `region_id` | Region being reported |
+| `node_id` | Reporting store node (region peer, not necessarily Raft leader) |
+| `series_count` | Series metadata rows in `[start, end)` on this node |
+| `approx_bytes` | Cheap chDB row-count × size estimate for load rebalance |
+| `write_qps` | Local ingest rate since last report |
+| `epoch` | Stale heartbeats (epoch mismatch) are dropped |
+
+### Distributed aggregate support
+
+Multi-region fan-out rewrites SELECT into per-region partial aggregations, then merges on the coordinator:
+
+| Aggregate | Multi-region behavior |
+|-----------|----------------------|
+| `sum`, `count`, `min`, `max` | Merge partials additively |
+| `mean` | Partial `sum` + `count`, finalize `sum/count` |
+| `first` / `last` | Carry bucket time; pick min/max time across regions |
+| `distinct`, `count(distinct)`, `stddev` | Set / moment partial merge |
+| `percentile`, `median`, `mode`, `spread` | **Error** — not supported across regions yet |
+
+Global **LIMIT**, **OFFSET**, and **ORDER BY** apply on the coordinator after merging (per-region SQL fetches `limit+offset` rows).
+
+- After split, the scheduler runs **region transfer** before proposing the map change.
+- **Drain** performs transfer + `TransferPrimary` + `MovePeer` for regions where the draining node is primary.
 - **Sync manifests** include per-region WAL watermarks; join sync pulls from region primaries where the joining node is a peer.
 
 ### Materialized views
@@ -733,4 +772,6 @@ After a **region transfer**, destination partial rows sourced from transferred `
 
 - Enable sharding only on **new clusters**; in-place conversion from full-copy replication is not supported.
 - **Proxy** load balancing is not shard-aware; any Active node can coordinate scatter-gather queries and write forwards.
-- **sync_quorum** replication semantics apply to the coordinator's local WAL append; sharded write forwards use region-scoped async replication to region peers.
+- **sync_quorum** on forwarded writes: `/internal/shard/write` honors the configured replication mode; SyncQuorum fails the request when region peer acks do not meet quorum.
+- Split keys prefer the **median local `series_id`** in the region (metadata catalog scan), falling back to range midpoint when empty.
+- `percentile`, `median`, `mode`, and `spread` are rejected on multi-region fan-out until a merge strategy exists.

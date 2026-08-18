@@ -13,6 +13,7 @@ use crate::error::HyperbytedbError;
 use crate::ports::flush::FlushPort;
 use crate::ports::metadata::MetadataPort;
 use crate::ports::points_sink::PointsSinkPort;
+use crate::ports::query::QueryPort;
 use crate::ports::sharding::ShardMapPort;
 use crate::ports::wal::WalPort;
 
@@ -26,6 +27,7 @@ pub struct DrainService {
     peer_client: Option<Arc<PeerClient>>,
     metadata: Option<Arc<dyn MetadataPort>>,
     points_sink: Option<Arc<dyn PointsSinkPort>>,
+    query_port: Option<Arc<dyn QueryPort>>,
     raft: Option<HyperbytedbRaft>,
     max_points_per_request: usize,
 }
@@ -49,17 +51,20 @@ impl DrainService {
             peer_client: None,
             metadata: None,
             points_sink: None,
+            query_port: None,
             raft: None,
             max_points_per_request: 0,
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn with_sharding(
         mut self,
         ctx: Arc<ShardRoutingContext>,
         peer_client: Arc<PeerClient>,
         metadata: Arc<dyn MetadataPort>,
         points_sink: Arc<dyn PointsSinkPort>,
+        query_port: Arc<dyn QueryPort>,
         raft: HyperbytedbRaft,
         max_points_per_request: usize,
     ) -> Self {
@@ -67,6 +72,7 @@ impl DrainService {
         self.peer_client = Some(peer_client);
         self.metadata = Some(metadata);
         self.points_sink = Some(points_sink);
+        self.query_port = Some(query_port);
         self.raft = Some(raft);
         self.max_points_per_request = max_points_per_request;
         self
@@ -138,6 +144,7 @@ impl DrainService {
                     pc,
                     metadata,
                     &self.wal,
+                    self.query_port.as_ref(),
                     self.points_sink.as_ref(),
                     self.node_id,
                     &space.key,
@@ -158,12 +165,20 @@ impl DrainService {
                     .await
                     .map_err(|e| HyperbytedbError::ShardMap(e.to_string()))?;
 
+                let map = ctx.shard_map.snapshot().await?;
+                let current = map
+                    .space(&space.key.db, &space.key.rp, &space.key.measurement)
+                    .and_then(|s| s.regions.iter().find(|r| r.region_id == region.region_id))
+                    .ok_or_else(|| {
+                        HyperbytedbError::ShardMap("region vanished after transfer primary".into())
+                    })?;
+
                 let mp = ShardMapOp::MovePeer {
                     key: space.key.clone(),
                     region_id: region.region_id,
                     from_peer: self.node_id,
                     to_peer: new_primary,
-                    epoch: region.epoch,
+                    epoch: current.epoch,
                 };
                 raft.client_write(ClusterRequest::ShardMapMutation(Box::new(mp)))
                     .await

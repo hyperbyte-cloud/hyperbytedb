@@ -18,7 +18,8 @@ fn heartbeat_key(region_id: u64, node_id: u64) -> Vec<u8> {
 
 pub struct RocksDbShardMap {
     db: Arc<DB>,
-    cache: RwLock<ShardMap>,
+    cache: RwLock<Arc<ShardMap>>,
+    apply_lock: tokio::sync::Mutex<()>,
     enabled: bool,
     _node_id: u64,
 }
@@ -33,10 +34,11 @@ impl RocksDbShardMap {
         let db =
             DB::open(&opts, &path).map_err(|e| HyperbytedbError::Storage(e.to_string().into()))?;
         let db = Arc::new(db);
-        let cache = load_map(&db)?;
+        let cache = Arc::new(load_map(&db)?);
         Ok(Self {
             db,
             cache: RwLock::new(cache),
+            apply_lock: tokio::sync::Mutex::new(()),
             enabled,
             _node_id: node_id,
         })
@@ -99,13 +101,20 @@ fn persist_map(db: &DB, map: &ShardMap) -> Result<(), HyperbytedbError> {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PersistedShardMap {
     map_version: u64,
+    #[serde(default = "default_next_region_id")]
+    next_region_id: u64,
     spaces: Vec<crate::domain::sharding::MeasurementShardSpace>,
+}
+
+fn default_next_region_id() -> u64 {
+    1
 }
 
 impl PersistedShardMap {
     fn from(map: &ShardMap) -> Self {
         Self {
             map_version: map.map_version,
+            next_region_id: map.next_region_id,
             spaces: map.spaces.values().cloned().collect(),
         }
     }
@@ -115,8 +124,18 @@ impl PersistedShardMap {
         for space in self.spaces {
             spaces.insert(space.key.clone(), space);
         }
+        let mut next_region_id = self.next_region_id;
+        if next_region_id == 0 {
+            next_region_id = spaces
+                .values()
+                .flat_map(|s| s.regions.iter().map(|r| r.region_id))
+                .max()
+                .map(|m| m.saturating_add(1))
+                .unwrap_or(1);
+        }
         ShardMap {
             map_version: self.map_version,
+            next_region_id,
             spaces,
         }
     }
@@ -128,8 +147,8 @@ impl ShardMapPort for RocksDbShardMap {
         self.enabled
     }
 
-    async fn snapshot(&self) -> Result<ShardMap, HyperbytedbError> {
-        Ok(self.cache.read().clone())
+    async fn snapshot(&self) -> Result<Arc<ShardMap>, HyperbytedbError> {
+        Ok(Arc::clone(&*self.cache.read()))
     }
 
     async fn locate(
@@ -161,10 +180,11 @@ impl ShardMapPort for RocksDbShardMap {
     }
 
     async fn apply_op(&self, op: ShardMapOp) -> Result<ShardMap, HyperbytedbError> {
-        let mut map = self.cache.write().clone();
+        let _guard = self.apply_lock.lock().await;
+        let mut map = (*self.cache.read()).as_ref().clone();
         apply_shard_map_op(&mut map, op).map_err(HyperbytedbError::ShardMap)?;
         persist_map(&self.db, &map)?;
-        *self.cache.write() = map.clone();
+        *self.cache.write() = Arc::new(map.clone());
         Ok(map)
     }
 

@@ -18,6 +18,7 @@ use crate::application::ingestion_service::IngestionServiceImpl;
 use crate::application::query_service::QueryServiceImpl;
 use crate::application::raft_leader_callbacks::{RaftLeaderCallbacks, SharedRaftLeaderCallbacks};
 use crate::application::replication_apply::ReplicationApplyQueue;
+use crate::application::runtime::RegionWriteStats;
 use crate::application::shard_routing::ShardRoutingContext;
 use crate::application::statement_summary::StatementSummary;
 use crate::config::HyperbytedbConfig;
@@ -285,6 +286,7 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
                 config: config.sharding.clone(),
                 node_id: config.cluster.node_id,
                 peer_client: pc.clone(),
+                region_write_stats: Arc::new(RegionWriteStats::new()),
             })),
             _ => None,
         }

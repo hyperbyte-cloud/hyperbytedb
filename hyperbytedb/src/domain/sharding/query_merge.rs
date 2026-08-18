@@ -1,12 +1,322 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
 
 use crate::domain::measurement::MeasurementMeta;
 use crate::domain::query_result::{QueryResponse, SeriesResult};
-use crate::domain::rollup::{RollupCombine, rollup_combine_from_field};
-use crate::timeseriesql::ast::{Expr, SelectStatement};
+use crate::domain::rollup::{
+    MeanRollupField, RollupCombine, aggregate_source_field_name, mean_rollup_column_names,
+    rollup_combine_from_field,
+};
+use crate::error::HyperbytedbError;
+use crate::timeseriesql::ast::{BinaryExpr, BinaryOp, Expr, Field, FunctionCall, SelectStatement};
 use crate::timeseriesql::to_clickhouse::{select_has_true_aggregate, select_output_field_name};
+
+const MULTI_REGION_UNSUPPORTED: &str = "aggregate is not supported across shard regions yet";
+
+/// Metadata for rewriting a sharded query into per-region partial aggregation
+/// and applying coordinator-side finalization.
+#[derive(Debug, Clone)]
+pub struct ShardedQueryPlan {
+    pub region_stmt: SelectStatement,
+    mean_partials: HashMap<String, MeanRollupField>,
+    first_partials: HashMap<String, String>,
+    last_partials: HashMap<String, String>,
+    stddev_partials: HashMap<String, StddevPartialCols>,
+    distinct_outputs: HashSet<String>,
+    count_distinct_outputs: HashMap<String, String>,
+    merge_rules: HashMap<String, ColumnMerge>,
+    row_key_distinct_cols: HashSet<String>,
+    saved_limit: Option<u64>,
+    saved_offset: Option<u64>,
+    saved_time_desc: Option<bool>,
+    needs_global_sort: bool,
+}
+
+#[derive(Debug, Clone)]
+struct StddevPartialCols {
+    sum_col: String,
+    sumsq_col: String,
+    count_col: String,
+}
+
+/// Rewrite a SELECT for per-region partial aggregation when fan-out > 1.
+pub fn prepare_sharded_region_query(
+    stmt: &SelectStatement,
+) -> Result<ShardedQueryPlan, HyperbytedbError> {
+    let mut plan = ShardedQueryPlan {
+        region_stmt: stmt.clone(),
+        mean_partials: HashMap::new(),
+        first_partials: HashMap::new(),
+        last_partials: HashMap::new(),
+        stddev_partials: HashMap::new(),
+        distinct_outputs: HashSet::new(),
+        count_distinct_outputs: HashMap::new(),
+        merge_rules: HashMap::new(),
+        row_key_distinct_cols: HashSet::new(),
+        saved_limit: None,
+        saved_offset: None,
+        saved_time_desc: None,
+        needs_global_sort: false,
+    };
+
+    validate_no_non_mergeable_aggs(stmt)?;
+
+    let mut region_fields = Vec::new();
+    for field in &stmt.fields {
+        region_fields.extend(rewrite_field_for_region(field, &mut plan)?);
+    }
+    plan.region_stmt.fields = region_fields;
+    plan.merge_rules = build_merge_rules(stmt, &plan);
+
+    if stmt.limit.is_some() || stmt.offset.is_some() {
+        let offset = stmt.offset.unwrap_or(0);
+        let fetch = stmt
+            .limit
+            .map(|l| l.saturating_add(offset))
+            .or_else(|| (offset > 0).then_some(offset));
+        plan.region_stmt.limit = fetch;
+        plan.region_stmt.offset = None;
+        plan.saved_limit = stmt.limit;
+        plan.saved_offset = stmt.offset;
+    }
+
+    if stmt.order_by.is_some()
+        || stmt
+            .group_by
+            .as_ref()
+            .is_some_and(|gb| gb.time_dimension().is_some())
+    {
+        plan.saved_time_desc = stmt.order_by.as_ref().map(|o| o.time_desc);
+        plan.needs_global_sort = true;
+        plan.region_stmt.order_by = None;
+        ensure_time_field_for_global_sort(&mut plan.region_stmt.fields);
+    }
+
+    Ok(plan)
+}
+
+fn ensure_time_field_for_global_sort(fields: &mut Vec<Field>) {
+    let has_time = fields.iter().any(|f| {
+        matches!(&f.expr, Expr::Identifier(name) if name == "time" || name == "__time")
+            || f.alias.as_deref() == Some("time")
+    });
+    if !has_time {
+        fields.insert(
+            0,
+            Field {
+                expr: Expr::Identifier("time".into()),
+                alias: None,
+            },
+        );
+    }
+}
+
+fn validate_no_non_mergeable_aggs(stmt: &SelectStatement) -> Result<(), HyperbytedbError> {
+    for field in &stmt.fields {
+        if let Expr::Call(func) = &field.expr
+            && is_non_mergeable_agg(func)
+        {
+            return Err(HyperbytedbError::QueryParse(format!(
+                "{MULTI_REGION_UNSUPPORTED}: {}",
+                func.name.to_lowercase()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn is_non_mergeable_agg(func: &FunctionCall) -> bool {
+    matches!(
+        func.name.to_uppercase().as_str(),
+        "PERCENTILE" | "MEDIAN" | "MODE" | "SPREAD"
+    )
+}
+
+fn rewrite_field_for_region(
+    field: &Field,
+    plan: &mut ShardedQueryPlan,
+) -> Result<Vec<Field>, HyperbytedbError> {
+    let Some(output) = select_output_field_name(field) else {
+        return Ok(vec![field.clone()]);
+    };
+
+    match &field.expr {
+        Expr::Call(func) => match func.name.to_uppercase().as_str() {
+            "MEAN" => {
+                let source = aggregate_source_field_name(func)?;
+                let (sum_col, count_col) = mean_rollup_column_names(&source);
+                plan.mean_partials.insert(
+                    output,
+                    MeanRollupField {
+                        sum_col: sum_col.clone(),
+                        count_col: count_col.clone(),
+                    },
+                );
+                Ok(vec![
+                    field_with_call("sum", &source, Some(sum_col)),
+                    field_with_call("count", &source, Some(count_col)),
+                ])
+            }
+            "FIRST" => {
+                let _source = aggregate_source_field_name(func)?;
+                let time_col = format!("{output}__sel_time");
+                plan.first_partials.insert(output.clone(), time_col.clone());
+                Ok(vec![
+                    field.clone(),
+                    field_with_call("min", "time", Some(time_col)),
+                ])
+            }
+            "LAST" => {
+                let _source = aggregate_source_field_name(func)?;
+                let time_col = format!("{output}__sel_time");
+                plan.last_partials.insert(output.clone(), time_col.clone());
+                Ok(vec![
+                    field.clone(),
+                    field_with_call("max", "time", Some(time_col)),
+                ])
+            }
+            "STDDEV" => {
+                let source = aggregate_source_field_name(func)?;
+                let sum_col = format!("stddev_sum_{source}");
+                let sumsq_col = format!("stddev_sumsq_{source}");
+                let count_col = format!("stddev_count_{source}");
+                plan.stddev_partials.insert(
+                    output,
+                    StddevPartialCols {
+                        sum_col: sum_col.clone(),
+                        sumsq_col: sumsq_col.clone(),
+                        count_col: count_col.clone(),
+                    },
+                );
+                Ok(vec![
+                    field_with_call("sum", &source, Some(sum_col)),
+                    field_with_call("sum", &format!("{source}*{source}"), Some(sumsq_col)),
+                    field_with_call("count", &source, Some(count_col)),
+                ])
+            }
+            "DISTINCT" => {
+                plan.distinct_outputs.insert(output.clone());
+                plan.row_key_distinct_cols.insert(output);
+                Ok(vec![field.clone()])
+            }
+            "COUNT" => {
+                if let Some(Expr::Call(inner)) = func.args.first()
+                    && inner.name.eq_ignore_ascii_case("distinct")
+                {
+                    let source = aggregate_source_field_name(inner)?;
+                    let distinct_output = format!("distinct_{source}");
+                    plan.count_distinct_outputs
+                        .insert(output, distinct_output.clone());
+                    plan.row_key_distinct_cols.insert(distinct_output.clone());
+                    return Ok(vec![Field {
+                        expr: call_expr("distinct", field_arg(&source)),
+                        alias: Some(distinct_output),
+                    }]);
+                }
+                Ok(vec![field.clone()])
+            }
+            _ => Ok(vec![field.clone()]),
+        },
+        _ => Ok(vec![field.clone()]),
+    }
+}
+
+fn field_with_call(name: &str, source: &str, alias: Option<String>) -> Field {
+    let expr = if name.eq_ignore_ascii_case("sum") && source.contains('*') {
+        let parts: Vec<&str> = source.split('*').collect();
+        if parts.len() == 2 {
+            call_expr(
+                "sum",
+                Expr::BinaryExpr(Box::new(BinaryExpr {
+                    left: field_arg(parts[0]),
+                    op: BinaryOp::Mul,
+                    right: field_arg(parts[1]),
+                })),
+            )
+        } else {
+            call_expr(name, field_arg(source))
+        }
+    } else {
+        call_expr(name, field_arg(source))
+    };
+    Field { expr, alias }
+}
+
+fn field_arg(name: &str) -> Expr {
+    Expr::Identifier(name.to_string())
+}
+
+fn call_expr(name: &str, arg: Expr) -> Expr {
+    Expr::Call(FunctionCall {
+        name: name.to_string(),
+        args: vec![arg],
+    })
+}
+
+fn build_merge_rules(
+    stmt: &SelectStatement,
+    plan: &ShardedQueryPlan,
+) -> HashMap<String, ColumnMerge> {
+    let mut rules = HashMap::new();
+
+    for (output, partial) in &plan.mean_partials {
+        rules.insert(partial.sum_col.clone(), ColumnMerge::Sum);
+        rules.insert(partial.count_col.clone(), ColumnMerge::Sum);
+        let _ = output;
+    }
+    for (output, time_col) in &plan.first_partials {
+        rules.insert(output.clone(), ColumnMerge::FirstByTime);
+        rules.insert(time_col.clone(), ColumnMerge::Min);
+    }
+    for (output, time_col) in &plan.last_partials {
+        rules.insert(output.clone(), ColumnMerge::LastByTime);
+        rules.insert(time_col.clone(), ColumnMerge::Max);
+    }
+    for partial in plan.stddev_partials.values() {
+        rules.insert(partial.sum_col.clone(), ColumnMerge::Sum);
+        rules.insert(partial.sumsq_col.clone(), ColumnMerge::Sum);
+        rules.insert(partial.count_col.clone(), ColumnMerge::Sum);
+    }
+    for col in &plan.distinct_outputs {
+        rules.insert(col.clone(), ColumnMerge::DistinctKeep);
+    }
+    for distinct_col in plan.count_distinct_outputs.values() {
+        rules.insert(distinct_col.clone(), ColumnMerge::DistinctKeep);
+    }
+
+    for field in &stmt.fields {
+        let Some(name) = select_output_field_name(field) else {
+            continue;
+        };
+        if rules.contains_key(&name) {
+            continue;
+        }
+        let merge = if let Ok(combine) = rollup_combine_from_field(field) {
+            match combine {
+                RollupCombine::Sum => ColumnMerge::Sum,
+                RollupCombine::Min => ColumnMerge::Min,
+                RollupCombine::Max => ColumnMerge::Max,
+                RollupCombine::First => ColumnMerge::First,
+                RollupCombine::Last => ColumnMerge::Last,
+            }
+        } else if matches!(
+            field.expr,
+            Expr::Call(ref func)
+                if func.name.eq_ignore_ascii_case("mean")
+                    || func.name.eq_ignore_ascii_case("count")
+        ) {
+            ColumnMerge::Sum
+        } else if plan.count_distinct_outputs.contains_key(&name) {
+            ColumnMerge::Skip
+        } else {
+            ColumnMerge::Unsupported
+        };
+        rules.insert(name, merge);
+    }
+
+    rules
+}
 
 /// Merge multiple partial query responses into one, deduplicating series by name+tags.
 pub fn merge_query_results(mut parts: Vec<QueryResponse>) -> QueryResponse {
@@ -61,11 +371,37 @@ pub fn merge_query_results(mut parts: Vec<QueryResponse>) -> QueryResponse {
 pub fn merge_sharded_query_results(
     parts: Vec<QueryResponse>,
     stmt: &SelectStatement,
+    plan: Option<&ShardedQueryPlan>,
 ) -> QueryResponse {
-    if !select_has_true_aggregate(stmt) {
-        return merge_query_results(parts);
+    let merged = if !select_has_true_aggregate(stmt) {
+        merge_query_results(parts)
+    } else {
+        merge_aggregate_parts(parts, stmt, plan)
+    };
+
+    if let Some(plan) = plan {
+        apply_sharded_post_merge(merged, stmt, plan)
+    } else {
+        merged
     }
-    merge_aggregate_parts(parts, stmt)
+}
+
+/// Apply coordinator-side finalization and global ORDER BY / LIMIT / OFFSET.
+pub fn apply_sharded_post_merge(
+    response: QueryResponse,
+    original: &SelectStatement,
+    plan: &ShardedQueryPlan,
+) -> QueryResponse {
+    let mut resp = if select_has_true_aggregate(original) {
+        finalize_sharded_aggregates(response, plan)
+    } else {
+        response
+    };
+
+    if plan.needs_global_sort || plan.saved_limit.is_some() || plan.saved_offset.is_some() {
+        resp = apply_global_sort_limit_offset(resp, original, plan);
+    }
+    resp
 }
 
 /// Merge partial materialized-view destination rows from multiple shard regions.
@@ -89,7 +425,7 @@ pub fn merge_materialized_rollup_results(
         .map(|r| r.statement_id)
         .unwrap_or(0);
     let rules = rollup_merge_rules(meta);
-    merge_rows_with_rules(parts, statement_id, &rules)
+    merge_rows_with_rules(parts, statement_id, &rules, &HashSet::new())
 }
 
 fn rollup_merge_rules(meta: &MeasurementMeta) -> HashMap<String, ColumnMerge> {
@@ -111,6 +447,7 @@ fn merge_rows_with_rules(
     parts: Vec<QueryResponse>,
     statement_id: u32,
     rules: &HashMap<String, ColumnMerge>,
+    row_key_distinct_cols: &HashSet<String>,
 ) -> QueryResponse {
     let mut rows: HashMap<String, (SeriesResult, Vec<Value>)> = HashMap::new();
 
@@ -121,7 +458,7 @@ fn merge_rows_with_rules(
             };
             for series in series_list {
                 for row in &series.values {
-                    let key = series_row_key(&series, row);
+                    let key = series_row_key(&series, row, row_key_distinct_cols);
                     rows.entry(key)
                         .and_modify(|(_, merged_row)| {
                             *merged_row = merge_row(&series.columns, rules, merged_row, row);
@@ -160,15 +497,18 @@ fn merge_rows_with_rules(
     QueryResponse::single(statement_id, series)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum ColumnMerge {
     Sum,
     Min,
     Max,
-    Mean,
     First,
     Last,
-    Passthrough,
+    FirstByTime,
+    LastByTime,
+    DistinctKeep,
+    Skip,
+    Unsupported,
 }
 
 fn column_merge_rules(stmt: &SelectStatement) -> HashMap<String, ColumnMerge> {
@@ -189,16 +529,20 @@ fn column_merge_rules(stmt: &SelectStatement) -> HashMap<String, ColumnMerge> {
             field.expr,
             Expr::Call(ref func) if func.name.eq_ignore_ascii_case("mean")
         ) {
-            ColumnMerge::Mean
+            ColumnMerge::Sum
         } else {
-            ColumnMerge::Passthrough
+            ColumnMerge::Unsupported
         };
         rules.insert(name, merge);
     }
     rules
 }
 
-fn series_row_key(series: &SeriesResult, row: &[Value]) -> String {
+fn series_row_key(
+    series: &SeriesResult,
+    row: &[Value],
+    row_key_distinct_cols: &HashSet<String>,
+) -> String {
     let mut key = series.name.clone();
     if let Some(tags) = &series.tags {
         let mut pairs: Vec<_> = tags.iter().collect();
@@ -218,6 +562,14 @@ fn series_row_key(series: &SeriesResult, row: &[Value]) -> String {
         key.push('|');
         key.push_str(&row[idx].to_string());
     }
+    for col in row_key_distinct_cols {
+        if let Some(idx) = series.columns.iter().position(|c| c == col) {
+            key.push('|');
+            key.push_str(col);
+            key.push('=');
+            key.push_str(&row[idx].to_string());
+        }
+    }
     key
 }
 
@@ -225,6 +577,29 @@ fn json_as_f64(v: &Value) -> Option<f64> {
     v.as_f64()
         .or_else(|| v.as_i64().map(|i| i as f64))
         .or_else(|| v.as_u64().map(|u| u as f64))
+}
+
+fn json_as_i64(v: &Value) -> Option<i64> {
+    v.as_i64()
+        .or_else(|| v.as_u64().and_then(|u| i64::try_from(u).ok()))
+}
+
+fn json_sortable_time(v: &Value) -> i64 {
+    if let Some(n) = json_as_i64(v) {
+        return n;
+    }
+    if let Some(s) = v.as_str() {
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+            return dt.timestamp_nanos_opt().unwrap_or(0);
+        }
+        if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+            return ndt.and_utc().timestamp_nanos_opt().unwrap_or(0);
+        }
+        if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
+            return ndt.and_utc().timestamp_nanos_opt().unwrap_or(0);
+        }
+    }
+    0
 }
 
 fn json_sum(left: &Value, right: &Value) -> Value {
@@ -239,18 +614,27 @@ fn json_sum(left: &Value, right: &Value) -> Value {
     json!(l + r)
 }
 
-fn merge_values(left: &Value, right: &Value, rule: ColumnMerge, mean_count: &mut u64) -> Value {
+fn merge_values(
+    left: &Value,
+    right: &Value,
+    rule: ColumnMerge,
+    columns: &[String],
+    col_idx: usize,
+    left_row: &[Value],
+    right_row: &[Value],
+) -> Value {
     match rule {
-        ColumnMerge::Passthrough | ColumnMerge::First => left.clone(),
+        ColumnMerge::DistinctKeep | ColumnMerge::Skip | ColumnMerge::Unsupported => left.clone(),
+        ColumnMerge::First => left.clone(),
         ColumnMerge::Last => right.clone(),
         ColumnMerge::Sum => json_sum(left, right),
         ColumnMerge::Min => {
             let l = json_as_f64(left);
             let r = json_as_f64(right);
             match (l, r) {
-                (Some(a), Some(b)) => serde_json::json!(a.min(b)),
-                (Some(a), None) => serde_json::json!(a),
-                (None, Some(b)) => serde_json::json!(b),
+                (Some(a), Some(b)) => json!(a.min(b)),
+                (Some(a), None) => json!(a),
+                (None, Some(b)) => json!(b),
                 (None, None) => left.clone(),
             }
         }
@@ -258,18 +642,47 @@ fn merge_values(left: &Value, right: &Value, rule: ColumnMerge, mean_count: &mut
             let l = json_as_f64(left);
             let r = json_as_f64(right);
             match (l, r) {
-                (Some(a), Some(b)) => serde_json::json!(a.max(b)),
-                (Some(a), None) => serde_json::json!(a),
-                (None, Some(b)) => serde_json::json!(b),
+                (Some(a), Some(b)) => json!(a.max(b)),
+                (Some(a), None) => json!(a),
+                (None, Some(b)) => json!(b),
                 (None, None) => left.clone(),
             }
         }
-        ColumnMerge::Mean => {
-            let l = json_as_f64(left).unwrap_or(0.0);
-            let r = json_as_f64(right).unwrap_or(0.0);
-            *mean_count = mean_count.saturating_add(1);
-            serde_json::json!((l * (*mean_count as f64 - 1.0) + r) / *mean_count as f64)
+        ColumnMerge::FirstByTime => {
+            let col = &columns[col_idx];
+            let time_col = format!("{col}__sel_time");
+            pick_by_time(left, right, left_row, right_row, columns, &time_col, true)
         }
+        ColumnMerge::LastByTime => {
+            let col = &columns[col_idx];
+            let time_col = format!("{col}__sel_time");
+            pick_by_time(left, right, left_row, right_row, columns, &time_col, false)
+        }
+    }
+}
+
+fn pick_by_time(
+    left: &Value,
+    right: &Value,
+    left_row: &[Value],
+    right_row: &[Value],
+    columns: &[String],
+    time_col: &str,
+    pick_min: bool,
+) -> Value {
+    let Some(time_idx) = columns.iter().position(|c| c == time_col) else {
+        return left.clone();
+    };
+    let lt = json_as_i64(&left_row[time_idx]);
+    let rt = json_as_i64(&right_row[time_idx]);
+    match (lt, rt) {
+        (Some(a), Some(b)) if a == b => left.clone(),
+        (Some(a), Some(b)) if pick_min && a <= b => left.clone(),
+        (Some(a), Some(b)) if !pick_min && a >= b => left.clone(),
+        (Some(_), Some(_)) => right.clone(),
+        (Some(_), None) => left.clone(),
+        (None, Some(_)) => right.clone(),
+        (None, None) => left.clone(),
     }
 }
 
@@ -279,16 +692,19 @@ fn merge_row(
     left: &[Value],
     right: &[Value],
 ) -> Vec<Value> {
-    let mut mean_counts = vec![1u64; columns.len()];
     let mut out = left.to_vec();
     for (i, col) in columns.iter().enumerate() {
-        let rule = rules.get(col).copied().unwrap_or(ColumnMerge::Passthrough);
-        out[i] = merge_values(&out[i], &right[i], rule, &mut mean_counts[i]);
+        let rule = rules.get(col).copied().unwrap_or(ColumnMerge::Unsupported);
+        out[i] = merge_values(&out[i], &right[i], rule, columns, i, left, right);
     }
     out
 }
 
-fn merge_aggregate_parts(parts: Vec<QueryResponse>, stmt: &SelectStatement) -> QueryResponse {
+fn merge_aggregate_parts(
+    parts: Vec<QueryResponse>,
+    stmt: &SelectStatement,
+    plan: Option<&ShardedQueryPlan>,
+) -> QueryResponse {
     if parts.is_empty() {
         return QueryResponse::empty(0);
     }
@@ -304,14 +720,308 @@ fn merge_aggregate_parts(parts: Vec<QueryResponse>, stmt: &SelectStatement) -> Q
         .first()
         .map(|r| r.statement_id)
         .unwrap_or(0);
-    let rules = column_merge_rules(stmt);
+    let rules = plan
+        .map(|p| p.merge_rules.clone())
+        .unwrap_or_else(|| column_merge_rules(stmt));
+    let row_key_distinct_cols = plan
+        .map(|p| p.row_key_distinct_cols.clone())
+        .unwrap_or_default();
 
-    merge_rows_with_rules(parts, statement_id, &rules)
+    merge_rows_with_rules(parts, statement_id, &rules, &row_key_distinct_cols)
+}
+
+fn finalize_sharded_aggregates(response: QueryResponse, plan: &ShardedQueryPlan) -> QueryResponse {
+    let Some(mut results) = response.results.into_iter().next() else {
+        return QueryResponse::empty(0);
+    };
+    let Some(series_list) = results.series.take() else {
+        return QueryResponse::single(results.statement_id, vec![]);
+    };
+
+    let finalized: Vec<SeriesResult> = series_list
+        .into_iter()
+        .map(|series| finalize_series_aggregates(series, plan))
+        .collect();
+
+    QueryResponse::single(results.statement_id, finalized)
+}
+
+fn finalize_series_aggregates(mut series: SeriesResult, plan: &ShardedQueryPlan) -> SeriesResult {
+    if !plan.count_distinct_outputs.is_empty() {
+        series = collapse_count_distinct(series, plan);
+    }
+
+    let drop_cols: HashSet<String> = plan
+        .mean_partials
+        .values()
+        .flat_map(|p| [p.sum_col.clone(), p.count_col.clone()])
+        .chain(
+            plan.first_partials
+                .values()
+                .chain(plan.last_partials.values())
+                .cloned(),
+        )
+        .chain(
+            plan.stddev_partials
+                .values()
+                .flat_map(|p| [p.sum_col.clone(), p.sumsq_col.clone(), p.count_col.clone()]),
+        )
+        .collect();
+
+    let mut new_columns = Vec::new();
+    let mut col_map = HashMap::new();
+    for (output, partial) in &plan.mean_partials {
+        let sum_idx = series.columns.iter().position(|c| c == &partial.sum_col);
+        let count_idx = series.columns.iter().position(|c| c == &partial.count_col);
+        if let (Some(si), Some(ci)) = (sum_idx, count_idx) {
+            col_map.insert(output.clone(), (si, ci));
+            new_columns.push(output.clone());
+        }
+    }
+    for (output, partial) in &plan.stddev_partials {
+        let sum_idx = series.columns.iter().position(|c| c == &partial.sum_col);
+        let sumsq_idx = series.columns.iter().position(|c| c == &partial.sumsq_col);
+        let count_idx = series.columns.iter().position(|c| c == &partial.count_col);
+        if let (Some(si), Some(sqi), Some(ci)) = (sum_idx, sumsq_idx, count_idx) {
+            col_map.insert(output.clone(), (si, sqi * 1000 + ci));
+            new_columns.push(output.clone());
+        }
+    }
+
+    let keep_cols: Vec<(usize, String)> = series
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| {
+            !drop_cols.contains(*c)
+                && !plan.mean_partials.contains_key(*c)
+                && !plan.stddev_partials.contains_key(*c)
+                && !plan.count_distinct_outputs.contains_key(*c)
+        })
+        .map(|(i, c)| (i, c.clone()))
+        .collect();
+
+    if col_map.is_empty() && keep_cols.len() == series.columns.len() {
+        return series;
+    }
+
+    let mut final_columns: Vec<String> = Vec::new();
+    let mut value_builders: Vec<Vec<Value>> = Vec::new();
+
+    for (idx, col) in &keep_cols {
+        final_columns.push(col.clone());
+        value_builders.push(series.values.iter().map(|row| row[*idx].clone()).collect());
+    }
+
+    for (output, (si, ci)) in &col_map {
+        if plan.mean_partials.contains_key(output) {
+            final_columns.push(output.clone());
+            let means: Vec<Value> = series
+                .values
+                .iter()
+                .map(|row| {
+                    let sum = json_as_f64(&row[*si]).unwrap_or(0.0);
+                    let count = json_as_f64(&row[*ci]).unwrap_or(0.0);
+                    if count == 0.0 {
+                        Value::Null
+                    } else {
+                        json!(sum / count)
+                    }
+                })
+                .collect();
+            value_builders.push(means);
+        } else if let Some(partial) = plan.stddev_partials.get(output) {
+            let sum_idx = series
+                .columns
+                .iter()
+                .position(|c| c == &partial.sum_col)
+                .unwrap_or(*si);
+            let sumsq_idx = series
+                .columns
+                .iter()
+                .position(|c| c == &partial.sumsq_col)
+                .unwrap_or(*si);
+            let count_idx = series
+                .columns
+                .iter()
+                .position(|c| c == &partial.count_col)
+                .unwrap_or(*ci);
+            final_columns.push(output.clone());
+            let stddevs: Vec<Value> = series
+                .values
+                .iter()
+                .map(|row| {
+                    let sum = json_as_f64(&row[sum_idx]).unwrap_or(0.0);
+                    let sumsq = json_as_f64(&row[sumsq_idx]).unwrap_or(0.0);
+                    let count = json_as_f64(&row[count_idx]).unwrap_or(0.0);
+                    if count < 2.0 {
+                        return Value::Null;
+                    }
+                    let n = count;
+                    let var = (sumsq - (sum * sum) / n) / (n - 1.0);
+                    if var <= 0.0 {
+                        json!(0.0)
+                    } else {
+                        json!(var.sqrt())
+                    }
+                })
+                .collect();
+            value_builders.push(stddevs);
+        }
+    }
+
+    let row_count = series.values.len();
+    let mut new_values = Vec::with_capacity(row_count);
+    for row_idx in 0..row_count {
+        let mut row = Vec::with_capacity(final_columns.len());
+        for col_values in &value_builders {
+            row.push(col_values[row_idx].clone());
+        }
+        new_values.push(row);
+    }
+
+    series.columns = final_columns;
+    series.values = new_values;
+    series
+}
+
+fn collapse_count_distinct(mut series: SeriesResult, plan: &ShardedQueryPlan) -> SeriesResult {
+    for (count_col, distinct_col) in &plan.count_distinct_outputs {
+        let Some(distinct_idx) = series.columns.iter().position(|c| c == distinct_col) else {
+            continue;
+        };
+        let time_idx = series
+            .columns
+            .iter()
+            .position(|c| c == "time" || c == "__time");
+
+        let mut groups: HashMap<String, (HashSet<String>, Vec<usize>)> = HashMap::new();
+        for row in series.values.iter() {
+            let mut key = String::new();
+            if let Some(ti) = time_idx {
+                key.push_str(&row[ti].to_string());
+            }
+            key.push('|');
+            key.push_str(&format!("{:?}", series.tags));
+            groups
+                .entry(key)
+                .or_default()
+                .0
+                .insert(row[distinct_idx].to_string());
+        }
+
+        let mut new_columns: Vec<String> = series
+            .columns
+            .iter()
+            .filter(|c| *c != distinct_col)
+            .cloned()
+            .collect();
+        let count_out_idx = match new_columns.iter().position(|c| c == count_col) {
+            Some(i) => i,
+            None => {
+                new_columns.push(count_col.clone());
+                new_columns.len() - 1
+            }
+        };
+
+        let mut new_values = Vec::new();
+        for ((_, (distinct_set, _)), template_row) in groups.into_iter().zip(series.values.iter()) {
+            let mut row: Vec<Value> = series
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(i, c)| *i != distinct_idx && **c != *count_col)
+                .map(|(i, _)| template_row[i].clone())
+                .collect();
+            while row.len() <= count_out_idx {
+                row.push(Value::Null);
+            }
+            row[count_out_idx] = json!(distinct_set.len());
+            new_values.push(row);
+        }
+
+        series.columns = new_columns;
+        series.values = new_values;
+    }
+    series
+}
+
+fn apply_global_sort_limit_offset(
+    response: QueryResponse,
+    original: &SelectStatement,
+    plan: &ShardedQueryPlan,
+) -> QueryResponse {
+    let Some(mut results) = response.results.into_iter().next() else {
+        return QueryResponse::empty(0);
+    };
+    let Some(mut series_list) = results.series.take() else {
+        return QueryResponse::single(results.statement_id, vec![]);
+    };
+
+    if series_list.is_empty() {
+        return QueryResponse::single(results.statement_id, series_list);
+    }
+
+    let time_desc = plan
+        .saved_time_desc
+        .unwrap_or_else(|| original.order_by.as_ref().is_some_and(|o| o.time_desc));
+
+    let time_idx = series_list[0]
+        .columns
+        .iter()
+        .position(|c| c == "time" || c == "__time");
+
+    let mut flat: Vec<(usize, Vec<Value>)> = Vec::new();
+    for (series_idx, series) in series_list.iter().enumerate() {
+        for row in &series.values {
+            flat.push((series_idx, row.clone()));
+        }
+    }
+
+    flat.sort_by(|a, b| {
+        if let Some(ti) = time_idx {
+            let at = json_sortable_time(&a.1[ti]);
+            let bt = json_sortable_time(&b.1[ti]);
+            if time_desc { bt.cmp(&at) } else { at.cmp(&bt) }
+        } else {
+            let av = a.1.first().map(|v| v.to_string()).unwrap_or_default();
+            let bv = b.1.first().map(|v| v.to_string()).unwrap_or_default();
+            if time_desc { bv.cmp(&av) } else { av.cmp(&bv) }
+        }
+    });
+
+    let offset = plan.saved_offset.unwrap_or(0) as usize;
+    if offset > 0 {
+        if offset >= flat.len() {
+            flat.clear();
+        } else {
+            flat.drain(0..offset);
+        }
+    }
+    if let Some(limit) = plan.saved_limit {
+        let limit = limit as usize;
+        if flat.len() > limit {
+            flat.truncate(limit);
+        }
+    }
+
+    for series in &mut series_list {
+        series.values.clear();
+    }
+    for (series_idx, row) in flat {
+        series_list[series_idx].values.push(row);
+    }
+    series_list.retain(|s| !s.values.is_empty());
+
+    QueryResponse::single(results.statement_id, series_list)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::timeseriesql::ast::{
+        Dimension, Duration, DurationUnit, Expr, Field, FunctionCall, GroupBy, SelectStatement,
+    };
     use serde_json::json;
 
     #[test]
@@ -342,8 +1052,6 @@ mod tests {
 
     #[test]
     fn merges_global_count_across_regions() {
-        use crate::timeseriesql::ast::{Expr, Field, FunctionCall, SelectStatement};
-
         let stmt = SelectStatement {
             fields: vec![Field {
                 expr: Expr::Call(FunctionCall {
@@ -378,7 +1086,7 @@ mod tests {
             )
         };
 
-        let merged = merge_sharded_query_results(vec![partial(5), partial(16)], &stmt);
+        let merged = merge_sharded_query_results(vec![partial(5), partial(16)], &stmt, None);
         let series = merged.results[0].series.as_ref().unwrap();
         assert_eq!(series.len(), 1);
         assert_eq!(series[0].values.len(), 1);
@@ -387,10 +1095,6 @@ mod tests {
 
     #[test]
     fn merges_group_by_time_buckets() {
-        use crate::timeseriesql::ast::{
-            Dimension, Expr, Field, FunctionCall, GroupBy, SelectStatement,
-        };
-
         let stmt = SelectStatement {
             fields: vec![Field {
                 expr: Expr::Call(FunctionCall {
@@ -404,9 +1108,9 @@ mod tests {
             condition: None,
             group_by: Some(GroupBy {
                 dimensions: vec![Dimension::Time {
-                    interval: crate::timeseriesql::ast::Duration {
+                    interval: Duration {
                         value: 1,
-                        unit: crate::timeseriesql::ast::DurationUnit::Hour,
+                        unit: DurationUnit::Hour,
                     },
                     offset: None,
                 }],
@@ -433,11 +1137,483 @@ mod tests {
             )
         };
 
-        let merged = merge_sharded_query_results(vec![partial(3), partial(7)], &stmt);
+        let merged = merge_sharded_query_results(vec![partial(3), partial(7)], &stmt, None);
         let series = merged.results[0].series.as_ref().unwrap();
         assert_eq!(series.len(), 1);
         assert_eq!(series[0].values.len(), 1);
         assert_eq!(series[0].values[0][1], json!(10));
+    }
+
+    #[test]
+    fn merges_mean_via_sum_and_count_partials() {
+        let stmt = SelectStatement {
+            fields: vec![Field {
+                expr: Expr::Call(FunctionCall {
+                    name: "mean".into(),
+                    args: vec![Expr::Identifier("value".into())],
+                }),
+                alias: None,
+            }],
+            into: None,
+            from: vec![],
+            condition: None,
+            group_by: Some(GroupBy {
+                dimensions: vec![Dimension::Time {
+                    interval: Duration {
+                        value: 1,
+                        unit: DurationUnit::Hour,
+                    },
+                    offset: None,
+                }],
+            }),
+            order_by: None,
+            limit: None,
+            offset: None,
+            slimit: None,
+            soffset: None,
+            fill: None,
+            timezone: None,
+        };
+        let plan = prepare_sharded_region_query(&stmt).unwrap();
+
+        let partial = |sum: i64, count: i64| {
+            QueryResponse::single(
+                0,
+                vec![SeriesResult {
+                    name: "metrics".into(),
+                    tags: None,
+                    columns: vec!["time".into(), "sum_value".into(), "count_value".into()],
+                    values: vec![vec![json!(1000), json!(sum), json!(count)]],
+                    partial: None,
+                }],
+            )
+        };
+
+        let merged =
+            merge_sharded_query_results(vec![partial(10, 2), partial(20, 3)], &stmt, Some(&plan));
+        let row = &merged.results[0].series.as_ref().unwrap()[0].values[0];
+        assert_eq!(row[0], json!(1000));
+        assert_eq!(row[1], json!(6.0));
+    }
+
+    #[test]
+    fn merges_first_by_earliest_selection_time() {
+        let stmt = SelectStatement {
+            fields: vec![Field {
+                expr: Expr::Call(FunctionCall {
+                    name: "first".into(),
+                    args: vec![Expr::Identifier("value".into())],
+                }),
+                alias: None,
+            }],
+            into: None,
+            from: vec![],
+            condition: None,
+            group_by: Some(GroupBy {
+                dimensions: vec![Dimension::Time {
+                    interval: Duration {
+                        value: 1,
+                        unit: DurationUnit::Hour,
+                    },
+                    offset: None,
+                }],
+            }),
+            order_by: None,
+            limit: None,
+            offset: None,
+            slimit: None,
+            soffset: None,
+            fill: None,
+            timezone: None,
+        };
+        let plan = prepare_sharded_region_query(&stmt).unwrap();
+
+        let partial = |value: i64, sel_time: i64| {
+            QueryResponse::single(
+                0,
+                vec![SeriesResult {
+                    name: "metrics".into(),
+                    tags: None,
+                    columns: vec![
+                        "time".into(),
+                        "first_value".into(),
+                        "first_value__sel_time".into(),
+                    ],
+                    values: vec![vec![json!(1000), json!(value), json!(sel_time)]],
+                    partial: None,
+                }],
+            )
+        };
+
+        let merged = merge_sharded_query_results(
+            vec![partial(10, 2000), partial(99, 500)],
+            &stmt,
+            Some(&plan),
+        );
+        let row = &merged.results[0].series.as_ref().unwrap()[0].values[0];
+        assert_eq!(row[1], json!(99));
+    }
+
+    #[test]
+    fn merges_last_by_latest_selection_time() {
+        let stmt = SelectStatement {
+            fields: vec![Field {
+                expr: Expr::Call(FunctionCall {
+                    name: "last".into(),
+                    args: vec![Expr::Identifier("value".into())],
+                }),
+                alias: None,
+            }],
+            into: None,
+            from: vec![],
+            condition: None,
+            group_by: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+            slimit: None,
+            soffset: None,
+            fill: None,
+            timezone: None,
+        };
+        let plan = prepare_sharded_region_query(&stmt).unwrap();
+
+        let partial = |value: i64, sel_time: i64| {
+            QueryResponse::single(
+                0,
+                vec![SeriesResult {
+                    name: "metrics".into(),
+                    tags: None,
+                    columns: vec!["last_value".into(), "last_value__sel_time".into()],
+                    values: vec![vec![json!(value), json!(sel_time)]],
+                    partial: None,
+                }],
+            )
+        };
+
+        let merged = merge_sharded_query_results(
+            vec![partial(10, 1000), partial(99, 5000)],
+            &stmt,
+            Some(&plan),
+        );
+        let row = &merged.results[0].series.as_ref().unwrap()[0].values[0];
+        assert_eq!(row[0], json!(99));
+    }
+
+    #[test]
+    fn rejects_percentile_on_multi_region() {
+        let stmt = SelectStatement {
+            fields: vec![Field {
+                expr: Expr::Call(FunctionCall {
+                    name: "percentile".into(),
+                    args: vec![Expr::Identifier("value".into()), Expr::IntegerLiteral(95)],
+                }),
+                alias: None,
+            }],
+            into: None,
+            from: vec![],
+            condition: None,
+            group_by: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+            slimit: None,
+            soffset: None,
+            fill: None,
+            timezone: None,
+        };
+        let err = prepare_sharded_region_query(&stmt).unwrap_err();
+        assert!(err.to_string().contains(MULTI_REGION_UNSUPPORTED));
+    }
+
+    #[test]
+    fn merges_stddev_from_partial_moments() {
+        let stmt = SelectStatement {
+            fields: vec![Field {
+                expr: Expr::Call(FunctionCall {
+                    name: "stddev".into(),
+                    args: vec![Expr::Identifier("value".into())],
+                }),
+                alias: None,
+            }],
+            into: None,
+            from: vec![],
+            condition: None,
+            group_by: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+            slimit: None,
+            soffset: None,
+            fill: None,
+            timezone: None,
+        };
+        let plan = prepare_sharded_region_query(&stmt).unwrap();
+
+        // Region A: values 2,4 -> sum=6, sumsq=20, count=2
+        // Region B: value 6 -> sum=6, sumsq=36, count=1
+        // Combined: sum=12, sumsq=56, count=3, mean=4, sample var = (56 - 144/3)/2 = 4, stddev=2
+        let partial = |sum: i64, sumsq: i64, count: i64| {
+            QueryResponse::single(
+                0,
+                vec![SeriesResult {
+                    name: "metrics".into(),
+                    tags: None,
+                    columns: vec![
+                        "stddev_sum_value".into(),
+                        "stddev_sumsq_value".into(),
+                        "stddev_count_value".into(),
+                    ],
+                    values: vec![vec![json!(sum), json!(sumsq), json!(count)]],
+                    partial: None,
+                }],
+            )
+        };
+
+        let merged = merge_sharded_query_results(
+            vec![partial(6, 20, 2), partial(6, 36, 1)],
+            &stmt,
+            Some(&plan),
+        );
+        let row = &merged.results[0].series.as_ref().unwrap()[0].values[0];
+        let stddev = row[0].as_f64().unwrap();
+        assert!(
+            (stddev - 2.0).abs() < 0.001,
+            "expected stddev 2.0, got {stddev}"
+        );
+    }
+
+    #[test]
+    fn prepare_desc_query_records_time_desc() {
+        use crate::timeseriesql::parser::parse_query;
+
+        let stmt = match parse_query("SELECT value FROM cpu ORDER BY time DESC LIMIT 2")
+            .unwrap()
+            .remove(0)
+        {
+            crate::timeseriesql::ast::Statement::Select(s) => s,
+            _ => panic!("select"),
+        };
+        assert!(stmt.order_by.as_ref().unwrap().time_desc);
+        let plan = prepare_sharded_region_query(&stmt).unwrap();
+        assert_eq!(plan.saved_time_desc, Some(true));
+        assert_eq!(plan.saved_limit, Some(2));
+    }
+
+    #[test]
+    fn global_sort_applies_descending_order() {
+        let stmt = SelectStatement {
+            fields: vec![Field {
+                expr: Expr::Identifier("value".into()),
+                alias: None,
+            }],
+            into: None,
+            from: vec![],
+            condition: None,
+            group_by: None,
+            order_by: Some(crate::timeseriesql::ast::OrderBy { time_desc: false }),
+            limit: Some(2),
+            offset: Some(1),
+            slimit: None,
+            soffset: None,
+            fill: None,
+            timezone: None,
+        };
+        let plan = prepare_sharded_region_query(&stmt).unwrap();
+
+        let partial = |values: Vec<i64>| {
+            QueryResponse::single(
+                0,
+                vec![SeriesResult {
+                    name: "cpu".into(),
+                    tags: None,
+                    columns: vec!["time".into(), "value".into()],
+                    values: values
+                        .into_iter()
+                        .map(|v| vec![json!(v), json!(v * 10)])
+                        .collect(),
+                    partial: None,
+                }],
+            )
+        };
+
+        let merged = merge_sharded_query_results(
+            vec![partial(vec![1000, 3000]), partial(vec![2000, 4000])],
+            &stmt,
+            Some(&plan),
+        );
+        let values = &merged.results[0].series.as_ref().unwrap()[0].values;
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0][0], json!(2000));
+        assert_eq!(values[1][0], json!(3000));
+    }
+
+    #[test]
+    fn applies_global_limit_offset_desc_after_merge() {
+        let stmt = SelectStatement {
+            fields: vec![Field {
+                expr: Expr::Identifier("value".into()),
+                alias: None,
+            }],
+            into: None,
+            from: vec![],
+            condition: None,
+            group_by: None,
+            order_by: Some(crate::timeseriesql::ast::OrderBy { time_desc: true }),
+            limit: Some(2),
+            offset: None,
+            slimit: None,
+            soffset: None,
+            fill: None,
+            timezone: None,
+        };
+        let plan = prepare_sharded_region_query(&stmt).unwrap();
+
+        let partial = |values: Vec<i64>| {
+            QueryResponse::single(
+                0,
+                vec![SeriesResult {
+                    name: "cpu".into(),
+                    tags: None,
+                    columns: vec!["time".into(), "value".into()],
+                    values: values
+                        .into_iter()
+                        .map(|v| vec![json!(v), json!(v / 100_000_000)])
+                        .collect(),
+                    partial: None,
+                }],
+            )
+        };
+
+        let merged = merge_sharded_query_results(
+            vec![
+                partial(vec![1_000_000_000, 3_000_000_000]),
+                partial(vec![2_000_000_000, 4_000_000_000]),
+            ],
+            &stmt,
+            Some(&plan),
+        );
+        let values = &merged.results[0].series.as_ref().unwrap()[0].values;
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0][1].as_f64().unwrap(), 40.0);
+        assert_eq!(values[1][1].as_f64().unwrap(), 30.0);
+    }
+
+    #[test]
+    fn applies_global_limit_offset_desc_with_rfc3339_times() {
+        let stmt = SelectStatement {
+            fields: vec![Field {
+                expr: Expr::Identifier("value".into()),
+                alias: None,
+            }],
+            into: None,
+            from: vec![],
+            condition: None,
+            group_by: None,
+            order_by: Some(crate::timeseriesql::ast::OrderBy { time_desc: true }),
+            limit: Some(2),
+            offset: None,
+            slimit: None,
+            soffset: None,
+            fill: None,
+            timezone: None,
+        };
+        let plan = prepare_sharded_region_query(&stmt).unwrap();
+
+        let partial = |times: &[&str], values: &[f64]| {
+            QueryResponse::single(
+                0,
+                vec![SeriesResult {
+                    name: "cpu".into(),
+                    tags: None,
+                    columns: vec!["time".into(), "value".into()],
+                    values: times
+                        .iter()
+                        .zip(values)
+                        .map(|(t, v)| vec![json!(t), json!(v)])
+                        .collect(),
+                    partial: None,
+                }],
+            )
+        };
+
+        let merged = merge_sharded_query_results(
+            vec![
+                partial(
+                    &["1970-01-01T00:00:01Z", "1970-01-01T00:00:02Z"],
+                    &[10.0, 20.0],
+                ),
+                partial(
+                    &["1970-01-01T00:00:03Z", "1970-01-01T00:00:04Z"],
+                    &[30.0, 40.0],
+                ),
+            ],
+            &stmt,
+            Some(&plan),
+        );
+        let values = &merged.results[0].series.as_ref().unwrap()[0].values;
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0][1].as_f64().unwrap(), 40.0);
+        assert_eq!(values[1][1].as_f64().unwrap(), 30.0);
+    }
+
+    #[test]
+    fn applies_global_limit_offset_desc_with_multi_tag_series() {
+        let stmt = SelectStatement {
+            fields: vec![Field {
+                expr: Expr::Identifier("value".into()),
+                alias: None,
+            }],
+            into: None,
+            from: vec![],
+            condition: None,
+            group_by: None,
+            order_by: Some(crate::timeseriesql::ast::OrderBy { time_desc: true }),
+            limit: Some(2),
+            offset: None,
+            slimit: None,
+            soffset: None,
+            fill: None,
+            timezone: None,
+        };
+        let plan = prepare_sharded_region_query(&stmt).unwrap();
+
+        let partial = |host: &str, times: &[i64], values: &[f64]| {
+            QueryResponse::single(
+                0,
+                vec![SeriesResult {
+                    name: "cpu".into(),
+                    tags: Some(HashMap::from([("host".into(), host.into())])),
+                    columns: vec!["time".into(), "value".into()],
+                    values: times
+                        .iter()
+                        .zip(values)
+                        .map(|(t, v)| vec![json!(t), json!(v)])
+                        .collect(),
+                    partial: None,
+                }],
+            )
+        };
+
+        let merged = merge_sharded_query_results(
+            vec![
+                partial("host_low", &[1_000_000_000, 2_000_000_000], &[10.0, 20.0]),
+                partial("host_high", &[3_000_000_000, 4_000_000_000], &[30.0, 40.0]),
+            ],
+            &stmt,
+            Some(&plan),
+        );
+        let mut values: Vec<f64> = merged.results[0]
+            .series
+            .as_ref()
+            .unwrap()
+            .iter()
+            .flat_map(|s| s.values.iter().map(|row| row[1].as_f64().unwrap()))
+            .collect();
+        values.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0], 40.0);
+        assert_eq!(values[1], 30.0);
     }
 
     fn mv_meta_sum() -> MeasurementMeta {
@@ -512,7 +1688,7 @@ mod tests {
             ]),
             mean_fields: HashMap::from([(
                 "value".into(),
-                crate::domain::rollup::MeanRollupField {
+                MeanRollupField {
                     sum_col: "sum_value".into(),
                     count_col: "count_value".into(),
                 },

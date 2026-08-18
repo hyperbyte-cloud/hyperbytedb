@@ -10,6 +10,7 @@ use metrics::{counter, histogram};
 use crate::adapters::cluster::peer_client::PeerClient;
 use crate::adapters::cluster::raft::types::{ClusterRequest, ClusterResponse};
 use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
+use crate::application::runtime::RegionWriteStats;
 use crate::application::shard_peer_resolution::{
     RegionTargetRole, ScatterKind, active_region_peer_targets, is_active_peer, peer_addr,
     resolve_region_peers,
@@ -31,6 +32,7 @@ pub struct ShardRoutingContext {
     pub config: ShardingConfig,
     pub node_id: u64,
     pub peer_client: Arc<PeerClient>,
+    pub region_write_stats: Arc<RegionWriteStats>,
 }
 
 pub struct PointBuckets {
@@ -360,6 +362,17 @@ async fn try_forward_shard_write_to_region(
         .ok_or_else(|| HyperbytedbError::ShardMap("region missing for forward".into()))?
         .clone();
 
+    if !ctx
+        .location_cache
+        .check_epoch(&map, db, rp, meas, sid, region.epoch)
+    {
+        ctx.location_cache
+            .invalidate_measurement(&MeasurementKey::new(db, rp, meas));
+        return Err(HyperbytedbError::StaleShardEpoch {
+            region_id: region.region_id,
+        });
+    }
+
     let precision_val = Precision::from_str_opt(precision);
     let body = encode_points_to_line_protocol(points, precision_val)?;
     let req = ShardWriteRequest {
@@ -635,6 +648,7 @@ mod scatter_tests {
             config,
             node_id,
             peer_client,
+            region_write_stats: Arc::new(RegionWriteStats::new()),
         }
     }
 

@@ -31,6 +31,19 @@ pub trait MetadataPort: Send + Sync {
         measurement: Option<&str>,
         predicate_sql: &str,
     ) -> Result<usize, HyperbytedbError>;
+
+    /// Delete series metadata rows whose `series_id` lies in `[start, end)`.
+    async fn delete_series_in_range(
+        &self,
+        db: &str,
+        rp: &str,
+        measurement: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<usize, HyperbytedbError> {
+        let _ = (db, rp, measurement, start, end);
+        Ok(0)
+    }
     async fn drop_database(&self, name: &str) -> Result<(), HyperbytedbError>;
     async fn list_databases(&self) -> Result<Vec<Database>, HyperbytedbError>;
     async fn get_database(&self, name: &str) -> Result<Option<Database>, HyperbytedbError>;
@@ -243,6 +256,26 @@ pub trait MetadataPort: Send + Sync {
             .into_iter()
             .filter(|id| *id >= start && *id < end)
             .count() as u64)
+    }
+
+    /// Median `series_id` in `[start, end)` from the local metadata catalog scan.
+    ///
+    /// Returns `None` when the range is empty; default scans all IDs.
+    async fn median_series_id_in_range(
+        &self,
+        db: &str,
+        rp: &str,
+        measurement: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Option<u64>, HyperbytedbError> {
+        let mut ids = self.list_series_ids(db, rp, measurement).await?;
+        ids.retain(|id| *id >= start && *id < end);
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        ids.sort_unstable();
+        Ok(Some(ids[ids.len() / 2]))
     }
 
     /// Resolve a single `series_id` to its tag set.

@@ -32,7 +32,7 @@ use crate::domain::database::Precision;
 use crate::domain::measurement::MeasurementMeta;
 use crate::domain::query_result::{QueryResponse, SeriesResult, StatementResult};
 use crate::domain::sharding::query_merge::{
-    merge_materialized_rollup_results, merge_sharded_query_results,
+    merge_materialized_rollup_results, merge_sharded_query_results, prepare_sharded_region_query,
 };
 use crate::domain::sharding::{ShardQueryRequest, ShardRegion};
 use crate::error::HyperbytedbError;
@@ -2138,6 +2138,7 @@ async fn query_sharded_region(
     epoch: Option<&str>,
     resolved_group_by_tags: &[String],
     materialized_meta: Option<&MeasurementMeta>,
+    aggregate_authoritative: bool,
 ) -> Result<Vec<SeriesResult>, HyperbytedbError> {
     match try_query_sharded_region(
         svc,
@@ -2152,6 +2153,7 @@ async fn query_sharded_region(
         epoch,
         resolved_group_by_tags,
         materialized_meta,
+        aggregate_authoritative,
     )
     .await
     {
@@ -2170,6 +2172,7 @@ async fn query_sharded_region(
                 epoch,
                 resolved_group_by_tags,
                 materialized_meta,
+                aggregate_authoritative,
             )
             .await
         }
@@ -2191,6 +2194,7 @@ async fn try_query_sharded_region(
     epoch: Option<&str>,
     resolved_group_by_tags: &[String],
     materialized_meta: Option<&MeasurementMeta>,
+    aggregate_authoritative: bool,
 ) -> Result<Vec<SeriesResult>, HyperbytedbError> {
     if let Some(meta) = materialized_meta {
         return query_materialized_region_all_peers(
@@ -2210,9 +2214,17 @@ async fn try_query_sharded_region(
         .await;
     }
 
-    if region.peers.contains(&ctx.node_id) {
+    let route_to_primary = aggregate_authoritative
+        && region.peers.contains(&ctx.node_id)
+        && ctx.node_id != region.primary;
+
+    if region.peers.contains(&ctx.node_id) && !route_to_primary {
         let raw = svc.query_port.execute_sql(region_sql).await?;
         return parse_json_each_row_to_series(&raw, measurement, epoch, resolved_group_by_tags);
+    }
+
+    if route_to_primary {
+        metrics::counter!("hyperbytedb_shard_query_aggregate_primary_routed_total").increment(1);
     }
 
     let req = ShardQueryRequest {
@@ -2229,10 +2241,15 @@ async fn try_query_sharded_region(
     };
 
     let region_id = region.region_id;
+    let scatter_role = if aggregate_authoritative {
+        RegionTargetRole::PrimaryRead
+    } else {
+        RegionTargetRole::Read
+    };
     let raw = scatter_to_region_peers(
         ctx,
         region,
-        RegionTargetRole::Read,
+        scatter_role,
         ScatterKind::Query,
         |peer_id, addr, timeout| {
             let req = req.clone();
@@ -2424,14 +2441,6 @@ async fn execute_sharded_measurement_query(
             force: !tombstones.is_empty(),
             tag_columns: &series_tag_columns,
         });
-    let mut sql = to_clickhouse::translate_native_table(
-        &effective_stmt,
-        table.as_str(),
-        effective_mapping.as_ref(),
-        series_join,
-        Some((time_min, time_max)),
-    )?;
-    sql = inject_tombstone_predicates(sql, &tombstones);
 
     let t_min = time_min.unwrap_or(i64::MIN);
     let t_max = time_max.unwrap_or(i64::MAX);
@@ -2441,7 +2450,37 @@ async fn execute_sharded_measurement_query(
     } else {
         select_regions_for_query(space, measurement, &effective_stmt)
     };
-    let selected_regions = region_selection.regions(space);
+    let is_global_aggregate = !is_materialized_dest && select_has_true_aggregate(&effective_stmt);
+    let selected_regions: Vec<ShardRegion> = if space.regions.len() > 1 && is_global_aggregate {
+        space.regions.clone()
+    } else {
+        region_selection
+            .regions(space)
+            .into_iter()
+            .cloned()
+            .collect()
+    };
+
+    let sharded_plan = if !is_materialized_dest
+        && (selected_regions.len() > 1 || (space.regions.len() > 1 && is_global_aggregate))
+    {
+        Some(prepare_sharded_region_query(&effective_stmt)?)
+    } else {
+        None
+    };
+    let translate_stmt = sharded_plan
+        .as_ref()
+        .map(|plan| &plan.region_stmt)
+        .unwrap_or(&effective_stmt);
+
+    let mut sql = to_clickhouse::translate_native_table(
+        translate_stmt,
+        table.as_str(),
+        effective_mapping.as_ref(),
+        series_join,
+        Some((time_min, time_max)),
+    )?;
+    sql = inject_tombstone_predicates(sql, &tombstones);
     tracing::debug!(
         db,
         rp,
@@ -2467,7 +2506,7 @@ async fn execute_sharded_measurement_query(
 
     let materialized_meta_ref = measurement_meta.as_ref().filter(|_| is_materialized_dest);
 
-    let region_futures = selected_regions.into_iter().map(|region| {
+    let region_futures = selected_regions.iter().map(|region| {
         let region_sql = if is_materialized_dest {
             sql.clone()
         } else {
@@ -2486,6 +2525,7 @@ async fn execute_sharded_measurement_query(
             epoch,
             &resolved_group_by_tags,
             materialized_meta_ref,
+            is_global_aggregate,
         )
     });
     let region_results = futures::future::try_join_all(region_futures).await?;
@@ -2499,7 +2539,7 @@ async fn execute_sharded_measurement_query(
     if parts.is_empty() {
         return Ok(Vec::new());
     }
-    if parts.len() == 1 && !is_materialized_dest {
+    if parts.len() == 1 && !is_materialized_dest && sharded_plan.is_none() {
         let Some(part) = parts.pop() else {
             return Ok(Vec::new());
         };
@@ -2511,12 +2551,12 @@ async fn execute_sharded_measurement_query(
         })?;
         let combined = merge_materialized_rollup_results(parts, &meta);
         if select_has_true_aggregate(&effective_stmt) {
-            merge_sharded_query_results(vec![combined], &effective_stmt)
+            merge_sharded_query_results(vec![combined], &effective_stmt, None)
         } else {
             combined
         }
     } else {
-        merge_sharded_query_results(parts, &effective_stmt)
+        merge_sharded_query_results(parts, &effective_stmt, sharded_plan.as_ref())
     };
     Ok(merged.results[0].series.clone().unwrap_or_default())
 }

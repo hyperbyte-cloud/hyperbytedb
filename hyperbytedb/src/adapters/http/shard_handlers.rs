@@ -17,14 +17,54 @@ use crate::application::shard_transfer::apply_transfer;
 use crate::application::sharded_mv_backfill::apply_mv_backfill_sql;
 use crate::application::wal_append::append_points_with_prepared;
 use crate::domain::sharding::{
-    RegionHeartbeat, ShardBootstrapRequest, ShardDeleteRequest, ShardMapJson, ShardMetadataKind,
-    ShardMetadataRequest, ShardMvBackfillRequest, ShardQueryRequest, ShardTransferPayload,
-    ShardWriteRequest,
+    RegionHeartbeat, ShardBootstrapRequest, ShardDeleteRequest, ShardMap, ShardMapJson,
+    ShardMetadataKind, ShardMetadataRequest, ShardMvBackfillRequest, ShardQueryRequest,
+    ShardRegion, ShardTransferPayload, ShardWriteRequest,
 };
 use crate::ports::replication::OutboundReplicationBatch;
 use crate::ports::sharding::ShardMapPort;
 
 use super::router::AppState;
+
+fn lookup_region(
+    map: &ShardMap,
+    db: &str,
+    rp: &str,
+    measurement: &str,
+    region_id: u64,
+) -> Option<ShardRegion> {
+    map.space(db, rp, measurement)
+        .and_then(|space| space.regions.iter().find(|r| r.region_id == region_id))
+        .cloned()
+}
+
+fn lookup_region_by_id(map: &ShardMap, region_id: u64) -> Option<ShardRegion> {
+    map.spaces.values().find_map(|space| {
+        space
+            .regions
+            .iter()
+            .find(|r| r.region_id == region_id)
+            .cloned()
+    })
+}
+
+fn lookup_region_in_db_rp(
+    map: &ShardMap,
+    db: &str,
+    rp: &str,
+    region_id: u64,
+) -> Option<ShardRegion> {
+    map.spaces.values().find_map(|space| {
+        if space.key.db != db || space.key.rp != rp {
+            return None;
+        }
+        space
+            .regions
+            .iter()
+            .find(|r| r.region_id == region_id)
+            .cloned()
+    })
+}
 
 pub async fn handle_shard_bootstrap(
     State(state): State<Arc<AppState>>,
@@ -144,12 +184,13 @@ pub async fn handle_shard_map(State(state): State<Arc<AppState>>) -> impl IntoRe
     let Some(shard_map) = state.shard_map.as_ref() else {
         return Json(ShardMapJson {
             map_version: 0,
+            next_region_id: 1,
             spaces: Vec::new(),
         })
         .into_response();
     };
     match shard_map.snapshot().await {
-        Ok(map) => Json(ShardMapJson::from(&map)).into_response(),
+        Ok(map) => Json(ShardMapJson::from(map.as_ref())).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
@@ -181,12 +222,7 @@ pub async fn handle_shard_write(
         }
     };
 
-    let region = map.spaces.values().find_map(|s| {
-        s.regions
-            .iter()
-            .find(|r| r.region_id == req.region_id)
-            .cloned()
-    });
+    let region = lookup_region_in_db_rp(&map, &req.db, &req.rp, req.region_id);
 
     let Some(region) = region else {
         return (
@@ -243,6 +279,8 @@ pub async fn handle_shard_write(
             .into_response();
     }
 
+    let point_count = points.len() as u64;
+
     let wal_seq = match append_points_with_prepared(
         state.wal.as_ref(),
         Some(&state.points_sink),
@@ -276,13 +314,24 @@ pub async fn handle_shard_write(
             wal_seq,
             target_node_ids: Some(targets),
         };
-        let _ = dispatch_outbound_replication(
+        if let Err(e) = dispatch_outbound_replication(
             pc.clone(),
             state.node_id,
             &state.cluster_replication,
             batch,
         )
-        .await;
+        .await
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    }
+
+    if let Some(ctx) = state.shard_routing.as_ref() {
+        ctx.region_write_stats.record(req.region_id, point_count);
     }
 
     counter!("hyperbytedb_shard_forwarded_writes_applied_total").increment(1);
@@ -304,12 +353,7 @@ pub async fn handle_shard_query(
                     .into_response();
             }
         };
-        let region = map.spaces.values().find_map(|s| {
-            s.regions
-                .iter()
-                .find(|r| r.region_id == req.region_id)
-                .cloned()
-        });
+        let region = lookup_region(&map, &req.db, &req.rp, &req.measurement, req.region_id);
         let Some(region) = region else {
             return (
                 StatusCode::NOT_FOUND,
@@ -364,12 +408,7 @@ pub async fn handle_shard_mv_backfill(
                     .into_response();
             }
         };
-        let region = map.spaces.values().find_map(|s| {
-            s.regions
-                .iter()
-                .find(|r| r.region_id == req.region_id)
-                .cloned()
-        });
+        let region = lookup_region_in_db_rp(&map, &req.db, &req.rp, req.region_id);
         let Some(region) = region else {
             return (
                 StatusCode::NOT_FOUND,
@@ -408,11 +447,56 @@ pub async fn handle_shard_heartbeat(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RegionHeartbeat>,
 ) -> impl IntoResponse {
+    if let Some(ctx) = state.shard_routing.as_ref() {
+        let map = match ctx.shard_map.snapshot().await {
+            Ok(m) => m,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+                    .into_response();
+            }
+        };
+        let region = lookup_region_by_id(&map, req.region_id);
+        let Some(region) = region else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "region not found"})),
+            )
+                .into_response();
+        };
+        if region.epoch != req.epoch {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "stale epoch"})),
+            )
+                .into_response();
+        }
+        let reporter = if req.node_id != 0 {
+            req.node_id
+        } else {
+            state.node_id
+        };
+        if !region.peers.contains(&reporter) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "reporter not a region peer"})),
+            )
+                .into_response();
+        }
+    }
+
     if let Some(scheduler) = state.shard_scheduler.as_ref() {
+        let reporter = if req.node_id != 0 {
+            req.node_id
+        } else {
+            state.node_id
+        };
         scheduler
             .record_heartbeat(
                 req.region_id,
-                state.node_id,
+                reporter,
                 req.series_count,
                 req.approx_bytes,
                 req.write_qps,
@@ -437,12 +521,7 @@ pub async fn handle_shard_transfer(
                     .into_response();
             }
         };
-        let region = map.spaces.values().find_map(|s| {
-            s.regions
-                .iter()
-                .find(|r| r.region_id == req.region_id)
-                .cloned()
-        });
+        let region = lookup_region(&map, &req.db, &req.rp, &req.measurement, req.region_id);
         let Some(region) = region else {
             return (
                 StatusCode::NOT_FOUND,
@@ -504,12 +583,7 @@ pub async fn handle_shard_metadata(
                     .into_response();
             }
         };
-        let region = map.spaces.values().find_map(|s| {
-            s.regions
-                .iter()
-                .find(|r| r.region_id == req.region_id)
-                .cloned()
-        });
+        let region = lookup_region(&map, &req.db, &req.rp, &req.measurement, req.region_id);
         let Some(region) = region else {
             return (
                 StatusCode::NOT_FOUND,
@@ -600,12 +674,7 @@ pub async fn handle_shard_delete(
                     .into_response();
             }
         };
-        let region = map.spaces.values().find_map(|s| {
-            s.regions
-                .iter()
-                .find(|r| r.region_id == req.region_id)
-                .cloned()
-        });
+        let region = lookup_region(&map, &req.db, &req.rp, &req.measurement, req.region_id);
         let Some(region) = region else {
             return (
                 StatusCode::NOT_FOUND,

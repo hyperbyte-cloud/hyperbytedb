@@ -900,10 +900,11 @@ impl RaftStore {
             }
             ClusterRequest::ShardMapMutation(op) => {
                 if let Some(ref shard_map) = self.shard_map {
+                    let measurement_key = op.measurement_key().clone();
                     match shard_map.apply_op(*op).await {
                         Ok(map) => {
                             if let Some(ref cache) = self.shard_location_cache {
-                                cache.refresh_from_map(&map);
+                                cache.refresh_measurement(&map, &measurement_key);
                             }
                             ClusterResponse::success()
                         }

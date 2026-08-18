@@ -56,7 +56,7 @@ No initialization step is required. Nodes begin replicating as soon as they star
 
 When `[sharding] enabled = true` on all cluster nodes, measurements are partitioned by `series_id` into regions with primary/replica peers. Any Active node can accept reads and writes — the coordinator scatters queries and forwards writes to region owners. This replaces full-copy write replication for sharded measurements with region-scoped replication.
 
-**Requirements:** enable on a **new** cluster before ingesting data; `[cluster] enabled = true`; identical sharding config on every node. Materialized views are not supported.
+**Requirements:** enable on a **new** cluster before ingesting data; `[cluster] enabled = true`; identical sharding config on every node. Materialized views are supported on sharded clusters (see [Materialized Views](#materialized-views) below).
 
 See [Configuration — sharding](configuration.md#sharding) and [Deep Dive: Clustering — Series Sharding](../deep-dive/deep-dive-clustering.md#15-series-sharding-experimental).
 
