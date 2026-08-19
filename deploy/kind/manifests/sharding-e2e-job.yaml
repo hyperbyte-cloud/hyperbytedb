@@ -1,0 +1,52 @@
+# In-cluster runner for run-sharding-e2e.sh (script mounted via ConfigMap sharding-e2e-script).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sharding-e2e
+  namespace: hyperbytedb
+spec:
+  ttlSecondsAfterFinished: 600
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: sharding-e2e
+        job-name: sharding-e2e
+    spec:
+      serviceAccountName: sharding-e2e-runner
+      restartPolicy: Never
+      containers:
+        - name: runner
+          image: python:3.12-alpine
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: IN_CLUSTER
+              value: "1"
+            - name: NS
+              value: hyperbytedb
+            - name: REPORT_DIR
+              value: /tmp
+            - name: SKIP_CARGO
+              value: "true"
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              set -e
+              apk add --no-cache curl bash >/dev/null
+              KVER="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
+              curl -fsSL -o /usr/local/bin/kubectl \
+                "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl"
+              chmod +x /usr/local/bin/kubectl
+              EXTRA=""
+              [ "${SKIP_CARGO:-false}" = "true" ] && EXTRA="--skip-cargo"
+              exec /scripts/run-sharding-e2e.sh --in-cluster ${EXTRA}
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: script
+          configMap:
+            name: sharding-e2e-script
+            defaultMode: 0755

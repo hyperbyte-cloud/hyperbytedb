@@ -773,13 +773,11 @@ After a **region transfer**, destination partial rows sourced from transferred `
 
 Use this sequence before sharding acceptance runs (e2e G0–G9) or any test that depends on a pristine shard map. **Do not** enable sharding on PVCs that already contain bootstrapped measurements — leftover regions pollute G0/G1 and mask bootstrap bugs.
 
-1. **Fresh storage** — delete the cluster (`deploy/kind/setup.sh down`) or delete all `hyperbytedb` PVCs in the namespace so every pod starts with empty Raft/shard-map state.
-2. **Deploy 6-node cluster** — `deploy/kind/setup.sh up` with `hyperbytedb-cr-6node-sharded.yaml` (6 replicas, 6 workers). Wait until **6/6 pods** are Running/Ready and `/cluster/nodes` reports **6 active** Raft members (no sharding yet).
-3. **Patch sharding once** — run `deploy/kind/patch-sharding-config.sh`. This scales `hyperbytedb-operator` to **0** (so it does not overwrite the ConfigMap), injects `[sharding]` into `hyperbytedb-config`, and restarts the StatefulSet.
-4. **Settle** — wait **≥60s** after pods become Ready so heartbeats and the shard scheduler stabilize before ingesting or running gates. Confirm `stale_epoch` is absent on region heartbeats.
-5. **Acceptance** — run `deploy/kind/run-sharding-e2e.sh` (in-cluster Job) or manual writes; first bootstrap per measurement should yield distinct `region_id`s with `next_region_id` strictly greater than the max assigned ID.
-
-Re-running step 3 alone on a dirty cluster is **not** sufficient — always reset PVCs (step 1) when changing sharding acceptance baselines.
+1. **Fresh storage** — `./deploy/kind/setup.sh hdb-down --sharded` (or `hdb-reset --sharded`) deletes the `HyperbytedbCluster` CR, lets the operator garbage-collect StatefulSet/services/config, then removes PVCs. Do **not** scale the operator to 0 or hand-patch `hyperbytedb-config`.
+2. **Deploy 6-node cluster** — `./deploy/kind/setup.sh up --sharded` creates a 6-worker kind cluster and applies `hyperbytedb-cr-6node-sharded.yaml` with `spec.sharding`. For an existing kind cluster: `./deploy/kind/setup.sh hdb-reset --sharded`.
+3. **Operator drives Raft** — keep `hyperbytedb-operator` at 1 replica; it calls `/cluster/membership/add-node` as pods become Ready. Wait until `/cluster/nodes` reports **6 active** members (setup script polls this).
+4. **Settle** — wait **≥60s** after pods are Ready and Raft is complete so shard heartbeats stabilize. `hdb-up --sharded` sleeps 60s by default (`SHARDED_SETTLE_SECS`).
+5. **Acceptance** — run `deploy/kind/run-sharding-e2e.sh` (in-cluster Job).
 
 ### Limitations
 
