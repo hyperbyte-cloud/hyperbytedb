@@ -231,8 +231,10 @@ pub async fn build_bootstrap_op(
         ));
     }
     let primary = peers[0];
+    let map = ctx.shard_map.snapshot().await?;
+    let region_id = map.next_region_id;
     let region = ShardRegion {
-        region_id: 1,
+        region_id,
         start: 0,
         end: u64::MAX,
         epoch: ShardEpoch::default(),
@@ -806,5 +808,31 @@ mod scatter_tests {
         h1.abort();
         h2.abort();
         h3.abort();
+    }
+
+    #[tokio::test]
+    async fn build_bootstrap_op_uses_next_region_id() {
+        let membership = membership_with(&[(1, "127.0.0.1:1"), (2, "127.0.0.1:2")]);
+        let ctx = test_ctx(membership, ShardingConfig::default(), 1);
+
+        let op_a = build_bootstrap_op(&ctx, "db", "autogen", "cpu")
+            .await
+            .unwrap();
+        let region_a_id = match &op_a {
+            ShardMapOp::BootstrapMeasurement { region, .. } => region.region_id,
+            _ => panic!("expected bootstrap op"),
+        };
+        assert_eq!(region_a_id, 1);
+        ctx.shard_map.apply_op(op_a).await.unwrap();
+
+        let op_b = build_bootstrap_op(&ctx, "db", "autogen", "mem")
+            .await
+            .unwrap();
+        let region_b_id = match &op_b {
+            ShardMapOp::BootstrapMeasurement { region, .. } => region.region_id,
+            _ => panic!("expected bootstrap op"),
+        };
+        assert_eq!(region_b_id, 2);
+        assert_ne!(region_a_id, region_b_id);
     }
 }

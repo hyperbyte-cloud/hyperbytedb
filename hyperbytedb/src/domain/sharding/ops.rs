@@ -69,6 +69,14 @@ pub fn apply_shard_map_op(map: &mut super::types::ShardMap, op: ShardMapOp) -> R
                     key.db, key.rp, key.measurement
                 ));
             }
+            if map.spaces.values().any(|space| {
+                space
+                    .regions
+                    .iter()
+                    .any(|r| r.region_id == region.region_id)
+            }) {
+                return Err(format!("duplicate region_id {}", region.region_id));
+            }
             map.next_region_id = map.next_region_id.max(region.region_id.saturating_add(1));
             let mut space = super::types::MeasurementShardSpace {
                 key: key.clone(),
@@ -357,6 +365,86 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(map.spaces.values().next().unwrap().regions[0].primary, 2);
+        let r = &map.spaces.values().next().unwrap().regions[0];
+        assert_eq!(r.primary, 2);
+    }
+
+    #[test]
+    fn bootstrap_assigns_unique_region_ids_across_measurements() {
+        let mut map = ShardMap::default();
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::BootstrapMeasurement {
+                key: MeasurementKey::new("db", "autogen", "cpu"),
+                region: sample_region(1, 0, u64::MAX, 1),
+            },
+        )
+        .unwrap();
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::BootstrapMeasurement {
+                key: MeasurementKey::new("db", "autogen", "mem"),
+                region: sample_region(2, 0, u64::MAX, 1),
+            },
+        )
+        .unwrap();
+        assert_eq!(map.next_region_id, 3);
+        let ids: Vec<u64> = map
+            .spaces
+            .values()
+            .flat_map(|s| s.regions.iter().map(|r| r.region_id))
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+    }
+
+    #[test]
+    fn bootstrap_rejects_duplicate_region_id() {
+        let mut map = ShardMap::default();
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::BootstrapMeasurement {
+                key: MeasurementKey::new("db", "autogen", "cpu"),
+                region: sample_region(1, 0, u64::MAX, 1),
+            },
+        )
+        .unwrap();
+        let err = apply_shard_map_op(
+            &mut map,
+            ShardMapOp::BootstrapMeasurement {
+                key: MeasurementKey::new("db", "autogen", "mem"),
+                region: sample_region(1, 0, u64::MAX, 1),
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("duplicate region_id"));
+    }
+
+    #[test]
+    fn split_rejects_duplicate_region_id_within_space() {
+        let key = MeasurementKey::new("db", "autogen", "cpu");
+        let mut map = ShardMap::default();
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::BootstrapMeasurement {
+                key: key.clone(),
+                region: sample_region(1, 0, u64::MAX, 1),
+            },
+        )
+        .unwrap();
+        let split_key = 1u64 << 40;
+        let err = apply_shard_map_op(
+            &mut map,
+            ShardMapOp::Split {
+                key,
+                region_id: 1,
+                split_key,
+                epoch: ShardEpoch::default(),
+                left: sample_region(1, 0, split_key, 1),
+                right: sample_region(1, split_key, u64::MAX, 1),
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("duplicate region_id"));
     }
 }

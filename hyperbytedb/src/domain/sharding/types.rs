@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -108,11 +108,17 @@ impl MeasurementShardSpace {
         if sorted.last().map(|r| r.end) != Some(u64::MAX) {
             return Err("last region must end at u64::MAX".into());
         }
+        let mut seen = HashSet::new();
+        for r in &self.regions {
+            if !seen.insert(r.region_id) {
+                return Err(format!("duplicate region_id {} within space", r.region_id));
+            }
+        }
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShardMap {
     pub map_version: u64,
     /// Monotonic allocator for new region IDs (initialized from max on load).
@@ -121,11 +127,33 @@ pub struct ShardMap {
     pub spaces: HashMap<MeasurementKey, MeasurementShardSpace>,
 }
 
+impl Default for ShardMap {
+    fn default() -> Self {
+        Self {
+            map_version: 0,
+            next_region_id: default_next_region_id(),
+            spaces: HashMap::new(),
+        }
+    }
+}
+
 fn default_next_region_id() -> u64 {
     1
 }
 
 impl ShardMap {
+    pub fn validate_global_region_ids(&self) -> Result<(), String> {
+        let mut seen = HashSet::new();
+        for space in self.spaces.values() {
+            for r in &space.regions {
+                if !seen.insert(r.region_id) {
+                    return Err(format!("duplicate region_id {}", r.region_id));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn locate(
         &self,
         db: &str,
