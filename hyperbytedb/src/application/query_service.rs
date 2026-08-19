@@ -2214,15 +2214,15 @@ async fn try_query_sharded_region(
         .await;
     }
 
-    let route_to_primary = aggregate_authoritative
-        && region.peers.contains(&ctx.node_id)
-        && ctx.node_id != region.primary;
-
-    if region.peers.contains(&ctx.node_id) && !route_to_primary {
+    // Only the region primary holds authoritative flushed data. Replica peers must
+    // scatter to the primary (TiDB-like RYW / cross-coordinator reads), not query
+    // their lagging local chDB copy.
+    if region.peers.contains(&ctx.node_id) && ctx.node_id == region.primary {
         let raw = svc.query_port.execute_sql(region_sql).await?;
         return parse_json_each_row_to_series(&raw, measurement, epoch, resolved_group_by_tags);
     }
 
+    let route_to_primary = region.peers.contains(&ctx.node_id) && ctx.node_id != region.primary;
     if route_to_primary {
         metrics::counter!("hyperbytedb_shard_query_aggregate_primary_routed_total").increment(1);
     }
@@ -2241,7 +2241,7 @@ async fn try_query_sharded_region(
     };
 
     let region_id = region.region_id;
-    let scatter_role = if aggregate_authoritative {
+    let scatter_role = if aggregate_authoritative || route_to_primary {
         RegionTargetRole::PrimaryRead
     } else {
         RegionTargetRole::Read

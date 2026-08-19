@@ -10,6 +10,86 @@ use std::collections::BTreeMap;
 
 #[tokio::test]
 #[serial(chdb)]
+async fn cross_coordinator_read_after_forwarded_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let nodes =
+        start_sharded_three_node_cluster(dir.path(), ShardedClusterOptions::default()).await;
+    bootstrap_region_on_all_nodes(&nodes, "sharddb", "autogen", "cpu", vec![1, 2], 1).await;
+
+    let client = reqwest::Client::new();
+    for node in &nodes {
+        create_db(&client, &node.url, "sharddb").await;
+    }
+
+    // Node 3 is not a region peer; write forwards to primary (node 1).
+    write_line(
+        &client,
+        &nodes[2].url,
+        "sharddb",
+        "cpu,host=crossnode value=99 5000000000",
+    )
+    .await;
+    flush_node(&nodes[0]).await;
+
+    // Node 2 is a replica peer — must read via primary scatter, not stale local chDB.
+    let resp = query_parsed(
+        &client,
+        &nodes[1].url,
+        "sharddb",
+        "SELECT value FROM cpu WHERE host='crossnode'",
+    )
+    .await;
+    let value = resp.results[0]
+        .series
+        .as_ref()
+        .and_then(|s| s.first())
+        .and_then(|s| s.values.first())
+        .and_then(|row| row.get(1))
+        .and_then(|v| v.as_f64());
+    assert_eq!(value, Some(99.0), "cross-coordinator RYW read");
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn group_by_host_mean_on_replica_coordinator() {
+    let dir = tempfile::tempdir().unwrap();
+    let nodes =
+        start_sharded_three_node_cluster(dir.path(), ShardedClusterOptions::default()).await;
+    bootstrap_region_on_all_nodes(&nodes, "sharddb", "autogen", "cpu", vec![1, 2], 1).await;
+
+    let client = reqwest::Client::new();
+    for node in &nodes {
+        create_db(&client, &node.url, "sharddb").await;
+    }
+
+    for i in 1..=20 {
+        write_line(
+            &client,
+            &nodes[2].url,
+            "sharddb",
+            &format!("cpu,host=node{i} value={i} {}", 1_000_000_000 + i),
+        )
+        .await;
+    }
+    flush_node(&nodes[0]).await;
+
+    let resp = query_parsed(
+        &client,
+        &nodes[1].url,
+        "sharddb",
+        "SELECT mean(value) FROM cpu GROUP BY host",
+    )
+    .await;
+    let series = resp.results[0].series.as_ref().expect("series");
+    assert!(
+        series.len() >= 20,
+        "expected >=20 host groups, got {}",
+        series.len()
+    );
+}
+
+#[tokio::test]
+#[serial(chdb)]
 async fn query_scatter_falls_back_when_primary_unreachable() {
     let dir = tempfile::tempdir().unwrap();
     let mut nodes =
