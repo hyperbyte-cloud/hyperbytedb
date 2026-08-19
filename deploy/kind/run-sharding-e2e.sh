@@ -22,7 +22,10 @@ KUBE_CTX="${KUBE_CTX:-kind-hyperbytedb}"
 NS="${NS:-hyperbytedb}"
 DB="${E2E_DB:-shard_e2e}"
 RP="${E2E_RP:-autogen}"
-SPLIT_WAIT_SECS="${SPLIT_WAIT_SECS:-90}"
+HEARTBEAT_INTERVAL_SECS="${HEARTBEAT_INTERVAL_SECS:-10}"
+SPLIT_MERGE_INTERVAL_SECS="${SPLIT_MERGE_INTERVAL_SECS:-30}"
+# Scheduler window: heartbeat_interval_secs × 6 + split_merge_interval_secs (kind CR defaults).
+SPLIT_WAIT_SECS="${SPLIT_WAIT_SECS:-$((HEARTBEAT_INTERVAL_SECS * 6 + SPLIT_MERGE_INTERVAL_SECS))}"
 RAFT_FAILOVER_WAIT_SECS="${RAFT_FAILOVER_WAIT_SECS:-120}"
 PRIMARY_FAILOVER_WAIT_SECS="${PRIMARY_FAILOVER_WAIT_SECS:-75}"
 REGION_SPLIT_SERIES="${REGION_SPLIT_SERIES:-5}"
@@ -330,6 +333,25 @@ print(n)
 
 region_count_for_db() {
   region_count "$@"
+}
+
+# Shard-map evidence for a measurement (region ids + key ranges).
+scale_map_summary() {
+  local pod_idx="$1"
+  local meas="${2:-scale}"
+  curl_api "$pod_idx" "/internal/shard/map" | python3 -c "
+import json,sys
+meas,db=sys.argv[1],sys.argv[2]
+d=json.load(sys.stdin)
+for sp in d.get('spaces',[]):
+    k=sp['key']
+    if k.get('measurement')==meas and k.get('db')==db:
+        regs=sp.get('regions',[])
+        parts=[f\"id={r['region_id']} [{r['start']}-{r['end']}]\" for r in regs]
+        print(f\"regions={len(regs)}: \" + ', '.join(parts))
+        sys.exit(0)
+print('regions=0: (no space)')
+" "$meas" "$DB"
 }
 
 bootstrap_region_id() {
@@ -685,48 +707,69 @@ phase_g4() {
 
 phase_g5() {
   log "=== G5 Control plane split ==="
-  local ingest_n=$((REGION_SPLIT_SERIES + 1))
+
+  # C.0 — at G5 entry, scale must be a single region (G1.4 bootstrap only; no G2 scale writes).
+  local entry_regions entry_cnt entry_map
+  entry_regions=$(region_count 0 scale)
+  entry_cnt=$(count_from_query 0 'SELECT count(value) FROM scale')
+  entry_map=$(scale_map_summary 0 scale)
+  if [[ "$entry_regions" == "1" ]]; then
+    pass G5.0 "C.0 scale regions=1 at entry (count=$entry_cnt)"
+  else
+    fail G5.0 "C.0 scale regions=$entry_regions at entry (expected 1); count=$entry_cnt; map=$entry_map"
+  fi
+
+  # Ingest ≥ region_split_series new distinct series on scale (bootstrap already has 1).
+  local split_ingest_n=$REGION_SPLIT_SERIES
+  local expected_total=$((entry_cnt + split_ingest_n))
   local base_ts i
   base_ts=$(write_ts 100)
-  for i in $(seq 1 "$ingest_n"); do
+  for i in $(seq 1 "$split_ingest_n"); do
     curl_write 0 "scale,host=s$i value=1 $((base_ts + i))" >/dev/null
   done
-  sleep 15
-  local pre_cnt pre_regions
-  pre_cnt=$(wait_for_count 0 'SELECT count(value) FROM scale' "$ingest_n" 30)
-  if [[ -z "$pre_cnt" || "$pre_cnt" -lt "$ingest_n" ]]; then
+
+  local pre_cnt pre_regions pre_map
+  pre_cnt=$(wait_for_count 0 'SELECT count(value) FROM scale' "$expected_total" 30)
+  if [[ -z "$pre_cnt" || "$pre_cnt" -lt "$expected_total" ]]; then
     pre_cnt=$(count_from_query 0 'SELECT count(value) FROM scale')
   fi
   pre_regions=$(region_count 0 scale)
-  if [[ "$pre_cnt" -ge "$ingest_n" && "$pre_regions" == "1" ]]; then
-    pass G5.1 "scale count=$pre_cnt regions=1 pre-split"
+  pre_map=$(scale_map_summary 0 scale)
+  if [[ "$pre_cnt" -ge "$expected_total" && "$pre_regions" == "1" ]]; then
+    pass G5.1 "scale count=$pre_cnt regions=1 pre-split (ingest=$split_ingest_n)"
   else
-    fail G5.1 "scale count=$pre_cnt regions=$pre_regions"
+    fail G5.1 "scale count=$pre_cnt regions=$pre_regions (expected count>=$expected_total regions=1); map=$pre_map"
   fi
 
-  log "Waiting ${SPLIT_WAIT_SECS}s for scheduler split..."
+  local splits_before
+  splits_before=$(metric_max_across_pods hyperbytedb_shard_splits_total)
+
+  log "Waiting ${SPLIT_WAIT_SECS}s for scheduler split (heartbeat=${HEARTBEAT_INTERVAL_SECS}s merge_cooldown=${SPLIT_MERGE_INTERVAL_SECS}s)..."
   sleep "$SPLIT_WAIT_SECS"
 
-  local post_regions splits post_cnt deadline
-  deadline=$((SECONDS + 60))
+  local post_regions splits_delta post_cnt deadline splits_after
+  deadline=$((SECONDS + HEARTBEAT_INTERVAL_SECS * 6))
   post_regions=$(region_count 0 scale)
   while [[ "$post_regions" -lt 2 && SECONDS -lt deadline ]]; do
     sleep 5
     post_regions=$(region_count 0 scale)
   done
-  splits=$(metric_max_across_pods hyperbytedb_shard_splits_total)
+  splits_after=$(metric_max_across_pods hyperbytedb_shard_splits_total)
+  splits_delta=$((splits_after - splits_before))
   post_cnt=$(count_from_query 0 'SELECT count(value) FROM scale')
 
+  local post_map
+  post_map=$(scale_map_summary 0 scale)
   if [[ "$post_regions" == "2" ]]; then
     pass G5.2 "scale regions=2 post-split"
   else
-    fail G5.2 "scale regions=$post_regions (expected 2)"
+    fail G5.2 "scale regions=$post_regions (expected 2); map=$post_map"
   fi
 
-  if [[ "$splits" -ge 1 ]]; then
-    pass G5.3 "splits_total=$splits"
+  if [[ "$splits_delta" -ge 1 ]]; then
+    pass G5.3 "splits_delta=$splits_delta (before=$splits_before after=$splits_after)"
   else
-    fail G5.3 "splits_total=$splits"
+    fail G5.3 "splits_delta=$splits_delta (before=$splits_before after=$splits_after; regions=$post_regions)"
   fi
 
   if [[ "$post_cnt" == "$pre_cnt" ]]; then
