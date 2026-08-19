@@ -26,8 +26,13 @@ HEARTBEAT_INTERVAL_SECS="${HEARTBEAT_INTERVAL_SECS:-10}"
 SPLIT_MERGE_INTERVAL_SECS="${SPLIT_MERGE_INTERVAL_SECS:-30}"
 # Scheduler window: heartbeat_interval_secs × 6 + split_merge_interval_secs (kind CR defaults).
 SPLIT_WAIT_SECS="${SPLIT_WAIT_SECS:-$((HEARTBEAT_INTERVAL_SECS * 6 + SPLIT_MERGE_INTERVAL_SECS))}"
+# D.1 post-election window: heartbeat_interval_secs × 6 (kind CR sharding.heartbeatIntervalSecs=10 → 60s).
+SCHEDULER_WINDOW_SECS="${SCHEDULER_WINDOW_SECS:-$((HEARTBEAT_INTERVAL_SECS * 6))}"
 RAFT_FAILOVER_WAIT_SECS="${RAFT_FAILOVER_WAIT_SECS:-120}"
-PRIMARY_FAILOVER_WAIT_SECS="${PRIMARY_FAILOVER_WAIT_SECS:-75}"
+# D.2 primary failover: primary_failover_after_secs (CR default 60) + margin.
+PRIMARY_FAILOVER_AFTER_SECS="${PRIMARY_FAILOVER_AFTER_SECS:-60}"
+PRIMARY_FAILOVER_MARGIN_SECS="${PRIMARY_FAILOVER_MARGIN_SECS:-15}"
+PRIMARY_FAILOVER_WAIT_SECS="${PRIMARY_FAILOVER_WAIT_SECS:-$((PRIMARY_FAILOVER_AFTER_SECS + PRIMARY_FAILOVER_MARGIN_SECS))}"
 REGION_SPLIT_SERIES="${REGION_SPLIT_SERIES:-5}"
 FLUSH_INTERVAL_SECS="${FLUSH_INTERVAL_SECS:-5}"
 FLUSH_WAIT_SECS="${FLUSH_WAIT_SECS:-$((FLUSH_INTERVAL_SECS + 1))}"
@@ -409,6 +414,52 @@ wait_for_raft_leader() {
     fi
     sleep 3
   done
+  return 1
+}
+
+# D.1: after Raft re-election, allow one scheduler window before data-plane checks.
+wait_for_post_election_scheduler() {
+  log "Waiting ${SCHEDULER_WINDOW_SECS}s post-election scheduler window (heartbeat=${HEARTBEAT_INTERVAL_SECS}s × 6)..."
+  sleep "$SCHEDULER_WINDOW_SECS"
+}
+
+region_primary() {
+  local meas="${1:-cpu}"
+  curl_api 0 "/internal/shard/map" | python3 -c "
+import json,sys
+db=sys.argv[1]
+meas=sys.argv[2]
+d=json.load(sys.stdin)
+for sp in d.get('spaces',[]):
+    k=sp['key']
+    if k.get('measurement')==meas and k.get('db')==db and sp.get('regions'):
+        print(sp['regions'][0].get('primary',''))
+        break
+" "$DB" "$meas"
+}
+
+# D.2: pod Ready alone is insufficient — wait for map primary change or failover metric.
+wait_for_primary_failover() {
+  local old_primary="$1"
+  local meas="${2:-cpu}"
+  local deadline=$((SECONDS + PRIMARY_FAILOVER_WAIT_SECS))
+  local baseline new_primary failover_cnt
+  baseline=$(metric_max_across_pods 'hyperbytedb_shard_primary_failover_total')
+  log "Waiting for primary failover (old=$old_primary, timeout=${PRIMARY_FAILOVER_WAIT_SECS}s = ${PRIMARY_FAILOVER_AFTER_SECS}s + ${PRIMARY_FAILOVER_MARGIN_SECS}s margin)..."
+  while (( SECONDS < deadline )); do
+    new_primary=$(region_primary "$meas")
+    if [[ -n "$new_primary" && "$new_primary" != "$old_primary" ]]; then
+      log "Shard map primary updated: $old_primary -> $new_primary"
+      return 0
+    fi
+    failover_cnt=$(metric_max_across_pods 'hyperbytedb_shard_primary_failover_total')
+    if [[ "$failover_cnt" -gt "$baseline" ]]; then
+      log "hyperbytedb_shard_primary_failover_total incremented to $failover_cnt"
+      return 0
+    fi
+    sleep 3
+  done
+  warn "Primary failover not confirmed within ${PRIMARY_FAILOVER_WAIT_SECS}s (map primary=$(region_primary "$meas"))"
   return 1
 }
 
@@ -826,13 +877,12 @@ phase_g6() {
     setup_port_forwards
   fi
   wait_for_cluster_ready 120 || warn "cluster not fully ready after raft failover"
-  sleep 10
+  wait_for_post_election_scheduler
 
-  local wcode
+  local wcode readback
   ts=$(write_ts 200)
   wcode=$(curl_write_retry 0 "cpu,host=after_raft_failover value=1 $ts" 12 5 || echo 503)
-  local readback
-  readback=$(count_from_query 0 "SELECT count(value) FROM cpu WHERE host='after_raft_failover'")
+  readback=$(wait_for_count 0 "SELECT count(value) FROM cpu WHERE host='after_raft_failover'" 1 45 || echo 0)
   if [[ "$wcode" == "204" && "$readback" -ge 1 ]]; then
     pass G6.2 "write/read after raft failover"
   else
@@ -854,16 +904,7 @@ phase_g6() {
 phase_g7() {
   log "=== G7 Region primary failover ==="
   local primary_node primary_pod
-  primary_node=$(curl_api 0 "/internal/shard/map" | python3 -c "
-import json,sys
-db=sys.argv[1]
-d=json.load(sys.stdin)
-for sp in d.get('spaces',[]):
-    k=sp['key']
-    if k.get('measurement')=='cpu' and k.get('db')==db and sp.get('regions'):
-        print(sp['regions'][0].get('primary',''))
-        break
-" "$DB")
+  primary_node=$(region_primary cpu)
   if [[ -z "$primary_node" ]]; then
     fail G7.1 "could not find cpu region primary"
     fail G7.2 "skipped"
@@ -879,13 +920,13 @@ for sp in d.get('spaces',[]):
     teardown_port_forwards
     setup_port_forwards
   fi
+  wait_for_primary_failover "$primary_node" cpu || warn "primary failover gate timed out"
   wait_for_cluster_ready 90 || warn "cluster not fully ready after primary recycle"
 
   local wcode cnt
   ts=$(write_ts 300)
-  wcode=$(curl_write_retry 1 "cpu,host=after_primary_failover value=1 $ts" 8 5 || echo 503)
-  sleep 3
-  cnt=$(count_from_query 0 "SELECT count(value) FROM cpu WHERE host='after_primary_failover'")
+  wcode=$(curl_write_retry 1 "cpu,host=after_primary_failover value=1 $ts" 12 5 || echo 503)
+  cnt=$(wait_for_count 0 "SELECT count(value) FROM cpu WHERE host='after_primary_failover'" 1 45 || echo 0)
   if [[ "$wcode" == "204" && "$cnt" -ge 1 ]]; then
     pass G7.2 "write/query after primary pod recycle"
   else
