@@ -203,12 +203,83 @@ count_from_query() {
   local q="$2"
   query_post "$pod_idx" "$q" | python3 -c "
 import json,sys
-d=json.load(sys.stdin)
-s=d.get('results',[{}])[0].get('series')
-if not s: print(0); sys.exit(0)
-v=s[0].get('values',[[0]])[0][0]
-print(v if v is not None else 0)
-"
+try:
+  d=json.load(sys.stdin)
+  results=d.get('results') or []
+  if not results:
+    print(0); sys.exit(0)
+  s=results[0].get('series')
+  if not s:
+    print(0); sys.exit(0)
+  vals=s[0].get('values') or []
+  if not vals or not vals[0]:
+    print(0); sys.exit(0)
+  v=vals[0][0]
+  print(v if v is not None else 0)
+except Exception:
+  print(0)
+" 2>/dev/null || echo 0
+}
+
+query_scalar() {
+  local pod_idx="$1"
+  local q="$2"
+  query_post "$pod_idx" "$q" | python3 -c "
+import json,sys
+try:
+  d=json.load(sys.stdin)
+  results=d.get('results') or []
+  if not results:
+    print(''); sys.exit(0)
+  s=results[0].get('series')
+  if not s:
+    print(''); sys.exit(0)
+  vals=s[0].get('values') or []
+  if not vals or len(vals[0]) < 2:
+    print(''); sys.exit(0)
+  print(vals[0][1])
+except Exception:
+  print('')
+" 2>/dev/null || true
+}
+
+query_series_group_count() {
+  local pod_idx="$1"
+  local q="$2"
+  query_post "$pod_idx" "$q" | python3 -c "
+import json,sys
+try:
+  d=json.load(sys.stdin)
+  if 'error' in d:
+    print(0); sys.exit(0)
+  results=d.get('results') or []
+  if not results:
+    print(0); sys.exit(0)
+  s=results[0].get('series')
+  print(len(s) if s else 0)
+except Exception:
+  print(0)
+" 2>/dev/null || echo 0
+}
+
+query_series_value_count() {
+  local pod_idx="$1"
+  local q="$2"
+  query_post "$pod_idx" "$q" | python3 -c "
+import json,sys
+try:
+  d=json.load(sys.stdin)
+  results=d.get('results') or []
+  if not results:
+    print(0); sys.exit(0)
+  s=results[0].get('series')
+  if not s:
+    print(0); sys.exit(0)
+  vals=s[0].get('values') or []
+  print(len(vals))
+except Exception:
+  print(0)
+" 2>/dev/null || echo 0
 }
 
 wait_for_count() {
@@ -427,15 +498,23 @@ region_primary() {
   local meas="${1:-cpu}"
   curl_api 0 "/internal/shard/map" | python3 -c "
 import json,sys
-db=sys.argv[1]
-meas=sys.argv[2]
-d=json.load(sys.stdin)
-for sp in d.get('spaces',[]):
-    k=sp['key']
-    if k.get('measurement')==meas and k.get('db')==db and sp.get('regions'):
-        print(sp['regions'][0].get('primary',''))
-        break
-" "$DB" "$meas"
+try:
+  db=sys.argv[1]
+  meas=sys.argv[2]
+  raw=sys.stdin.read().strip()
+  if not raw:
+    sys.exit(0)
+  d=json.loads(raw)
+  for sp in d.get('spaces') or []:
+    k=sp.get('key') or {}
+    if k.get('measurement')==meas and k.get('db')==db:
+      regs=sp.get('regions') or []
+      if regs:
+        print(regs[0].get('primary',''))
+      break
+except Exception:
+  pass
+" "$DB" "$meas" 2>/dev/null || true
 }
 
 # D.2: pod Ready alone is insufficient — wait for map primary change or failover metric.
@@ -444,8 +523,8 @@ wait_for_primary_failover() {
   local meas="${2:-cpu}"
   local deadline=$((SECONDS + PRIMARY_FAILOVER_WAIT_SECS))
   local baseline new_primary failover_cnt
-  baseline=$(metric_max_across_pods 'hyperbytedb_shard_primary_failover_total')
   log "Waiting for primary failover (old=$old_primary, timeout=${PRIMARY_FAILOVER_WAIT_SECS}s = ${PRIMARY_FAILOVER_AFTER_SECS}s + ${PRIMARY_FAILOVER_MARGIN_SECS}s margin)..."
+  baseline=$(metric_max_across_pods 'hyperbytedb_shard_primary_failover_total')
   while (( SECONDS < deadline )); do
     new_primary=$(region_primary "$meas")
     if [[ -n "$new_primary" && "$new_primary" != "$old_primary" ]]; then
@@ -656,12 +735,10 @@ phase_g2() {
   curl_write 1 "cpu,host=crossnode value=99 $ts" >/dev/null
   wait_flush_boundary
   local cross
-  cross=$(query_post 0 "SELECT value FROM cpu WHERE host='crossnode'" \
-    | python3 -c "import json,sys; d=json.load(sys.stdin); s=d['results'][0].get('series'); print(s[0]['values'][0][1] if s else '')" 2>/dev/null || true)
+  cross=$(query_scalar 0 "SELECT value FROM cpu WHERE host='crossnode'")
   if [[ "$cross" != "99" ]]; then
     sleep 1
-    cross=$(query_post 0 "SELECT value FROM cpu WHERE host='crossnode'" \
-      | python3 -c "import json,sys; d=json.load(sys.stdin); s=d['results'][0].get('series'); print(s[0]['values'][0][1] if s else '')" 2>/dev/null || true)
+    cross=$(query_scalar 0 "SELECT value FROM cpu WHERE host='crossnode'")
   fi
   if [[ "$cross" == "99" ]]; then
     pass G2.3 "cross-node write/read value=99"
@@ -691,14 +768,7 @@ phase_g3() {
   groups=0
   for attempt in $(seq 1 2); do
     [[ "$attempt" -gt 1 ]] && wait_flush_boundary
-    groups=$(query_post 0 "SELECT mean(value) FROM cpu GROUP BY host" \
-      | python3 -c "
-import json,sys
-d=json.load(sys.stdin)
-if 'error' in d: print(0); sys.exit(0)
-s=d['results'][0].get('series')
-print(len(s) if s else 0)
-" 2>/dev/null || echo 0)
+    groups=$(query_series_group_count 0 "SELECT mean(value) FROM cpu GROUP BY host")
     [[ "$groups" -ge 20 ]] && break
   done
   if [[ "$groups" -ge 20 ]]; then
@@ -714,8 +784,7 @@ print(len(s) if s else 0)
   fi
 
   local tvals
-  tvals=$(query_post 0 "SHOW TAG VALUES FROM cpu WITH KEY=host" \
-    | python3 -c "import json,sys; d=json.load(sys.stdin); s=d['results'][0].get('series'); print(len(s[0]['values']) if s else 0)" 2>/dev/null || echo 0)
+  tvals=$(query_series_value_count 0 "SHOW TAG VALUES FROM cpu WITH KEY=host")
   if [[ "$tvals" -ge 20 ]]; then
     pass G3.3 "SHOW TAG VALUES count=$tvals"
   else
@@ -723,8 +792,7 @@ print(len(s) if s else 0)
   fi
 
   local series
-  series=$(query_post 0 "SHOW SERIES FROM cpu" \
-    | python3 -c "import json,sys; d=json.load(sys.stdin); s=d['results'][0].get('series'); print(len(s[0]['values']) if s else 0)" 2>/dev/null || echo 0)
+  series=$(query_series_value_count 0 "SHOW SERIES FROM cpu")
   if [[ "$series" -ge 20 ]]; then
     pass G3.4 "SHOW SERIES count=$series"
   else
