@@ -1,3 +1,4 @@
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
@@ -350,12 +351,14 @@ pub fn merge_query_results(mut parts: Vec<QueryResponse>) -> QueryResponse {
                             pairs
                         })
                     );
-                    merged
-                        .entry(key)
-                        .and_modify(|existing| {
-                            existing.values.extend(series.values.clone());
-                        })
-                        .or_insert(series);
+                    match merged.entry(key) {
+                        Entry::Occupied(mut e) => {
+                            e.get_mut().values.extend(series.values);
+                        }
+                        Entry::Vacant(e) => {
+                            e.insert(series);
+                        }
+                    }
                 }
             }
         }
@@ -372,17 +375,17 @@ pub fn merge_sharded_query_results(
     parts: Vec<QueryResponse>,
     stmt: &SelectStatement,
     plan: Option<&ShardedQueryPlan>,
-) -> QueryResponse {
+) -> Result<QueryResponse, HyperbytedbError> {
     let merged = if !select_has_true_aggregate(stmt) {
         merge_query_results(parts)
     } else {
-        merge_aggregate_parts(parts, stmt, plan)
+        merge_aggregate_parts(parts, stmt, plan)?
     };
 
     if let Some(plan) = plan {
         apply_sharded_post_merge(merged, stmt, plan)
     } else {
-        merged
+        Ok(merged)
     }
 }
 
@@ -391,32 +394,32 @@ pub fn apply_sharded_post_merge(
     response: QueryResponse,
     original: &SelectStatement,
     plan: &ShardedQueryPlan,
-) -> QueryResponse {
+) -> Result<QueryResponse, HyperbytedbError> {
     let mut resp = if select_has_true_aggregate(original) {
-        finalize_sharded_aggregates(response, plan)
+        finalize_sharded_aggregates(response, plan)?
     } else {
         response
     };
 
     if plan.needs_global_sort || plan.saved_limit.is_some() || plan.saved_offset.is_some() {
-        resp = apply_global_sort_limit_offset(resp, original, plan);
+        resp = apply_global_sort_limit_offset(resp, original, plan)?;
     }
-    resp
+    Ok(resp)
 }
 
 /// Merge partial materialized-view destination rows from multiple shard regions.
 pub fn merge_materialized_rollup_results(
     parts: Vec<QueryResponse>,
     meta: &MeasurementMeta,
-) -> QueryResponse {
+) -> Result<QueryResponse, HyperbytedbError> {
     if parts.is_empty() {
-        return QueryResponse::empty(0);
+        return Ok(QueryResponse::empty(0));
     }
     if parts.len() == 1 {
         if let Some(part) = parts.into_iter().next() {
-            return part;
+            return Ok(part);
         }
-        return QueryResponse::empty(0);
+        return Ok(QueryResponse::empty(0));
     }
 
     let statement_id = parts[0]
@@ -443,12 +446,16 @@ fn rollup_merge_rules(meta: &MeasurementMeta) -> HashMap<String, ColumnMerge> {
     rules
 }
 
+fn ragged_merge_row() -> HyperbytedbError {
+    HyperbytedbError::Internal("ragged shard merge row".into())
+}
+
 fn merge_rows_with_rules(
     parts: Vec<QueryResponse>,
     statement_id: u32,
     rules: &HashMap<String, ColumnMerge>,
     row_key_distinct_cols: &HashSet<String>,
-) -> QueryResponse {
+) -> Result<QueryResponse, HyperbytedbError> {
     let mut rows: HashMap<String, (SeriesResult, Vec<Value>)> = HashMap::new();
 
     for part in parts {
@@ -458,12 +465,17 @@ fn merge_rows_with_rules(
             };
             for series in series_list {
                 for row in &series.values {
-                    let key = series_row_key(&series, row, row_key_distinct_cols);
-                    rows.entry(key)
-                        .and_modify(|(_, merged_row)| {
-                            *merged_row = merge_row(&series.columns, rules, merged_row, row);
-                        })
-                        .or_insert_with(|| (series.clone(), row.clone()));
+                    let key = series_row_key(&series, row, row_key_distinct_cols)?;
+                    match rows.entry(key) {
+                        Entry::Occupied(mut e) => {
+                            let (existing_series, merged_row) = e.get_mut();
+                            *merged_row =
+                                merge_row(&existing_series.columns, rules, merged_row, row)?;
+                        }
+                        Entry::Vacant(e) => {
+                            e.insert((series.clone(), row.clone()));
+                        }
+                    }
                 }
             }
         }
@@ -480,21 +492,23 @@ fn merge_rows_with_rules(
                 pairs
             })
         );
-        by_series
-            .entry(series_key)
-            .and_modify(|existing| existing.values.push(row.clone()))
-            .or_insert_with(|| SeriesResult {
-                name: series.name.clone(),
-                tags: series.tags.clone(),
-                columns: series.columns.clone(),
-                values: vec![row],
-                partial: series.partial,
-            });
+        match by_series.entry(series_key) {
+            Entry::Occupied(mut e) => e.get_mut().values.push(row),
+            Entry::Vacant(e) => {
+                e.insert(SeriesResult {
+                    name: series.name,
+                    tags: series.tags,
+                    columns: series.columns,
+                    values: vec![row],
+                    partial: series.partial,
+                });
+            }
+        }
     }
 
     let mut series: Vec<SeriesResult> = by_series.into_values().collect();
     series.sort_by(|a, b| a.name.cmp(&b.name));
-    QueryResponse::single(statement_id, series)
+    Ok(QueryResponse::single(statement_id, series))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -512,6 +526,11 @@ enum ColumnMerge {
 }
 
 fn column_merge_rules(stmt: &SelectStatement) -> HashMap<String, ColumnMerge> {
+    // Plan-less fallback for aggregate merges. Without a ShardedQueryPlan the
+    // partial columns needed to combine MEAN/FIRST/LAST/STDDEV do not exist, so
+    // those outputs are left untouched rather than combined with a rule that
+    // would fabricate a plausible-but-wrong number. COUNT is genuinely
+    // additive and stays mergeable.
     let mut rules = HashMap::new();
     for field in &stmt.fields {
         let Some(name) = select_output_field_name(field) else {
@@ -527,7 +546,7 @@ fn column_merge_rules(stmt: &SelectStatement) -> HashMap<String, ColumnMerge> {
             }
         } else if matches!(
             field.expr,
-            Expr::Call(ref func) if func.name.eq_ignore_ascii_case("mean")
+            Expr::Call(ref func) if func.name.eq_ignore_ascii_case("count")
         ) {
             ColumnMerge::Sum
         } else {
@@ -542,7 +561,7 @@ fn series_row_key(
     series: &SeriesResult,
     row: &[Value],
     row_key_distinct_cols: &HashSet<String>,
-) -> String {
+) -> Result<String, HyperbytedbError> {
     let mut key = series.name.clone();
     if let Some(tags) = &series.tags {
         let mut pairs: Vec<_> = tags.iter().collect();
@@ -559,18 +578,20 @@ fn series_row_key(
         .iter()
         .position(|c| c == "time" || c == "__time")
     {
+        let cell = row.get(idx).ok_or_else(ragged_merge_row)?;
         key.push('|');
-        key.push_str(&row[idx].to_string());
+        key.push_str(&cell.to_string());
     }
     for col in row_key_distinct_cols {
         if let Some(idx) = series.columns.iter().position(|c| c == col) {
+            let cell = row.get(idx).ok_or_else(ragged_merge_row)?;
             key.push('|');
             key.push_str(col);
             key.push('=');
-            key.push_str(&row[idx].to_string());
+            key.push_str(&cell.to_string());
         }
     }
-    key
+    Ok(key)
 }
 
 fn json_as_f64(v: &Value) -> Option<f64> {
@@ -582,6 +603,16 @@ fn json_as_f64(v: &Value) -> Option<f64> {
 fn json_as_i64(v: &Value) -> Option<i64> {
     v.as_i64()
         .or_else(|| v.as_u64().and_then(|u| i64::try_from(u).ok()))
+}
+
+fn json_as_count(v: &Value) -> i64 {
+    if let Some(i) = json_as_i64(v) {
+        return i;
+    }
+    json_as_f64(v)
+        .filter(|f| f.is_finite())
+        .map(|f| f as i64)
+        .unwrap_or(0)
 }
 
 fn json_sortable_time(v: &Value) -> i64 {
@@ -604,10 +635,16 @@ fn json_sortable_time(v: &Value) -> i64 {
 
 fn json_sum(left: &Value, right: &Value) -> Value {
     if let (Some(l), Some(r)) = (left.as_i64(), right.as_i64()) {
-        return json!(l + r);
+        return match l.checked_add(r) {
+            Some(s) => json!(s),
+            None => json!(l as f64 + r as f64),
+        };
     }
     if let (Some(l), Some(r)) = (left.as_u64(), right.as_u64()) {
-        return json!(l + r);
+        return match l.checked_add(r) {
+            Some(s) => json!(s),
+            None => json!(l as f64 + r as f64),
+        };
     }
     let l = json_as_f64(left).unwrap_or(0.0);
     let r = json_as_f64(right).unwrap_or(0.0);
@@ -622,39 +659,41 @@ fn merge_values(
     col_idx: usize,
     left_row: &[Value],
     right_row: &[Value],
-) -> Value {
+) -> Result<Value, HyperbytedbError> {
     match rule {
-        ColumnMerge::DistinctKeep | ColumnMerge::Skip | ColumnMerge::Unsupported => left.clone(),
-        ColumnMerge::First => left.clone(),
-        ColumnMerge::Last => right.clone(),
-        ColumnMerge::Sum => json_sum(left, right),
+        ColumnMerge::DistinctKeep | ColumnMerge::Skip | ColumnMerge::Unsupported => {
+            Ok(left.clone())
+        }
+        ColumnMerge::First => Ok(left.clone()),
+        ColumnMerge::Last => Ok(right.clone()),
+        ColumnMerge::Sum => Ok(json_sum(left, right)),
         ColumnMerge::Min => {
             let l = json_as_f64(left);
             let r = json_as_f64(right);
-            match (l, r) {
+            Ok(match (l, r) {
                 (Some(a), Some(b)) => json!(a.min(b)),
                 (Some(a), None) => json!(a),
                 (None, Some(b)) => json!(b),
                 (None, None) => left.clone(),
-            }
+            })
         }
         ColumnMerge::Max => {
             let l = json_as_f64(left);
             let r = json_as_f64(right);
-            match (l, r) {
+            Ok(match (l, r) {
                 (Some(a), Some(b)) => json!(a.max(b)),
                 (Some(a), None) => json!(a),
                 (None, Some(b)) => json!(b),
                 (None, None) => left.clone(),
-            }
+            })
         }
         ColumnMerge::FirstByTime => {
-            let col = &columns[col_idx];
+            let col = columns.get(col_idx).ok_or_else(ragged_merge_row)?;
             let time_col = format!("{col}__sel_time");
             pick_by_time(left, right, left_row, right_row, columns, &time_col, true)
         }
         ColumnMerge::LastByTime => {
-            let col = &columns[col_idx];
+            let col = columns.get(col_idx).ok_or_else(ragged_merge_row)?;
             let time_col = format!("{col}__sel_time");
             pick_by_time(left, right, left_row, right_row, columns, &time_col, false)
         }
@@ -669,13 +708,13 @@ fn pick_by_time(
     columns: &[String],
     time_col: &str,
     pick_min: bool,
-) -> Value {
+) -> Result<Value, HyperbytedbError> {
     let Some(time_idx) = columns.iter().position(|c| c == time_col) else {
-        return left.clone();
+        return Ok(left.clone());
     };
-    let lt = json_as_i64(&left_row[time_idx]);
-    let rt = json_as_i64(&right_row[time_idx]);
-    match (lt, rt) {
+    let lt = json_as_i64(left_row.get(time_idx).ok_or_else(ragged_merge_row)?);
+    let rt = json_as_i64(right_row.get(time_idx).ok_or_else(ragged_merge_row)?);
+    Ok(match (lt, rt) {
         (Some(a), Some(b)) if a == b => left.clone(),
         (Some(a), Some(b)) if pick_min && a <= b => left.clone(),
         (Some(a), Some(b)) if !pick_min && a >= b => left.clone(),
@@ -683,7 +722,7 @@ fn pick_by_time(
         (Some(_), None) => left.clone(),
         (None, Some(_)) => right.clone(),
         (None, None) => left.clone(),
-    }
+    })
 }
 
 fn merge_row(
@@ -691,28 +730,31 @@ fn merge_row(
     rules: &HashMap<String, ColumnMerge>,
     left: &[Value],
     right: &[Value],
-) -> Vec<Value> {
+) -> Result<Vec<Value>, HyperbytedbError> {
+    if left.len() != columns.len() || right.len() != columns.len() {
+        return Err(ragged_merge_row());
+    }
     let mut out = left.to_vec();
     for (i, col) in columns.iter().enumerate() {
         let rule = rules.get(col).copied().unwrap_or(ColumnMerge::Unsupported);
-        out[i] = merge_values(&out[i], &right[i], rule, columns, i, left, right);
+        out[i] = merge_values(&out[i], &right[i], rule, columns, i, left, right)?;
     }
-    out
+    Ok(out)
 }
 
 fn merge_aggregate_parts(
     parts: Vec<QueryResponse>,
     stmt: &SelectStatement,
     plan: Option<&ShardedQueryPlan>,
-) -> QueryResponse {
+) -> Result<QueryResponse, HyperbytedbError> {
     if parts.is_empty() {
-        return QueryResponse::empty(0);
+        return Ok(QueryResponse::empty(0));
     }
     if parts.len() == 1 {
         if let Some(part) = parts.into_iter().next() {
-            return part;
+            return Ok(part);
         }
-        return QueryResponse::empty(0);
+        return Ok(QueryResponse::empty(0));
     }
 
     let statement_id = parts[0]
@@ -730,25 +772,45 @@ fn merge_aggregate_parts(
     merge_rows_with_rules(parts, statement_id, &rules, &row_key_distinct_cols)
 }
 
-fn finalize_sharded_aggregates(response: QueryResponse, plan: &ShardedQueryPlan) -> QueryResponse {
+fn finalize_sharded_aggregates(
+    response: QueryResponse,
+    plan: &ShardedQueryPlan,
+) -> Result<QueryResponse, HyperbytedbError> {
     let Some(mut results) = response.results.into_iter().next() else {
-        return QueryResponse::empty(0);
+        return Ok(QueryResponse::empty(0));
     };
     let Some(series_list) = results.series.take() else {
-        return QueryResponse::single(results.statement_id, vec![]);
+        return Ok(QueryResponse::single(results.statement_id, vec![]));
     };
 
-    let finalized: Vec<SeriesResult> = series_list
-        .into_iter()
-        .map(|series| finalize_series_aggregates(series, plan))
-        .collect();
+    let mut finalized = Vec::with_capacity(series_list.len());
+    for series in series_list {
+        finalized.push(finalize_series_aggregates(series, plan)?);
+    }
 
-    QueryResponse::single(results.statement_id, finalized)
+    Ok(QueryResponse::single(results.statement_id, finalized))
 }
 
-fn finalize_series_aggregates(mut series: SeriesResult, plan: &ShardedQueryPlan) -> SeriesResult {
+/// Resolved column indices for one finalizable aggregate output.
+#[derive(Clone, Copy)]
+enum AggregateFinalizer {
+    Mean {
+        sum_idx: usize,
+        count_idx: usize,
+    },
+    Stddev {
+        sum_idx: usize,
+        sumsq_idx: usize,
+        count_idx: usize,
+    },
+}
+
+fn finalize_series_aggregates(
+    mut series: SeriesResult,
+    plan: &ShardedQueryPlan,
+) -> Result<SeriesResult, HyperbytedbError> {
     if !plan.count_distinct_outputs.is_empty() {
-        series = collapse_count_distinct(series, plan);
+        series = collapse_count_distinct(series, plan)?;
     }
 
     let drop_cols: HashSet<String> = plan
@@ -769,12 +831,18 @@ fn finalize_series_aggregates(mut series: SeriesResult, plan: &ShardedQueryPlan)
         .collect();
 
     let mut new_columns = Vec::new();
-    let mut col_map = HashMap::new();
+    let mut finalizers: Vec<(String, AggregateFinalizer)> = Vec::new();
     for (output, partial) in &plan.mean_partials {
         let sum_idx = series.columns.iter().position(|c| c == &partial.sum_col);
         let count_idx = series.columns.iter().position(|c| c == &partial.count_col);
         if let (Some(si), Some(ci)) = (sum_idx, count_idx) {
-            col_map.insert(output.clone(), (si, ci));
+            finalizers.push((
+                output.clone(),
+                AggregateFinalizer::Mean {
+                    sum_idx: si,
+                    count_idx: ci,
+                },
+            ));
             new_columns.push(output.clone());
         }
     }
@@ -783,7 +851,14 @@ fn finalize_series_aggregates(mut series: SeriesResult, plan: &ShardedQueryPlan)
         let sumsq_idx = series.columns.iter().position(|c| c == &partial.sumsq_col);
         let count_idx = series.columns.iter().position(|c| c == &partial.count_col);
         if let (Some(si), Some(sqi), Some(ci)) = (sum_idx, sumsq_idx, count_idx) {
-            col_map.insert(output.clone(), (si, sqi * 1000 + ci));
+            finalizers.push((
+                output.clone(),
+                AggregateFinalizer::Stddev {
+                    sum_idx: si,
+                    sumsq_idx: sqi,
+                    count_idx: ci,
+                },
+            ));
             new_columns.push(output.clone());
         }
     }
@@ -793,16 +868,18 @@ fn finalize_series_aggregates(mut series: SeriesResult, plan: &ShardedQueryPlan)
         .iter()
         .enumerate()
         .filter(|(_, c)| {
+            // NOTE: count_distinct_outputs keys are the FINAL count columns
+            // written by collapse_count_distinct above — they must be kept,
+            // not dropped here.
             !drop_cols.contains(*c)
                 && !plan.mean_partials.contains_key(*c)
                 && !plan.stddev_partials.contains_key(*c)
-                && !plan.count_distinct_outputs.contains_key(*c)
         })
         .map(|(i, c)| (i, c.clone()))
         .collect();
 
-    if col_map.is_empty() && keep_cols.len() == series.columns.len() {
-        return series;
+    if finalizers.is_empty() && keep_cols.len() == series.columns.len() {
+        return Ok(series);
     }
 
     let mut final_columns: Vec<String> = Vec::new();
@@ -810,63 +887,59 @@ fn finalize_series_aggregates(mut series: SeriesResult, plan: &ShardedQueryPlan)
 
     for (idx, col) in &keep_cols {
         final_columns.push(col.clone());
-        value_builders.push(series.values.iter().map(|row| row[*idx].clone()).collect());
+        let mut col_values = Vec::with_capacity(series.values.len());
+        for row in &series.values {
+            col_values.push(row.get(*idx).cloned().ok_or_else(ragged_merge_row)?);
+        }
+        value_builders.push(col_values);
     }
 
-    for (output, (si, ci)) in &col_map {
-        if plan.mean_partials.contains_key(output) {
-            final_columns.push(output.clone());
-            let means: Vec<Value> = series
-                .values
-                .iter()
-                .map(|row| {
-                    let sum = json_as_f64(&row[*si]).unwrap_or(0.0);
-                    let count = json_as_f64(&row[*ci]).unwrap_or(0.0);
-                    if count == 0.0 {
+    for (output, finalizer) in &finalizers {
+        match *finalizer {
+            AggregateFinalizer::Mean { sum_idx, count_idx } => {
+                final_columns.push(output.clone());
+                let mut means = Vec::with_capacity(series.values.len());
+                for row in &series.values {
+                    let sum =
+                        json_as_f64(row.get(sum_idx).ok_or_else(ragged_merge_row)?).unwrap_or(0.0);
+                    let count = json_as_count(row.get(count_idx).ok_or_else(ragged_merge_row)?);
+                    means.push(if count == 0 || !sum.is_finite() {
                         Value::Null
                     } else {
-                        json!(sum / count)
+                        json!(sum / count as f64)
+                    });
+                }
+                value_builders.push(means);
+            }
+            AggregateFinalizer::Stddev {
+                sum_idx,
+                sumsq_idx,
+                count_idx,
+            } => {
+                final_columns.push(output.clone());
+                let mut stddevs = Vec::with_capacity(series.values.len());
+                for row in &series.values {
+                    let sum =
+                        json_as_f64(row.get(sum_idx).ok_or_else(ragged_merge_row)?).unwrap_or(0.0);
+                    let sumsq = json_as_f64(row.get(sumsq_idx).ok_or_else(ragged_merge_row)?)
+                        .unwrap_or(0.0);
+                    let count = json_as_count(row.get(count_idx).ok_or_else(ragged_merge_row)?);
+                    if count < 2 || !sum.is_finite() || !sumsq.is_finite() {
+                        stddevs.push(Value::Null);
+                        continue;
                     }
-                })
-                .collect();
-            value_builders.push(means);
-        } else if let Some(partial) = plan.stddev_partials.get(output) {
-            let sum_idx = series
-                .columns
-                .iter()
-                .position(|c| c == &partial.sum_col)
-                .unwrap_or(*si);
-            let sumsq_idx = series
-                .columns
-                .iter()
-                .position(|c| c == &partial.sumsq_col)
-                .unwrap_or(*si);
-            let count_idx = series
-                .columns
-                .iter()
-                .position(|c| c == &partial.count_col)
-                .unwrap_or(*ci);
-            final_columns.push(output.clone());
-            let stddevs: Vec<Value> = series
-                .values
-                .iter()
-                .map(|row| {
-                    let sum = json_as_f64(&row[sum_idx]).unwrap_or(0.0);
-                    let sumsq = json_as_f64(&row[sumsq_idx]).unwrap_or(0.0);
-                    let count = json_as_f64(&row[count_idx]).unwrap_or(0.0);
-                    if count < 2.0 {
-                        return Value::Null;
-                    }
-                    let n = count;
+                    let n = count as f64;
                     let var = (sumsq - (sum * sum) / n) / (n - 1.0);
-                    if var <= 0.0 {
+                    stddevs.push(if !var.is_finite() {
+                        Value::Null
+                    } else if var <= 0.0 {
                         json!(0.0)
                     } else {
                         json!(var.sqrt())
-                    }
-                })
-                .collect();
-            value_builders.push(stddevs);
+                    });
+                }
+                value_builders.push(stddevs);
+            }
         }
     }
 
@@ -875,17 +948,25 @@ fn finalize_series_aggregates(mut series: SeriesResult, plan: &ShardedQueryPlan)
     for row_idx in 0..row_count {
         let mut row = Vec::with_capacity(final_columns.len());
         for col_values in &value_builders {
-            row.push(col_values[row_idx].clone());
+            row.push(
+                col_values
+                    .get(row_idx)
+                    .cloned()
+                    .ok_or_else(ragged_merge_row)?,
+            );
         }
         new_values.push(row);
     }
 
     series.columns = final_columns;
     series.values = new_values;
-    series
+    Ok(series)
 }
 
-fn collapse_count_distinct(mut series: SeriesResult, plan: &ShardedQueryPlan) -> SeriesResult {
+fn collapse_count_distinct(
+    mut series: SeriesResult,
+    plan: &ShardedQueryPlan,
+) -> Result<SeriesResult, HyperbytedbError> {
     for (count_col, distinct_col) in &plan.count_distinct_outputs {
         let Some(distinct_idx) = series.columns.iter().position(|c| c == distinct_col) else {
             continue;
@@ -895,19 +976,30 @@ fn collapse_count_distinct(mut series: SeriesResult, plan: &ShardedQueryPlan) ->
             .iter()
             .position(|c| c == "time" || c == "__time");
 
-        let mut groups: HashMap<String, (HashSet<String>, Vec<usize>)> = HashMap::new();
+        // One entry per output bucket, in first-seen order. The template row is
+        // captured from the bucket itself — pairing groups with rows by index
+        // would misalign columns whenever HashMap iteration order differs from
+        // input row order.
+        let mut group_order: Vec<String> = Vec::new();
+        let mut groups: HashMap<String, (HashSet<String>, Vec<Value>)> = HashMap::new();
         for row in series.values.iter() {
             let mut key = String::new();
             if let Some(ti) = time_idx {
-                key.push_str(&row[ti].to_string());
+                key.push_str(&row.get(ti).ok_or_else(ragged_merge_row)?.to_string());
             }
             key.push('|');
             key.push_str(&format!("{:?}", series.tags));
-            groups
-                .entry(key)
-                .or_default()
-                .0
-                .insert(row[distinct_idx].to_string());
+            let entry = groups
+                .entry(key.clone())
+                .or_insert_with(|| (HashSet::new(), row.clone()));
+            if !group_order.contains(&key) {
+                group_order.push(key);
+            }
+            entry.0.insert(
+                row.get(distinct_idx)
+                    .ok_or_else(ragged_merge_row)?
+                    .to_string(),
+            );
         }
 
         let mut new_columns: Vec<String> = series
@@ -924,15 +1016,17 @@ fn collapse_count_distinct(mut series: SeriesResult, plan: &ShardedQueryPlan) ->
             }
         };
 
-        let mut new_values = Vec::new();
-        for ((_, (distinct_set, _)), template_row) in groups.into_iter().zip(series.values.iter()) {
-            let mut row: Vec<Value> = series
-                .columns
-                .iter()
-                .enumerate()
-                .filter(|(i, c)| *i != distinct_idx && **c != *count_col)
-                .map(|(i, _)| template_row[i].clone())
-                .collect();
+        let mut new_values = Vec::with_capacity(group_order.len());
+        for key in group_order {
+            let Some((distinct_set, template_row)) = groups.get(&key) else {
+                continue;
+            };
+            let mut row: Vec<Value> = Vec::new();
+            for (i, c) in series.columns.iter().enumerate() {
+                if i != distinct_idx && *c != *count_col {
+                    row.push(template_row.get(i).cloned().ok_or_else(ragged_merge_row)?);
+                }
+            }
             while row.len() <= count_out_idx {
                 row.push(Value::Null);
             }
@@ -943,23 +1037,23 @@ fn collapse_count_distinct(mut series: SeriesResult, plan: &ShardedQueryPlan) ->
         series.columns = new_columns;
         series.values = new_values;
     }
-    series
+    Ok(series)
 }
 
 fn apply_global_sort_limit_offset(
     response: QueryResponse,
     original: &SelectStatement,
     plan: &ShardedQueryPlan,
-) -> QueryResponse {
+) -> Result<QueryResponse, HyperbytedbError> {
     let Some(mut results) = response.results.into_iter().next() else {
-        return QueryResponse::empty(0);
+        return Ok(QueryResponse::empty(0));
     };
     let Some(mut series_list) = results.series.take() else {
-        return QueryResponse::single(results.statement_id, vec![]);
+        return Ok(QueryResponse::single(results.statement_id, vec![]));
     };
 
     if series_list.is_empty() {
-        return QueryResponse::single(results.statement_id, series_list);
+        return Ok(QueryResponse::single(results.statement_id, series_list));
     }
 
     let time_desc = plan
@@ -980,8 +1074,8 @@ fn apply_global_sort_limit_offset(
 
     flat.sort_by(|a, b| {
         if let Some(ti) = time_idx {
-            let at = json_sortable_time(&a.1[ti]);
-            let bt = json_sortable_time(&b.1[ti]);
+            let at = a.1.get(ti).map(json_sortable_time).unwrap_or(0);
+            let bt = b.1.get(ti).map(json_sortable_time).unwrap_or(0);
             if time_desc { bt.cmp(&at) } else { at.cmp(&bt) }
         } else {
             let av = a.1.first().map(|v| v.to_string()).unwrap_or_default();
@@ -1009,13 +1103,15 @@ fn apply_global_sort_limit_offset(
         series.values.clear();
     }
     for (series_idx, row) in flat {
-        series_list[series_idx].values.push(row);
+        let series = series_list
+            .get_mut(series_idx)
+            .ok_or_else(ragged_merge_row)?;
+        series.values.push(row);
     }
     series_list.retain(|s| !s.values.is_empty());
 
-    QueryResponse::single(results.statement_id, series_list)
+    Ok(QueryResponse::single(results.statement_id, series_list))
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1086,7 +1182,8 @@ mod tests {
             )
         };
 
-        let merged = merge_sharded_query_results(vec![partial(5), partial(16)], &stmt, None);
+        let merged =
+            merge_sharded_query_results(vec![partial(5), partial(16)], &stmt, None).expect("merge");
         let series = merged.results[0].series.as_ref().unwrap();
         assert_eq!(series.len(), 1);
         assert_eq!(series[0].values.len(), 1);
@@ -1137,7 +1234,8 @@ mod tests {
             )
         };
 
-        let merged = merge_sharded_query_results(vec![partial(3), partial(7)], &stmt, None);
+        let merged =
+            merge_sharded_query_results(vec![partial(3), partial(7)], &stmt, None).expect("merge");
         let series = merged.results[0].series.as_ref().unwrap();
         assert_eq!(series.len(), 1);
         assert_eq!(series[0].values.len(), 1);
@@ -1190,7 +1288,8 @@ mod tests {
         };
 
         let merged =
-            merge_sharded_query_results(vec![partial(10, 2), partial(20, 3)], &stmt, Some(&plan));
+            merge_sharded_query_results(vec![partial(10, 2), partial(20, 3)], &stmt, Some(&plan))
+                .expect("merge");
         let row = &merged.results[0].series.as_ref().unwrap()[0].values[0];
         assert_eq!(row[0], json!(1000));
         assert_eq!(row[1], json!(6.0));
@@ -1249,7 +1348,8 @@ mod tests {
             vec![partial(10, 2000), partial(99, 500)],
             &stmt,
             Some(&plan),
-        );
+        )
+        .expect("merge");
         let row = &merged.results[0].series.as_ref().unwrap()[0].values[0];
         assert_eq!(row[1], json!(99));
     }
@@ -1295,7 +1395,8 @@ mod tests {
             vec![partial(10, 1000), partial(99, 5000)],
             &stmt,
             Some(&plan),
-        );
+        )
+        .expect("merge");
         let row = &merged.results[0].series.as_ref().unwrap()[0].values[0];
         assert_eq!(row[0], json!(99));
     }
@@ -1374,7 +1475,8 @@ mod tests {
             vec![partial(6, 20, 2), partial(6, 36, 1)],
             &stmt,
             Some(&plan),
-        );
+        )
+        .expect("merge");
         let row = &merged.results[0].series.as_ref().unwrap()[0].values[0];
         let stddev = row[0].as_f64().unwrap();
         assert!(
@@ -1441,7 +1543,8 @@ mod tests {
             vec![partial(vec![1000, 3000]), partial(vec![2000, 4000])],
             &stmt,
             Some(&plan),
-        );
+        )
+        .expect("merge");
         let values = &merged.results[0].series.as_ref().unwrap()[0].values;
         assert_eq!(values.len(), 2);
         assert_eq!(values[0][0], json!(2000));
@@ -1492,7 +1595,8 @@ mod tests {
             ],
             &stmt,
             Some(&plan),
-        );
+        )
+        .expect("merge");
         let values = &merged.results[0].series.as_ref().unwrap()[0].values;
         assert_eq!(values.len(), 2);
         assert_eq!(values[0][1].as_f64().unwrap(), 40.0);
@@ -1550,7 +1654,8 @@ mod tests {
             ],
             &stmt,
             Some(&plan),
-        );
+        )
+        .expect("merge");
         let values = &merged.results[0].series.as_ref().unwrap()[0].values;
         assert_eq!(values.len(), 2);
         assert_eq!(values[0][1].as_f64().unwrap(), 40.0);
@@ -1602,7 +1707,8 @@ mod tests {
             ],
             &stmt,
             Some(&plan),
-        );
+        )
+        .expect("merge");
         let mut values: Vec<f64> = merged.results[0]
             .series
             .as_ref()
@@ -1643,7 +1749,8 @@ mod tests {
             )
         };
         let merged =
-            merge_materialized_rollup_results(vec![partial(3), partial(7)], &mv_meta_sum());
+            merge_materialized_rollup_results(vec![partial(3), partial(7)], &mv_meta_sum())
+                .expect("merge");
         let series = merged.results[0].series.as_ref().unwrap();
         assert_eq!(series.len(), 1);
         assert_eq!(series[0].values.len(), 1);
@@ -1672,7 +1779,7 @@ mod tests {
                 partial: None,
             }],
         );
-        let merged = merge_materialized_rollup_results(vec![a, b], &mv_meta_sum());
+        let merged = merge_materialized_rollup_results(vec![a, b], &mv_meta_sum()).expect("merge");
         assert_eq!(merged.results[0].series.as_ref().unwrap().len(), 2);
     }
 
@@ -1708,7 +1815,8 @@ mod tests {
                 }],
             )
         };
-        let merged = merge_materialized_rollup_results(vec![partial(10, 2), partial(20, 3)], &meta);
+        let merged = merge_materialized_rollup_results(vec![partial(10, 2), partial(20, 3)], &meta)
+            .expect("merge");
         let row = &merged.results[0].series.as_ref().unwrap()[0].values[0];
         assert_eq!(row[1], json!(30));
         assert_eq!(row[2], json!(5));
@@ -1741,9 +1849,275 @@ mod tests {
             )
         };
         let merged =
-            merge_materialized_rollup_results(vec![partial(5.0, 20.0), partial(3.0, 25.0)], &meta);
+            merge_materialized_rollup_results(vec![partial(5.0, 20.0), partial(3.0, 25.0)], &meta)
+                .expect("merge");
         let row = &merged.results[0].series.as_ref().unwrap()[0].values[0];
         assert_eq!(row[1], json!(3.0));
         assert_eq!(row[2], json!(25.0));
+    }
+
+    #[test]
+    fn count_distinct_keeps_template_row_aligned_with_its_group() {
+        // Regression: groups were zipped with input rows by position, so a
+        // group could inherit another bucket's template row (wrong time/tags).
+        let stmt = SelectStatement {
+            fields: vec![Field {
+                expr: Expr::Call(FunctionCall {
+                    name: "count".into(),
+                    args: vec![Expr::Call(FunctionCall {
+                        name: "distinct".into(),
+                        args: vec![Expr::Identifier("value".into())],
+                    })],
+                }),
+                alias: Some("count_value".into()),
+            }],
+            into: None,
+            from: vec![],
+            condition: None,
+            group_by: Some(GroupBy {
+                dimensions: vec![Dimension::Time {
+                    interval: Duration {
+                        value: 1,
+                        unit: DurationUnit::Hour,
+                    },
+                    offset: None,
+                }],
+            }),
+            order_by: None,
+            limit: None,
+            offset: None,
+            slimit: None,
+            soffset: None,
+            fill: None,
+            timezone: None,
+        };
+        let plan = prepare_sharded_region_query(&stmt).unwrap();
+
+        let partial = |time: i64, distinct: &str| {
+            QueryResponse::single(
+                0,
+                vec![SeriesResult {
+                    name: "metrics".into(),
+                    tags: None,
+                    columns: vec!["time".into(), "distinct_value".into(), "count_value".into()],
+                    values: vec![vec![json!(time), json!(distinct), json!(0)]],
+                    partial: None,
+                }],
+            )
+        };
+
+        // Two regions, two time buckets each; bucket t=1000 has more rows than
+        // t=2000 in part A so naive positional pairing would misalign.
+        let merged = merge_sharded_query_results(
+            vec![partial(1000, "a"), partial(2000, "b"), partial(1000, "c")],
+            &stmt,
+            Some(&plan),
+        )
+        .expect("merge");
+        let series = merged.results[0].series.as_ref().unwrap();
+        let mut by_time = std::collections::HashMap::new();
+        for s in series {
+            for row in &s.values {
+                by_time.insert(row[0].as_i64().unwrap(), row[1].as_i64().unwrap());
+            }
+        }
+        assert_eq!(
+            by_time.get(&1000),
+            Some(&2),
+            "t=1000 must carry its own distinct set"
+        );
+        assert_eq!(
+            by_time.get(&2000),
+            Some(&1),
+            "t=2000 must carry its own distinct set"
+        );
+    }
+
+    #[test]
+    fn plan_less_mean_merge_does_not_sum_region_means() {
+        // Without partial columns there is no correct way to combine means;
+        // the fallback must not fabricate a summed value.
+        let stmt = SelectStatement {
+            fields: vec![Field {
+                expr: Expr::Call(FunctionCall {
+                    name: "mean".into(),
+                    args: vec![Expr::Identifier("value".into())],
+                }),
+                alias: None,
+            }],
+            into: None,
+            from: vec![],
+            condition: None,
+            group_by: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+            slimit: None,
+            soffset: None,
+            fill: None,
+            timezone: None,
+        };
+        let partial = |v: f64| {
+            QueryResponse::single(
+                0,
+                vec![SeriesResult {
+                    name: "metrics".into(),
+                    tags: None,
+                    columns: vec!["mean_value".into()],
+                    values: vec![vec![json!(v)]],
+                    partial: None,
+                }],
+            )
+        };
+        let merged = merge_sharded_query_results(vec![partial(10.0), partial(20.0)], &stmt, None)
+            .expect("merge");
+        let row = &merged.results[0].series.as_ref().unwrap()[0].values[0];
+        assert_ne!(
+            row[0],
+            json!(30.0),
+            "plan-less merge must not sum means across regions"
+        );
+    }
+
+    #[test]
+    fn ragged_empty_row_with_time_column_is_error() {
+        let stmt = SelectStatement {
+            fields: vec![Field {
+                expr: Expr::Call(FunctionCall {
+                    name: "count".into(),
+                    args: vec![Expr::Identifier("value".into())],
+                }),
+                alias: None,
+            }],
+            into: None,
+            from: vec![],
+            condition: None,
+            group_by: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+            slimit: None,
+            soffset: None,
+            fill: None,
+            timezone: None,
+        };
+        let a = QueryResponse::single(
+            0,
+            vec![SeriesResult {
+                name: "metrics".into(),
+                tags: None,
+                columns: vec!["time".into(), "count_value".into()],
+                values: vec![vec![]],
+                partial: None,
+            }],
+        );
+        let b = QueryResponse::single(
+            0,
+            vec![SeriesResult {
+                name: "metrics".into(),
+                tags: None,
+                columns: vec!["time".into(), "count_value".into()],
+                values: vec![vec![json!(1), json!(1)]],
+                partial: None,
+            }],
+        );
+        let err = merge_sharded_query_results(vec![a, b], &stmt, None).unwrap_err();
+        assert!(err.to_string().contains("ragged shard merge row"), "{err}");
+    }
+
+    #[test]
+    fn mismatched_row_width_is_error() {
+        let stmt = SelectStatement {
+            fields: vec![Field {
+                expr: Expr::Call(FunctionCall {
+                    name: "sum".into(),
+                    args: vec![Expr::Identifier("value".into())],
+                }),
+                alias: None,
+            }],
+            into: None,
+            from: vec![],
+            condition: None,
+            group_by: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+            slimit: None,
+            soffset: None,
+            fill: None,
+            timezone: None,
+        };
+        let a = QueryResponse::single(
+            0,
+            vec![SeriesResult {
+                name: "metrics".into(),
+                tags: None,
+                columns: vec!["sum_value".into()],
+                values: vec![vec![json!(1), json!(2)]],
+                partial: None,
+            }],
+        );
+        let b = QueryResponse::single(
+            0,
+            vec![SeriesResult {
+                name: "metrics".into(),
+                tags: None,
+                columns: vec!["sum_value".into()],
+                values: vec![vec![json!(3)]],
+                partial: None,
+            }],
+        );
+        let err = merge_sharded_query_results(vec![a, b], &stmt, None).unwrap_err();
+        assert!(err.to_string().contains("ragged shard merge row"), "{err}");
+    }
+
+    #[test]
+    fn json_sum_does_not_wrap_i64_max() {
+        let stmt = SelectStatement {
+            fields: vec![Field {
+                expr: Expr::Call(FunctionCall {
+                    name: "sum".into(),
+                    args: vec![Expr::Identifier("value".into())],
+                }),
+                alias: None,
+            }],
+            into: None,
+            from: vec![],
+            condition: None,
+            group_by: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+            slimit: None,
+            soffset: None,
+            fill: None,
+            timezone: None,
+        };
+        let partial = |n: i64| {
+            QueryResponse::single(
+                0,
+                vec![SeriesResult {
+                    name: "metrics".into(),
+                    tags: None,
+                    columns: vec!["sum_value".into()],
+                    values: vec![vec![json!(n)]],
+                    partial: None,
+                }],
+            )
+        };
+        let merged = merge_sharded_query_results(vec![partial(i64::MAX), partial(1)], &stmt, None)
+            .expect("merge");
+        let row = &merged.results[0].series.as_ref().unwrap()[0].values[0];
+        let n = row[0]
+            .as_f64()
+            .unwrap_or_else(|| row[0].as_i64().unwrap() as f64);
+        assert!(
+            (n - (i64::MAX as f64 + 1.0)).abs() < 1.0,
+            "expected f64 fallback, got {row:?}"
+        );
+        assert!(
+            row[0].as_i64() != Some(i64::MIN),
+            "i64 must not wrap: {row:?}"
+        );
     }
 }

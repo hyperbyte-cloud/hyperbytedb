@@ -703,6 +703,59 @@ The scheduler holds a **per-region operator lock** while split/merge/rebalance/f
 - **Drain** performs transfer, `TransferPrimary`, then `MovePeer` (re-reads epoch after primary transfer).
 - **Sync manifests** include per-region WAL watermarks; failover prefers the most caught-up Active peer (leader eligible).
 
+### Split-transfer reconciliation
+
+A split commits via Raft before its historical-row re-push completes. If the
+destination's Raft apply lags the leader's, re-home/push RPCs answer `404`
+("region range not found") or `409` (stale epoch). These failures are **not
+lost**:
+
+- Apply-time normalization records durable intent on the child region:
+  `transfer_verified=false` (+ `transfer_first_seen`) whenever a split child's
+  primary differs from its parent's. The flag rides the Raft-committed map, so
+  leadership change or process restart rebuilds the work queue from a map scan.
+- The leader keeps an in-memory reconciliation queue (ordering detail only) and
+  drains it each tick. Movement retries use **authoritative sources only** —
+  the old primary recorded at split time, then live peers with a non-zero
+  region WAL watermark (a data-less peer would verify vacuously).
+- Satisfaction requires **positive proof**: every exported point confirmed
+  applied at the destination. Sentinel outcomes (`transfer_id == 0`,
+  i.e. source==destination collision; empty exports) never clear debt.
+- On verified movement the leader proposes the `ClearVerified` shard-map op.
+  Disable with `[sharding] transfer_clear_proposals_enabled = false` on
+  mixed-version clusters: nodes older than the op cannot decode it from the
+  Raft log.
+- Splits and merges are refused while either region carries outstanding debt.
+  Stuck entries escalate once via `TransferPrimary` to another live peer
+  (stage-before-commit ordering prevents committing a data-less owner), then
+  park with `hyperbytedb_shard_transfer_parked_total` after ~10 stalled ticks
+  past a minimum age — operator action required.
+- Materialized-view rollup destinations (`SummingMergeTree`) are excluded from
+  reconciliation entirely: re-delivery would permanently double additive
+  aggregates. Their provisioning flows through the MV backfill path.
+- Raw measurement tables are `ReplacingMergeTree(ingest_seq)` keyed by
+  `(series_id, time)`: retried pushes dedupe eventually, but a transient
+  duplicate window exists until background merges collapse rows.
+
+### Membership self-truth (`/health` body)
+
+Every `/health` response (200 and 503 alike) carries machine-readable
+self-readiness fields:
+
+```json
+{"status": "...", "message": "...", "state": "active", "needs_sync": false}
+```
+
+Cluster peers parse these fields in their periodic probes and converge their
+local membership view toward each peer's **self-reported state**: a peer
+recorded `Syncing` is promoted to `Active` exactly when it reports
+`state=active && needs_sync=false` (caught up and accepting data), and demoted
+back when it reports `syncing`. Overall HTTP status never drives membership
+transitions — a wedged WAL batcher fails `/health` without changing what peers
+believe about regional catch-up. Peers that do not answer at all transition to
+`Disconnected` (the crash detector); responses without parseable bodies
+(legacy binaries) carry no information in either direction.
+
 ### Region heartbeats
 
 Store nodes report to the Raft leader via `/internal/shard/heartbeat`:

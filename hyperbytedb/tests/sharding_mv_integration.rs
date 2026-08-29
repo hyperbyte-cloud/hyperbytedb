@@ -28,6 +28,8 @@ async fn bootstrap_two_regions(nodes: &[ShardedTestNode], db: &str, rp: &str, me
         peers: vec![1, 2],
         primary: 1,
         last_split_at: 0,
+        transfer_verified: None,
+        transfer_first_seen: None,
     };
     let region_b = ShardRegion {
         region_id: 2,
@@ -40,6 +42,8 @@ async fn bootstrap_two_regions(nodes: &[ShardedTestNode], db: &str, rp: &str, me
         peers: vec![2, 3],
         primary: 2,
         last_split_at: 0,
+        transfer_verified: None,
+        transfer_first_seen: None,
     };
     let split = ShardMapOp::Split {
         key: MeasurementKey::new(db, rp, measurement),
@@ -420,6 +424,7 @@ async fn sharded_mv_transfer_purge_dest_partials() {
         transfer_id: 1,
         seq: 0,
         done: true,
+        stage: false,
     };
     let resp = post_shard_transfer(&client, &nodes[0].url, &ack).await;
     assert!(

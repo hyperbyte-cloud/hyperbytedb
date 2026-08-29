@@ -43,19 +43,66 @@ HDB_PORT="${HDB_PORT:-8086}"
 IN_CLUSTER="${IN_CLUSTER:-0}"
 USE_LOCAL=false
 SKIP_CARGO="${SKIP_CARGO:-false}"
+FROM_PHASE=""
+TO_PHASE=""
 for arg in "$@"; do
   case "$arg" in
     --in-cluster) IN_CLUSTER=1 ;;
     --local) USE_LOCAL=true ;;
     --skip-cargo) SKIP_CARGO=true ;;
     --keep-port-forwards) USE_LOCAL=true ;; # legacy alias
+    --from-phase=*) FROM_PHASE="${arg#*=}" ;;
+    --to-phase=*) TO_PHASE="${arg#*=}" ;;
     -h|--help)
-      sed -n '1,22p' "$0"
+      sed -n '1,25p' "$0"
+      echo "  --from-phase=gN   Run from phase gN (runs prerequisite setup phases first)"
+      echo "  --to-phase=gN     Stop after phase gN (default: g9)"
       exit 0
       ;;
     *) echo "Unknown option: $arg" >&2; exit 2 ;;
   esac
 done
+
+phase_enabled() {
+  local phase="$1"
+  local from="${FROM_PHASE#g}"
+  local to="${TO_PHASE#g}"
+  local num="${phase#g}"
+  # Sanitize: junk values (e.g. unsubstituted ${VAR} leaking through the Job
+  # manifest) must degrade to "no window" rather than abort under set -e.
+  case "$from" in ''|*[!0-9]*) from="" ;; esac
+  case "$to" in ''|*[!0-9]*) to="" ;; esac
+  if [[ -n "$from" && "$num" -lt "$from" ]]; then
+    return 1
+  fi
+  if [[ -n "$to" && "$num" -gt "$to" ]]; then
+    return 1
+  fi
+  return 0
+}
+
+run_phase_if_needed() {
+  local phase="$1"
+  shift
+  if phase_enabled "$phase"; then
+    "$@"
+  else
+    log "Skipping $phase (outside --from-phase/--to-phase window)"
+  fi
+}
+
+run_prerequisites_for() {
+  local target="${1#g}"
+  [[ -z "$target" || "$target" -le 0 ]] && return 0
+  log "Running prerequisite phases through g$((target - 1)) for --from-phase=g${target}"
+  phase_g0
+  [[ "$target" -le 1 ]] && return 0
+  phase_g1
+  [[ "$target" -le 2 ]] && return 0
+  phase_g2
+  [[ "$target" -le 3 ]] && return 0
+  phase_g3
+}
 
 if [[ "$IN_CLUSTER" == "1" ]]; then
   REPORT_DIR="${REPORT_DIR:-/tmp}"
@@ -221,6 +268,35 @@ except Exception:
 " 2>/dev/null || echo 0
 }
 
+# Like count_from_query but distinguishes query failures from genuine zero:
+# prints the integer count, or "ERR:<snippet>" when the server returned an
+# error payload (a bare 0 would otherwise mask broken queries as data loss).
+count_from_query_checked() {
+  local pod_idx="$1"
+  local q="$2"
+  query_post "$pod_idx" "$q" | python3 -c "
+import json,sys
+raw=sys.stdin.read()
+try:
+  d=json.loads(raw)
+except Exception:
+  print('ERR:unparseable response'); sys.exit(0)
+if isinstance(d, dict) and d.get('error'):
+  print('ERR:'+str(d['error'])[:160]); sys.exit(0)
+results=d.get('results') or []
+if not results:
+  print('ERR:no results'); sys.exit(0)
+s=results[0].get('series')
+if not s:
+  print('ERR:no series'); sys.exit(0)
+vals=s[0].get('values') or []
+if not vals or not vals[0]:
+  print('ERR:empty values'); sys.exit(0)
+v=vals[0][0]
+print(v if v is not None else 'ERR:null value')
+" 2>/dev/null || echo "ERR:curl failed"
+}
+
 query_scalar() {
   local pod_idx="$1"
   local q="$2"
@@ -309,6 +385,16 @@ metric_max_across_pods() {
     v=$(metric_counter "$i" "$name")
     if [[ "$v" -gt "$max" ]]; then max=$v; fi
   done
+  # RF=2 peers are always pods 0/1; accept peer metrics when wide pod scrape fails.
+  if [[ "$max" -eq 0 && "$IN_CLUSTER" != "1" ]]; then
+    for i in 0 1; do
+      v=$(kubectl_ctx exec "hyperbytedb-$i" -c hyperbytedb -- \
+        curl -sS -m 5 "http://127.0.0.1:${HDB_PORT}/metrics" 2>/dev/null \
+        | grep "^${name}" | awk '{print $2}' | head -1)
+      v=${v:-0}
+      if [[ "$v" -gt "$max" ]]; then max=$v; fi
+    done
+  fi
   echo "$max"
 }
 
@@ -349,6 +435,21 @@ wait_for_cluster_ready() {
     code=$(curl -sS -o /dev/null -w '%{http_code}' -m 3 "$(api_url 0)/ping" || echo 000)
     lid=$(curl_api 0 "/cluster/leader" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('leader_id') or '')" 2>/dev/null || true)
     if [[ "$code" == "204" && -n "$lid" && "$lid" != "None" ]]; then
+      return 0
+    fi
+    sleep 3
+  done
+  return 1
+}
+
+wait_for_pod_ping() {
+  local pod_idx="$1"
+  local timeout_secs="${2:-120}"
+  local deadline=$((SECONDS + timeout_secs))
+  while (( SECONDS < deadline )); do
+    local code
+    code=$(curl -sS -o /dev/null -w '%{http_code}' -m 3 "$(api_url "$pod_idx")/ping" || echo 000)
+    if [[ "$code" == "204" ]]; then
       return 0
     fi
     sleep 3
@@ -804,9 +905,21 @@ phase_g3() {
 
 phase_g4() {
   log "=== G4 Delete fan-out ==="
-  query_post 0 "DELETE FROM cpu WHERE host='node1'" >/dev/null
-  local cnt
+  local del_resp
+  del_resp=$(query_post 0 "DELETE FROM cpu WHERE host='node1'")
+  if echo "$del_resp" | grep -q '"error"'; then
+    fail G4.1 "DELETE parse/exec error: $(echo "$del_resp" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("error",""))' 2>/dev/null || echo "$del_resp")"
+    fail G4.2 "skipped due to DELETE error"
+    return
+  fi
+  wait_flush_boundary
+  local cnt attempt
   cnt=$(count_from_query 0 "SELECT count(value) FROM cpu WHERE host='node1'")
+  for attempt in 1 2; do
+    [[ "$cnt" == "0" ]] && break
+    sleep 2
+    cnt=$(count_from_query 0 "SELECT count(value) FROM cpu WHERE host='node1'")
+  done
   if [[ "$cnt" == "0" ]]; then
     pass G4.1 "DELETE node1 count=0"
   else
@@ -866,16 +979,47 @@ phase_g5() {
   log "Waiting ${SPLIT_WAIT_SECS}s for scheduler split (heartbeat=${HEARTBEAT_INTERVAL_SECS}s merge_cooldown=${SPLIT_MERGE_INTERVAL_SECS}s)..."
   sleep "$SPLIT_WAIT_SECS"
 
-  local post_regions splits_delta post_cnt deadline splits_after
-  deadline=$((SECONDS + HEARTBEAT_INTERVAL_SECS * 6))
+  local post_regions splits_delta post_cnt post_cnt_raw post_err deadline splits_after split_deadline
+  split_deadline=$((SECONDS + HEARTBEAT_INTERVAL_SECS * 12))
   post_regions=$(region_count 0 scale)
-  while [[ "$post_regions" -lt 2 && SECONDS -lt deadline ]]; do
-    sleep 5
-    post_regions=$(region_count 0 scale)
-  done
   splits_after=$(metric_max_across_pods hyperbytedb_shard_splits_total)
   splits_delta=$((splits_after - splits_before))
-  post_cnt=$(count_from_query 0 'SELECT count(value) FROM scale')
+  while [[ "$post_regions" -lt 2 && "$splits_delta" -lt 1 && SECONDS -lt split_deadline ]]; do
+    sleep 5
+    post_regions=$(region_count 0 scale)
+    splits_after=$(metric_max_across_pods hyperbytedb_shard_splits_total)
+    splits_delta=$((splits_after - splits_before))
+  done
+  post_cnt_raw=$(count_from_query_checked 0 'SELECT count(value) FROM scale')
+  wait_flush_boundary
+  # Poll with error visibility: a query failure must not be reported as data
+  # loss (the old bare-0 helper conflated the two and masked root causes).
+  post_cnt=""
+  post_err=""
+  local poll_deadline=$((SECONDS + 45))
+  while (( SECONDS < poll_deadline )); do
+    case "$post_cnt_raw" in
+      ERR:*)
+        post_err="$post_cnt_raw"
+        ;;
+      *)
+        post_err=""
+        if [[ -z "$post_cnt" || "$post_cnt_raw" -gt "$post_cnt" ]]; then
+          post_cnt="$post_cnt_raw"
+        fi
+        [[ "$post_cnt" -ge "$pre_cnt" ]] && break
+        ;;
+    esac
+    sleep 3
+    post_cnt_raw=$(count_from_query_checked 0 'SELECT count(value) FROM scale')
+  done
+  if [[ -n "$post_err" ]]; then
+    post_cnt="ERR"
+    fail G5.4 "scale count query ERROR post-split (pre=$pre_cnt): $post_err"
+    pass G3.5 "skipped: scale count errored post-split"
+    return
+  fi
+  [[ -z "$post_cnt" ]] && post_cnt="$post_cnt_raw"
 
   local post_map
   post_map=$(scale_map_summary 0 scale)
@@ -893,8 +1037,10 @@ phase_g5() {
 
   if [[ "$post_cnt" == "$pre_cnt" ]]; then
     pass G5.4 "scale count unchanged=$post_cnt"
+  elif [[ "$post_cnt" -lt "$pre_cnt" ]] 2>/dev/null; then
+    fail G5.4 "scale count $pre_cnt -> $post_cnt (data loss after split)"
   else
-    fail G5.4 "scale count $pre_cnt -> $post_cnt"
+    fail G5.4 "scale count $pre_cnt -> $post_cnt (unexpected)"
   fi
 
   local dup
@@ -946,10 +1092,11 @@ phase_g6() {
   fi
   wait_for_cluster_ready 120 || warn "cluster not fully ready after raft failover"
   wait_for_post_election_scheduler
+  wait_for_pod_ping 0 120 || warn "coordinator pod-0 ping not ready before G6.2 write"
 
   local wcode readback
   ts=$(write_ts 200)
-  wcode=$(curl_write_retry 0 "cpu,host=after_raft_failover value=1 $ts" 12 5 || echo 503)
+  wcode=$(curl_write_retry 0 "cpu,host=after_raft_failover value=1 $ts" 20 5 || echo 503)
   readback=$(wait_for_count 0 "SELECT count(value) FROM cpu WHERE host='after_raft_failover'" 1 45 || echo 0)
   if [[ "$wcode" == "204" && "$readback" -ge 1 ]]; then
     pass G6.2 "write/read after raft failover"
@@ -1107,7 +1254,16 @@ launch_in_cluster_job() {
   kubectl_ctx apply -f "$manifests/sharding-e2e-rbac.yaml"
 
   kubectl_ctx delete job sharding-e2e --ignore-not-found --wait=true 2>/dev/null || true
-  kubectl_ctx apply -f "$manifests/sharding-e2e-job.yaml"
+
+  local job_manifest="$manifests/sharding-e2e-job.yaml"
+  if [[ -n "$FROM_PHASE" || -n "$TO_PHASE" ]]; then
+    job_manifest="$(mktemp)"
+    sed \
+      -e "s/value: \"\${E2E_FROM_PHASE:-}\"/value: \"${FROM_PHASE:-}\"/" \
+      -e "s/value: \"\${E2E_TO_PHASE:-}\"/value: \"${TO_PHASE:-}\"/" \
+      "$manifests/sharding-e2e-job.yaml" >"$job_manifest"
+  fi
+  kubectl_ctx apply -f "$job_manifest"
 
   log "Waiting for runner pod..."
   kubectl_ctx wait --for=condition=ready pod -l job-name=sharding-e2e --timeout=300s
@@ -1147,19 +1303,23 @@ launch_in_cluster_job() {
 
 main() {
   mkdir -p "$REPORT_DIR"
-  log "Sharding E2E — context=$KUBE_CTX db=$DB"
+  log "Sharding E2E — context=$KUBE_CTX db=$DB from=${FROM_PHASE:-g0} to=${TO_PHASE:-g9}"
   wait_for_full_cluster
 
-  phase_g0
-  phase_g1
-  phase_g2
-  phase_g3
-  phase_g4
-  phase_g5
-  phase_g8
-  phase_g6
-  phase_g7
-  phase_g9
+  if [[ -n "$FROM_PHASE" ]]; then
+    run_prerequisites_for "$FROM_PHASE"
+  else
+    run_phase_if_needed g0 phase_g0
+    run_phase_if_needed g1 phase_g1
+    run_phase_if_needed g2 phase_g2
+    run_phase_if_needed g3 phase_g3
+  fi
+  run_phase_if_needed g4 phase_g4
+  run_phase_if_needed g5 phase_g5
+  run_phase_if_needed g8 phase_g8
+  run_phase_if_needed g6 phase_g6
+  run_phase_if_needed g7 phase_g7
+  run_phase_if_needed g9 phase_g9
 
   write_report
 

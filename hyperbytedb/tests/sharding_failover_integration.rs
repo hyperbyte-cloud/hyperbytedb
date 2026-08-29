@@ -66,7 +66,7 @@ async fn primary_failover_updates_shard_map_after_unhealthy_timeout() {
     let cluster_cfg = test_cluster_config(dir.path(), &addr);
     let bootstrap = ClusterBootstrap::init(&cluster_cfg, 1000).unwrap();
 
-    let shard_map = Arc::new(RocksDbShardMap::open(&meta_dir, true, 1).unwrap());
+    let shard_map = Arc::new(RocksDbShardMap::open(&meta_dir, true).unwrap());
     let location_cache = Arc::new(ShardLocationCache::new());
     let raft = bootstrap
         .start_raft(
@@ -76,6 +76,7 @@ async fn primary_failover_updates_shard_map_after_unhealthy_timeout() {
             sink.clone(),
             wal.clone(),
             Some((shard_map.clone(), location_cache.clone())),
+            None,
         )
         .await
         .unwrap();
@@ -90,6 +91,8 @@ async fn primary_failover_updates_shard_map_after_unhealthy_timeout() {
         peers: vec![1, 2],
         primary: 1,
         last_split_at: 0,
+        transfer_verified: None,
+        transfer_first_seen: None,
     };
     let op = ShardMapOp::BootstrapMeasurement {
         key: MeasurementKey::new("sharddb", "autogen", "cpu"),

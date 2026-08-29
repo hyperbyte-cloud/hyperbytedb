@@ -70,6 +70,15 @@ pub struct ShardingConfig {
     /// Max Active peers tried per region per scatter request.
     #[serde(default = "default_scatter_max_peer_attempts")]
     pub scatter_max_peer_attempts: usize,
+    /// Replace permanently-inactive region peers with healthy members
+    /// (replica-set healing). Disable to manage replica sets manually.
+    #[serde(default = "default_peer_heal_enabled")]
+    pub peer_heal_enabled: bool,
+    /// Propose `ClearVerified` shard-map ops once split-transfer movement
+    /// verifies. Disable on mixed-version clusters: nodes running builds
+    /// older than the `ClearVerified` op cannot decode it from the Raft log.
+    #[serde(default = "default_transfer_clear_proposals_enabled")]
+    pub transfer_clear_proposals_enabled: bool,
 }
 
 impl Default for ShardingConfig {
@@ -89,6 +98,8 @@ impl Default for ShardingConfig {
             primary_failover_after_secs: default_primary_failover_after_secs(),
             scatter_peer_timeout_ms: default_scatter_peer_timeout_ms(),
             scatter_max_peer_attempts: default_scatter_max_peer_attempts(),
+            peer_heal_enabled: default_peer_heal_enabled(),
+            transfer_clear_proposals_enabled: default_transfer_clear_proposals_enabled(),
         }
     }
 }
@@ -139,6 +150,14 @@ fn default_scatter_peer_timeout_ms() -> u64 {
 
 fn default_scatter_max_peer_attempts() -> usize {
     3
+}
+
+fn default_peer_heal_enabled() -> bool {
+    true
+}
+
+fn default_transfer_clear_proposals_enabled() -> bool {
+    true
 }
 
 impl HyperbytedbConfig {

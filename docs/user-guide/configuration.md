@@ -330,8 +330,11 @@ Automatic `series_id` range sharding across cluster nodes (experimental). Requir
 | `primary_failover_after_secs` | `60` | Seconds before Raft leader proposes `TransferPrimary` for an unhealthy primary |
 | `scatter_peer_timeout_ms` | `5000` | Per-peer HTTP timeout for sharded query/write/metadata scatter |
 | `scatter_max_peer_attempts` | `3` | Max Active peers tried per region per scatter request |
+| `peer_heal_enabled` | `true` | Replace permanently-inactive region peers with healthy members (replica-set healing) |
 | `load_split_qps_threshold` | `0` | Load-based split QPS threshold; `0` = disabled |
 | `max_regions_per_measurement` | `128` | Hard cap on regions per measurement (safety guard) |
+
+Writes are routed to exactly one node per region — the region primary. If the primary is down, writes to that region fail fast until the Raft leader promotes a new primary (`primary_failover_after_secs`), instead of being accepted by a replica.
 
 Environment example: `HYPERBYTEDB__SHARDING__ENABLED=true`
 

@@ -49,8 +49,16 @@ impl PeerClient {
         let depth = outbound_queue_depth.max(1);
         // See raft/network.rs: builder.build() only fails on broken TLS init,
         // and `Client::new()` would also be unusable in that case.
+        //
+        // connect_timeout bounds the worst-case tail for dead/unreachable
+        // peers (black-holed SYNs would otherwise hang until the full
+        // per-request timeout); keepalive keeps long-lived pool sockets from
+        // silently expiring behind NAT/firewalls. Operation timeouts remain
+        // the caller's responsibility via per-request `.timeout(...)`.
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(3))
+            .tcp_keepalive(Duration::from_secs(60))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         let (outbound_tx, outbound_rx) =

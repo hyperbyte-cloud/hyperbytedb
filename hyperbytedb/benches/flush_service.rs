@@ -132,5 +132,7 @@ unsafe extern "C" {
 fn main() {
     benches();
     // Skip libc++/chDB atexit handlers that abort in short-lived bench binaries.
+    // SAFETY: this process is exiting; `_exit` skips atexit handlers by design
+    // so embedded chDB/libc++ destructors cannot abort the bench binary.
     unsafe { _exit(0) };
 }

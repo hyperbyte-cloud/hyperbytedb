@@ -1,5 +1,6 @@
 //! Periodic region heartbeat reports from store nodes to the Raft leader.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,6 +19,21 @@ use crate::ports::metadata::MetadataPort;
 use crate::ports::query::QueryPort;
 use crate::ports::sharding::ShardMapPort;
 
+/// Byte estimates are recomputed at most every `ESTIMATE_REFRESH_TICKS` ticks —
+/// the underlying `SELECT count()` scans the whole fact table per region, so
+/// running it on every 10s heartbeat is disproportionate for a heuristic used
+/// only by the rebalancer.
+const ESTIMATE_REFRESH_TICKS: u32 = 15;
+
+type ByteEstimateKey = (String, String, String, u64);
+
+#[derive(Default)]
+struct ByteEstimateCache {
+    /// (db, rp, measurement, region_id) -> (approx_bytes, computed_at_tick)
+    values: HashMap<ByteEstimateKey, (u64, u32)>,
+    tick: u32,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_region_heartbeat_reporter(
     node_id: u64,
@@ -33,10 +49,12 @@ pub async fn run_region_heartbeat_reporter(
 ) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut byte_estimates = ByteEstimateCache::default();
 
     loop {
         tokio::select! {
             _ = ticker.tick() => {
+                byte_estimates.tick = byte_estimates.tick.wrapping_add(1);
                 if let Err(e) = report_once(
                     node_id,
                     &peer_client,
@@ -47,6 +65,7 @@ pub async fn run_region_heartbeat_reporter(
                     query_port.as_ref(),
                     region_write_stats.as_ref(),
                     interval,
+                    &mut byte_estimates,
                 ).await {
                     tracing::warn!(error = %e, "region heartbeat report failed");
                 }
@@ -71,6 +90,7 @@ async fn report_once(
     query_port: &dyn QueryPort,
     region_write_stats: &RegionWriteStats,
     interval: Duration,
+    byte_estimates: &mut ByteEstimateCache,
 ) -> Result<(), String> {
     let map = shard_map.snapshot().await.map_err(|e| e.to_string())?;
     let leader_id = raft
@@ -91,7 +111,7 @@ async fn report_once(
             if !region.peers.contains(&node_id) {
                 continue;
             }
-            let series_count = metadata
+            let series_count = match metadata
                 .count_series_ids_in_range(
                     &space.key.db,
                     &space.key.rp,
@@ -100,19 +120,56 @@ async fn report_once(
                     region.end,
                 )
                 .await
-                .unwrap_or(0);
-            let approx_bytes = estimate_region_bytes(
-                query_port,
-                metadata,
-                &space.key.db,
-                &space.key.rp,
-                &space.key.measurement,
-                region.start,
-                region.end,
-                series_count,
-            )
-            .await;
+            {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(
+                        db = %space.key.db,
+                        rp = %space.key.rp,
+                        measurement = %space.key.measurement,
+                        region_id = region.region_id,
+                        error = %e,
+                        "heartbeat skipped: series count failed"
+                    );
+                    counter!("hyperbytedb_shard_heartbeat_series_count_errors_total").increment(1);
+                    continue;
+                }
+            };
             let write_qps = region_write_stats.take_qps(region.region_id, interval);
+
+            let est_key: ByteEstimateKey = (
+                space.key.db.clone(),
+                space.key.rp.clone(),
+                space.key.measurement.clone(),
+                region.region_id,
+            );
+            let approx_bytes = match byte_estimates.values.get(&est_key) {
+                Some((bytes, at_tick))
+                    if byte_estimates.tick.wrapping_sub(*at_tick) < ESTIMATE_REFRESH_TICKS =>
+                {
+                    *bytes
+                }
+                _ => {
+                    let bytes = estimate_region_bytes(
+                        query_port,
+                        &space.key.db,
+                        &space.key.rp,
+                        &space.key.measurement,
+                        region.start,
+                        region.end,
+                        series_count,
+                    )
+                    .await;
+                    byte_estimates.values.retain(|_, (_, t)| {
+                        byte_estimates.tick.wrapping_sub(*t) < ESTIMATE_REFRESH_TICKS * 4
+                    });
+                    byte_estimates
+                        .values
+                        .insert(est_key, (bytes, byte_estimates.tick));
+                    bytes
+                }
+            };
+
             let mut hb = RegionHeartbeat {
                 region_id: region.region_id,
                 node_id,
@@ -198,7 +255,6 @@ fn record_heartbeat_failure(reason: &'static str) {
 #[allow(clippy::too_many_arguments)]
 async fn estimate_region_bytes(
     query_port: &dyn QueryPort,
-    metadata: &dyn MetadataPort,
     db: &str,
     rp: &str,
     measurement: &str,
@@ -229,6 +285,5 @@ async fn estimate_region_bytes(
         })
         .unwrap_or(0);
 
-    let _ = metadata;
     row_count.saturating_mul(128) + series_count.saturating_mul(64)
 }

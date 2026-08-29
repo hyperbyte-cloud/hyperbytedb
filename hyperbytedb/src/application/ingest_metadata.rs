@@ -50,6 +50,9 @@ pub struct IngestSchemaCache {
     schema: RwLock<HashMap<u64, u64>>,
     /// Set of hashed (db, measurement, tag_key, tag_value) tuples already persisted.
     tags: RwLock<HashSet<u64>>,
+    /// Set of hashed (db, rp, measurement, series_id) tuples already registered,
+    /// letting steady-state batches skip `register_series_batch` entirely.
+    series: RwLock<HashSet<u64>>,
 }
 
 impl Default for IngestSchemaCache {
@@ -63,6 +66,7 @@ impl IngestSchemaCache {
         Self {
             schema: RwLock::new(HashMap::with_capacity(256)),
             tags: RwLock::new(HashSet::with_capacity(4096)),
+            series: RwLock::new(HashSet::with_capacity(8192)),
         }
     }
 
@@ -144,6 +148,52 @@ impl IngestSchemaCache {
         }
         for (h,) in entries {
             cache.insert(*h);
+        }
+    }
+
+    fn hash_series(db: &str, rp: &str, meas: &str, sid: u64) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        db.hash(&mut h);
+        rp.hash(&mut h);
+        meas.hash(&mut h);
+        sid.hash(&mut h);
+        h.finish()
+    }
+
+    /// Split `points` into per-measurement subsets containing only series this
+    /// cache has never seen registered. Empty map ⇒ every series is already
+    /// known and `register_series_batch` can be skipped entirely.
+    fn unknown_series_by_measurement(
+        &self,
+        db: &str,
+        rp: &str,
+        points: &[Point],
+    ) -> HashMap<String, BTreeMap<u64, BTreeMap<String, String>>> {
+        let mut out: HashMap<String, BTreeMap<u64, BTreeMap<String, String>>> = HashMap::new();
+        let series = self.series.read();
+        for p in points {
+            let sid = crate::domain::series::series_id_for_point(p);
+            let h = Self::hash_series(db, rp, &p.measurement, sid);
+            if series.contains(&h) {
+                continue;
+            }
+            out.entry(p.measurement.clone())
+                .or_default()
+                .entry(sid)
+                .or_insert_with(|| p.tags.clone());
+        }
+        out
+    }
+
+    fn mark_series_seen(&self, db: &str, rp: &str, points: &[Point]) {
+        let mut cache = self.series.write();
+        if cache.len() > MAX_CACHED_TAG_HASHES {
+            cache.clear();
+            cache.shrink_to(8192);
+        }
+        for p in points {
+            let sid = crate::domain::series::series_id_for_point(p);
+            cache.insert(Self::hash_series(db, rp, &p.measurement, sid));
         }
     }
 }
@@ -466,6 +516,15 @@ async fn register_series_from_points(
             .entry(sid)
             .or_insert_with(|| p.tags.clone());
     }
+    register_series_entries(metadata, db, rp, by_meas).await
+}
+
+async fn register_series_entries(
+    metadata: &Arc<dyn MetadataPort>,
+    db: &str,
+    rp: &str,
+    by_meas: HashMap<String, BTreeMap<u64, BTreeMap<String, String>>>,
+) -> Result<(), HyperbytedbError> {
     for (meas, series) in by_meas {
         let entries: Vec<(u64, BTreeMap<String, String>)> = series.into_iter().collect();
         metadata
@@ -484,7 +543,20 @@ pub async fn prepare_batch_metadata(
     limits: IngestCardinalityLimits,
     schema_cache: Option<&IngestSchemaCache>,
 ) -> Result<(), HyperbytedbError> {
-    register_series_from_points(metadata, db, rp, points).await?;
+    // Series registration short-circuit: steady-state batches whose series are
+    // all already known skip the RocksDB registration round-trip entirely.
+    // Unknown subsets register per measurement; registration is an idempotent
+    // upsert, so a racing batch duplicating one new series is harmless.
+    match schema_cache {
+        Some(sc) => {
+            let unknown = sc.unknown_series_by_measurement(db, rp, points);
+            if !unknown.is_empty() {
+                register_series_entries(metadata, db, rp, unknown).await?;
+                sc.mark_series_seen(db, rp, points);
+            }
+        }
+        None => register_series_from_points(metadata, db, rp, points).await?,
+    }
 
     let mut measurements: HashMap<String, (HashMap<String, u8>, BTreeSet<String>)> = HashMap::new();
 

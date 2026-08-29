@@ -39,11 +39,27 @@ pub struct ShardRegion {
     /// Unix seconds when this region was last split (for merge cooldown).
     #[serde(default)]
     pub last_split_at: u64,
+    /// Durable reconciliation intent: `Some(false)` marks a split child whose
+    /// primary changed and whose historical rows have not yet been verified
+    /// as re-pushed. Cleared via [`crate::domain::sharding::ops::ShardMapOp::ClearVerified`]
+    /// once movement verifies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_verified: Option<bool>,
+    /// Unix seconds when the outstanding transfer debt was first recorded;
+    /// survives restarts and leadership changes so age-based parking cannot
+    /// be reset by failover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_first_seen: Option<i64>,
 }
 
 impl ShardRegion {
     pub fn contains(&self, series_id: u64) -> bool {
         series_id >= self.start && series_id < self.end
+    }
+
+    /// True when this region carries unverified split-transfer debt.
+    pub fn transfer_outstanding(&self) -> bool {
+        self.transfer_verified == Some(false)
     }
 }
 
@@ -83,6 +99,18 @@ impl MeasurementShardSpace {
         let idx = self.regions.partition_point(|r| r.start <= series_id);
         let region = self.regions.get(idx.checked_sub(1)?)?;
         region.contains(series_id).then_some(region)
+    }
+
+    /// Find the region exactly matching a committed `[start, end)` range.
+    ///
+    /// Used after a Split commits: region ids are reallocated at apply time
+    /// (`apply_shard_map_op`), so the proposing node's child may carry a stale
+    /// id. Matching by range is authoritative.
+    #[must_use]
+    pub fn region_with_range(&self, start: u64, end: u64) -> Option<&ShardRegion> {
+        self.regions
+            .iter()
+            .find(|r| r.start == start && r.end == end)
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -202,6 +230,8 @@ mod locate_tests {
             peers: vec![1],
             primary: 1,
             last_split_at: 0,
+            transfer_verified: None,
+            transfer_first_seen: None,
         }
     }
 
@@ -225,10 +255,28 @@ mod locate_tests {
         assert_eq!(space.locate(u64::MAX - 1).unwrap().region_id, 2);
         assert!(space.locate(u64::MAX).is_none());
     }
+
+    #[test]
+    fn region_with_range_matches_committed_child_after_id_reallocation() {
+        let split = 1u64 << 32;
+        // Apply-time reallocation renamed child 2 -> 9; the proposer still
+        // believes the right child is id 2. Range lookup must find id 9.
+        let space = MeasurementShardSpace {
+            key: MeasurementKey::new("db", "rp", "cpu"),
+            regions: vec![region(1, 0, split), region(9, split, u64::MAX)],
+        };
+        assert_eq!(
+            space.region_with_range(split, u64::MAX).unwrap().region_id,
+            9
+        );
+        assert_eq!(space.region_with_range(0, split).unwrap().region_id, 1);
+        assert!(space.region_with_range(0, u64::MAX).is_none());
+    }
 }
 
 /// Per-region stats reported by store nodes to the Raft leader (PD-lite).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RegionHeartbeat {
     pub region_id: u64,
     /// Store node that produced this heartbeat (region peer, not necessarily Raft leader).
@@ -242,6 +290,7 @@ pub struct RegionHeartbeat {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShardWriteRequest {
     pub db: String,
     pub rp: String,
@@ -252,6 +301,7 @@ pub struct ShardWriteRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShardBootstrapRequest {
     pub db: String,
     pub rp: String,
@@ -259,6 +309,7 @@ pub struct ShardBootstrapRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShardQueryRequest {
     pub db: String,
     pub rp: String,
@@ -273,6 +324,7 @@ pub struct ShardQueryRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShardMetadataRequest {
     pub db: String,
     pub rp: String,
@@ -291,6 +343,7 @@ pub enum ShardMetadataKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShardDeleteRequest {
     pub db: String,
     pub rp: String,
@@ -303,6 +356,7 @@ pub struct ShardDeleteRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShardTransferRequest {
     pub db: String,
     pub rp: String,
@@ -321,6 +375,7 @@ pub enum MvBackfillPhase {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShardMvBackfillRequest {
     pub db: String,
     pub rp: String,

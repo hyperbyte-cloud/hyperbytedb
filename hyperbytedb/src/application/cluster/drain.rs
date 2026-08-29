@@ -151,6 +151,8 @@ impl DrainService {
                     region,
                     new_primary,
                     self.max_points_per_request.max(1),
+                    // This node is draining away; its local copy must go.
+                    true,
                 )
                 .await?;
 
@@ -163,7 +165,7 @@ impl DrainService {
                 };
                 raft.client_write(ClusterRequest::ShardMapMutation(Box::new(tp)))
                     .await
-                    .map_err(|e| HyperbytedbError::ShardMap(e.to_string()))?;
+                    .map_err(|e| HyperbytedbError::ShardMap(e.to_string().into()))?;
 
                 let map = ctx.shard_map.snapshot().await?;
                 let current = map
@@ -182,7 +184,7 @@ impl DrainService {
                 };
                 raft.client_write(ClusterRequest::ShardMapMutation(Box::new(mp)))
                     .await
-                    .map_err(|e| HyperbytedbError::ShardMap(e.to_string()))?;
+                    .map_err(|e| HyperbytedbError::ShardMap(e.to_string().into()))?;
             }
         }
         Ok(())

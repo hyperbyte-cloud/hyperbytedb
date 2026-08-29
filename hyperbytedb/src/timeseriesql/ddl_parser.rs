@@ -447,31 +447,10 @@ fn validate_cq_mv_select(stmt: &SelectStatement) -> Result<(), HyperbytedbError>
     Ok(())
 }
 
-fn validate_delete_predicate(expr: &Expr) -> Result<(), HyperbytedbError> {
-    if !expr_is_time_only(expr) {
-        return Err(HyperbytedbError::QueryParse(
-            "only time predicates are supported in DELETE WHERE clause \
-             (tag and field filters are not supported)"
-                .to_string(),
-        ));
-    }
+fn validate_delete_predicate(_expr: &Expr) -> Result<(), HyperbytedbError> {
+    // Tag/field predicates are supported by the delete execution path (tombstones +
+    // scatter_delete_to_regions). Time-only restriction removed for sharded fan-out.
     Ok(())
-}
-
-fn expr_is_time_only(expr: &Expr) -> bool {
-    match expr {
-        Expr::BinaryExpr(b) => expr_is_time_only(&b.left) && expr_is_time_only(&b.right),
-        Expr::UnaryExpr(_, inner) => expr_is_time_only(inner),
-        Expr::Identifier(name) => name == "time",
-        Expr::StringLiteral(_)
-        | Expr::TimeLiteral(_)
-        | Expr::DurationLiteral(_)
-        | Expr::IntegerLiteral(_)
-        | Expr::FloatLiteral(_) => true,
-        Expr::Now => true,
-        Expr::Call(fc) if fc.name.eq_ignore_ascii_case("now") => true,
-        _ => false,
-    }
 }
 
 fn parse_create_retention_policy(cur: &mut TokenCursor<'_>) -> Result<Statement, HyperbytedbError> {

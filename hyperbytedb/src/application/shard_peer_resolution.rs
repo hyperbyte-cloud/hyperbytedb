@@ -43,14 +43,29 @@ pub fn is_active_peer(membership: &ClusterMembership, node_id: u64) -> bool {
 
 /// Ordered Active peer candidates for scatter/replication.
 ///
-/// Order: self (if Active + in region.peers) → primary (if Active) → other Active peers.
+/// - [`RegionTargetRole::Write`] / [`RegionTargetRole::PrimaryRead`]: the Active
+///   primary only. Writes must land on exactly one node per region (the map's
+///   primary); falling back to a replica would create two concurrent WAL
+///   writers and divergent watermarks. An inactive primary yields no targets —
+///   the caller fails fast until failover promotes a new primary.
+/// - Other roles: self (if Active + in region.peers) → primary → other Active peers.
 #[must_use]
 pub fn resolve_region_peers(
     region: &ShardRegion,
     self_id: u64,
     membership: &ClusterMembership,
-    _role: RegionTargetRole,
+    role: RegionTargetRole,
 ) -> Vec<u64> {
+    if matches!(
+        role,
+        RegionTargetRole::Write | RegionTargetRole::PrimaryRead
+    ) {
+        if region.peers.contains(&region.primary) && is_active_peer(membership, region.primary) {
+            return vec![region.primary];
+        }
+        return Vec::new();
+    }
+
     let mut out = Vec::with_capacity(region.peers.len());
     let mut seen = HashSet::with_capacity(region.peers.len());
 
@@ -59,17 +74,6 @@ pub fn resolve_region_peers(
             out.push(id);
         }
     };
-
-    if matches!(_role, RegionTargetRole::PrimaryRead) {
-        if region.peers.contains(&region.primary) && is_active_peer(membership, region.primary) {
-            return vec![region.primary];
-        }
-        push(region.primary);
-        for id in &region.peers {
-            push(*id);
-        }
-        return out;
-    }
 
     push(self_id);
     push(region.primary);
@@ -125,6 +129,8 @@ mod tests {
             peers: peers.to_vec(),
             primary,
             last_split_at: 0,
+            transfer_verified: None,
+            transfer_first_seen: None,
         }
     }
 
@@ -149,15 +155,29 @@ mod tests {
     }
 
     #[test]
-    fn primary_down_returns_active_replica() {
+    fn write_primary_down_returns_no_targets() {
         let r = region(1, &[1, 2, 3]);
         let m = membership(&[
             (1, NodeState::Disconnected),
             (2, NodeState::Active),
             (3, NodeState::Active),
         ]);
+        // Writes must not fall back to replicas: a second concurrent writer
+        // would append to its own WAL and diverge from the region primary.
         let peers = resolve_region_peers(&r, 99, &m, RegionTargetRole::Write);
-        assert_eq!(peers, vec![2, 3]);
+        assert!(peers.is_empty());
+    }
+
+    #[test]
+    fn write_targets_only_active_primary() {
+        let r = region(1, &[1, 2, 3]);
+        let m = membership(&[
+            (1, NodeState::Active),
+            (2, NodeState::Active),
+            (3, NodeState::Active),
+        ]);
+        let peers = resolve_region_peers(&r, 99, &m, RegionTargetRole::Write);
+        assert_eq!(peers, vec![1]);
     }
 
     #[test]

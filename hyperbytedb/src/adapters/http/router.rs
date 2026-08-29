@@ -78,6 +78,9 @@ pub struct AppState {
     pub shard_routing: Option<Arc<ShardRoutingContext>>,
     pub shard_scheduler: Option<Arc<ShardScheduler>>,
     pub ingest_cardinality: IngestCardinalityLimits,
+    /// Shared ingest fast-path cache. Used by both the local ingestion service
+    /// and forwarded shard writes so steady-state batches skip metadata I/O.
+    pub ingest_schema_cache: Arc<crate::application::ingest_metadata::IngestSchemaCache>,
     pub cluster_replication: ReplicationConfig,
 }
 
@@ -210,6 +213,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
                 .route(
                     "/internal/shard/transfer",
                     post(shard_handlers::handle_shard_transfer),
+                )
+                .route(
+                    "/internal/shard/rehome",
+                    post(shard_handlers::handle_shard_rehome),
                 )
                 .route(
                     "/internal/shard/metadata",

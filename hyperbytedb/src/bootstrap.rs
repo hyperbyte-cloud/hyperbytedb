@@ -149,7 +149,6 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         Some(Arc::new(RocksDbShardMap::open(
             std::path::Path::new(&config.storage.meta_dir),
             true,
-            config.cluster.node_id,
         )?))
     } else {
         None
@@ -299,6 +298,7 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
             Some(Arc::new(RaftLeaderCallbacks::new(
                 config.cluster.node_id,
                 membership.clone(),
+                Some(config.cluster.cluster_addr.clone()),
             )))
         } else {
             None
@@ -524,6 +524,7 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         shard_routing,
         shard_scheduler: None,
         ingest_cardinality,
+        ingest_schema_cache: Default::default(),
         cluster_replication: config.cluster.replication.clone(),
     };
 

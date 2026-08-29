@@ -125,6 +125,7 @@ fn setup(dir: &tempfile::TempDir) -> (Arc<AppState>, Arc<FlushServiceImpl>) {
         shard_routing: None,
         shard_scheduler: None,
         ingest_cardinality: IngestCardinalityLimits::default(),
+        ingest_schema_cache: Default::default(),
         cluster_replication: ReplicationConfig::default(),
     });
 
@@ -218,6 +219,7 @@ async fn test_auth_blocks_unauthenticated() {
         shard_routing: None,
         shard_scheduler: None,
         ingest_cardinality: IngestCardinalityLimits::default(),
+        ingest_schema_cache: Default::default(),
         cluster_replication: ReplicationConfig::default(),
     });
 
@@ -340,6 +342,7 @@ async fn test_cardinality_limit() {
         shard_routing: None,
         shard_scheduler: None,
         ingest_cardinality: IngestCardinalityLimits::default(),
+        ingest_schema_cache: Default::default(),
         cluster_replication: ReplicationConfig::default(),
     });
 
@@ -497,6 +500,7 @@ async fn test_metrics_endpoint() {
         shard_routing: None,
         shard_scheduler: None,
         ingest_cardinality: IngestCardinalityLimits::default(),
+        ingest_schema_cache: Default::default(),
         cluster_replication: ReplicationConfig::default(),
     });
 
@@ -842,6 +846,7 @@ async fn test_rate_limiter_refills_and_denies() {
         shard_routing: None,
         shard_scheduler: None,
         ingest_cardinality: IngestCardinalityLimits::default(),
+        ingest_schema_cache: Default::default(),
         cluster_replication: ReplicationConfig::default(),
     });
 
@@ -1007,6 +1012,7 @@ async fn test_cross_database_on_clause_requires_authorization() {
         shard_routing: None,
         shard_scheduler: None,
         ingest_cardinality: IngestCardinalityLimits::default(),
+        ingest_schema_cache: Default::default(),
         cluster_replication: ReplicationConfig::default(),
     });
 

@@ -28,6 +28,12 @@ spec:
               value: /tmp
             - name: SKIP_CARGO
               value: "true"
+            - name: E2E_FROM_PHASE
+              # kubectl does not substitute ${...} here — keep empty and let
+              # run-sharding-e2e.sh default to the full G0–G9 window.
+              value: ""
+            - name: E2E_TO_PHASE
+              value: ""
           command:
             - /bin/sh
             - -ec
@@ -40,7 +46,11 @@ spec:
               chmod +x /usr/local/bin/kubectl
               EXTRA=""
               [ "${SKIP_CARGO:-false}" = "true" ] && EXTRA="--skip-cargo"
-              exec /scripts/run-sharding-e2e.sh --in-cluster ${EXTRA}
+              FROM=""
+              TO=""
+              [ -n "${E2E_FROM_PHASE:-}" ] && FROM="--from-phase=${E2E_FROM_PHASE}"
+              [ -n "${E2E_TO_PHASE:-}" ] && TO="--to-phase=${E2E_TO_PHASE}"
+              exec /scripts/run-sharding-e2e.sh --in-cluster ${EXTRA} ${FROM} ${TO}
           volumeMounts:
             - name: script
               mountPath: /scripts

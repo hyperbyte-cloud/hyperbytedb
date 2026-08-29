@@ -49,6 +49,14 @@ const COLUMN_MAPPING_CACHE_MAX: usize = 4096;
 
 type ColumnMappingCacheEntry = (u64, ColumnMapping);
 type ColumnMappingCache = HashMap<(String, String), ColumnMappingCacheEntry>;
+type SchemaColumnsCache = HashMap<(String, String, String), (u64, CachedTableColumns)>;
+
+/// Physical column lists for one measurement's fact + series tables.
+#[derive(Clone, Default)]
+struct CachedTableColumns {
+    fact: Vec<String>,
+    series: std::collections::HashSet<String>,
+}
 
 #[derive(Clone)]
 pub struct QueryServiceImpl {
@@ -60,6 +68,11 @@ pub struct QueryServiceImpl {
     points_sink: Arc<dyn crate::ports::points_sink::PointsSinkPort>,
     /// `(db, measurement)` → (schema fingerprint, mapping) for TimeseriesQL translation.
     column_mapping_cache: Arc<RwLock<ColumnMappingCache>>,
+    /// `(db, rp, measurement)` → (schema fingerprint, physical column lists).
+    /// Saves two `system.columns` chDB round-trips per query in steady state;
+    /// entries revalidate whenever measurement metadata changes, which is what
+    /// drives the physical schema.
+    schema_columns_cache: Arc<RwLock<SchemaColumnsCache>>,
     /// When set, `SELECT ... INTO` writes replicate to peers after local WAL append.
     replication_port: Option<Arc<dyn ReplicationPort>>,
     node_id: u64,
@@ -89,6 +102,7 @@ impl QueryServiceImpl {
             query_timeout_secs,
             points_sink,
             column_mapping_cache: Arc::new(RwLock::new(HashMap::with_capacity(256))),
+            schema_columns_cache: Arc::new(RwLock::new(HashMap::with_capacity(256))),
             replication_port: None,
             node_id: 0,
             replication_config: ReplicationConfig::default(),
@@ -158,6 +172,53 @@ impl QueryServiceImpl {
             cache.insert(key, (fp, mapping.clone()));
         }
         Ok(Some(mapping))
+    }
+
+    /// Fact- and series-table column lists for one measurement, cached by the
+    /// measurement-metadata fingerprint (fields/tags/rollups are what drive
+    /// the physical schema). A fingerprint miss re-runs the two
+    /// `system.columns` probes once and refreshes the entry.
+    /// Fact- and series-table column lists for one measurement, cached by the
+    /// measurement-metadata fingerprint (fields/tags/rollups are what drive
+    /// the physical schema). A fingerprint miss re-runs the two
+    /// `system.columns` probes once and refreshes the entry.
+    ///
+    /// Tables are physically created at flush time, NOT at registration, so
+    /// an early probe can legitimately observe *absent* tables (empty column
+    /// lists) under an already-final metadata fingerprint. Empty lists are
+    /// therefore never served from nor stored into the cache — they would
+    /// otherwise pin "table missing" forever and strip field columns from
+    /// generated SQL once flush creates the tables.
+    async fn table_columns(
+        &self,
+        db: &str,
+        rp: &str,
+        measurement: &str,
+    ) -> Result<CachedTableColumns, HyperbytedbError> {
+        let meta = self.metadata.get_measurement(db, rp, measurement).await?;
+        let fp = meta.as_ref().map(measurement_meta_fingerprint).unwrap_or(0);
+        let key = (db.to_string(), rp.to_string(), measurement.to_string());
+        {
+            let cache = self.schema_columns_cache.read();
+            if let Some((cached_fp, cols)) = cache.get(&key)
+                && *cached_fp == fp
+                && !cols.fact.is_empty()
+                && !cols.series.is_empty()
+            {
+                return Ok(cols.clone());
+            }
+        }
+        let fact = fact_table_columns(self, db, rp, measurement).await?;
+        let series = series_table_columns(self, db, rp, measurement).await?;
+        let cols = CachedTableColumns { fact, series };
+        if !cols.fact.is_empty() && !cols.series.is_empty() {
+            let mut cache = self.schema_columns_cache.write();
+            if cache.len() >= COLUMN_MAPPING_CACHE_MAX {
+                cache.clear();
+            }
+            cache.insert(key, (fp, cols.clone()));
+        }
+        Ok(cols)
     }
 
     /// Enable peer replication for mutating queries (`SELECT ... INTO`).
@@ -1994,30 +2055,12 @@ async fn execute_select_from_source(
             let table = quoted_table_name(query_db, &rp, sub_source);
             let sub_series_table = quoted_series_table_name(query_db, &rp, sub_source);
 
-            let sub_effective_mapping = if let Some(ref mapping) = sub_mapping {
-                let fact_cols = fact_table_columns(svc, query_db, &rp, sub_source).await?;
-                if mapping.field_names.iter().any(|f| !fact_cols.contains(f)) {
-                    let mut reconciled = mapping.clone();
-                    reconciled.field_names = fact_cols.iter().cloned().collect();
-                    for col in &fact_cols {
-                        reconciled
-                            .field_rollups
-                            .entry(col.clone())
-                            .or_insert(crate::domain::rollup::RollupCombine::Last);
-                    }
-                    Some(reconciled)
-                } else {
-                    sub_mapping.clone()
-                }
-            } else {
-                None
-            };
+            let sub_table_cols = svc.table_columns(query_db, &rp, sub_source).await?;
+            let sub_effective_mapping =
+                reconcile_column_mapping_with(sub_mapping.clone(), &sub_table_cols.fact);
 
             let sub_series_tag_columns: Vec<String> =
-                series_table_columns(svc, query_db, &rp, sub_source)
-                    .await?
-                    .into_iter()
-                    .collect();
+                sub_table_cols.series.iter().cloned().collect();
             let sub_series_join =
                 sub_effective_mapping
                     .as_ref()
@@ -2377,14 +2420,21 @@ async fn query_materialized_region_all_peers(
         return Ok(Vec::new());
     }
     if parts.len() == 1 {
-        return Ok(parts
-            .pop()
-            .and_then(|p| p.results.into_iter().next())
-            .and_then(|r| r.series)
-            .unwrap_or_default());
+        let Some(part) = parts.pop() else {
+            return Ok(Vec::new());
+        };
+        return Ok(first_statement_series(part));
     }
-    let merged = merge_materialized_rollup_results(parts, meta);
-    Ok(merged.results[0].series.clone().unwrap_or_default())
+    let merged = merge_materialized_rollup_results(parts, meta)?;
+    Ok(first_statement_series(merged))
+}
+
+fn first_statement_series(resp: QueryResponse) -> Vec<SeriesResult> {
+    resp.results
+        .into_iter()
+        .next()
+        .and_then(|r| r.series)
+        .unwrap_or_default()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2428,12 +2478,9 @@ async fn execute_sharded_measurement_query(
     let tombstones = svc.metadata.list_tombstones(db, rp, measurement).await?;
     let table = quoted_table_name(db, rp, measurement);
     let series_table = quoted_series_table_name(db, rp, measurement);
-    let effective_mapping =
-        reconcile_column_mapping(svc, db, rp, measurement, column_mapping).await?;
-    let series_tag_columns: Vec<String> = series_table_columns(svc, db, rp, measurement)
-        .await?
-        .into_iter()
-        .collect();
+    let table_cols = svc.table_columns(db, rp, measurement).await?;
+    let effective_mapping = reconcile_column_mapping_with(column_mapping, &table_cols.fact);
+    let series_tag_columns: Vec<String> = table_cols.series.iter().cloned().collect();
     let series_join = effective_mapping
         .as_ref()
         .map(|_| to_clickhouse::SeriesJoin {
@@ -2543,48 +2590,43 @@ async fn execute_sharded_measurement_query(
         let Some(part) = parts.pop() else {
             return Ok(Vec::new());
         };
-        return Ok(part.results[0].series.clone().unwrap_or_default());
+        return Ok(first_statement_series(part));
     }
     let merged = if is_materialized_dest {
         let meta = measurement_meta.ok_or_else(|| {
             HyperbytedbError::Internal("materialized destination missing metadata".into())
         })?;
-        let combined = merge_materialized_rollup_results(parts, &meta);
+        let combined = merge_materialized_rollup_results(parts, &meta)?;
         if select_has_true_aggregate(&effective_stmt) {
-            merge_sharded_query_results(vec![combined], &effective_stmt, None)
+            merge_sharded_query_results(vec![combined], &effective_stmt, None)?
         } else {
             combined
         }
     } else {
-        merge_sharded_query_results(parts, &effective_stmt, sharded_plan.as_ref())
+        merge_sharded_query_results(parts, &effective_stmt, sharded_plan.as_ref())?
     };
-    Ok(merged.results[0].series.clone().unwrap_or_default())
+    Ok(first_statement_series(merged))
 }
 
-async fn reconcile_column_mapping(
-    svc: &QueryServiceImpl,
-    db: &str,
-    rp: &str,
-    measurement: &str,
+/// Reconcile the column mapping's field names with the fact table's actual
+/// columns (defensive against historical metadata/table drift).
+fn reconcile_column_mapping_with(
     column_mapping: Option<ColumnMapping>,
-) -> Result<Option<ColumnMapping>, HyperbytedbError> {
-    if let Some(ref mapping) = column_mapping {
-        let fact_cols = fact_table_columns(svc, db, rp, measurement).await?;
-        if mapping.field_names.iter().any(|f| !fact_cols.contains(f)) {
-            let mut reconciled = mapping.clone();
-            reconciled.field_names = fact_cols.iter().cloned().collect();
-            for col in &fact_cols {
-                reconciled
-                    .field_rollups
-                    .entry(col.clone())
-                    .or_insert(crate::domain::rollup::RollupCombine::Last);
-            }
-            Ok(Some(reconciled))
-        } else {
-            Ok(column_mapping)
+    fact_cols: &[String],
+) -> Option<ColumnMapping> {
+    let mapping = column_mapping?;
+    if mapping.field_names.iter().any(|f| !fact_cols.contains(f)) {
+        let mut reconciled = mapping;
+        reconciled.field_names = fact_cols.iter().cloned().collect();
+        for col in fact_cols {
+            reconciled
+                .field_rollups
+                .entry(col.clone())
+                .or_insert(crate::domain::rollup::RollupCombine::Last);
         }
+        Some(reconciled)
     } else {
-        Ok(None)
+        Some(mapping)
     }
 }
 
@@ -2613,13 +2655,10 @@ async fn execute_local_measurement_query(
     let series_table = quoted_series_table_name(db, rp, measurement);
 
     // Reconcile the column mapping's field names with the fact table's actual columns.
-    let effective_mapping =
-        reconcile_column_mapping(svc, db, rp, measurement, column_mapping).await?;
+    let table_cols = svc.table_columns(db, rp, measurement).await?;
+    let effective_mapping = reconcile_column_mapping_with(column_mapping, &table_cols.fact);
 
-    let series_tag_columns: Vec<String> = series_table_columns(svc, db, rp, measurement)
-        .await?
-        .into_iter()
-        .collect();
+    let series_tag_columns: Vec<String> = table_cols.series.iter().cloned().collect();
     let series_join = effective_mapping
         .as_ref()
         .map(|_| to_clickhouse::SeriesJoin {
@@ -2792,7 +2831,7 @@ async fn tag_keys_from_series_table(
         return Ok(Vec::new());
     };
 
-    let phys_cols = series_table_columns(svc, db, rp, measurement).await?;
+    let phys_cols = svc.table_columns(db, rp, measurement).await?.series;
     let mut keys: Vec<String> = mapping
         .tag_keys
         .iter()
@@ -2828,8 +2867,10 @@ async fn tag_values_for_measurement(
         return Ok(Vec::new());
     };
     let phys = mapping.physical_tag_column_name(tag_key);
-    if !series_table_columns(svc, db, rp, measurement)
+    if !svc
+        .table_columns(db, rp, measurement)
         .await?
+        .series
         .contains(&phys)
     {
         return Ok(Vec::new());
@@ -2997,11 +3038,18 @@ async fn write_series_as_points(
             };
             use crate::application::wal_append::append_points_with_prepared;
 
-            let buckets = partition_points(ctx, db, rp, &all_points).await?;
+            let buckets = partition_points(ctx, db, rp, all_points).await?;
 
-            for fwd_points in buckets.forward.values() {
-                forward_shard_write_to_region(ctx, db, rp, Some("ns"), fwd_points).await?;
-            }
+            // Concurrent forward fan-out (bounded), matching the ingestion path.
+            const FORWARD_CONCURRENCY: usize = 8;
+            let forwards = buckets.forward.into_values().map(|fwd_points| async move {
+                forward_shard_write_to_region(ctx, db, rp, Some("ns"), &fwd_points).await
+            });
+            use futures::stream::{StreamExt, TryStreamExt as _};
+            futures::stream::iter(forwards)
+                .buffer_unordered(FORWARD_CONCURRENCY)
+                .try_collect::<Vec<()>>()
+                .await?;
 
             if !buckets.local.is_empty() {
                 prepare_batch_metadata(

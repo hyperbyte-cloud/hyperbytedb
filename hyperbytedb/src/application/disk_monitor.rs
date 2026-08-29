@@ -22,11 +22,16 @@ pub fn free_bytes(path: &Path) -> std::io::Result<u64> {
 
     let c_path = CString::new(path.as_os_str().as_bytes())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+    // SAFETY: `c_path` is a valid NUL-terminated C string; `stat` is a writable
+    // `statvfs` out-parameter that libc fills on success.
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) };
     if rc != 0 {
         return Err(std::io::Error::last_os_error());
     }
+    // SAFETY: `statvfs` returned 0, so the kernel initialized every field of
+    // this all-integer C struct.
+    let stat = unsafe { stat.assume_init() };
     Ok(stat.f_bavail * stat.f_frsize)
 }
 

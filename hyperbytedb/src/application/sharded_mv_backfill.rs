@@ -58,10 +58,13 @@ pub async fn scatter_mv_backfill(
     let space = map
         .space(source.db, source.rp, source.measurement)
         .ok_or_else(|| {
-            HyperbytedbError::ShardMap(format!(
-                "source measurement {}/{}/{} has no shard space",
-                source.db, source.rp, source.measurement
-            ))
+            HyperbytedbError::ShardMap(
+                format!(
+                    "source measurement {}/{}/{} has no shard space",
+                    source.db, source.rp, source.measurement
+                )
+                .into(),
+            )
         })?;
 
     for region in &space.regions {

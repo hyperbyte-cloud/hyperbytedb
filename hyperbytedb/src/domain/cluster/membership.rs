@@ -26,6 +26,22 @@ impl std::fmt::Display for NodeState {
     }
 }
 
+impl std::str::FromStr for NodeState {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "joining" => Ok(NodeState::Joining),
+            "syncing" => Ok(NodeState::Syncing),
+            "active" => Ok(NodeState::Active),
+            "disconnected" => Ok(NodeState::Disconnected),
+            "draining" => Ok(NodeState::Draining),
+            "leaving" => Ok(NodeState::Leaving),
+            _ => Err(()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeInfo {
     pub node_id: u64,
@@ -64,6 +80,14 @@ impl ClusterMembership {
 
     pub fn set_state(&mut self, node_id: u64, state: NodeState) -> bool {
         if let Some(node) = self.nodes.get_mut(&node_id) {
+            if node.state != state {
+                tracing::debug!(
+                    node_id,
+                    from = %node.state,
+                    to = %state,
+                    "membership state transition"
+                );
+            }
             node.state = state;
             self.version += 1;
             true

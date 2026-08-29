@@ -17,14 +17,22 @@ use crate::application::shard_transfer::apply_transfer;
 use crate::application::sharded_mv_backfill::apply_mv_backfill_sql;
 use crate::application::wal_append::append_points_with_prepared;
 use crate::domain::sharding::{
-    RegionHeartbeat, ShardBootstrapRequest, ShardDeleteRequest, ShardMap, ShardMapJson,
-    ShardMetadataKind, ShardMetadataRequest, ShardMvBackfillRequest, ShardQueryRequest,
-    ShardRegion, ShardTransferPayload, ShardWriteRequest,
+    MeasurementKey, RegionHeartbeat, ShardBootstrapRequest, ShardDeleteRequest, ShardMap,
+    ShardMapJson, ShardMetadataKind, ShardMetadataRequest, ShardMvBackfillRequest,
+    ShardQueryRequest, ShardRegion, ShardRehomeRequest, ShardTransferPayload, ShardWriteRequest,
 };
 use crate::ports::replication::OutboundReplicationBatch;
 use crate::ports::sharding::ShardMapPort;
 
 use super::router::AppState;
+
+fn sharding_disabled() -> axum::response::Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({"error": "sharding disabled"})),
+    )
+        .into_response()
+}
 
 fn lookup_region(
     map: &ShardMap,
@@ -106,9 +114,14 @@ pub async fn handle_shard_bootstrap(
                                 .into_response();
                         }
                         Ok(resp) => {
+                            let status = resp.status();
+                            let body = resp.text().await.unwrap_or_default();
                             return (
                                 StatusCode::BAD_GATEWAY,
-                                Json(serde_json::json!({"error": resp.status().to_string()})),
+                                Json(serde_json::json!({
+                                    "error": format!("leader bootstrap failed: {status}"),
+                                    "leader_error": body,
+                                })),
                             )
                                 .into_response();
                         }
@@ -246,6 +259,18 @@ pub async fn handle_shard_write(
         )
             .into_response();
     }
+    // Single-writer invariant: only the region primary may accept a forwarded
+    // write. A replica accepting one would append to its own WAL concurrently
+    // with the primary, diverging watermarks and replication. 409 (not 403)
+    // so the coordinator's forward path treats it as stale ownership, refreshes
+    // the region from the shard map, and re-routes to the current primary.
+    if region.primary != state.node_id {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "not region primary"})),
+        )
+            .into_response();
+    }
 
     let points = match parse_line_body_to_points_limited(
         &req.body,
@@ -268,7 +293,7 @@ pub async fn handle_shard_write(
         &req.rp,
         &points,
         state.ingest_cardinality,
-        None,
+        Some(&state.ingest_schema_cache),
     )
     .await
     {
@@ -342,39 +367,40 @@ pub async fn handle_shard_query(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ShardQueryRequest>,
 ) -> impl IntoResponse {
-    if let Some(ctx) = state.shard_routing.as_ref() {
-        let map = match ctx.shard_map.snapshot().await {
-            Ok(m) => m,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": e.to_string()})),
-                )
-                    .into_response();
-            }
-        };
-        let region = lookup_region(&map, &req.db, &req.rp, &req.measurement, req.region_id);
-        let Some(region) = region else {
+    let Some(ctx) = state.shard_routing.as_ref() else {
+        return sharding_disabled();
+    };
+    let map = match ctx.shard_map.snapshot().await {
+        Ok(m) => m,
+        Err(e) => {
             return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "region not found"})),
-            )
-                .into_response();
-        };
-        if region.epoch != req.epoch {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({"error": "stale epoch"})),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
             )
                 .into_response();
         }
-        if !region.peers.contains(&state.node_id) {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({"error": "not owner"})),
-            )
-                .into_response();
-        }
+    };
+    let region = lookup_region(&map, &req.db, &req.rp, &req.measurement, req.region_id);
+    let Some(region) = region else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "region not found"})),
+        )
+            .into_response();
+    };
+    if region.epoch != req.epoch {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "stale epoch"})),
+        )
+            .into_response();
+    }
+    if !region.peers.contains(&state.node_id) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "not owner"})),
+        )
+            .into_response();
     }
 
     let sql = if req.series_id_end > req.series_id_start {
@@ -397,39 +423,40 @@ pub async fn handle_shard_mv_backfill(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ShardMvBackfillRequest>,
 ) -> impl IntoResponse {
-    if let Some(ctx) = state.shard_routing.as_ref() {
-        let map = match ctx.shard_map.snapshot().await {
-            Ok(m) => m,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": e.to_string()})),
-                )
-                    .into_response();
-            }
-        };
-        let region = lookup_region_in_db_rp(&map, &req.db, &req.rp, req.region_id);
-        let Some(region) = region else {
+    let Some(ctx) = state.shard_routing.as_ref() else {
+        return sharding_disabled();
+    };
+    let map = match ctx.shard_map.snapshot().await {
+        Ok(m) => m,
+        Err(e) => {
             return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "region not found"})),
-            )
-                .into_response();
-        };
-        if region.epoch != req.epoch {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({"error": "stale epoch"})),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
             )
                 .into_response();
         }
-        if !region.peers.contains(&state.node_id) {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({"error": "not owner"})),
-            )
-                .into_response();
-        }
+    };
+    let region = lookup_region_in_db_rp(&map, &req.db, &req.rp, req.region_id);
+    let Some(region) = region else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "region not found"})),
+        )
+            .into_response();
+    };
+    if region.epoch != req.epoch {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "stale epoch"})),
+        )
+            .into_response();
+    }
+    if !region.peers.contains(&state.node_id) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "not owner"})),
+        )
+            .into_response();
     }
 
     match apply_mv_backfill_sql(&state.points_sink, &state.metadata, &state.query_port, &req).await
@@ -447,6 +474,13 @@ pub async fn handle_shard_heartbeat(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RegionHeartbeat>,
 ) -> impl IntoResponse {
+    if req.node_id == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "node_id required"})),
+        )
+            .into_response();
+    }
     if let Some(ctx) = state.shard_routing.as_ref() {
         let map = match ctx.shard_map.snapshot().await {
             Ok(m) => m,
@@ -473,11 +507,7 @@ pub async fn handle_shard_heartbeat(
             )
                 .into_response();
         }
-        let reporter = if req.node_id != 0 {
-            req.node_id
-        } else {
-            state.node_id
-        };
+        let reporter = req.node_id;
         if !region.peers.contains(&reporter) {
             return (
                 StatusCode::FORBIDDEN,
@@ -488,11 +518,7 @@ pub async fn handle_shard_heartbeat(
     }
 
     if let Some(scheduler) = state.shard_scheduler.as_ref() {
-        let reporter = if req.node_id != 0 {
-            req.node_id
-        } else {
-            state.node_id
-        };
+        let reporter = req.node_id;
         scheduler
             .record_heartbeat(
                 req.region_id,
@@ -510,7 +536,46 @@ pub async fn handle_shard_transfer(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ShardTransferPayload>,
 ) -> impl IntoResponse {
-    if let Some(ctx) = state.shard_routing.as_ref() {
+    if req.stage {
+        // Pre-commit staging (split optimization): the range is not owned by
+        // the destination in the committed map yet, so region/epoch checks are
+        // skipped. Guard rails: sender must be a known member and the local
+        // measurement must exist; rows outside `[start, end)` are filtered
+        // during apply.
+        let Some(membership) = state.membership.as_ref() else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "membership unavailable"})),
+            )
+                .into_response();
+        };
+        let m = membership.read().await;
+        if m.get_node(req.source_node_id).is_none() {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "unknown source node"})),
+            )
+                .into_response();
+        }
+        drop(m);
+        if state
+            .metadata
+            .get_measurement(&req.db, &req.rp, &req.measurement)
+            .await
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "measurement not found for staging"})),
+            )
+                .into_response();
+        }
+    } else {
+        let Some(ctx) = state.shard_routing.as_ref() else {
+            return sharding_disabled();
+        };
         let map = match ctx.shard_map.snapshot().await {
             Ok(m) => m,
             Err(e) => {
@@ -556,9 +621,13 @@ pub async fn handle_shard_transfer(
     )
     .await
     {
-        Ok(()) => {
+        Ok(applied) => {
             counter!("hyperbytedb_shard_transfers_total").increment(1);
-            (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ok": true, "applied": applied})),
+            )
+                .into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -568,43 +637,175 @@ pub async fn handle_shard_transfer(
     }
 }
 
+/// POST /internal/shard/rehome — push this node's local rows for the committed
+/// `[start, end)` child range to `dest_primary`.
+///
+/// Used after a Split when the Raft leader is neither the old primary (the only
+/// node that can export historical rows) nor the new child primary.
+pub async fn handle_shard_rehome(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ShardRehomeRequest>,
+) -> impl IntoResponse {
+    use crate::application::shard_transfer::{complete_region_transfer, push_region_transfer_data};
+
+    let Some(ctx) = state.shard_routing.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "sharding disabled"})),
+        )
+            .into_response();
+    };
+    let Some(peer_client) = state.peer_client.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "no peer client"})),
+        )
+            .into_response();
+    };
+    if req.dest_primary == state.node_id {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "destination is this node"})),
+        )
+            .into_response();
+    }
+
+    let map = match ctx.shard_map.snapshot().await {
+        Ok(m) => m,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    // Validate against the committed map: exact child range + epoch. This also
+    // pins the real apply-allocated region_id into the transfer payloads.
+    let region = map
+        .space(&req.db, &req.rp, &req.measurement)
+        .and_then(|space| space.region_with_range(req.start, req.end));
+    let Some(region) = region else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "region range not found"})),
+        )
+            .into_response();
+    };
+    if region.epoch != req.epoch {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "stale epoch"})),
+        )
+            .into_response();
+    }
+    if !region.peers.contains(&state.node_id) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "not owner"})),
+        )
+            .into_response();
+    }
+
+    let outcome = match push_region_transfer_data(
+        peer_client,
+        &state.metadata,
+        &state.wal,
+        Some(&state.query_port),
+        state.node_id,
+        &ctx_key(&req),
+        region,
+        req.dest_primary,
+        state.max_points_per_request,
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            counter!("hyperbytedb_shard_transfer_failures_total").increment(1);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    if let Err(e) = complete_region_transfer(
+        peer_client,
+        &state.metadata,
+        Some(&state.points_sink),
+        state.node_id,
+        &ctx_key(&req),
+        region,
+        req.dest_primary,
+        outcome.transfer_id,
+        req.drop_source,
+    )
+    .await
+    {
+        counter!("hyperbytedb_shard_transfer_failures_total").increment(1);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+
+    counter!("hyperbytedb_shard_rehome_total").increment(1);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "exported": outcome.exported,
+            "applied": outcome.applied,
+        })),
+    )
+        .into_response()
+}
+
+fn ctx_key(req: &ShardRehomeRequest) -> MeasurementKey {
+    MeasurementKey::new(&req.db, &req.rp, &req.measurement)
+}
+
 pub async fn handle_shard_metadata(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ShardMetadataRequest>,
 ) -> impl IntoResponse {
-    if let Some(ctx) = state.shard_routing.as_ref() {
-        let map = match ctx.shard_map.snapshot().await {
-            Ok(m) => m,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": e.to_string()})),
-                )
-                    .into_response();
-            }
-        };
-        let region = lookup_region(&map, &req.db, &req.rp, &req.measurement, req.region_id);
-        let Some(region) = region else {
+    let Some(ctx) = state.shard_routing.as_ref() else {
+        return sharding_disabled();
+    };
+    let map = match ctx.shard_map.snapshot().await {
+        Ok(m) => m,
+        Err(e) => {
             return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "region not found"})),
-            )
-                .into_response();
-        };
-        if region.epoch != req.epoch {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({"error": "stale epoch"})),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
             )
                 .into_response();
         }
-        if !region.peers.contains(&state.node_id) {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({"error": "not owner"})),
-            )
-                .into_response();
-        }
+    };
+    let region = lookup_region(&map, &req.db, &req.rp, &req.measurement, req.region_id);
+    let Some(region) = region else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "region not found"})),
+        )
+            .into_response();
+    };
+    if region.epoch != req.epoch {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "stale epoch"})),
+        )
+            .into_response();
+    }
+    if !region.peers.contains(&state.node_id) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "not owner"})),
+        )
+            .into_response();
     }
 
     match req.kind {
@@ -663,42 +864,55 @@ pub async fn handle_shard_delete(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ShardDeleteRequest>,
 ) -> impl IntoResponse {
-    if let Some(ctx) = state.shard_routing.as_ref() {
-        let map = match ctx.shard_map.snapshot().await {
-            Ok(m) => m,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": e.to_string()})),
-                )
-                    .into_response();
-            }
-        };
-        let region = lookup_region(&map, &req.db, &req.rp, &req.measurement, req.region_id);
-        let Some(region) = region else {
+    let Some(ctx) = state.shard_routing.as_ref() else {
+        return sharding_disabled();
+    };
+    let map = match ctx.shard_map.snapshot().await {
+        Ok(m) => m,
+        Err(e) => {
             return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "region not found"})),
-            )
-                .into_response();
-        };
-        if region.epoch != req.epoch {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({"error": "stale epoch"})),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
             )
                 .into_response();
         }
-        if region.primary != state.node_id {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({"error": "not primary"})),
-            )
-                .into_response();
-        }
+    };
+    let region = lookup_region(&map, &req.db, &req.rp, &req.measurement, req.region_id);
+    let Some(region) = region else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "region not found"})),
+        )
+            .into_response();
+    };
+    if region.epoch != req.epoch {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "stale epoch"})),
+        )
+            .into_response();
+    }
+    if region.primary != state.node_id {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "not primary"})),
+        )
+            .into_response();
     }
 
     let predicate = req.predicate.as_deref().unwrap_or("");
+    if !predicate.is_empty()
+        && let Err(e) = state
+            .metadata
+            .store_tombstone(&req.db, &req.rp, &req.measurement, predicate)
+            .await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
     if let Err(e) = state
         .metadata
         .delete_series_matching(&req.db, &req.rp, Some(&req.measurement), predicate)

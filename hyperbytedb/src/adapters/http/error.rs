@@ -41,6 +41,8 @@ fn error_to_status_and_message(err: &HyperbytedbError) -> (StatusCode, String) {
         HyperbytedbError::ShardNotOwner { .. } => StatusCode::FORBIDDEN,
         HyperbytedbError::StaleShardEpoch { .. } => StatusCode::CONFLICT,
         HyperbytedbError::ShardMap(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        HyperbytedbError::TransferRejected { .. } => StatusCode::BAD_GATEWAY,
+        HyperbytedbError::TransferCollision => StatusCode::CONFLICT,
         HyperbytedbError::SyncFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
         HyperbytedbError::ReplicationTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
         HyperbytedbError::ReplicationQuorumTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,

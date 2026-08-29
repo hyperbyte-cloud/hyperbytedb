@@ -171,6 +171,7 @@ async fn start_auth_cluster_node(dir: &std::path::Path) -> AuthClusterNode {
         shard_routing: None,
         shard_scheduler: None,
         ingest_cardinality: IngestCardinalityLimits::default(),
+        ingest_schema_cache: Default::default(),
         cluster_replication: ReplicationConfig::default(),
     });
 

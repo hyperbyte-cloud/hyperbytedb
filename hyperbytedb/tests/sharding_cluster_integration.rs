@@ -122,7 +122,7 @@ async fn query_scatter_falls_back_when_primary_unreachable() {
 
 #[tokio::test]
 #[serial(chdb)]
-async fn write_forwards_to_active_replica_when_primary_down() {
+async fn write_fails_fast_when_primary_down_then_succeeds_after_failover() {
     let dir = tempfile::tempdir().unwrap();
     let mut nodes =
         start_sharded_three_node_cluster(dir.path(), ShardedClusterOptions::default()).await;
@@ -135,6 +135,9 @@ async fn write_forwards_to_active_replica_when_primary_down() {
 
     stop_node(&mut nodes[0]);
 
+    // Single-writer invariant: with the region primary down there is no valid
+    // write target — the coordinator must reject the write rather than accept
+    // it on a replica (which would create two concurrent WAL writers).
     let resp = write_line(
         &client,
         &nodes[2].url,
@@ -143,8 +146,24 @@ async fn write_forwards_to_active_replica_when_primary_down() {
     )
     .await;
     assert!(
+        !resp.status().is_success(),
+        "write must fail while region primary is down, got {}",
+        resp.status()
+    );
+
+    // Failover: move the primary role to the surviving replica (node 2).
+    promote_region_primary_on_all_nodes(&nodes, "sharddb", "autogen", "cpu", 2).await;
+
+    let resp = write_line(
+        &client,
+        &nodes[1].url,
+        "sharddb",
+        "cpu,host=b value=3 3000000000",
+    )
+    .await;
+    assert!(
         resp.status().is_success(),
-        "write failed: {}",
+        "write after failover failed: {}",
         resp.status()
     );
 
@@ -155,7 +174,7 @@ async fn write_forwards_to_active_replica_when_primary_down() {
     let body = q.text().await.unwrap();
     assert!(
         body.contains("cpu"),
-        "expected measurement on replica: {body}"
+        "expected measurement on promoted primary: {body}"
     );
 }
 
@@ -271,6 +290,8 @@ async fn transfer_moves_flushed_data_and_drops_source_range() {
         peers: vec![1, 2],
         primary: 1,
         last_split_at: 0,
+        transfer_verified: None,
+        transfer_first_seen: None,
     };
     let key = MeasurementKey::new("sharddb", "autogen", "cpu");
 
@@ -307,6 +328,7 @@ async fn transfer_moves_flushed_data_and_drops_source_range() {
         &transfer_region,
         2,
         10_000,
+        true,
     )
     .await
     .expect("region transfer");
@@ -346,6 +368,8 @@ async fn bootstrap_two_regions(nodes: &[ShardedTestNode], db: &str, rp: &str, me
         peers: vec![1, 2],
         primary: 1,
         last_split_at: 0,
+        transfer_verified: None,
+        transfer_first_seen: None,
     };
     let region_b = ShardRegion {
         region_id: 2,
@@ -358,6 +382,8 @@ async fn bootstrap_two_regions(nodes: &[ShardedTestNode], db: &str, rp: &str, me
         peers: vec![2, 3],
         primary: 2,
         last_split_at: 0,
+        transfer_verified: None,
+        transfer_first_seen: None,
     };
     let split = ShardMapOp::Split {
         key: MeasurementKey::new(db, rp, measurement),

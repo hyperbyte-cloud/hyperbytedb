@@ -2,6 +2,94 @@ use std::time::Duration;
 
 use crate::domain::cluster::membership::{NodeState, SharedMembership};
 
+/// Self-reported readiness fields parsed from a peer's `/health` body.
+///
+/// Both fields are optional: absent/unparseable bodies (legacy binaries,
+/// non-JSON responses) carry no membership information and produce no
+/// inference — see [`decide_transition`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct HealthBody {
+    pub state: Option<NodeState>,
+    pub needs_sync: Option<bool>,
+}
+
+impl HealthBody {
+    fn parse(text: &str) -> Option<Self> {
+        let v: serde_json::Value = serde_json::from_str(text).ok()?;
+        let state = v
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|s| s.parse::<NodeState>().ok());
+        let needs_sync = v.get("needs_sync").and_then(serde_json::Value::as_bool);
+        // A body that is valid JSON but carries neither field is treated as
+        // no-information, same as an unparseable body.
+        if state.is_none() && needs_sync.is_none() {
+            return None;
+        }
+        Some(Self { state, needs_sync })
+    }
+
+    /// Self-truth readiness: the peer reports itself caught up and accepting
+    /// data. A failed startup sync (`needs_sync=true`) deliberately serves
+    /// healthy traffic but must not be promoted as caught-up.
+    fn ready(&self) -> bool {
+        self.state == Some(NodeState::Active) && self.needs_sync != Some(true)
+    }
+}
+
+/// Outcome of probing one peer.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ProbeSignal {
+    /// No response at all (connect error, timeout): the only crash detector.
+    Unreachable,
+    /// The peer answered. `health_ok` records the overall HTTP status for
+    /// observability only — it never drives membership transitions.
+    Response {
+        health_ok: bool,
+        body: Option<HealthBody>,
+    },
+}
+
+/// Compute the membership transition implied by one probe of a peer in
+/// `current` state.
+///
+/// Authority model: for reachable peers the decoded body `state` field is the
+/// sole transition input; overall HTTP status never transitions membership.
+/// `Joining`/`Draining`/`Leaving` are operator-owned and never auto-promoted.
+pub(crate) fn decide_transition(current: NodeState, signal: &ProbeSignal) -> Option<NodeState> {
+    use NodeState::{Active, Disconnected, Draining, Joining, Leaving, Syncing};
+    match (current, signal) {
+        // Transport failure is the sole demotion path to Disconnected;
+        // operator states stay untouched.
+        (_, ProbeSignal::Unreachable) => {
+            if matches!(current, Active | Syncing) {
+                Some(Disconnected)
+            } else {
+                None
+            }
+        }
+        // Reachable but no usable body: legacy liveness heal only.
+        (current, ProbeSignal::Response { body: None, .. }) => {
+            (current == Disconnected).then_some(Active)
+        }
+        // Reachable with a parseable self-report: mirror self-truth.
+        (current, ProbeSignal::Response { body: Some(b), .. }) => match current {
+            Disconnected => {
+                if b.ready() {
+                    Some(Active)
+                } else if b.state == Some(Syncing) {
+                    Some(Syncing)
+                } else {
+                    None
+                }
+            }
+            Syncing => b.ready().then_some(Active),
+            Active => (b.state == Some(Syncing)).then_some(Syncing),
+            Joining | Draining | Leaving => None,
+        },
+    }
+}
+
 /// Logs cluster membership summary every 60 seconds for observability.
 pub async fn run_heartbeat_logger(
     node_addr: String,
@@ -37,9 +125,10 @@ pub async fn run_heartbeat_logger(
     }
 }
 
-/// Periodically probes every peer via `GET /ping` and updates
-/// `last_heartbeat` for reachable peers.  Peers that fail the probe
-/// are transitioned to `Disconnected` (unless already `Draining`/`Leaving`).
+/// Periodically probes every peer via `GET /health` and converges the local
+/// membership view toward each peer's self-reported state. Peers that fail to
+/// answer at all are transitioned to `Disconnected` (unless already
+/// `Draining`/`Leaving`).
 pub async fn run_heartbeat_updater(
     self_id: u64,
     membership: SharedMembership,
@@ -82,11 +171,11 @@ pub async fn run_heartbeat_updater(
 }
 
 async fn probe_peers(self_id: u64, membership: &SharedMembership, client: &reqwest::Client) {
-    let peers: Vec<(u64, String, NodeState)> = {
+    let peers: Vec<(u64, String)> = {
         let m = membership.read().await;
         m.all_peers(self_id)
             .into_iter()
-            .map(|n| (n.node_id, n.addr.clone(), n.state))
+            .map(|n| (n.node_id, n.addr.clone()))
             .collect()
     };
 
@@ -96,24 +185,33 @@ async fn probe_peers(self_id: u64, membership: &SharedMembership, client: &reqwe
 
     let futures: Vec<_> = peers
         .iter()
-        .map(|(peer_id, addr, _state)| {
+        .map(|(peer_id, addr)| {
             let health_url = format!("http://{addr}/health");
             let ping_url = format!("http://{addr}/ping");
             let client = client.clone();
             let pid = *peer_id;
             async move {
-                let health_ok = client
-                    .get(&health_url)
-                    .send()
-                    .await
-                    .map(|r| r.status().is_success())
-                    .unwrap_or(false);
-                let ping_ok = if health_ok {
-                    true
-                } else {
-                    client.get(&ping_url).send().await.is_ok()
+                let health = client.get(&health_url).send().await;
+                let signal = match health {
+                    Ok(resp) => {
+                        let health_ok = resp.status().is_success();
+                        let body = resp.text().await.ok().and_then(|t| HealthBody::parse(&t));
+                        ProbeSignal::Response { health_ok, body }
+                    }
+                    Err(_) => {
+                        // Health endpoint unreachable entirely: fall back to
+                        // liveness ping so reachable-but-unhealthy peers are
+                        // not mistaken for crashed ones.
+                        match client.get(&ping_url).send().await {
+                            Ok(_) => ProbeSignal::Response {
+                                health_ok: false,
+                                body: None,
+                            },
+                            Err(_) => ProbeSignal::Unreachable,
+                        }
+                    }
                 };
-                (pid, health_ok, ping_ok)
+                (pid, signal)
             }
         })
         .collect();
@@ -123,28 +221,35 @@ async fn probe_peers(self_id: u64, membership: &SharedMembership, client: &reqwe
     let now = chrono::Utc::now().timestamp();
     let mut m = membership.write().await;
 
-    for (pid, health_ok, ping_ok) in results {
-        if health_ok {
-            m.update_heartbeat(pid, now);
-
-            if let Some(node) = m.get_node(pid)
-                && node.state == NodeState::Disconnected
-            {
-                tracing::info!(peer_id = pid, "peer reconnected, marking active");
-                m.set_state(pid, NodeState::Active);
+    for (pid, signal) in results {
+        match &signal {
+            ProbeSignal::Unreachable => {
+                let should_disconnect = m
+                    .get_node(pid)
+                    .is_some_and(|n| matches!(n.state, NodeState::Active | NodeState::Syncing));
+                if should_disconnect {
+                    tracing::warn!(peer_id = pid, "peer unreachable, marking disconnected");
+                    m.set_state(pid, NodeState::Disconnected);
+                }
             }
-        } else if ping_ok {
-            // Reachable but not ready for traffic (Syncing/Draining/etc.).
-            m.update_heartbeat(pid, now);
-        } else {
-            let should_disconnect = m
-                .get_node(pid)
-                .map(|n| n.state == NodeState::Active || n.state == NodeState::Syncing)
-                .unwrap_or(false);
-
-            if should_disconnect {
-                tracing::warn!(peer_id = pid, "peer unreachable, marking disconnected");
-                m.set_state(pid, NodeState::Disconnected);
+            ProbeSignal::Response { health_ok, .. } => {
+                m.update_heartbeat(pid, now);
+                let Some(current) = m.get_node(pid).map(|n| n.state) else {
+                    continue;
+                };
+                let Some(next) = decide_transition(current, &signal) else {
+                    continue;
+                };
+                if next != current {
+                    tracing::info!(
+                        peer_id = pid,
+                        from = %current,
+                        to = %next,
+                        health_ok,
+                        "peer membership converged from self-reported state"
+                    );
+                    m.set_state(pid, next);
+                }
             }
         }
     }
@@ -169,6 +274,312 @@ mod tests {
         }
         new_shared(m)
     }
+
+    fn body(state: Option<NodeState>, needs_sync: Option<bool>) -> ProbeSignal {
+        ProbeSignal::Response {
+            health_ok: true,
+            body: Some(HealthBody { state, needs_sync }),
+        }
+    }
+
+    // ── pure transition matrix (H.2/H.3/H.4 semantics) ──────────────────
+
+    #[test]
+    fn syncing_promotes_when_body_reports_active_ready() {
+        let next = decide_transition(
+            NodeState::Syncing,
+            &body(Some(NodeState::Active), Some(false)),
+        );
+        assert_eq!(next, Some(NodeState::Active));
+    }
+
+    #[test]
+    fn syncing_stays_when_body_reports_needs_sync() {
+        let next = decide_transition(
+            NodeState::Syncing,
+            &body(Some(NodeState::Active), Some(true)),
+        );
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn syncing_stays_when_body_reports_syncing() {
+        let next = decide_transition(
+            NodeState::Syncing,
+            &body(Some(NodeState::Syncing), Some(false)),
+        );
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn syncing_stays_when_body_has_no_usable_state() {
+        let next = decide_transition(NodeState::Syncing, &body(None, None));
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn active_demotes_when_body_reports_syncing() {
+        let next = decide_transition(
+            NodeState::Active,
+            &body(Some(NodeState::Syncing), Some(false)),
+        );
+        assert_eq!(next, Some(NodeState::Syncing));
+    }
+
+    #[test]
+    fn active_unchanged_when_body_absent() {
+        let next = decide_transition(
+            NodeState::Active,
+            &ProbeSignal::Response {
+                health_ok: false,
+                body: None,
+            },
+        );
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn disconnected_heals_to_active_on_ready_body() {
+        let next = decide_transition(
+            NodeState::Disconnected,
+            &body(Some(NodeState::Active), Some(false)),
+        );
+        assert_eq!(next, Some(NodeState::Active));
+    }
+
+    #[test]
+    fn disconnected_set_syncing_when_body_reports_syncing() {
+        let next = decide_transition(
+            NodeState::Disconnected,
+            &body(Some(NodeState::Syncing), Some(false)),
+        );
+        assert_eq!(next, Some(NodeState::Syncing));
+    }
+
+    #[test]
+    fn disconnected_legacy_heal_without_body() {
+        let next = decide_transition(
+            NodeState::Disconnected,
+            &ProbeSignal::Response {
+                health_ok: true,
+                body: None,
+            },
+        );
+        assert_eq!(next, Some(NodeState::Active));
+    }
+
+    #[test]
+    fn unreachable_demotes_only_active_and_syncing() {
+        for current in [NodeState::Active, NodeState::Syncing] {
+            assert_eq!(
+                decide_transition(current, &ProbeSignal::Unreachable),
+                Some(NodeState::Disconnected)
+            );
+        }
+        for current in [
+            NodeState::Disconnected,
+            NodeState::Joining,
+            NodeState::Draining,
+            NodeState::Leaving,
+        ] {
+            assert_eq!(decide_transition(current, &ProbeSignal::Unreachable), None);
+        }
+    }
+
+    #[test]
+    fn operator_states_are_never_promoted() {
+        for current in [NodeState::Joining, NodeState::Draining, NodeState::Leaving] {
+            assert_eq!(
+                decide_transition(current, &body(Some(NodeState::Active), Some(false))),
+                None
+            );
+            assert_eq!(
+                decide_transition(
+                    current,
+                    &ProbeSignal::Response {
+                        health_ok: false,
+                        body: None
+                    }
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn flap_freedom_status_does_not_drive_transitions() {
+        // Alternating overall status with an identical body must produce the
+        // same decision every time: only the first application ever changes
+        // state.
+        let ok = body(Some(NodeState::Active), Some(false));
+        let degraded = ProbeSignal::Response {
+            health_ok: false,
+            body: Some(HealthBody {
+                state: Some(NodeState::Active),
+                needs_sync: Some(false),
+            }),
+        };
+        let mut state = NodeState::Syncing;
+        for signal in [&ok, &degraded, &ok, &degraded] {
+            if let Some(next) = decide_transition(state, signal) {
+                state = next;
+            }
+        }
+        assert_eq!(state, NodeState::Active);
+    }
+
+    #[test]
+    fn health_body_parse_handles_fields_and_garbage() {
+        let b = HealthBody::parse(r#"{"state":"active","needs_sync":false}"#).unwrap();
+        assert_eq!(b.state, Some(NodeState::Active));
+        assert!(b.ready());
+        let lagging = HealthBody::parse(r#"{"state":"active","needs_sync":true}"#).unwrap();
+        assert!(!lagging.ready(), "needs_sync must block readiness");
+        assert_eq!(
+            HealthBody::parse(r#"{"state":"syncing"}"#).unwrap().state,
+            Some(NodeState::Syncing)
+        );
+        assert!(HealthBody::parse("not json").is_none());
+        assert!(HealthBody::parse(r#"{"status":"pass"}"#).is_none());
+    }
+
+    // ── probe_peers against real HTTP endpoints ─────────────────────────
+
+    /// Serves `/health` (+ optional `/ping`) with responses produced by
+    /// `responder(count) -> (status, body)`; returns the bound address.
+    async fn spawn_health_server(
+        responder: impl Fn(u64) -> (axum::http::StatusCode, &'static str) + Send + Sync + 'static,
+    ) -> String {
+        use axum::extract::State;
+        use axum::routing::get;
+        use std::sync::atomic::AtomicU64;
+
+        type Responder =
+            std::sync::Arc<dyn Fn(u64) -> (axum::http::StatusCode, &'static str) + Send + Sync>;
+
+        let count = std::sync::Arc::new(AtomicU64::new(0));
+        let responder: Responder = std::sync::Arc::new(responder);
+
+        async fn health(
+            State((count, responder)): State<(std::sync::Arc<AtomicU64>, Responder)>,
+        ) -> (axum::http::StatusCode, &'static str) {
+            let n = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            responder(n)
+        }
+
+        let app = axum::Router::new()
+            .route("/health", get(health))
+            .route(
+                "/ping",
+                get(|| async { axum::http::StatusCode::NO_CONTENT }),
+            )
+            .with_state((count, responder));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr
+    }
+
+    #[tokio::test]
+    async fn prober_promotes_syncing_peer_from_self_reported_body() {
+        let addr = spawn_health_server(|_| {
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"status":"warn","message":"x","state":"active","needs_sync":false}"#,
+            )
+        })
+        .await;
+
+        let membership = make_membership(&[(2, addr.as_str(), NodeState::Syncing)]);
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(500))
+            .build()
+            .unwrap();
+        probe_peers(1, &membership, &client).await;
+
+        let m = membership.read().await;
+        assert_eq!(m.get_node(2).unwrap().state, NodeState::Active);
+    }
+
+    #[tokio::test]
+    async fn prober_demotes_active_peer_reporting_syncing() {
+        let addr = spawn_health_server(|_| {
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"status":"warn","message":"x","state":"syncing","needs_sync":false}"#,
+            )
+        })
+        .await;
+
+        let membership = make_membership(&[(2, addr.as_str(), NodeState::Active)]);
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(500))
+            .build()
+            .unwrap();
+        probe_peers(1, &membership, &client).await;
+
+        let m = membership.read().await;
+        assert_eq!(m.get_node(2).unwrap().state, NodeState::Syncing);
+    }
+
+    #[tokio::test]
+    async fn prober_no_inference_on_bodyless_response() {
+        let addr = spawn_health_server(|_| (axum::http::StatusCode::OK, "")).await;
+
+        let membership = make_membership(&[(2, addr.as_str(), NodeState::Syncing)]);
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(500))
+            .build()
+            .unwrap();
+        probe_peers(1, &membership, &client).await;
+
+        let m = membership.read().await;
+        assert_eq!(
+            m.get_node(2).unwrap().state,
+            NodeState::Syncing,
+            "unparseable body must not promote"
+        );
+    }
+
+    #[tokio::test]
+    async fn prober_flap_freedom_over_alternating_status() {
+        let addr = spawn_health_server(|n| {
+            if n % 2 == 0 {
+                (
+                    axum::http::StatusCode::OK,
+                    r#"{"status":"pass","message":"ok","state":"active","needs_sync":false}"#,
+                )
+            } else {
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    r#"{"status":"fail","message":"wal","state":"active","needs_sync":false}"#,
+                )
+            }
+        })
+        .await;
+
+        let membership = make_membership(&[(2, addr.as_str(), NodeState::Syncing)]);
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(500))
+            .build()
+            .unwrap();
+        for _ in 0..6 {
+            probe_peers(1, &membership, &client).await;
+        }
+
+        let m = membership.read().await;
+        assert_eq!(
+            m.get_node(2).unwrap().state,
+            NodeState::Active,
+            "alternating status with constant self-truth must not flap"
+        );
+    }
+
+    // ── pre-existing behavior guards ────────────────────────────────────
 
     #[tokio::test]
     async fn unreachable_peer_is_disconnected() {

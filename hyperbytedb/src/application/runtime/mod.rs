@@ -124,6 +124,7 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
                         .as_ref()
                         .zip(Some(app_state.shard_location_cache.clone()))
                         .map(|(m, cache)| (m.clone(), cache)),
+                    app_state.shard_routing.clone(),
                 )
                 .await?,
             )

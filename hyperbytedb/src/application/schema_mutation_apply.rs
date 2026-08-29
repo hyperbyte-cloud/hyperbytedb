@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use crate::application::materialized_view_service::MaterializedViewService;
+use crate::application::shard_routing::{self, ShardRoutingContext};
 use crate::domain::cluster::types::MutationRequest;
 use crate::error::HyperbytedbError;
 use crate::ports::metadata::MetadataPort;
@@ -19,6 +20,7 @@ pub struct SchemaMutationDeps<'a> {
     pub mv_service: Option<&'a MaterializedViewService>,
     pub points_sink: Option<&'a Arc<dyn PointsSinkPort>>,
     pub wal: Option<&'a Arc<dyn WalPort>>,
+    pub shard_routing: Option<&'a Arc<ShardRoutingContext>>,
 }
 
 /// Apply a schema mutation locally, including chDB DDL where required.
@@ -69,6 +71,7 @@ async fn apply_schema_mutation_inner(
         mv_service,
         points_sink,
         wal,
+        shard_routing,
     } = deps;
     match mutation {
         MutationRequest::CreateDatabase { name, rp } => {
@@ -113,6 +116,21 @@ async fn apply_schema_mutation_inner(
             metadata
                 .store_tombstone(&database, &rp, &measurement, &predicate_sql)
                 .await?;
+            if let Some(ctx) = shard_routing {
+                shard_routing::scatter_delete_to_regions(
+                    ctx,
+                    metadata.as_ref(),
+                    &database,
+                    &rp,
+                    &measurement,
+                    &predicate_sql,
+                )
+                .await?;
+            } else {
+                metadata
+                    .delete_series_matching(&database, &rp, Some(&measurement), &predicate_sql)
+                    .await?;
+            }
             Ok(())
         }
         MutationRequest::CreateContinuousQuery {

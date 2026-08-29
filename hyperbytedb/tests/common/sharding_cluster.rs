@@ -142,7 +142,7 @@ pub async fn start_sharded_node(
         8 * 1024 * 1024,
     ));
 
-    let shard_map = Arc::new(RocksDbShardMap::open(&meta_dir, true, node_id).unwrap());
+    let shard_map = Arc::new(RocksDbShardMap::open(&meta_dir, true).unwrap());
     let location_cache = Arc::new(ShardLocationCache::new());
     let shard_routing = Arc::new(ShardRoutingContext {
         shard_map: shard_map.clone(),
@@ -263,6 +263,7 @@ pub async fn start_sharded_node(
         shard_routing: Some(shard_routing),
         shard_scheduler: None,
         ingest_cardinality: IngestCardinalityLimits::default(),
+        ingest_schema_cache: Default::default(),
         cluster_replication: opts.replication.clone(),
     });
 
@@ -348,6 +349,8 @@ pub async fn bootstrap_region_on_all_nodes(
         peers,
         primary,
         last_split_at: 0,
+        transfer_verified: None,
+        transfer_first_seen: None,
     };
     let op = ShardMapOp::BootstrapMeasurement {
         key: MeasurementKey::new(db, rp, measurement),
@@ -362,6 +365,35 @@ pub async fn bootstrap_region_on_all_nodes(
 
 pub async fn set_node_state(membership: &SharedMembership, node_id: u64, state: NodeState) {
     membership.write().await.set_state(node_id, state);
+}
+
+/// Apply a `TransferPrimary` op on every node's shard map (test-side failover
+/// without waiting for the scheduler).
+pub async fn promote_region_primary_on_all_nodes(
+    nodes: &[ShardedTestNode],
+    db: &str,
+    rp: &str,
+    measurement: &str,
+    new_primary: u64,
+) {
+    for node in nodes {
+        let map = node.shard_map.snapshot().await.unwrap();
+        let Some(space) = map.space(db, rp, measurement) else {
+            continue;
+        };
+        let Some(region) = space.regions.first() else {
+            continue;
+        };
+        let op = ShardMapOp::TransferPrimary {
+            key: MeasurementKey::new(db, rp, measurement),
+            region_id: region.region_id,
+            new_primary,
+            epoch: region.epoch,
+        };
+        node.shard_map.apply_op(op).await.unwrap();
+        let snap = node.shard_map.snapshot().await.unwrap();
+        node.location_cache.refresh_from_map(&snap);
+    }
 }
 
 pub async fn flush_node(node: &ShardedTestNode) {

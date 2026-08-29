@@ -108,14 +108,14 @@ flowchart TD
   ```
 - Consumes: `ShardRoutingContext`, `ensure_measurement_bootstrapped` (used in Task 5)
 
-- [ ] **Step 1:** Add optional fields to `MaterializedViewService`:
+- [x] **Step 1:** Add optional fields to `MaterializedViewService`:
   ```rust
   shard_routing: Option<Arc<ShardRoutingContext>>,
   is_raft_leader: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
   raft_leader_addr: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
   ```
-- [ ] **Step 2:** Implement `with_sharding()` builder; default `None` preserves non-sharded behavior
-- [ ] **Step 3:** In `QueryServiceImpl::with_sharding`, after setting `self.shard_routing`, clone context into `self.mv_service`:
+- [x] **Step 2:** Implement `with_sharding()` builder; default `None` preserves non-sharded behavior
+- [x] **Step 3:** In `QueryServiceImpl::with_sharding`, after setting `self.shard_routing`, clone context into `self.mv_service`:
   ```rust
   pub fn with_sharding(mut self, ctx: Arc<ShardRoutingContext>) -> Self {
       self.shard_routing = Some(ctx.clone());
@@ -129,8 +129,8 @@ flowchart TD
   let mv = MaterializedViewService::new(...).with_sharding(ctx.clone(), ...);
   self.mv_service = Arc::new(mv);
   ```
-- [ ] **Step 4:** In `bootstrap.rs`, after creating `shard_routing`, call `mv_service.with_sharding(...)` before `reconcile_all()`
-- [ ] **Step 5:** Run `cargo check -p hyperbytedb`
+- [x] **Step 4:** In `bootstrap.rs`, after creating `shard_routing`, call `mv_service.with_sharding(...)` before `reconcile_all()`
+- [x] **Step 5:** Run `cargo check -p hyperbytedb`
 
 **Deliverable:** MV service can access shard map; no behavior change yet.
 
@@ -152,9 +152,9 @@ flowchart TD
   ```
   (Thin wrapper now; documents intent; future hook for optimization.)
 
-- [ ] **Step 1:** Add function returning `RegionSelection::All`
-- [ ] **Step 2:** Add unit test confirming it always returns all regions regardless of WHERE clause
-- [ ] **Step 3:** Run `cargo test -p hyperbytedb shard_query_routing`
+- [x] **Step 1:** Add function returning `RegionSelection::All`
+- [x] **Step 2:** Add unit test confirming it always returns all regions regardless of WHERE clause
+- [x] **Step 3:** Run `cargo test -p hyperbytedb shard_query_routing`
 
 **Deliverable:** Explicit API for dest region fan-out.
 
@@ -176,18 +176,18 @@ flowchart TD
   ```
 - Reuses private `merge_row` / `ColumnMerge` logic; builds rules from `meta.field_rollups` and `meta.mean_fields`
 
-- [ ] **Step 1: Write failing tests** in `query_merge.rs` `mod tests`:
+- [x] **Step 1: Write failing tests** in `query_merge.rs` `mod tests`:
   - Two partials with same `(name, tags, time)`, sum columns → summed
   - Two partials with mean storage (`sum_x`, `count_x`) → correct mean
   - Two partials with min/max → min/max respectively
   - Different tag sets → separate series (no merge)
-- [ ] **Step 2:** Run `cargo test -p hyperbytedb merge_materialized` — expect FAIL
-- [ ] **Step 3:** Implement `rollup_merge_rules(meta: &MeasurementMeta) -> HashMap<String, ColumnMerge>` mapping:
+- [x] **Step 2:** Run `cargo test -p hyperbytedb merge_materialized` — expect FAIL
+- [x] **Step 3:** Implement `rollup_merge_rules(meta: &MeasurementMeta) -> HashMap<String, ColumnMerge>` mapping:
   - `RollupCombine::Sum` → `ColumnMerge::Sum`
   - mean fields → sum count columns separately; expose mean only when query asks (passthrough columns for now)
   - Non-rollup columns → `Passthrough` (must match across partials)
-- [ ] **Step 4:** Implement `merge_materialized_rollup_results` using same row-key logic as `merge_aggregate_parts` (`series_row_key` includes time)
-- [ ] **Step 5:** Run tests — expect PASS
+- [x] **Step 4:** Implement `merge_materialized_rollup_results` using same row-key logic as `merge_aggregate_parts` (`series_row_key` includes time)
+- [x] **Step 5:** Run tests — expect PASS
 
 **Deliverable:** Correct cross-region rollup merge for pre-materialized rows.
 
@@ -201,7 +201,7 @@ flowchart TD
 **Interfaces:**
 - Consumes: `merge_materialized_rollup_results`, `select_regions_for_materialized_dest`, `MeasurementMeta.materialized`
 
-- [ ] **Step 1:** In `execute_sharded_measurement_query`, after loading measurement meta, branch:
+- [x] **Step 1:** In `execute_sharded_measurement_query`, after loading measurement meta, branch:
   ```rust
   let is_materialized_dest = meta.as_ref().map(|m| m.materialized).unwrap_or(false);
   let region_selection = if is_materialized_dest {
@@ -210,7 +210,7 @@ flowchart TD
       select_regions_for_query(space, measurement, &effective_stmt)
   };
   ```
-- [ ] **Step 2:** When building per-region SQL, skip `inject_region_series_id_predicate` if `is_materialized_dest`:
+- [x] **Step 2:** When building per-region SQL, skip `inject_region_series_id_predicate` if `is_materialized_dest`:
   ```rust
   let region_sql = if is_materialized_dest {
       sql.clone()
@@ -218,7 +218,7 @@ flowchart TD
       inject_region_series_id_predicate(sql.clone(), region.start, region.end)
   };
   ```
-- [ ] **Step 3:** After fan-out merge:
+- [x] **Step 3:** After fan-out merge:
   ```rust
   let merged = if is_materialized_dest {
       let meta = meta.expect("materialized dest must have metadata");
@@ -233,7 +233,7 @@ flowchart TD
       merge_sharded_query_results(parts, &effective_stmt)
   };
   ```
-- [ ] **Step 4:** Run `cargo test -p hyperbytedb query_merge` and existing sharding tests
+- [x] **Step 4:** Run `cargo test -p hyperbytedb query_merge` and existing sharding tests
 
 **Deliverable:** Dest SELECT returns globally merged rollups across regions.
 
@@ -249,8 +249,8 @@ flowchart TD
 **Interfaces:**
 - Consumes: `ensure_measurement_bootstrapped`, sharding context from Task 1
 
-- [ ] **Step 1:** Delete CREATE MV sharding guard in `query_service.rs`
-- [ ] **Step 2:** Add private helper to `MaterializedViewService`:
+- [x] **Step 1:** Delete CREATE MV sharding guard in `query_service.rs`
+- [x] **Step 2:** Add private helper to `MaterializedViewService`:
   ```rust
   async fn bootstrap_sharded_measurements(
       &self,
@@ -259,10 +259,10 @@ flowchart TD
   ) -> Result<(), HyperbytedbError>;
   ```
   Calls `ensure_measurement_bootstrapped` for source and dest when `shard_routing` is `Some`
-- [ ] **Step 3:** Call from `create()` before `materialize_ddl()`
-- [ ] **Step 4:** When sharding enabled and `backfill_on_create`, skip local fact backfill in `materialize_ddl` (Task 8 will scatter); keep series backfill local-only for now OR skip until Task 8
-- [ ] **Step 5:** Update `sharding_cluster.rs` to build MV service with `.with_sharding(shard_routing.clone(), is_leader, leader_addr)`
-- [ ] **Step 6:** Run `cargo check -p hyperbytedb`
+- [x] **Step 3:** Call from `create()` before `materialize_ddl()`
+- [x] **Step 4:** When sharding enabled and `backfill_on_create`, skip local fact backfill in `materialize_ddl` (Task 8 will scatter); keep series backfill local-only for now OR skip until Task 8
+- [x] **Step 5:** Update `sharding_cluster.rs` to build MV service with `.with_sharding(shard_routing.clone(), is_leader, leader_addr)`
+- [x] **Step 6:** Run `cargo check -p hyperbytedb`
 
 **Deliverable:** `CREATE MATERIALIZED VIEW` succeeds on sharded clusters; dest shard space exists.
 
@@ -273,8 +273,8 @@ flowchart TD
 **Files:**
 - Create: [`hyperbytedb/tests/sharding_mv_integration.rs`](hyperbytedb/tests/sharding_mv_integration.rs)
 
-- [ ] **Step 1:** Add test module to `hyperbytedb/tests/integration.rs` or standalone binary (follow `sharding_cluster_integration.rs` pattern)
-- [ ] **Step 2:** Write `sharded_mv_incremental_rollup`:
+- [x] **Step 1:** Add test module to `hyperbytedb/tests/integration.rs` or standalone binary (follow `sharding_cluster_integration.rs` pattern)
+- [x] **Step 2:** Write `sharded_mv_incremental_rollup`:
   1. Start 3-node sharded cluster via `common::sharding_cluster`
   2. Force split into 2+ regions (enough writes with distinct tag sets)
   3. Write points to source measurement on different hosts
@@ -282,9 +282,9 @@ flowchart TD
   5. Write additional points
   6. Flush WAL on all nodes
   7. `SELECT mean("value") FROM "cpu_5m"` — assert globally correct mean per host
-- [ ] **Step 3:** Write `sharded_mv_drop` — CREATE then DROP; verify dest tables gone on all nodes
-- [ ] **Step 4:** Run `cargo test -p hyperbytedb sharded_mv -- --test-threads=1`
-- [ ] **Step 5:** Run existing `cargo test -p hyperbytedb test_materialized_view_replicates_to_peer` — non-sharded regression
+- [x] **Step 3:** Write `sharded_mv_drop` — CREATE then DROP; verify dest tables gone on all nodes
+- [x] **Step 4:** Run `cargo test -p hyperbytedb sharded_mv -- --test-threads=1`
+- [x] **Step 5:** Run existing `cargo test -p hyperbytedb test_materialized_view_replicates_to_peer` — non-sharded regression
 
 **Deliverable:** Incremental sharded MV proven end-to-end.
 
@@ -316,8 +316,8 @@ flowchart TD
   }
   ```
 
-- [ ] **Step 1:** Add types and export from `mod.rs`
-- [ ] **Step 2:** `cargo check -p hyperbytedb`
+- [x] **Step 1:** Add types and export from `mod.rs`
+- [x] **Step 2:** `cargo check -p hyperbytedb`
 
 **Deliverable:** Request type for backfill scatter endpoint.
 
@@ -346,18 +346,18 @@ flowchart TD
   ) -> Result<(), HyperbytedbError>;
   ```
 
-- [ ] **Step 1:** Implement `handle_shard_mv_backfill` — validate epoch, execute `req.sql` via `query_port`, return 204
-- [ ] **Step 2:** Register `POST /internal/shard/mv-backfill` in router (same auth/middleware as other shard routes)
-- [ ] **Step 3:** Implement `scatter_mv_backfill`:
+- [x] **Step 1:** Implement `handle_shard_mv_backfill` — validate epoch, execute `req.sql` via `query_port`, return 204
+- [x] **Step 2:** Register `POST /internal/shard/mv-backfill` in router (same auth/middleware as other shard routes)
+- [x] **Step 3:** Implement `scatter_mv_backfill`:
   - For each region in source space
   - Inject `inject_region_series_id_predicate` into fact and series SQL
   - `scatter_to_region_peers` with `ScatterKind::Query` (or new `Backfill` kind if metrics needed)
-- [ ] **Step 4:** In `MaterializedViewService::create()` when sharding + `backfill_on_create`:
+- [x] **Step 4:** In `MaterializedViewService::create()` when sharding + `backfill_on_create`:
   1. Build fact/series backfill SQL (reuse `translate_materialized_view_backfill` / series select)
   2. Call `scatter_mv_backfill` **before** `CREATE MATERIALIZED VIEW` DDL
   3. Then run `materialize_ddl` with `backfill_on_create: false`
-- [ ] **Step 5:** Add metric `hyperbytedb_shard_mv_backfill_regions_total`
-- [ ] **Step 6:** `cargo check -p hyperbytedb`
+- [x] **Step 5:** Add metric `hyperbytedb_shard_mv_backfill_regions_total`
+- [x] **Step 6:** `cargo check -p hyperbytedb`
 
 **Deliverable:** `CREATE ... WITH BACKFILL` populates all source regions.
 
@@ -368,10 +368,10 @@ flowchart TD
 **Files:**
 - Modify: [`hyperbytedb/tests/sharding_mv_integration.rs`](hyperbytedb/tests/sharding_mv_integration.rs)
 
-- [ ] **Step 1:** `sharded_mv_backfill` — write historical source data across regions, CREATE WITH BACKFILL, assert dest values match direct rollup query
-- [ ] **Step 2:** `sharded_mv_tag_subset_group_by` — source with tags `host`, `rack`; MV `GROUP BY time(1m), host` only; verify cross-region partial merge
-- [ ] **Step 3:** `sharded_mv_raft_replicate` — CREATE on leader; assert follower has CH MV objects (`system.tables` check, pattern from `raft_integration.rs`)
-- [ ] **Step 4:** Run full `cargo test -p hyperbytedb sharded_mv -- --test-threads=1`
+- [x] **Step 1:** `sharded_mv_backfill` — write historical source data across regions, CREATE WITH BACKFILL, assert dest values match direct rollup query
+- [x] **Step 2:** `sharded_mv_tag_subset_group_by` — source with tags `host`, `rack`; MV `GROUP BY time(1m), host` only; verify cross-region partial merge
+- [x] **Step 3:** `sharded_mv_raft_replicate` — CREATE on leader; assert follower has CH MV objects (`system.tables` check, pattern from `raft_integration.rs`)
+- [x] **Step 4:** Run full `cargo test -p hyperbytedb sharded_mv -- --test-threads=1`
 
 **Deliverable:** Backfill, tag-subset merge, and Raft convergence verified.
 
@@ -383,12 +383,12 @@ flowchart TD
 - Modify: [`hyperbytedb/src/application/shard_transfer.rs`](hyperbytedb/src/application/shard_transfer.rs)
 - Modify: [`hyperbytedb/src/application/materialized_view_service.rs`](hyperbytedb/src/application/materialized_view_service.rs)
 
-- [ ] **Step 1:** Add `MaterializedViewService::purge_dest_partials_for_source_range(db, source_meas, start, end)`
+- [x] **Step 1:** Add `MaterializedViewService::purge_dest_partials_for_source_range(db, source_meas, start, end)`
   - List MVs where `source_measurement` matches
   - Execute `ALTER TABLE dest DELETE WHERE series_id IN (...)` or time-bounded delete per dest schema
-- [ ] **Step 2:** Call from `drop_region_data` after source fact delete (transfer ACK phase)
-- [ ] **Step 3:** Optional: trigger targeted re-backfill on new region primary
-- [ ] **Step 4:** Integration test: split → transfer → verify dest not doubled
+- [x] **Step 2:** Call from `drop_region_data` after source fact delete (transfer ACK phase)
+- [x] **Step 3:** Optional: trigger targeted re-backfill on new region primary
+- [x] **Step 4:** Integration test: split → transfer → verify dest not doubled
 
 **Deliverable:** No stale dest partials after region transfer. **Can ship independently after Tasks 1–9.**
 
@@ -400,9 +400,9 @@ flowchart TD
 - Modify: [`docs/deep-dive/deep-dive-clustering.md`](docs/deep-dive/deep-dive-clustering.md) — remove MV limitation bullet
 - Modify: [`docs/user-guide/advanced-features.md`](docs/user-guide/advanced-features.md) — add "Materialized Views with Sharding" section
 
-- [ ] **Step 1:** Document semantics: partial per region, all-region dest reads, backfill scatter, transfer limitation until Task 10
-- [ ] **Step 2:** Add example CREATE MV on sharded cluster
-- [ ] **Step 3:** Update [`docs/glossary.md`](docs/glossary.md) if MV entry mentions sharding incompatibility
+- [x] **Step 1:** Document semantics: partial per region, all-region dest reads, backfill scatter, transfer limitation until Task 10
+- [x] **Step 2:** Add example CREATE MV on sharded cluster
+- [x] **Step 3:** Update [`docs/glossary.md`](docs/glossary.md) if MV entry mentions sharding incompatibility
 
 **Deliverable:** User-facing docs match implementation.
 

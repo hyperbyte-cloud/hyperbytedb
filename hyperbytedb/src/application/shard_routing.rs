@@ -152,6 +152,12 @@ pub async fn ensure_measurement_bootstrapped(
         if let Some(addr) = leader_addr {
             propose_shard_map_op_via_raft(addr, op).await?;
         } else {
+            // No leader address resolves: this is raft-less sharding (async
+            // replication without OpenRaft), where this node's shard map IS
+            // the authoritative placement authority — apply locally. Real
+            // Raft deployments never land here: RaftLeaderCallbacks falls
+            // back to the configured cluster address whenever leadership is
+            // held locally.
             bootstrap_measurement_local(ctx, db, rp, measurement).await?;
         }
     } else if let Some(addr) = leader_addr {
@@ -171,10 +177,9 @@ pub async fn ensure_measurement_bootstrapped(
             .await
             .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(HyperbytedbError::ShardMap(format!(
-                "bootstrap failed: {}",
-                resp.status()
-            )));
+            return Err(HyperbytedbError::ShardMap(
+                format!("bootstrap failed: {}", resp.status()).into(),
+            ));
         }
     } else {
         return Err(HyperbytedbError::ClusterUnavailable(
@@ -224,7 +229,7 @@ pub async fn build_bootstrap_op(
     rp: &str,
     measurement: &str,
 ) -> Result<ShardMapOp, HyperbytedbError> {
-    let peers = select_bootstrap_peers(ctx).await?;
+    let peers = select_bootstrap_peers(ctx, db, rp, measurement).await?;
     if peers.is_empty() {
         return Err(HyperbytedbError::ClusterUnavailable(
             "no active peers for shard bootstrap".into(),
@@ -241,6 +246,8 @@ pub async fn build_bootstrap_op(
         peers: peers.clone(),
         primary,
         last_split_at: 0,
+        transfer_verified: None,
+        transfer_first_seen: None,
     };
     Ok(ShardMapOp::BootstrapMeasurement {
         key: MeasurementKey::new(db, rp, measurement),
@@ -262,7 +269,20 @@ pub async fn bootstrap_measurement_local(
     Ok(())
 }
 
-async fn select_bootstrap_peers(ctx: &ShardRoutingContext) -> Result<Vec<u64>, HyperbytedbError> {
+/// Pick the peer set for a brand-new measurement's first region.
+///
+/// Candidates are ordered by `hash(measurement, node_id)` so different
+/// measurements bootstrap onto different node subsets. The previous
+/// lowest-ID-first ordering sent every new measurement's initial (and hottest)
+/// region to the same RF nodes — a deterministic cluster-wide hotspot. Pure
+/// function of the key + membership, so every coordinator computing the op
+/// agrees on the same peer set and primary.
+async fn select_bootstrap_peers(
+    ctx: &ShardRoutingContext,
+    db: &str,
+    rp: &str,
+    measurement: &str,
+) -> Result<Vec<u64>, HyperbytedbError> {
     let membership = ctx.peer_client.membership().read().await;
     let mut peers: Vec<u64> = membership
         .active_peers(ctx.node_id)
@@ -270,28 +290,45 @@ async fn select_bootstrap_peers(ctx: &ShardRoutingContext) -> Result<Vec<u64>, H
         .map(|n| n.node_id)
         .collect();
     peers.push(ctx.node_id);
+    drop(membership);
     peers.sort_unstable();
     peers.dedup();
+    // Spread placement: deterministic per-(measurement, node) hash order.
+    use std::hash::{Hash, Hasher};
+    peers.sort_by_key(|node_id| {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        db.hash(&mut h);
+        rp.hash(&mut h);
+        measurement.hash(&mut h);
+        node_id.hash(&mut h);
+        h.finish()
+    });
     peers.truncate(ctx.config.replication_factor.max(1));
     Ok(peers)
 }
 
+/// Partition an owned batch into local vs per-region forward buckets.
+///
+/// Takes ownership and *moves* points into their buckets — a `Point` move is
+/// pointer-copying, so this replaces what used to be a deep clone of every
+/// point (strings + two BTreeMaps) on the hot ingest path. Region lookups use
+/// the allocation-free [`ShardLocationCache::locate_route`].
 pub async fn partition_points(
     ctx: &ShardRoutingContext,
     db: &str,
     rp: &str,
-    points: &[Point],
+    points: Vec<Point>,
 ) -> Result<PointBuckets, HyperbytedbError> {
     let map = ctx.shard_map.snapshot().await?;
-    let mut measurements: HashSet<String> = HashSet::new();
-    for p in points {
-        measurements.insert(p.measurement.clone());
-    }
-    for meas in &measurements {
-        if map.space(db, rp, meas).is_none() {
-            return Err(HyperbytedbError::ShardMap(format!(
-                "measurement {db}.{rp}.{meas} not bootstrapped"
-            )));
+    {
+        let mut seen: HashSet<&str> = HashSet::new();
+        for p in &points {
+            // contains-then-insert avoids a String allocation per point.
+            if seen.insert(p.measurement.as_str()) && map.space(db, rp, &p.measurement).is_none() {
+                return Err(HyperbytedbError::ShardMap(
+                    format!("measurement {db}.{rp}.{} not bootstrapped", p.measurement).into(),
+                ));
+            }
         }
     }
 
@@ -299,15 +336,19 @@ pub async fn partition_points(
     let mut forward: HashMap<u64, Vec<Point>> = HashMap::new();
 
     for p in points {
-        let sid = series_id_for_point(p);
-        let region = ctx
+        let sid = series_id_for_point(&p);
+        // TiDB-like routing: only the region primary writes locally; replica
+        // peers and non-peers forward to the primary via /internal/shard/write.
+        let route = ctx
             .location_cache
-            .locate(&map, db, rp, &p.measurement, sid)
-            .ok_or_else(|| HyperbytedbError::ShardMap(format!("no region for series_id {sid}")))?;
-        if region.peers.contains(&ctx.node_id) {
-            local.push(p.clone());
+            .locate_route(&map, db, rp, &p.measurement, sid, ctx.node_id)
+            .ok_or_else(|| {
+                HyperbytedbError::ShardMap(format!("no region for series_id {sid}").into())
+            })?;
+        if route.self_is_peer && route.primary == ctx.node_id {
+            local.push(p);
         } else {
-            forward.entry(region.region_id).or_default().push(p.clone());
+            forward.entry(route.region_id).or_default().push(p);
         }
     }
 
@@ -453,14 +494,30 @@ pub async fn propose_shard_map_op_via_raft(
         .await
         .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
     if !resp.status().is_success() {
-        return Err(HyperbytedbError::ShardMap(format!(
-            "raft client_write failed: {}",
-            resp.status()
-        )));
+        return Err(HyperbytedbError::ShardMap(
+            format!("raft client_write failed: {}", resp.status()).into(),
+        ));
     }
     resp.json()
         .await
-        .map_err(|e| HyperbytedbError::ShardMap(e.to_string()))
+        .map_err(|e| HyperbytedbError::ShardMap(e.to_string().into()))
+}
+
+/// Per-region outcome counts for one sharded delete fan-out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShardDeleteOutcome {
+    /// Regions whose primary applied the delete locally.
+    pub applied: usize,
+    /// Regions skipped because their primary was inactive or unknown.
+    pub skipped: usize,
+    /// Regions whose primary rejected or failed the delete RPC.
+    pub failed: usize,
+}
+
+impl ShardDeleteOutcome {
+    pub fn fully_applied(&self) -> bool {
+        self.skipped == 0 && self.failed == 0
+    }
 }
 
 pub async fn scatter_delete_to_regions(
@@ -470,19 +527,28 @@ pub async fn scatter_delete_to_regions(
     rp: &str,
     measurement: &str,
     predicate: &str,
-) -> Result<(), HyperbytedbError> {
+) -> Result<ShardDeleteOutcome, HyperbytedbError> {
     use crate::domain::sharding::ShardDeleteRequest;
 
     let map = ctx.shard_map.snapshot().await?;
     let Some(space) = map.space(db, rp, measurement) else {
-        return Ok(());
+        return Ok(ShardDeleteOutcome::default());
     };
+
+    let mut outcome = ShardDeleteOutcome::default();
 
     for region in &space.regions {
         if region.primary == ctx.node_id {
+            if !predicate.is_empty() {
+                metadata
+                    .store_tombstone(db, rp, measurement, predicate)
+                    .await?;
+            }
             metadata
                 .delete_series_matching(db, rp, Some(measurement), predicate)
                 .await?;
+            counter!("hyperbytedb_shard_delete_applied_total").increment(1);
+            outcome.applied += 1;
             continue;
         }
 
@@ -493,6 +559,8 @@ pub async fn scatter_delete_to_regions(
                 primary = region.primary,
                 "shard delete skipped: region primary not active"
             );
+            outcome.skipped += 1;
+            counter!("hyperbytedb_shard_delete_skipped_total").increment(1);
             continue;
         }
         let Some(addr) = peer_addr(&membership, region.primary) else {
@@ -500,6 +568,8 @@ pub async fn scatter_delete_to_regions(
                 region_id = region.region_id,
                 "shard delete skipped: unknown primary address"
             );
+            outcome.skipped += 1;
+            counter!("hyperbytedb_shard_delete_skipped_total").increment(1);
             continue;
         };
         drop(membership);
@@ -529,12 +599,18 @@ pub async fn scatter_delete_to_regions(
         match resp {
             Ok(r) if r.status() == reqwest::StatusCode::CONFLICT => {
                 refresh_location_cache(ctx).await?;
+                outcome.failed += 1;
+                counter!("hyperbytedb_shard_delete_failures_total", "reason" => "stale_epoch")
+                    .increment(1);
                 tracing::warn!(
                     region_id = region.region_id,
                     "shard delete stale epoch; retry on next request"
                 );
             }
             Ok(r) if !r.status().is_success() => {
+                outcome.failed += 1;
+                counter!("hyperbytedb_shard_delete_failures_total", "reason" => "http_status")
+                    .increment(1);
                 tracing::warn!(
                     status = %r.status(),
                     region_id = region.region_id,
@@ -542,16 +618,42 @@ pub async fn scatter_delete_to_regions(
                 );
             }
             Err(e) => {
+                outcome.failed += 1;
+                counter!("hyperbytedb_shard_delete_failures_total", "reason" => "transport")
+                    .increment(1);
                 tracing::warn!(
                     error = %e,
                     region_id = region.region_id,
                     "shard delete scatter failed for region"
                 );
             }
-            _ => {}
+            _ => {
+                outcome.applied += 1;
+            }
         }
     }
-    Ok(())
+
+    // Partial deletes are otherwise invisible: every caller currently drops
+    // this result, so surface degraded fan-outs loudly.
+    if !outcome.fully_applied() {
+        tracing::warn!(
+            db = %db,
+            rp = %rp,
+            measurement = %measurement,
+            applied = outcome.applied,
+            skipped = outcome.skipped,
+            failed = outcome.failed,
+            "sharded delete completed partially across regions"
+        );
+        return Err(HyperbytedbError::ShardMap(
+            format!(
+                "sharded delete incomplete: applied={} skipped={} failed={}",
+                outcome.applied, outcome.skipped, outcome.failed
+            )
+            .into(),
+        ));
+    }
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -643,7 +745,7 @@ mod scatter_tests {
             1024,
         ));
         let map_dir = tempfile::tempdir().unwrap();
-        let shard_map = Arc::new(RocksDbShardMap::open(map_dir.path(), true, node_id).unwrap());
+        let shard_map = Arc::new(RocksDbShardMap::open(map_dir.path(), true).unwrap());
         ShardRoutingContext {
             shard_map,
             location_cache: Arc::new(ShardLocationCache::new()),
@@ -663,6 +765,8 @@ mod scatter_tests {
             peers: vec![1, 2],
             primary: 1,
             last_split_at: 0,
+            transfer_verified: None,
+            transfer_first_seen: None,
         }
     }
 
@@ -834,5 +938,47 @@ mod scatter_tests {
         };
         assert_eq!(region_b_id, 2);
         assert_ne!(region_a_id, region_b_id);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_placement_spreads_across_measurements() {
+        // 4-node membership, RF=2: the old lowest-ID-first ordering put every
+        // new measurement's primary on node 1. Hash-ordered placement must
+        // distribute primaries across measurements while staying
+        // deterministic for a given key.
+        let membership = membership_with(&[
+            (1, "127.0.0.1:1"),
+            (2, "127.0.0.1:2"),
+            (3, "127.0.0.1:3"),
+            (4, "127.0.0.1:4"),
+        ]);
+        let ctx = test_ctx(membership, ShardingConfig::default(), 99);
+
+        let mut primaries = std::collections::HashSet::new();
+        for i in 0..16u32 {
+            let meas = format!("m{i}");
+            let op = build_bootstrap_op(&ctx, "db", "autogen", &meas)
+                .await
+                .unwrap();
+            let ShardMapOp::BootstrapMeasurement { region, .. } = &op else {
+                panic!("expected bootstrap op");
+            };
+            // Deterministic: same key always yields the same peer set.
+            let op_again = build_bootstrap_op(&ctx, "db", "autogen", &meas)
+                .await
+                .unwrap();
+            let ShardMapOp::BootstrapMeasurement { region: again, .. } = &op_again else {
+                panic!("expected bootstrap op");
+            };
+            assert_eq!(
+                region.peers, again.peers,
+                "placement must be deterministic for {meas}"
+            );
+            primaries.insert(region.primary);
+        }
+        assert!(
+            primaries.len() >= 3,
+            "primaries must spread across nodes, got {primaries:?}"
+        );
     }
 }

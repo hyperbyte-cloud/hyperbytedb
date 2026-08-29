@@ -141,6 +141,7 @@ impl HttpTestContext {
             shard_scheduler: None,
             ingest_cardinality:
                 hyperbytedb::application::ingest_metadata::IngestCardinalityLimits::default(),
+            ingest_schema_cache: Default::default(),
             cluster_replication: hyperbytedb::config::ReplicationConfig::default(),
         });
 

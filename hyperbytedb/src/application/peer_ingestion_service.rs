@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::stream::{StreamExt, TryStreamExt};
 use metrics::{counter, histogram};
 
 #[cfg(feature = "columnar-ingest")]
@@ -147,15 +148,33 @@ impl PeerIngestionService {
         rp: &str,
         precision: Option<&str>,
         points: Vec<crate::domain::point::Point>,
-        _replication_body: Vec<u8>,
     ) -> Result<(), HyperbytedbError> {
         let ctx = self.shard_routing.as_ref().ok_or_else(|| {
             HyperbytedbError::Internal("sharding context missing on ingest path".into())
         })?;
         let mut measurements = std::collections::HashSet::new();
         for p in &points {
-            measurements.insert(p.measurement.clone());
+            // contains-then-insert avoids a String allocation per point.
+            if !measurements.contains(p.measurement.as_str()) {
+                measurements.insert(p.measurement.clone());
+            }
         }
+
+        // Reject direct writes to materialized view destinations before any
+        // WAL append — same guard as the non-sharded path. This was
+        // previously skipped on the sharded path, allowing writes that the
+        // flush pipeline cannot serve (stuck-flush liveness gaps).
+        for meas in &measurements {
+            if let Some(meta) = self.metadata.get_measurement(db, rp, meas).await?
+                && meta.materialized
+                && meta.materialized_rp.as_deref().is_none_or(|mr| mr == rp)
+            {
+                return Err(HyperbytedbError::QueryParse(format!(
+                    "cannot write directly to materialized view destination \"{meas}\""
+                )));
+            }
+        }
+
         let leader = (self.raft_leader_addr)();
         for meas in &measurements {
             ensure_measurement_bootstrapped(
@@ -169,15 +188,31 @@ impl PeerIngestionService {
             .await?;
         }
 
-        let buckets = partition_points(ctx, db, rp, &points).await?;
+        let buckets = partition_points(ctx, db, rp, points).await?;
         let precision_val = Precision::from_str_opt(precision);
 
-        for fwd_points in buckets.forward.values() {
-            forward_shard_write_to_region(ctx, db, rp, precision, fwd_points).await?;
-        }
+        // Forward every non-local region bucket concurrently with bounded
+        // parallelism: a batch spanning many regions must not pay serial
+        // HTTP round-trips. First error fails the ingest (same semantics as
+        // the previous sequential loop).
+        const FORWARD_CONCURRENCY: usize = 8;
+        let forwards = buckets.forward.into_values().map(|fwd_points| async move {
+            forward_shard_write_to_region(ctx, db, rp, precision, &fwd_points).await
+        });
+        futures::stream::iter(forwards)
+            .buffer_unordered(FORWARD_CONCURRENCY)
+            .try_collect::<Vec<()>>()
+            .await?;
 
         if !buckets.local.is_empty() {
-            let local_points = buckets.local.clone();
+            // Capture routing identity before the bucket is moved into the WAL
+            // append; encode the replica body before the move too, avoiding a
+            // full clone of the local bucket.
+            let first = &buckets.local[0];
+            let first_measurement = first.measurement.clone();
+            let first_sid = crate::domain::series::series_id_for_point(first);
+            let local_body = encode_points_to_line_protocol(&buckets.local, precision_val)?;
+
             prepare_batch_metadata(
                 &self.metadata,
                 db,
@@ -198,14 +233,12 @@ impl PeerIngestionService {
             )
             .await?;
 
-            let local_body = encode_points_to_line_protocol(&local_points, precision_val)?;
-
-            let sid = crate::domain::series::series_id_for_point(&local_points[0]);
             let map = ctx.shard_map.snapshot().await?;
             let region = ctx
                 .location_cache
-                .locate(&map, db, rp, &local_points[0].measurement, sid)
+                .locate(&map, db, rp, &first_measurement, first_sid)
                 .ok_or_else(|| HyperbytedbError::ShardMap("no region".into()))?;
+            drop(map);
             let targets = region_replication_targets(ctx, &region).await;
             self.dispatch_replication(OutboundReplicationBatch {
                 database: db.to_string(),
@@ -310,6 +343,20 @@ impl IngestionPort for PeerIngestionService {
 
             let point_count = wire.values.len() as u64;
             let precision_val = Precision::from_str_opt(precision);
+
+            // Sharded clusters: region routing needs per-row series_id, so
+            // expand the wire batch once and take the standard
+            // partition/forward path. The prepared-WAL slot optimization
+            // stays exclusive to the non-sharded single-writer flow below.
+            if self.shard_routing.is_some() {
+                let points = crate::application::columnar_msgpack::columnar_batch_to_points(
+                    &wire, precision,
+                )?;
+                return self
+                    .ingest_sharded_points(db, &retention_policy, precision, points)
+                    .await;
+            }
+
             let replication_body =
                 crate::application::columnar_msgpack::columnar_wire_to_line_protocol(
                     &wire,
@@ -359,7 +406,9 @@ impl IngestionPort for PeerIngestionService {
             }
             #[cfg(feature = "columnar-ingest")]
             WritePayloadFormat::ColumnarMsgpack => {
-                unreachable!("handled by fast path above")
+                return Err(HyperbytedbError::Internal(
+                    "columnar ingest fell through fast path".into(),
+                ));
             }
         };
         if points.is_empty() {
@@ -375,7 +424,9 @@ impl IngestionPort for PeerIngestionService {
             WritePayloadFormat::Msgpack => encode_points_to_line_protocol(&points, precision_val)?,
             #[cfg(feature = "columnar-ingest")]
             WritePayloadFormat::ColumnarMsgpack => {
-                unreachable!("handled by fast path above")
+                return Err(HyperbytedbError::Internal(
+                    "columnar ingest fell through fast path".into(),
+                ));
             }
         };
 
@@ -384,7 +435,7 @@ impl IngestionPort for PeerIngestionService {
 
         if self.shard_routing.is_some() {
             return self
-                .ingest_sharded_points(db, &retention_policy, precision, points, replication_body)
+                .ingest_sharded_points(db, &retention_policy, precision, points)
                 .await;
         }
 

@@ -37,7 +37,7 @@ fn sharding_disabled_validation_passes() {
 #[tokio::test]
 async fn location_cache_locates_after_bootstrap() {
     let dir = tempfile::tempdir().unwrap();
-    let map_store = Arc::new(RocksDbShardMap::open(dir.path(), true, 1).expect("open shard map"));
+    let map_store = Arc::new(RocksDbShardMap::open(dir.path(), true).expect("open shard map"));
     let region = ShardRegion {
         region_id: 1,
         start: 0,
@@ -46,6 +46,8 @@ async fn location_cache_locates_after_bootstrap() {
         peers: vec![1, 2, 3],
         primary: 1,
         last_split_at: 0,
+        transfer_verified: None,
+        transfer_first_seen: None,
     };
     map_store
         .apply_op(ShardMapOp::BootstrapMeasurement {
@@ -80,7 +82,7 @@ async fn location_cache_locates_after_bootstrap() {
 #[serial]
 fn flag_off_shard_map_is_empty() {
     let dir = tempfile::tempdir().unwrap();
-    let map = RocksDbShardMap::open(dir.path(), false, 1).unwrap();
+    let map = RocksDbShardMap::open(dir.path(), false).unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let snapshot = rt.block_on(map.snapshot()).unwrap();
     assert!(snapshot.spaces.is_empty());
@@ -105,6 +107,8 @@ fn split_op_divides_region_range() {
         peers: vec![1, 2],
         primary: 1,
         last_split_at: 0,
+        transfer_verified: None,
+        transfer_first_seen: None,
     };
     let mut map = ShardMap::default();
     apply_shard_map_op(
@@ -152,6 +156,8 @@ fn merge_op_consolidates_adjacent_regions() {
         peers: vec![1, 2],
         primary: 1,
         last_split_at: 0,
+        transfer_verified: None,
+        transfer_first_seen: None,
     };
     let right = ShardRegion {
         region_id: 2,
@@ -161,6 +167,8 @@ fn merge_op_consolidates_adjacent_regions() {
         peers: vec![1, 2],
         primary: 1,
         last_split_at: 0,
+        transfer_verified: None,
+        transfer_first_seen: None,
     };
     let mut map = ShardMap::default();
     apply_shard_map_op(
@@ -175,6 +183,8 @@ fn merge_op_consolidates_adjacent_regions() {
                 peers: vec![1, 2],
                 primary: 1,
                 last_split_at: 0,
+                transfer_verified: None,
+                transfer_first_seen: None,
             },
         },
     )
@@ -199,6 +209,8 @@ fn merge_op_consolidates_adjacent_regions() {
         peers: vec![1, 2],
         primary: 1,
         last_split_at: 0,
+        transfer_verified: None,
+        transfer_first_seen: None,
     };
     apply_shard_map_op(
         &mut map,
@@ -227,6 +239,8 @@ fn four_region_space() -> hyperbytedb::domain::sharding::MeasurementShardSpace {
                 peers: vec![1],
                 primary: 1,
                 last_split_at: 0,
+                transfer_verified: None,
+                transfer_first_seen: None,
             },
             ShardRegion {
                 region_id: 2,
@@ -236,6 +250,8 @@ fn four_region_space() -> hyperbytedb::domain::sharding::MeasurementShardSpace {
                 peers: vec![1],
                 primary: 1,
                 last_split_at: 0,
+                transfer_verified: None,
+                transfer_first_seen: None,
             },
             ShardRegion {
                 region_id: 3,
@@ -245,6 +261,8 @@ fn four_region_space() -> hyperbytedb::domain::sharding::MeasurementShardSpace {
                 peers: vec![1],
                 primary: 1,
                 last_split_at: 0,
+                transfer_verified: None,
+                transfer_first_seen: None,
             },
             ShardRegion {
                 region_id: 4,
@@ -254,6 +272,8 @@ fn four_region_space() -> hyperbytedb::domain::sharding::MeasurementShardSpace {
                 peers: vec![1],
                 primary: 1,
                 last_split_at: 0,
+                transfer_verified: None,
+                transfer_first_seen: None,
             },
         ],
     }
@@ -336,6 +356,8 @@ fn resolve_region_peers_skips_disconnected_primary() {
         peers: vec![1, 2, 3],
         primary: 1,
         last_split_at: 0,
+        transfer_verified: None,
+        transfer_first_seen: None,
     };
     let membership = sample_membership(&[
         (1, NodeState::Disconnected),
@@ -357,6 +379,8 @@ fn active_replication_targets_skip_disconnected_peers() {
         peers: vec![1, 2, 3],
         primary: 1,
         last_split_at: 0,
+        transfer_verified: None,
+        transfer_first_seen: None,
     };
     let membership = sample_membership(&[
         (1, NodeState::Active),
