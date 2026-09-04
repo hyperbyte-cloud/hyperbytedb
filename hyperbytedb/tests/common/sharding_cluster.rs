@@ -290,6 +290,17 @@ pub async fn start_sharded_node(
     }
 }
 
+pub async fn start_sharded_single_node(dir: &Path, opts: ShardedClusterOptions) -> ShardedTestNode {
+    let chdb_dir = dir.join("chdb-shared");
+    std::fs::create_dir_all(&chdb_dir).unwrap();
+    let chdb = SharedSession::new_eager(chdb_dir.to_str().unwrap(), 1).unwrap();
+
+    let l1 = bind_ephemeral().await;
+    let a1 = l1.local_addr().unwrap().to_string();
+    let membership = build_shared_membership(&[(1, a1)]);
+    start_sharded_node(dir, 1, l1, membership, &opts, chdb).await
+}
+
 pub async fn start_sharded_pair_cluster(
     dir: &Path,
     opts: ShardedClusterOptions,

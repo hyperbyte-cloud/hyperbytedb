@@ -274,6 +274,19 @@ pub async fn bootstrap_measurement_local(
     Ok(())
 }
 
+/// Effective replica count for a region: never more than live membership.
+///
+/// A 1-member cluster therefore has RF=1 even when `configured` is 3.
+/// RF is also never raised above the configured target.
+#[must_use]
+pub fn effective_replication_factor(configured: usize, active_members: usize) -> usize {
+    let target = configured.max(1);
+    if active_members == 0 {
+        return 0;
+    }
+    target.min(active_members)
+}
+
 /// Pick the peer set for a brand-new measurement's first region.
 ///
 /// Candidates are ordered by `hash(measurement, node_id)` so different
@@ -282,6 +295,9 @@ pub async fn bootstrap_measurement_local(
 /// region to the same RF nodes — a deterministic cluster-wide hotspot. Pure
 /// function of the key + membership, so every coordinator computing the op
 /// agrees on the same peer set and primary.
+///
+/// Peer count is [`effective_replication_factor`]: n=1 yields `[self]`,
+/// not an empty set truncated against a configured RF of 2 or 3.
 async fn select_bootstrap_peers(
     ctx: &ShardRoutingContext,
     db: &str,
@@ -298,6 +314,7 @@ async fn select_bootstrap_peers(
     drop(membership);
     peers.sort_unstable();
     peers.dedup();
+    let member_count = peers.len();
     // Spread placement: deterministic per-(measurement, node) hash order.
     use std::hash::{Hash, Hasher};
     peers.sort_by_key(|node_id| {
@@ -308,7 +325,10 @@ async fn select_bootstrap_peers(
         node_id.hash(&mut h);
         h.finish()
     });
-    peers.truncate(ctx.config.replication_factor.max(1));
+    peers.truncate(effective_replication_factor(
+        ctx.config.replication_factor,
+        member_count,
+    ));
     Ok(peers)
 }
 
@@ -995,5 +1015,33 @@ mod scatter_tests {
             primaries.len() >= 3,
             "primaries must spread across nodes, got {primaries:?}"
         );
+    }
+
+    #[test]
+    fn effective_rf_never_exceeds_membership() {
+        assert_eq!(effective_replication_factor(3, 1), 1);
+        assert_eq!(effective_replication_factor(3, 2), 2);
+        assert_eq!(effective_replication_factor(2, 4), 2);
+        assert_eq!(effective_replication_factor(0, 3), 1);
+        assert_eq!(effective_replication_factor(3, 0), 0);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_n1_peers_are_self() {
+        let membership = membership_with(&[(1, "127.0.0.1:1")]);
+        let config = ShardingConfig {
+            replication_factor: 3,
+            ..Default::default()
+        };
+        let ctx = test_ctx(membership, config, 1);
+
+        let op = build_bootstrap_op(&ctx, "db", "autogen", "cpu")
+            .await
+            .unwrap();
+        let ShardMapOp::BootstrapMeasurement { region, .. } = op else {
+            panic!("expected bootstrap op");
+        };
+        assert_eq!(region.peers, vec![1], "n=1 must own the region");
+        assert_eq!(region.primary, 1);
     }
 }

@@ -750,6 +750,53 @@ async fn aggregate_read_from_primary_when_replica_lags() {
     );
 }
 
+/// P1.1: a 1-member cluster with sharding on accepts /write and owns the
+/// first region (peers=[self], primary=self) even when configured RF is 3.
+#[tokio::test]
+#[serial(chdb)]
+async fn one_member_cluster_owns_region_after_first_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = ShardedClusterOptions {
+        sharding: hyperbytedb::config::ShardingConfig {
+            enabled: true,
+            replication_factor: 3,
+            scatter_peer_timeout_ms: 500,
+            scatter_max_peer_attempts: 3,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let node = start_sharded_single_node(dir.path(), opts).await;
+
+    let client = reqwest::Client::new();
+    create_db(&client, &node.url, "p1db").await;
+    let resp = write_line(
+        &client,
+        &node.url,
+        "p1db",
+        "cpu,host=solo value=1 1000000000",
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::NO_CONTENT,
+        "n=1 sharded write must succeed: {}",
+        resp.status()
+    );
+
+    let map = node.shard_map.snapshot().await.unwrap();
+    let space = map
+        .space("p1db", "autogen", "cpu")
+        .expect("first write must bootstrap a region");
+    assert!(
+        !space.regions.is_empty(),
+        "shard map must have at least one region"
+    );
+    let region = &space.regions[0];
+    assert_eq!(region.peers, vec![1], "n=1 peers must be [self]");
+    assert_eq!(region.primary, 1, "n=1 primary must be self");
+}
+
 async fn wait_for_database(client: &reqwest::Client, url: &str, db: &str) {
     for _ in 0..100 {
         let resp = query_sql(client, url, db, "SHOW DATABASES").await;
