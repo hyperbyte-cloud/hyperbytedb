@@ -81,6 +81,21 @@ impl ColumnMapping {
         }
     }
 
+    /// Best-effort mapping when this node has no local measurement catalog
+    /// (typical for a sharded coordinator that is not a region peer).
+    #[must_use]
+    pub fn from_identifiers(
+        tags: impl IntoIterator<Item = String>,
+        fields: impl IntoIterator<Item = String>,
+    ) -> Self {
+        Self {
+            tag_keys: tags.into_iter().collect(),
+            field_names: fields.into_iter().collect(),
+            field_rollups: HashMap::new(),
+            mean_fields: HashMap::new(),
+        }
+    }
+
     #[must_use]
     pub fn tag_column_name(&self, tag_key: &str) -> String {
         let fields: HashSet<&str> = self.field_names.iter().map(|s| s.as_str()).collect();

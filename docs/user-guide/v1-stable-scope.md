@@ -23,9 +23,12 @@ It does not mean every deployment size has been tested — see [Resource Sizing]
 | Single-node                 | Durable after WAL fsync                                   | Reads from chDB after flush  | Restart required for upgrades; drain before shutdown         |
 | Cluster (async replication) | Acknowledged after local WAL append; eventual consistency | Each node reads its own chDB | Peer unreachable → hinted handoff; schema mutations via Raft |
 | Cluster (sync_quorum)       | Acknowledged after local WAL append + W-of-N peer acks    | Each node reads its own chDB | Configured via `[cluster.replication] mode = "sync_quorum"`  |
+| Cluster (series sharding)   | Local WAL for owned regions; forwards to region peers     | Scatter-gather across regions | Experimental; requires `[sharding] enabled = true` on all nodes |
 
 
-There is no distributed query fan-out. Each node queries its own embedded chDB tables.
+When sharding is enabled, clients may connect to **any Active node** for reads and writes — the coordinator forwards or scatters as needed. Replica reads are eventually consistent. See [Deep Dive: Clustering](../deep-dive/deep-dive-clustering.md#15-series-sharding-experimental).
+
+Without sharding, there is no distributed query fan-out. Each node queries its own embedded chDB tables.
 Clients should balance reads across nodes or use the hyperbytedb-proxy for HTTP load balancing.
 
 ## What We Commit To Fixing
@@ -47,6 +50,8 @@ without a major version bump:
 - Non-S3 backup destinations
 - Custom TLS certificate authority integration beyond cert-manager or operator-generated certs
 - Metrics label schema (new labels may be added)
+- **Automatic series sharding** (`[sharding] enabled = true`) — cluster-only experimental feature; split/merge/rebalance semantics may change
+- **Materialized views with sharding enabled** — supported with scatter-merge query and per-region backfill; semantics may still change. See [Materialized views with series sharding](advanced-features.md#materialized-views-with-series-sharding)
 
 ## Breaking vs Non-Breaking Changes
 

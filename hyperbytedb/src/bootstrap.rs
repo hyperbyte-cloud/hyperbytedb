@@ -6,6 +6,7 @@ use crate::adapters::chdb::session::SharedSession;
 use crate::adapters::http::rate_limit;
 use crate::adapters::http::router::AppState;
 use crate::adapters::metadata::rocksdb_meta::RocksDbMetadata;
+use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
 use crate::adapters::wal::batching_wal::BatchingWal;
 use crate::adapters::wal::rocksdb_wal::{RocksDbWal, RocksDbWalOptions};
 use crate::application::cluster::bootstrap::ClusterBootstrap;
@@ -15,12 +16,17 @@ use crate::application::flush_service::FlushServiceImpl;
 use crate::application::ingest_metadata::IngestCardinalityLimits;
 use crate::application::ingestion_service::IngestionServiceImpl;
 use crate::application::query_service::QueryServiceImpl;
+use crate::application::raft_leader_callbacks::{RaftLeaderCallbacks, SharedRaftLeaderCallbacks};
 use crate::application::replication_apply::ReplicationApplyQueue;
+use crate::application::runtime::RegionWriteStats;
+use crate::application::shard_routing::ShardRoutingContext;
 use crate::application::statement_summary::StatementSummary;
 use crate::config::HyperbytedbConfig;
+use crate::domain::sharding::ShardLocationCache;
 use crate::ports::metadata::MetadataPort;
 use crate::ports::points_sink::PointsSinkPort;
 use crate::ports::query::QueryService;
+use crate::ports::sharding::{DisabledShardMap, ShardMapPort};
 use crate::ports::wal::WalFormat;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -35,6 +41,8 @@ pub struct BootstrappedApp {
     pub disk_paths: DiskMonitorPaths,
     pub disk_config: crate::config::DiskConfig,
     pub disk_read_only: Option<Arc<AtomicBool>>,
+    pub raft_leader_callbacks: Option<SharedRaftLeaderCallbacks>,
+    pub rocks_shard_map: Option<Arc<RocksDbShardMap>>,
 }
 
 /// Construct all adapters and application services from config.
@@ -43,6 +51,8 @@ pub struct BootstrappedApp {
 /// this, then runs the HTTP server and background tasks using the
 /// returned handles.
 pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<BootstrappedApp> {
+    config.validate().map_err(anyhow::Error::msg)?;
+
     let prometheus_handle = {
         let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
         let recorder = builder.build_recorder();
@@ -133,6 +143,22 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         .enabled
         .then(|| Arc::new(AtomicBool::new(false)));
     let metadata = Arc::new(RocksDbMetadata::open(&config.storage.meta_dir)?);
+
+    let shard_location_cache = Arc::new(ShardLocationCache::new());
+    let rocks_shard_map: Option<Arc<RocksDbShardMap>> = if config.sharding.enabled {
+        Some(Arc::new(RocksDbShardMap::open(
+            std::path::Path::new(&config.storage.meta_dir),
+            true,
+        )?))
+    } else {
+        None
+    };
+    let shard_map: Arc<dyn ShardMapPort> = if let Some(ref m) = rocks_shard_map {
+        m.clone()
+    } else {
+        Arc::new(DisabledShardMap)
+    };
+
     match metadata.warm_tag_value_counts().await {
         Ok(tag_counters) => {
             tracing::info!(tag_counters, "warmed tag value count cache from metadata")
@@ -220,25 +246,6 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
     }
     let points_sink: Arc<dyn PointsSinkPort> = Arc::new(native_sink);
 
-    let mv_service = Arc::new(
-        crate::application::materialized_view_service::MaterializedViewService::new(
-            metadata.clone(),
-            chdb.clone(),
-            points_sink.clone(),
-        ),
-    );
-    match mv_service.reconcile_all().await {
-        Ok(n) if n > 0 => tracing::info!(
-            reconciled = n,
-            "reconciled materialized view DDL from metadata"
-        ),
-        Ok(_) => {}
-        Err(e) => tracing::warn!(
-            error = %e,
-            "failed to reconcile materialized views from metadata"
-        ),
-    }
-
     let auth: Arc<dyn crate::ports::auth::AuthPort> =
         Arc::new(MetadataAuthAdapter::new(metadata.clone()));
 
@@ -265,6 +272,69 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
 
     let max_points_per_request = config.server.max_points_per_request;
 
+    let ingest_cardinality = IngestCardinalityLimits {
+        max_tag_values_per_measurement: config.cardinality.max_tag_values_per_measurement,
+        max_measurements_per_database: config.cardinality.max_measurements_per_database,
+    };
+
+    let shard_routing = if config.sharding.enabled {
+        match (peer_client.as_ref(), rocks_shard_map.clone()) {
+            (Some(pc), Some(shard_map)) => Some(Arc::new(ShardRoutingContext {
+                shard_map,
+                location_cache: shard_location_cache.clone(),
+                config: config.sharding.clone(),
+                node_id: config.cluster.node_id,
+                peer_client: pc.clone(),
+                region_write_stats: Arc::new(RegionWriteStats::new()),
+            })),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    let raft_leader_callbacks: Option<SharedRaftLeaderCallbacks> =
+        if config.sharding.enabled && peer_client.is_some() {
+            Some(Arc::new(RaftLeaderCallbacks::new(
+                config.cluster.node_id,
+                membership.clone(),
+                Some(config.cluster.cluster_addr.clone()),
+            )))
+        } else {
+            None
+        };
+
+    let mv_service = {
+        let mut svc = crate::application::materialized_view_service::MaterializedViewService::new(
+            metadata.clone(),
+            chdb.clone(),
+            points_sink.clone(),
+        );
+        if let (Some(sr), Some(callbacks)) =
+            (shard_routing.as_ref(), raft_leader_callbacks.as_ref())
+        {
+            let cb_leader = callbacks.clone();
+            let cb_addr = callbacks.clone();
+            svc = svc.with_sharding(
+                sr.clone(),
+                Arc::new(move || cb_leader.is_leader()),
+                Arc::new(move || cb_addr.leader_addr()),
+            );
+        }
+        Arc::new(svc)
+    };
+    match mv_service.reconcile_all().await {
+        Ok(n) if n > 0 => tracing::info!(
+            reconciled = n,
+            "reconciled materialized view DDL from metadata"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(
+            error = %e,
+            "failed to reconcile materialized views from metadata"
+        ),
+    }
+
     let base_query_service: Arc<dyn QueryService> = {
         let mut qs = QueryServiceImpl::new(
             chdb.clone(),
@@ -281,31 +351,47 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
                 config.cluster.replication.clone(),
             );
         }
+        if let (Some(sr), Some(callbacks)) =
+            (shard_routing.as_ref(), raft_leader_callbacks.as_ref())
+        {
+            let cb_leader = callbacks.clone();
+            let cb_addr = callbacks.clone();
+            qs = qs.with_materialized_view_sharding(
+                sr.clone(),
+                Arc::new(move || cb_leader.is_leader()),
+                Arc::new(move || cb_addr.leader_addr()),
+            );
+        } else if let Some(sr) = shard_routing.as_ref() {
+            qs = qs.with_sharding(sr.clone());
+        }
         Arc::new(qs)
     };
-
-    let ingest_cardinality = IngestCardinalityLimits {
-        max_tag_values_per_measurement: config.cardinality.max_tag_values_per_measurement,
-        max_measurements_per_database: config.cardinality.max_measurements_per_database,
-    };
-
-    let max_points_per_request = config.server.max_points_per_request;
 
     let ingestion_service: Arc<dyn crate::ports::ingestion::IngestionPort> = if let Some(ref pc) =
         peer_client
     {
-        Arc::new(
-                crate::application::peer_ingestion_service::PeerIngestionService::with_replication_and_sink(
-                    wal.clone(),
-                    Some(points_sink.clone()),
-                    metadata.clone(),
-                    pc.clone(),
-                    config.cluster.node_id,
-                    ingest_cardinality,
-                    max_points_per_request,
-                    config.cluster.replication.clone(),
-                ),
-            )
+        let mut svc =
+            crate::application::peer_ingestion_service::PeerIngestionService::with_replication_and_sink(
+                wal.clone(),
+                Some(points_sink.clone()),
+                metadata.clone(),
+                pc.clone(),
+                config.cluster.node_id,
+                ingest_cardinality,
+                max_points_per_request,
+                config.cluster.replication.clone(),
+            );
+        if let (Some(sr), Some(callbacks)) = (shard_routing.as_ref(), raft_leader_callbacks.clone())
+        {
+            let cb_leader = callbacks.clone();
+            let cb_addr = callbacks;
+            svc = svc.with_sharding(
+                sr.clone(),
+                Arc::new(move || cb_leader.is_leader()),
+                Arc::new(move || cb_addr.leader_addr()),
+            );
+        }
+        Arc::new(svc)
     } else {
         Arc::new(IngestionServiceImpl::with_sink(
             wal.clone(),
@@ -318,13 +404,16 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
     };
 
     let replication_apply = if cluster.is_some() {
-        Some(ReplicationApplyQueue::with_sink(
+        Some(ReplicationApplyQueue::with_sink_and_sharding(
             config.cluster.replicate_receiver_queue_depth,
             metadata.clone(),
             wal.clone(),
             Some(points_sink.clone()),
             ingest_cardinality,
             max_points_per_request,
+            config.sharding.enabled,
+            config.cluster.node_id,
+            membership.clone(),
         ))
     } else {
         None
@@ -363,6 +452,9 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
                     config.cluster.heartbeat_miss_threshold,
                     config.cluster.replication_truncate_stale_peer_multiplier,
                 );
+        }
+        if config.sharding.enabled {
+            fs = fs.with_sharding(true, Some(shard_map.clone()), config.cluster.node_id);
         }
         Arc::new(fs)
     };
@@ -426,6 +518,14 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         },
         wal_batcher_alive,
         disk_read_only: disk_read_only.clone(),
+        sharding_enabled: config.sharding.enabled,
+        shard_map: Some(shard_map),
+        shard_location_cache,
+        shard_routing,
+        shard_scheduler: None,
+        ingest_cardinality,
+        ingest_schema_cache: Default::default(),
+        cluster_replication: config.cluster.replication.clone(),
     };
 
     Ok(BootstrappedApp {
@@ -437,5 +537,7 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         disk_paths,
         disk_config: config.disk.clone(),
         disk_read_only,
+        raft_leader_callbacks,
+        rocks_shard_map,
     })
 }

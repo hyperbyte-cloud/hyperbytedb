@@ -134,6 +134,15 @@ impl HttpTestContext {
             rate_limiter: None,
             wal_batcher_alive: None,
             disk_read_only: None,
+            sharding_enabled: false,
+            shard_map: None,
+            shard_location_cache: Arc::new(hyperbytedb::domain::sharding::ShardLocationCache::new()),
+            shard_routing: None,
+            shard_scheduler: None,
+            ingest_cardinality:
+                hyperbytedb::application::ingest_metadata::IngestCardinalityLimits::default(),
+            ingest_schema_cache: Default::default(),
+            cluster_replication: hyperbytedb::config::ReplicationConfig::default(),
         });
 
         let app = build_router(state);

@@ -407,6 +407,10 @@ pub async fn handle_sync_manifest(State(state): State<Arc<AppState>>) -> impl In
         state.node_id,
         &state.metadata,
         &state.wal,
+        state
+            .shard_map
+            .as_ref()
+            .map(|m| m.as_ref() as &dyn crate::ports::sharding::ShardMapPort),
     )
     .await
     {
@@ -505,6 +509,7 @@ async fn apply_mutation(
             mv_service: Some(state.mv_service.as_ref()),
             points_sink: Some(&state.points_sink),
             wal: Some(&state.wal),
+            shard_routing: state.shard_routing.as_ref(),
         },
         req,
     )
@@ -635,6 +640,7 @@ pub async fn handle_sync_trigger(State(state): State<Arc<AppState>>) -> impl Int
     let points_sink = state.points_sink.clone();
     let mv_service = state.mv_service.clone();
     let max_points_per_request = state.max_points_per_request;
+    let shard_map = state.shard_map.clone();
 
     let membership_clone = membership.clone();
 
@@ -647,7 +653,7 @@ pub async fn handle_sync_trigger(State(state): State<Arc<AppState>>) -> impl Int
     };
 
     tokio::spawn(async move {
-        let sync_client = crate::adapters::cluster::sync_client::SyncClient::with_points_sink(
+        let mut sync_client = crate::adapters::cluster::sync_client::SyncClient::with_points_sink(
             node_id,
             {
                 let m = membership_clone.read().await;
@@ -662,6 +668,10 @@ pub async fn handle_sync_trigger(State(state): State<Arc<AppState>>) -> impl Int
             max_points_per_request,
             fallback_peers,
         );
+        if let Some(ref map) = shard_map {
+            let sm: Arc<dyn crate::ports::sharding::ShardMapPort> = map.clone();
+            sync_client = sync_client.with_shard_map(sm);
+        }
 
         let has_data = metadata
             .list_databases()
@@ -683,6 +693,7 @@ pub async fn handle_sync_trigger(State(state): State<Arc<AppState>>) -> impl Int
             sync_client.reconnect_sync().await
         };
 
+        let sync_failed = result.is_err();
         match result {
             Ok(_) => {
                 if let Err(e) = mv_service.reconcile_all().await {
@@ -693,13 +704,17 @@ pub async fn handle_sync_trigger(State(state): State<Arc<AppState>>) -> impl Int
                 }
                 tracing::info!("sync trigger: completed successfully");
             }
-            Err(e) => tracing::error!(error = %e, "sync trigger: sync failed"),
+            Err(ref e) => tracing::error!(error = %e, "sync trigger: sync failed"),
         }
 
         {
             let mut m = membership_clone.write().await;
+            // Readiness stays Active either way (a stuck Syncing would block
+            // the leader from reaching us), but a failed sync must keep the
+            // `needs_sync` flag set: peers parse it to avoid promoting this
+            // node as caught-up, and the leader keeps triggering re-syncs.
             m.set_state(node_id, NodeState::Active);
-            m.set_needs_sync(node_id, false);
+            m.set_needs_sync(node_id, sync_failed);
         }
         gauge!("hyperbytedb_cluster_node_state").set(1.0);
         SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);

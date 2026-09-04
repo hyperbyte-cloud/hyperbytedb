@@ -341,21 +341,17 @@ async fn delete_from_measurement_where_tag() {
         .await
         .unwrap();
 
-    let err = ctx
+    let resp = ctx
         .query(
             "testdb",
             r#"DELETE FROM cpu WHERE "host" = 'a' AND time < 2000000000"#,
         )
         .await
-        .unwrap_err();
+        .expect("DELETE with tag+time predicate should parse and execute");
     assert!(
-        matches!(err, HyperbytedbError::QueryParse(_)),
-        "DELETE with tag predicate should fail at parse: {err:?}"
-    );
-    assert!(
-        err.to_string()
-            .contains("only time predicates are supported"),
-        "unexpected error: {err:?}"
+        resp.results[0].error.is_none(),
+        "DELETE should succeed: {:?}",
+        resp.results[0].error
     );
 }
 

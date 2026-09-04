@@ -4,6 +4,7 @@
 //! `tests/compat/`. This crate keeps auth, cardinality, admin users, metrics,
 //! backup manifest shape, and chDB physical layout checks.
 
+use hyperbytedb::config::ReplicationConfig;
 use std::sync::{Arc, OnceLock};
 
 use axum::http::StatusCode;
@@ -14,6 +15,7 @@ use hyperbytedb::adapters::http::router::{AppState, build_router};
 use hyperbytedb::adapters::metadata::rocksdb_meta::RocksDbMetadata;
 use hyperbytedb::adapters::wal::rocksdb_wal::RocksDbWal;
 use hyperbytedb::application::flush_service::FlushServiceImpl;
+use hyperbytedb::application::ingest_metadata::IngestCardinalityLimits;
 use hyperbytedb::application::ingestion_service::IngestionServiceImpl;
 use hyperbytedb::application::materialized_view_service::MaterializedViewService;
 use hyperbytedb::application::query_service::QueryServiceImpl;
@@ -116,6 +118,15 @@ fn setup(dir: &tempfile::TempDir) -> (Arc<AppState>, Arc<FlushServiceImpl>) {
         wal_batcher_alive: None,
         disk_read_only: None,
         rate_limiter: None,
+
+        sharding_enabled: false,
+        shard_map: None,
+        shard_location_cache: Arc::new(hyperbytedb::domain::sharding::ShardLocationCache::new()),
+        shard_routing: None,
+        shard_scheduler: None,
+        ingest_cardinality: IngestCardinalityLimits::default(),
+        ingest_schema_cache: Default::default(),
+        cluster_replication: ReplicationConfig::default(),
     });
 
     (app_state, flush_service)
@@ -201,6 +212,15 @@ async fn test_auth_blocks_unauthenticated() {
         wal_batcher_alive: None,
         disk_read_only: None,
         rate_limiter: None,
+
+        sharding_enabled: false,
+        shard_map: None,
+        shard_location_cache: Arc::new(hyperbytedb::domain::sharding::ShardLocationCache::new()),
+        shard_routing: None,
+        shard_scheduler: None,
+        ingest_cardinality: IngestCardinalityLimits::default(),
+        ingest_schema_cache: Default::default(),
+        cluster_replication: ReplicationConfig::default(),
     });
 
     let (url, _handle) = start_server(app_state).await;
@@ -315,6 +335,15 @@ async fn test_cardinality_limit() {
         wal_batcher_alive: None,
         disk_read_only: None,
         rate_limiter: None,
+
+        sharding_enabled: false,
+        shard_map: None,
+        shard_location_cache: Arc::new(hyperbytedb::domain::sharding::ShardLocationCache::new()),
+        shard_routing: None,
+        shard_scheduler: None,
+        ingest_cardinality: IngestCardinalityLimits::default(),
+        ingest_schema_cache: Default::default(),
+        cluster_replication: ReplicationConfig::default(),
     });
 
     let (url, _handle) = start_server(app_state).await;
@@ -464,6 +493,15 @@ async fn test_metrics_endpoint() {
         wal_batcher_alive: None,
         disk_read_only: None,
         rate_limiter: None,
+
+        sharding_enabled: false,
+        shard_map: None,
+        shard_location_cache: Arc::new(hyperbytedb::domain::sharding::ShardLocationCache::new()),
+        shard_routing: None,
+        shard_scheduler: None,
+        ingest_cardinality: IngestCardinalityLimits::default(),
+        ingest_schema_cache: Default::default(),
+        cluster_replication: ReplicationConfig::default(),
     });
 
     let (url, _handle) = start_server(app_state).await;
@@ -801,6 +839,15 @@ async fn test_rate_limiter_refills_and_denies() {
         rate_limiter: Some(Arc::new(EndpointRateLimiters::new(5))),
         wal_batcher_alive: None,
         disk_read_only: None,
+
+        sharding_enabled: false,
+        shard_map: None,
+        shard_location_cache: Arc::new(hyperbytedb::domain::sharding::ShardLocationCache::new()),
+        shard_routing: None,
+        shard_scheduler: None,
+        ingest_cardinality: IngestCardinalityLimits::default(),
+        ingest_schema_cache: Default::default(),
+        cluster_replication: ReplicationConfig::default(),
     });
 
     let (url, _handle) = start_server(app_state).await;
@@ -958,6 +1005,15 @@ async fn test_cross_database_on_clause_requires_authorization() {
         wal_batcher_alive: None,
         disk_read_only: None,
         rate_limiter: None,
+
+        sharding_enabled: false,
+        shard_map: None,
+        shard_location_cache: Arc::new(hyperbytedb::domain::sharding::ShardLocationCache::new()),
+        shard_routing: None,
+        shard_scheduler: None,
+        ingest_cardinality: IngestCardinalityLimits::default(),
+        ingest_schema_cache: Default::default(),
+        cluster_replication: ReplicationConfig::default(),
     });
 
     let (url, _handle) = start_server(app_state).await;

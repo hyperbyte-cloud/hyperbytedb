@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::cluster::membership::NodeState;
 use crate::domain::cluster::types::MutationRequest;
+use crate::domain::sharding::ShardMapOp;
 
 /// Application-level request that goes through Raft consensus.
 /// Only cluster coordination and schema DDL use Raft -- high-throughput
@@ -10,6 +11,7 @@ use crate::domain::cluster::types::MutationRequest;
 pub enum ClusterRequest {
     SetNodeState { node_id: u64, state: NodeState },
     SchemaMutation(Box<MutationRequest>),
+    ShardMapMutation(Box<ShardMapOp>),
 }
 
 /// Response returned after a ClusterRequest is committed and applied.

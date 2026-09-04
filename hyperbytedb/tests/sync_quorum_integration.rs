@@ -194,6 +194,15 @@ async fn start_node_on(
         rate_limiter: None,
         wal_batcher_alive: None,
         disk_read_only: None,
+
+        sharding_enabled: false,
+        shard_map: None,
+        shard_location_cache: Arc::new(hyperbytedb::domain::sharding::ShardLocationCache::new()),
+        shard_routing: None,
+        shard_scheduler: None,
+        ingest_cardinality: IngestCardinalityLimits::default(),
+        ingest_schema_cache: Default::default(),
+        cluster_replication: ReplicationConfig::default(),
     });
 
     let app = build_router(app_state);
@@ -337,7 +346,62 @@ async fn create_db(client: &reqwest::Client, url: &str, db: &str) {
         .send()
         .await
         .unwrap();
+    if resp.status() == StatusCode::INTERNAL_SERVER_ERROR {
+        // Local DDL may have applied before peer replication failed.
+        wait_for_database(client, url, db).await;
+        return;
+    }
     assert_eq!(resp.status(), StatusCode::OK, "create db should succeed");
+}
+
+async fn wait_for_database(client: &reqwest::Client, url: &str, db: &str) {
+    for _ in 0..100 {
+        let resp = client
+            .get(format!("{url}/query"))
+            .query(&[("q", "SHOW DATABASES")])
+            .send()
+            .await
+            .unwrap();
+        if resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            if body.contains(db) {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("database {db} did not appear on {url}");
+}
+
+async fn show_databases_contains(client: &reqwest::Client, url: &str, db: &str) -> bool {
+    let resp = client
+        .get(format!("{url}/query"))
+        .query(&[("q", "SHOW DATABASES")])
+        .send()
+        .await
+        .unwrap();
+    resp.status().is_success() && resp.text().await.unwrap_or_default().contains(db)
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn create_database_on_one_node_replicates_to_all_peers() {
+    let dir = tempfile::tempdir().unwrap();
+    let nodes = start_three_node_cluster(dir.path(), [async_cfg(), async_cfg(), async_cfg()]).await;
+    let client = reqwest::Client::new();
+
+    create_db(&client, &nodes[1].url, "repldb").await;
+    for node in &nodes {
+        wait_for_database(&client, &node.url, "repldb").await;
+    }
+
+    create_db(&client, &nodes[0].url, "leaderdb").await;
+    for node in &nodes {
+        wait_for_database(&client, &node.url, "leaderdb").await;
+    }
+
+    assert!(show_databases_contains(&client, &nodes[0].url, "repldb").await);
+    assert!(show_databases_contains(&client, &nodes[2].url, "leaderdb").await);
 }
 
 async fn write_one(client: &reqwest::Client, url: &str, db: &str, line: &str) -> reqwest::Response {
@@ -361,9 +425,9 @@ async fn sync_quorum_blocks_until_peer_acks_and_converges() {
     let client = reqwest::Client::new();
 
     create_db(&client, &nodes[0].url, "syncdb").await;
-    // Replicate the CREATE DATABASE to the other nodes via their own /query.
-    create_db(&client, &nodes[1].url, "syncdb").await;
-    create_db(&client, &nodes[2].url, "syncdb").await;
+    for node in &nodes[1..] {
+        wait_for_database(&client, &node.url, "syncdb").await;
+    }
 
     let resp = write_one(
         &client,

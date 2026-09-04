@@ -15,9 +15,10 @@ This document describes HyperbyteDB's clustering subsystem: node state machine, 
 9. [Replication Log](#9-replication-log)
 10. [Cluster Convergence](#10-cluster-convergence)
 11. [Graceful Drain](#11-graceful-drain)
-12. [Peer Internal Endpoints](#13-peer-internal-endpoints)
-13. [Cluster Configuration](#14-cluster-configuration)
-14. [Metrics](#15-metrics)
+12. [Peer Internal Endpoints](#12-peer-internal-endpoints)
+13. [Cluster Configuration](#13-cluster-configuration)
+14. [Metrics](#14-metrics)
+15. [Series Sharding (Experimental)](#15-series-sharding-experimental)
 
 ---
 
@@ -239,6 +240,7 @@ pub type HyperbytedbRaft = openraft::Raft<TypeConfig>;
 pub enum ClusterRequest {
     SetNodeState { node_id: u64, state: NodeState },
     SchemaMutation(MutationRequest),
+    ShardMapMutation(Box<ShardMapOp>),  // when [sharding] enabled
 }
 
 pub struct ClusterResponse {
@@ -274,6 +276,7 @@ When a `ClusterRequest` is committed by Raft:
   - `Delete` -> `metadata.store_tombstone()`
   - `CreateUser` -> `metadata.create_user()`
   - etc.
+- **`ShardMapMutation`:** Applies a `ShardMapOp` to the local shard map (bootstrap, split, merge, `TransferPrimary`, `MovePeer`, etc.). See [Section 15](#15-series-sharding-experimental).
 
 ### Raft-to-membership synchronization
 
@@ -545,6 +548,22 @@ Step 5: Set node state to Leaving
 |----------|--------|---------|
 | `/internal/drain` | POST | Trigger drain procedure |
 
+### Shard endpoints (when `[sharding] enabled = true`)
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/internal/shard/bootstrap` | POST | Register a measurement region on the Raft leader |
+| `/internal/shard/write` | POST | Apply forwarded line protocol for a region |
+| `/internal/shard/query` | POST | Execute translated ClickHouse SQL for a region |
+| `/internal/shard/metadata` | POST | Region-scoped SHOW TAG KEYS/VALUES/SERIES |
+| `/internal/shard/delete` | POST | Physical delete cleanup for a region |
+| `/internal/shard/transfer` | POST | Receive WAL export during region transfer |
+| `/internal/shard/mv-backfill` | POST | Apply region-scoped MV historical backfill SQL |
+| `/internal/shard/heartbeat` | POST | Region stats report to the Raft leader |
+| `/internal/shard/map` | GET | Read-only shard map snapshot |
+
+Shard handlers validate `region_id`, `epoch`, and local peer membership before applying data-plane work. Stale epochs return `409 Conflict`.
+
 ---
 
 ## 13. Cluster Configuration
@@ -599,3 +618,224 @@ Step 5: Set node state to Leaving
 | `hyperbytedb_drain_total` | counter | Drain procedures initiated |
 | `hyperbytedb_cluster_peers_active` | gauge | Number of active peers |
 | `hyperbytedb_uptime_seconds` | gauge | Node uptime in seconds |
+
+---
+
+## 15. Series Sharding (Experimental)
+
+When `[sharding] enabled = true` (requires `[cluster] enabled = true`), HyperbyteDB partitions each measurement's series space by `series_id` into **regions** covering `[0, u64::MAX)`. Each region has a primary and replica peers; data is not fully replicated to every cluster node.
+
+```
+Client /write or /query (any node)
+        |
+        v
++----------------------------------+
+| Coordinator (local node)         |
+|  - Resolve region via shard map  |
+|  - Local peer: apply directly    |
+|  - Remote region: scatter HTTP   |
++----------------------------------+
+        |
+        +--> /internal/shard/write   (writes)
+        +--> /internal/shard/query   (SELECT)
+        +--> /internal/shard/metadata (SHOW *)
+        +--> /internal/shard/delete  (DELETE cleanup)
+```
+
+Configuration keys are documented in [Configuration Reference](../user-guide/configuration.md#sharding).
+
+### Control plane
+
+- **Shard map** is stored in RocksDB (`RocksDBShardMap`) and replicated via Raft (`ClusterRequest::ShardMapMutation`).
+- The **Raft leader** runs a **shard scheduler** (`ShardScheduler`) that evaluates region heartbeats and proposes split, merge, rebalance, and primary-transfer operations.
+- Split/merge respect `split_merge_interval_secs` cooldown and `schedule_limit` concurrent ops.
+- **`max_regions_per_measurement`** caps runaway splits; **`load_split_qps_threshold`** optionally triggers load-based splits when non-zero.
+- **`region_id` is globally unique** across all measurements in the shard map. Bootstrap allocates via monotonic `next_region_id` (`build_bootstrap_op` in `shard_routing.rs`); splits allocate the right-hand child the same way. `apply_shard_map_op` rejects duplicate IDs on bootstrap and split; `MeasurementShardSpace::validate` rejects duplicates within a space; `ShardMap::validate_global_region_ids` checks the full map. Heartbeats, epoch CAS, and `lookup_region_by_id` all assume this invariant — reusing an ID causes endless `stale_epoch` rejections.
+
+### Data plane — writes
+
+- Incoming points are bucketed by `series_id` using `ShardLocationCache`.
+- Points for regions where this node is an **Active** peer are written locally (WAL + region-scoped replication).
+- Other regions are forwarded via `scatter_to_region_peers` to `/internal/shard/write` (primary first, then other Active replicas).
+- Region-scoped replication sets `target_node_ids` on outbound batches so only Active region peers receive WAL fan-out.
+
+### Data plane — queries
+
+- **SELECT** queries translate TimeseriesQL to ClickHouse SQL, select overlapping regions, inject per-region `series_id` range predicates, then scatter to Active peers via `/internal/shard/query`. Results are merged on the coordinator.
+- **SHOW TAG KEYS/VALUES/SERIES** scatter via `/internal/shard/metadata` and merge on the coordinator.
+- **DELETE / DropSeries / DropMeasurement** store a logical tombstone once, then fan out physical cleanup via `/internal/shard/delete` (primary-only; skipped until primary is Active or failovered).
+
+### Scatter and down-node avoidance
+
+**File:** `src/application/shard_routing.rs`, `src/application/shard_peer_resolution.rs`
+
+`scatter_to_region_peers` is the shared retry loop for queries, metadata, and write forwards:
+
+1. Build an ordered candidate list: **self** (if Active and in `region.peers`) → **primary** (if Active) → **other Active peers**.
+2. Exclude non-`Active` membership states (`Disconnected`, `Draining`, etc.).
+3. Truncate to `scatter_max_peer_attempts` remote tries (self is handled separately on the coordinator).
+4. For each candidate, invoke the caller's HTTP callback with `scatter_peer_timeout_ms`.
+5. On success after the first remote candidate, increment `hyperbytedb_shard_scatter_fallback_total{kind}`.
+6. **`StaleShardEpoch`** aborts immediately without trying further peers (map changed underfoot).
+7. If all candidates fail, return `PeerUnreachable`.
+
+Cluster heartbeats probe `/health` (readiness) in addition to `/ping`; peers that fail readiness are marked non-Active and drop out of scatter routing.
+
+Replica reads are **eventually consistent** — a scatter query may succeed against a replica while the primary is down, but lagging replicas can return slightly stale data until replication catches up.
+
+### Primary failover
+
+When a region primary stays non-Active longer than `primary_failover_after_secs`, the Raft leader's scheduler proposes `TransferPrimary` to the next Active peer in the region. Metrics: `hyperbytedb_shard_primary_failover_total` and `hyperbytedb_shard_primary_failover_skipped_total{reason}`.
+
+Remote DELETE cleanup waits for an Active primary; use drain or wait for automatic failover before expecting cross-node delete cleanup during a primary outage.
+
+### Transfer and lifecycle
+
+Region transfers move vacated `series_id` ranges **before** split/map mutations commit so clients never read an empty new owner:
+
+1. **Push** — source exports WAL tail + flushed chDB rows in chunked `/internal/shard/transfer` payloads (`transfer_id`, `seq`, `done`).
+2. **Split / rebalance / merge** — Raft commits the shard-map change (epoch CAS on Split/Merge).
+3. **Ack** — source sends Ack to the destination primary; destination purges stale materialized-view partials for the vacated range.
+4. **Drop** — source deletes range-scoped series metadata and issues chDB `DELETE` for the vacated fact/series tables.
+
+The scheduler holds a **per-region operator lock** while split/merge/rebalance/failover/transfer runs; `schedule_limit` counts live operators, not per-tick slots.
+
+- **Drain** performs transfer, `TransferPrimary`, then `MovePeer` (re-reads epoch after primary transfer).
+- **Sync manifests** include per-region WAL watermarks; failover prefers the most caught-up Active peer (leader eligible).
+
+### Split-transfer reconciliation
+
+A split commits via Raft before its historical-row re-push completes. If the
+destination's Raft apply lags the leader's, re-home/push RPCs answer `404`
+("region range not found") or `409` (stale epoch). These failures are **not
+lost**:
+
+- Apply-time normalization records durable intent on the child region:
+  `transfer_verified=false` (+ `transfer_first_seen`) whenever a split child's
+  primary differs from its parent's. The flag rides the Raft-committed map, so
+  leadership change or process restart rebuilds the work queue from a map scan.
+- The leader keeps an in-memory reconciliation queue (ordering detail only) and
+  drains it each tick. Movement retries use **authoritative sources only** —
+  the old primary recorded at split time, then live peers with a non-zero
+  region WAL watermark (a data-less peer would verify vacuously).
+- Satisfaction requires **positive proof**: every exported point confirmed
+  applied at the destination. Sentinel outcomes (`transfer_id == 0`,
+  i.e. source==destination collision; empty exports) never clear debt.
+- On verified movement the leader proposes the `ClearVerified` shard-map op.
+  Disable with `[sharding] transfer_clear_proposals_enabled = false` on
+  mixed-version clusters: nodes older than the op cannot decode it from the
+  Raft log.
+- Splits and merges are refused while either region carries outstanding debt.
+  Stuck entries escalate once via `TransferPrimary` to another live peer
+  (stage-before-commit ordering prevents committing a data-less owner), then
+  park with `hyperbytedb_shard_transfer_parked_total` after ~10 stalled ticks
+  past a minimum age — operator action required.
+- Materialized-view rollup destinations (`SummingMergeTree`) are excluded from
+  reconciliation entirely: re-delivery would permanently double additive
+  aggregates. Their provisioning flows through the MV backfill path.
+- Raw measurement tables are `ReplacingMergeTree(ingest_seq)` keyed by
+  `(series_id, time)`: retried pushes dedupe eventually, but a transient
+  duplicate window exists until background merges collapse rows.
+
+### Membership self-truth (`/health` body)
+
+Every `/health` response (200 and 503 alike) carries machine-readable
+self-readiness fields:
+
+```json
+{"status": "...", "message": "...", "state": "active", "needs_sync": false}
+```
+
+Cluster peers parse these fields in their periodic probes and converge their
+local membership view toward each peer's **self-reported state**: a peer
+recorded `Syncing` is promoted to `Active` exactly when it reports
+`state=active && needs_sync=false` (caught up and accepting data), and demoted
+back when it reports `syncing`. Overall HTTP status never drives membership
+transitions — a wedged WAL batcher fails `/health` without changing what peers
+believe about regional catch-up. Peers that do not answer at all transition to
+`Disconnected` (the crash detector); responses without parseable bodies
+(legacy binaries) carry no information in either direction.
+
+### Region heartbeats
+
+Store nodes report to the Raft leader via `/internal/shard/heartbeat`:
+
+| Field | Meaning |
+|-------|---------|
+| `region_id` | Region being reported |
+| `node_id` | Reporting store node (region peer, not necessarily Raft leader) |
+| `series_count` | Series metadata rows in `[start, end)` on this node |
+| `approx_bytes` | Cheap chDB row-count × size estimate for load rebalance |
+| `write_qps` | Local ingest rate since last report |
+| `epoch` | Stale heartbeats (epoch mismatch) are dropped |
+
+### Distributed aggregate support
+
+Multi-region fan-out rewrites SELECT into per-region partial aggregations, then merges on the coordinator:
+
+| Aggregate | Multi-region behavior |
+|-----------|----------------------|
+| `sum`, `count`, `min`, `max` | Merge partials additively |
+| `mean` | Partial `sum` + `count`, finalize `sum/count` |
+| `first` / `last` | Carry bucket time; pick min/max time across regions |
+| `distinct`, `count(distinct)`, `stddev` | Set / moment partial merge |
+| `percentile`, `median`, `mode`, `spread` | **Error** — not supported across regions yet |
+
+Global **LIMIT**, **OFFSET**, and **ORDER BY** apply on the coordinator after merging (per-region SQL fetches `limit+offset` rows).
+
+- After split, the scheduler runs **region transfer** before proposing the map change.
+- **Drain** performs transfer + `TransferPrimary` + `MovePeer` for regions where the draining node is primary.
+- **Sync manifests** include per-region WAL watermarks; join sync pulls from region primaries where the joining node is a peer.
+
+### Materialized views
+
+When sharding is enabled, materialized views use the same per-node ClickHouse MV model as non-sharded clusters, with three extra behaviors:
+
+1. **Incremental triggers stay local.** Source writes are already routed by `series_id` region, so each node installs fact + series ClickHouse MVs that fire on locally ingested source rows. No cross-region predicate is injected into MV SQL.
+
+2. **Destination queries fan out to all regions and all Active peers in each region.** Materialized destination measurements store **region-local partial rollups**. Coordinators select every region in the dest shard map (no `series_id` predicate), query every Active peer in each region via `/internal/shard/query`, then merge partial rows with SummingMergeTree semantics (`merge_materialized_rollup_results`). Tag-subset `GROUP BY` (for example `GROUP BY time(1m), "host"`) relies on this merge at read time.
+
+3. **`WITH BACKFILL` scatters before MV DDL.** On `CREATE MATERIALIZED VIEW ... WITH BACKFILL`, the leader ensures dest schema, inserts historical fact + series rows per source region through `/internal/shard/mv-backfill` (with region `series_id` predicates), then installs ClickHouse MV objects without dropping the backfilled destination tables.
+
+On create, both source and destination measurements are bootstrapped into the shard map. MV definitions replicate through Raft like other schema mutations; each node reconciles local ClickHouse MV objects on startup.
+
+After a **region transfer**, destination partial rows sourced from transferred `series_id` ranges are purged on the ACK phase so stale rollups do not linger on vacated peers.
+
+### Metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `hyperbytedb_shard_regions` | gauge | Regions tracked in the local shard map |
+| `hyperbytedb_shard_splits_total` | counter | Split operations proposed |
+| `hyperbytedb_shard_merges_total` | counter | Merge operations proposed |
+| `hyperbytedb_shard_rebalances_total` | counter | Primary transfer / rebalance ops |
+| `hyperbytedb_shard_transfers_total` | counter | Completed region transfers |
+| `hyperbytedb_shard_transfer_bytes` | counter | Bytes moved by transfer |
+| `hyperbytedb_shard_forwarded_writes_applied_total` | counter | Writes applied via `/internal/shard/write` |
+| `hyperbytedb_shard_delete_applied_total` | counter | Region delete cleanups applied |
+| `hyperbytedb_shard_region_lag_wal_seq` | gauge | Per-region WAL lag vs primary (leader monitor) |
+| `hyperbytedb_shard_query_regions_total` | gauge | Regions in shard map for a measurement query |
+| `hyperbytedb_shard_query_regions_selected` | gauge | Regions selected for a specific query |
+| `hyperbytedb_shard_scatter_fallback_total{kind}` | counter | Scatter succeeded via non-first peer (`kind` ∈ {`query`, `metadata`, `write`}) |
+| `hyperbytedb_shard_scatter_peer_attempts` | histogram | Peer attempts per scatter request |
+| `hyperbytedb_shard_primary_failover_total` | counter | Automatic `TransferPrimary` on unhealthy primary |
+| `hyperbytedb_shard_primary_failover_skipped_total{reason}` | counter | Failover skipped |
+| `hyperbytedb_shard_mv_backfill_regions_total` | counter | Source regions backfilled during sharded MV create |
+
+### Clean cluster runbook (kind, 6-node)
+
+Use this sequence before sharding acceptance runs (e2e G0–G9) or any test that depends on a pristine shard map. **Do not** enable sharding on PVCs that already contain bootstrapped measurements — leftover regions pollute G0/G1 and mask bootstrap bugs.
+
+1. **Fresh storage** — `./deploy/kind/setup.sh hdb-down --sharded` (or `hdb-reset --sharded`) deletes the `HyperbytedbCluster` CR, lets the operator garbage-collect StatefulSet/services/config, then removes PVCs. Do **not** scale the operator to 0 or hand-patch `hyperbytedb-config`.
+2. **Deploy 6-node cluster** — `./deploy/kind/setup.sh up --sharded` creates a 6-worker kind cluster and applies `hyperbytedb-cr-6node-sharded.yaml` with `spec.sharding`. For an existing kind cluster: `./deploy/kind/setup.sh hdb-reset --sharded`.
+3. **Operator drives Raft** — keep `hyperbytedb-operator` at 1 replica; it calls `/cluster/membership/add-node` as pods become Ready. Wait until `/cluster/nodes` reports **6 active** members (setup script polls this).
+4. **Settle** — wait **≥60s** after pods are Ready and Raft is complete so shard heartbeats stabilize. `hdb-up --sharded` sleeps 60s by default (`SHARDED_SETTLE_SECS`).
+5. **Acceptance** — run `deploy/kind/run-sharding-e2e.sh` (in-cluster Job).
+
+### Limitations
+
+- Enable sharding only on **new clusters**; in-place conversion from full-copy replication is not supported.
+- **Proxy** load balancing is not shard-aware; any Active node can coordinate scatter-gather queries and write forwards.
+- **sync_quorum** on forwarded writes: `/internal/shard/write` honors the configured replication mode; SyncQuorum fails the request when region peer acks do not meet quorum.
+- Split keys prefer the **median local `series_id`** in the region (metadata catalog scan), falling back to range midpoint when empty.
+- `percentile`, `median`, `mode`, and `spread` are rejected on multi-region fan-out until a merge strategy exists.

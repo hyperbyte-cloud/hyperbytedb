@@ -307,7 +307,55 @@ export HYPERBYTEDB__SERVER__MAX_CONCURRENT_QUERIES=32
 export HYPERBYTEDB__LOGGING__LEVEL=debug
 export HYPERBYTEDB__LOGGING__FORMAT=json
 export HYPERBYTEDB__RETENTION__INTERVAL=5m
+export HYPERBYTEDB__SHARDING__ENABLED=false
 ```
+
+---
+
+## [sharding]
+
+Automatic `series_id` range sharding across cluster nodes (experimental). Requires `[cluster] enabled = true`. When disabled, cluster nodes use full-copy master-master replication.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `false` | Master switch for series sharding |
+| `replication_factor` | `3` | Target replica count per shard region |
+| `region_split_series` | `100000` | Target series per region before split |
+| `region_max_series` | `150000` | Hard split threshold (~1.5× target) |
+| `region_merge_series` | `20000` | Merge when adjacent regions fall below |
+| `split_merge_interval_secs` | `3600` | Cooldown between split/merge on a region |
+| `schedule_limit` | `4` | Max concurrent split/move/merge operators |
+| `heartbeat_interval_secs` | `10` | Region stats report interval |
+| `bootstrap_timeout_ms` | `5000` | Sync bootstrap RPC timeout |
+| `primary_failover_after_secs` | `60` | Seconds before Raft leader proposes `TransferPrimary` for an unhealthy primary |
+| `scatter_peer_timeout_ms` | `5000` | Per-peer HTTP timeout for sharded query/write/metadata scatter |
+| `scatter_max_peer_attempts` | `3` | Max Active peers tried per region per scatter request |
+| `peer_heal_enabled` | `true` | Replace permanently-inactive region peers with healthy members (replica-set healing) |
+| `load_split_qps_threshold` | `0` | Load-based split QPS threshold; `0` = disabled |
+| `max_regions_per_measurement` | `128` | Hard cap on regions per measurement (safety guard) |
+
+Writes are routed to exactly one node per region — the region primary. If the primary is down, writes to that region fail fast until the Raft leader promotes a new primary (`primary_failover_after_secs`), instead of being accepted by a replica.
+
+Environment example: `HYPERBYTEDB__SHARDING__ENABLED=true`
+
+### Example: Sharded cluster node
+
+```toml
+[cluster]
+enabled = true
+node_id = 1
+cluster_addr = "10.0.0.1:8086"
+peers = "10.0.0.2:8086,10.0.0.3:8086"
+
+[sharding]
+enabled = true
+replication_factor = 3
+primary_failover_after_secs = 60
+scatter_peer_timeout_ms = 5000
+scatter_max_peer_attempts = 3
+```
+
+Enable sharding on **every** node in the cluster before ingesting data. See [Deep Dive: Clustering](../deep-dive/deep-dive-clustering.md#15-series-sharding-experimental) for behavior and limitations.
 
 ---
 

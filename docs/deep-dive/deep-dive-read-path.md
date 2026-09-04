@@ -208,11 +208,24 @@ When the query includes an INTO clause, results are written back through the ing
 
 ## 9. Cluster Query Behavior
 
-Each node executes queries against its **local** chDB tables. There is no distributed scatter-gather for data queries — clients should route to a healthy peer or use a load balancer.
+### Full-copy cluster (default)
+
+When `[sharding] enabled = false`, each node executes queries against its **local** chDB tables. There is no distributed scatter-gather for data queries — clients should route to a healthy peer or use a load balancer.
 
 Schema mutations (CREATE DATABASE, DELETE tombstones, CQ definitions) go through Raft for ordering and are replicated to all peers.
 
-For replication and sync that keeps peer data aligned, see [Deep Dive: Clustering](deep-dive-clustering.md).
+### Sharded cluster (experimental)
+
+When `[sharding] enabled = true`, SELECT and SHOW statements on sharded measurements are **scatter-gather**:
+
+1. Resolve the measurement's shard map and select overlapping regions.
+2. Translate TimeseriesQL to ClickHouse SQL and inject per-region `series_id` predicates.
+3. For each region, execute locally (if this node is an Active peer) or POST to `/internal/shard/query` / `/internal/shard/metadata` on Active region peers.
+4. Merge partial results on the coordinator into InfluxDB-compatible JSON.
+
+The scatter loop tries Active peers in order (self → primary → replicas), respects `scatter_max_peer_attempts` and `scatter_peer_timeout_ms`, and fails over to replicas when the primary is unreachable. Stale shard epochs abort without retry.
+
+For replication, sync, and sharding control-plane details, see [Deep Dive: Clustering](deep-dive-clustering.md).
 
 ---
 
@@ -223,6 +236,8 @@ For replication and sync that keeps peer data aligned, see [Deep Dive: Clusterin
 | `hyperbytedb_query_requests_total` | counter | Query requests received |
 | `hyperbytedb_query_errors_total` | counter | Failed queries |
 | `hyperbytedb_query_duration_seconds` | histogram | End-to-end query latency |
+
+When sharding is enabled, additional metrics track region selection and scatter behavior — see [Deep Dive: Clustering](deep-dive-clustering.md#15-series-sharding-experimental).
 
 When enabled, `StatementSummary` records normalized query text and timing for `GET /api/v1/statements`.
 

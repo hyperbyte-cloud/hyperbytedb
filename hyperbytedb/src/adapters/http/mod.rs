@@ -1,3 +1,4 @@
+pub mod app_state_defaults;
 pub mod auth_middleware;
 pub mod chdb;
 pub mod cluster;
@@ -11,5 +12,6 @@ pub mod raft_handlers;
 pub mod rate_limit;
 pub mod response;
 pub mod router;
+pub mod shard_handlers;
 pub mod statements;
 pub mod write;

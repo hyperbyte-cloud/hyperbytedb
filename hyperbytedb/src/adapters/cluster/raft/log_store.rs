@@ -20,9 +20,12 @@ use rocksdb::{
 
 use crate::application::materialized_view_service::MaterializedViewService;
 use crate::application::schema_mutation_apply::{self, SchemaMutationDeps};
+use crate::application::shard_routing::ShardRoutingContext;
 use crate::domain::cluster::membership::{NodeInfo, NodeState, SharedMembership};
+use crate::domain::sharding::ShardLocationCache;
 use crate::ports::metadata::MetadataPort;
 use crate::ports::points_sink::PointsSinkPort;
+use crate::ports::sharding::ShardMapPort;
 use crate::ports::wal::WalPort;
 
 use super::TypeConfig;
@@ -58,6 +61,32 @@ fn storage_io_err(e: impl std::fmt::Display) -> StorageError<u64> {
         openraft::ErrorVerb::Write,
         io_err(e),
     )
+}
+
+/// Merge a snapshot's app-level membership into the live view without
+/// clobbering heartbeat/self-truth state. For nodes already present, only
+/// transport metadata (addr) is refreshed — `Active`/`Syncing` belong to the
+/// prober, and operator states (`Draining`/`Leaving`/...) stay as observed.
+/// New topology arrives through the snapshot; nothing is removed.
+pub(crate) fn merge_snapshot_membership(
+    shared: &mut crate::domain::cluster::membership::ClusterMembership,
+    incoming: crate::domain::cluster::membership::ClusterMembership,
+) {
+    use crate::domain::cluster::membership::NodeState;
+    for (id, info) in incoming.nodes {
+        match shared.nodes.get_mut(&id) {
+            Some(existing) => {
+                existing.addr = info.addr;
+                let self_owned = matches!(existing.state, NodeState::Active | NodeState::Syncing);
+                if !self_owned {
+                    existing.state = info.state;
+                }
+            }
+            None => {
+                shared.add_node(info);
+            }
+        }
+    }
 }
 
 fn raft_cf<'a>(
@@ -96,6 +125,9 @@ pub struct RaftStore {
     mv_service: Option<Arc<MaterializedViewService>>,
     points_sink: Option<Arc<dyn PointsSinkPort>>,
     wal: Option<Arc<dyn WalPort>>,
+    shard_map: Option<Arc<dyn ShardMapPort>>,
+    shard_location_cache: Option<Arc<ShardLocationCache>>,
+    shard_routing: Option<Arc<ShardRoutingContext>>,
 }
 
 impl RaftStore {
@@ -170,6 +202,9 @@ impl RaftStore {
             mv_service: None,
             points_sink: None,
             wal: None,
+            shard_map: None,
+            shard_location_cache: None,
+            shard_routing: None,
         })
     }
 
@@ -220,6 +255,11 @@ impl RaftStore {
 
         let now = chrono::Utc::now().timestamp();
         for (nid, addr) in &raft_nodes {
+            // Topology-only for nodes we already know about: the heartbeat
+            // prober owns the Active/Syncing axis (self-truth model), so a
+            // stale persisted topology must never re-promote or re-demote an
+            // existing record. New nodes get their initial state from Raft
+            // topology (voter → Active, learner → Syncing).
             let raft_state = if voter_ids.contains(nid) {
                 NodeState::Active
             } else {
@@ -227,9 +267,6 @@ impl RaftStore {
             };
             if let Some(existing) = shared.nodes.get_mut(nid) {
                 existing.addr = addr.clone();
-                if existing.state != NodeState::Draining && existing.state != NodeState::Leaving {
-                    existing.state = raft_state;
-                }
                 existing.last_heartbeat = now;
             } else {
                 shared.add_node(NodeInfo {
@@ -275,6 +312,21 @@ impl RaftStore {
 
     pub fn with_wal(mut self, wal: Arc<dyn WalPort>) -> Self {
         self.wal = Some(wal);
+        self
+    }
+
+    pub fn with_shard_map(
+        mut self,
+        shard_map: Arc<dyn ShardMapPort>,
+        location_cache: Arc<ShardLocationCache>,
+    ) -> Self {
+        self.shard_map = Some(shard_map);
+        self.shard_location_cache = Some(location_cache);
+        self
+    }
+
+    pub fn with_shard_routing(mut self, shard_routing: Arc<ShardRoutingContext>) -> Self {
+        self.shard_routing = Some(shard_routing);
         self
     }
 
@@ -471,6 +523,9 @@ impl RaftStorage<TypeConfig> for RaftStore {
             mv_service: self.mv_service.clone(),
             points_sink: self.points_sink.clone(),
             wal: self.wal.clone(),
+            shard_map: self.shard_map.clone(),
+            shard_location_cache: self.shard_location_cache.clone(),
+            shard_routing: self.shard_routing.clone(),
         }
     }
 
@@ -639,6 +694,9 @@ impl RaftStorage<TypeConfig> for RaftStore {
             mv_service: self.mv_service.clone(),
             points_sink: self.points_sink.clone(),
             wal: self.wal.clone(),
+            shard_map: self.shard_map.clone(),
+            shard_location_cache: self.shard_location_cache.clone(),
+            shard_routing: self.shard_routing.clone(),
         }
     }
 
@@ -713,15 +771,20 @@ impl RaftStorage<TypeConfig> for RaftStore {
         self.sm = sm_data.clone();
         self.last_purged_log_id = meta.last_log_id;
 
-        let mut shared = self.shared_membership.write().await;
-        *shared = sm_data.cluster_membership;
+        // Writer precedence: a snapshot carries the LEADER'S membership view.
+        // Heartbeat/self-truth owns Active/Syncing on records we already
+        // have (including our own!), so merge conservatively instead of
+        // replacing wholesale.
+        {
+            let mut shared = self.shared_membership.write().await;
+            merge_snapshot_membership(&mut shared, sm_data.cluster_membership);
+        }
 
         metrics::histogram!("hyperbytedb_raft_install_snapshot_seconds")
             .record(start.elapsed().as_secs_f64());
         metrics::counter!("hyperbytedb_raft_install_snapshot_total").increment(1);
         Ok(())
     }
-
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<u64>> {
@@ -803,6 +866,10 @@ impl RaftStore {
             .collect();
 
         for (nid, addr) in &all_nodes {
+            // Topology-only for existing nodes: heartbeat/self-truth owns the
+            // Active/Syncing axis, so a Raft membership event (learner
+            // promotion, joint-config churn) must never overwrite the state a
+            // probe observed. New nodes still start from topology state.
             let raft_state = if voter_ids.contains(nid) {
                 NodeState::Active
             } else {
@@ -811,16 +878,6 @@ impl RaftStore {
 
             if let Some(existing) = shared.nodes.get_mut(nid) {
                 existing.addr = addr.clone();
-                let should_update = if raft_state == NodeState::Active {
-                    existing.state != NodeState::Draining && existing.state != NodeState::Leaving
-                } else {
-                    existing.state == NodeState::Joining
-                        || existing.state == NodeState::Disconnected
-                        || existing.state == NodeState::Syncing
-                };
-                if should_update {
-                    existing.state = raft_state;
-                }
                 existing.last_heartbeat = now;
             } else {
                 shared.add_node(NodeInfo {
@@ -866,6 +923,7 @@ impl RaftStore {
                             mv_service: self.mv_service.as_deref(),
                             points_sink: self.points_sink.as_ref(),
                             wal: self.wal.as_ref(),
+                            shard_routing: self.shard_routing.as_ref(),
                         },
                         *mutation,
                     )
@@ -878,6 +936,22 @@ impl RaftStore {
                     ClusterResponse::error("metadata port not available")
                 }
             }
+            ClusterRequest::ShardMapMutation(op) => {
+                if let Some(ref shard_map) = self.shard_map {
+                    let measurement_key = op.measurement_key().clone();
+                    match shard_map.apply_op(*op).await {
+                        Ok(map) => {
+                            if let Some(ref cache) = self.shard_location_cache {
+                                cache.refresh_measurement(&map, &measurement_key);
+                            }
+                            ClusterResponse::success()
+                        }
+                        Err(e) => ClusterResponse::error(e.to_string()),
+                    }
+                } else {
+                    ClusterResponse::error("shard map not available")
+                }
+            }
         }
     }
 }
@@ -886,6 +960,7 @@ impl RaftStore {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+    use super::merge_snapshot_membership;
     use openraft::{BasicNode, LeaderId, LogId, Membership, StoredMembership};
     use rocksdb::{DB, Options};
     use tempfile::TempDir;
@@ -1018,6 +1093,44 @@ mod tests {
         assert_eq!(g.nodes.get(&1).unwrap().state, NodeState::Active);
     }
 
+    #[test]
+    fn merge_snapshot_membership_preserves_self_truth() {
+        let mut shared = ClusterMembership::new();
+        shared.add_node(NodeInfo {
+            node_id: 2,
+            addr: "10.0.0.2:8086".into(),
+            state: NodeState::Active, // probe-set after restart
+            joined_at: 1,
+            last_heartbeat: 50,
+            needs_sync: false,
+        });
+
+        let mut incoming = ClusterMembership::new();
+        // Leader's stale view: node 2 still a learner (Syncing), plus brand
+        // new node 3.
+        incoming.add_node(NodeInfo {
+            node_id: 2,
+            addr: "10.0.0.2:8086".into(),
+            state: NodeState::Syncing,
+            joined_at: 1,
+            last_heartbeat: 99,
+            needs_sync: false,
+        });
+        incoming.add_node(NodeInfo {
+            node_id: 3,
+            addr: "10.0.0.3:8086".into(),
+            state: NodeState::Syncing,
+            joined_at: 2,
+            last_heartbeat: 99,
+            needs_sync: false,
+        });
+
+        merge_snapshot_membership(&mut shared, incoming);
+
+        assert_eq!(shared.nodes.get(&2).unwrap().state, NodeState::Active);
+        assert_eq!(shared.nodes.get(&3).unwrap().state, NodeState::Syncing);
+    }
+
     #[tokio::test]
     async fn hydrate_is_a_noop_for_empty_state_machine() {
         let tmp = TempDir::new().unwrap();
@@ -1028,5 +1141,83 @@ mod tests {
         store.hydrate_shared_membership_from_state_machine().await;
         let g = shared.read().await;
         assert_eq!(g.nodes.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn hydrate_is_topology_only_for_existing_nodes() {
+        // Writer precedence: a persisted app-level Syncing record for a node
+        // that Raft sees as a voter must survive hydration — the heartbeat
+        // prober owns the Active/Syncing axis.
+        let tmp = TempDir::new().unwrap();
+        let raft_dir = tmp.path().join("raft");
+
+        let mut app_mem = make_app_membership();
+        app_mem.nodes.get_mut(&2).unwrap().state = NodeState::Syncing;
+        app_mem.nodes.get_mut(&1).unwrap().state = NodeState::Syncing;
+        let sm = StateMachineData {
+            last_applied_log: Some(LogId::new(LeaderId::new(8, 1), 21)),
+            last_membership: make_raft_membership(&[(1, "10.0.0.1:8086"), (2, "10.0.0.2:8086")]),
+            cluster_membership: app_mem,
+        };
+        seed_state_machine(&raft_dir, &sm);
+
+        let shared = new_shared(ClusterMembership::new());
+        let store = RaftStore::open(&raft_dir, shared.clone()).expect("open");
+        store.hydrate_shared_membership_from_state_machine().await;
+
+        let g = shared.read().await;
+        assert_eq!(
+            g.nodes.get(&2).unwrap().state,
+            NodeState::Syncing,
+            "hydrate must not overwrite Syncing on an existing record"
+        );
+        assert_eq!(g.nodes.get(&1).unwrap().state, NodeState::Syncing);
+    }
+
+    #[tokio::test]
+    async fn membership_apply_is_topology_only_for_existing_nodes() {
+        // A learner→voter promotion event must not promote a probe-observed
+        // Syncing record; the prober owns that transition.
+        let tmp = TempDir::new().unwrap();
+        let raft_dir = tmp.path().join("raft");
+
+        let sm = StateMachineData {
+            last_applied_log: Some(LogId::new(LeaderId::new(8, 1), 21)),
+            last_membership: make_raft_membership(&[(1, "10.0.0.1:8086")]),
+            cluster_membership: ClusterMembership::new(),
+        };
+        seed_state_machine(&raft_dir, &sm);
+
+        let mut initial = ClusterMembership::new();
+        initial.add_node(NodeInfo {
+            node_id: 1,
+            addr: "10.0.0.1:8086".into(),
+            state: NodeState::Syncing,
+            joined_at: 100,
+            last_heartbeat: 100,
+            needs_sync: false,
+        });
+        let shared = new_shared(initial);
+        let store = RaftStore::open(&raft_dir, shared.clone()).expect("open");
+
+        store
+            .sync_raft_membership_to_shared(
+                &make_raft_membership(&[(1, "10.0.0.1:8086"), (2, "10.0.0.2:8086")])
+                    .membership()
+                    .clone(),
+            )
+            .await;
+
+        let g = shared.read().await;
+        assert_eq!(
+            g.nodes.get(&1).unwrap().state,
+            NodeState::Syncing,
+            "voter promotion must not overwrite probe-observed Syncing"
+        );
+        assert_eq!(
+            g.nodes.get(&2).unwrap().state,
+            NodeState::Active,
+            "new nodes take topology state"
+        );
     }
 }

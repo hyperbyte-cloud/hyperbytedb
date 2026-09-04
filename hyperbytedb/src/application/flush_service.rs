@@ -14,6 +14,7 @@ use crate::domain::prepared_wal::{PreparedMeasurementBatch, PreparedWalSlot};
 use crate::error::HyperbytedbError;
 use crate::ports::flush::FlushPort;
 use crate::ports::points_sink::PointsSinkPort;
+use crate::ports::sharding::ShardMapPort;
 use crate::ports::wal::WalPort;
 
 const WAL_READ_CHUNK: usize = 5_000;
@@ -49,6 +50,8 @@ pub struct FlushServiceImpl {
     /// When true (default), merge partial-field writes sharing a series-instant
     /// before insert. Set `HYPERBYTEDB_DISABLE_COALESCE=1` to skip.
     coalesce: bool,
+    sharding_enabled: bool,
+    shard_map: Option<Arc<dyn ShardMapPort>>,
 }
 
 struct FlushWork {
@@ -96,7 +99,20 @@ impl FlushServiceImpl {
             truncate_stale_peer_multiplier: 0,
             sink,
             coalesce: std::env::var("HYPERBYTEDB_DISABLE_COALESCE").is_err(),
+            sharding_enabled: false,
+            shard_map: None,
         }
+    }
+
+    pub fn with_sharding(
+        mut self,
+        enabled: bool,
+        shard_map: Option<Arc<dyn ShardMapPort>>,
+        _node_id: u64,
+    ) -> Self {
+        self.sharding_enabled = enabled;
+        self.shard_map = shard_map;
+        self
     }
 
     pub fn with_truncate_heartbeat_policy(
@@ -169,7 +185,33 @@ impl FlushServiceImpl {
             None => return chunk_max_seq,
         };
 
-        let peer_ids: Vec<u64> = if let Some(ref m) = self.membership {
+        let peer_ids: Vec<u64> = if self.sharding_enabled {
+            if let Some(ref map) = self.shard_map {
+                match map.snapshot().await {
+                    Ok(shard_map) => {
+                        let mut peers = std::collections::HashSet::new();
+                        for space in shard_map.spaces.values() {
+                            for region in &space.regions {
+                                if region.peers.contains(&self.node_id) {
+                                    for p in &region.peers {
+                                        if *p != self.node_id {
+                                            peers.insert(*p);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        peers.into_iter().collect()
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "shard map snapshot failed for truncate barrier");
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            }
+        } else if let Some(ref m) = self.membership {
             let membership = m.read().await;
             membership
                 .active_peers(self.node_id)

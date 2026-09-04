@@ -1,6 +1,7 @@
 //! Security-focused HTTP integration tests: cluster+auth route gating,
 //! statement summary auth/redaction, and GRANT/REVOKE enforcement.
 
+use hyperbytedb::config::ReplicationConfig;
 use std::sync::Arc;
 
 use axum::http::StatusCode;
@@ -101,6 +102,9 @@ async fn start_auth_cluster_node(dir: &std::path::Path) -> AuthClusterNode {
         Some(sink.clone()),
         IngestCardinalityLimits::default(),
         0,
+        false,
+        1,
+        Some(shared_membership.clone()),
     ));
 
     let base_query_service: Arc<dyn hyperbytedb::adapters::http::router::QueryService> =
@@ -160,6 +164,15 @@ async fn start_auth_cluster_node(dir: &std::path::Path) -> AuthClusterNode {
         rate_limiter: None,
         wal_batcher_alive: None,
         disk_read_only: None,
+
+        sharding_enabled: false,
+        shard_map: None,
+        shard_location_cache: Arc::new(hyperbytedb::domain::sharding::ShardLocationCache::new()),
+        shard_routing: None,
+        shard_scheduler: None,
+        ingest_cardinality: IngestCardinalityLimits::default(),
+        ingest_schema_cache: Default::default(),
+        cluster_replication: ReplicationConfig::default(),
     });
 
     let app = build_router(app_state);

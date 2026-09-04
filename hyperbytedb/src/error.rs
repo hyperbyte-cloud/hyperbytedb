@@ -149,6 +149,31 @@ pub enum HyperbytedbError {
     #[error("peer unreachable: {0}")]
     PeerUnreachable(String),
 
+    #[error("shard not owner for series_id {series_id} on {db}.{rp}.{measurement}")]
+    ShardNotOwner {
+        db: String,
+        rp: String,
+        measurement: String,
+        series_id: u64,
+    },
+
+    #[error("stale shard epoch for region {region_id}")]
+    StaleShardEpoch { region_id: u64 },
+
+    #[error("shard map error: {0}")]
+    ShardMap(#[source] ChainedError),
+
+    /// A shard transfer/rehome endpoint answered with a non-success status.
+    /// The status drives the reconciliation disposition (retryable vs
+    /// re-resolve vs terminal).
+    #[error("shard transfer rejected with status {status}")]
+    TransferRejected { status: u16 },
+
+    /// The movement's source and destination collapsed to the same node
+    /// mid-flight (e.g. ownership moved between resolution and execution).
+    #[error("shard transfer source and destination collided")]
+    TransferCollision,
+
     #[error("sync failed: {0}")]
     SyncFailed(String),
 
@@ -208,5 +233,16 @@ mod tests {
         let err = HyperbytedbError::Wal(ChainedError::new("wal column family not found"));
         assert!(err.source().is_some());
         assert!(err.source().unwrap().source().is_none());
+    }
+
+    #[test]
+    fn shard_map_persist_load_failure_has_source() {
+        let serde_err = serde_json::from_str::<u8>("not-json").unwrap_err();
+        let err = HyperbytedbError::ShardMap(ChainedError::with_context(
+            "shard map meta corrupt",
+            serde_err,
+        ));
+        assert!(err.source().is_some());
+        assert!(err.source().unwrap().source().is_some());
     }
 }

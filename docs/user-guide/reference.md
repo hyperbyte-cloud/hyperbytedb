@@ -130,6 +130,21 @@ The following apply when the corresponding features are compiled in and enabled.
 | `/cluster/membership/add-node` | POST | Operator-style add node |
 | `/cluster/membership/remove-node` | POST | Operator-style remove node |
 
+**Series sharding (when `[sharding] enabled = true`)**
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/internal/shard/bootstrap` | POST | Register a measurement region (Raft leader) |
+| `/internal/shard/write` | POST | Apply forwarded line protocol for a region |
+| `/internal/shard/query` | POST | Execute region-scoped ClickHouse SQL |
+| `/internal/shard/metadata` | POST | Region-scoped SHOW TAG KEYS/VALUES/SERIES |
+| `/internal/shard/delete` | POST | Physical delete cleanup for a region |
+| `/internal/shard/transfer` | POST | Receive WAL export during region transfer |
+| `/internal/shard/heartbeat` | POST | Region stats to the Raft leader |
+| `/internal/shard/map` | GET | Read-only shard map snapshot |
+
+See [Deep Dive: Clustering — Series Sharding](../deep-dive/deep-dive-clustering.md#15-series-sharding-experimental) for scatter, failover, and epoch semantics.
+
 ### POST /api/v1/chdb
 
 Execute raw ClickHouse SQL against the embedded chDB engine. **Admin-only** when auth is enabled.

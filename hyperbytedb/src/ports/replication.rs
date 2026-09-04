@@ -13,6 +13,8 @@ pub struct OutboundReplicationBatch {
     pub precision: Option<String>,
     pub body: Vec<u8>,
     pub wal_seq: u64,
+    /// When set, replicate only to these node ids (sharding region peers).
+    pub target_node_ids: Option<Vec<u64>>,
 }
 
 /// Outbound write/mutation replication to cluster peers.
@@ -30,7 +32,7 @@ pub trait ReplicationPort: Send + Sync {
         timeout: Duration,
     ) -> Result<(), HyperbytedbError>;
 
-    fn replicate_mutation(self: Arc<Self>, req: MutationRequest);
+    fn replicate_mutation(self: Arc<Self>, req: MutationRequest, target_node_ids: Option<Vec<u64>>);
 
     async fn replicate_mutation_sync(
         self: Arc<Self>,

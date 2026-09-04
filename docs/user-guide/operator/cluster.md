@@ -312,6 +312,42 @@ Tuning parameters for multi-replica cluster behavior. These only take effect whe
 
 In cluster mode, the Raft leader compares `/internal/sync/manifest` responses from peers and triggers sync when needed. See [Deep Dive: Clustering](../../deep-dive/deep-dive-clustering.md).
 
+### `sharding`
+
+Experimental series-id range sharding. Omitted fields are left out of `config.toml` so server defaults apply. Enable only on a **new** cluster (`replicas > 1`) before ingest. See [Series sharding](../advanced-features.md#series-sharding-experimental) and [Configuration — sharding](../configuration.md#sharding).
+
+```yaml
+spec:
+  replicas: 6
+  sharding:
+    enabled: true
+    replicationFactor: 2
+    regionSplitSeries: 5
+    regionMaxSeries: 10
+    regionMergeSeries: 2
+    splitMergeIntervalSecs: 30
+    heartbeatIntervalSecs: 10
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Master switch (`sharding.enabled`). Requires cluster mode |
+| `replicationFactor` | int32 | | Target replica count per region (min: 1) |
+| `regionSplitSeries` | int64 | | Target series per region before split |
+| `regionMaxSeries` | int64 | | Hard split threshold; must be greater than `regionSplitSeries` when both are set |
+| `regionMergeSeries` | int64 | | Merge adjacent regions below this; must be less than `regionSplitSeries` when both are set |
+| `splitMergeIntervalSecs` | int64 | | Cooldown between split/merge on a region |
+| `scheduleLimit` | int32 | | Max concurrent split/move/merge operators |
+| `heartbeatIntervalSecs` | int64 | | Region-stats report interval and scheduler tick |
+| `bootstrapTimeoutMs` | int64 | | Sync bootstrap RPC timeout |
+| `primaryFailoverAfterSecs` | int64 | | Seconds before the Raft leader proposes a primary transfer for an unhealthy primary |
+| `scatterPeerTimeoutMs` | int64 | | Per-peer HTTP timeout for sharded scatter |
+| `scatterMaxPeerAttempts` | int32 | | Max Active peers tried per region per scatter request |
+| `loadSplitQpsThreshold` | int64 | `0` | Load-based split QPS threshold; `0` disables |
+| `maxRegionsPerMeasurement` | int32 | | Hard cap on regions per measurement |
+
+When `enabled` is true, validation requires `regionMergeSeries < regionSplitSeries < regionMaxSeries` (same inequalities as the server).
+
 ### `monitoring`
 
 | Field | Type | Default | Description |

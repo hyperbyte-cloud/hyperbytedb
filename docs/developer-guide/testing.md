@@ -10,6 +10,9 @@ HyperbyteDB uses unit tests, integration tests, a compatibility suite, cluster t
 | Integration | `tests/integration.rs` | Auth, cardinality, users, metrics, backup manifests, chDB layout |
 | Compatibility | `tests/compat/` | InfluxDB v1 HTTP, DDL, query, and error behavior |
 | Raft integration | `tests/raft_integration.rs` | Multi-node cluster, membership, replication log |
+| Sharding integration | `tests/sharding_integration.rs` | Shard map, location cache, bootstrap (single-process) |
+| Sharding cluster | `tests/sharding_cluster_integration.rs` | HTTP scatter fallback, write forward, internal shard query |
+| Sharding failover | `tests/sharding_failover_integration.rs` | Primary failover via scheduler + Raft |
 | Sync quorum | `tests/sync_quorum_integration.rs` | `sync_quorum` replication mode and ack semantics |
 | E2E | `tests/e2e/` | Production bootstrap + background flush + HTTP; backup/restore round-trip |
 | Load scripts | `scripts/load.sh`, `load.js`, `query.js` | Ad-hoc load testing (used by kind setup) |
@@ -24,6 +27,9 @@ cargo test --lib
 # Individual integration crates
 cargo test --test integration
 cargo test --test raft_integration
+cargo test --test sharding_integration
+cargo test --test sharding_cluster_integration
+cargo test --test sharding_failover_integration
 cargo test --test sync_quorum_integration
 cargo test --test compat
 cargo test --test e2e
@@ -58,7 +64,9 @@ Integration and compat tests build an in-process Axum application:
 3. Send HTTP requests directly to the router (no TCP).
 4. Clean up on drop.
 
-Cluster tests spin up multiple in-process nodes to exercise replication, membership, and sync quorum behavior.
+Cluster tests spin up multiple in-process nodes to exercise replication, membership, and sync quorum behavior. Sharding cluster tests use a shared harness in `tests/common/sharding_cluster.rs` (shared membership, multi-node Axum servers, flush helpers). Sharding integration tests require `#[serial(chdb)]` because they share a process-wide chDB session.
+
+Unit tests for scatter routing and scheduler failover live in `src/application/shard_routing.rs` and `src/application/shard_scheduler.rs` under `#[cfg(test)]`.
 
 ## Writing tests
 

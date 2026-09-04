@@ -6,7 +6,7 @@ Subsystem walkthroughs with pointers to source files. When a deep dive disagrees
 |----------|--------|------------------|
 | [Write path](deep-dive-write-path.md) | HTTP → WAL → flush → chDB MergeTree | `adapters/http/write.rs`, `application/flush_service.rs`, `adapters/chdb/native_adapter.rs` |
 | [Read path](deep-dive-read-path.md) | TimeseriesQL → ClickHouse SQL → chDB | `timeseriesql/`, `application/query_service.rs`, `adapters/chdb/` |
-| [Clustering](deep-dive-clustering.md) | Replication, Raft, sync, hinted handoff | `domain/cluster/`, `application/cluster/`, `adapters/cluster/` |
+| [Clustering](deep-dive-clustering.md) | Replication, Raft, sync, hinted handoff, **series sharding** | `domain/cluster/`, `application/cluster/`, `application/shard_*.rs`, `adapters/cluster/` |
 | [Compaction](deep-dive-compaction.md) | MergeTree background merges | chDB / ClickHouse engine |
 | [Self-repair](deep-dive-self-repair.md) | Peer convergence via replication and sync | `adapters/cluster/sync_client.rs`, `replication_log.rs` |
 

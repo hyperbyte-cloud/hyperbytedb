@@ -191,7 +191,9 @@ impl IngestionPort for IngestionServiceImpl {
             }
             #[cfg(feature = "columnar-ingest")]
             WritePayloadFormat::ColumnarMsgpack => {
-                unreachable!("handled by fast path above")
+                return Err(HyperbytedbError::Internal(
+                    "columnar ingest fell through fast path".into(),
+                ));
             }
         };
         if points.is_empty() {

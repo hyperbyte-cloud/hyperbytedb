@@ -951,14 +951,23 @@ mod tests {
 
     #[test]
     fn test_parse_delete_with_tag_and_time() {
-        let err =
+        // G4.1: DELETE supports tag predicates combined with time bounds; the
+        // statement must parse and carry both sides of the AND.
+        let stmts =
             parse_query(r#"DELETE FROM "cpu" WHERE "host" = 'server01' AND time < now() - 7d"#)
-                .unwrap_err();
-        assert!(matches!(err, HyperbytedbError::QueryParse(_)));
-        assert!(
-            err.to_string()
-                .contains("only time predicates are supported")
-        );
+                .unwrap();
+        match &stmts[0] {
+            Statement::Delete(del) => {
+                assert_eq!(del.from, "cpu");
+                let Some(cond) = del.condition.as_ref() else {
+                    panic!("expected condition");
+                };
+                let rendered = format!("{cond:?}");
+                assert!(rendered.contains("host"), "{rendered}");
+                assert!(rendered.contains("server01"), "{rendered}");
+            }
+            _ => panic!("expected DELETE"),
+        }
     }
 
     #[test]

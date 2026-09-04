@@ -229,6 +229,7 @@ impl ClusterBootstrap {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_raft(
         &self,
         config: &ClusterConfig,
@@ -236,18 +237,29 @@ impl ClusterBootstrap {
         mv_service: Arc<crate::application::materialized_view_service::MaterializedViewService>,
         points_sink: Arc<dyn PointsSinkPort>,
         wal: Arc<dyn WalPort>,
+        shard_map: Option<(
+            Arc<crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap>,
+            Arc<crate::domain::sharding::ShardLocationCache>,
+        )>,
+        shard_routing: Option<Arc<crate::application::shard_routing::ShardRoutingContext>>,
     ) -> anyhow::Result<HyperbytedbRaft> {
         use crate::adapters::cluster::raft::log_store::RaftStore;
         use crate::adapters::cluster::raft::network::Network;
         use openraft::Config as RaftConfig;
         use openraft::storage::Adaptor;
 
-        let raft_store = RaftStore::open(&config.raft_dir, self.membership.clone())
+        let mut raft_store = RaftStore::open(&config.raft_dir, self.membership.clone())
             .map_err(|e| anyhow::anyhow!("failed to open raft store: {e}"))?
             .with_metadata(metadata)
             .with_mv_service(mv_service)
             .with_points_sink(points_sink)
             .with_wal(wal);
+        if let Some((map, cache)) = shard_map {
+            raft_store = raft_store.with_shard_map(map, cache);
+        }
+        if let Some(sr) = shard_routing {
+            raft_store = raft_store.with_shard_routing(sr);
+        }
         // Push the persisted Raft membership into the data-plane SharedMembership
         // BEFORE handing the store to openraft. Without this, a restarted leader's
         // log is fully applied so no Membership entries replay during catch-up

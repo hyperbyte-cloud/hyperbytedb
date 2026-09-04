@@ -131,3 +131,16 @@ max_requests_per_second = 0
 [retention]
 enabled = true
 interval = "12h"
+
+# Automatic series_id range sharding (experimental; requires cluster.enabled = true).
+[sharding]
+enabled = false
+replication_factor = 3
+region_split_series = 100000
+region_max_series = 150000
+region_merge_series = 20000
+split_merge_interval_secs = 3600
+schedule_limit = 4
+heartbeat_interval_secs = 10
+load_split_qps_threshold = 0
+bootstrap_timeout_ms = 5000

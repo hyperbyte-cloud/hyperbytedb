@@ -1,0 +1,39 @@
+# RBAC for the in-cluster sharding e2e runner Job.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sharding-e2e-runner
+  namespace: hyperbytedb
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sharding-e2e-runner
+  namespace: hyperbytedb
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list"]
+  - apiGroups: ["hyperbytedb.hyperbyte.cloud"]
+    resources: ["hyperbytedbclusters"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sharding-e2e-runner
+  namespace: hyperbytedb
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sharding-e2e-runner
+subjects:
+  - kind: ServiceAccount
+    name: sharding-e2e-runner
+    namespace: hyperbytedb

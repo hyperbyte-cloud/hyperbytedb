@@ -10,6 +10,7 @@ use crate::domain::cluster::sync::{
 use crate::error::HyperbytedbError;
 use crate::ports::metadata::MetadataPort;
 use crate::ports::points_sink::PointsSinkPort;
+use crate::ports::sharding::ShardMapPort;
 use crate::ports::wal::WalPort;
 
 pub struct SyncClient {
@@ -24,6 +25,7 @@ pub struct SyncClient {
     /// Static peer addresses from config, used as fallback when the
     /// membership has no active peers yet (Raft hasn't formed).
     fallback_peer_addrs: Vec<String>,
+    shard_map: Option<Arc<dyn ShardMapPort>>,
 }
 
 impl SyncClient {
@@ -73,7 +75,13 @@ impl SyncClient {
             max_points_per_request,
             client,
             fallback_peer_addrs,
+            shard_map: None,
         }
+    }
+
+    pub fn with_shard_map(mut self, map: Arc<dyn ShardMapPort>) -> Self {
+        self.shard_map = Some(map);
+        self
     }
 
     /// Reconnect after a disconnect: detect WAL gap and do WAL catch-up or
@@ -171,10 +179,25 @@ impl SyncClient {
 
         self.sync_metadata(&peer_addr).await?;
 
-        // Pull all WAL entries this node is missing, starting from our local
-        // sequence. Using the remote watermark would skip the entire history on
-        // a new node (cursor starts at remote+1).
-        let applied = self.wal_catchup(&peer_addr, local_wal_seq).await?;
+        let mut applied = 0u64;
+        if let Some(ref shard_map) = self.shard_map {
+            let map = shard_map.snapshot().await?;
+            for space in map.spaces.values() {
+                for region in &space.regions {
+                    if !region.peers.contains(&self.node_id) || region.primary == self.node_id {
+                        continue;
+                    }
+                    let primary_addr = {
+                        let m = self.membership.read().await;
+                        m.get_node(region.primary).map(|n| n.addr.clone())
+                    };
+                    if let Some(addr) = primary_addr {
+                        applied += self.wal_catchup(&addr, local_wal_seq).await?;
+                    }
+                }
+            }
+        }
+        applied += self.wal_catchup(&peer_addr, local_wal_seq).await?;
         let local_after = self.wal.last_sequence().await?;
         verify_catchup_progress(local_wal_seq, manifest.wal_last_seq, applied, local_after)?;
 

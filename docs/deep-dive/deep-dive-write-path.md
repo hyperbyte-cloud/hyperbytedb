@@ -227,6 +227,18 @@ WAL truncation on the origin node coordinates with peer acks (see [§5](#5-flush
 
 For the full replication and sync protocol, see [Deep Dive: Clustering](deep-dive-clustering.md).
 
+### Sharded writes (experimental)
+
+When `[sharding] enabled = true`, the ingestion path partitions points by `series_id`:
+
+1. Resolve the target region from the shard map / location cache.
+2. Apply points locally when this node is an Active region peer (WAL append + region-scoped replication to other Active peers in the region).
+3. Forward other regions via HTTP to `/internal/shard/write`, trying Active peers in primary-first order with scatter fallback.
+
+Region-scoped replication uses `target_node_ids` on outbound batches instead of fanning out to the entire cluster. Writes that arrive at a non-owner node are transparently forwarded — clients do not need to route by series.
+
+See [Deep Dive: Clustering — Series Sharding](deep-dive-clustering.md#15-series-sharding-experimental).
+
 ---
 
 ## 8. Metrics

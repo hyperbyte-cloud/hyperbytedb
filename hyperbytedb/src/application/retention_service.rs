@@ -7,11 +7,14 @@ use crate::domain::chdb_naming::{quoted_series_table_name, quoted_table_name};
 use crate::error::HyperbytedbError;
 use crate::ports::metadata::MetadataPort;
 use crate::ports::query::QueryPort;
+use crate::ports::sharding::ShardMapPort;
 
 pub struct RetentionService {
     metadata: Arc<dyn MetadataPort>,
     query: Arc<dyn QueryPort>,
     raft: Option<HyperbytedbRaft>,
+    sharding_enabled: bool,
+    shard_map: Option<Arc<dyn ShardMapPort>>,
     node_id: u64,
 }
 
@@ -26,8 +29,20 @@ impl RetentionService {
             metadata,
             query,
             raft,
+            sharding_enabled: false,
+            shard_map: None,
             node_id,
         }
+    }
+
+    pub fn with_sharding(
+        mut self,
+        enabled: bool,
+        shard_map: Option<Arc<dyn ShardMapPort>>,
+    ) -> Self {
+        self.sharding_enabled = enabled;
+        self.shard_map = shard_map;
+        self
     }
 
     fn is_raft_leader(&self) -> bool {
@@ -135,6 +150,29 @@ impl RetentionService {
                 };
 
                 for meas in &measurements {
+                    if self.sharding_enabled
+                        && let Some(ref sm) = self.shard_map
+                    {
+                        match sm.snapshot().await {
+                            Ok(map) => {
+                                if let Some(space) = map.space(&db.name, &rp.name, meas) {
+                                    let is_primary =
+                                        space.regions.iter().any(|r| r.primary == self.node_id);
+                                    if !is_primary {
+                                        continue;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "retention: shard map snapshot failed, skipping measurement"
+                                );
+                                continue;
+                            }
+                        }
+                    }
+
                     let fact_table = quoted_table_name(&db.name, &rp.name, meas);
                     let series_table = quoted_series_table_name(&db.name, &rp.name, meas);
                     for table in [fact_table, series_table] {

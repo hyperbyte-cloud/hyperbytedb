@@ -1,0 +1,73 @@
+# HyperbyteDB perf cluster for sharding tests — 4 nodes, 12 CPU / 30 GiB host budget.
+# Proxy disabled; hit pods directly via port-forward.
+apiVersion: hyperbytedb.hyperbyte.cloud/v1alpha1
+kind: HyperbytedbCluster
+metadata:
+  name: hyperbytedb
+  namespace: hyperbytedb
+spec:
+  replicas: 4
+  image: hyperbytedb:local
+  imagePullPolicy: Never
+  server:
+    port: 8086
+    maxBodySizeBytes: 26214400
+    requestTimeoutSecs: 30
+    queryTimeoutSecs: 30
+    maxConcurrentQueries: 16
+  storage:
+    volumeClaimTemplate:
+      size: 32Gi
+  chdb:
+    poolSize: 2
+  flush:
+    intervalSecs: 5
+    maxPointsPerBatch: 100000
+    walBatchSize: 128
+    walBatchDelayUs: 0
+  retention:
+    enabled: true
+    interval: 12h
+  cardinality:
+    maxTagValuesPerMeasurement: 200000
+    maxMeasurementsPerDatabase: 10000
+  cluster:
+    heartbeatIntervalSecs: 2
+    heartbeatMissThreshold: 5
+    replicationMaxRetries: 5
+    replicationQueueDepth: 8192
+    replicationMaxInflightBatches: 4
+    replicationMaxCoalesceBodyBytes: 8388608
+    replicateReceiverQueueDepth: 1024
+    replicationTruncateStalePeerMultiplier: 2
+    raftHeartbeatIntervalMs: 1000
+    raftElectionTimeoutMs: 5000
+    raftSnapshotThreshold: 1000
+    drainWaitSecs: 30
+    replication:
+      mode: async
+      ackTimeoutMs: 5000
+      syncQuorum:
+        minAcks: majority
+  statementSummary:
+    enabled: true
+    maxEntries: 1000
+  hintedHandoff:
+    enabled: true
+    maxHintsPerPeer: 100000
+    maxHintAgeSecs: 3600
+  rateLimit:
+    enabled: false
+    maxRequestsPerSecond: 0
+  logging:
+    level: info
+    format: json
+  resources:
+    requests:
+      cpu: 1500m
+      memory: 5Gi
+    limits:
+      cpu: "2"
+      memory: 6Gi
+  proxy:
+    enabled: false
