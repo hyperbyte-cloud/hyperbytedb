@@ -411,11 +411,14 @@ pub async fn handle_shard_query(
 
     match state.query_port.execute_sql(&sql).await {
         Ok(raw) => (StatusCode::OK, raw).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, sql = %sql, "shard query execute_sql failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
     }
 }
 

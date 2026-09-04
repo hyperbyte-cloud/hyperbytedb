@@ -2308,13 +2308,14 @@ async fn try_query_sharded_region(
                     .send()
                     .await
                     .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
-                if resp.status() == reqwest::StatusCode::CONFLICT {
+                let status = resp.status();
+                if status == reqwest::StatusCode::CONFLICT {
                     return Err(HyperbytedbError::StaleShardEpoch { region_id });
                 }
-                if !resp.status().is_success() {
+                if !status.is_success() {
+                    let body = resp.text().await.unwrap_or_default();
                     return Err(HyperbytedbError::PeerUnreachable(format!(
-                        "shard query to peer {peer_id} failed: {}",
-                        resp.status()
+                        "shard query to peer {peer_id} failed: {status} {body}"
                     )));
                 }
                 resp.text()
@@ -2437,6 +2438,28 @@ fn first_statement_series(resp: QueryResponse) -> Vec<SeriesResult> {
         .unwrap_or_default()
 }
 
+fn inferred_mapping_from_select(stmt: &SelectStatement) -> ColumnMapping {
+    let mut tags = Vec::new();
+    let mut fields = Vec::new();
+    if let Some(gb) = &stmt.group_by {
+        for tag in gb.tag_dimensions() {
+            tags.push(tag.to_string());
+        }
+    }
+    if let Some(cond) = &stmt.condition {
+        crate::application::predicate_sql::collect_expr_identifiers(cond, &mut tags);
+    }
+    for field in &stmt.fields {
+        crate::application::predicate_sql::collect_expr_identifiers(&field.expr, &mut fields);
+    }
+    fields.retain(|name| name != "*" && !tags.iter().any(|t| t == name));
+    tags.retain(|name| !fields.iter().any(|f| f == name));
+    if fields.is_empty() {
+        fields.push("value".to_string());
+    }
+    ColumnMapping::from_identifiers(tags, fields)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_sharded_measurement_query(
     svc: &QueryServiceImpl,
@@ -2472,7 +2495,10 @@ async fn execute_sharded_measurement_query(
     let measurement_meta = svc.metadata.get_measurement(db, rp, measurement).await?;
     let is_materialized_dest = measurement_meta.as_ref().is_some_and(|m| m.materialized);
 
-    let column_mapping = svc.column_mapping_for(db, rp, measurement).await?;
+    let column_mapping = match svc.column_mapping_for(db, rp, measurement).await? {
+        Some(mapping) => Some(mapping),
+        None => Some(inferred_mapping_from_select(stmt)),
+    };
     let tag_keys = tag_keys_from_mapping(column_mapping.as_ref());
     let (effective_stmt, resolved_group_by_tags) = select_with_expanded_group_by(stmt, &tag_keys);
     let tombstones = svc.metadata.list_tombstones(db, rp, measurement).await?;
@@ -2480,12 +2506,20 @@ async fn execute_sharded_measurement_query(
     let series_table = quoted_series_table_name(db, rp, measurement);
     let table_cols = svc.table_columns(db, rp, measurement).await?;
     let effective_mapping = reconcile_column_mapping_with(column_mapping, &table_cols.fact);
-    let series_tag_columns: Vec<String> = table_cols.series.iter().cloned().collect();
+    let missing_local_schema = table_cols.fact.is_empty() && table_cols.series.is_empty();
+    let series_tag_columns: Vec<String> = if table_cols.series.is_empty() {
+        effective_mapping
+            .as_ref()
+            .map(|m| m.tag_keys.iter().cloned().collect())
+            .unwrap_or_default()
+    } else {
+        table_cols.series.iter().cloned().collect()
+    };
     let series_join = effective_mapping
         .as_ref()
         .map(|_| to_clickhouse::SeriesJoin {
             table: &series_table,
-            force: !tombstones.is_empty(),
+            force: !tombstones.is_empty() || missing_local_schema,
             tag_columns: &series_tag_columns,
         });
 
@@ -2615,6 +2649,9 @@ fn reconcile_column_mapping_with(
     fact_cols: &[String],
 ) -> Option<ColumnMapping> {
     let mapping = column_mapping?;
+    if fact_cols.is_empty() {
+        return Some(mapping);
+    }
     if mapping.field_names.iter().any(|f| !fact_cols.contains(f)) {
         let mut reconciled = mapping;
         reconciled.field_names = fact_cols.iter().cloned().collect();

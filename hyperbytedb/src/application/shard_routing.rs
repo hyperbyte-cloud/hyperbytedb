@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use metrics::{counter, histogram};
 
@@ -238,6 +238,11 @@ pub async fn build_bootstrap_op(
     let primary = peers[0];
     let map = ctx.shard_map.snapshot().await?;
     let region_id = map.next_region_id;
+    let last_split_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(1)
+        .max(1);
     let region = ShardRegion {
         region_id,
         start: 0,
@@ -245,7 +250,7 @@ pub async fn build_bootstrap_op(
         epoch: ShardEpoch::default(),
         peers: peers.clone(),
         primary,
-        last_split_at: 0,
+        last_split_at,
         transfer_verified: None,
         transfer_first_seen: None,
     };
@@ -938,6 +943,16 @@ mod scatter_tests {
         };
         assert_eq!(region_b_id, 2);
         assert_ne!(region_a_id, region_b_id);
+
+        match op_b {
+            ShardMapOp::BootstrapMeasurement { region, .. } => {
+                assert!(
+                    region.last_split_at > 0,
+                    "bootstrap must stamp last_split_at so cooldown is not vacuously elapsed"
+                );
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[tokio::test]

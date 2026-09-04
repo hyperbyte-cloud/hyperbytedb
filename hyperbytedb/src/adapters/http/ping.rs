@@ -59,6 +59,40 @@ fn json_response(code: StatusCode, body: String) -> Response {
     (code, [("Content-Type", "application/json")], body).into_response()
 }
 
+/// Raft Leader/Follower means this node is in the voting set and serving
+/// consensus. A leftover `Syncing`/`Joining` membership label (set while we
+/// were still a learner) must not keep `/health` on 503 — that deadlocks
+/// StatefulSet OrderedReady and, via self-echoed `/health` bodies, the
+/// peer heartbeat that would otherwise promote us.
+fn raft_is_serving(state: &AppState) -> bool {
+    let Some(raft) = state.raft.as_ref() else {
+        return false;
+    };
+    let metrics = raft.metrics();
+    matches!(
+        metrics.borrow().state,
+        openraft::ServerState::Leader | openraft::ServerState::Follower
+    )
+}
+
+/// If Raft already treats us as a voter, report Active even when the local
+/// membership record is still Syncing/Joining.
+fn maybe_promote_caught_up_voter(readiness: SelfReadiness, raft_serving: bool) -> SelfReadiness {
+    if raft_serving
+        && matches!(
+            readiness.state,
+            Some(NodeState::Syncing | NodeState::Joining)
+        )
+    {
+        SelfReadiness {
+            state: Some(NodeState::Active),
+            needs_sync: readiness.needs_sync,
+        }
+    } else {
+        readiness
+    }
+}
+
 /// GET /health - readiness check.
 /// Returns 200 when the node is Active (or standalone).
 /// Returns 503 when the node is Syncing, Joining, Draining, or Leaving
@@ -67,7 +101,18 @@ fn json_response(code: StatusCode, body: String) -> Response {
 /// Every response body carries the machine-readable `{state, needs_sync}`
 /// self-readiness fields used by cluster peers for membership convergence.
 pub async fn health(State(state): State<Arc<AppState>>) -> Response {
-    let readiness = self_readiness(&state).await;
+    let readiness =
+        maybe_promote_caught_up_voter(self_readiness(&state).await, raft_is_serving(&state));
+    if readiness.state == Some(NodeState::Active)
+        && let Some(ref membership) = state.membership
+    {
+        let mut m = membership.write().await;
+        if m.get_node(state.node_id)
+            .is_some_and(|n| matches!(n.state, NodeState::Syncing | NodeState::Joining))
+        {
+            m.set_state(state.node_id, NodeState::Active);
+        }
+    }
 
     if let Some(node_state) = readiness.state
         && node_state != NodeState::Active
@@ -205,5 +250,36 @@ mod tests {
         assert_eq!(v["status"], "fail");
         assert_eq!(v["state"], "active");
         assert_eq!(v["needs_sync"], false);
+    }
+
+    #[test]
+    fn caught_up_voter_promotes_syncing_readiness() {
+        let before = SelfReadiness {
+            state: Some(NodeState::Syncing),
+            needs_sync: Some(false),
+        };
+        let after = maybe_promote_caught_up_voter(before, true);
+        assert_eq!(after.state, Some(NodeState::Active));
+        assert_eq!(after.needs_sync, Some(false));
+    }
+
+    #[test]
+    fn learner_stays_syncing_until_raft_is_serving() {
+        let before = SelfReadiness {
+            state: Some(NodeState::Syncing),
+            needs_sync: Some(false),
+        };
+        let after = maybe_promote_caught_up_voter(before, false);
+        assert_eq!(after.state, Some(NodeState::Syncing));
+    }
+
+    #[test]
+    fn draining_is_not_overridden_by_raft_serving() {
+        let before = SelfReadiness {
+            state: Some(NodeState::Draining),
+            needs_sync: Some(false),
+        };
+        let after = maybe_promote_caught_up_voter(before, true);
+        assert_eq!(after.state, Some(NodeState::Draining));
     }
 }

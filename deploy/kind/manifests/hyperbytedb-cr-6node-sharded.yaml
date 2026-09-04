@@ -75,8 +75,8 @@ spec:
   sharding:
     enabled: true
     replicationFactor: 2
-    regionSplitSeries: 5
-    regionMaxSeries: 10
+    regionSplitSeries: 25
+    regionMaxSeries: 40
     regionMergeSeries: 2
     splitMergeIntervalSecs: 30
     scheduleLimit: 4

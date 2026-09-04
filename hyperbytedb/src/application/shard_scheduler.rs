@@ -30,6 +30,26 @@ type RegionHeartbeatRow = (u64, u64, u64, u64, u64, u64);
 /// drive splits/rebalances forever.
 const HEARTBEAT_TTL_INTERVALS: u64 = 3;
 
+/// Split only after the region's cooldown has elapsed. `last_split_at == 0`
+/// means "never split" (bootstrap must stamp wall-clock time); treating 0 as
+/// "long ago" let a single hot region binary-split every tick (1→2→4→8).
+fn region_ready_to_split(
+    series_count: u64,
+    last_split_at: u64,
+    now: u64,
+    split_series: u64,
+    max_series: u64,
+    cooldown_secs: u64,
+) -> bool {
+    if last_split_at == 0 {
+        return false;
+    }
+    if now.saturating_sub(last_split_at) < cooldown_secs {
+        return false;
+    }
+    series_count > max_series || series_count > split_series
+}
+
 fn max_region_peer_heartbeat_stats(hb: &[RegionHeartbeatRow], region: &ShardRegion) -> (u64, u64) {
     hb.iter()
         .filter(|(region_id, node_id, _, _, _, _)| {
@@ -293,10 +313,14 @@ impl ShardScheduler {
                     continue;
                 }
 
-                let should_split = series_count > self.config.region_max_series
-                    || (series_count > self.config.region_split_series
-                        && now.saturating_sub(region.last_split_at)
-                            >= self.config.split_merge_interval_secs);
+                let should_split = region_ready_to_split(
+                    series_count,
+                    region.last_split_at,
+                    now,
+                    self.config.region_split_series,
+                    self.config.region_max_series,
+                    self.config.split_merge_interval_secs,
+                );
 
                 if should_split {
                     let key = space.key.clone();
@@ -1763,6 +1787,23 @@ mod tests {
         assert_eq!(max_region_peer_heartbeat_stats(&hb, &region), (130, 42));
     }
 
+    #[test]
+    fn unsplit_region_does_not_split_while_last_split_at_is_zero() {
+        assert!(!region_ready_to_split(1_000, 0, 1_000_000, 5, 10, 30));
+    }
+
+    #[test]
+    fn split_requires_cooldown_even_above_max_series() {
+        assert!(!region_ready_to_split(1_000, 100, 120, 5, 10, 30));
+        assert!(region_ready_to_split(1_000, 100, 130, 5, 10, 30));
+    }
+
+    #[test]
+    fn split_fires_after_cooldown_when_above_target() {
+        assert!(region_ready_to_split(6, 100, 130, 5, 10, 30));
+        assert!(!region_ready_to_split(5, 100, 130, 5, 10, 30));
+    }
+
     #[tokio::test]
     async fn pick_alternate_primary_requires_active_peer() {
         let mut m = ClusterMembership::new();
@@ -2073,7 +2114,7 @@ mod tests {
             epoch: ShardEpoch::default(),
             peers: vec![1],
             primary: 1,
-            last_split_at: 0,
+            last_split_at: 1,
             transfer_verified: None,
             transfer_first_seen: None,
         };

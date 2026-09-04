@@ -601,6 +601,22 @@ delete_hdb_pvcs() {
     fi
     log "Deleting $pvcs HyperbyteDB PVC(s) (StatefulSet PVCs survive CR delete)"
     kubectl delete pvc -n "$NAMESPACE" -l app.kubernetes.io/name=hyperbytedb --wait=true
+    wipe_hdb_host_data
+}
+
+# kind extraMounts bind /tmp/hyperbytedb-data/worker-N → node /data/hyperbytedb.
+# local-path may recreate a PVC with the same name and reuse leftover raft/meta
+# files, so hdb-reset must wipe the hostPath contents — not just the PVC objects.
+wipe_hdb_host_data() {
+    local d
+    if [[ ! -d /tmp/hyperbytedb-data ]]; then
+        return 0
+    fi
+    log "Wiping kind hostPath data under /tmp/hyperbytedb-data"
+    for d in /tmp/hyperbytedb-data/worker-*; do
+        [[ -d "$d" ]] || continue
+        find "$d" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+    done
 }
 
 ensure_operator_stack() {
@@ -825,6 +841,7 @@ cmd_hdb_down() {
 
     wait_for_hdb_teardown 300 || true
     delete_hdb_pvcs
+    wipe_hdb_host_data
     log "HyperbyteDB cluster removed (operator still running)."
 }
 

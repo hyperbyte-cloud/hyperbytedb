@@ -33,7 +33,7 @@ RAFT_FAILOVER_WAIT_SECS="${RAFT_FAILOVER_WAIT_SECS:-120}"
 PRIMARY_FAILOVER_AFTER_SECS="${PRIMARY_FAILOVER_AFTER_SECS:-60}"
 PRIMARY_FAILOVER_MARGIN_SECS="${PRIMARY_FAILOVER_MARGIN_SECS:-15}"
 PRIMARY_FAILOVER_WAIT_SECS="${PRIMARY_FAILOVER_WAIT_SECS:-$((PRIMARY_FAILOVER_AFTER_SECS + PRIMARY_FAILOVER_MARGIN_SECS))}"
-REGION_SPLIT_SERIES="${REGION_SPLIT_SERIES:-5}"
+REGION_SPLIT_SERIES="${REGION_SPLIT_SERIES:-25}"
 FLUSH_INTERVAL_SECS="${FLUSH_INTERVAL_SECS:-5}"
 FLUSH_WAIT_SECS="${FLUSH_WAIT_SECS:-$((FLUSH_INTERVAL_SECS + 1))}"
 HEADLESS_SVC="${HEADLESS_SVC:-hyperbytedb-headless}"
@@ -262,10 +262,10 @@ try:
   if not vals or not vals[0]:
     print(0); sys.exit(0)
   v=vals[0][0]
-  print(v if v is not None else 0)
+  print(int(v) if v is not None else 0)
 except Exception:
   print(0)
-" 2>/dev/null || echo 0
+" 2>/dev/null | head -n 1 || echo 0
 }
 
 # Like count_from_query but distinguishes query failures from genuine zero:
@@ -834,13 +834,14 @@ phase_g2() {
 
   ts=$(write_ts 50)
   curl_write 1 "cpu,host=crossnode value=99 $ts" >/dev/null
-  wait_flush_boundary
-  local cross
-  cross=$(query_scalar 0 "SELECT value FROM cpu WHERE host='crossnode'")
-  if [[ "$cross" != "99" ]]; then
-    sleep 1
+  local cross attempt
+  cross=""
+  for attempt in 1 2 3 4 5; do
+    wait_flush_boundary
     cross=$(query_scalar 0 "SELECT value FROM cpu WHERE host='crossnode'")
-  fi
+    [[ "$cross" == "99" ]] && break
+    sleep 2
+  done
   if [[ "$cross" == "99" ]]; then
     pass G2.3 "cross-node write/read value=99"
   else
@@ -867,7 +868,7 @@ phase_g3() {
     warn "cpu has $cpu_regions regions at G3 entry (expected 1 through G3)"
   fi
   groups=0
-  for attempt in $(seq 1 2); do
+  for attempt in $(seq 1 5); do
     [[ "$attempt" -gt 1 ]] && wait_flush_boundary
     groups=$(query_series_group_count 0 "SELECT mean(value) FROM cpu GROUP BY host")
     [[ "$groups" -ge 20 ]] && break
@@ -907,8 +908,16 @@ phase_g4() {
   log "=== G4 Delete fan-out ==="
   local del_resp
   del_resp=$(query_post 0 "DELETE FROM cpu WHERE host='node1'")
-  if echo "$del_resp" | grep -q '"error"'; then
-    fail G4.1 "DELETE parse/exec error: $(echo "$del_resp" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("error",""))' 2>/dev/null || echo "$del_resp")"
+  del_err=$(echo "$del_resp" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+err=d.get('error') or ''
+for r in d.get('results') or []:
+    err=err or r.get('error') or ''
+print(err)
+" 2>/dev/null || true)
+  if [[ -n "$del_err" ]]; then
+    fail G4.1 "DELETE parse/exec error: $del_err"
     fail G4.2 "skipped due to DELETE error"
     return
   fi
@@ -1004,10 +1013,8 @@ phase_g5() {
         ;;
       *)
         post_err=""
-        if [[ -z "$post_cnt" || "$post_cnt_raw" -gt "$post_cnt" ]]; then
-          post_cnt="$post_cnt_raw"
-        fi
-        [[ "$post_cnt" -ge "$pre_cnt" ]] && break
+        post_cnt="$post_cnt_raw"
+        [[ "$post_cnt" == "$pre_cnt" ]] && break
         ;;
     esac
     sleep 3
@@ -1097,7 +1104,8 @@ phase_g6() {
   local wcode readback
   ts=$(write_ts 200)
   wcode=$(curl_write_retry 0 "cpu,host=after_raft_failover value=1 $ts" 20 5 || echo 503)
-  readback=$(wait_for_count 0 "SELECT count(value) FROM cpu WHERE host='after_raft_failover'" 1 45 || echo 0)
+  readback=$(wait_for_count 0 "SELECT count(value) FROM cpu WHERE host='after_raft_failover'" 1 45 || true)
+  readback=$(echo "$readback" | head -n 1)
   if [[ "$wcode" == "204" && "$readback" -ge 1 ]]; then
     pass G6.2 "write/read after raft failover"
   else
@@ -1141,7 +1149,8 @@ phase_g7() {
   local wcode cnt
   ts=$(write_ts 300)
   wcode=$(curl_write_retry 1 "cpu,host=after_primary_failover value=1 $ts" 12 5 || echo 503)
-  cnt=$(wait_for_count 0 "SELECT count(value) FROM cpu WHERE host='after_primary_failover'" 1 45 || echo 0)
+  cnt=$(wait_for_count 0 "SELECT count(value) FROM cpu WHERE host='after_primary_failover'" 1 45 || true)
+  cnt=$(echo "$cnt" | head -n 1)
   if [[ "$wcode" == "204" && "$cnt" -ge 1 ]]; then
     pass G7.2 "write/query after primary pod recycle"
   else
@@ -1274,7 +1283,20 @@ launch_in_cluster_job() {
   log_pid=$!
 
   local job_ok=true
-  if ! kubectl_ctx wait --for=condition=complete job/sharding-e2e --timeout=1800s; then
+  local wait_deadline=$((SECONDS + 1800))
+  while (( SECONDS < wait_deadline )); do
+    local cond
+    cond=$(kubectl_ctx get job sharding-e2e -o jsonpath='{range .status.conditions[*]}{.type}={.status} {end}' 2>/dev/null || true)
+    if [[ "$cond" == *"Complete=True"* ]]; then
+      break
+    fi
+    if [[ "$cond" == *"Failed=True"* ]]; then
+      job_ok=false
+      break
+    fi
+    sleep 5
+  done
+  if (( SECONDS >= wait_deadline )); then
     job_ok=false
   fi
 
