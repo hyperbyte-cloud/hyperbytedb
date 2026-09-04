@@ -397,12 +397,12 @@ flowchart TD
 ### Task 11: Documentation
 
 **Files:**
-- Modify: [`docs/deep-dive/deep-dive-clustering.md`](docs/deep-dive/deep-dive-clustering.md) — remove MV limitation bullet
-- Modify: [`docs/user-guide/advanced-features.md`](docs/user-guide/advanced-features.md) — add "Materialized Views with Sharding" section
+- Modify: [`docs/deep-dive/deep-dive-clustering.md`](../../deep-dive/deep-dive-clustering.md) — remove MV limitation bullet
+- Modify: [`docs/user-guide/advanced-features.md`](../../user-guide/advanced-features.md) — add "Materialized Views with Sharding" section
 
 - [x] **Step 1:** Document semantics: partial per region, all-region dest reads, backfill scatter, transfer limitation until Task 10
 - [x] **Step 2:** Add example CREATE MV on sharded cluster
-- [x] **Step 3:** Update [`docs/glossary.md`](docs/glossary.md) if MV entry mentions sharding incompatibility
+- [x] **Step 3:** Update [`docs/glossary.md`](../../glossary.md) if MV entry mentions sharding incompatibility
 
 **Deliverable:** User-facing docs match implementation.
 
