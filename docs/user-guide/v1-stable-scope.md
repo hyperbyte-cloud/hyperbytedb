@@ -51,7 +51,7 @@ without a major version bump:
 - Custom TLS certificate authority integration beyond cert-manager or operator-generated certs
 - Metrics label schema (new labels may be added)
 - **Automatic series sharding** (`[sharding] enabled = true`) — cluster-only experimental feature; split/merge/rebalance semantics may change
-- **Materialized views with sharding enabled** — `CREATE MATERIALIZED VIEW` is rejected when `[sharding] enabled = true`
+- **Materialized views with sharding enabled** — supported with scatter-merge query and per-region backfill; semantics may still change. See [Materialized views with series sharding](advanced-features.md#materialized-views-with-series-sharding)
 
 ## Breaking vs Non-Breaking Changes
 
