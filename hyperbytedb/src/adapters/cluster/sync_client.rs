@@ -7,6 +7,7 @@ use crate::domain::cluster::membership::{NodeState, SharedMembership};
 use crate::domain::cluster::sync::{
     JoinRequest, JoinResponse, MetadataSnapshot, SyncManifest, WalSyncResponse,
 };
+use crate::domain::sharding::{ShardMap, ShardMapJson};
 use crate::error::HyperbytedbError;
 use crate::ports::metadata::MetadataPort;
 use crate::ports::points_sink::PointsSinkPort;
@@ -133,6 +134,7 @@ impl SyncClient {
             );
 
             self.sync_metadata(&peer_addr).await?;
+            self.sync_shard_map(&peer_addr).await?;
 
             let updated_wal_seq = self.wal.last_sequence().await?;
             let applied = self.wal_catchup(&peer_addr, updated_wal_seq).await?;
@@ -178,6 +180,9 @@ impl SyncClient {
         );
 
         self.sync_metadata(&peer_addr).await?;
+        // Install the committed map before any region data movement so the
+        // joiner's map_version matches the cluster at Active.
+        self.sync_shard_map(&peer_addr).await?;
 
         let mut applied = 0u64;
         if let Some(ref shard_map) = self.shard_map {
@@ -325,6 +330,23 @@ impl SyncClient {
         }
 
         tracing::debug!("metadata sync complete");
+        Ok(())
+    }
+
+    /// Copy the peer's committed shard map so `map_version` matches before
+    /// region rows are transferred onto this joiner.
+    pub async fn sync_shard_map(&self, peer_addr: &str) -> Result<(), HyperbytedbError> {
+        let Some(shard_map) = self.shard_map.as_ref() else {
+            return Ok(());
+        };
+        let remote = fetch_shard_map(self.client.clone(), peer_addr).await?;
+        let version = remote.map_version;
+        shard_map.replace_map(remote).await?;
+        tracing::info!(
+            peer = %peer_addr,
+            map_version = version,
+            "installed peer shard map before region movement"
+        );
         Ok(())
     }
 
@@ -485,6 +507,29 @@ impl SyncClient {
         .await?;
         Ok(())
     }
+}
+
+/// GET `/internal/shard/map` from `peer_addr` and return the committed snapshot.
+pub async fn fetch_shard_map(
+    client: reqwest::Client,
+    peer_addr: &str,
+) -> Result<ShardMap, HyperbytedbError> {
+    let url = format!("http://{peer_addr}/internal/shard/map");
+    let resp =
+        client.get(&url).send().await.map_err(|e| {
+            HyperbytedbError::PeerUnreachable(format!("shard map request failed: {e}"))
+        })?;
+    if !resp.status().is_success() {
+        return Err(HyperbytedbError::SyncFailed(format!(
+            "shard map request failed: {}",
+            resp.status()
+        )));
+    }
+    let json: ShardMapJson = resp
+        .json()
+        .await
+        .map_err(|e| HyperbytedbError::SyncFailed(format!("parse shard map: {e}")))?;
+    Ok(ShardMap::from(json))
 }
 
 /// Fail closed when the peer advertises a higher WAL watermark but returns no

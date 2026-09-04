@@ -1169,6 +1169,24 @@ fn failover_watermark_safe(candidate_watermark: u64, max_peer_watermark: u64) ->
     candidate_watermark > 0 || max_peer_watermark == 0
 }
 
+/// Region data movement onto a joiner starts only after its committed
+/// `map_version` matches the cluster's. Staging rows against a lagging map
+/// would apply under the wrong epoch / peer set.
+#[must_use]
+pub fn joiner_map_caught_up(cluster_map_version: u64, joiner_map_version: u64) -> bool {
+    joiner_map_version == cluster_map_version
+}
+
+/// Read a peer's committed `map_version` via `/internal/shard/map`.
+pub async fn fetch_peer_map_version(
+    client: &reqwest::Client,
+    peer_addr: &str,
+) -> Result<u64, HyperbytedbError> {
+    let map =
+        crate::adapters::cluster::sync_client::fetch_shard_map(client.clone(), peer_addr).await?;
+    Ok(map.map_version)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn push_and_drop_range(
     peer_client: &Arc<PeerClient>,
@@ -1886,6 +1904,14 @@ mod tests {
         assert!(!failover_watermark_safe(0, 42));
         // Nobody has data yet (fresh region): allow.
         assert!(failover_watermark_safe(0, 0));
+    }
+
+    #[test]
+    fn joiner_map_catchup_blocks_movement_until_versions_match() {
+        assert!(joiner_map_caught_up(3, 3));
+        assert!(!joiner_map_caught_up(3, 0));
+        assert!(!joiner_map_caught_up(3, 2));
+        assert!(!joiner_map_caught_up(3, 4));
     }
 
     #[tokio::test]

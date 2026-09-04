@@ -47,6 +47,8 @@ pub struct ShardedTestNode {
     pub location_cache: Arc<ShardLocationCache>,
     pub membership: SharedMembership,
     pub query_port: Arc<ChdbQueryAdapter>,
+    /// Shared with other in-process peers — libchdb allows one session per process.
+    pub chdb: SharedSession,
     flush: Arc<FlushServiceImpl>,
     handle: tokio::task::JoinHandle<()>,
     shutdown: Option<watch::Sender<bool>>,
@@ -123,7 +125,7 @@ pub async fn start_sharded_node(
     let wal = Arc::new(RocksDbWal::open(&wal_dir).unwrap());
     let metadata = Arc::new(RocksDbMetadata::open(&meta_dir).unwrap());
     let chdb_adapter = Arc::new(ChdbQueryAdapter::from_shared(chdb.clone(), 0));
-    let sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(chdb));
+    let sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(chdb.clone()));
     let flush: Arc<FlushServiceImpl> =
         Arc::new(FlushServiceImpl::new(wal.clone(), 0, sink.clone()));
 
@@ -284,10 +286,37 @@ pub async fn start_sharded_node(
         location_cache,
         membership: shared_membership,
         query_port: chdb_adapter,
+        chdb,
         flush,
         handle,
         shutdown: Some(shutdown_tx),
     }
+}
+
+pub async fn fetch_shard_map(
+    client: &reqwest::Client,
+    url: &str,
+) -> hyperbytedb::domain::sharding::ShardMap {
+    let resp = client
+        .get(format!("{url}/internal/shard/map"))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "shard map fetch failed: {}",
+        resp.status()
+    );
+    let json: hyperbytedb::domain::sharding::ShardMapJson = resp.json().await.unwrap();
+    json.into()
+}
+
+pub async fn install_shard_map_from_peer(from: &ShardedTestNode, onto: &ShardedTestNode) {
+    let client = reqwest::Client::new();
+    let map = fetch_shard_map(&client, &from.url).await;
+    onto.shard_map.replace_map(map).await.unwrap();
+    let snap = onto.shard_map.snapshot().await.unwrap();
+    onto.location_cache.refresh_from_map(&snap);
 }
 
 pub async fn start_sharded_single_node(dir: &Path, opts: ShardedClusterOptions) -> ShardedTestNode {

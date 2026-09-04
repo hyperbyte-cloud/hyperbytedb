@@ -797,6 +797,105 @@ async fn one_member_cluster_owns_region_after_first_write() {
     assert_eq!(region.primary, 1, "n=1 primary must be self");
 }
 
+/// P1.2: after a joiner is Active, its map_version equals the cluster's
+/// before any region data movement (peer-set change) starts.
+#[tokio::test]
+#[serial(chdb)]
+async fn joiner_map_version_matches_before_region_movement() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = ShardedClusterOptions {
+        sharding: hyperbytedb::config::ShardingConfig {
+            enabled: true,
+            replication_factor: 3,
+            scatter_peer_timeout_ms: 500,
+            scatter_max_peer_attempts: 3,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let node1 = start_sharded_single_node(dir.path(), opts).await;
+    let client = reqwest::Client::new();
+    create_db(&client, &node1.url, "p1db").await;
+    let resp = write_line(
+        &client,
+        &node1.url,
+        "p1db",
+        "cpu,host=solo value=1 1000000000",
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let cluster_before = node1.shard_map.snapshot().await.unwrap();
+    assert!(
+        cluster_before.map_version >= 1,
+        "first write must bump map_version"
+    );
+    let region = cluster_before
+        .space("p1db", "autogen", "cpu")
+        .and_then(|s| s.regions.first())
+        .expect("region after write");
+    assert_eq!(region.peers, vec![1]);
+
+    let l2 = bind_ephemeral().await;
+    let a2 = l2.local_addr().unwrap().to_string();
+    {
+        let mut m = node1.membership.write().await;
+        m.add_node(hyperbytedb::domain::cluster::membership::NodeInfo {
+            node_id: 2,
+            addr: a2,
+            state: hyperbytedb::domain::cluster::membership::NodeState::Active,
+            joined_at: 0,
+            last_heartbeat: 0,
+            needs_sync: false,
+        });
+    }
+    // libchdb is process-global; share node 1's session (pair-cluster harness).
+    let node2 = start_sharded_node(
+        dir.path(),
+        2,
+        l2,
+        node1.membership.clone(),
+        &ShardedClusterOptions {
+            sharding: hyperbytedb::config::ShardingConfig {
+                enabled: true,
+                replication_factor: 3,
+                scatter_peer_timeout_ms: 500,
+                scatter_max_peer_attempts: 3,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        node1.chdb.clone(),
+    )
+    .await;
+
+    let empty = node2.shard_map.snapshot().await.unwrap();
+    assert_eq!(empty.map_version, 0, "joiner starts with an empty map");
+
+    install_shard_map_from_peer(&node1, &node2).await;
+
+    let after = node2.shard_map.snapshot().await.unwrap();
+    assert_eq!(
+        after.map_version, cluster_before.map_version,
+        "joiner map_version must equal the cluster's before movement"
+    );
+    let joined_region = after
+        .space("p1db", "autogen", "cpu")
+        .and_then(|s| s.regions.first())
+        .expect("installed region");
+    assert_eq!(
+        joined_region.peers,
+        vec![1],
+        "catch-up must not add the joiner as a peer"
+    );
+    assert!(
+        hyperbytedb::application::shard_scheduler::joiner_map_caught_up(
+            cluster_before.map_version,
+            after.map_version
+        )
+    );
+}
+
 async fn wait_for_database(client: &reqwest::Client, url: &str, db: &str) {
     for _ in 0..100 {
         let resp = query_sql(client, url, db, "SHOW DATABASES").await;

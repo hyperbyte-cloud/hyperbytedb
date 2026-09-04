@@ -111,6 +111,9 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
                 &wal_port,
                 Some(sink_port),
                 config.server.max_points_per_request,
+                rocks_shard_map
+                    .as_ref()
+                    .map(|m| m.clone() as Arc<dyn crate::ports::sharding::ShardMapPort>),
             )
             .await?;
             Some(
