@@ -1065,7 +1065,13 @@ impl ShardScheduler {
             return Ok(());
         };
 
+        // Re-read the region: an `AddPeer` earlier in this same tick leaves the
+        // caller's snapshot stale, and acting on it would stage a full copy
+        // only for the proposal to bounce off the epoch CAS.
         let map = self.shard_map.snapshot().await?;
+        let Some(region) = current_region(&map, key, region.region_id) else {
+            return Ok(());
+        };
         let memberships = region_memberships(&map);
         let Some(displaced) = idle_member_replica_swap(region, newcomer, &memberships) else {
             return Ok(());
@@ -1152,7 +1158,13 @@ impl ShardScheduler {
             return Ok(());
         };
 
+        // Re-read the region: a peer placement earlier in this same tick leaves
+        // the caller's snapshot stale, and a stale epoch would fail the
+        // `TransferPrimary` proposal only after a full region copy had run.
         let map = self.shard_map.snapshot().await?;
+        let Some(region) = current_region(&map, key, region.region_id) else {
+            return Ok(());
+        };
         let counts = primary_counts(&map);
         let active: Vec<u64> = {
             let m = self.membership.read().await;
@@ -1484,6 +1496,21 @@ pub fn primary_counts(map: &ShardMap) -> HashMap<u64, usize> {
         }
     }
     counts
+}
+
+/// The committed state of `region_id` in `map`, or `None` if it is gone (split,
+/// merged, or its measurement dropped since the caller's snapshot).
+#[must_use]
+pub fn current_region<'a>(
+    map: &'a ShardMap,
+    key: &MeasurementKey,
+    region_id: u64,
+) -> Option<&'a ShardRegion> {
+    map.spaces
+        .get(key)?
+        .regions
+        .iter()
+        .find(|r| r.region_id == region_id)
 }
 
 /// Count the regions each node is a peer of, across every space in the map.
