@@ -896,6 +896,159 @@ async fn joiner_map_version_matches_before_region_movement() {
     );
 }
 
+/// P1.3: after join, each pre-existing region has the joiner as a committed
+/// peer, series rows for that range exist on the joiner, RF = min(config, 2).
+#[tokio::test]
+#[serial(chdb)]
+async fn joiner_receives_existing_region_as_replica() {
+    use hyperbytedb::application::shard_scheduler::live_replica_candidate;
+    use hyperbytedb::application::shard_transfer::stage_region_transfer_data;
+    use hyperbytedb::ports::metadata::MetadataPort;
+    use hyperbytedb::ports::query::QueryPort;
+    use hyperbytedb::ports::wal::WalPort;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let opts = ShardedClusterOptions {
+        sharding: hyperbytedb::config::ShardingConfig {
+            enabled: true,
+            replication_factor: 3,
+            scatter_peer_timeout_ms: 500,
+            scatter_max_peer_attempts: 3,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let node1 = start_sharded_single_node(dir.path(), opts).await;
+    let client = reqwest::Client::new();
+    create_db(&client, &node1.url, "p1db").await;
+    let resp = write_line(
+        &client,
+        &node1.url,
+        "p1db",
+        "cpu,host=solo value=1 1000000000",
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+    flush_node(&node1).await;
+
+    let before = node1.shard_map.snapshot().await.unwrap();
+    let region = before
+        .space("p1db", "autogen", "cpu")
+        .and_then(|s| s.regions.first())
+        .cloned()
+        .expect("region after write");
+    assert_eq!(region.peers, vec![1]);
+    let expected_sid = series_id("cpu", &BTreeMap::from([("host".into(), "solo".into())]));
+    assert!(
+        region.contains(expected_sid),
+        "written series must fall in the bootstrapped region"
+    );
+
+    let node2 = start_sharded_joiner(
+        dir.path(),
+        &node1,
+        2,
+        &ShardedClusterOptions {
+            sharding: hyperbytedb::config::ShardingConfig {
+                enabled: true,
+                replication_factor: 3,
+                scatter_peer_timeout_ms: 500,
+                scatter_max_peer_attempts: 3,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await;
+    create_db(&client, &node2.url, "p1db").await;
+    install_shard_map_from_peer(&node1, &node2).await;
+
+    let active = [1u64, 2];
+    assert_eq!(
+        live_replica_candidate(&region, &active, 3),
+        Some(2),
+        "live joiner must be the placement candidate"
+    );
+
+    let peer_client = Arc::new(
+        hyperbytedb::adapters::cluster::peer_client::PeerClient::new(
+            1,
+            node1.addr.clone(),
+            node1.membership.clone(),
+            Arc::new(
+                hyperbytedb::adapters::cluster::replication_log::ReplicationLog::open(
+                    dir.path().join("repl-place"),
+                )
+                .unwrap(),
+            ),
+            2,
+            8192,
+            8,
+            8 * 1024 * 1024,
+        ),
+    );
+    let metadata: Arc<dyn MetadataPort> = node1.metadata.clone();
+    let wal: Arc<dyn WalPort> = node1.wal.clone();
+    let query_port: Arc<dyn QueryPort> = node1.query_port.clone();
+    let key = MeasurementKey::new("p1db", "autogen", "cpu");
+    let outcome = stage_region_transfer_data(
+        &peer_client,
+        &metadata,
+        &wal,
+        Some(&query_port),
+        1,
+        &key,
+        &region,
+        2,
+        10_000,
+    )
+    .await
+    .expect("stage onto joiner");
+    assert!(
+        outcome.verified(),
+        "stage must confirm every exported point: exported={} applied={}",
+        outcome.exported,
+        outcome.applied
+    );
+    assert!(
+        outcome.exported >= 1,
+        "pre-existing measurement must copy at least one point"
+    );
+
+    apply_add_peer_on_nodes(&[&node1, &node2], "p1db", "autogen", "cpu", 2).await;
+
+    for node in [&node1, &node2] {
+        let map = node.shard_map.snapshot().await.unwrap();
+        let placed = map
+            .space("p1db", "autogen", "cpu")
+            .and_then(|s| s.regions.first())
+            .expect("region after AddPeer");
+        assert!(
+            placed.peers.contains(&2),
+            "node {} map missing joiner peer: {:?}",
+            node.node_id,
+            placed.peers
+        );
+        assert_eq!(placed.primary, 1, "AddPeer must not move primary");
+        assert_eq!(
+            placed.peers.len(),
+            2,
+            "effective RF = min(configured=3, members=2)"
+        );
+    }
+
+    let dest_series = node2
+        .metadata
+        .list_series_ids("p1db", "autogen", "cpu")
+        .await
+        .unwrap();
+    assert!(
+        dest_series.contains(&expected_sid),
+        "joiner metadata must hold the series for the copied range: {dest_series:?}"
+    );
+}
+
 async fn wait_for_database(client: &reqwest::Client, url: &str, db: &str) {
     for _ in 0..100 {
         let resp = query_sql(client, url, db, "SHOW DATABASES").await;

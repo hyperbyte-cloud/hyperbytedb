@@ -9,6 +9,7 @@ use crate::adapters::cluster::peer_client::PeerClient;
 use crate::adapters::cluster::raft::HyperbytedbRaft;
 use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
 use crate::application::shard_peer_resolution::is_active_peer;
+use crate::application::shard_routing::effective_replication_factor;
 use crate::application::shard_transfer::{
     complete_region_transfer, push_region_transfer_data, run_region_transfer,
     stage_region_transfer_data,
@@ -360,6 +361,10 @@ impl ShardScheduler {
                         self.release_operator(region.region_id).await;
                         continue;
                     }
+                }
+
+                if let Err(e) = self.try_place_live_member(&space.key, region).await {
+                    tracing::debug!(error = %e, region_id = region.region_id, "live placement skipped");
                 }
 
                 if let Err(e) = self.try_rebalance(&space.key, region, &hb).await {
@@ -939,6 +944,88 @@ impl ShardScheduler {
         Ok(())
     }
 
+    /// Place a live Active member that is not yet a region peer, when
+    /// effective RF has room. Stages rows onto the joiner, then commits
+    /// `AddPeer` — never commit-then-stage (that's heal `MovePeer`).
+    async fn try_place_live_member(
+        &self,
+        key: &MeasurementKey,
+        region: &ShardRegion,
+    ) -> Result<(), HyperbytedbError> {
+        // Resolve the peer client before probing the joiner: without one there
+        // is no way to stage rows, so the round trip below would be wasted.
+        let Some(pc) = self.peer_client.as_ref() else {
+            return Ok(());
+        };
+
+        let joiner_addr = {
+            let m = self.membership.read().await;
+            let ids: Vec<u64> = m.active_peers(0).into_iter().map(|n| n.node_id).collect();
+            live_replica_candidate(region, &ids, self.config.replication_factor)
+                .and_then(|id| m.get_node(id).map(|n| (id, n.addr.clone())))
+        };
+        let Some((joiner, addr)) = joiner_addr else {
+            return Ok(());
+        };
+
+        let cluster_ver = self.shard_map.snapshot().await?.map_version;
+        let joiner_ver = fetch_peer_map_version(pc.http_client(), &addr).await?;
+        if !joiner_map_caught_up(cluster_ver, joiner_ver) {
+            tracing::debug!(
+                region_id = region.region_id,
+                joiner,
+                cluster_ver,
+                joiner_ver,
+                "skip live placement: joiner map not caught up"
+            );
+            return Ok(());
+        }
+
+        if region.primary == self.node_id {
+            let outcome = stage_region_transfer_data(
+                pc,
+                &self.metadata,
+                &self.wal,
+                self.query_port.as_ref(),
+                self.node_id,
+                key,
+                region,
+                joiner,
+                self.max_points_per_request,
+            )
+            .await?;
+            if !outcome.verified() {
+                return Err(HyperbytedbError::ShardMap(
+                    format!(
+                        "live placement stage unverified: exported={} applied={}",
+                        outcome.exported, outcome.applied
+                    )
+                    .into(),
+                ));
+            }
+        } else {
+            request_region_stage(
+                pc.as_ref(),
+                &self.membership,
+                region.primary,
+                key,
+                region,
+                joiner,
+            )
+            .await?;
+        }
+
+        self.propose(ShardMapOp::AddPeer {
+            key: key.clone(),
+            region_id: region.region_id,
+            to_peer: joiner,
+            epoch: region.epoch,
+        })
+        .await?;
+        counter!("hyperbytedb_shard_live_placements_total").increment(1);
+        Ok(())
+    }
+
     async fn try_rebalance(
         &self,
         key: &MeasurementKey,
@@ -1177,6 +1264,28 @@ pub fn joiner_map_caught_up(cluster_map_version: u64, joiner_map_version: u64) -
     joiner_map_version == cluster_map_version
 }
 
+/// Next live member to add as a replica, or `None` when RF is full, the
+/// region carries transfer debt, or every Active member is already a peer.
+#[must_use]
+pub fn live_replica_candidate(
+    region: &ShardRegion,
+    active_member_ids: &[u64],
+    configured_rf: usize,
+) -> Option<u64> {
+    if region.transfer_outstanding() {
+        return None;
+    }
+    let target = effective_replication_factor(configured_rf, active_member_ids.len());
+    if region.peers.len() >= target {
+        return None;
+    }
+    active_member_ids
+        .iter()
+        .copied()
+        .filter(|id| !region.peers.contains(id))
+        .min()
+}
+
 /// Read a peer's committed `map_version` via `/internal/shard/map`.
 pub async fn fetch_peer_map_version(
     client: &reqwest::Client,
@@ -1263,6 +1372,52 @@ async fn request_region_rehome(
         epoch: range.epoch,
         dest_primary,
         drop_source,
+        stage: false,
+    };
+    let url = format!("http://{addr}/internal/shard/rehome");
+    let resp = peer_client
+        .http_client()
+        .post(&url)
+        .json(&req)
+        .timeout(Duration::from_secs(REHOME_TIMEOUT_SECS))
+        .send()
+        .await
+        .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(HyperbytedbError::TransferRejected {
+            status: resp.status().as_u16(),
+        });
+    }
+    Ok(())
+}
+
+/// Ask the current primary to stage `[start, end)` onto a joiner that is
+/// not yet a committed peer.
+async fn request_region_stage(
+    peer_client: &PeerClient,
+    membership: &SharedMembership,
+    target_node: u64,
+    key: &MeasurementKey,
+    range: &ShardRegion,
+    dest: u64,
+) -> Result<(), HyperbytedbError> {
+    let addr = {
+        let m = membership.read().await;
+        m.get_node(target_node).map(|n| n.addr.clone())
+    }
+    .ok_or_else(|| {
+        HyperbytedbError::PeerUnreachable(format!("stage target node {target_node} unknown"))
+    })?;
+    let req = ShardRehomeRequest {
+        db: key.db.clone(),
+        rp: key.rp.clone(),
+        measurement: key.measurement.clone(),
+        start: range.start,
+        end: range.end,
+        epoch: range.epoch,
+        dest_primary: dest,
+        drop_source: false,
+        stage: true,
     };
     let url = format!("http://{addr}/internal/shard/rehome");
     let resp = peer_client
@@ -1912,6 +2067,45 @@ mod tests {
         assert!(!joiner_map_caught_up(3, 0));
         assert!(!joiner_map_caught_up(3, 2));
         assert!(!joiner_map_caught_up(3, 4));
+    }
+
+    fn sample_region_peers(peers: Vec<u64>, primary: u64) -> ShardRegion {
+        ShardRegion {
+            region_id: 1,
+            start: 0,
+            end: u64::MAX,
+            epoch: ShardEpoch::default(),
+            peers,
+            primary,
+            last_split_at: 0,
+            transfer_verified: None,
+            transfer_first_seen: None,
+        }
+    }
+
+    #[test]
+    fn live_replica_candidate_picks_lowest_id_joiner() {
+        let region = sample_region_peers(vec![1], 1);
+        assert_eq!(live_replica_candidate(&region, &[1, 2], 3), Some(2));
+    }
+
+    #[test]
+    fn live_replica_candidate_none_when_rf_full() {
+        let region = sample_region_peers(vec![1, 2, 3], 1);
+        assert_eq!(live_replica_candidate(&region, &[1, 2, 3, 4], 3), None);
+    }
+
+    #[test]
+    fn live_replica_candidate_none_when_already_peer() {
+        let region = sample_region_peers(vec![1, 2], 1);
+        assert_eq!(live_replica_candidate(&region, &[1, 2], 3), None);
+    }
+
+    #[test]
+    fn live_replica_candidate_none_with_transfer_debt() {
+        let mut region = sample_region_peers(vec![1], 1);
+        region.transfer_verified = Some(false);
+        assert_eq!(live_replica_candidate(&region, &[1, 2], 3), None);
     }
 
     #[tokio::test]

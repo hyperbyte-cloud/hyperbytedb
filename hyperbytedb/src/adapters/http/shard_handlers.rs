@@ -561,20 +561,8 @@ pub async fn handle_shard_transfer(
                 .into_response();
         }
         drop(m);
-        if state
-            .metadata
-            .get_measurement(&req.db, &req.rp, &req.measurement)
-            .await
-            .ok()
-            .flatten()
-            .is_none()
-        {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "measurement not found for staging"})),
-            )
-                .into_response();
-        }
+        // Joiner staging: dest may not have the measurement catalog row yet.
+        // apply_transfer_push registers it via prepare_batch_metadata.
     } else {
         let Some(ctx) = state.shard_routing.as_ref() else {
             return sharding_disabled();
@@ -710,19 +698,33 @@ pub async fn handle_shard_rehome(
             .into_response();
     }
 
-    let outcome = match push_region_transfer_data(
-        peer_client,
-        &state.metadata,
-        &state.wal,
-        Some(&state.query_port),
-        state.node_id,
-        &ctx_key(&req),
-        region,
-        req.dest_primary,
-        state.max_points_per_request,
-    )
-    .await
-    {
+    let outcome = match if req.stage {
+        crate::application::shard_transfer::stage_region_transfer_data(
+            peer_client,
+            &state.metadata,
+            &state.wal,
+            Some(&state.query_port),
+            state.node_id,
+            &ctx_key(&req),
+            region,
+            req.dest_primary,
+            state.max_points_per_request,
+        )
+        .await
+    } else {
+        push_region_transfer_data(
+            peer_client,
+            &state.metadata,
+            &state.wal,
+            Some(&state.query_port),
+            state.node_id,
+            &ctx_key(&req),
+            region,
+            req.dest_primary,
+            state.max_points_per_request,
+        )
+        .await
+    } {
         Ok(o) => o,
         Err(e) => {
             counter!("hyperbytedb_shard_transfer_failures_total").increment(1);
@@ -734,18 +736,19 @@ pub async fn handle_shard_rehome(
         }
     };
 
-    if let Err(e) = complete_region_transfer(
-        peer_client,
-        &state.metadata,
-        Some(&state.points_sink),
-        state.node_id,
-        &ctx_key(&req),
-        region,
-        req.dest_primary,
-        outcome.transfer_id,
-        req.drop_source,
-    )
-    .await
+    if !req.stage
+        && let Err(e) = complete_region_transfer(
+            peer_client,
+            &state.metadata,
+            Some(&state.points_sink),
+            state.node_id,
+            &ctx_key(&req),
+            region,
+            req.dest_primary,
+            outcome.transfer_id,
+            req.drop_source,
+        )
+        .await
     {
         counter!("hyperbytedb_shard_transfer_failures_total").increment(1);
         return (

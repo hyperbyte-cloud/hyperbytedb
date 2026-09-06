@@ -319,6 +319,68 @@ pub async fn install_shard_map_from_peer(from: &ShardedTestNode, onto: &ShardedT
     onto.location_cache.refresh_from_map(&snap);
 }
 
+/// Start `node_id` sharing `existing`'s membership and chDB session (libchdb
+/// is process-global). Marks the joiner Active before serving.
+pub async fn start_sharded_joiner(
+    dir: &Path,
+    existing: &ShardedTestNode,
+    node_id: u64,
+    opts: &ShardedClusterOptions,
+) -> ShardedTestNode {
+    let listener = bind_ephemeral().await;
+    let addr = listener.local_addr().unwrap().to_string();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    {
+        let mut m = existing.membership.write().await;
+        m.add_node(NodeInfo {
+            node_id,
+            addr,
+            state: NodeState::Active,
+            joined_at: now,
+            last_heartbeat: now,
+            needs_sync: false,
+        });
+    }
+    start_sharded_node(
+        dir,
+        node_id,
+        listener,
+        existing.membership.clone(),
+        opts,
+        existing.chdb.clone(),
+    )
+    .await
+}
+
+pub async fn apply_add_peer_on_nodes(
+    nodes: &[&ShardedTestNode],
+    db: &str,
+    rp: &str,
+    measurement: &str,
+    to_peer: u64,
+) {
+    for node in nodes {
+        let map = node.shard_map.snapshot().await.unwrap();
+        let region = map
+            .space(db, rp, measurement)
+            .and_then(|s| s.regions.first())
+            .cloned()
+            .expect("region for AddPeer");
+        let op = ShardMapOp::AddPeer {
+            key: MeasurementKey::new(db, rp, measurement),
+            region_id: region.region_id,
+            to_peer,
+            epoch: region.epoch,
+        };
+        node.shard_map.apply_op(op).await.unwrap();
+        let snap = node.shard_map.snapshot().await.unwrap();
+        node.location_cache.refresh_from_map(&snap);
+    }
+}
+
 pub async fn start_sharded_single_node(dir: &Path, opts: ShardedClusterOptions) -> ShardedTestNode {
     let chdb_dir = dir.join("chdb-shared");
     std::fs::create_dir_all(&chdb_dir).unwrap();
