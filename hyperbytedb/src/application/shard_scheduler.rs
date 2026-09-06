@@ -1160,15 +1160,31 @@ impl ShardScheduler {
         Ok(true)
     }
 
-    /// Give a member that joined an already-replicated cluster a replica slot.
+    /// Rebalance one replica slot onto the latest-joined member.
     ///
     /// `try_place_live_member` only fires while a region is below effective RF.
     /// At 3 nodes and RF 3 every region is already complete, so a 4th process
     /// needs an existing peer to step aside instead. Rows are staged onto the
-    /// newcomer before `MovePeer` commits — same stage-then-commit ordering, so
+    /// target before `MovePeer` commits — same stage-then-commit ordering, so
     /// no peer is ever published holding nothing. `MovePeer` appends the
-    /// newcomer, which makes it the region's newest peer and therefore the next
+    /// target, which makes it the region's newest peer and therefore the next
     /// primary-placement candidate.
+    ///
+    /// # This is not join-triggered
+    ///
+    /// The target is the active member with the greatest `joined_at`, which is
+    /// whoever joined last — there is no recency window, so "last" may mean
+    /// months ago. The rule fires whenever that member is under-loaded relative
+    /// to some region's non-primary peer, which means a cluster that has been
+    /// stable but unbalanced will start moving replicas on the first tick after
+    /// an upgrade, not in response to any join.
+    ///
+    /// Movement is bounded and convergent — it stops as soon as memberships
+    /// even out — and each copy is staged and verified before the map changes,
+    /// so this is a scheduling surprise rather than a correctness risk. It is
+    /// accepted while sharding is beta and stays deliberately ungated; revisit
+    /// before sharding graduates, when an unannounced rebalance on upgrade
+    /// stops being acceptable.
     async fn try_place_idle_member(
         &self,
         key: &MeasurementKey,
@@ -1182,14 +1198,14 @@ impl ShardScheduler {
             return Ok(false);
         };
 
-        let newcomer = {
+        let latest_member = {
             let m = self.membership.read().await;
             m.active_peers(0)
                 .into_iter()
                 .max_by_key(|n| (n.joined_at, n.node_id))
                 .map(|n| (n.node_id, n.addr.clone()))
         };
-        let Some((newcomer, addr)) = newcomer else {
+        let Some((latest_member, addr)) = latest_member else {
             return Ok(false);
         };
 
@@ -1201,20 +1217,20 @@ impl ShardScheduler {
             return Ok(false);
         };
         let memberships = region_memberships(&map);
-        let Some(displaced) = idle_member_replica_swap(region, newcomer, &memberships) else {
+        let Some(displaced) = idle_member_replica_swap(region, latest_member, &memberships) else {
             return Ok(false);
         };
 
         let joiner_ver = self
-            .cached_peer_map_version(newcomer, &addr, pc.http_client())
+            .cached_peer_map_version(latest_member, &addr, pc.http_client())
             .await?;
         if !joiner_map_caught_up(map.map_version, joiner_ver) {
             tracing::debug!(
                 region_id = region.region_id,
-                newcomer,
+                latest_member,
                 cluster_ver = map.map_version,
                 joiner_ver,
-                "skip idle placement: newcomer map not caught up"
+                "skip idle placement: rebalance target map not caught up"
             );
             return Ok(false);
         }
@@ -1228,7 +1244,7 @@ impl ShardScheduler {
                 self.node_id,
                 key,
                 region,
-                newcomer,
+                latest_member,
                 self.max_points_per_request,
             )
             .await?;
@@ -1248,7 +1264,7 @@ impl ShardScheduler {
                 region.primary,
                 key,
                 region,
-                newcomer,
+                latest_member,
             )
             .await?;
         }
@@ -1256,14 +1272,14 @@ impl ShardScheduler {
         tracing::info!(
             region_id = region.region_id,
             displaced,
-            newcomer,
-            "moving region replica onto newly joined member"
+            latest_member,
+            "rebalancing region replica onto latest-joined member"
         );
         self.propose(ShardMapOp::MovePeer {
             key: key.clone(),
             region_id: region.region_id,
             from_peer: displaced,
-            to_peer: newcomer,
+            to_peer: latest_member,
             epoch: region.epoch,
         })
         .await?;
@@ -1695,38 +1711,42 @@ pub fn region_memberships(map: &ShardMap) -> HashMap<u64, usize> {
     counts
 }
 
-/// Non-primary peer that should yield its replica slot to `newcomer`, or `None`
-/// when this region is already well placed.
+/// Non-primary peer that should yield its replica slot to `latest_member`, or
+/// `None` when this region is already well placed.
 ///
-/// An RF-complete region never triggers `AddPeer`, so a process joining an
-/// already-replicated cluster (3 nodes at RF 3, add a 4th) would own nothing
-/// forever — every region legitimately has its full replica count, and pure
-/// load balancing has no reason to disturb them. The bias is deliberately
-/// one-way: only the newcomer displaces anyone, and only a peer carrying
-/// strictly more region memberships than it.
+/// An RF-complete region never triggers `AddPeer`, so a member that is not
+/// already a peer would own nothing — every region legitimately has its full
+/// replica count, and pure load balancing has no reason to disturb them. This
+/// rule breaks that tie in one direction only: `latest_member` may displace a
+/// peer, and only one carrying strictly more region memberships than it.
 ///
-/// `newcomer` must be the newest active member — the caller establishes that,
-/// and it is what makes the swap converge. Because the identity is stable until
-/// membership itself changes, the node just displaced cannot turn around and
-/// reclaim the slot: it is not the newcomer. Passing an arbitrary node here
-/// forfeits that guarantee and can trade a slot back and forth.
+/// `latest_member` must be the active member with the greatest `joined_at`.
+/// The caller establishes that, and it is what makes the swap converge: the
+/// identity is stable until membership itself changes, so the node just
+/// displaced cannot reclaim the slot — it is not the latest member. Passing an
+/// arbitrary node, or the least-loaded one, forfeits that and lets a slot trade
+/// back and forth indefinitely.
+///
+/// Note this is *ordering*, not recency: the greatest `joined_at` is simply
+/// whichever member joined last, whether that was seconds or months ago. See
+/// [`ShardScheduler::try_place_idle_member`] for what that means in practice.
 #[must_use]
 pub fn idle_member_replica_swap(
     region: &ShardRegion,
-    newcomer: u64,
+    latest_member: u64,
     memberships: &HashMap<u64, usize>,
 ) -> Option<u64> {
-    if region.transfer_outstanding() || region.peers.contains(&newcomer) {
+    if region.transfer_outstanding() || region.peers.contains(&latest_member) {
         return None;
     }
-    let newcomer_load = memberships.get(&newcomer).copied().unwrap_or(0);
+    let latest_member_load = memberships.get(&latest_member).copied().unwrap_or(0);
     region
         .peers
         .iter()
         .copied()
         .filter(|p| *p != region.primary)
         .map(|p| (memberships.get(&p).copied().unwrap_or(0), p))
-        .filter(|(load, _)| *load > newcomer_load)
+        .filter(|(load, _)| *load > latest_member_load)
         .max()
         .map(|(_, peer)| peer)
 }
@@ -2716,12 +2736,12 @@ mod tests {
         let region = sample_region_peers(vec![1, 2, 3], 1);
         let memberships = region_memberships(&map_of(vec![region.clone()]));
         let displaced =
-            idle_member_replica_swap(&region, 4, &memberships).expect("newcomer takes a slot");
+            idle_member_replica_swap(&region, 4, &memberships).expect("latest member takes a slot");
         assert_ne!(displaced, 1, "the primary must never be displaced");
         assert!(displaced == 2 || displaced == 3);
     }
 
-    /// The swap must converge. `newcomer` stays the same node for as long as
+    /// The swap must converge. `latest_member` stays the same node for as long as
     /// membership is unchanged, so once it holds the slot the rule stops firing
     /// and the slot cannot trade back and forth.
     #[test]
@@ -2732,7 +2752,7 @@ mod tests {
             4,
             &region_memberships(&map_of(vec![before.clone()])),
         )
-        .expect("first pass moves the newcomer in");
+        .expect("first pass moves the latest member in");
 
         let mut after = before.clone();
         after.peers.retain(|p| *p != displaced);
@@ -2740,7 +2760,7 @@ mod tests {
         assert_eq!(
             idle_member_replica_swap(&after, 4, &region_memberships(&map_of(vec![after.clone()]))),
             None,
-            "second pass with the same newcomer must be a no-op"
+            "second pass with the same latest member must be a no-op"
         );
     }
 
