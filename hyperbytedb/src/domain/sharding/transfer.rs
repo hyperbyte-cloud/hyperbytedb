@@ -165,6 +165,10 @@ pub struct ShardRehomeRequest {
     pub dest_primary: u64,
     #[serde(default)]
     pub drop_source: bool,
+    /// When true, the destination is not yet a committed peer (`AddPeer`
+    /// staging). Uses the stage transfer that skips dest ownership checks.
+    #[serde(default)]
+    pub stage: bool,
 }
 
 #[cfg(test)]
