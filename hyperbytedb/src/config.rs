@@ -79,6 +79,12 @@ pub struct ShardingConfig {
     /// older than the `ClearVerified` op cannot decode it from the Raft log.
     #[serde(default = "default_transfer_clear_proposals_enabled")]
     pub transfer_clear_proposals_enabled: bool,
+    /// Propose `AddPeer` shard-map ops to place a joiner as a region replica.
+    /// Disable on mixed-version clusters: nodes running builds older than the
+    /// `AddPeer` op cannot decode it from the Raft log, and a committed entry
+    /// they cannot deserialize wedges them.
+    #[serde(default = "default_add_peer_proposals_enabled")]
+    pub add_peer_proposals_enabled: bool,
 }
 
 impl Default for ShardingConfig {
@@ -100,6 +106,7 @@ impl Default for ShardingConfig {
             scatter_max_peer_attempts: default_scatter_max_peer_attempts(),
             peer_heal_enabled: default_peer_heal_enabled(),
             transfer_clear_proposals_enabled: default_transfer_clear_proposals_enabled(),
+            add_peer_proposals_enabled: default_add_peer_proposals_enabled(),
         }
     }
 }
@@ -158,6 +165,15 @@ fn default_peer_heal_enabled() -> bool {
 
 fn default_transfer_clear_proposals_enabled() -> bool {
     true
+}
+
+/// Off for the release that introduces `AddPeer`. A leader that emits a new
+/// shard-map op the moment it upgrades commits a Raft entry the rest of a
+/// half-upgraded fleet cannot deserialize. Operators turn this on once every
+/// node runs a build that knows the op; the default flips in a later release,
+/// the same way `transfer_clear_proposals_enabled` did.
+fn default_add_peer_proposals_enabled() -> bool {
+    false
 }
 
 impl HyperbytedbConfig {
@@ -1241,6 +1257,22 @@ mod replicate_body_limit_tests {
         assert_eq!(
             c.effective_replicate_body_limit_bytes(25 * 1024 * 1024),
             64 * 1024 * 1024
+        );
+    }
+
+    /// A new Raft-log op must stay off by default for the release that adds it.
+    /// A leader that proposes one mid-rolling-restart commits an entry the
+    /// un-upgraded followers cannot deserialize.
+    #[test]
+    fn new_shard_map_ops_are_off_by_default() {
+        let s = super::ShardingConfig::default();
+        assert!(
+            !s.add_peer_proposals_enabled,
+            "AddPeer is new in this release and must not be proposed until the fleet can decode it"
+        );
+        assert!(
+            s.transfer_clear_proposals_enabled,
+            "ClearVerified shipped in an earlier release and is past its upgrade window"
         );
     }
 }

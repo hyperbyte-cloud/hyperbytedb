@@ -176,6 +176,21 @@ impl ShardScheduler {
         self
     }
 
+    /// True when `key` is a rollup (SummingMergeTree) destination.
+    ///
+    /// `apply_transfer_push` has no idempotence guard, so a staged region that
+    /// fails to commit its map op is staged again on the next tick. A
+    /// `ReplacingMergeTree` measurement collapses the redelivery; an additive
+    /// rollup destination sums it twice and is corrupted permanently. Contended
+    /// lock counts as "yes" — skipping a placement costs a tick, guessing wrong
+    /// costs the data.
+    async fn is_rollup_dest(&self, key: &MeasurementKey) -> bool {
+        match self.rollup_dests.try_read() {
+            Ok(set) => set.contains_key(key),
+            Err(_) => true,
+        }
+    }
+
     #[cfg(test)]
     async fn seed_rollup_dest(&self, key: &MeasurementKey) {
         self.rollup_dests.write().await.insert(key.clone(), ());
@@ -365,16 +380,33 @@ impl ShardScheduler {
                     }
                 }
 
-                if let Err(e) = self.try_place_live_member(&space.key, region).await {
-                    tracing::debug!(error = %e, region_id = region.region_id, "live placement skipped");
+                // A placement that commits changes the region's epoch, peers or
+                // primary, which makes the `region` borrowed from this tick's
+                // snapshot stale. Everything below reads that borrow, and
+                // `try_rebalance` would spend a full region copy before its
+                // proposal failed the epoch CAS — so yield the region and pick
+                // it up fresh on the next tick.
+                let mut placed = false;
+                for step in ["live", "idle", "primary"] {
+                    let outcome = match step {
+                        "live" => self.try_place_live_member(&space.key, region).await,
+                        "idle" => self.try_place_idle_member(&space.key, region).await,
+                        _ => self.try_place_primary(&space.key, region).await,
+                    };
+                    match outcome {
+                        Ok(true) => {
+                            placed = true;
+                            break;
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            tracing::debug!(error = %e, region_id = region.region_id, step, "placement skipped");
+                        }
+                    }
                 }
-
-                if let Err(e) = self.try_place_idle_member(&space.key, region).await {
-                    tracing::debug!(error = %e, region_id = region.region_id, "idle placement skipped");
-                }
-
-                if let Err(e) = self.try_place_primary(&space.key, region).await {
-                    tracing::debug!(error = %e, region_id = region.region_id, "primary placement skipped");
+                if placed {
+                    self.release_operator(region.region_id).await;
+                    continue;
                 }
 
                 if let Err(e) = self.try_rebalance(&space.key, region, &hb).await {
@@ -961,11 +993,24 @@ impl ShardScheduler {
         &self,
         key: &MeasurementKey,
         region: &ShardRegion,
-    ) -> Result<(), HyperbytedbError> {
+    ) -> Result<bool, HyperbytedbError> {
+        if !self.config.add_peer_proposals_enabled || self.is_rollup_dest(key).await {
+            return Ok(false);
+        }
+
         // Resolve the peer client before probing the joiner: without one there
         // is no way to stage rows, so the round trip below would be wasted.
         let Some(pc) = self.peer_client.as_ref() else {
-            return Ok(());
+            return Ok(false);
+        };
+
+        // Re-read the region: `drain_reconciliation` runs before this loop and
+        // can bump epochs, so the caller's snapshot may already be stale.
+        // Acting on it stages a whole region copy that the epoch CAS then
+        // rejects.
+        let map = self.shard_map.snapshot().await?;
+        let Some(region) = current_region(&map, key, region.region_id) else {
+            return Ok(false);
         };
 
         let joiner_addr = {
@@ -975,10 +1020,10 @@ impl ShardScheduler {
                 .and_then(|id| m.get_node(id).map(|n| (id, n.addr.clone())))
         };
         let Some((joiner, addr)) = joiner_addr else {
-            return Ok(());
+            return Ok(false);
         };
 
-        let cluster_ver = self.shard_map.snapshot().await?.map_version;
+        let cluster_ver = map.map_version;
         let joiner_ver = fetch_peer_map_version(pc.http_client(), &addr).await?;
         if !joiner_map_caught_up(cluster_ver, joiner_ver) {
             tracing::debug!(
@@ -988,7 +1033,7 @@ impl ShardScheduler {
                 joiner_ver,
                 "skip live placement: joiner map not caught up"
             );
-            return Ok(());
+            return Ok(false);
         }
 
         if region.primary == self.node_id {
@@ -1033,7 +1078,7 @@ impl ShardScheduler {
         })
         .await?;
         counter!("hyperbytedb_shard_live_placements_total").increment(1);
-        Ok(())
+        Ok(true)
     }
 
     /// Give a member that joined an already-replicated cluster a replica slot.
@@ -1049,9 +1094,13 @@ impl ShardScheduler {
         &self,
         key: &MeasurementKey,
         region: &ShardRegion,
-    ) -> Result<(), HyperbytedbError> {
+    ) -> Result<bool, HyperbytedbError> {
+        if self.is_rollup_dest(key).await {
+            return Ok(false);
+        }
+
         let Some(pc) = self.peer_client.as_ref() else {
-            return Ok(());
+            return Ok(false);
         };
 
         let newcomer = {
@@ -1062,7 +1111,7 @@ impl ShardScheduler {
                 .map(|n| (n.node_id, n.addr.clone()))
         };
         let Some((newcomer, addr)) = newcomer else {
-            return Ok(());
+            return Ok(false);
         };
 
         // Re-read the region: an `AddPeer` earlier in this same tick leaves the
@@ -1070,11 +1119,11 @@ impl ShardScheduler {
         // only for the proposal to bounce off the epoch CAS.
         let map = self.shard_map.snapshot().await?;
         let Some(region) = current_region(&map, key, region.region_id) else {
-            return Ok(());
+            return Ok(false);
         };
         let memberships = region_memberships(&map);
         let Some(displaced) = idle_member_replica_swap(region, newcomer, &memberships) else {
-            return Ok(());
+            return Ok(false);
         };
 
         let joiner_ver = fetch_peer_map_version(pc.http_client(), &addr).await?;
@@ -1086,7 +1135,7 @@ impl ShardScheduler {
                 joiner_ver,
                 "skip idle placement: newcomer map not caught up"
             );
-            return Ok(());
+            return Ok(false);
         }
 
         if region.primary == self.node_id {
@@ -1138,7 +1187,7 @@ impl ShardScheduler {
         })
         .await?;
         counter!("hyperbytedb_shard_idle_placements_total").increment(1);
-        Ok(())
+        Ok(true)
     }
 
     /// Hand a region's primary to its newest peer so a joiner starts taking
@@ -1153,9 +1202,13 @@ impl ShardScheduler {
         &self,
         key: &MeasurementKey,
         region: &ShardRegion,
-    ) -> Result<(), HyperbytedbError> {
+    ) -> Result<bool, HyperbytedbError> {
+        if self.is_rollup_dest(key).await {
+            return Ok(false);
+        }
+
         let Some(pc) = self.peer_client.as_ref() else {
-            return Ok(());
+            return Ok(false);
         };
 
         // Re-read the region: a peer placement earlier in this same tick leaves
@@ -1163,7 +1216,7 @@ impl ShardScheduler {
         // `TransferPrimary` proposal only after a full region copy had run.
         let map = self.shard_map.snapshot().await?;
         let Some(region) = current_region(&map, key, region.region_id) else {
-            return Ok(());
+            return Ok(false);
         };
         let counts = primary_counts(&map);
         let active: Vec<u64> = {
@@ -1171,7 +1224,7 @@ impl ShardScheduler {
             m.active_peers(0).into_iter().map(|n| n.node_id).collect()
         };
         let Some(new_primary) = primary_placement_candidate(region, &counts, &active) else {
-            return Ok(());
+            return Ok(false);
         };
 
         // Source from whoever holds the authoritative rows. Exporting from the
@@ -1222,7 +1275,7 @@ impl ShardScheduler {
         })
         .await?;
         counter!("hyperbytedb_shard_primary_placements_total").increment(1);
-        Ok(())
+        Ok(true)
     }
 
     async fn try_rebalance(
@@ -2991,6 +3044,27 @@ mod tests {
         assert!(q.is_empty(), "SummingMergeTree spaces must never enqueue");
     }
 
+    /// Placement stages rows and `apply_transfer_push` is not idempotent, so a
+    /// placement that stages and then fails its proposal re-delivers on the
+    /// next tick. `SummingMergeTree` destinations would sum the redelivery.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn placement_refuses_rollup_destinations() {
+        let harness = ReconcileTestHarness::new().await;
+        let rollup = MeasurementKey::new("db", "autogen", "rollup_dest");
+        let raw = MeasurementKey::new("db", "autogen", "cpu");
+        harness.scheduler.seed_rollup_dest(&rollup).await;
+
+        assert!(
+            harness.scheduler.is_rollup_dest(&rollup).await,
+            "seeded rollup destination must be refused by every placement path"
+        );
+        assert!(
+            !harness.scheduler.is_rollup_dest(&raw).await,
+            "raw ReplacingMergeTree measurements stay eligible"
+        );
+    }
+
     #[tokio::test]
     #[serial_test::serial(chdb)]
     async fn rebuild_skips_flagged_rollup_destinations() {
@@ -3054,6 +3128,52 @@ mod tests {
 
     /// Minimal standalone harness for reconciliation tests: real RocksDB shard
     /// map + scheduler internals without a full raft bootstrap where possible.
+    /// Minimal stand-in for a joiner: answers the map-version probe with
+    /// `map_version`, and accepts a staging push by echoing the line count it
+    /// received. Returns the address it bound to.
+    async fn spawn_mock_peer(map_version: u64) -> String {
+        use axum::routing::{get, post};
+        let app = axum::Router::new()
+            .route(
+                "/internal/shard/map",
+                get(move || async move {
+                    axum::Json(serde_json::json!({
+                        "map_version": map_version,
+                        "next_region_id": 2,
+                        "spaces": [],
+                    }))
+                }),
+            )
+            .route(
+                "/internal/shard/transfer",
+                post(|body: axum::body::Bytes| async move {
+                    let payload: serde_json::Value =
+                        serde_json::from_slice(&body).unwrap_or_default();
+                    let applied = payload
+                        .get("body")
+                        .and_then(|b| b.as_array())
+                        .map(|bytes| {
+                            let raw: Vec<u8> = bytes
+                                .iter()
+                                .filter_map(|v| v.as_u64().map(|n| n as u8))
+                                .collect();
+                            String::from_utf8_lossy(&raw)
+                                .lines()
+                                .filter(|l| !l.trim().is_empty())
+                                .count() as u64
+                        })
+                        .unwrap_or(0);
+                    axum::Json(serde_json::json!({ "applied": applied }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        addr
+    }
+
     struct ReconcileTestHarness {
         _dir: tempfile::TempDir,
         shard_map: Arc<RocksDbShardMap>,
@@ -3073,6 +3193,177 @@ mod tests {
             transfer_verified: Some(false),
             transfer_first_seen: Some(first_seen),
         }
+    }
+
+    /// Harness whose scheduler owns the region and can actually reach a peer,
+    /// so `tick()` runs the placement steps end to end.
+    struct PlacementTestHarness {
+        _dir: tempfile::TempDir,
+        scheduler: ShardScheduler,
+        proposals: Arc<std::sync::Mutex<Vec<ShardMapOp>>>,
+    }
+
+    impl PlacementTestHarness {
+        async fn new(add_peer_proposals_enabled: bool) -> Self {
+            use crate::adapters::chdb::native_adapter::ChdbNativeAdapter;
+            use crate::adapters::chdb::query_adapter::ChdbQueryAdapter;
+            use crate::adapters::chdb::session::SharedSession;
+            use crate::adapters::cluster::peer_client::PeerClient;
+            use crate::adapters::cluster::replication_log::ReplicationLog;
+            use crate::adapters::metadata::rocksdb_meta::RocksDbMetadata;
+            use crate::adapters::wal::rocksdb_wal::RocksDbWal;
+            use crate::application::cluster::bootstrap::ClusterBootstrap;
+            use crate::application::materialized_view_service::MaterializedViewService;
+            use crate::ports::points_sink::PointsSinkPort;
+
+            let dir = tempfile::tempdir().unwrap();
+            let meta_dir = dir.path().join("meta");
+            let wal_dir = dir.path().join("wal");
+            let chdb_dir = dir.path().join("chdb");
+            for p in [&meta_dir, &wal_dir, &chdb_dir] {
+                std::fs::create_dir_all(p).unwrap();
+            }
+
+            let chdb = SharedSession::new_eager(chdb_dir.to_str().unwrap(), 1).unwrap();
+            let chdb_adapter = Arc::new(ChdbQueryAdapter::from_shared(chdb.clone(), 0));
+            let sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(chdb));
+            let wal = Arc::new(RocksDbWal::open(&wal_dir).unwrap());
+            let metadata = Arc::new(RocksDbMetadata::open(&meta_dir).unwrap());
+            let mv_service = Arc::new(MaterializedViewService::new(
+                metadata.clone(),
+                chdb_adapter,
+                sink.clone(),
+            ));
+
+            let mut cluster_cfg = crate::config::HyperbytedbConfig::load(None)
+                .unwrap()
+                .cluster;
+            cluster_cfg.enabled = true;
+            cluster_cfg.node_id = 1;
+            cluster_cfg.cluster_addr = "127.0.0.1:18100".into();
+            cluster_cfg.replication_log_dir = dir.path().join("repl").to_string_lossy().into();
+            cluster_cfg.raft_dir = dir.path().join("raft").to_string_lossy().into();
+            cluster_cfg.raft_heartbeat_interval_ms = Some(200);
+            cluster_cfg.raft_election_timeout_ms = Some(500);
+
+            let bootstrap = ClusterBootstrap::init(&cluster_cfg, 1000).unwrap();
+            let shard_map = Arc::new(RocksDbShardMap::open(&meta_dir, true).unwrap());
+            let location_cache = Arc::new(ShardLocationCache::new());
+            let raft = bootstrap
+                .start_raft(
+                    &cluster_cfg,
+                    metadata.clone(),
+                    mv_service,
+                    sink.clone(),
+                    wal.clone(),
+                    Some((shard_map.clone(), location_cache)),
+                    None,
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+            // Region owned by this node, one peer short of effective RF.
+            let key = MeasurementKey::new("db", "autogen", "cpu");
+            shard_map
+                .apply_op(ShardMapOp::BootstrapMeasurement {
+                    key,
+                    region: sample_region_peers(vec![1], 1),
+                })
+                .await
+                .unwrap();
+            let map_version = shard_map.snapshot().await.unwrap().map_version;
+
+            let joiner_addr = spawn_mock_peer(map_version).await;
+            {
+                let mut m = bootstrap.membership.write().await;
+                m.add_node(NodeInfo {
+                    node_id: 1,
+                    addr: "127.0.0.1:18100".into(),
+                    state: NodeState::Active,
+                    joined_at: 0,
+                    last_heartbeat: 0,
+                    needs_sync: false,
+                });
+                m.add_node(NodeInfo {
+                    node_id: 2,
+                    addr: joiner_addr,
+                    state: NodeState::Active,
+                    joined_at: 1,
+                    last_heartbeat: 0,
+                    needs_sync: false,
+                });
+            }
+
+            let peer_client = Arc::new(PeerClient::new(
+                1,
+                "127.0.0.1:18100".into(),
+                bootstrap.membership.clone(),
+                Arc::new(ReplicationLog::open(dir.path().join("repl-peer")).unwrap()),
+                2,
+                8192,
+                8,
+                8 * 1024 * 1024,
+            ));
+
+            let sharding = crate::config::ShardingConfig {
+                replication_factor: 3,
+                add_peer_proposals_enabled,
+                ..Default::default()
+            };
+            let proposals = Arc::new(std::sync::Mutex::new(Vec::<ShardMapOp>::new()));
+            let scheduler = ShardScheduler::new(
+                shard_map,
+                bootstrap.membership.clone(),
+                raft,
+                Some(peer_client),
+                metadata,
+                wal,
+                None,
+                Some(sink),
+                1,
+                sharding,
+                10_000,
+            )
+            .with_test_force_leader(true)
+            .with_test_propose_sink(proposals.clone());
+
+            Self {
+                _dir: dir,
+                scheduler,
+                proposals,
+            }
+        }
+    }
+
+    /// Guards the tick wiring. Without this, deleting the three placement calls
+    /// from `tick()` leaves every other test in the suite green.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn tick_places_a_live_joiner_as_a_region_peer() {
+        let harness = PlacementTestHarness::new(true).await;
+        harness.scheduler.tick_once_for_test().await.unwrap();
+        let ops = harness.proposals.lock().unwrap();
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, ShardMapOp::AddPeer { to_peer: 2, .. })),
+            "tick must propose AddPeer to place the live joiner, got {ops:?}"
+        );
+    }
+
+    /// The upgrade gate has to hold at the tick, not just in config: a leader
+    /// that proposes `AddPeer` mid-rolling-restart wedges un-upgraded voters.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn tick_withholds_add_peer_while_the_upgrade_gate_is_closed() {
+        let harness = PlacementTestHarness::new(false).await;
+        harness.scheduler.tick_once_for_test().await.unwrap();
+        let ops = harness.proposals.lock().unwrap();
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op, ShardMapOp::AddPeer { .. })),
+            "AddPeer must not be proposed while the gate is closed, got {ops:?}"
+        );
     }
 
     impl ReconcileTestHarness {
