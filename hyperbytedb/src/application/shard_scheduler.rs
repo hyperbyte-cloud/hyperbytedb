@@ -33,6 +33,10 @@ type RegionHeartbeatRow = (u64, u64, u64, u64, u64, u64);
 /// drive splits/rebalances forever.
 const HEARTBEAT_TTL_INTERVALS: u64 = 3;
 
+/// Warn once a region has gone this many consecutive ticks with candidates
+/// available but none caught up to the committed map.
+const PLACEMENT_STALL_WARN_TICKS: u32 = 5;
+
 /// Split only after the region's cooldown has elapsed. `last_split_at == 0`
 /// means "never split" (bootstrap must stamp wall-clock time); treating 0 as
 /// "long ago" let a single hot region binary-split every tick (1→2→4→8).
@@ -119,6 +123,15 @@ pub struct ShardScheduler {
     /// enqueued — their primary changes are provisioned by the MV backfill
     /// path.
     rollup_dests: tokio::sync::RwLock<HashMap<MeasurementKey, ()>>,
+    /// Peer `map_version` probes for the tick in progress, keyed by node id,
+    /// cleared when each tick starts. `/internal/shard/map` serializes every
+    /// space and region in the cluster to answer one `u64`, so probing per
+    /// region cost O(regions x map size) bytes on every tick of a join.
+    peer_map_versions: tokio::sync::RwLock<HashMap<u64, u64>>,
+    /// Consecutive ticks a region skipped placement with no caught-up
+    /// candidate, keyed by region id. A cluster-wide placement stall is
+    /// otherwise only visible at `debug!`.
+    placement_stalls: tokio::sync::RwLock<HashMap<u64, u32>>,
     #[cfg(test)]
     test_force_leader: bool,
     #[cfg(test)]
@@ -157,6 +170,8 @@ impl ShardScheduler {
             unhealthy_primaries: tokio::sync::RwLock::new(HashMap::new()),
             reconciliation_queue: std::sync::Mutex::new(Vec::new()),
             rollup_dests: tokio::sync::RwLock::new(HashMap::new()),
+            peer_map_versions: tokio::sync::RwLock::new(HashMap::new()),
+            placement_stalls: tokio::sync::RwLock::new(HashMap::new()),
             #[cfg(test)]
             test_force_leader: false,
             #[cfg(test)]
@@ -174,6 +189,43 @@ impl ShardScheduler {
     pub fn with_test_propose_sink(mut self, sink: Arc<std::sync::Mutex<Vec<ShardMapOp>>>) -> Self {
         self.test_propose_sink = Some(sink);
         self
+    }
+
+    /// `peer`'s committed `map_version`, probed at most once per tick.
+    async fn cached_peer_map_version(
+        &self,
+        peer: u64,
+        addr: &str,
+        client: &reqwest::Client,
+    ) -> Result<u64, HyperbytedbError> {
+        if let Some(v) = self.peer_map_versions.read().await.get(&peer) {
+            return Ok(*v);
+        }
+        let version = fetch_peer_map_version(client, addr).await?;
+        self.peer_map_versions.write().await.insert(peer, version);
+        Ok(version)
+    }
+
+    /// Record that `region_id` could not place a replica this tick, and warn
+    /// once the stall has persisted. A placement blocked forever by a lagging
+    /// candidate is otherwise silent above `debug!`.
+    async fn note_placement_stall(&self, region_id: u64, candidates: usize) {
+        let mut stalls = self.placement_stalls.write().await;
+        let count = stalls.entry(region_id).or_insert(0);
+        *count = count.saturating_add(1);
+        if *count == PLACEMENT_STALL_WARN_TICKS {
+            counter!("hyperbytedb_shard_placement_stalled_total").increment(1);
+            tracing::warn!(
+                region_id,
+                candidates,
+                ticks = *count,
+                "region has no caught-up replica candidate; placement stalled"
+            );
+        }
+    }
+
+    async fn clear_placement_stall(&self, region_id: u64) {
+        self.placement_stalls.write().await.remove(&region_id);
     }
 
     /// True when `key` is a rollup (SummingMergeTree) destination.
@@ -285,6 +337,8 @@ impl ShardScheduler {
     }
 
     async fn tick(&self) -> Result<(), HyperbytedbError> {
+        // Peer map versions are only valid for the tick that probed them.
+        self.peer_map_versions.write().await.clear();
         let map = self.shard_map.snapshot().await?;
         self.drain_reconciliation(&map).await;
         let now = SystemTime::now()
@@ -1013,28 +1067,53 @@ impl ShardScheduler {
             return Ok(false);
         };
 
-        let joiner_addr = {
+        let candidates: Vec<(u64, String)> = {
             let m = self.membership.read().await;
             let ids: Vec<u64> = m.active_peers(0).into_iter().map(|n| n.node_id).collect();
-            live_replica_candidate(region, &ids, self.config.replication_factor)
-                .and_then(|id| m.get_node(id).map(|n| (id, n.addr.clone())))
+            live_replica_candidates(region, &ids, self.config.replication_factor)
+                .into_iter()
+                .filter_map(|id| m.get_node(id).map(|n| (id, n.addr.clone())))
+                .collect()
         };
-        let Some((joiner, addr)) = joiner_addr else {
-            return Ok(false);
-        };
-
-        let cluster_ver = map.map_version;
-        let joiner_ver = fetch_peer_map_version(pc.http_client(), &addr).await?;
-        if !joiner_map_caught_up(cluster_ver, joiner_ver) {
-            tracing::debug!(
-                region_id = region.region_id,
-                joiner,
-                cluster_ver,
-                joiner_ver,
-                "skip live placement: joiner map not caught up"
-            );
+        if candidates.is_empty() {
+            self.clear_placement_stall(region.region_id).await;
             return Ok(false);
         }
+
+        // Take the first candidate that has caught up. Stopping at the first
+        // candidate outright let one lagging node block every region forever,
+        // because the choice was made before the probe and never advanced.
+        let cluster_ver = map.map_version;
+        let mut chosen = None;
+        for (id, addr) in &candidates {
+            let ver = match self
+                .cached_peer_map_version(*id, addr, pc.http_client())
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!(error = %e, candidate = id, "map version probe failed");
+                    continue;
+                }
+            };
+            if joiner_map_caught_up(cluster_ver, ver) {
+                chosen = Some(*id);
+                break;
+            }
+            tracing::debug!(
+                region_id = region.region_id,
+                candidate = id,
+                cluster_ver,
+                candidate_ver = ver,
+                "candidate map not caught up"
+            );
+        }
+        let Some(joiner) = chosen else {
+            self.note_placement_stall(region.region_id, candidates.len())
+                .await;
+            return Ok(false);
+        };
+        self.clear_placement_stall(region.region_id).await;
 
         if region.primary == self.node_id {
             let outcome = stage_region_transfer_data(
@@ -1126,7 +1205,9 @@ impl ShardScheduler {
             return Ok(false);
         };
 
-        let joiner_ver = fetch_peer_map_version(pc.http_client(), &addr).await?;
+        let joiner_ver = self
+            .cached_peer_map_version(newcomer, &addr, pc.http_client())
+            .await?;
         if !joiner_map_caught_up(map.map_version, joiner_ver) {
             tracing::debug!(
                 region_id = region.region_id,
@@ -1509,12 +1590,46 @@ fn failover_watermark_safe(candidate_watermark: u64, max_peer_watermark: u64) ->
     candidate_watermark > 0 || max_peer_watermark == 0
 }
 
-/// Region data movement onto a joiner starts only after its committed
-/// `map_version` matches the cluster's. Staging rows against a lagging map
+/// Region data movement onto a joiner starts only after it has caught up to
+/// the cluster's committed `map_version`. Staging rows against a lagging map
 /// would apply under the wrong epoch / peer set.
+///
+/// Ahead is fine, and has to be: the cluster version is read from a snapshot
+/// taken a moment before the probe, so a joiner that applied an op in between
+/// legitimately reports a higher number. Requiring equality rejected that node
+/// and — because the candidate was chosen before the probe and never advanced
+/// — stalled replica growth for every region indefinitely.
 #[must_use]
 pub fn joiner_map_caught_up(cluster_map_version: u64, joiner_map_version: u64) -> bool {
-    joiner_map_version == cluster_map_version
+    joiner_map_version >= cluster_map_version
+}
+
+/// Members eligible to become a replica of `region`, lowest id first.
+///
+/// Returns every candidate rather than just the best one so the caller can
+/// advance past a node that fails its catch-up probe. Returning a single
+/// candidate meant one permanently-lagging node was re-chosen every tick and
+/// blocked replica growth cluster-wide.
+#[must_use]
+pub fn live_replica_candidates(
+    region: &ShardRegion,
+    active_member_ids: &[u64],
+    configured_rf: usize,
+) -> Vec<u64> {
+    if region.transfer_outstanding() {
+        return Vec::new();
+    }
+    let target = effective_replication_factor(configured_rf, active_member_ids.len());
+    if region.peers.len() >= target {
+        return Vec::new();
+    }
+    let mut candidates: Vec<u64> = active_member_ids
+        .iter()
+        .copied()
+        .filter(|id| !region.peers.contains(id))
+        .collect();
+    candidates.sort_unstable();
+    candidates
 }
 
 /// Next live member to add as a replica, or `None` when RF is full, the
@@ -2420,11 +2535,14 @@ mod tests {
     }
 
     #[test]
-    fn joiner_map_catchup_blocks_movement_until_versions_match() {
+    fn joiner_map_catchup_blocks_a_lagging_joiner() {
         assert!(joiner_map_caught_up(3, 3));
         assert!(!joiner_map_caught_up(3, 0));
         assert!(!joiner_map_caught_up(3, 2));
-        assert!(!joiner_map_caught_up(3, 4));
+        // Ahead is allowed. The gate exists to stop staging against a *lagging*
+        // map; a joiner that applied an op after the cluster snapshot was read
+        // is not lagging, and rejecting it stalled placement permanently.
+        assert!(joiner_map_caught_up(3, 4));
     }
 
     fn sample_region_peers(peers: Vec<u64>, primary: u64) -> ShardRegion {
@@ -2457,6 +2575,36 @@ mod tests {
     fn live_replica_candidate_none_when_already_peer() {
         let region = sample_region_peers(vec![1, 2], 1);
         assert_eq!(live_replica_candidate(&region, &[1, 2], 3), None);
+    }
+
+    #[test]
+    fn catch_up_accepts_a_candidate_that_is_ahead() {
+        assert!(joiner_map_caught_up(5, 5), "equal is caught up");
+        // The cluster version comes from a snapshot taken before the probe, so
+        // a candidate that applied an op in between is legitimately ahead.
+        // Rejecting it stalled placement permanently.
+        assert!(joiner_map_caught_up(5, 6), "ahead is caught up");
+        assert!(!joiner_map_caught_up(5, 4), "behind is not");
+    }
+
+    #[test]
+    fn live_replica_candidates_returns_every_option_in_order() {
+        let region = sample_region_peers(vec![1], 1);
+        assert_eq!(
+            live_replica_candidates(&region, &[1, 3, 2], 3),
+            vec![2, 3],
+            "all non-peers, lowest first, so a lagging one can be skipped"
+        );
+    }
+
+    #[test]
+    fn live_replica_candidates_empty_when_rf_full_or_indebted() {
+        let full = sample_region_peers(vec![1, 2, 3], 1);
+        assert!(live_replica_candidates(&full, &[1, 2, 3, 4], 3).is_empty());
+
+        let mut indebted = sample_region_peers(vec![1], 1);
+        indebted.transfer_verified = Some(false);
+        assert!(live_replica_candidates(&indebted, &[1, 2], 3).is_empty());
     }
 
     #[test]
@@ -3131,17 +3279,23 @@ mod tests {
     /// Minimal stand-in for a joiner: answers the map-version probe with
     /// `map_version`, and accepts a staging push by echoing the line count it
     /// received. Returns the address it bound to.
-    async fn spawn_mock_peer(map_version: u64) -> String {
+    async fn spawn_mock_peer(map_version: u64) -> (String, Arc<std::sync::atomic::AtomicU64>) {
         use axum::routing::{get, post};
+        let probes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let probe_counter = probes.clone();
         let app = axum::Router::new()
             .route(
                 "/internal/shard/map",
-                get(move || async move {
-                    axum::Json(serde_json::json!({
-                        "map_version": map_version,
-                        "next_region_id": 2,
-                        "spaces": [],
-                    }))
+                get(move || {
+                    let probes = probe_counter.clone();
+                    async move {
+                        probes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        axum::Json(serde_json::json!({
+                            "map_version": map_version,
+                            "next_region_id": 2,
+                            "spaces": [],
+                        }))
+                    }
                 }),
             )
             .route(
@@ -3171,7 +3325,7 @@ mod tests {
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        addr
+        (addr, probes)
     }
 
     struct ReconcileTestHarness {
@@ -3201,10 +3355,19 @@ mod tests {
         _dir: tempfile::TempDir,
         scheduler: ShardScheduler,
         proposals: Arc<std::sync::Mutex<Vec<ShardMapOp>>>,
+        /// `/internal/shard/map` hit counts, keyed by mock peer node id.
+        probes: HashMap<u64, Arc<std::sync::atomic::AtomicU64>>,
     }
 
     impl PlacementTestHarness {
-        async fn new(add_peer_proposals_enabled: bool) -> Self {
+        /// `peers` is `(node_id, map_version_delta)`; a negative delta makes
+        /// that peer report a map behind the cluster's. `regions` is how many
+        /// measurements to bootstrap, each one region owned by this node.
+        async fn new(
+            add_peer_proposals_enabled: bool,
+            peers: &[(u64, i64)],
+            regions: usize,
+        ) -> Self {
             use crate::adapters::chdb::native_adapter::ChdbNativeAdapter;
             use crate::adapters::chdb::query_adapter::ChdbQueryAdapter;
             use crate::adapters::chdb::session::SharedSession;
@@ -3263,18 +3426,21 @@ mod tests {
                 .unwrap();
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
-            // Region owned by this node, one peer short of effective RF.
-            let key = MeasurementKey::new("db", "autogen", "cpu");
-            shard_map
-                .apply_op(ShardMapOp::BootstrapMeasurement {
-                    key,
-                    region: sample_region_peers(vec![1], 1),
-                })
-                .await
-                .unwrap();
+            // Regions owned by this node, each one peer short of effective RF.
+            for i in 0..regions.max(1) {
+                let mut region = sample_region_peers(vec![1], 1);
+                region.region_id = (i + 1) as u64;
+                shard_map
+                    .apply_op(ShardMapOp::BootstrapMeasurement {
+                        key: MeasurementKey::new("db", "autogen", format!("cpu{i}")),
+                        region,
+                    })
+                    .await
+                    .unwrap();
+            }
             let map_version = shard_map.snapshot().await.unwrap().map_version;
 
-            let joiner_addr = spawn_mock_peer(map_version).await;
+            let mut probes = HashMap::new();
             {
                 let mut m = bootstrap.membership.write().await;
                 m.add_node(NodeInfo {
@@ -3285,14 +3451,19 @@ mod tests {
                     last_heartbeat: 0,
                     needs_sync: false,
                 });
-                m.add_node(NodeInfo {
-                    node_id: 2,
-                    addr: joiner_addr,
-                    state: NodeState::Active,
-                    joined_at: 1,
-                    last_heartbeat: 0,
-                    needs_sync: false,
-                });
+                for (id, delta) in peers {
+                    let reported = map_version.saturating_add_signed(*delta);
+                    let (addr, counter) = spawn_mock_peer(reported).await;
+                    probes.insert(*id, counter);
+                    m.add_node(NodeInfo {
+                        node_id: *id,
+                        addr,
+                        state: NodeState::Active,
+                        joined_at: *id as i64,
+                        last_heartbeat: 0,
+                        needs_sync: false,
+                    });
+                }
             }
 
             let peer_client = Arc::new(PeerClient::new(
@@ -3332,7 +3503,12 @@ mod tests {
                 _dir: dir,
                 scheduler,
                 proposals,
+                probes,
             }
+        }
+
+        fn probe_count(&self, peer: u64) -> u64 {
+            self.probes[&peer].load(std::sync::atomic::Ordering::Relaxed)
         }
     }
 
@@ -3341,7 +3517,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(chdb)]
     async fn tick_places_a_live_joiner_as_a_region_peer() {
-        let harness = PlacementTestHarness::new(true).await;
+        let harness = PlacementTestHarness::new(true, &[(2, 0)], 1).await;
         harness.scheduler.tick_once_for_test().await.unwrap();
         let ops = harness.proposals.lock().unwrap();
         assert!(
@@ -3351,12 +3527,48 @@ mod tests {
         );
     }
 
+    /// H.2: one lagging candidate must not block the others. Node 2 reports a
+    /// map behind the cluster and is chosen first by id; placement has to move
+    /// on to node 3 instead of stalling here every tick forever.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn placement_skips_a_lagging_candidate_for_a_caught_up_one() {
+        let harness = PlacementTestHarness::new(true, &[(2, -1), (3, 0)], 1).await;
+        harness.scheduler.tick_once_for_test().await.unwrap();
+        let ops = harness.proposals.lock().unwrap();
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, ShardMapOp::AddPeer { to_peer: 3, .. })),
+            "must place onto the caught-up candidate, got {ops:?}"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op, ShardMapOp::AddPeer { to_peer: 2, .. })),
+            "must not place onto the lagging candidate, got {ops:?}"
+        );
+    }
+
+    /// H.4: `/internal/shard/map` serializes the whole cluster map to answer
+    /// one `u64`. Probing per region made a join cost O(regions x map size)
+    /// bytes per tick; one probe per peer per tick is the contract.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn map_version_is_probed_once_per_peer_per_tick() {
+        let harness = PlacementTestHarness::new(true, &[(2, -1)], 4).await;
+        harness.scheduler.tick_once_for_test().await.unwrap();
+        assert_eq!(
+            harness.probe_count(2),
+            1,
+            "four regions must share one probe, not one probe each"
+        );
+    }
+
     /// The upgrade gate has to hold at the tick, not just in config: a leader
     /// that proposes `AddPeer` mid-rolling-restart wedges un-upgraded voters.
     #[tokio::test]
     #[serial_test::serial(chdb)]
     async fn tick_withholds_add_peer_while_the_upgrade_gate_is_closed() {
-        let harness = PlacementTestHarness::new(false).await;
+        let harness = PlacementTestHarness::new(false, &[(2, 0)], 1).await;
         harness.scheduler.tick_once_for_test().await.unwrap();
         let ops = harness.proposals.lock().unwrap();
         assert!(

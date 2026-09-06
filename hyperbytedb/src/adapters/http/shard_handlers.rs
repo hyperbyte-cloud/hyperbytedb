@@ -540,11 +540,15 @@ pub async fn handle_shard_transfer(
     Json(req): Json<ShardTransferPayload>,
 ) -> impl IntoResponse {
     if req.stage {
-        // Pre-commit staging (split optimization): the range is not owned by
-        // the destination in the committed map yet, so region/epoch checks are
-        // skipped. Guard rails: sender must be a known member and the local
-        // measurement must exist; rows outside `[start, end)` are filtered
-        // during apply.
+        // Pre-commit staging (split optimization, and replica placement onto a
+        // joiner): the range is not owned by the destination in the committed
+        // map yet, so region/epoch checks are skipped. The only guard rail is
+        // that the sender must be a known member; rows outside `[start, end)`
+        // are filtered during apply.
+        //
+        // There is deliberately no local-measurement check. A joiner receiving
+        // a measurement it has never seen has no catalog row yet, and
+        // `apply_transfer_push` creates one via `prepare_batch_metadata`.
         let Some(membership) = state.membership.as_ref() else {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -561,8 +565,6 @@ pub async fn handle_shard_transfer(
                 .into_response();
         }
         drop(m);
-        // Joiner staging: dest may not have the measurement catalog row yet.
-        // apply_transfer_push registers it via prepare_batch_metadata.
     } else {
         let Some(ctx) = state.shard_routing.as_ref() else {
             return sharding_disabled();
