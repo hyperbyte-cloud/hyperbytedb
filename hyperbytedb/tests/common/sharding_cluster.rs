@@ -381,6 +381,34 @@ pub async fn apply_add_peer_on_nodes(
     }
 }
 
+pub async fn apply_move_peer_on_nodes(
+    nodes: &[&ShardedTestNode],
+    db: &str,
+    rp: &str,
+    measurement: &str,
+    from_peer: u64,
+    to_peer: u64,
+) {
+    for node in nodes {
+        let map = node.shard_map.snapshot().await.unwrap();
+        let region = map
+            .space(db, rp, measurement)
+            .and_then(|s| s.regions.first())
+            .cloned()
+            .expect("region for MovePeer");
+        let op = ShardMapOp::MovePeer {
+            key: MeasurementKey::new(db, rp, measurement),
+            region_id: region.region_id,
+            from_peer,
+            to_peer,
+            epoch: region.epoch,
+        };
+        node.shard_map.apply_op(op).await.unwrap();
+        let snap = node.shard_map.snapshot().await.unwrap();
+        node.location_cache.refresh_from_map(&snap);
+    }
+}
+
 pub async fn start_sharded_single_node(dir: &Path, opts: ShardedClusterOptions) -> ShardedTestNode {
     let chdb_dir = dir.join("chdb-shared");
     std::fs::create_dir_all(&chdb_dir).unwrap();
@@ -473,6 +501,17 @@ pub async fn set_node_state(membership: &SharedMembership, node_id: u64, state: 
 /// without waiting for the scheduler).
 pub async fn promote_region_primary_on_all_nodes(
     nodes: &[ShardedTestNode],
+    db: &str,
+    rp: &str,
+    measurement: &str,
+    new_primary: u64,
+) {
+    let refs: Vec<&ShardedTestNode> = nodes.iter().collect();
+    promote_region_primary_on_nodes(&refs, db, rp, measurement, new_primary).await;
+}
+
+pub async fn promote_region_primary_on_nodes(
+    nodes: &[&ShardedTestNode],
     db: &str,
     rp: &str,
     measurement: &str,

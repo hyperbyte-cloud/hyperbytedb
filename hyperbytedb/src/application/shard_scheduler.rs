@@ -16,7 +16,9 @@ use crate::application::shard_transfer::{
 };
 use crate::config::ShardingConfig;
 use crate::domain::cluster::membership::{NodeState, SharedMembership};
-use crate::domain::sharding::{MeasurementKey, ShardMapOp, ShardRegion, ShardRehomeRequest};
+use crate::domain::sharding::{
+    MeasurementKey, ShardMap, ShardMapOp, ShardRegion, ShardRehomeRequest,
+};
 use crate::error::HyperbytedbError;
 use crate::ports::metadata::MetadataPort;
 use crate::ports::points_sink::PointsSinkPort;
@@ -365,6 +367,14 @@ impl ShardScheduler {
 
                 if let Err(e) = self.try_place_live_member(&space.key, region).await {
                     tracing::debug!(error = %e, region_id = region.region_id, "live placement skipped");
+                }
+
+                if let Err(e) = self.try_place_idle_member(&space.key, region).await {
+                    tracing::debug!(error = %e, region_id = region.region_id, "idle placement skipped");
+                }
+
+                if let Err(e) = self.try_place_primary(&space.key, region).await {
+                    tracing::debug!(error = %e, region_id = region.region_id, "primary placement skipped");
                 }
 
                 if let Err(e) = self.try_rebalance(&space.key, region, &hb).await {
@@ -1026,22 +1036,200 @@ impl ShardScheduler {
         Ok(())
     }
 
+    /// Give a member that joined an already-replicated cluster a replica slot.
+    ///
+    /// `try_place_live_member` only fires while a region is below effective RF.
+    /// At 3 nodes and RF 3 every region is already complete, so a 4th process
+    /// needs an existing peer to step aside instead. Rows are staged onto the
+    /// newcomer before `MovePeer` commits — same stage-then-commit ordering, so
+    /// no peer is ever published holding nothing. `MovePeer` appends the
+    /// newcomer, which makes it the region's newest peer and therefore the next
+    /// primary-placement candidate.
+    async fn try_place_idle_member(
+        &self,
+        key: &MeasurementKey,
+        region: &ShardRegion,
+    ) -> Result<(), HyperbytedbError> {
+        let Some(pc) = self.peer_client.as_ref() else {
+            return Ok(());
+        };
+
+        let newcomer = {
+            let m = self.membership.read().await;
+            m.active_peers(0)
+                .into_iter()
+                .max_by_key(|n| (n.joined_at, n.node_id))
+                .map(|n| (n.node_id, n.addr.clone()))
+        };
+        let Some((newcomer, addr)) = newcomer else {
+            return Ok(());
+        };
+
+        let map = self.shard_map.snapshot().await?;
+        let memberships = region_memberships(&map);
+        let Some(displaced) = idle_member_replica_swap(region, newcomer, &memberships) else {
+            return Ok(());
+        };
+
+        let joiner_ver = fetch_peer_map_version(pc.http_client(), &addr).await?;
+        if !joiner_map_caught_up(map.map_version, joiner_ver) {
+            tracing::debug!(
+                region_id = region.region_id,
+                newcomer,
+                cluster_ver = map.map_version,
+                joiner_ver,
+                "skip idle placement: newcomer map not caught up"
+            );
+            return Ok(());
+        }
+
+        if region.primary == self.node_id {
+            let outcome = stage_region_transfer_data(
+                pc,
+                &self.metadata,
+                &self.wal,
+                self.query_port.as_ref(),
+                self.node_id,
+                key,
+                region,
+                newcomer,
+                self.max_points_per_request,
+            )
+            .await?;
+            if !outcome.verified() {
+                return Err(HyperbytedbError::ShardMap(
+                    format!(
+                        "idle placement stage unverified: exported={} applied={}",
+                        outcome.exported, outcome.applied
+                    )
+                    .into(),
+                ));
+            }
+        } else {
+            request_region_stage(
+                pc.as_ref(),
+                &self.membership,
+                region.primary,
+                key,
+                region,
+                newcomer,
+            )
+            .await?;
+        }
+
+        tracing::info!(
+            region_id = region.region_id,
+            displaced,
+            newcomer,
+            "moving region replica onto newly joined member"
+        );
+        self.propose(ShardMapOp::MovePeer {
+            key: key.clone(),
+            region_id: region.region_id,
+            from_peer: displaced,
+            to_peer: newcomer,
+            epoch: region.epoch,
+        })
+        .await?;
+        counter!("hyperbytedb_shard_idle_placements_total").increment(1);
+        Ok(())
+    }
+
+    /// Hand a region's primary to its newest peer so a joiner starts taking
+    /// writes instead of serving only as a replica.
+    ///
+    /// Rows move and are verified *before* `TransferPrimary` commits, the same
+    /// ordering drain and rebalance use: an empty primary must never own a
+    /// range. `try_rebalance` cannot do this job — it reacts to a 2x byte-load
+    /// imbalance between peers, and a joiner that has just been staged holds a
+    /// copy of the same rows, so the imbalance it looks for never appears.
+    async fn try_place_primary(
+        &self,
+        key: &MeasurementKey,
+        region: &ShardRegion,
+    ) -> Result<(), HyperbytedbError> {
+        let Some(pc) = self.peer_client.as_ref() else {
+            return Ok(());
+        };
+
+        let map = self.shard_map.snapshot().await?;
+        let counts = primary_counts(&map);
+        let active: Vec<u64> = {
+            let m = self.membership.read().await;
+            m.active_peers(0).into_iter().map(|n| n.node_id).collect()
+        };
+        let Some(new_primary) = primary_placement_candidate(region, &counts, &active) else {
+            return Ok(());
+        };
+
+        // Source from whoever holds the authoritative rows. Exporting from the
+        // leader when leadership and primary diverge finds nothing, and a
+        // 0-exported/0-applied transfer "verifies" vacuously onto an empty node.
+        if region.primary == self.node_id {
+            run_region_transfer(
+                pc,
+                &self.metadata,
+                &self.wal,
+                self.query_port.as_ref(),
+                self.points_sink.as_ref(),
+                self.node_id,
+                key,
+                region,
+                new_primary,
+                self.max_points_per_request,
+                // Placement keeps the same range and only changes who leads it;
+                // keep the source copy as a replica rather than stranding data
+                // if the ownership change later fails.
+                false,
+            )
+            .await?;
+        } else {
+            request_region_rehome(
+                pc,
+                &self.membership,
+                region.primary,
+                key,
+                region,
+                new_primary,
+                false,
+            )
+            .await?;
+        }
+
+        tracing::info!(
+            region_id = region.region_id,
+            from = region.primary,
+            to = new_primary,
+            "placing region primary on newest peer"
+        );
+        self.propose(ShardMapOp::TransferPrimary {
+            key: key.clone(),
+            region_id: region.region_id,
+            new_primary,
+            epoch: region.epoch,
+        })
+        .await?;
+        counter!("hyperbytedb_shard_primary_placements_total").increment(1);
+        Ok(())
+    }
+
     async fn try_rebalance(
         &self,
         key: &MeasurementKey,
         region: &ShardRegion,
         hb: &[(u64, u64, u64, u64, u64, u64)],
     ) -> Result<(), HyperbytedbError> {
+        // Only peers that have actually reported can be scored. A peer with no
+        // live heartbeat row is unmeasured, not empty: scoring it as 0 bytes
+        // made any freshly added replica look infinitely lighter than the
+        // primary and handed it ownership on the strength of missing telemetry.
         let mut loads: Vec<(u64, u64)> = region
             .peers
             .iter()
-            .map(|node| {
-                let bytes = hb
-                    .iter()
+            .filter_map(|node| {
+                hb.iter()
                     .find(|(r, n, _, _, _, _)| *r == region.region_id && *n == *node)
-                    .map(|(_, _, _, b, _, _)| *b)
-                    .unwrap_or(0);
-                (*node, bytes)
+                    .map(|(_, _, _, b, _, _)| (*node, *b))
             })
             .collect();
         if loads.len() < 2 {
@@ -1284,6 +1472,96 @@ pub fn live_replica_candidate(
         .copied()
         .filter(|id| !region.peers.contains(id))
         .min()
+}
+
+/// Count the regions each node is primary for, across every space in the map.
+#[must_use]
+pub fn primary_counts(map: &ShardMap) -> HashMap<u64, usize> {
+    let mut counts: HashMap<u64, usize> = HashMap::new();
+    for space in map.spaces.values() {
+        for region in &space.regions {
+            *counts.entry(region.primary).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+/// Count the regions each node is a peer of, across every space in the map.
+#[must_use]
+pub fn region_memberships(map: &ShardMap) -> HashMap<u64, usize> {
+    let mut counts: HashMap<u64, usize> = HashMap::new();
+    for space in map.spaces.values() {
+        for region in &space.regions {
+            for peer in &region.peers {
+                *counts.entry(*peer).or_insert(0) += 1;
+            }
+        }
+    }
+    counts
+}
+
+/// Non-primary peer that should yield its replica slot to `newcomer`, or `None`
+/// when this region is already well placed.
+///
+/// An RF-complete region never triggers `AddPeer`, so a process joining an
+/// already-replicated cluster (3 nodes at RF 3, add a 4th) would own nothing
+/// forever — every region legitimately has its full replica count, and pure
+/// load balancing has no reason to disturb them. The bias is deliberately
+/// one-way: only the newcomer displaces anyone, and only a peer carrying
+/// strictly more region memberships than it.
+///
+/// `newcomer` must be the newest active member — the caller establishes that,
+/// and it is what makes the swap converge. Because the identity is stable until
+/// membership itself changes, the node just displaced cannot turn around and
+/// reclaim the slot: it is not the newcomer. Passing an arbitrary node here
+/// forfeits that guarantee and can trade a slot back and forth.
+#[must_use]
+pub fn idle_member_replica_swap(
+    region: &ShardRegion,
+    newcomer: u64,
+    memberships: &HashMap<u64, usize>,
+) -> Option<u64> {
+    if region.transfer_outstanding() || region.peers.contains(&newcomer) {
+        return None;
+    }
+    let newcomer_load = memberships.get(&newcomer).copied().unwrap_or(0);
+    region
+        .peers
+        .iter()
+        .copied()
+        .filter(|p| *p != region.primary)
+        .map(|p| (memberships.get(&p).copied().unwrap_or(0), p))
+        .filter(|(load, _)| *load > newcomer_load)
+        .max()
+        .map(|(_, peer)| peer)
+}
+
+/// Node that should take this region's primary so a newly added replica starts
+/// serving writes, or `None` when the primary is already well placed.
+///
+/// The candidate is the region's newest peer — `AddPeer` appends, and region
+/// sorting only orders by range, so `peers.last()` is the most recently placed
+/// replica. It takes the primary only while it carries strictly fewer primaries
+/// than the current one, which is what stops a join from stampeding every
+/// region's primary onto the joiner and what makes the rule terminate: once the
+/// newest peer *is* the primary the rule no longer applies, so there is no
+/// oscillation back to the previous owner.
+#[must_use]
+pub fn primary_placement_candidate(
+    region: &ShardRegion,
+    primary_counts: &HashMap<u64, usize>,
+    active_member_ids: &[u64],
+) -> Option<u64> {
+    if region.transfer_outstanding() {
+        return None;
+    }
+    let newest = *region.peers.last()?;
+    if newest == region.primary || !active_member_ids.contains(&newest) {
+        return None;
+    }
+    let current = primary_counts.get(&region.primary).copied().unwrap_or(0);
+    let candidate = primary_counts.get(&newest).copied().unwrap_or(0);
+    (candidate < current).then_some(newest)
 }
 
 /// Read a peer's committed `map_version` via `/internal/shard/map`.
@@ -2106,6 +2384,169 @@ mod tests {
         let mut region = sample_region_peers(vec![1], 1);
         region.transfer_verified = Some(false);
         assert_eq!(live_replica_candidate(&region, &[1, 2], 3), None);
+    }
+
+    /// Build a map whose single space holds `regions`, for primary counting.
+    fn map_of(regions: Vec<ShardRegion>) -> ShardMap {
+        let key = MeasurementKey::new("db", "autogen", "cpu");
+        let mut map = ShardMap::default();
+        map.spaces.insert(
+            key.clone(),
+            crate::domain::sharding::MeasurementShardSpace { key, regions },
+        );
+        map
+    }
+
+    #[test]
+    fn primary_counts_tallies_every_space() {
+        let map = map_of(vec![
+            sample_region_peers(vec![1, 2], 1),
+            sample_region_peers(vec![1, 2], 2),
+            sample_region_peers(vec![1, 2], 1),
+        ]);
+        let counts = primary_counts(&map);
+        assert_eq!(counts.get(&1), Some(&2));
+        assert_eq!(counts.get(&2), Some(&1));
+    }
+
+    #[test]
+    fn primary_placement_hands_only_region_to_the_joiner() {
+        let region = sample_region_peers(vec![1, 2], 1);
+        let counts = primary_counts(&map_of(vec![region.clone()]));
+        assert_eq!(
+            primary_placement_candidate(&region, &counts, &[1, 2]),
+            Some(2),
+            "a joiner with no primaries must take the region so writes land on it"
+        );
+    }
+
+    /// The rule must terminate: after the joiner takes the primary, evaluating
+    /// the same region again must not hand it straight back.
+    #[test]
+    fn primary_placement_does_not_oscillate() {
+        let placed = sample_region_peers(vec![1, 2], 2);
+        let counts = primary_counts(&map_of(vec![placed.clone()]));
+        assert_eq!(
+            primary_placement_candidate(&placed, &counts, &[1, 2]),
+            None,
+            "newest peer already holds the primary; nothing left to place"
+        );
+    }
+
+    #[test]
+    fn primary_placement_stops_at_an_even_split() {
+        // Four regions, primaries already 2/2 across the pair.
+        let regions = vec![
+            sample_region_peers(vec![1, 2], 1),
+            sample_region_peers(vec![1, 2], 1),
+            sample_region_peers(vec![1, 2], 2),
+            sample_region_peers(vec![1, 2], 2),
+        ];
+        let counts = primary_counts(&map_of(regions.clone()));
+        assert_eq!(
+            primary_placement_candidate(&regions[0], &counts, &[1, 2]),
+            None,
+            "moving another primary would only invert the imbalance"
+        );
+    }
+
+    #[test]
+    fn primary_placement_drains_a_lopsided_owner() {
+        let regions = vec![
+            sample_region_peers(vec![1, 2], 1),
+            sample_region_peers(vec![1, 2], 1),
+            sample_region_peers(vec![1, 2], 1),
+        ];
+        let counts = primary_counts(&map_of(regions.clone()));
+        assert_eq!(
+            primary_placement_candidate(&regions[0], &counts, &[1, 2]),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn primary_placement_skips_inactive_and_indebted() {
+        let region = sample_region_peers(vec![1, 2], 1);
+        let counts = primary_counts(&map_of(vec![region.clone()]));
+        assert_eq!(
+            primary_placement_candidate(&region, &counts, &[1]),
+            None,
+            "joiner is not an active member"
+        );
+
+        let mut indebted = region.clone();
+        indebted.transfer_verified = Some(false);
+        assert_eq!(
+            primary_placement_candidate(&indebted, &counts, &[1, 2]),
+            None,
+            "no ownership mutation while transfer debt is outstanding"
+        );
+    }
+
+    #[test]
+    fn idle_member_displaces_a_loaded_replica_not_the_primary() {
+        let region = sample_region_peers(vec![1, 2, 3], 1);
+        let memberships = region_memberships(&map_of(vec![region.clone()]));
+        let displaced =
+            idle_member_replica_swap(&region, 4, &memberships).expect("newcomer takes a slot");
+        assert_ne!(displaced, 1, "the primary must never be displaced");
+        assert!(displaced == 2 || displaced == 3);
+    }
+
+    /// The swap must converge. `newcomer` stays the same node for as long as
+    /// membership is unchanged, so once it holds the slot the rule stops firing
+    /// and the slot cannot trade back and forth.
+    #[test]
+    fn idle_member_swap_converges() {
+        let before = sample_region_peers(vec![1, 2, 3], 1);
+        let displaced = idle_member_replica_swap(
+            &before,
+            4,
+            &region_memberships(&map_of(vec![before.clone()])),
+        )
+        .expect("first pass moves the newcomer in");
+
+        let mut after = before.clone();
+        after.peers.retain(|p| *p != displaced);
+        after.peers.push(4);
+        assert_eq!(
+            idle_member_replica_swap(&after, 4, &region_memberships(&map_of(vec![after.clone()]))),
+            None,
+            "second pass with the same newcomer must be a no-op"
+        );
+    }
+
+    #[test]
+    fn idle_member_swap_skips_debt_and_balanced_regions() {
+        let mut indebted = sample_region_peers(vec![1, 2, 3], 1);
+        indebted.transfer_verified = Some(false);
+        let memberships = region_memberships(&map_of(vec![indebted.clone()]));
+        assert_eq!(
+            idle_member_replica_swap(&indebted, 4, &memberships),
+            None,
+            "no peer mutation while transfer debt is outstanding"
+        );
+
+        // Newcomer already carries as many memberships as every replica here.
+        let region = sample_region_peers(vec![1, 2, 3], 1);
+        let balanced = region_memberships(&map_of(vec![
+            region.clone(),
+            sample_region_peers(vec![4, 5, 6], 4),
+        ]));
+        assert_eq!(idle_member_replica_swap(&region, 4, &balanced), None);
+    }
+
+    #[test]
+    fn primary_placement_never_moves_off_the_newest_peer() {
+        // Node 3 is both newest and primary while node 1 carries none. Evening
+        // that out is byte-load rebalance's job, not placement's — placement
+        // exists to give a joiner work, and node 3 already has it.
+        let region = sample_region_peers(vec![1, 2, 3], 3);
+        let counts = primary_counts(&map_of(vec![region.clone()]));
+        assert_eq!(
+            primary_placement_candidate(&region, &counts, &[1, 2, 3]),
+            None
+        );
     }
 
     #[tokio::test]
