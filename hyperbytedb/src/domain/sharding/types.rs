@@ -217,6 +217,20 @@ impl From<&ShardMap> for ShardMapJson {
     }
 }
 
+impl From<ShardMapJson> for ShardMap {
+    fn from(json: ShardMapJson) -> Self {
+        let mut spaces = HashMap::new();
+        for space in json.spaces {
+            spaces.insert(space.key.clone(), space);
+        }
+        Self {
+            map_version: json.map_version,
+            next_region_id: json.next_region_id,
+            spaces,
+        }
+    }
+}
+
 #[cfg(test)]
 mod locate_tests {
     use super::*;

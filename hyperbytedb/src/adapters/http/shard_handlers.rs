@@ -540,11 +540,15 @@ pub async fn handle_shard_transfer(
     Json(req): Json<ShardTransferPayload>,
 ) -> impl IntoResponse {
     if req.stage {
-        // Pre-commit staging (split optimization): the range is not owned by
-        // the destination in the committed map yet, so region/epoch checks are
-        // skipped. Guard rails: sender must be a known member and the local
-        // measurement must exist; rows outside `[start, end)` are filtered
-        // during apply.
+        // Pre-commit staging (split optimization, and replica placement onto a
+        // joiner): the range is not owned by the destination in the committed
+        // map yet, so region/epoch checks are skipped. The only guard rail is
+        // that the sender must be a known member; rows outside `[start, end)`
+        // are filtered during apply.
+        //
+        // There is deliberately no local-measurement check. A joiner receiving
+        // a measurement it has never seen has no catalog row yet, and
+        // `apply_transfer_push` creates one via `prepare_batch_metadata`.
         let Some(membership) = state.membership.as_ref() else {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -561,20 +565,6 @@ pub async fn handle_shard_transfer(
                 .into_response();
         }
         drop(m);
-        if state
-            .metadata
-            .get_measurement(&req.db, &req.rp, &req.measurement)
-            .await
-            .ok()
-            .flatten()
-            .is_none()
-        {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "measurement not found for staging"})),
-            )
-                .into_response();
-        }
     } else {
         let Some(ctx) = state.shard_routing.as_ref() else {
             return sharding_disabled();
@@ -710,19 +700,33 @@ pub async fn handle_shard_rehome(
             .into_response();
     }
 
-    let outcome = match push_region_transfer_data(
-        peer_client,
-        &state.metadata,
-        &state.wal,
-        Some(&state.query_port),
-        state.node_id,
-        &ctx_key(&req),
-        region,
-        req.dest_primary,
-        state.max_points_per_request,
-    )
-    .await
-    {
+    let outcome = match if req.stage {
+        crate::application::shard_transfer::stage_region_transfer_data(
+            peer_client,
+            &state.metadata,
+            &state.wal,
+            Some(&state.query_port),
+            state.node_id,
+            &ctx_key(&req),
+            region,
+            req.dest_primary,
+            state.max_points_per_request,
+        )
+        .await
+    } else {
+        push_region_transfer_data(
+            peer_client,
+            &state.metadata,
+            &state.wal,
+            Some(&state.query_port),
+            state.node_id,
+            &ctx_key(&req),
+            region,
+            req.dest_primary,
+            state.max_points_per_request,
+        )
+        .await
+    } {
         Ok(o) => o,
         Err(e) => {
             counter!("hyperbytedb_shard_transfer_failures_total").increment(1);
@@ -734,18 +738,19 @@ pub async fn handle_shard_rehome(
         }
     };
 
-    if let Err(e) = complete_region_transfer(
-        peer_client,
-        &state.metadata,
-        Some(&state.points_sink),
-        state.node_id,
-        &ctx_key(&req),
-        region,
-        req.dest_primary,
-        outcome.transfer_id,
-        req.drop_source,
-    )
-    .await
+    if !req.stage
+        && let Err(e) = complete_region_transfer(
+            peer_client,
+            &state.metadata,
+            Some(&state.points_sink),
+            state.node_id,
+            &ctx_key(&req),
+            region,
+            req.dest_primary,
+            outcome.transfer_id,
+            req.drop_source,
+        )
+        .await
     {
         counter!("hyperbytedb_shard_transfer_failures_total").increment(1);
         return (

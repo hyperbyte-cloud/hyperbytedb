@@ -58,6 +58,17 @@ pub enum ShardMapOp {
         #[serde(default)]
         epoch: ShardEpoch,
     },
+    /// Grow a region's replica set. Does not change primary.
+    ///
+    /// Used when effective RF has room (n grew). Transfer data onto `to_peer`
+    /// *before* proposing this op — commit-then-stage is the heal path only.
+    AddPeer {
+        key: MeasurementKey,
+        region_id: u64,
+        to_peer: u64,
+        #[serde(default)]
+        epoch: ShardEpoch,
+    },
     TransferPrimary {
         key: MeasurementKey,
         region_id: u64,
@@ -84,6 +95,7 @@ impl ShardMapOp {
             | ShardMapOp::Split { key, .. }
             | ShardMapOp::Merge { key, .. }
             | ShardMapOp::MovePeer { key, .. }
+            | ShardMapOp::AddPeer { key, .. }
             | ShardMapOp::TransferPrimary { key, .. }
             | ShardMapOp::ClearVerified { key, .. } => key,
         }
@@ -265,6 +277,38 @@ pub fn apply_shard_map_op(
             if region.primary == from_peer {
                 region.primary = to_peer;
             }
+            sort_space_regions(space);
+        }
+        ShardMapOp::AddPeer {
+            key,
+            region_id,
+            to_peer,
+            epoch,
+        } => {
+            let space = map
+                .spaces
+                .get_mut(&key)
+                .ok_or(ShardMapApplyError::UnknownSpace)?;
+            let region = space
+                .regions
+                .iter_mut()
+                .find(|r| r.region_id == region_id)
+                .ok_or(ShardMapApplyError::UnknownRegion(region_id))?;
+            if region.epoch != epoch {
+                return Err(ShardMapApplyError::StaleEpoch("AddPeer"));
+            }
+            if region.transfer_outstanding() {
+                return Err(ShardMapApplyError::Invalid(
+                    "cannot add peer while transfer debt is outstanding".into(),
+                ));
+            }
+            if region.peers.contains(&to_peer) {
+                return Err(ShardMapApplyError::Invalid(format!(
+                    "peer {to_peer} already in region"
+                )));
+            }
+            region.peers.push(to_peer);
+            region.epoch = epoch.bump_conf_ver();
             sort_space_regions(space);
         }
         ShardMapOp::TransferPrimary {
@@ -510,6 +554,86 @@ mod tests {
     }
 
     #[test]
+    fn add_peer_appends_replica_without_moving_primary() {
+        let key = MeasurementKey::new("db", "autogen", "cpu");
+        let region = sample_region(1, 0, u64::MAX, 1);
+        let mut map = ShardMap::default();
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::BootstrapMeasurement {
+                key: key.clone(),
+                region: region.clone(),
+            },
+        )
+        .unwrap();
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::AddPeer {
+                key,
+                region_id: 1,
+                to_peer: 3,
+                epoch: region.epoch,
+            },
+        )
+        .unwrap();
+        let r = &map.spaces.values().next().unwrap().regions[0];
+        assert_eq!(r.primary, 1);
+        assert!(r.peers.contains(&3));
+        assert_eq!(r.epoch.conf_ver, region.epoch.conf_ver + 1);
+    }
+
+    #[test]
+    fn add_peer_rejects_duplicate_and_stale_epoch() {
+        let key = MeasurementKey::new("db", "autogen", "cpu");
+        let region = sample_region(1, 0, u64::MAX, 1);
+        let mut map = ShardMap::default();
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::BootstrapMeasurement {
+                key: key.clone(),
+                region: region.clone(),
+            },
+        )
+        .unwrap();
+        let dup = apply_shard_map_op(
+            &mut map,
+            ShardMapOp::AddPeer {
+                key: key.clone(),
+                region_id: 1,
+                to_peer: 1,
+                epoch: region.epoch,
+            },
+        )
+        .unwrap_err();
+        assert!(dup.to_string().contains("already in region"), "{dup}");
+
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::AddPeer {
+                key: key.clone(),
+                region_id: 1,
+                to_peer: 3,
+                epoch: region.epoch,
+            },
+        )
+        .unwrap();
+        let stale = apply_shard_map_op(
+            &mut map,
+            ShardMapOp::AddPeer {
+                key,
+                region_id: 1,
+                to_peer: 4,
+                epoch: region.epoch,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            stale.to_string().contains("stale epoch on AddPeer"),
+            "{stale}"
+        );
+    }
+
+    #[test]
     fn transfer_primary_changes_owner() {
         let key = MeasurementKey::new("db", "autogen", "cpu");
         let region = sample_region(1, 0, u64::MAX, 1);
@@ -637,6 +761,32 @@ mod tests {
             transfer_first_seen: Some(first_seen),
             ..sample_region(id, start, end, primary)
         }
+    }
+
+    #[test]
+    fn add_peer_rejects_outstanding_transfer_debt() {
+        let key = MeasurementKey::new("db", "autogen", "cpu");
+        let region = flagged_region(1, 0, u64::MAX, 1, 1000);
+        let mut map = ShardMap::default();
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::BootstrapMeasurement {
+                key: key.clone(),
+                region: region.clone(),
+            },
+        )
+        .unwrap();
+        let err = apply_shard_map_op(
+            &mut map,
+            ShardMapOp::AddPeer {
+                key,
+                region_id: 1,
+                to_peer: 3,
+                epoch: region.epoch,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("transfer debt"), "{err}");
     }
 
     #[test]

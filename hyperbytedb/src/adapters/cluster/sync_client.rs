@@ -7,6 +7,7 @@ use crate::domain::cluster::membership::{NodeState, SharedMembership};
 use crate::domain::cluster::sync::{
     JoinRequest, JoinResponse, MetadataSnapshot, SyncManifest, WalSyncResponse,
 };
+use crate::domain::sharding::{ShardMap, ShardMapJson};
 use crate::error::HyperbytedbError;
 use crate::ports::metadata::MetadataPort;
 use crate::ports::points_sink::PointsSinkPort;
@@ -133,6 +134,7 @@ impl SyncClient {
             );
 
             self.sync_metadata(&peer_addr).await?;
+            self.sync_shard_map(&peer_addr).await?;
 
             let updated_wal_seq = self.wal.last_sequence().await?;
             let applied = self.wal_catchup(&peer_addr, updated_wal_seq).await?;
@@ -178,6 +180,23 @@ impl SyncClient {
         );
 
         self.sync_metadata(&peer_addr).await?;
+        // Install the committed map before any region data movement so the
+        // joiner's map_version matches the cluster at Active.
+        //
+        // Best-effort: `/internal/shard/map` only exists on peers that have
+        // sharding enabled and run a build that serves it, so a 404 here says
+        // nothing about whether this node can catch up its WAL. Failing hard
+        // used to abort the join before `wal_catchup`, and after the retries
+        // were exhausted the node went Active having synced nothing at all.
+        // Skipping is safe: without a map there are no regions to move below,
+        // and the leader's own catch-up check gates placement onto this node.
+        if let Err(e) = self.sync_shard_map(&peer_addr).await {
+            tracing::warn!(
+                error = %e,
+                peer = %peer_addr,
+                "shard map install failed; continuing with WAL catch-up"
+            );
+        }
 
         let mut applied = 0u64;
         if let Some(ref shard_map) = self.shard_map {
@@ -325,6 +344,42 @@ impl SyncClient {
         }
 
         tracing::debug!("metadata sync complete");
+        Ok(())
+    }
+
+    /// Copy the peer's committed shard map so `map_version` matches before
+    /// region rows are transferred onto this joiner.
+    pub async fn sync_shard_map(&self, peer_addr: &str) -> Result<(), HyperbytedbError> {
+        let Some(shard_map) = self.shard_map.as_ref() else {
+            return Ok(());
+        };
+        let remote = fetch_shard_map(self.client.clone(), peer_addr).await?;
+        let version = remote.map_version;
+
+        // Never move the map backwards. `map_version` counts local applies and
+        // the sync peer is whichever Active node came first out of a HashMap —
+        // not the leader, and not necessarily the most-applied node. Installing
+        // an older snapshot would drop ops Raft will never redeliver, because
+        // `replace_map` bypasses the state machine and leaves `last_applied`
+        // untouched; every later op would then fail StaleEpoch/UnknownRegion
+        // and the node would silently stop owning regions it holds data for.
+        let local = shard_map.snapshot().await?.map_version;
+        if !remote_map_is_newer(version, local) {
+            tracing::info!(
+                peer = %peer_addr,
+                remote_map_version = version,
+                local_map_version = local,
+                "peer shard map is not newer; keeping local map"
+            );
+            return Ok(());
+        }
+
+        shard_map.replace_map(remote).await?;
+        tracing::info!(
+            peer = %peer_addr,
+            map_version = version,
+            "installed peer shard map before region movement"
+        );
         Ok(())
     }
 
@@ -487,6 +542,39 @@ impl SyncClient {
     }
 }
 
+/// GET `/internal/shard/map` from `peer_addr` and return the committed snapshot.
+/// Whether a peer's shard map may replace the local one.
+///
+/// Strictly-newer only. Equal is a no-op, and older must be refused: a sync
+/// peer is whichever Active node came first out of a `HashMap`, so it is not
+/// necessarily the leader or the most-applied node.
+#[must_use]
+pub fn remote_map_is_newer(remote_version: u64, local_version: u64) -> bool {
+    remote_version > local_version
+}
+
+pub async fn fetch_shard_map(
+    client: reqwest::Client,
+    peer_addr: &str,
+) -> Result<ShardMap, HyperbytedbError> {
+    let url = format!("http://{peer_addr}/internal/shard/map");
+    let resp =
+        client.get(&url).send().await.map_err(|e| {
+            HyperbytedbError::PeerUnreachable(format!("shard map request failed: {e}"))
+        })?;
+    if !resp.status().is_success() {
+        return Err(HyperbytedbError::SyncFailed(format!(
+            "shard map request failed: {}",
+            resp.status()
+        )));
+    }
+    let json: ShardMapJson = resp
+        .json()
+        .await
+        .map_err(|e| HyperbytedbError::SyncFailed(format!("parse shard map: {e}")))?;
+    Ok(ShardMap::from(json))
+}
+
 /// Fail closed when the peer advertises a higher WAL watermark but returns no
 /// readable entries — usually because the leader truncated past the gap.
 fn verify_catchup_progress(
@@ -509,8 +597,18 @@ fn verify_catchup_progress(
 
 #[cfg(test)]
 mod tests {
-    use super::verify_catchup_progress;
+    use super::{remote_map_is_newer, verify_catchup_progress};
     use crate::error::HyperbytedbError;
+
+    #[test]
+    fn remote_map_installs_only_when_strictly_newer() {
+        assert!(remote_map_is_newer(10, 0), "fresh joiner takes the map");
+        assert!(remote_map_is_newer(10, 9));
+        assert!(!remote_map_is_newer(10, 10), "equal is a no-op");
+        // The case that silently strands a node: syncing from a less-applied
+        // peer would drop ops Raft never redelivers.
+        assert!(!remote_map_is_newer(8, 10));
+    }
 
     #[test]
     fn verify_catchup_progress_ok_when_caught_up() {

@@ -47,6 +47,8 @@ pub struct ShardedTestNode {
     pub location_cache: Arc<ShardLocationCache>,
     pub membership: SharedMembership,
     pub query_port: Arc<ChdbQueryAdapter>,
+    /// Shared with other in-process peers — libchdb allows one session per process.
+    pub chdb: SharedSession,
     flush: Arc<FlushServiceImpl>,
     handle: tokio::task::JoinHandle<()>,
     shutdown: Option<watch::Sender<bool>>,
@@ -123,7 +125,7 @@ pub async fn start_sharded_node(
     let wal = Arc::new(RocksDbWal::open(&wal_dir).unwrap());
     let metadata = Arc::new(RocksDbMetadata::open(&meta_dir).unwrap());
     let chdb_adapter = Arc::new(ChdbQueryAdapter::from_shared(chdb.clone(), 0));
-    let sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(chdb));
+    let sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(chdb.clone()));
     let flush: Arc<FlushServiceImpl> =
         Arc::new(FlushServiceImpl::new(wal.clone(), 0, sink.clone()));
 
@@ -284,10 +286,138 @@ pub async fn start_sharded_node(
         location_cache,
         membership: shared_membership,
         query_port: chdb_adapter,
+        chdb,
         flush,
         handle,
         shutdown: Some(shutdown_tx),
     }
+}
+
+pub async fn fetch_shard_map(
+    client: &reqwest::Client,
+    url: &str,
+) -> hyperbytedb::domain::sharding::ShardMap {
+    let resp = client
+        .get(format!("{url}/internal/shard/map"))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "shard map fetch failed: {}",
+        resp.status()
+    );
+    let json: hyperbytedb::domain::sharding::ShardMapJson = resp.json().await.unwrap();
+    json.into()
+}
+
+pub async fn install_shard_map_from_peer(from: &ShardedTestNode, onto: &ShardedTestNode) {
+    let client = reqwest::Client::new();
+    let map = fetch_shard_map(&client, &from.url).await;
+    onto.shard_map.replace_map(map).await.unwrap();
+    let snap = onto.shard_map.snapshot().await.unwrap();
+    onto.location_cache.refresh_from_map(&snap);
+}
+
+/// Start `node_id` sharing `existing`'s membership and chDB session (libchdb
+/// is process-global). Marks the joiner Active before serving.
+pub async fn start_sharded_joiner(
+    dir: &Path,
+    existing: &ShardedTestNode,
+    node_id: u64,
+    opts: &ShardedClusterOptions,
+) -> ShardedTestNode {
+    let listener = bind_ephemeral().await;
+    let addr = listener.local_addr().unwrap().to_string();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    {
+        let mut m = existing.membership.write().await;
+        m.add_node(NodeInfo {
+            node_id,
+            addr,
+            state: NodeState::Active,
+            joined_at: now,
+            last_heartbeat: now,
+            needs_sync: false,
+        });
+    }
+    start_sharded_node(
+        dir,
+        node_id,
+        listener,
+        existing.membership.clone(),
+        opts,
+        existing.chdb.clone(),
+    )
+    .await
+}
+
+pub async fn apply_add_peer_on_nodes(
+    nodes: &[&ShardedTestNode],
+    db: &str,
+    rp: &str,
+    measurement: &str,
+    to_peer: u64,
+) {
+    for node in nodes {
+        let map = node.shard_map.snapshot().await.unwrap();
+        let region = map
+            .space(db, rp, measurement)
+            .and_then(|s| s.regions.first())
+            .cloned()
+            .expect("region for AddPeer");
+        let op = ShardMapOp::AddPeer {
+            key: MeasurementKey::new(db, rp, measurement),
+            region_id: region.region_id,
+            to_peer,
+            epoch: region.epoch,
+        };
+        node.shard_map.apply_op(op).await.unwrap();
+        let snap = node.shard_map.snapshot().await.unwrap();
+        node.location_cache.refresh_from_map(&snap);
+    }
+}
+
+pub async fn apply_move_peer_on_nodes(
+    nodes: &[&ShardedTestNode],
+    db: &str,
+    rp: &str,
+    measurement: &str,
+    from_peer: u64,
+    to_peer: u64,
+) {
+    for node in nodes {
+        let map = node.shard_map.snapshot().await.unwrap();
+        let region = map
+            .space(db, rp, measurement)
+            .and_then(|s| s.regions.first())
+            .cloned()
+            .expect("region for MovePeer");
+        let op = ShardMapOp::MovePeer {
+            key: MeasurementKey::new(db, rp, measurement),
+            region_id: region.region_id,
+            from_peer,
+            to_peer,
+            epoch: region.epoch,
+        };
+        node.shard_map.apply_op(op).await.unwrap();
+        let snap = node.shard_map.snapshot().await.unwrap();
+        node.location_cache.refresh_from_map(&snap);
+    }
+}
+
+pub async fn start_sharded_single_node(dir: &Path, opts: ShardedClusterOptions) -> ShardedTestNode {
+    let chdb_dir = dir.join("chdb-shared");
+    std::fs::create_dir_all(&chdb_dir).unwrap();
+    let chdb = SharedSession::new_eager(chdb_dir.to_str().unwrap(), 1).unwrap();
+
+    let l1 = bind_ephemeral().await;
+    let a1 = l1.local_addr().unwrap().to_string();
+    let membership = build_shared_membership(&[(1, a1)]);
+    start_sharded_node(dir, 1, l1, membership, &opts, chdb).await
 }
 
 pub async fn start_sharded_pair_cluster(
@@ -371,6 +501,17 @@ pub async fn set_node_state(membership: &SharedMembership, node_id: u64, state: 
 /// without waiting for the scheduler).
 pub async fn promote_region_primary_on_all_nodes(
     nodes: &[ShardedTestNode],
+    db: &str,
+    rp: &str,
+    measurement: &str,
+    new_primary: u64,
+) {
+    let refs: Vec<&ShardedTestNode> = nodes.iter().collect();
+    promote_region_primary_on_nodes(&refs, db, rp, measurement, new_primary).await;
+}
+
+pub async fn promote_region_primary_on_nodes(
+    nodes: &[&ShardedTestNode],
     db: &str,
     rp: &str,
     measurement: &str,

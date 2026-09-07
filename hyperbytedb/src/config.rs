@@ -79,6 +79,12 @@ pub struct ShardingConfig {
     /// older than the `ClearVerified` op cannot decode it from the Raft log.
     #[serde(default = "default_transfer_clear_proposals_enabled")]
     pub transfer_clear_proposals_enabled: bool,
+    /// Propose `AddPeer` shard-map ops to place a joiner as a region replica.
+    /// Disable for the duration of a rolling upgrade: a node on a build older
+    /// than the `AddPeer` op cannot decode it, rejects the append RPC carrying
+    /// it, and stops replicating until every node is upgraded.
+    #[serde(default = "default_add_peer_proposals_enabled")]
+    pub add_peer_proposals_enabled: bool,
 }
 
 impl Default for ShardingConfig {
@@ -100,6 +106,7 @@ impl Default for ShardingConfig {
             scatter_max_peer_attempts: default_scatter_max_peer_attempts(),
             peer_heal_enabled: default_peer_heal_enabled(),
             transfer_clear_proposals_enabled: default_transfer_clear_proposals_enabled(),
+            add_peer_proposals_enabled: default_add_peer_proposals_enabled(),
         }
     }
 }
@@ -157,6 +164,21 @@ fn default_peer_heal_enabled() -> bool {
 }
 
 fn default_transfer_clear_proposals_enabled() -> bool {
+    true
+}
+
+/// On, matching `transfer_clear_proposals_enabled`: the flag is an opt-out for
+/// a mixed-version rollout, not an opt-in for the feature.
+///
+/// The hazard is real but bounded. A follower on a build that does not know
+/// `AddPeer` fails to deserialize the whole append RPC — axum rejects the body
+/// before the handler runs — so it stops replicating and the leader can lose
+/// commit quorum for the duration. It is self-healing: replication resumes as
+/// soon as every node runs a build that knows the op, and ingest does not go
+/// through Raft. Defaulting off instead would leave region placement inert for
+/// everyone who enables sharding, which is the worse trade while sharding is
+/// beta and clusters are rebuilt more often than rolling-upgraded.
+fn default_add_peer_proposals_enabled() -> bool {
     true
 }
 
@@ -1242,5 +1264,15 @@ mod replicate_body_limit_tests {
             c.effective_replicate_body_limit_bytes(25 * 1024 * 1024),
             64 * 1024 * 1024
         );
+    }
+
+    /// Shard-map op gates are opt-*outs* for a rolling upgrade, not opt-ins for
+    /// the feature. Defaulting one off leaves the behaviour it guards inert for
+    /// everyone who never finds the flag.
+    #[test]
+    fn shard_map_op_gates_default_on() {
+        let s = super::ShardingConfig::default();
+        assert!(s.add_peer_proposals_enabled);
+        assert!(s.transfer_clear_proposals_enabled);
     }
 }

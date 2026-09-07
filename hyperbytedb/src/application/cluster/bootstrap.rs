@@ -98,6 +98,7 @@ impl ClusterBootstrap {
         wal: &Arc<dyn WalPort>,
         points_sink: Option<Arc<dyn PointsSinkPort>>,
         max_points_per_request: usize,
+        shard_map: Option<Arc<dyn crate::ports::sharding::ShardMapPort>>,
     ) -> anyhow::Result<()> {
         {
             let mut m = self.membership.write().await;
@@ -107,7 +108,7 @@ impl ClusterBootstrap {
 
         tracing::info!("startup phase: syncing with cluster before accepting traffic");
 
-        let sync_client = SyncClient::with_points_sink(
+        let mut sync_client = SyncClient::with_points_sink(
             config.node_id,
             config.cluster_addr.clone(),
             self.membership.clone(),
@@ -117,6 +118,9 @@ impl ClusterBootstrap {
             max_points_per_request,
             self.peer_addrs.clone(),
         );
+        if let Some(map) = shard_map {
+            sync_client = sync_client.with_shard_map(map);
+        }
 
         let dbs = metadata.list_databases().await?;
         let has_data = !dbs.is_empty();

@@ -9,13 +9,16 @@ use crate::adapters::cluster::peer_client::PeerClient;
 use crate::adapters::cluster::raft::HyperbytedbRaft;
 use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
 use crate::application::shard_peer_resolution::is_active_peer;
+use crate::application::shard_routing::effective_replication_factor;
 use crate::application::shard_transfer::{
     complete_region_transfer, push_region_transfer_data, run_region_transfer,
     stage_region_transfer_data,
 };
 use crate::config::ShardingConfig;
 use crate::domain::cluster::membership::{NodeState, SharedMembership};
-use crate::domain::sharding::{MeasurementKey, ShardMapOp, ShardRegion, ShardRehomeRequest};
+use crate::domain::sharding::{
+    MeasurementKey, ShardMap, ShardMapOp, ShardRegion, ShardRehomeRequest,
+};
 use crate::error::HyperbytedbError;
 use crate::ports::metadata::MetadataPort;
 use crate::ports::points_sink::PointsSinkPort;
@@ -29,6 +32,10 @@ type RegionHeartbeatRow = (u64, u64, u64, u64, u64, u64);
 /// scheduling decisions — otherwise stats from permanently-dead nodes would
 /// drive splits/rebalances forever.
 const HEARTBEAT_TTL_INTERVALS: u64 = 3;
+
+/// Warn once a region has gone this many consecutive ticks with candidates
+/// available but none caught up to the committed map.
+const PLACEMENT_STALL_WARN_TICKS: u32 = 5;
 
 /// Split only after the region's cooldown has elapsed. `last_split_at == 0`
 /// means "never split" (bootstrap must stamp wall-clock time); treating 0 as
@@ -116,6 +123,15 @@ pub struct ShardScheduler {
     /// enqueued — their primary changes are provisioned by the MV backfill
     /// path.
     rollup_dests: tokio::sync::RwLock<HashMap<MeasurementKey, ()>>,
+    /// Peer `map_version` probes for the tick in progress, keyed by node id,
+    /// cleared when each tick starts. `/internal/shard/map` serializes every
+    /// space and region in the cluster to answer one `u64`, so probing per
+    /// region cost O(regions x map size) bytes on every tick of a join.
+    peer_map_versions: tokio::sync::RwLock<HashMap<u64, u64>>,
+    /// Consecutive ticks a region skipped placement with no caught-up
+    /// candidate, keyed by region id. A cluster-wide placement stall is
+    /// otherwise only visible at `debug!`.
+    placement_stalls: tokio::sync::RwLock<HashMap<u64, u32>>,
     #[cfg(test)]
     test_force_leader: bool,
     #[cfg(test)]
@@ -154,6 +170,8 @@ impl ShardScheduler {
             unhealthy_primaries: tokio::sync::RwLock::new(HashMap::new()),
             reconciliation_queue: std::sync::Mutex::new(Vec::new()),
             rollup_dests: tokio::sync::RwLock::new(HashMap::new()),
+            peer_map_versions: tokio::sync::RwLock::new(HashMap::new()),
+            placement_stalls: tokio::sync::RwLock::new(HashMap::new()),
             #[cfg(test)]
             test_force_leader: false,
             #[cfg(test)]
@@ -171,6 +189,58 @@ impl ShardScheduler {
     pub fn with_test_propose_sink(mut self, sink: Arc<std::sync::Mutex<Vec<ShardMapOp>>>) -> Self {
         self.test_propose_sink = Some(sink);
         self
+    }
+
+    /// `peer`'s committed `map_version`, probed at most once per tick.
+    async fn cached_peer_map_version(
+        &self,
+        peer: u64,
+        addr: &str,
+        client: &reqwest::Client,
+    ) -> Result<u64, HyperbytedbError> {
+        if let Some(v) = self.peer_map_versions.read().await.get(&peer) {
+            return Ok(*v);
+        }
+        let version = fetch_peer_map_version(client, addr).await?;
+        self.peer_map_versions.write().await.insert(peer, version);
+        Ok(version)
+    }
+
+    /// Record that `region_id` could not place a replica this tick, and warn
+    /// once the stall has persisted. A placement blocked forever by a lagging
+    /// candidate is otherwise silent above `debug!`.
+    async fn note_placement_stall(&self, region_id: u64, candidates: usize) {
+        let mut stalls = self.placement_stalls.write().await;
+        let count = stalls.entry(region_id).or_insert(0);
+        *count = count.saturating_add(1);
+        if *count == PLACEMENT_STALL_WARN_TICKS {
+            counter!("hyperbytedb_shard_placement_stalled_total").increment(1);
+            tracing::warn!(
+                region_id,
+                candidates,
+                ticks = *count,
+                "region has no caught-up replica candidate; placement stalled"
+            );
+        }
+    }
+
+    async fn clear_placement_stall(&self, region_id: u64) {
+        self.placement_stalls.write().await.remove(&region_id);
+    }
+
+    /// True when `key` is a rollup (SummingMergeTree) destination.
+    ///
+    /// `apply_transfer_push` has no idempotence guard, so a staged region that
+    /// fails to commit its map op is staged again on the next tick. A
+    /// `ReplacingMergeTree` measurement collapses the redelivery; an additive
+    /// rollup destination sums it twice and is corrupted permanently. Contended
+    /// lock counts as "yes" — skipping a placement costs a tick, guessing wrong
+    /// costs the data.
+    async fn is_rollup_dest(&self, key: &MeasurementKey) -> bool {
+        match self.rollup_dests.try_read() {
+            Ok(set) => set.contains_key(key),
+            Err(_) => true,
+        }
     }
 
     #[cfg(test)]
@@ -267,6 +337,8 @@ impl ShardScheduler {
     }
 
     async fn tick(&self) -> Result<(), HyperbytedbError> {
+        // Peer map versions are only valid for the tick that probed them.
+        self.peer_map_versions.write().await.clear();
         let map = self.shard_map.snapshot().await?;
         self.drain_reconciliation(&map).await;
         let now = SystemTime::now()
@@ -360,6 +432,35 @@ impl ShardScheduler {
                         self.release_operator(region.region_id).await;
                         continue;
                     }
+                }
+
+                // A placement that commits changes the region's epoch, peers or
+                // primary, which makes the `region` borrowed from this tick's
+                // snapshot stale. Everything below reads that borrow, and
+                // `try_rebalance` would spend a full region copy before its
+                // proposal failed the epoch CAS — so yield the region and pick
+                // it up fresh on the next tick.
+                let mut placed = false;
+                for step in ["live", "idle", "primary"] {
+                    let outcome = match step {
+                        "live" => self.try_place_live_member(&space.key, region).await,
+                        "idle" => self.try_place_idle_member(&space.key, region).await,
+                        _ => self.try_place_primary(&space.key, region).await,
+                    };
+                    match outcome {
+                        Ok(true) => {
+                            placed = true;
+                            break;
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            tracing::debug!(error = %e, region_id = region.region_id, step, "placement skipped");
+                        }
+                    }
+                }
+                if placed {
+                    self.release_operator(region.region_id).await;
+                    continue;
                 }
 
                 if let Err(e) = self.try_rebalance(&space.key, region, &hb).await {
@@ -939,22 +1040,358 @@ impl ShardScheduler {
         Ok(())
     }
 
+    /// Place a live Active member that is not yet a region peer, when
+    /// effective RF has room. Stages rows onto the joiner, then commits
+    /// `AddPeer` — never commit-then-stage (that's heal `MovePeer`).
+    async fn try_place_live_member(
+        &self,
+        key: &MeasurementKey,
+        region: &ShardRegion,
+    ) -> Result<bool, HyperbytedbError> {
+        if !self.config.add_peer_proposals_enabled || self.is_rollup_dest(key).await {
+            return Ok(false);
+        }
+
+        // Resolve the peer client before probing the joiner: without one there
+        // is no way to stage rows, so the round trip below would be wasted.
+        let Some(pc) = self.peer_client.as_ref() else {
+            return Ok(false);
+        };
+
+        // Re-read the region: `drain_reconciliation` runs before this loop and
+        // can bump epochs, so the caller's snapshot may already be stale.
+        // Acting on it stages a whole region copy that the epoch CAS then
+        // rejects.
+        let map = self.shard_map.snapshot().await?;
+        let Some(region) = current_region(&map, key, region.region_id) else {
+            return Ok(false);
+        };
+
+        let candidates: Vec<(u64, String)> = {
+            let m = self.membership.read().await;
+            let ids: Vec<u64> = m.active_peers(0).into_iter().map(|n| n.node_id).collect();
+            live_replica_candidates(region, &ids, self.config.replication_factor)
+                .into_iter()
+                .filter_map(|id| m.get_node(id).map(|n| (id, n.addr.clone())))
+                .collect()
+        };
+        if candidates.is_empty() {
+            self.clear_placement_stall(region.region_id).await;
+            return Ok(false);
+        }
+
+        // Take the first candidate that has caught up. Stopping at the first
+        // candidate outright let one lagging node block every region forever,
+        // because the choice was made before the probe and never advanced.
+        let cluster_ver = map.map_version;
+        let mut chosen = None;
+        for (id, addr) in &candidates {
+            let ver = match self
+                .cached_peer_map_version(*id, addr, pc.http_client())
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!(error = %e, candidate = id, "map version probe failed");
+                    continue;
+                }
+            };
+            if joiner_map_caught_up(cluster_ver, ver) {
+                chosen = Some(*id);
+                break;
+            }
+            tracing::debug!(
+                region_id = region.region_id,
+                candidate = id,
+                cluster_ver,
+                candidate_ver = ver,
+                "candidate map not caught up"
+            );
+        }
+        let Some(joiner) = chosen else {
+            self.note_placement_stall(region.region_id, candidates.len())
+                .await;
+            return Ok(false);
+        };
+        self.clear_placement_stall(region.region_id).await;
+
+        if region.primary == self.node_id {
+            let outcome = stage_region_transfer_data(
+                pc,
+                &self.metadata,
+                &self.wal,
+                self.query_port.as_ref(),
+                self.node_id,
+                key,
+                region,
+                joiner,
+                self.max_points_per_request,
+            )
+            .await?;
+            if !outcome.verified() {
+                return Err(HyperbytedbError::ShardMap(
+                    format!(
+                        "live placement stage unverified: exported={} applied={}",
+                        outcome.exported, outcome.applied
+                    )
+                    .into(),
+                ));
+            }
+        } else {
+            request_region_stage(
+                pc.as_ref(),
+                &self.membership,
+                region.primary,
+                key,
+                region,
+                joiner,
+            )
+            .await?;
+        }
+
+        self.propose(ShardMapOp::AddPeer {
+            key: key.clone(),
+            region_id: region.region_id,
+            to_peer: joiner,
+            epoch: region.epoch,
+        })
+        .await?;
+        counter!("hyperbytedb_shard_live_placements_total").increment(1);
+        Ok(true)
+    }
+
+    /// Rebalance one replica slot onto the latest-joined member.
+    ///
+    /// `try_place_live_member` only fires while a region is below effective RF.
+    /// At 3 nodes and RF 3 every region is already complete, so a 4th process
+    /// needs an existing peer to step aside instead. Rows are staged onto the
+    /// target before `MovePeer` commits — same stage-then-commit ordering, so
+    /// no peer is ever published holding nothing. `MovePeer` appends the
+    /// target, which makes it the region's newest peer and therefore the next
+    /// primary-placement candidate.
+    ///
+    /// # This is not join-triggered
+    ///
+    /// The target is the active member with the greatest `joined_at`, which is
+    /// whoever joined last — there is no recency window, so "last" may mean
+    /// months ago. The rule fires whenever that member is under-loaded relative
+    /// to some region's non-primary peer, which means a cluster that has been
+    /// stable but unbalanced will start moving replicas on the first tick after
+    /// an upgrade, not in response to any join.
+    ///
+    /// Movement is bounded and convergent — it stops as soon as memberships
+    /// even out — and each copy is staged and verified before the map changes,
+    /// so this is a scheduling surprise rather than a correctness risk. It is
+    /// accepted while sharding is beta and stays deliberately ungated; revisit
+    /// before sharding graduates, when an unannounced rebalance on upgrade
+    /// stops being acceptable.
+    async fn try_place_idle_member(
+        &self,
+        key: &MeasurementKey,
+        region: &ShardRegion,
+    ) -> Result<bool, HyperbytedbError> {
+        if self.is_rollup_dest(key).await {
+            return Ok(false);
+        }
+
+        let Some(pc) = self.peer_client.as_ref() else {
+            return Ok(false);
+        };
+
+        let latest_member = {
+            let m = self.membership.read().await;
+            m.active_peers(0)
+                .into_iter()
+                .max_by_key(|n| (n.joined_at, n.node_id))
+                .map(|n| (n.node_id, n.addr.clone()))
+        };
+        let Some((latest_member, addr)) = latest_member else {
+            return Ok(false);
+        };
+
+        // Re-read the region: an `AddPeer` earlier in this same tick leaves the
+        // caller's snapshot stale, and acting on it would stage a full copy
+        // only for the proposal to bounce off the epoch CAS.
+        let map = self.shard_map.snapshot().await?;
+        let Some(region) = current_region(&map, key, region.region_id) else {
+            return Ok(false);
+        };
+        let memberships = region_memberships(&map);
+        let Some(displaced) = idle_member_replica_swap(region, latest_member, &memberships) else {
+            return Ok(false);
+        };
+
+        let joiner_ver = self
+            .cached_peer_map_version(latest_member, &addr, pc.http_client())
+            .await?;
+        if !joiner_map_caught_up(map.map_version, joiner_ver) {
+            tracing::debug!(
+                region_id = region.region_id,
+                latest_member,
+                cluster_ver = map.map_version,
+                joiner_ver,
+                "skip idle placement: rebalance target map not caught up"
+            );
+            return Ok(false);
+        }
+
+        if region.primary == self.node_id {
+            let outcome = stage_region_transfer_data(
+                pc,
+                &self.metadata,
+                &self.wal,
+                self.query_port.as_ref(),
+                self.node_id,
+                key,
+                region,
+                latest_member,
+                self.max_points_per_request,
+            )
+            .await?;
+            if !outcome.verified() {
+                return Err(HyperbytedbError::ShardMap(
+                    format!(
+                        "idle placement stage unverified: exported={} applied={}",
+                        outcome.exported, outcome.applied
+                    )
+                    .into(),
+                ));
+            }
+        } else {
+            request_region_stage(
+                pc.as_ref(),
+                &self.membership,
+                region.primary,
+                key,
+                region,
+                latest_member,
+            )
+            .await?;
+        }
+
+        tracing::info!(
+            region_id = region.region_id,
+            displaced,
+            latest_member,
+            "rebalancing region replica onto latest-joined member"
+        );
+        self.propose(ShardMapOp::MovePeer {
+            key: key.clone(),
+            region_id: region.region_id,
+            from_peer: displaced,
+            to_peer: latest_member,
+            epoch: region.epoch,
+        })
+        .await?;
+        counter!("hyperbytedb_shard_idle_placements_total").increment(1);
+        Ok(true)
+    }
+
+    /// Hand a region's primary to its newest peer so a joiner starts taking
+    /// writes instead of serving only as a replica.
+    ///
+    /// Rows move and are verified *before* `TransferPrimary` commits, the same
+    /// ordering drain and rebalance use: an empty primary must never own a
+    /// range. `try_rebalance` cannot do this job — it reacts to a 2x byte-load
+    /// imbalance between peers, and a joiner that has just been staged holds a
+    /// copy of the same rows, so the imbalance it looks for never appears.
+    async fn try_place_primary(
+        &self,
+        key: &MeasurementKey,
+        region: &ShardRegion,
+    ) -> Result<bool, HyperbytedbError> {
+        if self.is_rollup_dest(key).await {
+            return Ok(false);
+        }
+
+        let Some(pc) = self.peer_client.as_ref() else {
+            return Ok(false);
+        };
+
+        // Re-read the region: a peer placement earlier in this same tick leaves
+        // the caller's snapshot stale, and a stale epoch would fail the
+        // `TransferPrimary` proposal only after a full region copy had run.
+        let map = self.shard_map.snapshot().await?;
+        let Some(region) = current_region(&map, key, region.region_id) else {
+            return Ok(false);
+        };
+        let counts = primary_counts(&map);
+        let active: Vec<u64> = {
+            let m = self.membership.read().await;
+            m.active_peers(0).into_iter().map(|n| n.node_id).collect()
+        };
+        let Some(new_primary) = primary_placement_candidate(region, &counts, &active) else {
+            return Ok(false);
+        };
+
+        // Source from whoever holds the authoritative rows. Exporting from the
+        // leader when leadership and primary diverge finds nothing, and a
+        // 0-exported/0-applied transfer "verifies" vacuously onto an empty node.
+        if region.primary == self.node_id {
+            run_region_transfer(
+                pc,
+                &self.metadata,
+                &self.wal,
+                self.query_port.as_ref(),
+                self.points_sink.as_ref(),
+                self.node_id,
+                key,
+                region,
+                new_primary,
+                self.max_points_per_request,
+                // Placement keeps the same range and only changes who leads it;
+                // keep the source copy as a replica rather than stranding data
+                // if the ownership change later fails.
+                false,
+            )
+            .await?;
+        } else {
+            request_region_rehome(
+                pc,
+                &self.membership,
+                region.primary,
+                key,
+                region,
+                new_primary,
+                false,
+            )
+            .await?;
+        }
+
+        tracing::info!(
+            region_id = region.region_id,
+            from = region.primary,
+            to = new_primary,
+            "placing region primary on newest peer"
+        );
+        self.propose(ShardMapOp::TransferPrimary {
+            key: key.clone(),
+            region_id: region.region_id,
+            new_primary,
+            epoch: region.epoch,
+        })
+        .await?;
+        counter!("hyperbytedb_shard_primary_placements_total").increment(1);
+        Ok(true)
+    }
+
     async fn try_rebalance(
         &self,
         key: &MeasurementKey,
         region: &ShardRegion,
         hb: &[(u64, u64, u64, u64, u64, u64)],
     ) -> Result<(), HyperbytedbError> {
+        // Only peers that have actually reported can be scored. A peer with no
+        // live heartbeat row is unmeasured, not empty: scoring it as 0 bytes
+        // made any freshly added replica look infinitely lighter than the
+        // primary and handed it ownership on the strength of missing telemetry.
         let mut loads: Vec<(u64, u64)> = region
             .peers
             .iter()
-            .map(|node| {
-                let bytes = hb
-                    .iter()
+            .filter_map(|node| {
+                hb.iter()
                     .find(|(r, n, _, _, _, _)| *r == region.region_id && *n == *node)
-                    .map(|(_, _, _, b, _, _)| *b)
-                    .unwrap_or(0);
-                (*node, bytes)
+                    .map(|(_, _, _, b, _, _)| (*node, *b))
             })
             .collect();
         if loads.len() < 2 {
@@ -1169,6 +1606,189 @@ fn failover_watermark_safe(candidate_watermark: u64, max_peer_watermark: u64) ->
     candidate_watermark > 0 || max_peer_watermark == 0
 }
 
+/// Region data movement onto a joiner starts only after it has caught up to
+/// the cluster's committed `map_version`. Staging rows against a lagging map
+/// would apply under the wrong epoch / peer set.
+///
+/// Ahead is fine, and has to be: the cluster version is read from a snapshot
+/// taken a moment before the probe, so a joiner that applied an op in between
+/// legitimately reports a higher number. Requiring equality rejected that node
+/// and — because the candidate was chosen before the probe and never advanced
+/// — stalled replica growth for every region indefinitely.
+#[must_use]
+pub fn joiner_map_caught_up(cluster_map_version: u64, joiner_map_version: u64) -> bool {
+    joiner_map_version >= cluster_map_version
+}
+
+/// Members eligible to become a replica of `region`, lowest id first.
+///
+/// Returns every candidate rather than just the best one so the caller can
+/// advance past a node that fails its catch-up probe. Returning a single
+/// candidate meant one permanently-lagging node was re-chosen every tick and
+/// blocked replica growth cluster-wide.
+#[must_use]
+pub fn live_replica_candidates(
+    region: &ShardRegion,
+    active_member_ids: &[u64],
+    configured_rf: usize,
+) -> Vec<u64> {
+    if region.transfer_outstanding() {
+        return Vec::new();
+    }
+    let target = effective_replication_factor(configured_rf, active_member_ids.len());
+    if region.peers.len() >= target {
+        return Vec::new();
+    }
+    let mut candidates: Vec<u64> = active_member_ids
+        .iter()
+        .copied()
+        .filter(|id| !region.peers.contains(id))
+        .collect();
+    candidates.sort_unstable();
+    candidates
+}
+
+/// Next live member to add as a replica, or `None` when RF is full, the
+/// region carries transfer debt, or every Active member is already a peer.
+#[must_use]
+pub fn live_replica_candidate(
+    region: &ShardRegion,
+    active_member_ids: &[u64],
+    configured_rf: usize,
+) -> Option<u64> {
+    if region.transfer_outstanding() {
+        return None;
+    }
+    let target = effective_replication_factor(configured_rf, active_member_ids.len());
+    if region.peers.len() >= target {
+        return None;
+    }
+    active_member_ids
+        .iter()
+        .copied()
+        .filter(|id| !region.peers.contains(id))
+        .min()
+}
+
+/// Count the regions each node is primary for, across every space in the map.
+#[must_use]
+pub fn primary_counts(map: &ShardMap) -> HashMap<u64, usize> {
+    let mut counts: HashMap<u64, usize> = HashMap::new();
+    for space in map.spaces.values() {
+        for region in &space.regions {
+            *counts.entry(region.primary).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+/// The committed state of `region_id` in `map`, or `None` if it is gone (split,
+/// merged, or its measurement dropped since the caller's snapshot).
+#[must_use]
+pub fn current_region<'a>(
+    map: &'a ShardMap,
+    key: &MeasurementKey,
+    region_id: u64,
+) -> Option<&'a ShardRegion> {
+    map.spaces
+        .get(key)?
+        .regions
+        .iter()
+        .find(|r| r.region_id == region_id)
+}
+
+/// Count the regions each node is a peer of, across every space in the map.
+#[must_use]
+pub fn region_memberships(map: &ShardMap) -> HashMap<u64, usize> {
+    let mut counts: HashMap<u64, usize> = HashMap::new();
+    for space in map.spaces.values() {
+        for region in &space.regions {
+            for peer in &region.peers {
+                *counts.entry(*peer).or_insert(0) += 1;
+            }
+        }
+    }
+    counts
+}
+
+/// Non-primary peer that should yield its replica slot to `latest_member`, or
+/// `None` when this region is already well placed.
+///
+/// An RF-complete region never triggers `AddPeer`, so a member that is not
+/// already a peer would own nothing — every region legitimately has its full
+/// replica count, and pure load balancing has no reason to disturb them. This
+/// rule breaks that tie in one direction only: `latest_member` may displace a
+/// peer, and only one carrying strictly more region memberships than it.
+///
+/// `latest_member` must be the active member with the greatest `joined_at`.
+/// The caller establishes that, and it is what makes the swap converge: the
+/// identity is stable until membership itself changes, so the node just
+/// displaced cannot reclaim the slot — it is not the latest member. Passing an
+/// arbitrary node, or the least-loaded one, forfeits that and lets a slot trade
+/// back and forth indefinitely.
+///
+/// Note this is *ordering*, not recency: the greatest `joined_at` is simply
+/// whichever member joined last, whether that was seconds or months ago. See
+/// [`ShardScheduler::try_place_idle_member`] for what that means in practice.
+#[must_use]
+pub fn idle_member_replica_swap(
+    region: &ShardRegion,
+    latest_member: u64,
+    memberships: &HashMap<u64, usize>,
+) -> Option<u64> {
+    if region.transfer_outstanding() || region.peers.contains(&latest_member) {
+        return None;
+    }
+    let latest_member_load = memberships.get(&latest_member).copied().unwrap_or(0);
+    region
+        .peers
+        .iter()
+        .copied()
+        .filter(|p| *p != region.primary)
+        .map(|p| (memberships.get(&p).copied().unwrap_or(0), p))
+        .filter(|(load, _)| *load > latest_member_load)
+        .max()
+        .map(|(_, peer)| peer)
+}
+
+/// Node that should take this region's primary so a newly added replica starts
+/// serving writes, or `None` when the primary is already well placed.
+///
+/// The candidate is the region's newest peer — `AddPeer` appends, and region
+/// sorting only orders by range, so `peers.last()` is the most recently placed
+/// replica. It takes the primary only while it carries strictly fewer primaries
+/// than the current one, which is what stops a join from stampeding every
+/// region's primary onto the joiner and what makes the rule terminate: once the
+/// newest peer *is* the primary the rule no longer applies, so there is no
+/// oscillation back to the previous owner.
+#[must_use]
+pub fn primary_placement_candidate(
+    region: &ShardRegion,
+    primary_counts: &HashMap<u64, usize>,
+    active_member_ids: &[u64],
+) -> Option<u64> {
+    if region.transfer_outstanding() {
+        return None;
+    }
+    let newest = *region.peers.last()?;
+    if newest == region.primary || !active_member_ids.contains(&newest) {
+        return None;
+    }
+    let current = primary_counts.get(&region.primary).copied().unwrap_or(0);
+    let candidate = primary_counts.get(&newest).copied().unwrap_or(0);
+    (candidate < current).then_some(newest)
+}
+
+/// Read a peer's committed `map_version` via `/internal/shard/map`.
+pub async fn fetch_peer_map_version(
+    client: &reqwest::Client,
+    peer_addr: &str,
+) -> Result<u64, HyperbytedbError> {
+    let map =
+        crate::adapters::cluster::sync_client::fetch_shard_map(client.clone(), peer_addr).await?;
+    Ok(map.map_version)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn push_and_drop_range(
     peer_client: &Arc<PeerClient>,
@@ -1245,6 +1865,52 @@ async fn request_region_rehome(
         epoch: range.epoch,
         dest_primary,
         drop_source,
+        stage: false,
+    };
+    let url = format!("http://{addr}/internal/shard/rehome");
+    let resp = peer_client
+        .http_client()
+        .post(&url)
+        .json(&req)
+        .timeout(Duration::from_secs(REHOME_TIMEOUT_SECS))
+        .send()
+        .await
+        .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(HyperbytedbError::TransferRejected {
+            status: resp.status().as_u16(),
+        });
+    }
+    Ok(())
+}
+
+/// Ask the current primary to stage `[start, end)` onto a joiner that is
+/// not yet a committed peer.
+async fn request_region_stage(
+    peer_client: &PeerClient,
+    membership: &SharedMembership,
+    target_node: u64,
+    key: &MeasurementKey,
+    range: &ShardRegion,
+    dest: u64,
+) -> Result<(), HyperbytedbError> {
+    let addr = {
+        let m = membership.read().await;
+        m.get_node(target_node).map(|n| n.addr.clone())
+    }
+    .ok_or_else(|| {
+        HyperbytedbError::PeerUnreachable(format!("stage target node {target_node} unknown"))
+    })?;
+    let req = ShardRehomeRequest {
+        db: key.db.clone(),
+        rp: key.rp.clone(),
+        measurement: key.measurement.clone(),
+        start: range.start,
+        end: range.end,
+        epoch: range.epoch,
+        dest_primary: dest,
+        drop_source: false,
+        stage: true,
     };
     let url = format!("http://{addr}/internal/shard/rehome");
     let resp = peer_client
@@ -1888,6 +2554,249 @@ mod tests {
         assert!(failover_watermark_safe(0, 0));
     }
 
+    #[test]
+    fn joiner_map_catchup_blocks_a_lagging_joiner() {
+        assert!(joiner_map_caught_up(3, 3));
+        assert!(!joiner_map_caught_up(3, 0));
+        assert!(!joiner_map_caught_up(3, 2));
+        // Ahead is allowed. The gate exists to stop staging against a *lagging*
+        // map; a joiner that applied an op after the cluster snapshot was read
+        // is not lagging, and rejecting it stalled placement permanently.
+        assert!(joiner_map_caught_up(3, 4));
+    }
+
+    fn sample_region_peers(peers: Vec<u64>, primary: u64) -> ShardRegion {
+        ShardRegion {
+            region_id: 1,
+            start: 0,
+            end: u64::MAX,
+            epoch: ShardEpoch::default(),
+            peers,
+            primary,
+            last_split_at: 0,
+            transfer_verified: None,
+            transfer_first_seen: None,
+        }
+    }
+
+    #[test]
+    fn live_replica_candidate_picks_lowest_id_joiner() {
+        let region = sample_region_peers(vec![1], 1);
+        assert_eq!(live_replica_candidate(&region, &[1, 2], 3), Some(2));
+    }
+
+    #[test]
+    fn live_replica_candidate_none_when_rf_full() {
+        let region = sample_region_peers(vec![1, 2, 3], 1);
+        assert_eq!(live_replica_candidate(&region, &[1, 2, 3, 4], 3), None);
+    }
+
+    #[test]
+    fn live_replica_candidate_none_when_already_peer() {
+        let region = sample_region_peers(vec![1, 2], 1);
+        assert_eq!(live_replica_candidate(&region, &[1, 2], 3), None);
+    }
+
+    #[test]
+    fn catch_up_accepts_a_candidate_that_is_ahead() {
+        assert!(joiner_map_caught_up(5, 5), "equal is caught up");
+        // The cluster version comes from a snapshot taken before the probe, so
+        // a candidate that applied an op in between is legitimately ahead.
+        // Rejecting it stalled placement permanently.
+        assert!(joiner_map_caught_up(5, 6), "ahead is caught up");
+        assert!(!joiner_map_caught_up(5, 4), "behind is not");
+    }
+
+    #[test]
+    fn live_replica_candidates_returns_every_option_in_order() {
+        let region = sample_region_peers(vec![1], 1);
+        assert_eq!(
+            live_replica_candidates(&region, &[1, 3, 2], 3),
+            vec![2, 3],
+            "all non-peers, lowest first, so a lagging one can be skipped"
+        );
+    }
+
+    #[test]
+    fn live_replica_candidates_empty_when_rf_full_or_indebted() {
+        let full = sample_region_peers(vec![1, 2, 3], 1);
+        assert!(live_replica_candidates(&full, &[1, 2, 3, 4], 3).is_empty());
+
+        let mut indebted = sample_region_peers(vec![1], 1);
+        indebted.transfer_verified = Some(false);
+        assert!(live_replica_candidates(&indebted, &[1, 2], 3).is_empty());
+    }
+
+    #[test]
+    fn live_replica_candidate_none_with_transfer_debt() {
+        let mut region = sample_region_peers(vec![1], 1);
+        region.transfer_verified = Some(false);
+        assert_eq!(live_replica_candidate(&region, &[1, 2], 3), None);
+    }
+
+    /// Build a map whose single space holds `regions`, for primary counting.
+    fn map_of(regions: Vec<ShardRegion>) -> ShardMap {
+        let key = MeasurementKey::new("db", "autogen", "cpu");
+        let mut map = ShardMap::default();
+        map.spaces.insert(
+            key.clone(),
+            crate::domain::sharding::MeasurementShardSpace { key, regions },
+        );
+        map
+    }
+
+    #[test]
+    fn primary_counts_tallies_every_space() {
+        let map = map_of(vec![
+            sample_region_peers(vec![1, 2], 1),
+            sample_region_peers(vec![1, 2], 2),
+            sample_region_peers(vec![1, 2], 1),
+        ]);
+        let counts = primary_counts(&map);
+        assert_eq!(counts.get(&1), Some(&2));
+        assert_eq!(counts.get(&2), Some(&1));
+    }
+
+    #[test]
+    fn primary_placement_hands_only_region_to_the_joiner() {
+        let region = sample_region_peers(vec![1, 2], 1);
+        let counts = primary_counts(&map_of(vec![region.clone()]));
+        assert_eq!(
+            primary_placement_candidate(&region, &counts, &[1, 2]),
+            Some(2),
+            "a joiner with no primaries must take the region so writes land on it"
+        );
+    }
+
+    /// The rule must terminate: after the joiner takes the primary, evaluating
+    /// the same region again must not hand it straight back.
+    #[test]
+    fn primary_placement_does_not_oscillate() {
+        let placed = sample_region_peers(vec![1, 2], 2);
+        let counts = primary_counts(&map_of(vec![placed.clone()]));
+        assert_eq!(
+            primary_placement_candidate(&placed, &counts, &[1, 2]),
+            None,
+            "newest peer already holds the primary; nothing left to place"
+        );
+    }
+
+    #[test]
+    fn primary_placement_stops_at_an_even_split() {
+        // Four regions, primaries already 2/2 across the pair.
+        let regions = vec![
+            sample_region_peers(vec![1, 2], 1),
+            sample_region_peers(vec![1, 2], 1),
+            sample_region_peers(vec![1, 2], 2),
+            sample_region_peers(vec![1, 2], 2),
+        ];
+        let counts = primary_counts(&map_of(regions.clone()));
+        assert_eq!(
+            primary_placement_candidate(&regions[0], &counts, &[1, 2]),
+            None,
+            "moving another primary would only invert the imbalance"
+        );
+    }
+
+    #[test]
+    fn primary_placement_drains_a_lopsided_owner() {
+        let regions = vec![
+            sample_region_peers(vec![1, 2], 1),
+            sample_region_peers(vec![1, 2], 1),
+            sample_region_peers(vec![1, 2], 1),
+        ];
+        let counts = primary_counts(&map_of(regions.clone()));
+        assert_eq!(
+            primary_placement_candidate(&regions[0], &counts, &[1, 2]),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn primary_placement_skips_inactive_and_indebted() {
+        let region = sample_region_peers(vec![1, 2], 1);
+        let counts = primary_counts(&map_of(vec![region.clone()]));
+        assert_eq!(
+            primary_placement_candidate(&region, &counts, &[1]),
+            None,
+            "joiner is not an active member"
+        );
+
+        let mut indebted = region.clone();
+        indebted.transfer_verified = Some(false);
+        assert_eq!(
+            primary_placement_candidate(&indebted, &counts, &[1, 2]),
+            None,
+            "no ownership mutation while transfer debt is outstanding"
+        );
+    }
+
+    #[test]
+    fn idle_member_displaces_a_loaded_replica_not_the_primary() {
+        let region = sample_region_peers(vec![1, 2, 3], 1);
+        let memberships = region_memberships(&map_of(vec![region.clone()]));
+        let displaced =
+            idle_member_replica_swap(&region, 4, &memberships).expect("latest member takes a slot");
+        assert_ne!(displaced, 1, "the primary must never be displaced");
+        assert!(displaced == 2 || displaced == 3);
+    }
+
+    /// The swap must converge. `latest_member` stays the same node for as long as
+    /// membership is unchanged, so once it holds the slot the rule stops firing
+    /// and the slot cannot trade back and forth.
+    #[test]
+    fn idle_member_swap_converges() {
+        let before = sample_region_peers(vec![1, 2, 3], 1);
+        let displaced = idle_member_replica_swap(
+            &before,
+            4,
+            &region_memberships(&map_of(vec![before.clone()])),
+        )
+        .expect("first pass moves the latest member in");
+
+        let mut after = before.clone();
+        after.peers.retain(|p| *p != displaced);
+        after.peers.push(4);
+        assert_eq!(
+            idle_member_replica_swap(&after, 4, &region_memberships(&map_of(vec![after.clone()]))),
+            None,
+            "second pass with the same latest member must be a no-op"
+        );
+    }
+
+    #[test]
+    fn idle_member_swap_skips_debt_and_balanced_regions() {
+        let mut indebted = sample_region_peers(vec![1, 2, 3], 1);
+        indebted.transfer_verified = Some(false);
+        let memberships = region_memberships(&map_of(vec![indebted.clone()]));
+        assert_eq!(
+            idle_member_replica_swap(&indebted, 4, &memberships),
+            None,
+            "no peer mutation while transfer debt is outstanding"
+        );
+
+        // Newcomer already carries as many memberships as every replica here.
+        let region = sample_region_peers(vec![1, 2, 3], 1);
+        let balanced = region_memberships(&map_of(vec![
+            region.clone(),
+            sample_region_peers(vec![4, 5, 6], 4),
+        ]));
+        assert_eq!(idle_member_replica_swap(&region, 4, &balanced), None);
+    }
+
+    #[test]
+    fn primary_placement_never_moves_off_the_newest_peer() {
+        // Node 3 is both newest and primary while node 1 carries none. Evening
+        // that out is byte-load rebalance's job, not placement's — placement
+        // exists to give a joiner work, and node 3 already has it.
+        let region = sample_region_peers(vec![1, 2, 3], 3);
+        let counts = primary_counts(&map_of(vec![region.clone()]));
+        assert_eq!(
+            primary_placement_candidate(&region, &counts, &[1, 2, 3]),
+            None
+        );
+    }
+
     #[tokio::test]
     #[serial_test::serial(chdb)]
     async fn try_failover_proposes_transfer_primary() {
@@ -2303,6 +3212,27 @@ mod tests {
         assert!(q.is_empty(), "SummingMergeTree spaces must never enqueue");
     }
 
+    /// Placement stages rows and `apply_transfer_push` is not idempotent, so a
+    /// placement that stages and then fails its proposal re-delivers on the
+    /// next tick. `SummingMergeTree` destinations would sum the redelivery.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn placement_refuses_rollup_destinations() {
+        let harness = ReconcileTestHarness::new().await;
+        let rollup = MeasurementKey::new("db", "autogen", "rollup_dest");
+        let raw = MeasurementKey::new("db", "autogen", "cpu");
+        harness.scheduler.seed_rollup_dest(&rollup).await;
+
+        assert!(
+            harness.scheduler.is_rollup_dest(&rollup).await,
+            "seeded rollup destination must be refused by every placement path"
+        );
+        assert!(
+            !harness.scheduler.is_rollup_dest(&raw).await,
+            "raw ReplacingMergeTree measurements stay eligible"
+        );
+    }
+
     #[tokio::test]
     #[serial_test::serial(chdb)]
     async fn rebuild_skips_flagged_rollup_destinations() {
@@ -2366,6 +3296,58 @@ mod tests {
 
     /// Minimal standalone harness for reconciliation tests: real RocksDB shard
     /// map + scheduler internals without a full raft bootstrap where possible.
+    /// Minimal stand-in for a joiner: answers the map-version probe with
+    /// `map_version`, and accepts a staging push by echoing the line count it
+    /// received. Returns the address it bound to.
+    async fn spawn_mock_peer(map_version: u64) -> (String, Arc<std::sync::atomic::AtomicU64>) {
+        use axum::routing::{get, post};
+        let probes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let probe_counter = probes.clone();
+        let app = axum::Router::new()
+            .route(
+                "/internal/shard/map",
+                get(move || {
+                    let probes = probe_counter.clone();
+                    async move {
+                        probes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        axum::Json(serde_json::json!({
+                            "map_version": map_version,
+                            "next_region_id": 2,
+                            "spaces": [],
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/internal/shard/transfer",
+                post(|body: axum::body::Bytes| async move {
+                    let payload: serde_json::Value =
+                        serde_json::from_slice(&body).unwrap_or_default();
+                    let applied = payload
+                        .get("body")
+                        .and_then(|b| b.as_array())
+                        .map(|bytes| {
+                            let raw: Vec<u8> = bytes
+                                .iter()
+                                .filter_map(|v| v.as_u64().map(|n| n as u8))
+                                .collect();
+                            String::from_utf8_lossy(&raw)
+                                .lines()
+                                .filter(|l| !l.trim().is_empty())
+                                .count() as u64
+                        })
+                        .unwrap_or(0);
+                    axum::Json(serde_json::json!({ "applied": applied }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, probes)
+    }
+
     struct ReconcileTestHarness {
         _dir: tempfile::TempDir,
         shard_map: Arc<RocksDbShardMap>,
@@ -2385,6 +3367,235 @@ mod tests {
             transfer_verified: Some(false),
             transfer_first_seen: Some(first_seen),
         }
+    }
+
+    /// Harness whose scheduler owns the region and can actually reach a peer,
+    /// so `tick()` runs the placement steps end to end.
+    struct PlacementTestHarness {
+        _dir: tempfile::TempDir,
+        scheduler: ShardScheduler,
+        proposals: Arc<std::sync::Mutex<Vec<ShardMapOp>>>,
+        /// `/internal/shard/map` hit counts, keyed by mock peer node id.
+        probes: HashMap<u64, Arc<std::sync::atomic::AtomicU64>>,
+    }
+
+    impl PlacementTestHarness {
+        /// `peers` is `(node_id, map_version_delta)`; a negative delta makes
+        /// that peer report a map behind the cluster's. `regions` is how many
+        /// measurements to bootstrap, each one region owned by this node.
+        async fn new(
+            add_peer_proposals_enabled: bool,
+            peers: &[(u64, i64)],
+            regions: usize,
+        ) -> Self {
+            use crate::adapters::chdb::native_adapter::ChdbNativeAdapter;
+            use crate::adapters::chdb::query_adapter::ChdbQueryAdapter;
+            use crate::adapters::chdb::session::SharedSession;
+            use crate::adapters::cluster::peer_client::PeerClient;
+            use crate::adapters::cluster::replication_log::ReplicationLog;
+            use crate::adapters::metadata::rocksdb_meta::RocksDbMetadata;
+            use crate::adapters::wal::rocksdb_wal::RocksDbWal;
+            use crate::application::cluster::bootstrap::ClusterBootstrap;
+            use crate::application::materialized_view_service::MaterializedViewService;
+            use crate::ports::points_sink::PointsSinkPort;
+
+            let dir = tempfile::tempdir().unwrap();
+            let meta_dir = dir.path().join("meta");
+            let wal_dir = dir.path().join("wal");
+            let chdb_dir = dir.path().join("chdb");
+            for p in [&meta_dir, &wal_dir, &chdb_dir] {
+                std::fs::create_dir_all(p).unwrap();
+            }
+
+            let chdb = SharedSession::new_eager(chdb_dir.to_str().unwrap(), 1).unwrap();
+            let chdb_adapter = Arc::new(ChdbQueryAdapter::from_shared(chdb.clone(), 0));
+            let sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(chdb));
+            let wal = Arc::new(RocksDbWal::open(&wal_dir).unwrap());
+            let metadata = Arc::new(RocksDbMetadata::open(&meta_dir).unwrap());
+            let mv_service = Arc::new(MaterializedViewService::new(
+                metadata.clone(),
+                chdb_adapter,
+                sink.clone(),
+            ));
+
+            let mut cluster_cfg = crate::config::HyperbytedbConfig::load(None)
+                .unwrap()
+                .cluster;
+            cluster_cfg.enabled = true;
+            cluster_cfg.node_id = 1;
+            cluster_cfg.cluster_addr = "127.0.0.1:18100".into();
+            cluster_cfg.replication_log_dir = dir.path().join("repl").to_string_lossy().into();
+            cluster_cfg.raft_dir = dir.path().join("raft").to_string_lossy().into();
+            cluster_cfg.raft_heartbeat_interval_ms = Some(200);
+            cluster_cfg.raft_election_timeout_ms = Some(500);
+
+            let bootstrap = ClusterBootstrap::init(&cluster_cfg, 1000).unwrap();
+            let shard_map = Arc::new(RocksDbShardMap::open(&meta_dir, true).unwrap());
+            let location_cache = Arc::new(ShardLocationCache::new());
+            let raft = bootstrap
+                .start_raft(
+                    &cluster_cfg,
+                    metadata.clone(),
+                    mv_service,
+                    sink.clone(),
+                    wal.clone(),
+                    Some((shard_map.clone(), location_cache)),
+                    None,
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+            // Regions owned by this node, each one peer short of effective RF.
+            for i in 0..regions.max(1) {
+                let mut region = sample_region_peers(vec![1], 1);
+                region.region_id = (i + 1) as u64;
+                shard_map
+                    .apply_op(ShardMapOp::BootstrapMeasurement {
+                        key: MeasurementKey::new("db", "autogen", format!("cpu{i}")),
+                        region,
+                    })
+                    .await
+                    .unwrap();
+            }
+            let map_version = shard_map.snapshot().await.unwrap().map_version;
+
+            let mut probes = HashMap::new();
+            {
+                let mut m = bootstrap.membership.write().await;
+                m.add_node(NodeInfo {
+                    node_id: 1,
+                    addr: "127.0.0.1:18100".into(),
+                    state: NodeState::Active,
+                    joined_at: 0,
+                    last_heartbeat: 0,
+                    needs_sync: false,
+                });
+                for (id, delta) in peers {
+                    let reported = map_version.saturating_add_signed(*delta);
+                    let (addr, counter) = spawn_mock_peer(reported).await;
+                    probes.insert(*id, counter);
+                    m.add_node(NodeInfo {
+                        node_id: *id,
+                        addr,
+                        state: NodeState::Active,
+                        joined_at: *id as i64,
+                        last_heartbeat: 0,
+                        needs_sync: false,
+                    });
+                }
+            }
+
+            let peer_client = Arc::new(PeerClient::new(
+                1,
+                "127.0.0.1:18100".into(),
+                bootstrap.membership.clone(),
+                Arc::new(ReplicationLog::open(dir.path().join("repl-peer")).unwrap()),
+                2,
+                8192,
+                8,
+                8 * 1024 * 1024,
+            ));
+
+            let sharding = crate::config::ShardingConfig {
+                replication_factor: 3,
+                add_peer_proposals_enabled,
+                ..Default::default()
+            };
+            let proposals = Arc::new(std::sync::Mutex::new(Vec::<ShardMapOp>::new()));
+            let scheduler = ShardScheduler::new(
+                shard_map,
+                bootstrap.membership.clone(),
+                raft,
+                Some(peer_client),
+                metadata,
+                wal,
+                None,
+                Some(sink),
+                1,
+                sharding,
+                10_000,
+            )
+            .with_test_force_leader(true)
+            .with_test_propose_sink(proposals.clone());
+
+            Self {
+                _dir: dir,
+                scheduler,
+                proposals,
+                probes,
+            }
+        }
+
+        fn probe_count(&self, peer: u64) -> u64 {
+            self.probes[&peer].load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    /// Guards the tick wiring. Without this, deleting the three placement calls
+    /// from `tick()` leaves every other test in the suite green.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn tick_places_a_live_joiner_as_a_region_peer() {
+        let harness = PlacementTestHarness::new(true, &[(2, 0)], 1).await;
+        harness.scheduler.tick_once_for_test().await.unwrap();
+        let ops = harness.proposals.lock().unwrap();
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, ShardMapOp::AddPeer { to_peer: 2, .. })),
+            "tick must propose AddPeer to place the live joiner, got {ops:?}"
+        );
+    }
+
+    /// H.2: one lagging candidate must not block the others. Node 2 reports a
+    /// map behind the cluster and is chosen first by id; placement has to move
+    /// on to node 3 instead of stalling here every tick forever.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn placement_skips_a_lagging_candidate_for_a_caught_up_one() {
+        let harness = PlacementTestHarness::new(true, &[(2, -1), (3, 0)], 1).await;
+        harness.scheduler.tick_once_for_test().await.unwrap();
+        let ops = harness.proposals.lock().unwrap();
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, ShardMapOp::AddPeer { to_peer: 3, .. })),
+            "must place onto the caught-up candidate, got {ops:?}"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op, ShardMapOp::AddPeer { to_peer: 2, .. })),
+            "must not place onto the lagging candidate, got {ops:?}"
+        );
+    }
+
+    /// H.4: `/internal/shard/map` serializes the whole cluster map to answer
+    /// one `u64`. Probing per region made a join cost O(regions x map size)
+    /// bytes per tick; one probe per peer per tick is the contract.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn map_version_is_probed_once_per_peer_per_tick() {
+        let harness = PlacementTestHarness::new(true, &[(2, -1)], 4).await;
+        harness.scheduler.tick_once_for_test().await.unwrap();
+        assert_eq!(
+            harness.probe_count(2),
+            1,
+            "four regions must share one probe, not one probe each"
+        );
+    }
+
+    /// The upgrade gate has to hold at the tick, not just in config: a leader
+    /// that proposes `AddPeer` mid-rolling-restart wedges un-upgraded voters.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn tick_withholds_add_peer_while_the_upgrade_gate_is_closed() {
+        let harness = PlacementTestHarness::new(false, &[(2, 0)], 1).await;
+        harness.scheduler.tick_once_for_test().await.unwrap();
+        let ops = harness.proposals.lock().unwrap();
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op, ShardMapOp::AddPeer { .. })),
+            "AddPeer must not be proposed while the gate is closed, got {ops:?}"
+        );
     }
 
     impl ReconcileTestHarness {
