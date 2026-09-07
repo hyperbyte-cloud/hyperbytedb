@@ -80,9 +80,9 @@ pub struct ShardingConfig {
     #[serde(default = "default_transfer_clear_proposals_enabled")]
     pub transfer_clear_proposals_enabled: bool,
     /// Propose `AddPeer` shard-map ops to place a joiner as a region replica.
-    /// Disable on mixed-version clusters: nodes running builds older than the
-    /// `AddPeer` op cannot decode it from the Raft log, and a committed entry
-    /// they cannot deserialize wedges them.
+    /// Disable for the duration of a rolling upgrade: a node on a build older
+    /// than the `AddPeer` op cannot decode it, rejects the append RPC carrying
+    /// it, and stops replicating until every node is upgraded.
     #[serde(default = "default_add_peer_proposals_enabled")]
     pub add_peer_proposals_enabled: bool,
 }
@@ -167,13 +167,19 @@ fn default_transfer_clear_proposals_enabled() -> bool {
     true
 }
 
-/// Off for the release that introduces `AddPeer`. A leader that emits a new
-/// shard-map op the moment it upgrades commits a Raft entry the rest of a
-/// half-upgraded fleet cannot deserialize. Operators turn this on once every
-/// node runs a build that knows the op; the default flips in a later release,
-/// the same way `transfer_clear_proposals_enabled` did.
+/// On, matching `transfer_clear_proposals_enabled`: the flag is an opt-out for
+/// a mixed-version rollout, not an opt-in for the feature.
+///
+/// The hazard is real but bounded. A follower on a build that does not know
+/// `AddPeer` fails to deserialize the whole append RPC — axum rejects the body
+/// before the handler runs — so it stops replicating and the leader can lose
+/// commit quorum for the duration. It is self-healing: replication resumes as
+/// soon as every node runs a build that knows the op, and ingest does not go
+/// through Raft. Defaulting off instead would leave region placement inert for
+/// everyone who enables sharding, which is the worse trade while sharding is
+/// beta and clusters are rebuilt more often than rolling-upgraded.
 fn default_add_peer_proposals_enabled() -> bool {
-    false
+    true
 }
 
 impl HyperbytedbConfig {
@@ -1260,19 +1266,13 @@ mod replicate_body_limit_tests {
         );
     }
 
-    /// A new Raft-log op must stay off by default for the release that adds it.
-    /// A leader that proposes one mid-rolling-restart commits an entry the
-    /// un-upgraded followers cannot deserialize.
+    /// Shard-map op gates are opt-*outs* for a rolling upgrade, not opt-ins for
+    /// the feature. Defaulting one off leaves the behaviour it guards inert for
+    /// everyone who never finds the flag.
     #[test]
-    fn new_shard_map_ops_are_off_by_default() {
+    fn shard_map_op_gates_default_on() {
         let s = super::ShardingConfig::default();
-        assert!(
-            !s.add_peer_proposals_enabled,
-            "AddPeer is new in this release and must not be proposed until the fleet can decode it"
-        );
-        assert!(
-            s.transfer_clear_proposals_enabled,
-            "ClearVerified shipped in an earlier release and is past its upgrade window"
-        );
+        assert!(s.add_peer_proposals_enabled);
+        assert!(s.transfer_clear_proposals_enabled);
     }
 }
