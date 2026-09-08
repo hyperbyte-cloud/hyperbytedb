@@ -276,6 +276,7 @@ impl RaftStore {
                     joined_at: now,
                     last_heartbeat: now,
                     needs_sync: false,
+                    consecutive_misses: 0,
                 });
             }
         }
@@ -887,6 +888,7 @@ impl RaftStore {
                     joined_at: now,
                     last_heartbeat: now,
                     needs_sync: false,
+                    consecutive_misses: 0,
                 });
             }
         }
@@ -982,6 +984,7 @@ mod tests {
                 joined_at: 100,
                 last_heartbeat: 100,
                 needs_sync: false,
+                consecutive_misses: 0,
             },
         );
         nodes.insert(
@@ -993,6 +996,7 @@ mod tests {
                 joined_at: 100,
                 last_heartbeat: 100,
                 needs_sync: false,
+                consecutive_misses: 0,
             },
         );
         ClusterMembership { version: 7, nodes }
@@ -1103,6 +1107,7 @@ mod tests {
             joined_at: 1,
             last_heartbeat: 50,
             needs_sync: false,
+            consecutive_misses: 0,
         });
 
         let mut incoming = ClusterMembership::new();
@@ -1115,6 +1120,7 @@ mod tests {
             joined_at: 1,
             last_heartbeat: 99,
             needs_sync: false,
+            consecutive_misses: 0,
         });
         incoming.add_node(NodeInfo {
             node_id: 3,
@@ -1123,6 +1129,7 @@ mod tests {
             joined_at: 2,
             last_heartbeat: 99,
             needs_sync: false,
+            consecutive_misses: 0,
         });
 
         merge_snapshot_membership(&mut shared, incoming);
@@ -1196,6 +1203,7 @@ mod tests {
             joined_at: 100,
             last_heartbeat: 100,
             needs_sync: false,
+            consecutive_misses: 0,
         });
         let shared = new_shared(initial);
         let store = RaftStore::open(&raft_dir, shared.clone()).expect("open");

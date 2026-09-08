@@ -56,13 +56,21 @@ pub(crate) enum ProbeSignal {
 /// Authority model: for reachable peers the decoded body `state` field is the
 /// sole transition input; overall HTTP status never transitions membership.
 /// `Joining`/`Draining`/`Leaving` are operator-owned and never auto-promoted.
-pub(crate) fn decide_transition(current: NodeState, signal: &ProbeSignal) -> Option<NodeState> {
+pub(crate) fn decide_transition(
+    current: NodeState,
+    signal: &ProbeSignal,
+    consecutive_misses: u32,
+    miss_threshold: u32,
+) -> Option<NodeState> {
     use NodeState::{Active, Decommissioning, Disconnected, Draining, Joining, Leaving, Syncing};
     match (current, signal) {
         // Transport failure is the sole demotion path to Disconnected;
         // operator states stay untouched.
         (_, ProbeSignal::Unreachable) => {
-            if matches!(current, Active | Syncing) {
+            // Hysteresis: a demotion now costs real data movement, because
+            // placement is a pure function of membership. One dropped probe
+            // must not move regions. Slow to evict, fast to readmit.
+            if matches!(current, Active | Syncing) && consecutive_misses >= miss_threshold {
                 Some(Disconnected)
             } else {
                 None
@@ -140,6 +148,7 @@ pub async fn run_heartbeat_logger(
 pub async fn run_heartbeat_updater(
     self_id: u64,
     membership: SharedMembership,
+    miss_threshold: u32,
     interval: Duration,
     probe_timeout: Duration,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
@@ -164,7 +173,7 @@ pub async fn run_heartbeat_updater(
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                probe_peers(self_id, &membership, &client).await;
+                probe_peers(self_id, &membership, &client, miss_threshold).await;
             }
             _ = async {
                 while !*shutdown_rx.borrow() {
@@ -178,7 +187,12 @@ pub async fn run_heartbeat_updater(
     }
 }
 
-async fn probe_peers(self_id: u64, membership: &SharedMembership, client: &reqwest::Client) {
+async fn probe_peers(
+    self_id: u64,
+    membership: &SharedMembership,
+    client: &reqwest::Client,
+    miss_threshold: u32,
+) {
     let peers: Vec<(u64, String)> = {
         let m = membership.read().await;
         m.all_peers(self_id)
@@ -232,20 +246,33 @@ async fn probe_peers(self_id: u64, membership: &SharedMembership, client: &reqwe
     for (pid, signal) in results {
         match &signal {
             ProbeSignal::Unreachable => {
-                let should_disconnect = m
-                    .get_node(pid)
-                    .is_some_and(|n| matches!(n.state, NodeState::Active | NodeState::Syncing));
-                if should_disconnect {
-                    tracing::warn!(peer_id = pid, "peer unreachable, marking disconnected");
-                    m.set_state(pid, NodeState::Disconnected);
+                // Count first: the counter lives on NodeInfo precisely so it
+                // survives across ticks, which a map local to this function
+                // would not.
+                let misses = m.record_probe_miss(pid);
+                let Some(current) = m.get_node(pid).map(|n| n.state) else {
+                    continue;
+                };
+                let Some(next) = decide_transition(current, &signal, misses, miss_threshold) else {
+                    continue;
+                };
+                if next != current {
+                    tracing::warn!(
+                        peer_id = pid,
+                        misses,
+                        miss_threshold,
+                        "peer unreachable past threshold, marking disconnected"
+                    );
+                    m.set_state(pid, next);
                 }
             }
             ProbeSignal::Response { health_ok, .. } => {
                 m.update_heartbeat(pid, now);
+                m.record_probe_success(pid);
                 let Some(current) = m.get_node(pid).map(|n| n.state) else {
                     continue;
                 };
-                let Some(next) = decide_transition(current, &signal) else {
+                let Some(next) = decide_transition(current, &signal, 0, miss_threshold) else {
                     continue;
                 };
                 if next != current {
@@ -266,6 +293,13 @@ async fn probe_peers(self_id: u64, membership: &SharedMembership, client: &reqwe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Probe-count arguments for `decide_transition`. A Response signal ignores
+    /// them; an Unreachable signal is passed AT the threshold so these tests
+    /// keep asserting that the *state* decides, not that a low count blocked
+    /// the demotion. Hysteresis itself is covered separately below.
+    const THRESHOLD: u32 = 5;
+    const MISSES_AT_THRESHOLD: u32 = 5;
     use crate::domain::cluster::membership::{ClusterMembership, NodeInfo, new_shared};
 
     fn make_membership(peer_addrs: &[(u64, &str, NodeState)]) -> SharedMembership {
@@ -278,6 +312,7 @@ mod tests {
                 joined_at: 1000,
                 last_heartbeat: 1000,
                 needs_sync: false,
+                consecutive_misses: 0,
             });
         }
         new_shared(m)
@@ -297,6 +332,8 @@ mod tests {
         let next = decide_transition(
             NodeState::Syncing,
             &body(Some(NodeState::Active), Some(false)),
+            0,
+            THRESHOLD,
         );
         assert_eq!(next, Some(NodeState::Active));
     }
@@ -306,6 +343,8 @@ mod tests {
         let next = decide_transition(
             NodeState::Syncing,
             &body(Some(NodeState::Active), Some(true)),
+            0,
+            THRESHOLD,
         );
         assert_eq!(next, None);
     }
@@ -315,13 +354,15 @@ mod tests {
         let next = decide_transition(
             NodeState::Syncing,
             &body(Some(NodeState::Syncing), Some(false)),
+            0,
+            THRESHOLD,
         );
         assert_eq!(next, None);
     }
 
     #[test]
     fn syncing_stays_when_body_has_no_usable_state() {
-        let next = decide_transition(NodeState::Syncing, &body(None, None));
+        let next = decide_transition(NodeState::Syncing, &body(None, None), 0, THRESHOLD);
         assert_eq!(next, None);
     }
 
@@ -330,6 +371,8 @@ mod tests {
         let next = decide_transition(
             NodeState::Active,
             &body(Some(NodeState::Syncing), Some(false)),
+            0,
+            THRESHOLD,
         );
         assert_eq!(next, Some(NodeState::Syncing));
     }
@@ -342,6 +385,8 @@ mod tests {
                 health_ok: false,
                 body: None,
             },
+            0,
+            THRESHOLD,
         );
         assert_eq!(next, None);
     }
@@ -351,6 +396,8 @@ mod tests {
         let next = decide_transition(
             NodeState::Disconnected,
             &body(Some(NodeState::Active), Some(false)),
+            0,
+            THRESHOLD,
         );
         assert_eq!(next, Some(NodeState::Active));
     }
@@ -360,6 +407,8 @@ mod tests {
         let next = decide_transition(
             NodeState::Disconnected,
             &body(Some(NodeState::Syncing), Some(false)),
+            0,
+            THRESHOLD,
         );
         assert_eq!(next, Some(NodeState::Syncing));
     }
@@ -372,6 +421,8 @@ mod tests {
                 health_ok: true,
                 body: None,
             },
+            0,
+            THRESHOLD,
         );
         assert_eq!(next, Some(NodeState::Active));
     }
@@ -380,7 +431,12 @@ mod tests {
     fn unreachable_demotes_only_active_and_syncing() {
         for current in [NodeState::Active, NodeState::Syncing] {
             assert_eq!(
-                decide_transition(current, &ProbeSignal::Unreachable),
+                decide_transition(
+                    current,
+                    &ProbeSignal::Unreachable,
+                    MISSES_AT_THRESHOLD,
+                    THRESHOLD
+                ),
                 Some(NodeState::Disconnected)
             );
         }
@@ -390,7 +446,15 @@ mod tests {
             NodeState::Draining,
             NodeState::Leaving,
         ] {
-            assert_eq!(decide_transition(current, &ProbeSignal::Unreachable), None);
+            assert_eq!(
+                decide_transition(
+                    current,
+                    &ProbeSignal::Unreachable,
+                    MISSES_AT_THRESHOLD,
+                    THRESHOLD
+                ),
+                None
+            );
         }
     }
 
@@ -405,7 +469,12 @@ mod tests {
             NodeState::Leaving,
         ] {
             assert_eq!(
-                decide_transition(current, &body(Some(NodeState::Active), Some(false))),
+                decide_transition(
+                    current,
+                    &body(Some(NodeState::Active), Some(false)),
+                    0,
+                    THRESHOLD
+                ),
                 None
             );
             assert_eq!(
@@ -414,7 +483,9 @@ mod tests {
                     &ProbeSignal::Response {
                         health_ok: false,
                         body: None
-                    }
+                    },
+                    0,
+                    THRESHOLD
                 ),
                 None
             );
@@ -430,7 +501,9 @@ mod tests {
         assert_eq!(
             decide_transition(
                 NodeState::Draining,
-                &body(Some(NodeState::Active), Some(false))
+                &body(Some(NodeState::Active), Some(false)),
+                0,
+                THRESHOLD
             ),
             Some(NodeState::Active)
         );
@@ -438,7 +511,9 @@ mod tests {
         assert_eq!(
             decide_transition(
                 NodeState::Draining,
-                &body(Some(NodeState::Active), Some(true))
+                &body(Some(NodeState::Active), Some(true)),
+                0,
+                THRESHOLD
             ),
             None
         );
@@ -456,7 +531,10 @@ mod tests {
                 body: None,
             },
         ] {
-            assert_eq!(decide_transition(NodeState::Decommissioning, &signal), None);
+            assert_eq!(
+                decide_transition(NodeState::Decommissioning, &signal, 0, THRESHOLD),
+                None
+            );
         }
     }
 
@@ -475,7 +553,7 @@ mod tests {
         };
         let mut state = NodeState::Syncing;
         for signal in [&ok, &degraded, &ok, &degraded] {
-            if let Some(next) = decide_transition(state, signal) {
+            if let Some(next) = decide_transition(state, signal, 0, THRESHOLD) {
                 state = next;
             }
         }
@@ -550,7 +628,7 @@ mod tests {
             .timeout(Duration::from_millis(500))
             .build()
             .unwrap();
-        probe_peers(1, &membership, &client).await;
+        probe_peers(1, &membership, &client, THRESHOLD).await;
 
         let m = membership.read().await;
         assert_eq!(m.get_node(2).unwrap().state, NodeState::Active);
@@ -572,7 +650,7 @@ mod tests {
             .timeout(Duration::from_millis(500))
             .build()
             .unwrap();
-        probe_peers(1, &membership, &client).await;
+        probe_peers(1, &membership, &client, THRESHOLD).await;
 
         let m = membership.read().await;
         assert_eq!(m.get_node(2).unwrap().state, NodeState::Syncing);
@@ -588,7 +666,7 @@ mod tests {
             .timeout(Duration::from_millis(500))
             .build()
             .unwrap();
-        probe_peers(1, &membership, &client).await;
+        probe_peers(1, &membership, &client, THRESHOLD).await;
 
         let m = membership.read().await;
         assert_eq!(
@@ -622,7 +700,7 @@ mod tests {
             .build()
             .unwrap();
         for _ in 0..6 {
-            probe_peers(1, &membership, &client).await;
+            probe_peers(1, &membership, &client, THRESHOLD).await;
         }
 
         let m = membership.read().await;
@@ -636,18 +714,59 @@ mod tests {
     // ── pre-existing behavior guards ────────────────────────────────────
 
     #[tokio::test]
-    async fn unreachable_peer_is_disconnected() {
+    async fn unreachable_peer_is_disconnected_only_past_the_threshold() {
+        // Rewritten, not widened: under hysteresis a single failed probe no
+        // longer demotes, because a demotion now moves data. The old
+        // single-probe assertion encoded the pre-hysteresis contract.
         let membership = make_membership(&[(1, "127.0.0.1:19999", NodeState::Active)]);
-
         let client = reqwest::Client::builder()
             .timeout(Duration::from_millis(100))
             .build()
             .unwrap();
 
-        probe_peers(0, &membership, &client).await;
+        for probe in 1..THRESHOLD {
+            probe_peers(0, &membership, &client, THRESHOLD).await;
+            assert_eq!(
+                membership.read().await.get_node(1).unwrap().state,
+                NodeState::Active,
+                "demoted after only {probe} miss(es); threshold is {THRESHOLD}"
+            );
+        }
 
-        let m = membership.read().await;
-        assert_eq!(m.get_node(1).unwrap().state, NodeState::Disconnected);
+        probe_peers(0, &membership, &client, THRESHOLD).await;
+        assert_eq!(
+            membership.read().await.get_node(1).unwrap().state,
+            NodeState::Disconnected,
+            "still Active at the threshold"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_success_decrements_rather_than_resets_the_miss_count() {
+        // Hard-reset-on-success never demotes a node alternating four misses
+        // and one success -- unreachable 80% of the time yet permanently
+        // Active, which is worse than the old single-miss rule.
+        let membership = make_membership(&[(1, "127.0.0.1:19999", NodeState::Active)]);
+        {
+            let mut m = membership.write().await;
+            for _ in 0..4 {
+                m.record_probe_miss(1);
+            }
+            m.record_probe_success(1);
+            assert_eq!(
+                m.get_node(1).unwrap().consecutive_misses,
+                3,
+                "a success must decrement, not zero the count"
+            );
+            for _ in 0..4 {
+                m.record_probe_miss(1);
+            }
+            m.record_probe_success(1);
+            assert!(
+                m.get_node(1).unwrap().consecutive_misses >= THRESHOLD,
+                "sustained flapping must converge on demotion"
+            );
+        }
     }
 
     #[tokio::test]
@@ -659,7 +778,7 @@ mod tests {
             .build()
             .unwrap();
 
-        probe_peers(0, &membership, &client).await;
+        probe_peers(0, &membership, &client, THRESHOLD).await;
 
         let m = membership.read().await;
         assert_eq!(m.get_node(1).unwrap().state, NodeState::Draining);
@@ -673,6 +792,6 @@ mod tests {
             .build()
             .unwrap();
 
-        probe_peers(0, &membership, &client).await;
+        probe_peers(0, &membership, &client, THRESHOLD).await;
     }
 }

@@ -58,6 +58,14 @@ pub struct NodeInfo {
     /// Set when startup sync failed and the leader should trigger a re-sync.
     #[serde(default)]
     pub needs_sync: bool,
+    /// Consecutive failed probes, for demotion hysteresis.
+    ///
+    /// Lives here rather than in the prober because `probe_peers` is stateless
+    /// and called fresh each tick — a counter local to it resets every tick and
+    /// pins the value at 1, which compiles and passes unit tests while
+    /// demoting on the first miss exactly as before.
+    #[serde(default)]
+    pub consecutive_misses: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -125,6 +133,30 @@ impl ClusterMembership {
             _ => true,
         };
         legal && self.set_state(node_id, to)
+    }
+
+    /// Count a failed probe. Returns the new consecutive-miss total.
+    pub fn record_probe_miss(&mut self, node_id: u64) -> u32 {
+        match self.nodes.get_mut(&node_id) {
+            Some(node) => {
+                node.consecutive_misses = node.consecutive_misses.saturating_add(1);
+                node.consecutive_misses
+            }
+            None => 0,
+        }
+    }
+
+    /// Count a successful probe.
+    ///
+    /// Decrements rather than resetting. A hard reset never demotes a node
+    /// alternating four misses and one success — unreachable 80% of the time
+    /// yet permanently `Active`, which is worse than demoting on the first
+    /// miss. Decrementing lets sustained flapping converge on demotion while a
+    /// single blip still recovers.
+    pub fn record_probe_success(&mut self, node_id: u64) {
+        if let Some(node) = self.nodes.get_mut(&node_id) {
+            node.consecutive_misses = node.consecutive_misses.saturating_sub(1);
+        }
     }
 
     pub fn set_needs_sync(&mut self, node_id: u64, needs: bool) {
@@ -220,6 +252,7 @@ mod tests {
             joined_at: 1000,
             last_heartbeat: 1000,
             needs_sync: false,
+            consecutive_misses: 0,
         }
     }
 

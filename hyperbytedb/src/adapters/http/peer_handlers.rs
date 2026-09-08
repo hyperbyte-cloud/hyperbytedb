@@ -336,6 +336,7 @@ pub async fn handle_join(
             joined_at: now,
             last_heartbeat: now,
             needs_sync: false,
+            consecutive_misses: 0,
         });
 
         gauge!("hyperbytedb_cluster_peers").set(m.active_peers(state.node_id).len() as f64);

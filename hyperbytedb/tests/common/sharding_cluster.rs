@@ -101,6 +101,7 @@ pub fn build_shared_membership(specs: &[(u64, String)]) -> SharedMembership {
             joined_at: now,
             last_heartbeat: now,
             needs_sync: false,
+            consecutive_misses: 0,
         });
     }
     new_shared(membership)
@@ -342,6 +343,7 @@ pub async fn start_sharded_joiner(
             joined_at: now,
             last_heartbeat: now,
             needs_sync: false,
+            consecutive_misses: 0,
         });
     }
     start_sharded_node(

@@ -140,6 +140,7 @@ pub async fn run_raft_cluster_formation(
                             joined_at: now,
                             last_heartbeat: now,
                             needs_sync: false,
+                            consecutive_misses: 0,
                         });
                     }
                 }

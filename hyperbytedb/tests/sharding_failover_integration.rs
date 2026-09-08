@@ -132,6 +132,7 @@ async fn primary_failover_updates_shard_map_after_unhealthy_timeout() {
             joined_at: 0,
             last_heartbeat: 0,
             needs_sync: false,
+            consecutive_misses: 0,
         });
     }
 
