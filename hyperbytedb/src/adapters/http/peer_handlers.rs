@@ -9,7 +9,7 @@ use axum::response::IntoResponse;
 use metrics::{counter, gauge};
 
 use crate::application::replication_apply::ReplicationApplyError;
-use crate::domain::cluster::membership::{NodeInfo, NodeState};
+use crate::domain::cluster::membership::{ClusterMembership, NodeInfo, NodeState};
 use crate::domain::cluster::replication_wire::{
     HTTP_HEADER_DATABASE, HTTP_HEADER_ORIGIN_NODE, HTTP_HEADER_PRECISION,
     HTTP_HEADER_RETENTION_POLICY, HTTP_HEADER_SYNC, LINE_PROTOCOL_MEDIA_TYPE_V1,
@@ -359,6 +359,17 @@ pub async fn handle_join(
     }
 }
 
+/// Move `node_id` into `Draining` for a self-reported leave, refusing to
+/// downgrade a terminal lifecycle state.
+///
+/// Pulled out of [`handle_leave`] so the guard is directly unit-testable:
+/// `/internal/membership/leave` self-calls used to `set_state` unconditionally,
+/// which let this call clobber a `Decommissioning` node back into a
+/// placement-eligible state. Returns whether the transition happened.
+fn apply_self_leave(m: &mut ClusterMembership, node_id: u64) -> bool {
+    m.transition(node_id, NodeState::Draining)
+}
+
 /// Handle a leave request from a node.
 pub async fn handle_leave(
     State(state): State<Arc<AppState>>,
@@ -378,12 +389,19 @@ pub async fn handle_leave(
 
     if req.node_id == state.node_id {
         let mut m = membership.write().await;
-        m.set_state(req.node_id, NodeState::Draining);
-        gauge!("hyperbytedb_cluster_node_state").set(4.0); // Draining
-        tracing::info!(node_id = req.node_id, "local node entering drain mode");
+        if apply_self_leave(&mut m, req.node_id) {
+            gauge!("hyperbytedb_cluster_node_state").set(4.0); // Draining
+            tracing::info!(node_id = req.node_id, "local node entering drain mode");
+        } else {
+            tracing::info!(
+                node_id = req.node_id,
+                current = ?m.get_node(req.node_id).map(|n| n.state),
+                "self-leave ignored: node already in a terminal lifecycle state"
+            );
+        }
     } else {
         let mut m = membership.write().await;
-        m.set_state(req.node_id, NodeState::Leaving);
+        m.transition(req.node_id, NodeState::Leaving);
         m.remove_node(req.node_id);
         if let Some(ref rl) = state.replication_log {
             let _ = rl.remove_peer(req.node_id);
@@ -497,6 +515,32 @@ pub async fn handle_drain(State(state): State<Arc<AppState>>) -> impl IntoRespon
     (
         StatusCode::ACCEPTED,
         Json(serde_json::json!({"ok": true, "message": "drain initiated"})),
+    )
+}
+
+/// Execute the full decommission procedure (mark decommissioning, hand off
+/// primaries, flush, wait for acks). Region evacuation and the eventual
+/// `Leaving` transition are the shard scheduler's job, not this request's.
+pub async fn handle_decommission(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let drain_service = match &state.drain_service {
+        Some(ds) => ds.clone(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "drain service not available"})),
+            );
+        }
+    };
+
+    tokio::spawn(async move {
+        if let Err(e) = drain_service.decommission().await {
+            tracing::error!(error = %e, "decommission procedure failed");
+        }
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({"ok": true, "message": "decommission initiated"})),
     )
 }
 
