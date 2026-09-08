@@ -85,6 +85,14 @@ pub struct ShardingConfig {
     /// it, and stops replicating until every node is upgraded.
     #[serde(default = "default_add_peer_proposals_enabled")]
     pub add_peer_proposals_enabled: bool,
+    /// Propose `RemovePeer` shard-map ops to shrink a region's replica set.
+    #[serde(default = "default_remove_peer_proposals_enabled")]
+    pub remove_peer_proposals_enabled: bool,
+    /// Cluster-wide cap on region-transfer bytes per second for
+    /// convergence-tier moves. 0 = unlimited. RF violations and decommission
+    /// evacuation are never throttled.
+    #[serde(default = "default_movement_budget_bytes_per_sec")]
+    pub movement_budget_bytes_per_sec: u64,
 }
 
 impl Default for ShardingConfig {
@@ -107,6 +115,8 @@ impl Default for ShardingConfig {
             peer_heal_enabled: default_peer_heal_enabled(),
             transfer_clear_proposals_enabled: default_transfer_clear_proposals_enabled(),
             add_peer_proposals_enabled: default_add_peer_proposals_enabled(),
+            remove_peer_proposals_enabled: default_remove_peer_proposals_enabled(),
+            movement_budget_bytes_per_sec: default_movement_budget_bytes_per_sec(),
         }
     }
 }
@@ -180,6 +190,14 @@ fn default_transfer_clear_proposals_enabled() -> bool {
 /// beta and clusters are rebuilt more often than rolling-upgraded.
 fn default_add_peer_proposals_enabled() -> bool {
     true
+}
+
+fn default_remove_peer_proposals_enabled() -> bool {
+    true
+}
+
+fn default_movement_budget_bytes_per_sec() -> u64 {
+    0
 }
 
 impl HyperbytedbConfig {
@@ -1273,6 +1291,11 @@ mod replicate_body_limit_tests {
     fn shard_map_op_gates_default_on() {
         let s = super::ShardingConfig::default();
         assert!(s.add_peer_proposals_enabled);
+        assert!(s.remove_peer_proposals_enabled);
+        assert_eq!(
+            s.movement_budget_bytes_per_sec, 0,
+            "0 means unlimited; a nonzero default would throttle silently"
+        );
         assert!(s.transfer_clear_proposals_enabled);
     }
 }
