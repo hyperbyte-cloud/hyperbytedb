@@ -2468,6 +2468,7 @@ mod tests {
             joined_at: 0,
             last_heartbeat: 0,
             needs_sync: false,
+            consecutive_misses: 0,
         }
     }
 
@@ -3509,6 +3510,7 @@ mod tests {
                     joined_at: 0,
                     last_heartbeat: 0,
                     needs_sync: false,
+                    consecutive_misses: 0,
                 });
                 for (id, delta) in peers {
                     let reported = map_version.saturating_add_signed(*delta);
@@ -3521,6 +3523,7 @@ mod tests {
                         joined_at: *id as i64,
                         last_heartbeat: 0,
                         needs_sync: false,
+                        consecutive_misses: 0,
                     });
                 }
             }

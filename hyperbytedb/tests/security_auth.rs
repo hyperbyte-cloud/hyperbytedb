@@ -80,6 +80,7 @@ async fn start_auth_cluster_node(dir: &std::path::Path) -> AuthClusterNode {
         joined_at: now,
         last_heartbeat: now,
         needs_sync: false,
+        consecutive_misses: 0,
     });
     let shared_membership = new_shared(membership);
 

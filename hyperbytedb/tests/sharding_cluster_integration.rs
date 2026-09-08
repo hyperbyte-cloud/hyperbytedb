@@ -847,6 +847,7 @@ async fn joiner_map_version_matches_before_region_movement() {
             joined_at: 0,
             last_heartbeat: 0,
             needs_sync: false,
+            consecutive_misses: 0,
         });
     }
     // libchdb is process-global; share node 1's session (pair-cluster harness).

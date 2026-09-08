@@ -91,9 +91,21 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
         let self_id = config.cluster.node_id;
         let hb_interval = Duration::from_secs(config.cluster.heartbeat_interval_secs.max(1));
         let probe_timeout = Duration::from_secs(5);
+        // Reuses the existing cluster.heartbeat_miss_threshold knob, already
+        // surfaced in the CRD and until now consumed only by flush_service.
+        let miss_threshold =
+            u32::try_from(config.cluster.heartbeat_miss_threshold).unwrap_or(u32::MAX);
         let rx = service_shutdown_rx.clone();
         Some(tokio::spawn(async move {
-            heartbeat::run_heartbeat_updater(self_id, m, hb_interval, probe_timeout, rx).await;
+            heartbeat::run_heartbeat_updater(
+                self_id,
+                m,
+                miss_threshold,
+                hb_interval,
+                probe_timeout,
+                rx,
+            )
+            .await;
         }))
     } else {
         None

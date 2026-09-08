@@ -38,6 +38,7 @@ impl ClusterBootstrap {
             joined_at: now,
             last_heartbeat: now,
             needs_sync: false,
+            consecutive_misses: 0,
         });
 
         let shared_membership = crate::domain::cluster::membership::new_shared(cluster_membership);

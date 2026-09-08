@@ -104,6 +104,7 @@ async fn start_node_on(
         joined_at: now,
         last_heartbeat: now,
         needs_sync: false,
+        consecutive_misses: 0,
     });
     for p in peers {
         membership.add_node(NodeInfo {
@@ -113,6 +114,7 @@ async fn start_node_on(
             joined_at: now,
             last_heartbeat: now,
             needs_sync: false,
+            consecutive_misses: 0,
         });
     }
     let shared_membership = new_shared(membership);
