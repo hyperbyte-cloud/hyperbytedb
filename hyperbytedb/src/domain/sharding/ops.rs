@@ -69,6 +69,19 @@ pub enum ShardMapOp {
         #[serde(default)]
         epoch: ShardEpoch,
     },
+    /// Shrink a region's replica set. Does not change primary.
+    ///
+    /// The mirror of [`ShardMapOp::AddPeer`], and what makes drain and
+    /// rebalancing possible: without it a peer set can only grow. Refuses to
+    /// remove the primary or the last peer, so a region is never left
+    /// ownerless. RF policy belongs to the caller.
+    RemovePeer {
+        key: MeasurementKey,
+        region_id: u64,
+        from_peer: u64,
+        #[serde(default)]
+        epoch: ShardEpoch,
+    },
     TransferPrimary {
         key: MeasurementKey,
         region_id: u64,
@@ -96,6 +109,7 @@ impl ShardMapOp {
             | ShardMapOp::Merge { key, .. }
             | ShardMapOp::MovePeer { key, .. }
             | ShardMapOp::AddPeer { key, .. }
+            | ShardMapOp::RemovePeer { key, .. }
             | ShardMapOp::TransferPrimary { key, .. }
             | ShardMapOp::ClearVerified { key, .. } => key,
         }
@@ -308,6 +322,48 @@ pub fn apply_shard_map_op(
                 )));
             }
             region.peers.push(to_peer);
+            region.epoch = epoch.bump_conf_ver();
+            sort_space_regions(space);
+        }
+        ShardMapOp::RemovePeer {
+            key,
+            region_id,
+            from_peer,
+            epoch,
+        } => {
+            let space = map
+                .spaces
+                .get_mut(&key)
+                .ok_or(ShardMapApplyError::UnknownSpace)?;
+            let region = space
+                .regions
+                .iter_mut()
+                .find(|r| r.region_id == region_id)
+                .ok_or(ShardMapApplyError::UnknownRegion(region_id))?;
+            if region.epoch != epoch {
+                return Err(ShardMapApplyError::StaleEpoch("RemovePeer"));
+            }
+            if region.transfer_outstanding() {
+                return Err(ShardMapApplyError::Invalid(
+                    "cannot remove peer while transfer debt is outstanding".into(),
+                ));
+            }
+            if !region.peers.contains(&from_peer) {
+                return Err(ShardMapApplyError::Invalid(format!(
+                    "peer {from_peer} not in region"
+                )));
+            }
+            if region.primary == from_peer {
+                return Err(ShardMapApplyError::Invalid(format!(
+                    "cannot remove peer {from_peer}: it is the region primary"
+                )));
+            }
+            if region.peers.len() <= 1 {
+                return Err(ShardMapApplyError::Invalid(
+                    "cannot remove the last peer of a region".into(),
+                ));
+            }
+            region.peers.retain(|p| *p != from_peer);
             region.epoch = epoch.bump_conf_ver();
             sort_space_regions(space);
         }
@@ -950,5 +1006,104 @@ mod tests {
             err.to_string().contains("stale epoch on ClearVerified"),
             "{err}"
         );
+    }
+
+    fn bootstrapped(peers: Vec<u64>, primary: u64) -> (MeasurementKey, ShardMap, ShardEpoch) {
+        let key = MeasurementKey::new("db", "autogen", "cpu");
+        let mut region = sample_region(1, 0, u64::MAX, primary);
+        region.peers = peers;
+        region.primary = primary;
+        let epoch = region.epoch;
+        let mut map = ShardMap::default();
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::BootstrapMeasurement {
+                key: key.clone(),
+                region,
+            },
+        )
+        .unwrap();
+        (key, map, epoch)
+    }
+
+    fn remove_op(key: &MeasurementKey, from_peer: u64, epoch: ShardEpoch) -> ShardMapOp {
+        ShardMapOp::RemovePeer {
+            key: key.clone(),
+            region_id: 1,
+            from_peer,
+            epoch,
+        }
+    }
+
+    #[test]
+    fn remove_peer_drops_the_peer_and_bumps_conf_ver() {
+        let (key, mut map, epoch) = bootstrapped(vec![1, 2, 3], 1);
+        apply_shard_map_op(&mut map, remove_op(&key, 3, epoch)).unwrap();
+        let r = &map.spaces.values().next().unwrap().regions[0];
+        assert_eq!(r.peers, vec![1, 2]);
+        assert_eq!(r.primary, 1);
+        assert_eq!(r.epoch.conf_ver, epoch.conf_ver + 1);
+    }
+
+    #[test]
+    fn remove_peer_refuses_the_primary() {
+        let (key, mut map, epoch) = bootstrapped(vec![1, 2, 3], 1);
+        assert!(matches!(
+            apply_shard_map_op(&mut map, remove_op(&key, 1, epoch)).unwrap_err(),
+            ShardMapApplyError::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn remove_peer_refuses_a_non_peer() {
+        let (key, mut map, epoch) = bootstrapped(vec![1, 2, 3], 1);
+        assert!(matches!(
+            apply_shard_map_op(&mut map, remove_op(&key, 9, epoch)).unwrap_err(),
+            ShardMapApplyError::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn remove_peer_refuses_the_last_peer() {
+        let (key, mut map, epoch) = bootstrapped(vec![1], 1);
+        assert!(matches!(
+            apply_shard_map_op(&mut map, remove_op(&key, 1, epoch)).unwrap_err(),
+            ShardMapApplyError::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn remove_peer_refuses_stale_epoch() {
+        let (key, mut map, epoch) = bootstrapped(vec![1, 2, 3], 1);
+        let stale = ShardEpoch {
+            conf_ver: epoch.conf_ver + 5,
+            version: epoch.version,
+        };
+        assert!(matches!(
+            apply_shard_map_op(&mut map, remove_op(&key, 3, stale)).unwrap_err(),
+            ShardMapApplyError::StaleEpoch("RemovePeer")
+        ));
+    }
+
+    #[test]
+    fn remove_peer_refuses_while_transfer_debt_outstanding() {
+        let key = MeasurementKey::new("db", "autogen", "cpu");
+        let mut region = sample_region(1, 0, u64::MAX, 1);
+        region.peers = vec![1, 2, 3];
+        region.transfer_verified = Some(false);
+        let epoch = region.epoch;
+        let mut map = ShardMap::default();
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::BootstrapMeasurement {
+                key: key.clone(),
+                region,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            apply_shard_map_op(&mut map, remove_op(&key, 3, epoch)).unwrap_err(),
+            ShardMapApplyError::Invalid(_)
+        ));
     }
 }
