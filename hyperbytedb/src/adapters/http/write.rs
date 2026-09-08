@@ -52,7 +52,7 @@ pub async fn handle_write(
         if let Some(node) = m.get_node(state.node_id) {
             use crate::domain::cluster::membership::NodeState;
             match node.state {
-                NodeState::Draining | NodeState::Leaving => {
+                NodeState::Draining | NodeState::Decommissioning | NodeState::Leaving => {
                     let active_peer = m
                         .active_peers(state.node_id)
                         .first()
@@ -74,7 +74,10 @@ pub async fn handle_write(
                 NodeState::Syncing | NodeState::Joining => {
                     return Ok(StatusCode::SERVICE_UNAVAILABLE.into_response());
                 }
-                _ => {}
+                // Listed explicitly rather than `_`: a catch-all here silently
+                // admits client writes for any state added later, which is how
+                // a node being removed kept accepting them.
+                NodeState::Active | NodeState::Disconnected => {}
             }
         }
     }

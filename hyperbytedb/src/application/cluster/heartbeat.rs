@@ -57,7 +57,7 @@ pub(crate) enum ProbeSignal {
 /// sole transition input; overall HTTP status never transitions membership.
 /// `Joining`/`Draining`/`Leaving` are operator-owned and never auto-promoted.
 pub(crate) fn decide_transition(current: NodeState, signal: &ProbeSignal) -> Option<NodeState> {
-    use NodeState::{Active, Disconnected, Draining, Joining, Leaving, Syncing};
+    use NodeState::{Active, Decommissioning, Disconnected, Draining, Joining, Leaving, Syncing};
     match (current, signal) {
         // Transport failure is the sole demotion path to Disconnected;
         // operator states stay untouched.
@@ -85,7 +85,15 @@ pub(crate) fn decide_transition(current: NodeState, signal: &ProbeSignal) -> Opt
             }
             Syncing => b.ready().then_some(Active),
             Active => (b.state == Some(Syncing)).then_some(Syncing),
-            Joining | Draining | Leaving => None,
+            // A drained node is restarting, not leaving: it must be able to
+            // rejoin. Without this it stays `Draining` in its peers' views
+            // forever, and since `Draining` keeps its placement seat, the
+            // cluster would keep targeting a node it never readmits.
+            Draining => b.ready().then_some(Active),
+            // Terminal and operator-owned. No probe result may resurrect a
+            // node that is being removed, or evacuation would be undone.
+            Decommissioning | Leaving => None,
+            Joining => None,
         },
     }
 }
@@ -388,7 +396,14 @@ mod tests {
 
     #[test]
     fn operator_states_are_never_promoted() {
-        for current in [NodeState::Joining, NodeState::Draining, NodeState::Leaving] {
+        // `Draining` is deliberately absent: a drained node is restarting, not
+        // leaving, and must be able to rejoin. See
+        // `draining_recovers_when_the_node_reports_ready`.
+        for current in [
+            NodeState::Joining,
+            NodeState::Decommissioning,
+            NodeState::Leaving,
+        ] {
             assert_eq!(
                 decide_transition(current, &body(Some(NodeState::Active), Some(false))),
                 None
@@ -403,6 +418,45 @@ mod tests {
                 ),
                 None
             );
+        }
+    }
+
+    #[test]
+    fn draining_recovers_when_the_node_reports_ready() {
+        // Drain keeps the node's seat in every region it belongs to, so it
+        // must come back. Without this it stays `Draining` in its peers' views
+        // forever while the cluster keeps targeting it -- a live defect today,
+        // and load-bearing once placement keys on candidacy.
+        assert_eq!(
+            decide_transition(
+                NodeState::Draining,
+                &body(Some(NodeState::Active), Some(false))
+            ),
+            Some(NodeState::Active)
+        );
+        // Not ready yet: stay put rather than readmitting a node mid-restart.
+        assert_eq!(
+            decide_transition(
+                NodeState::Draining,
+                &body(Some(NodeState::Active), Some(true))
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn decommissioning_is_terminal_under_every_signal() {
+        // No probe result may resurrect a node being removed, or evacuation
+        // would be undone by a heartbeat.
+        for signal in [
+            body(Some(NodeState::Active), Some(false)),
+            ProbeSignal::Unreachable,
+            ProbeSignal::Response {
+                health_ok: false,
+                body: None,
+            },
+        ] {
+            assert_eq!(decide_transition(NodeState::Decommissioning, &signal), None);
         }
     }
 
