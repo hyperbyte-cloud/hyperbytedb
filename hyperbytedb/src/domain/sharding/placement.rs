@@ -48,6 +48,57 @@ pub fn placement_hash(key: &MeasurementKey, start: u64, node_id: u64) -> u64 {
     mix(acc.wrapping_add(node_id).wrapping_add(GOLDEN))
 }
 
+use super::types::ShardRegion;
+
+/// One mutation moving a region toward its target placement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlacementStep {
+    /// Stage data onto this node, then commit `AddPeer`.
+    Add(u64),
+    /// Commit `RemovePeer` for this node.
+    Remove(u64),
+    /// Commit `TransferPrimary` to this node.
+    Promote(u64),
+}
+
+/// The next step toward `target`, or `None` at the fixed point.
+///
+/// Priority is deliberate and load-bearing:
+///
+/// 1. **Add** before remove, so replication factor never dips while
+///    converging. This is what gives drain correct behaviour for free.
+/// 2. **Promote** before remove, so the primary is never the node leaving.
+/// 3. **Remove** last, only once the target set is fully present.
+///
+/// One step per call: a committed step bumps the region epoch, so the caller
+/// must re-read the region before the next one.
+///
+/// Callers must act on the returned step; ignoring it stalls convergence.
+#[must_use]
+pub fn next_placement_step(region: &ShardRegion, target: &[u64]) -> Option<PlacementStep> {
+    // Both deleted candidate functions opened with this guard, and `AddPeer`
+    // apply rejects on outstanding debt. Without it, convergence stages a full
+    // region copy over the network and then has the proposal rejected, every
+    // tick, uncounted against the movement budget.
+    if region.transfer_outstanding() {
+        return None;
+    }
+    if target.is_empty() {
+        return None;
+    }
+    if let Some(&missing) = target.iter().find(|t| !region.peers.contains(t)) {
+        return Some(PlacementStep::Add(missing));
+    }
+    let want_primary = target[0];
+    if region.primary != want_primary {
+        return Some(PlacementStep::Promote(want_primary));
+    }
+    if let Some(&extra) = region.peers.iter().find(|p| !target.contains(p)) {
+        return Some(PlacementStep::Remove(extra));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,5 +138,104 @@ mod tests {
             "top byte collides too often: {}",
             seen.len()
         );
+    }
+
+    use crate::domain::sharding::types::ShardRegion;
+
+    fn region(peers: Vec<u64>, primary: u64) -> ShardRegion {
+        ShardRegion {
+            region_id: 1,
+            start: 0,
+            end: u64::MAX,
+            epoch: Default::default(),
+            peers,
+            primary,
+            last_split_at: 0,
+            transfer_verified: None,
+            transfer_first_seen: None,
+        }
+    }
+
+    #[test]
+    fn converged_region_needs_no_step() {
+        assert_eq!(
+            next_placement_step(&region(vec![3, 1, 2], 3), &[3, 1, 2]),
+            None
+        );
+    }
+
+    #[test]
+    fn missing_peer_is_added_before_anything_else() {
+        assert_eq!(
+            next_placement_step(&region(vec![1, 2], 1), &[3, 1, 2]),
+            Some(PlacementStep::Add(3))
+        );
+    }
+
+    #[test]
+    fn primary_is_promoted_once_peers_are_present() {
+        assert_eq!(
+            next_placement_step(&region(vec![1, 2, 3], 1), &[3, 1, 2]),
+            Some(PlacementStep::Promote(3))
+        );
+    }
+
+    #[test]
+    fn extra_peer_is_removed_last() {
+        assert_eq!(
+            next_placement_step(&region(vec![1, 2, 3, 4], 3), &[3, 1, 2]),
+            Some(PlacementStep::Remove(4))
+        );
+    }
+
+    #[test]
+    fn add_precedes_remove_so_rf_never_dips() {
+        assert_eq!(
+            next_placement_step(&region(vec![1, 2, 3], 3), &[3, 2, 4]),
+            Some(PlacementStep::Add(4))
+        );
+    }
+
+    #[test]
+    fn primary_is_never_the_node_being_removed() {
+        assert_eq!(
+            next_placement_step(&region(vec![1, 2, 3], 1), &[2, 3]),
+            Some(PlacementStep::Promote(2))
+        );
+    }
+
+    #[test]
+    fn empty_target_is_a_no_op() {
+        assert_eq!(next_placement_step(&region(vec![1, 2, 3], 1), &[]), None);
+    }
+
+    #[test]
+    fn transfer_debt_blocks_convergence() {
+        // AddPeer apply rejects while debt is outstanding, so proposing anyway
+        // costs a full region copy for a guaranteed rejection, every tick.
+        let mut r = region(vec![1, 2], 1);
+        r.transfer_verified = Some(false);
+        assert_eq!(next_placement_step(&r, &[3, 1, 2]), None);
+    }
+
+    #[test]
+    fn repeated_steps_converge_to_a_fixed_point() {
+        // This is the whole convergence argument that replaces the recency
+        // keying. If it loops, the design is wrong, not the test.
+        let mut r = region(vec![1, 2, 3], 1);
+        let target = vec![5, 4, 2];
+        for _ in 0..16 {
+            match next_placement_step(&r, &target) {
+                Some(PlacementStep::Add(n)) => r.peers.push(n),
+                Some(PlacementStep::Remove(n)) => r.peers.retain(|p| *p != n),
+                Some(PlacementStep::Promote(n)) => r.primary = n,
+                None => break,
+            }
+        }
+        assert_eq!(next_placement_step(&r, &target), None, "did not converge");
+        assert_eq!(r.primary, 5);
+        let mut peers = r.peers.clone();
+        peers.sort_unstable();
+        assert_eq!(peers, vec![2, 4, 5]);
     }
 }
