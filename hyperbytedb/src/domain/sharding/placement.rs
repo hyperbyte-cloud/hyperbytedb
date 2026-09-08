@@ -127,6 +127,58 @@ pub fn next_placement_step(region: &ShardRegion, target: &[u64]) -> Option<Place
     None
 }
 
+/// Priority class for a pending region movement.
+///
+/// Variant order is the sort order, and it is the point: durability must never
+/// queue behind balance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MoveTier {
+    /// Below effective RF in substance. Preempts everything, never throttled.
+    RfViolation,
+    /// Holds a peer being permanently removed. Bounded, never throttled, so a
+    /// decommission finishes predictably.
+    Evacuation,
+    /// Merely misplaced. Uses leftover budget only.
+    Convergence,
+}
+
+/// Classify why a region needs to move.
+///
+/// `unhealthy` is peers that are not serving, `departing` is peers being
+/// permanently removed. A region at full peer count with a dead peer is
+/// under-replicated in substance even though `peers.len()` still reads RF, and
+/// must not be throttled as ordinary balance work.
+#[must_use]
+pub fn move_tier(
+    region: &ShardRegion,
+    rf: usize,
+    departing: &[u64],
+    unhealthy: &[u64],
+) -> MoveTier {
+    let live = region
+        .peers
+        .iter()
+        .filter(|p| !unhealthy.contains(p))
+        .count();
+    if live < rf {
+        MoveTier::RfViolation
+    } else if region.peers.iter().any(|p| departing.contains(p)) {
+        MoveTier::Evacuation
+    } else {
+        MoveTier::Convergence
+    }
+}
+
+/// True when a move must yield to the movement budget.
+///
+/// Only `Convergence` is throttled; RF violations and evacuation are exempt,
+/// because safety must never queue behind balance. An allowance of 0 means
+/// unlimited.
+#[must_use]
+pub fn budget_exhausted(tier: MoveTier, allowance: u64, moved: u64) -> bool {
+    tier == MoveTier::Convergence && allowance > 0 && moved >= allowance
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,5 +381,66 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn under_replicated_region_is_the_top_tier() {
+        assert_eq!(
+            move_tier(&region(vec![1, 2], 1), 3, &[], &[]),
+            MoveTier::RfViolation
+        );
+    }
+
+    #[test]
+    fn a_dead_peer_makes_a_full_region_under_replicated() {
+        // peers.len() still reads 3, but only two can serve. Throttling this
+        // as ordinary balance work would queue durability behind optimisation.
+        assert_eq!(
+            move_tier(&region(vec![1, 2, 3], 1), 3, &[], &[3]),
+            MoveTier::RfViolation
+        );
+    }
+
+    #[test]
+    fn region_holding_a_departing_peer_is_the_evacuation_tier() {
+        assert_eq!(
+            move_tier(&region(vec![1, 2, 3], 1), 3, &[3], &[]),
+            MoveTier::Evacuation
+        );
+    }
+
+    #[test]
+    fn a_merely_misplaced_region_is_the_convergence_tier() {
+        assert_eq!(
+            move_tier(&region(vec![1, 2, 3], 1), 3, &[], &[]),
+            MoveTier::Convergence
+        );
+    }
+
+    #[test]
+    fn rf_violation_outranks_evacuation() {
+        // Both under RF and holding a departing peer: durability comes first.
+        assert_eq!(
+            move_tier(&region(vec![1, 3], 1), 3, &[3], &[]),
+            MoveTier::RfViolation
+        );
+    }
+
+    #[test]
+    fn tier_ordering_puts_safety_first() {
+        assert!(MoveTier::RfViolation < MoveTier::Evacuation);
+        assert!(MoveTier::Evacuation < MoveTier::Convergence);
+    }
+
+    #[test]
+    fn budget_gates_only_the_convergence_tier() {
+        assert!(budget_exhausted(MoveTier::Convergence, 100, 100));
+        assert!(!budget_exhausted(MoveTier::RfViolation, 100, 100));
+        assert!(!budget_exhausted(MoveTier::Evacuation, 100, 100));
+        assert!(
+            !budget_exhausted(MoveTier::Convergence, 0, u64::MAX),
+            "0 allowance means unlimited"
+        );
+        assert!(!budget_exhausted(MoveTier::Convergence, 100, 99));
     }
 }
