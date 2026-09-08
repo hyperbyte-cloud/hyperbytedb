@@ -1043,6 +1043,102 @@ impl ShardScheduler {
     /// Place a live Active member that is not yet a region peer, when
     /// effective RF has room. Stages rows onto the joiner, then commits
     /// `AddPeer` — never commit-then-stage (that's heal `MovePeer`).
+    /// Copy a region's rows onto `to_peer`, from whichever node holds them.
+    ///
+    /// Staging always precedes the map commit. Heal's commit-then-stage
+    /// ordering would publish a peer holding no rows, and scatter reads fall
+    /// back to replicas, so that surfaces as silent empty results rather than
+    /// an error.
+    async fn stage_region_onto(
+        &self,
+        key: &MeasurementKey,
+        region: &ShardRegion,
+        to_peer: u64,
+    ) -> Result<(), HyperbytedbError> {
+        let Some(pc) = self.peer_client.as_ref() else {
+            return Err(HyperbytedbError::ShardMap("no peer client".into()));
+        };
+        if region.primary == self.node_id {
+            let outcome = stage_region_transfer_data(
+                pc,
+                &self.metadata,
+                &self.wal,
+                self.query_port.as_ref(),
+                self.node_id,
+                key,
+                region,
+                to_peer,
+                self.max_points_per_request,
+            )
+            .await?;
+            if !outcome.verified() {
+                return Err(HyperbytedbError::ShardMap(
+                    format!(
+                        "placement stage unverified: exported={} applied={}",
+                        outcome.exported, outcome.applied
+                    )
+                    .into(),
+                ));
+            }
+            Ok(())
+        } else {
+            request_region_stage(
+                pc.as_ref(),
+                &self.membership,
+                region.primary,
+                key,
+                region,
+                to_peer,
+            )
+            .await
+        }
+    }
+
+    /// First candidate whose shard map has caught up to `cluster_ver`.
+    ///
+    /// Walks candidates rather than committing to one up front: choosing
+    /// before probing let a single lagging node block every region forever.
+    /// A persistent stall warns and increments
+    /// `hyperbytedb_shard_placement_stalled_total`.
+    async fn first_caught_up(
+        &self,
+        region_id: u64,
+        cluster_ver: u64,
+        candidates: &[(u64, String)],
+    ) -> Option<u64> {
+        let pc = self.peer_client.as_ref()?;
+        // Preserve the original accounting: no candidates is not a stall.
+        if candidates.is_empty() {
+            self.clear_placement_stall(region_id).await;
+            return None;
+        }
+        for (id, addr) in candidates {
+            let ver = match self
+                .cached_peer_map_version(*id, addr, pc.http_client())
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!(error = %e, candidate = id, "map version probe failed");
+                    continue;
+                }
+            };
+            if joiner_map_caught_up(cluster_ver, ver) {
+                self.clear_placement_stall(region_id).await;
+                return Some(*id);
+            }
+            tracing::debug!(
+                region_id,
+                candidate = id,
+                cluster_ver,
+                candidate_ver = ver,
+                "candidate map not caught up"
+            );
+        }
+        self.note_placement_stall(region_id, candidates.len()).await;
+        None
+    }
+
     async fn try_place_live_member(
         &self,
         key: &MeasurementKey,
@@ -1052,11 +1148,11 @@ impl ShardScheduler {
             return Ok(false);
         }
 
-        // Resolve the peer client before probing the joiner: without one there
+        // Check the peer client before probing the joiner: without one there
         // is no way to stage rows, so the round trip below would be wasted.
-        let Some(pc) = self.peer_client.as_ref() else {
+        if self.peer_client.is_none() {
             return Ok(false);
-        };
+        }
 
         // Re-read the region: `drain_reconciliation` runs before this loop and
         // can bump epochs, so the caller's snapshot may already be stale.
@@ -1083,71 +1179,14 @@ impl ShardScheduler {
         // Take the first candidate that has caught up. Stopping at the first
         // candidate outright let one lagging node block every region forever,
         // because the choice was made before the probe and never advanced.
-        let cluster_ver = map.map_version;
-        let mut chosen = None;
-        for (id, addr) in &candidates {
-            let ver = match self
-                .cached_peer_map_version(*id, addr, pc.http_client())
-                .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::debug!(error = %e, candidate = id, "map version probe failed");
-                    continue;
-                }
-            };
-            if joiner_map_caught_up(cluster_ver, ver) {
-                chosen = Some(*id);
-                break;
-            }
-            tracing::debug!(
-                region_id = region.region_id,
-                candidate = id,
-                cluster_ver,
-                candidate_ver = ver,
-                "candidate map not caught up"
-            );
-        }
-        let Some(joiner) = chosen else {
-            self.note_placement_stall(region.region_id, candidates.len())
-                .await;
+        let Some(joiner) = self
+            .first_caught_up(region.region_id, map.map_version, &candidates)
+            .await
+        else {
             return Ok(false);
         };
-        self.clear_placement_stall(region.region_id).await;
 
-        if region.primary == self.node_id {
-            let outcome = stage_region_transfer_data(
-                pc,
-                &self.metadata,
-                &self.wal,
-                self.query_port.as_ref(),
-                self.node_id,
-                key,
-                region,
-                joiner,
-                self.max_points_per_request,
-            )
-            .await?;
-            if !outcome.verified() {
-                return Err(HyperbytedbError::ShardMap(
-                    format!(
-                        "live placement stage unverified: exported={} applied={}",
-                        outcome.exported, outcome.applied
-                    )
-                    .into(),
-                ));
-            }
-        } else {
-            request_region_stage(
-                pc.as_ref(),
-                &self.membership,
-                region.primary,
-                key,
-                region,
-                joiner,
-            )
-            .await?;
-        }
+        self.stage_region_onto(key, region, joiner).await?;
 
         self.propose(ShardMapOp::AddPeer {
             key: key.clone(),
