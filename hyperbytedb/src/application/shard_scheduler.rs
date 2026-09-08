@@ -614,7 +614,27 @@ impl ShardScheduler {
         right.start = split_key;
         right.epoch = child_epoch;
         right.last_split_at = left.last_split_at;
-        if let Some(new_primary) = pick_best_primary(
+        // The left child keeps the parent's `start`, so its placement is
+        // unchanged by construction and its rows never move. Only the right
+        // child is re-placed, and it is keyed on `start` rather than
+        // `region_id` because Split allocates the child's id at apply time —
+        // a proposer cannot hash on an id that does not exist yet.
+        //
+        // The right child starts with its primary ALONE, not the full target
+        // set. try_split stages to `right.primary` only, so publishing the
+        // whole target here would commit RF-1 peers holding zero rows; scatter
+        // falls back to replicas, and the result is silently empty reads. It
+        // would also be self-sealing: once peers == target, convergence reads
+        // the region as finished and never backfills. Convergence grows it to
+        // RF instead, via staged AddPeer steps in the unthrottled RfViolation
+        // tier.
+        let candidates = self.active_candidate_ids().await;
+        let rf = effective_replication_factor(self.config.replication_factor, candidates.len());
+        let target = target_placement(key, split_key, &candidates, rf);
+        if let Some(&new_primary) = target.first() {
+            right.primary = new_primary;
+            right.peers = vec![new_primary];
+        } else if let Some(new_primary) = pick_best_primary(
             &self.membership,
             region,
             self.node_id,
@@ -622,6 +642,8 @@ impl ShardScheduler {
         )
         .await
         {
+            // No candidates (membership unreadable): fall back rather than
+            // splitting into a region nobody owns.
             right.primary = new_primary;
         }
 
