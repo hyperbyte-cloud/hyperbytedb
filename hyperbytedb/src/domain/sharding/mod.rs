@@ -1,5 +1,6 @@
 pub mod location_cache;
 pub mod ops;
+pub mod placement;
 pub mod query_merge;
 pub mod transfer;
 pub mod types;
