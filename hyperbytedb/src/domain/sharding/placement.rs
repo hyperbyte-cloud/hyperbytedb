@@ -48,6 +48,34 @@ pub fn placement_hash(key: &MeasurementKey, start: u64, node_id: u64) -> u64 {
     mix(acc.wrapping_add(node_id).wrapping_add(GOLDEN))
 }
 
+/// Target peer set for a region, best-first. Index 0 is the target primary.
+///
+/// `candidates` is the set of nodes eligible to hold data — see
+/// `holds_placement`. A node excluded from it (decommissioning, leaving) can
+/// never be selected, which is what makes evacuation converge.
+///
+/// Ranking by raw hash descending is equivalent to the weighted rendezvous
+/// score `w / -ln(h/MAX)` whenever all weights are equal, because that is a
+/// monotonic transform of `h`. Phase 1 ships uniform weights; a weighted
+/// variant must switch to the full score.
+#[must_use]
+pub fn target_placement(
+    key: &MeasurementKey,
+    start: u64,
+    candidates: &[u64],
+    rf: usize,
+) -> Vec<u64> {
+    let mut scored: Vec<(u64, u64)> = candidates
+        .iter()
+        .map(|&n| (placement_hash(key, start, n), n))
+        .collect();
+    // Descending by score; node_id breaks ties so the order is total and
+    // independent of the caller's candidate ordering.
+    scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    scored.truncate(rf);
+    scored.into_iter().map(|(_, n)| n).collect()
+}
+
 use super::types::ShardRegion;
 
 /// One mutation moving a region toward its target placement.
@@ -237,5 +265,69 @@ mod tests {
         let mut peers = r.peers.clone();
         peers.sort_unstable();
         assert_eq!(peers, vec![2, 4, 5]);
+    }
+
+    #[test]
+    fn placement_is_deterministic_and_order_independent() {
+        let asc: Vec<u64> = (1..=10).collect();
+        let desc: Vec<u64> = (1..=10).rev().collect();
+        let a = target_placement(&key(), 0, &asc, 3);
+        assert_eq!(a.len(), 3);
+        assert_eq!(a, target_placement(&key(), 0, &asc, 3));
+        assert_eq!(a, target_placement(&key(), 0, &desc, 3));
+    }
+
+    #[test]
+    fn different_starts_spread_across_nodes() {
+        // The property the whole design exists for: one measurement's regions
+        // must not all land on the same RF nodes.
+        let nodes: Vec<u64> = (1..=12).collect();
+        let mut primaries = std::collections::HashSet::new();
+        for i in 0..48u64 {
+            primaries.insert(target_placement(&key(), i * 1_000_000, &nodes, 3)[0]);
+        }
+        assert!(
+            primaries.len() >= 10,
+            "only {} distinct primaries",
+            primaries.len()
+        );
+    }
+
+    #[test]
+    fn rf_is_capped_by_candidate_count() {
+        assert_eq!(target_placement(&key(), 0, &[1, 2], 3).len(), 2);
+        assert_eq!(target_placement(&key(), 0, &[], 3).len(), 0);
+    }
+
+    #[test]
+    fn adding_a_node_moves_a_minimal_share() {
+        let before: Vec<u64> = (1..=10).collect();
+        let after: Vec<u64> = (1..=11).collect();
+        let total = 500u64;
+        let moved = (0..total)
+            .filter(|&i| {
+                target_placement(&key(), i, &before, 3) != target_placement(&key(), i, &after, 3)
+            })
+            .count() as u64;
+        assert!(
+            moved > total / 10 && moved < total / 2,
+            "expected a minimal-but-nonzero share, got {moved}/{total}"
+        );
+    }
+
+    #[test]
+    fn removing_a_node_only_moves_its_own_regions() {
+        let before: Vec<u64> = (1..=10).collect();
+        let after: Vec<u64> = (1..=9).collect();
+        for i in 0..500u64 {
+            let a = target_placement(&key(), i, &before, 3);
+            if !a.contains(&10) {
+                assert_eq!(
+                    a,
+                    target_placement(&key(), i, &after, 3),
+                    "region {i} moved needlessly"
+                );
+            }
+        }
     }
 }
