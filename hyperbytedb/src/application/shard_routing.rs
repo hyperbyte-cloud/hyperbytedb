@@ -289,12 +289,15 @@ pub fn effective_replication_factor(configured: usize, active_members: usize) ->
 
 /// Pick the peer set for a brand-new measurement's first region.
 ///
-/// Candidates are ordered by `hash(measurement, node_id)` so different
-/// measurements bootstrap onto different node subsets. The previous
-/// lowest-ID-first ordering sent every new measurement's initial (and hottest)
-/// region to the same RF nodes — a deterministic cluster-wide hotspot. Pure
-/// function of the key + membership, so every coordinator computing the op
-/// agrees on the same peer set and primary.
+/// Candidates are ordered by
+/// [`crate::domain::sharding::placement::target_placement`] — the same function
+/// that places every other region — so a freshly bootstrapped region already
+/// sits where the scheduler would put it and needs no movement. A measurement's
+/// first region starts at 0, which is the `start` passed here.
+///
+/// The previous ordering used `DefaultHasher`, which std does not guarantee
+/// stable across releases; placement is recomputed continuously on every node,
+/// so two builds disagreeing would scatter regions during a rolling upgrade.
 ///
 /// Peer count is [`effective_replication_factor`]: n=1 yields `[self]`,
 /// not an empty set truncated against a configured RF of 2 or 3.
@@ -315,21 +318,11 @@ async fn select_bootstrap_peers(
     peers.sort_unstable();
     peers.dedup();
     let member_count = peers.len();
-    // Spread placement: deterministic per-(measurement, node) hash order.
-    use std::hash::{Hash, Hasher};
-    peers.sort_by_key(|node_id| {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        db.hash(&mut h);
-        rp.hash(&mut h);
-        measurement.hash(&mut h);
-        node_id.hash(&mut h);
-        h.finish()
-    });
-    peers.truncate(effective_replication_factor(
-        ctx.config.replication_factor,
-        member_count,
-    ));
-    Ok(peers)
+    let rf = effective_replication_factor(ctx.config.replication_factor, member_count);
+    let key = crate::domain::sharding::types::MeasurementKey::new(db, rp, measurement);
+    Ok(crate::domain::sharding::placement::target_placement(
+        &key, 0, &peers, rf,
+    ))
 }
 
 /// Partition an owned batch into local vs per-region forward buckets.
@@ -1044,5 +1037,31 @@ mod scatter_tests {
         };
         assert_eq!(region.peers, vec![1], "n=1 must own the region");
         assert_eq!(region.primary, 1);
+    }
+
+    #[test]
+    fn bootstrap_placement_matches_the_shared_placement_function() {
+        // A measurement's first region starts at 0, so bootstrap placement is
+        // exactly target_placement(key, 0, members, rf). If these diverge, a
+        // freshly bootstrapped region is immediately "misplaced" and the
+        // scheduler moves it on the first tick.
+        use crate::domain::sharding::placement::target_placement;
+        use crate::domain::sharding::types::MeasurementKey;
+
+        let key = MeasurementKey::new("db", "autogen", "cpu");
+        let members: Vec<u64> = vec![1, 2, 3, 4, 5];
+        let placed = target_placement(&key, 0, &members, 3);
+        assert_eq!(placed.len(), 3);
+        assert!(members.contains(&placed[0]));
+
+        // Order-independent: membership enumeration order must not change it.
+        let mut reversed = members.clone();
+        reversed.reverse();
+        assert_eq!(placed, target_placement(&key, 0, &reversed, 3));
+
+        // Different measurements land on different subsets, which is why
+        // bootstrap hashes at all.
+        let other = MeasurementKey::new("db", "autogen", "mem");
+        assert_ne!(placed, target_placement(&other, 0, &members, 3));
     }
 }
