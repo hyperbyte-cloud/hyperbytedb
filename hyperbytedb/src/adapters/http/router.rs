@@ -186,7 +186,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
                 "/internal/sync/trigger",
                 post(peer_handlers::handle_sync_trigger),
             )
-            .route("/internal/drain", post(peer_handlers::handle_drain));
+            .route("/internal/drain", post(peer_handlers::handle_drain))
+            .route(
+                "/internal/decommission",
+                post(peer_handlers::handle_decommission),
+            );
 
         if state.sharding_enabled {
             cluster_router = cluster_router

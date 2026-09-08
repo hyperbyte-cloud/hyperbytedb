@@ -11,7 +11,6 @@ use crate::application::disk_monitor;
 use crate::application::retention_service::RetentionService;
 use crate::bootstrap::build_services;
 use crate::config::{HyperbytedbConfig, RetentionConfig};
-use crate::domain::cluster::membership::NodeState;
 use crate::ports::metadata::MetadataPort;
 use crate::ports::points_sink::PointsSinkPort;
 use crate::ports::wal::WalPort;
@@ -179,8 +178,6 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
     // Keep handles for the shutdown sequence
     let shutdown_wal = app_state.wal.clone();
     let shutdown_drain_service = app_state.drain_service.clone();
-    let shutdown_membership = membership.clone();
-    let shutdown_node_id = config.cluster.node_id;
 
     // Set Raft instance on AppState before building the router
     app_state.raft = raft_instance.clone();
@@ -477,18 +474,13 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
     }
 
     if let Some(ref ds) = shutdown_drain_service {
-        // Skip drain if it was already triggered by the Kubernetes preStop hook
-        let already_drained = if let Some(ref m) = shutdown_membership {
-            let guard = m.read().await;
-            guard
-                .get_node(shutdown_node_id)
-                .map(|n| n.state == NodeState::Leaving)
-                .unwrap_or(false)
-        } else {
-            false
-        };
-
-        if already_drained {
+        // Skip drain if it already ran, e.g. triggered by the Kubernetes
+        // preStop hook. A successful drain now ends in `Draining`, not
+        // `Leaving` (draining keeps the node's seat and its data, so it must
+        // never reach the terminal `Leaving` state), so "already drained" can
+        // no longer be read off membership state -- `has_drained()` tracks it
+        // directly instead.
+        if ds.has_drained() {
             tracing::info!("drain already completed (preStop hook), skipping");
         } else {
             tracing::info!("running drain procedure before stopping services");
