@@ -773,3 +773,60 @@ pub async fn handle_sync_trigger(State(state): State<Arc<AppState>>) -> impl Int
         })),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_node(id: u64, state: NodeState) -> NodeInfo {
+        NodeInfo {
+            node_id: id,
+            addr: format!("127.0.0.1:{}", 8080 + id),
+            state,
+            joined_at: 0,
+            last_heartbeat: 0,
+            needs_sync: false,
+            consecutive_misses: 0,
+        }
+    }
+
+    #[test]
+    fn self_leave_transitions_active_to_draining() {
+        let mut m = ClusterMembership::new();
+        m.add_node(make_node(1, NodeState::Active));
+
+        assert!(apply_self_leave(&mut m, 1));
+        assert_eq!(m.get_node(1).map(|n| n.state), Some(NodeState::Draining));
+    }
+
+    #[test]
+    fn self_leave_does_not_downgrade_a_decommissioning_node() {
+        // /internal/membership/leave{node_id: self} used to `set_state`
+        // unconditionally, so this self-call could clobber Decommissioning
+        // back into Draining -- re-admitting the node as a placement
+        // candidate mid-evacuation.
+        let mut m = ClusterMembership::new();
+        m.add_node(make_node(1, NodeState::Decommissioning));
+
+        assert!(!apply_self_leave(&mut m, 1));
+        assert_eq!(
+            m.get_node(1).map(|n| n.state),
+            Some(NodeState::Decommissioning)
+        );
+    }
+
+    #[test]
+    fn self_leave_does_not_downgrade_a_leaving_node() {
+        let mut m = ClusterMembership::new();
+        m.add_node(make_node(1, NodeState::Leaving));
+
+        assert!(!apply_self_leave(&mut m, 1));
+        assert_eq!(m.get_node(1).map(|n| n.state), Some(NodeState::Leaving));
+    }
+
+    #[test]
+    fn self_leave_on_unknown_node_is_false() {
+        let mut m = ClusterMembership::new();
+        assert!(!apply_self_leave(&mut m, 99));
+    }
+}
