@@ -501,6 +501,10 @@ impl ShardScheduler {
                 self.release_operator(region.region_id).await;
             }
         }
+
+        // After the region pass, so a node that finished evacuating this tick
+        // is retired in the same tick rather than waiting for the next.
+        self.retire_evacuated_nodes().await;
         Ok(())
     }
 
@@ -1133,6 +1137,49 @@ impl ShardScheduler {
             .collect();
         drop(m);
         ids
+    }
+
+    /// True when no region anywhere in the map still lists `node_id`.
+    ///
+    /// A `Decommissioning` node stays in membership until this holds, so
+    /// operators can watch evacuation progress and nothing removes a node that
+    /// still owns rows. This is the ONLY thing that may move a decommissioning
+    /// node to `Leaving`: `drain` reaches its terminal state on a 90s-capped
+    /// replication wait, which says nothing about whether regions have moved.
+    async fn decommission_complete(&self, node_id: u64) -> bool {
+        let Ok(map) = self.shard_map.snapshot().await else {
+            return false;
+        };
+        !map.spaces
+            .values()
+            .flat_map(|s| s.regions.iter())
+            .any(|r| r.peers.contains(&node_id))
+    }
+
+    /// Move a fully evacuated `Decommissioning` node to `Leaving`.
+    async fn retire_evacuated_nodes(&self) {
+        for node_id in self.departing_node_ids().await {
+            let still_decommissioning = {
+                let m = self.membership.read().await;
+                let v = m
+                    .get_node(node_id)
+                    .is_some_and(|n| n.state == NodeState::Decommissioning);
+                drop(m);
+                v
+            };
+            if !still_decommissioning {
+                continue;
+            }
+            if self.decommission_complete(node_id).await {
+                let mut m = self.membership.write().await;
+                let moved = m.transition(node_id, NodeState::Leaving);
+                drop(m);
+                if moved {
+                    counter!("hyperbytedb_shard_decommission_completed_total").increment(1);
+                    tracing::info!(node_id, "decommission complete; node marked Leaving");
+                }
+            }
+        }
     }
 
     /// Move one region one step toward its target placement.
@@ -3704,5 +3751,20 @@ mod tests {
             allowance,
             u64::MAX
         ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn decommission_completes_only_once_no_region_references_the_node() {
+        let h = PlacementTestHarness::new(true, &[(2, 0)], 1).await;
+        let owner = h.scheduler.node_id;
+        assert!(
+            !h.scheduler.decommission_complete(owner).await,
+            "the owning node still holds a region"
+        );
+        assert!(
+            h.scheduler.decommission_complete(9999).await,
+            "a node holding nothing must read as evacuated"
+        );
     }
 }
