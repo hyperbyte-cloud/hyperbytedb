@@ -902,8 +902,8 @@ async fn joiner_map_version_matches_before_region_movement() {
 #[tokio::test]
 #[serial(chdb)]
 async fn joiner_receives_existing_region_as_replica() {
-    use hyperbytedb::application::shard_scheduler::live_replica_candidate;
     use hyperbytedb::application::shard_transfer::stage_region_transfer_data;
+    use hyperbytedb::domain::sharding::placement::target_placement;
     use hyperbytedb::ports::metadata::MetadataPort;
     use hyperbytedb::ports::query::QueryPort;
     use hyperbytedb::ports::wal::WalPort;
@@ -965,11 +965,14 @@ async fn joiner_receives_existing_region_as_replica() {
     create_db(&client, &node2.url, "p1db").await;
     install_shard_map_from_peer(&node1, &node2).await;
 
+    // The joiner must be somewhere the placement function actually wants this
+    // region. With two live members and RF capped at 2, both are targeted.
     let active = [1u64, 2];
-    assert_eq!(
-        live_replica_candidate(&region, &active, 3),
-        Some(2),
-        "live joiner must be the placement candidate"
+    let key = hyperbytedb::domain::sharding::types::MeasurementKey::new("p1db", "autogen", "cpu");
+    let target = target_placement(&key, region.start, &active, 2);
+    assert!(
+        target.contains(&2),
+        "live joiner must be in the region's target placement, got {target:?}"
     );
 
     let peer_client = Arc::new(
@@ -1077,8 +1080,8 @@ async fn local_wal_points(
 #[tokio::test]
 #[serial(chdb)]
 async fn joiner_takes_region_primary_and_applies_writes_locally() {
-    use hyperbytedb::application::shard_scheduler::{primary_counts, primary_placement_candidate};
     use hyperbytedb::application::shard_transfer::run_region_transfer;
+    use hyperbytedb::domain::sharding::placement::target_placement;
     use hyperbytedb::ports::metadata::MetadataPort;
     use hyperbytedb::ports::points_sink::PointsSinkPort;
     use hyperbytedb::ports::query::QueryPort;
@@ -1103,7 +1106,7 @@ async fn joiner_takes_region_primary_and_applies_writes_locally() {
         &client,
         &node1.url,
         "p14db",
-        "cpu,host=solo value=1 1000000000",
+        "disk,host=solo value=1 1000000000",
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
@@ -1114,7 +1117,7 @@ async fn joiner_takes_region_primary_and_applies_writes_locally() {
         .snapshot()
         .await
         .unwrap()
-        .space("p14db", "autogen", "cpu")
+        .space("p14db", "autogen", "disk")
         .and_then(|s| s.regions.first())
         .cloned()
         .expect("region after write");
@@ -1146,7 +1149,7 @@ async fn joiner_takes_region_primary_and_applies_writes_locally() {
     let wal: Arc<dyn WalPort> = node1.wal.clone();
     let query_port: Arc<dyn QueryPort> = node1.query_port.clone();
     let sink: Arc<dyn PointsSinkPort> = node1.points_sink.clone();
-    let key = MeasurementKey::new("p14db", "autogen", "cpu");
+    let key = MeasurementKey::new("p14db", "autogen", "disk");
 
     hyperbytedb::application::shard_transfer::stage_region_transfer_data(
         &peer_client,
@@ -1161,7 +1164,7 @@ async fn joiner_takes_region_primary_and_applies_writes_locally() {
     )
     .await
     .expect("stage onto joiner");
-    apply_add_peer_on_nodes(&[&node1, &node2], "p14db", "autogen", "cpu", 2).await;
+    apply_add_peer_on_nodes(&[&node1, &node2], "p14db", "autogen", "disk", 2).await;
 
     // P1.5: replica-only is not a pass. A write aimed at node 2 forwards to the
     // primary and leaves node 2's own WAL untouched.
@@ -1170,7 +1173,7 @@ async fn joiner_takes_region_primary_and_applies_writes_locally() {
         &client,
         &node2.url,
         "p14db",
-        "cpu,host=solo value=2 1000000001",
+        "disk,host=solo value=2 1000000001",
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
@@ -1185,15 +1188,19 @@ async fn joiner_takes_region_primary_and_applies_writes_locally() {
         .snapshot()
         .await
         .unwrap()
-        .space("p14db", "autogen", "cpu")
+        .space("p14db", "autogen", "disk")
         .and_then(|s| s.regions.first())
         .cloned()
         .expect("region after AddPeer");
-    let counts = primary_counts(&node1.shard_map.snapshot().await.unwrap());
+    // Under the placement function the primary goes wherever the hash says,
+    // not to the joiner by virtue of being newest. This measurement's region
+    // targets node 2 first, which is what makes it a P1.4 case at all.
+    let key = hyperbytedb::domain::sharding::types::MeasurementKey::new("p14db", "autogen", "disk");
+    let target = target_placement(&key, staged.start, &[1, 2], 2);
     assert_eq!(
-        primary_placement_candidate(&staged, &counts, &[1, 2]),
+        target.first().copied(),
         Some(2),
-        "the joiner holds no primaries and must be chosen to take this one"
+        "expected this region to target the joiner as primary, got {target:?}"
     );
 
     // Transfer-then-commit: rows move and verify before ownership changes.
@@ -1213,7 +1220,7 @@ async fn joiner_takes_region_primary_and_applies_writes_locally() {
     .await
     .expect("verified handoff to the joiner");
     let nodes = [node1, node2];
-    promote_region_primary_on_all_nodes(&nodes, "p14db", "autogen", "cpu", 2).await;
+    promote_region_primary_on_all_nodes(&nodes, "p14db", "autogen", "disk", 2).await;
 
     for node in &nodes {
         let placed = node
@@ -1221,7 +1228,7 @@ async fn joiner_takes_region_primary_and_applies_writes_locally() {
             .snapshot()
             .await
             .unwrap()
-            .space("p14db", "autogen", "cpu")
+            .space("p14db", "autogen", "disk")
             .and_then(|s| s.regions.first())
             .cloned()
             .expect("region after TransferPrimary");
@@ -1243,13 +1250,13 @@ async fn joiner_takes_region_primary_and_applies_writes_locally() {
         &client,
         &nodes[1].url,
         "p14db",
-        "cpu,host=solo value=3 1000000002",
+        "disk,host=solo value=3 1000000002",
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
     let landed = local_wal_points(&nodes[1], primary_seq + 1).await;
     assert!(
-        landed.iter().any(|p| p.measurement == "cpu"),
+        landed.iter().any(|p| p.measurement == "disk"),
         "joiner is primary but the write did not reach its own WAL: {landed:?}"
     );
 }
@@ -1261,11 +1268,11 @@ async fn joiner_takes_region_primary_and_applies_writes_locally() {
 #[tokio::test]
 #[serial(chdb)]
 async fn fourth_node_joining_rf_complete_cluster_takes_a_region() {
-    use hyperbytedb::application::shard_scheduler::{
-        idle_member_replica_swap, primary_counts, primary_placement_candidate, region_memberships,
-    };
     use hyperbytedb::application::shard_transfer::{
         run_region_transfer, stage_region_transfer_data,
+    };
+    use hyperbytedb::domain::sharding::placement::{
+        PlacementStep, next_placement_step, target_placement,
     };
     use hyperbytedb::ports::metadata::MetadataPort;
     use hyperbytedb::ports::points_sink::PointsSinkPort;
@@ -1285,7 +1292,7 @@ async fn fourth_node_joining_rf_complete_cluster_takes_a_region() {
         ..Default::default()
     };
     let nodes = start_sharded_three_node_cluster(dir.path(), opts()).await;
-    bootstrap_region_on_all_nodes(&nodes, "p16db", "autogen", "cpu", vec![1, 2, 3], 1).await;
+    bootstrap_region_on_all_nodes(&nodes, "p16db", "autogen", "disk", vec![1, 2, 3], 1).await;
 
     let client = reqwest::Client::new();
     for node in &nodes {
@@ -1295,7 +1302,7 @@ async fn fourth_node_joining_rf_complete_cluster_takes_a_region() {
         &client,
         &nodes[0].url,
         "p16db",
-        "cpu,host=rfc value=7 1000000000",
+        "disk,host=rfc value=7 1000000000",
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
@@ -1306,7 +1313,7 @@ async fn fourth_node_joining_rf_complete_cluster_takes_a_region() {
         .snapshot()
         .await
         .unwrap()
-        .space("p16db", "autogen", "cpu")
+        .space("p16db", "autogen", "disk")
         .and_then(|s| s.regions.first())
         .cloned()
         .expect("region after write");
@@ -1318,19 +1325,46 @@ async fn fourth_node_joining_rf_complete_cluster_takes_a_region() {
 
     // No region is under RF, so replica *addition* correctly declines; the
     // newcomer has to displace a replica instead.
-    assert_eq!(
-        hyperbytedb::application::shard_scheduler::live_replica_candidate(
-            &region,
-            &[1, 2, 3, 4],
-            3
-        ),
-        None,
-        "RF is already satisfied; AddPeer must not fire"
+    // Under the placement function a fourth node needs no special rule: it
+    // simply enters the targets its hash wins. This region targets node 4, so
+    // convergence adds it and drops whichever incumbent is no longer wanted.
+    // The old policy needed an idle-member displacement rule here precisely
+    // because RF was already satisfied and AddPeer declined.
+    let placement_key =
+        hyperbytedb::domain::sharding::types::MeasurementKey::new("p16db", "autogen", "disk");
+    let target = target_placement(&placement_key, region.start, &[1, 2, 3, 4], 3);
+    assert!(
+        target.contains(&4),
+        "the newcomer must be wanted by this region, got {target:?}"
     );
-    let memberships = region_memberships(&nodes[0].shard_map.snapshot().await.unwrap());
-    let displaced =
-        idle_member_replica_swap(&region, 4, &memberships).expect("newcomer takes a replica slot");
-    assert_ne!(displaced, region.primary, "the primary is never displaced");
+    assert_eq!(
+        next_placement_step(&region, &target),
+        Some(PlacementStep::Add(4)),
+        "convergence must add the newcomer before removing anyone"
+    );
+    let displaced = *region
+        .peers
+        .iter()
+        .find(|p| !target.contains(p))
+        .expect("some incumbent is no longer targeted");
+
+    // The old rule refused to displace a primary at all. The new one may --
+    // but never while it still holds the role: `next_placement_step` orders
+    // Promote before Remove, so the region is never left without an owner.
+    // Walk the steps and assert no Remove ever names the sitting primary.
+    let mut walk = region.clone();
+    for _ in 0..8 {
+        match next_placement_step(&walk, &target) {
+            Some(PlacementStep::Add(n)) => walk.peers.push(n),
+            Some(PlacementStep::Promote(n)) => walk.primary = n,
+            Some(PlacementStep::Remove(n)) => {
+                assert_ne!(n, walk.primary, "a sitting primary was removed");
+                walk.peers.retain(|p| *p != n);
+            }
+            None => break,
+        }
+    }
+    assert_eq!(walk.primary, 4, "the newcomer ends up owning the region");
 
     let peer_client = Arc::new(
         hyperbytedb::adapters::cluster::peer_client::PeerClient::new(
@@ -1353,7 +1387,7 @@ async fn fourth_node_joining_rf_complete_cluster_takes_a_region() {
     let wal: Arc<dyn WalPort> = nodes[0].wal.clone();
     let query_port: Arc<dyn QueryPort> = nodes[0].query_port.clone();
     let sink: Arc<dyn PointsSinkPort> = nodes[0].points_sink.clone();
-    let key = MeasurementKey::new("p16db", "autogen", "cpu");
+    let key = MeasurementKey::new("p16db", "autogen", "disk");
 
     // P1.3 shape: stage before the map commits the newcomer as a peer.
     let staged = stage_region_transfer_data(
@@ -1377,14 +1411,14 @@ async fn fourth_node_joining_rf_complete_cluster_takes_a_region() {
     );
 
     let all = [&nodes[0], &nodes[1], &nodes[2], &node4];
-    apply_move_peer_on_nodes(&all, "p16db", "autogen", "cpu", displaced, 4).await;
+    apply_move_peer_on_nodes(&all, "p16db", "autogen", "disk", displaced, 4).await;
 
     let swapped = nodes[0]
         .shard_map
         .snapshot()
         .await
         .unwrap()
-        .space("p16db", "autogen", "cpu")
+        .space("p16db", "autogen", "disk")
         .and_then(|s| s.regions.first())
         .cloned()
         .expect("region after MovePeer");
@@ -1397,11 +1431,10 @@ async fn fourth_node_joining_rf_complete_cluster_takes_a_region() {
 
     // P1.4 shape: MovePeer appended the newcomer, so it is now the newest peer
     // and the primary-placement rule hands it the region.
-    let counts = primary_counts(&nodes[0].shard_map.snapshot().await.unwrap());
     assert_eq!(
-        primary_placement_candidate(&swapped, &counts, &[1, 2, 3, 4]),
+        target.first().copied(),
         Some(4),
-        "the newcomer holds no primaries and must take this one"
+        "this region targets the newcomer as primary, got {target:?}"
     );
 
     run_region_transfer(
@@ -1420,7 +1453,7 @@ async fn fourth_node_joining_rf_complete_cluster_takes_a_region() {
     .await
     .expect("verified handoff to the newcomer");
 
-    promote_region_primary_on_nodes(&all, "p16db", "autogen", "cpu", 4).await;
+    promote_region_primary_on_nodes(&all, "p16db", "autogen", "disk", 4).await;
 
     for node in all {
         let placed = node
@@ -1428,7 +1461,7 @@ async fn fourth_node_joining_rf_complete_cluster_takes_a_region() {
             .snapshot()
             .await
             .unwrap()
-            .space("p16db", "autogen", "cpu")
+            .space("p16db", "autogen", "disk")
             .and_then(|s| s.regions.first())
             .cloned()
             .expect("region after TransferPrimary");
@@ -1444,13 +1477,13 @@ async fn fourth_node_joining_rf_complete_cluster_takes_a_region() {
         &client,
         &node4.url,
         "p16db",
-        "cpu,host=rfc value=8 1000000001",
+        "disk,host=rfc value=8 1000000001",
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
     let landed = local_wal_points(&node4, seq + 1).await;
     assert!(
-        landed.iter().any(|p| p.measurement == "cpu"),
+        landed.iter().any(|p| p.measurement == "disk"),
         "newcomer is primary but the write did not reach its own WAL: {landed:?}"
     );
 }
