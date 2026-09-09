@@ -1513,9 +1513,9 @@ impl ShardScheduler {
         if !self.config.peer_heal_enabled {
             return Ok(());
         }
-        let Some(pc) = self.peer_client.as_ref() else {
+        if self.peer_client.is_none() {
             return Ok(());
-        };
+        }
 
         let dead_peer = {
             let m = self.membership.read().await;
@@ -1529,86 +1529,45 @@ impl ShardScheduler {
             return Ok(());
         };
 
-        // Prefer the active member carrying the fewest region memberships.
-        let map = self.shard_map.snapshot().await?;
-        let mut load: HashMap<u64, usize> = HashMap::new();
-        for space in map.spaces.values() {
-            for r in &space.regions {
-                for p in &r.peers {
-                    *load.entry(*p).or_insert(0) += 1;
-                }
-            }
-        }
-        let replacement = {
-            let m = self.membership.read().await;
-            let mut candidates: Vec<u64> = m
-                .active_peers(0)
-                .into_iter()
-                .map(|n| n.node_id)
-                .filter(|id| !region.peers.contains(id))
-                .collect();
-            drop(m);
-            candidates.sort_by_key(|id| (load.get(id).copied().unwrap_or(0), *id));
-            candidates.into_iter().next()
-        };
-        let Some(replacement) = replacement else {
-            counter!(
-                "hyperbytedb_shard_peer_heal_skipped_total",
-                "reason" => "no_replacement"
-            )
-            .increment(1);
+        if !self.config.remove_peer_proposals_enabled {
             return Ok(());
-        };
+        }
+
+        // A dead peer is dropped first, not swapped. There is no live source to
+        // stage from, so preserving its membership only delays RF restoration —
+        // the deliberate asymmetry with drain, which has a live source and so
+        // restores before it removes.
+        //
+        // RemovePeer refuses the primary, so a dead primary is left to
+        // `try_failover_unhealthy_primary`, which runs immediately after this
+        // in the tick; the peer is removed on a later pass once it no longer
+        // owns the region.
+        if region.primary == dead_peer {
+            tracing::debug!(
+                region_id = region.region_id,
+                dead_peer,
+                "dead peer is the primary; deferring to failover before removal"
+            );
+            return Ok(());
+        }
 
         tracing::info!(
             region_id = region.region_id,
             dead_peer,
-            replacement,
-            "proposing shard peer replacement"
+            "removing dead region peer; convergence will restore RF"
         );
-        self.propose(ShardMapOp::MovePeer {
+        self.propose(ShardMapOp::RemovePeer {
             key: key.clone(),
             region_id: region.region_id,
             from_peer: dead_peer,
-            to_peer: replacement,
             epoch: region.epoch,
         })
         .await?;
         counter!("hyperbytedb_shard_peer_heals_total").increment(1);
-
-        // Stage data onto the new peer from whoever holds authoritative rows.
-        let fresh = self
-            .committed_child_for_range(key, region.start, region.end)
-            .await
-            .unwrap_or_else(|| region.clone());
-        if fresh.primary == self.node_id {
-            run_region_transfer(
-                pc,
-                &self.metadata,
-                &self.wal,
-                self.query_port.as_ref(),
-                self.points_sink.as_ref(),
-                self.node_id,
-                key,
-                &fresh,
-                replacement,
-                self.max_points_per_request,
-                // The new peer is an added replica; keep every other copy.
-                false,
-            )
-            .await?;
-        } else {
-            request_region_rehome(
-                pc,
-                &self.membership,
-                fresh.primary,
-                key,
-                &fresh,
-                replacement,
-                false,
-            )
-            .await?;
-        }
+        // The region is now below effective RF, so convergence classifies it
+        // RfViolation — top tier, exempt from the movement budget — and stages
+        // a replacement chosen by the placement function rather than one picked
+        // here that the hash may disagree with.
         Ok(())
     }
 
