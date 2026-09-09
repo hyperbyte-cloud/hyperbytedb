@@ -15,8 +15,12 @@ use crate::application::shard_transfer::{
     stage_region_transfer_data,
 };
 use crate::config::ShardingConfig;
-use crate::domain::cluster::membership::{NodeState, SharedMembership, holds_placement};
-use crate::domain::sharding::placement::{PlacementStep, next_placement_step, target_placement};
+use crate::domain::cluster::membership::{
+    NodeState, SharedMembership, holds_placement, is_departing, is_serving,
+};
+use crate::domain::sharding::placement::{
+    PlacementStep, budget_exhausted, move_tier, next_placement_step, target_placement,
+};
 use crate::domain::sharding::{
     MeasurementKey, ShardMap, ShardMapOp, ShardRegion, ShardRehomeRequest,
 };
@@ -133,6 +137,16 @@ pub struct ShardScheduler {
     /// candidate, keyed by region id. A cluster-wide placement stall is
     /// otherwise only visible at `debug!`.
     placement_stalls: tokio::sync::RwLock<HashMap<u64, u32>>,
+    /// Bytes staged by convergence-tier moves during the current tick.
+    ///
+    /// A bare `AtomicU64`: the scheduler is already shared behind an `Arc`, so
+    /// wrapping again buys nothing. `Relaxed` is correct — the counter is
+    /// written and read only by the single scheduler task and orders no other
+    /// memory.
+    tick_moved_bytes: std::sync::atomic::AtomicU64,
+    /// The scheduler's own tick cadence, for sizing the movement budget.
+    /// Set from the interval passed to [`ShardScheduler::run`].
+    tick_interval_secs: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     test_force_leader: bool,
     #[cfg(test)]
@@ -173,6 +187,8 @@ impl ShardScheduler {
             rollup_dests: tokio::sync::RwLock::new(HashMap::new()),
             peer_map_versions: tokio::sync::RwLock::new(HashMap::new()),
             placement_stalls: tokio::sync::RwLock::new(HashMap::new()),
+            tick_moved_bytes: std::sync::atomic::AtomicU64::new(0),
+            tick_interval_secs: std::sync::atomic::AtomicU64::new(1),
             #[cfg(test)]
             test_force_leader: false,
             #[cfg(test)]
@@ -298,6 +314,14 @@ impl ShardScheduler {
     }
 
     pub async fn run(&self, interval: Duration, mut shutdown_rx: watch::Receiver<bool>) {
+        // The budget is bytes-per-second, so it needs the real cadence. Sizing
+        // it from `split_merge_interval_secs` (default 3600) while ticking on
+        // `heartbeat_interval_secs` (default 10) would hand every tick an
+        // hour's allowance.
+        self.tick_interval_secs.store(
+            interval.as_secs().max(1),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -340,6 +364,8 @@ impl ShardScheduler {
     async fn tick(&self) -> Result<(), HyperbytedbError> {
         // Peer map versions are only valid for the tick that probed them.
         self.peer_map_versions.write().await.clear();
+        self.tick_moved_bytes
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         let map = self.shard_map.snapshot().await?;
         self.drain_reconciliation(&map).await;
         let now = SystemTime::now()
@@ -1083,6 +1109,32 @@ impl ShardScheduler {
         ids
     }
 
+    /// Node ids being permanently removed. NOT `Draining` — that is a restart.
+    async fn departing_node_ids(&self) -> Vec<u64> {
+        let m = self.membership.read().await;
+        let ids = m
+            .nodes
+            .values()
+            .filter(|n| is_departing(n))
+            .map(|n| n.node_id)
+            .collect();
+        drop(m);
+        ids
+    }
+
+    /// Peers of `region` whose node is not serving, for movement-tier urgency.
+    async fn unhealthy_region_peers(&self, region: &ShardRegion) -> Vec<u64> {
+        let m = self.membership.read().await;
+        let ids = region
+            .peers
+            .iter()
+            .copied()
+            .filter(|p| m.get_node(*p).is_none_or(|n| !is_serving(n)))
+            .collect();
+        drop(m);
+        ids
+    }
+
     /// Move one region one step toward its target placement.
     ///
     /// Replaces `try_place_live_member`, `try_place_idle_member` and
@@ -1128,6 +1180,24 @@ impl ShardScheduler {
             self.clear_placement_stall(region.region_id).await;
             return Ok(false);
         };
+        // After the converged check, never before: gating first would skip the
+        // `None` branch for already-converged regions once a tick's budget was
+        // spent, leaving their stall counters uncleared and reporting healthy
+        // regions as stalled under exactly the load stall detection exists for.
+        let departing = self.departing_node_ids().await;
+        let unhealthy = self.unhealthy_region_peers(region).await;
+        let allowance = self.config.movement_budget_bytes_per_sec.saturating_mul(
+            self.tick_interval_secs
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        if budget_exhausted(
+            move_tier(region, rf, &departing, &unhealthy),
+            allowance,
+            self.tick_moved_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ) {
+            return Ok(false);
+        }
         match step {
             PlacementStep::Add(_) => {
                 if !self.config.add_peer_proposals_enabled {
@@ -1155,7 +1225,9 @@ impl ShardScheduler {
                 // Stage before committing. The heal path's commit-then-stage
                 // ordering publishes a peer holding no rows, and scatter falls
                 // back to replicas, so that surfaces as silent empty results.
-                self.stage_region_onto(key, region, to_peer).await?;
+                let staged = self.stage_region_onto(key, region, to_peer).await?;
+                self.tick_moved_bytes
+                    .fetch_add(staged, std::sync::atomic::Ordering::Relaxed);
                 self.propose(ShardMapOp::AddPeer {
                     key: key.clone(),
                     region_id: region.region_id,
@@ -1197,12 +1269,15 @@ impl ShardScheduler {
     /// ordering would publish a peer holding no rows, and scatter reads fall
     /// back to replicas, so that surfaces as silent empty results rather than
     /// an error.
+    /// Returns the number of points staged, for movement-budget accounting.
+    /// The remote branch reports 0: the source node accounts for those bytes,
+    /// not the leader that asked for the transfer.
     async fn stage_region_onto(
         &self,
         key: &MeasurementKey,
         region: &ShardRegion,
         to_peer: u64,
-    ) -> Result<(), HyperbytedbError> {
+    ) -> Result<u64, HyperbytedbError> {
         let Some(pc) = self.peer_client.as_ref() else {
             return Err(HyperbytedbError::ShardMap("no peer client".into()));
         };
@@ -1228,7 +1303,7 @@ impl ShardScheduler {
                     .into(),
                 ));
             }
-            Ok(())
+            Ok(outcome.exported)
         } else {
             request_region_stage(
                 pc.as_ref(),
@@ -1239,6 +1314,7 @@ impl ShardScheduler {
                 to_peer,
             )
             .await
+            .map(|()| 0)
         }
     }
 
@@ -3598,5 +3674,35 @@ mod tests {
                 proposals,
             }
         }
+    }
+
+    #[test]
+    fn budget_sizing_uses_the_tick_cadence_not_the_split_cooldown() {
+        use crate::domain::sharding::placement::MoveTier;
+        // The scheduler ticks on sharding.heartbeat_interval_secs (default 10);
+        // split_merge_interval_secs (default 3600) is an unrelated cooldown.
+        // Sizing the allowance from the latter hands every tick an hour's worth
+        // of budget -- a 360x hole in the throttle.
+        let per_sec: u64 = 1_000;
+        let tick_secs: u64 = 10;
+        let allowance = per_sec.saturating_mul(tick_secs);
+        assert_eq!(allowance, 10_000);
+
+        let converging = sample_region_peers(vec![1, 2, 3], 1);
+        assert_eq!(move_tier(&converging, 3, &[], &[]), MoveTier::Convergence);
+        assert!(budget_exhausted(
+            move_tier(&converging, 3, &[], &[]),
+            allowance,
+            allowance
+        ));
+
+        // Safety tiers ignore it entirely.
+        let under_rf = sample_region_peers(vec![1, 2], 1);
+        assert_eq!(move_tier(&under_rf, 3, &[], &[]), MoveTier::RfViolation);
+        assert!(!budget_exhausted(
+            move_tier(&under_rf, 3, &[], &[]),
+            allowance,
+            u64::MAX
+        ));
     }
 }
