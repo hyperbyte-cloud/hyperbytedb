@@ -124,9 +124,19 @@ run_in_cluster_job() {
     exit 1
   fi
   kubectl_ctx logs "$pod" 2>&1 || true
+  # Remove any report from a previous run BEFORE copying. kubectl cp failures
+  # are swallowed below, so a stale file left in place would be read as this
+  # run's verdict -- and the launcher's own exit trap writes an empty-goals
+  # report saying PASS, which would turn any copy failure into a false green.
+  GOALS_FILE=""
+  rm -f "$REPORT_FILE"
   kubectl_ctx cp "$NS/$pod:/tmp/scaledown-e2e-report.md" "$REPORT_FILE" 2>/dev/null || true
   if [ ! -f "$REPORT_FILE" ]; then
     err "No report copied from job pod — see kubectl logs above"
+    exit 1
+  fi
+  if ! grep -qE '^\| D[0-9]' "$REPORT_FILE" 2>/dev/null; then
+    err "Report copied from job pod has no gate rows — refusing to call this a pass"
     exit 1
   fi
   if grep -q '^\*\*Overall:\*\* PASS' "$REPORT_FILE" 2>/dev/null; then
