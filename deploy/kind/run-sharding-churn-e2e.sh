@@ -1,10 +1,16 @@
 #!/bin/sh
-# Writes DURING topology change: exactly-once under a live scale-down.
+# Writes DURING topology change: exactly-once across a full lifecycle.
 #
 # Every other e2e seeds data and then moves it. Real clusters write
-# continuously, so this keeps a writer running across a decommission and
-# asserts exactly-once: the final row count equals the seed plus every write
-# the cluster acknowledged with 204 -- no fewer, and no more.
+# continuously, so this keeps ONE writer running across three consecutive
+# topology changes -- scale down, kill a pod, scale back up -- and asserts
+# exactly-once after each: rows equal every write the cluster acknowledged
+# with 204, no fewer and no more.
+#
+# One change proves much less than a sequence. The windows that matter are the
+# ones a single scale-down never reaches: a write landing on a JOINING node
+# whose region is still staging, and a write landing during a RESTART when the
+# primary is briefly unreachable and resolve_region_peers yields no target.
 #
 # "No more" matters as much as "no fewer": apply_transfer_push is not
 # idempotent, so a region staged twice duplicates rows rather than losing them.
@@ -33,11 +39,12 @@ WRITER_BATCH=${WRITER_BATCH:-10}
 
 FULL_REPLICAS=6
 DOWN_REPLICAS=5
+KILL_ORDINAL=2
 
 REPORT_DIR=${REPORT_DIR:-$PROJECT_ROOT/../.scratch/linear-scaling-p1}
 REPORT_FILE=$REPORT_DIR/churn-e2e-report.md
 E2E_REPORT_TITLE="Sharding Write-Churn E2E Report"
-E2E_CLUSTER_LABEL="6→5 under continuous writes, RF=2"
+E2E_CLUSTER_LABEL="6→5→kill→6 under continuous writes, RF=2"
 
 . "$SCRIPT_DIR/lib/e2e-common-posix.sh"
 
@@ -99,6 +106,44 @@ print('\n'.join('churn,host=w{} value=1 {}'.format(i, base + n) for i in range(b
   done
 }
 
+wait_for_pods() {
+  want=$1
+  deadline=$(( $(date +%s) + CONVERGE_WAIT_SECS ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if [ "$(sts_replicas)" = "$want" ] && [ "$(running_pod_count)" = "$want" ]; then
+      return 0
+    fi
+    sleep 3
+  done
+  return 1
+}
+
+# Exactly-once, checked at every checkpoint rather than only at the end. Fewer
+# rows means acknowledged writes were lost; more means a region was staged
+# twice, since apply_transfer_push is not idempotent. Both are corruption, and
+# checking per phase says WHICH change broke it.
+check_exactly_once() {
+  gate=$1
+  when=$2
+  # The writer keeps running through this check, so a point comparison is
+  # racy: reading `acked` before the flush wait and `rows` after it counts
+  # every write acknowledged in between as a duplicate. Bracket instead --
+  # sample acked either side and require rows to land within. Anything below
+  # the low mark is a genuinely lost write; anything above the high mark is a
+  # genuine duplicate, because apply_transfer_push is not idempotent.
+  before=$(acked_total)
+  wait_flush_boundary
+  rows=$(count_from_query_checked 0 "SELECT COUNT(value) FROM churn")
+  after=$(acked_total)
+  if [ "$rows" -lt "$before" ] 2>/dev/null; then
+    fail "$gate" "LOST ${when}: ${rows} rows, ${before} acked before the check (missing $((before - rows)))"
+  elif [ "$rows" -gt "$after" ] 2>/dev/null; then
+    fail "$gate" "DUPLICATED ${when}: ${rows} rows, only ${after} acked (extra $((rows - after)))"
+  else
+    pass "$gate" "exactly-once ${when}: ${rows} rows within acked bracket [${before}, ${after}]"
+  fi
+}
+
 acked_total() {
   if [ -s "$ACK_FILE" ]; then
     awk '{s+=$1} END {print s+0}' "$ACK_FILE"
@@ -112,6 +157,14 @@ main() {
   log "Write-churn E2E — ${FULL_REPLICAS}→${DOWN_REPLICAS} with a live writer"
   setup_port_forwards
 
+  # Restore the starting topology rather than demanding a hand-reset. An
+  # aborted earlier run leaves the cluster mid-lifecycle, and a test that needs
+  # manual cleanup before every attempt is one people stop running.
+  if [ "$(cr_spec_replicas)" != "$FULL_REPLICAS" ]; then
+    log "Cluster at $(cr_spec_replicas); restoring to ${FULL_REPLICAS} before starting"
+    kubectl_ctx patch hyperbytedbcluster hyperbytedb --type merge \
+      -p "{\"spec\":{\"replicas\":${FULL_REPLICAS}}}" >/dev/null 2>&1 || true
+  fi
   if wait_for_full_cluster "$FULL_REPLICAS"; then
     pass W0 "cluster ${FULL_REPLICAS}/${FULL_REPLICAS} healthy"
   else
@@ -140,60 +193,68 @@ main() {
   log "Scaling ${FULL_REPLICAS}→${DOWN_REPLICAS} with writes in flight"
   kubectl_ctx patch hyperbytedbcluster hyperbytedb --type merge \
     -p "{\"spec\":{\"replicas\":${DOWN_REPLICAS}}}" >/dev/null
-
-  deadline=$(( $(date +%s) + CONVERGE_WAIT_SECS ))
-  moved=0
-  while [ "$(date +%s)" -lt "$deadline" ]; do
-    if [ "$(sts_replicas)" = "$DOWN_REPLICAS" ] && [ "$(running_pod_count)" = "$DOWN_REPLICAS" ]; then
-      moved=1; break
-    fi
-    sleep 3
-  done
-  if [ "$moved" = "1" ]; then
+  if wait_for_pods "$DOWN_REPLICAS"; then
     pass W3 "scaled to ${DOWN_REPLICAS} while writing"
   else
     fail W3 "still sts=$(sts_replicas) pods=$(running_pod_count)"
   fi
-
   during=$(acked_total)
   if [ "$during" -gt "$early" ]; then
-    pass W4 "writes were acknowledged during the move (${early} → ${during})"
+    pass W4 "writes acknowledged during scale-down (${early} → ${during})"
   else
-    fail W4 "no writes acknowledged during the move (still ${early}) — the window was not exercised"
+    fail W4 "no writes acknowledged during scale-down — window not exercised"
+  fi
+  check_exactly_once W5 "after scale-down"
+
+  log "Killing pod ${KILL_ORDINAL} with writes in flight"
+  before_kill=$(acked_total)
+  kubectl_ctx delete pod "hyperbytedb-${KILL_ORDINAL}" --wait=false >/dev/null 2>&1 || true
+  if wait_for_pods "$DOWN_REPLICAS"; then
+    pass W6 "pod ${KILL_ORDINAL} recovered while writing"
+  else
+    fail W6 "only $(running_pod_count)/${DOWN_REPLICAS} running"
+  fi
+  after_kill=$(acked_total)
+  if [ "$after_kill" -gt "$before_kill" ]; then
+    pass W7 "writes acknowledged across the restart (${before_kill} → ${after_kill})"
+  else
+    fail W7 "no writes acknowledged across the restart — window not exercised"
+  fi
+  check_exactly_once W8 "after node restart"
+
+  log "Scaling ${DOWN_REPLICAS}→${FULL_REPLICAS} with writes in flight"
+  before_up=$(acked_total)
+  kubectl_ctx patch hyperbytedbcluster hyperbytedb --type merge \
+    -p "{\"spec\":{\"replicas\":${FULL_REPLICAS}}}" >/dev/null
+  if wait_for_pods "$FULL_REPLICAS"; then
+    pass W9 "scaled back to ${FULL_REPLICAS} while writing"
+  else
+    fail W9 "still sts=$(sts_replicas) pods=$(running_pod_count)"
+  fi
+  after_up=$(acked_total)
+  if [ "$after_up" -gt "$before_up" ]; then
+    pass W10 "writes acknowledged during scale-up (${before_up} → ${after_up})"
+  else
+    fail W10 "no writes acknowledged during scale-up — window not exercised"
   fi
 
   touch "$STOP_FILE"
   wait "$WRITER_PID" 2>/dev/null || true
   WRITER_PID=""
-  acked=$(acked_total)
-  wait_flush_boundary
-  wait_flush_boundary
+  check_exactly_once W11 "after the full lifecycle"
 
   seed_now=$(count_from_query_checked 0 "SELECT COUNT(value) FROM cpu")
-  churn_now=$(count_from_query_checked 0 "SELECT COUNT(value) FROM churn")
-
   if [ "$seed_now" = "$EXP_SEED" ]; then
-    pass W5 "seed data intact across the move (${seed_now})"
+    pass W12 "seed data intact across all three changes (${seed_now})"
   else
-    fail W5 "seed count=${seed_now} want ${EXP_SEED}"
-  fi
-
-  # The exactly-once assertion. Fewer means acknowledged writes were lost;
-  # more means a region was staged twice, since apply_transfer_push is not
-  # idempotent. Both are corruption.
-  if [ "$churn_now" = "$acked" ]; then
-    pass W6 "exactly-once: ${churn_now} rows for ${acked} acknowledged writes"
-  elif [ "$churn_now" -lt "$acked" ] 2>/dev/null; then
-    fail W6 "LOST: ${churn_now} rows for ${acked} acknowledged writes (missing $((acked - churn_now)))"
-  else
-    fail W6 "DUPLICATED: ${churn_now} rows for ${acked} acknowledged writes (extra $((churn_now - acked)))"
+    fail W12 "seed count=${seed_now} want ${EXP_SEED}"
   fi
 
   rf=$(wait_for_regions_rf_ok 2 "$((HEARTBEAT_INTERVAL_SECS * 12))")
   if [ "$rf" = "OK" ]; then
-    pass W7 "all regions RF>=2 after churn"
+    pass W13 "all regions RF>=2 after churn"
   else
-    fail W7 "RF violation: $rf"
+    fail W13 "RF violation: $rf"
   fi
 
   write_report
