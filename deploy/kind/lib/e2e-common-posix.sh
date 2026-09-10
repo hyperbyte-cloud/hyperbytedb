@@ -163,6 +163,64 @@ print(v if v is not None else 'ERR:null value')
 " 2>/dev/null || echo "ERR:curl failed"
 }
 
+# Extract a single numeric value from the first series/first row of a query.
+# Prints "" when the query errored or returned no rows, so callers can tell
+# "no answer" from a legitimate 0.
+query_scalar() {
+  pod_idx=$1
+  q=$2
+  query_post "$pod_idx" "$q" | python3 -c "
+import json,sys
+raw=sys.stdin.read()
+try:
+  d=json.loads(raw)
+except Exception:
+  print('') ; raise SystemExit
+res=(d.get('results') or [{}])[0]
+if res.get('error'):
+  print('') ; raise SystemExit
+ser=(res.get('series') or [])
+if not ser or not ser[0].get('values'):
+  print('') ; raise SystemExit
+cols=ser[0].get('columns') or []
+row=ser[0]['values'][0]
+# Pick the value column by NAME, not position. An aggregate with no GROUP BY
+# returns a single-element row like [1962000] with columns ['sum_value'];
+# assuming a leading 'time' column and taking row[1] silently yields nothing.
+idx=next((i for i,c in enumerate(cols) if c != 'time'), None)
+if idx is None or idx >= len(row):
+  idx = len(row) - 1
+val=row[idx] if row else None
+if val is None:
+  print('')
+else:
+  # Normalise numeric type. The engine returns SUM as an int but MIN/MAX as
+  # floats, so a shell string compare against an expected `0` fails on `0.0`.
+  try:
+    f=float(val)
+    print(int(f) if f == int(f) else f)
+  except (TypeError, ValueError):
+    print(val)
+" 2>/dev/null || echo ""
+}
+
+# Number of distinct groups a GROUP BY returned.
+query_group_count() {
+  pod_idx=$1
+  q=$2
+  query_post "$pod_idx" "$q" | python3 -c "
+import json,sys
+try:
+  d=json.load(sys.stdin)
+except Exception:
+  print(-1) ; raise SystemExit
+res=(d.get('results') or [{}])[0]
+if res.get('error'):
+  print(-1) ; raise SystemExit
+print(len(res.get('series') or []))
+" 2>/dev/null || echo -1
+}
+
 metric_value() {
   pod_idx=$1
   name=$2
