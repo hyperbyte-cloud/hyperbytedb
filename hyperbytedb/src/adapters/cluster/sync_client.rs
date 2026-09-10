@@ -126,7 +126,7 @@ impl SyncClient {
         } else {
             {
                 let mut m = self.membership.write().await;
-                m.set_state(self.node_id, NodeState::Syncing);
+                m.begin_sync_to_syncing(self.node_id);
             }
             tracing::info!(
                 gap = gap,
@@ -143,7 +143,7 @@ impl SyncClient {
 
             {
                 let mut m = self.membership.write().await;
-                m.set_state(self.node_id, NodeState::Active);
+                m.complete_sync_to_active(self.node_id);
             }
         }
 
@@ -221,7 +221,7 @@ impl SyncClient {
         verify_catchup_progress(local_wal_seq, manifest.wal_last_seq, applied, local_after)?;
 
         let mut m = self.membership.write().await;
-        m.set_state(self.node_id, NodeState::Active);
+        m.complete_sync_to_active(self.node_id);
         tracing::info!("node sync complete, transitioned to Active");
         Ok(true)
     }

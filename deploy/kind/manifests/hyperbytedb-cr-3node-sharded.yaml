@@ -1,0 +1,48 @@
+# 3-node RF=3 sharded cluster for scale-up S7 (3→4).
+apiVersion: hyperbytedb.hyperbyte.cloud/v1alpha1
+kind: HyperbytedbCluster
+metadata:
+  name: hyperbytedb
+  namespace: hyperbytedb
+spec:
+  replicas: 3
+  image: hyperbytedb:local
+  imagePullPolicy: Never
+  server:
+    port: 8086
+    maxBodySizeBytes: 26214400
+    requestTimeoutSecs: 30
+    queryTimeoutSecs: 30
+    maxConcurrentQueries: 8
+  storage:
+    volumeClaimTemplate:
+      size: 16Gi
+  chdb:
+    poolSize: 1
+  flush:
+    intervalSecs: 5
+    maxPointsPerBatch: 100000
+  cluster:
+    heartbeatIntervalSecs: 2
+    heartbeatMissThreshold: 5
+    raftHeartbeatIntervalMs: 1000
+    raftElectionTimeoutMs: 5000
+    replication:
+      mode: async
+  resources:
+    requests:
+      cpu: 500m
+      memory: 2Gi
+    limits:
+      cpu: "2"
+      memory: 4Gi
+  proxy:
+    enabled: false
+  sharding:
+    enabled: true
+    replicationFactor: 3
+    regionSplitSeries: 25
+    regionMaxSeries: 40
+    regionMergeSeries: 2
+    splitMergeIntervalSecs: 30
+    heartbeatIntervalSecs: 10

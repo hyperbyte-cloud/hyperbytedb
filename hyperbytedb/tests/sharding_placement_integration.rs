@@ -48,36 +48,50 @@ fn the_left_child_never_moves() {
 }
 
 #[test]
-fn a_right_child_holding_only_its_primary_is_grown_to_rf_by_convergence() {
-    // try_split stages to right.primary alone, so the child is published with
-    // one peer. Convergence must then see it as under-replicated and add the
-    // rest -- if it read as converged, the region would sit at RF=1 forever.
+fn a_split_child_is_never_published_below_replication_factor() {
+    // A split child inherits the parent's peers, which genuinely hold its rows
+    // because they replicated the parent's whole range. Publishing the hash
+    // target instead would commit RF-1 nodes that have never seen this range:
+    // reads fall back to those replicas and come back empty. Worse, a split
+    // child carries transfer debt, and convergence skips debt-carrying
+    // regions -- so nothing would ever repair it. That combination lost 625
+    // of 5000 points in the kind scale-down e2e.
+    let parent_peers = vec![1u64, 2];
+    let child = region(1u64 << 63, u64::MAX, parent_peers.clone(), 1);
+    assert_eq!(
+        child.peers.len(),
+        parent_peers.len(),
+        "a split child must not be published below the parent's replication factor"
+    );
+}
+
+#[test]
+fn convergence_walks_a_split_child_to_its_hash_target() {
+    // Spreading still happens -- just after the split rather than during it,
+    // with each new peer staged before it is committed.
     let members: Vec<u64> = (1..=6).collect();
     let start = 1u64 << 63;
     let target = target_placement(&key(), start, &members, 3);
-    let child = region(start, u64::MAX, vec![target[0]], target[0]);
+    let mut child = region(start, u64::MAX, vec![1, 2], 1);
 
-    let step = next_placement_step(&child, &target);
-    assert!(
-        matches!(step, Some(PlacementStep::Add(_))),
-        "a freshly split child at RF=1 must be grown, got {step:?}"
-    );
-
-    // And it converges to the full target rather than stopping early.
-    let mut r = child;
     for _ in 0..16 {
-        match next_placement_step(&r, &target) {
-            Some(PlacementStep::Add(n)) => r.peers.push(n),
-            Some(PlacementStep::Remove(n)) => r.peers.retain(|p| *p != n),
-            Some(PlacementStep::Promote(n)) => r.primary = n,
+        match next_placement_step(&child, &target) {
+            Some(PlacementStep::Add(n)) => child.peers.push(n),
+            Some(PlacementStep::Remove(n)) => child.peers.retain(|p| *p != n),
+            Some(PlacementStep::Promote(n)) => child.primary = n,
             None => break,
         }
     }
-    let mut peers = r.peers.clone();
+    assert_eq!(
+        next_placement_step(&child, &target),
+        None,
+        "did not converge"
+    );
+    let mut peers = child.peers.clone();
     peers.sort_unstable();
     let mut want = target.clone();
     want.sort_unstable();
-    assert_eq!(peers, want, "child did not reach full RF");
+    assert_eq!(peers, want, "child did not reach its hash target");
 }
 
 #[test]

@@ -646,24 +646,40 @@ impl ShardScheduler {
         right.last_split_at = left.last_split_at;
         // The left child keeps the parent's `start`, so its placement is
         // unchanged by construction and its rows never move. Only the right
-        // child is re-placed, and it is keyed on `start` rather than
-        // `region_id` because Split allocates the child's id at apply time —
-        // a proposer cannot hash on an id that does not exist yet.
+        // child is re-placed, keyed on `start` rather than `region_id` because
+        // Split allocates the child's id at apply time.
         //
-        // The right child starts with its primary ALONE, not the full target
-        // set. try_split stages to `right.primary` only, so publishing the
-        // whole target here would commit RF-1 peers holding zero rows; scatter
-        // falls back to replicas, and the result is silently empty reads. It
-        // would also be self-sealing: once peers == target, convergence reads
-        // the region as finished and never backfills. Convergence grows it to
-        // RF instead, via staged AddPeer steps in the unthrottled RfViolation
-        // tier.
+        // The child KEEPS THE PARENT'S PEER SET. Those nodes replicated the
+        // parent's whole range, so they already hold the child's rows -- no
+        // peer is published empty, and replication factor never dips. Setting
+        // the child's peers to the hash target instead publishes nodes that
+        // have never seen this range: with RF-1 of them empty it reads as
+        // silently missing rows, and because a split child also carries
+        // transfer debt, convergence skips it and cannot repair it.
+        //
+        // Only the primary moves eagerly, and only to a peer that already has
+        // the data. Convergence then walks the child to its hash target over
+        // the following ticks, staging each new peer before committing it.
         let candidates = self.active_candidate_ids().await;
         let rf = effective_replication_factor(self.config.replication_factor, candidates.len());
         let target = target_placement(key, split_key, &candidates, rf);
-        if let Some(&new_primary) = target.first() {
+        let hashed_primary = target
+            .iter()
+            .find(|t| right.peers.contains(t))
+            .copied()
+            .or_else(|| {
+                // No target member holds this range yet. Rank the peers that do
+                // by the same function, so the choice is still deterministic.
+                let mut owned: Vec<u64> = right.peers.clone();
+                owned.sort_by_key(|p| {
+                    std::cmp::Reverse(crate::domain::sharding::placement::placement_hash(
+                        key, split_key, *p,
+                    ))
+                });
+                owned.first().copied()
+            });
+        if let Some(new_primary) = hashed_primary {
             right.primary = new_primary;
-            right.peers = vec![new_primary];
         } else if let Some(new_primary) = pick_best_primary(
             &self.membership,
             region,
@@ -672,8 +688,6 @@ impl ShardScheduler {
         )
         .await
         {
-            // No candidates (membership unreadable): fall back rather than
-            // splitting into a region nobody owns.
             right.primary = new_primary;
         }
 
@@ -1519,11 +1533,17 @@ impl ShardScheduler {
 
         let dead_peer = {
             let m = self.membership.read().await;
-            region
-                .peers
-                .iter()
-                .copied()
-                .find(|id| *id != region.primary && !is_active_peer(&m, *id))
+            region.peers.iter().copied().find(|id| {
+                *id != region.primary
+                    && !is_active_peer(&m, *id)
+                    // A departing node is NOT dead: it is alive and still holds
+                    // rows. Convergence evacuates it, staging onto a
+                    // replacement before it removes. Dropping it here would
+                    // delete the map's only reference to that copy without
+                    // making another one first -- silent data loss on every
+                    // scale-down.
+                    && !m.get_node(*id).is_some_and(is_departing)
+            })
         };
         let Some(dead_peer) = dead_peer else {
             return Ok(());
@@ -3172,6 +3192,42 @@ mod tests {
             }
         }
 
+        /// The measurement `new(.., regions: 1)` bootstraps: `cpu0`.
+        fn key() -> MeasurementKey {
+            MeasurementKey::new("db", "autogen", "cpu0")
+        }
+
+        async fn region(&self) -> ShardRegion {
+            self.scheduler
+                .shard_map
+                .snapshot()
+                .await
+                .unwrap()
+                .spaces
+                .get(&Self::key())
+                .and_then(|s| s.regions.first().cloned())
+                .expect("harness bootstrapped one region")
+        }
+
+        async fn add_peer_to_region(&self, peer: u64) {
+            let region = self.region().await;
+            self.scheduler
+                .shard_map
+                .apply_op(ShardMapOp::AddPeer {
+                    key: Self::key(),
+                    region_id: region.region_id,
+                    to_peer: peer,
+                    epoch: region.epoch,
+                })
+                .await
+                .unwrap();
+        }
+
+        async fn set_node_state(&self, node_id: u64, state: NodeState) {
+            let mut m = self.scheduler.membership.write().await;
+            m.set_state(node_id, state);
+        }
+
         fn probe_count(&self, peer: u64) -> u64 {
             self.probes[&peer].load(std::sync::atomic::Ordering::Relaxed)
         }
@@ -3372,6 +3428,33 @@ mod tests {
         assert!(
             h.scheduler.decommission_complete(9999).await,
             "a node holding nothing must read as evacuated"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn a_departing_peer_is_not_treated_as_dead() {
+        // Regression: is_active_peer tests `== Active`, so a Decommissioning
+        // node reads as dead and the drop-first heal path removed it without
+        // staging its rows anywhere. Scale-down lost ~24% of points in the
+        // kind e2e before this guard.
+        let h = PlacementTestHarness::new(true, &[(2, 0)], 1).await;
+        let key = PlacementTestHarness::key();
+        h.add_peer_to_region(2).await;
+        h.set_node_state(2, NodeState::Decommissioning).await;
+
+        let region = h.region().await;
+        h.scheduler
+            .try_replace_dead_peer(&key, &region)
+            .await
+            .unwrap();
+
+        let ops = h.proposals.lock().unwrap();
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op, ShardMapOp::RemovePeer { from_peer: 2, .. })),
+            "a decommissioning peer was dropped by the heal path, losing its \
+             only copy; convergence must evacuate it instead. ops={ops:?}"
         );
     }
 }

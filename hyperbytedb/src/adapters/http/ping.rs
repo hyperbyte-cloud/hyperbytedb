@@ -6,6 +6,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
+use metrics::counter;
+
 use super::router::AppState;
 use crate::domain::cluster::membership::NodeState;
 
@@ -93,6 +95,43 @@ fn maybe_promote_caught_up_voter(readiness: SelfReadiness, raft_serving: bool) -
     }
 }
 
+/// A decommissioning node owns its own `/health` state. The leader scheduler
+/// marks it `Leaving` in its local membership once regions are evacuated, but
+/// membership is not replicated — the departing pod must self-retire when its
+/// shard map no longer references it, or the operator gate never clears.
+async fn maybe_self_retire_after_evacuation(state: &AppState) {
+    let (Some(membership), Some(shard_map)) = (&state.membership, &state.shard_map) else {
+        return;
+    };
+    let is_decommissioning = {
+        let m = membership.read().await;
+        m.get_node(state.node_id)
+            .is_some_and(|n| n.state == NodeState::Decommissioning)
+    };
+    if !is_decommissioning {
+        return;
+    }
+    let Ok(map) = shard_map.snapshot().await else {
+        return;
+    };
+    let still_owns = map
+        .spaces
+        .values()
+        .flat_map(|s| s.regions.iter())
+        .any(|r| r.peers.contains(&state.node_id));
+    if still_owns {
+        return;
+    }
+    let mut m = membership.write().await;
+    if m.transition(state.node_id, NodeState::Leaving) {
+        counter!("hyperbytedb_shard_decommission_completed_total").increment(1);
+        tracing::info!(
+            node_id = state.node_id,
+            "evacuation complete; node self-marked Leaving"
+        );
+    }
+}
+
 /// GET /health - readiness check.
 /// Returns 200 when the node is Active (or standalone).
 /// Returns 503 when the node is Syncing, Joining, Draining, or Leaving
@@ -101,6 +140,7 @@ fn maybe_promote_caught_up_voter(readiness: SelfReadiness, raft_serving: bool) -
 /// Every response body carries the machine-readable `{state, needs_sync}`
 /// self-readiness fields used by cluster peers for membership convergence.
 pub async fn health(State(state): State<Arc<AppState>>) -> Response {
+    maybe_self_retire_after_evacuation(&state).await;
     let readiness =
         maybe_promote_caught_up_voter(self_readiness(&state).await, raft_is_serving(&state));
     if readiness.state == Some(NodeState::Active)

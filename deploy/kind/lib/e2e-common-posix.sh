@@ -1,0 +1,398 @@
+# POSIX helpers for kind sharding e2e scripts (scaledown).
+# Source after setting SCRIPT_DIR, KUBE_CTX, NS, DB, REPORT_DIR, etc.
+
+: "${E2E_EXPECT_REPLICAS:=6}"
+: "${E2E_REPORT_TITLE:=Sharding E2E Test Report}"
+: "${E2E_CLUSTER_LABEL:=6 replicas, RF=2}"
+: "${FAILURES:=0}"
+
+GOALS_FILE="${REPORT_DIR}/.e2e-goals.$$"
+
+log() { printf '%s\n' "[e2e] $*"; }
+warn() { printf '%s\n' "[e2e] WARN: $*" >&2; }
+err() { printf '%s\n' "[e2e] ERROR: $*" >&2; }
+
+record() {
+  goal_id=$1
+  result=$2
+  evidence=$3
+  printf '%s\n' "${goal_id}|${result}|${evidence}" >> "$GOALS_FILE"
+  if [ "$result" = "FAIL" ]; then
+    FAILURES=$((FAILURES + 1))
+    err "${goal_id} FAIL — ${evidence}"
+  else
+    log "${goal_id} ${result} — ${evidence}"
+  fi
+}
+
+pass() { record "$1" "PASS" "$2"; }
+fail() { record "$1" "FAIL" "$2"; }
+
+init_goals() {
+  mkdir -p "$REPORT_DIR"
+  : > "$GOALS_FILE"
+}
+
+wait_flush_boundary() {
+  sleep "${FLUSH_WAIT_SECS:-6}"
+}
+
+kubectl_ctx() {
+  if [ "${IN_CLUSTER:-0}" = "1" ]; then
+    kubectl -n "$NS" "$@"
+  else
+    kubectl --context "$KUBE_CTX" -n "$NS" "$@"
+  fi
+}
+
+api_port() {
+  pod_idx=$1
+  echo $((18080 + pod_idx))
+}
+
+api_url() {
+  pod_idx=$1
+  if [ "${IN_CLUSTER:-0}" = "1" ]; then
+    printf 'http://hyperbytedb-%s.%s.%s.%s:%s' \
+      "$pod_idx" "${HEADLESS_SVC:-hyperbytedb-headless}" "$NS" \
+      "${CLUSTER_DOMAIN:-svc.cluster.local}" "${HDB_PORT:-8086}"
+  else
+    printf 'http://127.0.0.1:%s' "$(api_port "$pod_idx")"
+  fi
+}
+
+PF_PIDS=""
+
+setup_port_forwards() {
+  [ "${IN_CLUSTER:-0}" = "1" ] && return 0
+  max=$((E2E_EXPECT_REPLICAS - 1))
+  log "Starting port-forwards hyperbytedb-0..${max}"
+  i=0
+  while [ "$i" -le "$max" ]; do
+    port=$(api_port "$i")
+    fuser -k "${port}/tcp" 2>/dev/null || true
+    kubectl_ctx port-forward "pod/hyperbytedb-$i" "${port}:8086" \
+      >/tmp/pf-hdb-"$i".log 2>&1 &
+    PF_PIDS="${PF_PIDS} $!"
+    i=$((i + 1))
+  done
+  deadline=$(( $(date +%s) + 45 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    all_ok=1
+    i=0
+    while [ "$i" -le "$max" ]; do
+      code=$(curl -sS -o /dev/null -w '%{http_code}' -m 3 "$(api_url "$i")/ping" 2>/dev/null || echo 000)
+      if [ "$code" != "204" ]; then
+        all_ok=0
+        break
+      fi
+      i=$((i + 1))
+    done
+    if [ "$all_ok" -eq 1 ]; then
+      log "All port-forwards responding"
+      return 0
+    fi
+    sleep 2
+  done
+  warn "Not all port-forwards ready after 45s (continuing)"
+}
+
+teardown_port_forwards() {
+  [ "${IN_CLUSTER:-0}" = "1" ] && return 0
+  [ "${KEEP_PF:-false}" = "true" ] && return 0
+  for pid in $PF_PIDS; do
+    kill "$pid" 2>/dev/null || true
+  done
+  PF_PIDS=""
+  i=0
+  while [ "$i" -lt "$E2E_EXPECT_REPLICAS" ]; do
+    fuser -k "$(api_port "$i")/tcp" 2>/dev/null || true
+    i=$((i + 1))
+  done
+}
+
+curl_api() {
+  pod_idx=$1
+  shift
+  curl -sS -m "${CURL_TIMEOUT:-15}" "$(api_url "$pod_idx")$*" || true
+}
+
+curl_write() {
+  pod_idx=$1
+  body=$2
+  curl -sS -m 15 -o /tmp/e2e-write.out -w '%{http_code}' \
+    -X POST "$(api_url "$pod_idx")/write?db=${DB}&rp=${RP:-autogen}&precision=s" \
+    --data-binary "$body" 2>/dev/null || echo 000
+}
+
+write_ts() {
+  echo $(($(date +%s) + ${1:-0}))
+}
+
+query_post() {
+  pod_idx=$1
+  q=$2
+  curl -sS -m "${CURL_TIMEOUT:-15}" -G "$(api_url "$pod_idx")/query" \
+    --data-urlencode "db=${DB}" \
+    --data-urlencode "q=${q}" 2>/dev/null || echo '{"results":[]}'
+}
+
+count_from_query_checked() {
+  pod_idx=$1
+  q=$2
+  query_post "$pod_idx" "$q" | python3 -c "
+import json,sys
+raw=sys.stdin.read()
+try:
+  d=json.loads(raw)
+except Exception:
+  print('ERR:unparseable response'); sys.exit(0)
+if isinstance(d, dict) and d.get('error'):
+  print('ERR:'+str(d['error'])[:160]); sys.exit(0)
+results=d.get('results') or []
+if not results:
+  print('ERR:no results'); sys.exit(0)
+s=results[0].get('series')
+if not s:
+  print('ERR:no series'); sys.exit(0)
+vals=s[0].get('values') or []
+if not vals or not vals[0]:
+  print('ERR:empty values'); sys.exit(0)
+v=vals[0][0]
+print(v if v is not None else 'ERR:null value')
+" 2>/dev/null || echo "ERR:curl failed"
+}
+
+metric_value() {
+  pod_idx=$1
+  name=$2
+  curl_api "$pod_idx" "/metrics" | grep "^${name}" | awk '{print $2}' | head -1
+}
+
+metric_counter() {
+  pod_idx=$1
+  name=$2
+  v=$(metric_value "$pod_idx" "$name" || true)
+  if [ -n "$v" ]; then
+    echo "$v"
+  else
+    echo "0"
+  fi
+}
+
+metric_max_across_pods() {
+  name=$1
+  max_pods=${2:-$E2E_EXPECT_REPLICAS}
+  max=0
+  i=0
+  while [ "$i" -lt "$max_pods" ]; do
+    v=$(metric_counter "$i" "$name")
+    if [ "$v" -gt "$max" ]; then
+      max=$v
+    fi
+    i=$((i + 1))
+  done
+  echo "$max"
+}
+
+wait_for_pod_ping() {
+  pod_idx=$1
+  timeout_secs=${2:-120}
+  deadline=$(( $(date +%s) + timeout_secs ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    code=$(curl -sS -o /dev/null -w '%{http_code}' -m 3 "$(api_url "$pod_idx")/ping" 2>/dev/null || echo 000)
+    if [ "$code" = "204" ]; then
+      return 0
+    fi
+    sleep 3
+  done
+  return 1
+}
+
+node_health_state() {
+  pod_idx=$1
+  curl -sS -m 5 "$(api_url "$pod_idx")/health" 2>/dev/null | python3 -c "
+import json,sys
+try:
+  d=json.load(sys.stdin)
+  print(d.get('state',''))
+except Exception:
+  print('')
+" 2>/dev/null || echo ""
+}
+
+hyperbytedb_cr_exists() {
+  kubectl_ctx get hyperbytedbcluster hyperbytedb >/dev/null 2>&1
+}
+
+cr_spec_replicas() {
+  if ! hyperbytedb_cr_exists; then
+    echo 0
+    return 0
+  fi
+  kubectl_ctx get hyperbytedbcluster hyperbytedb -o jsonpath='{.spec.replicas}' 2>/dev/null || echo 0
+}
+
+sts_replicas() {
+  kubectl_ctx get statefulset -l app.kubernetes.io/name=hyperbytedb \
+    -o jsonpath='{.items[0].spec.replicas}' 2>/dev/null || echo 0
+}
+
+cluster_not_deployed_hint() {
+  printf '%s\n' \
+    "HyperbytedbCluster 'hyperbytedb' is not running in namespace '${NS}'." \
+    "Deploy first: ./deploy/kind/setup.sh hdb-reset --sharded"
+}
+
+running_pod_count() {
+  kubectl_ctx get pods -l app.kubernetes.io/name=hyperbytedb --field-selector=status.phase=Running \
+    -o json 2>/dev/null | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+print(sum(1 for p in d.get('items',[]) if all(c.get('ready') for c in p['status'].get('containerStatuses',[]))))
+" 2>/dev/null || echo 0
+}
+
+# Running pods regardless of Ready. A decommissioning node serves 503 on /health
+# and becomes NotReady while still evacuating — do not treat that as scale-down.
+existing_pod_count() {
+  kubectl_ctx get pods -l app.kubernetes.io/name=hyperbytedb --field-selector=status.phase=Running \
+    -o json 2>/dev/null | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+print(len(d.get('items',[])))
+" 2>/dev/null || echo 0
+}
+
+pod_exists() {
+  ordinal=$1
+  if kubectl_ctx get pod "hyperbytedb-${ordinal}" >/dev/null 2>&1; then
+    echo 1
+  else
+    echo 0
+  fi
+}
+
+# Fail fast when CR/STS are not at the expected size (avoids waiting for pods
+# that will never exist, e.g. cluster already scaled to 5 from a prior run).
+cluster_replica_counts_match() {
+  expect=$1
+  if ! hyperbytedb_cr_exists; then
+    cluster_not_deployed_hint >&2
+    return 1
+  fi
+  cr=$(cr_spec_replicas)
+  sts=$(sts_replicas)
+  if [ "$cr" = "$expect" ] && [ "$sts" = "$expect" ]; then
+    return 0
+  fi
+  warn "Cluster at CR=${cr} STS=${sts}, expected ${expect} (run: ./deploy/kind/setup.sh hdb-reset --sharded)"
+  return 1
+}
+
+wait_for_full_cluster() {
+  expect=${1:-$E2E_EXPECT_REPLICAS}
+  if ! cluster_replica_counts_match "$expect"; then
+    return 1
+  fi
+  log "Waiting for ${expect}/${expect} ready pods and ${expect} active raft nodes..."
+  kubectl_ctx wait --for=condition=ready pod -l app.kubernetes.io/name=hyperbytedb --timeout=600s || true
+  deadline=$(( $(date +%s) + 300 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if [ "${IN_CLUSTER:-0}" != "1" ]; then
+      teardown_port_forwards
+      setup_port_forwards
+    fi
+    ready=$(running_pod_count)
+    if [ "$ready" != "$expect" ]; then
+      cr=$(cr_spec_replicas)
+      sts=$(sts_replicas)
+      if [ "$cr" != "$expect" ] || [ "$sts" != "$expect" ]; then
+        warn "Replica counts changed to CR=${cr} STS=${sts} (expected ${expect})"
+        return 1
+      fi
+    fi
+    nodes=$(curl_api 0 "/cluster/nodes" 2>/dev/null | python3 -c "
+import json,sys
+try:
+  d=json.load(sys.stdin)
+  ns=d.get('nodes',[])
+  print(len(ns), sum(1 for n in ns if n.get('state')=='active'))
+except Exception:
+  print('0 0')
+" 2>/dev/null || echo "0 0")
+    active=$(echo "$nodes" | awk '{print $2}')
+    leader=$(curl_api 0 "/cluster/leader" 2>/dev/null | python3 -c \
+      "import json,sys; print(json.load(sys.stdin).get('leader_id') or '')" 2>/dev/null || true)
+    if [ "$ready" = "$expect" ] && [ "$active" = "$expect" ] && \
+       [ -n "$leader" ] && [ "$leader" != "None" ]; then
+      log "Cluster stable: ${ready} pods, ${active} active nodes, leader=${leader}"
+      return 0
+    fi
+    log "  ... ready=${ready}/${expect} active=${active}/${expect} leader=${leader:-none}"
+    sleep 10
+  done
+  warn "Cluster not fully stable after 300s"
+  return 1
+}
+
+wait_for_regions_rf_ok() {
+  min_rf=${1:-2}
+  timeout_secs=${2:-120}
+  deadline=$(( $(date +%s) + timeout_secs ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    rf=$(shard_map_all_regions_rf_ok "$min_rf")
+    if [ "$rf" = "OK" ]; then
+      echo OK
+      return 0
+    fi
+    sleep 5
+  done
+  # Always print the final state; callers decide pass/fail. Must not return
+  # non-zero here — set -e would abort the script before recording D5.
+  shard_map_all_regions_rf_ok "$min_rf"
+  return 0
+}
+
+shard_map_all_regions_rf_ok() {
+  min_rf=${1:-2}
+  curl_api 0 "/internal/shard/map" | python3 -c "
+import json,sys
+min_rf=int(sys.argv[1])
+d=json.load(sys.stdin)
+bad=[]
+for sp in d.get('spaces',[]):
+  for r in sp.get('regions',[]):
+    if len(r.get('peers',[])) < min_rf:
+      bad.append(r['region_id'])
+if bad:
+  print('FAIL:'+','.join(map(str,bad)))
+else:
+  print('OK')
+" "$min_rf"
+}
+
+write_report() {
+  report_file=${REPORT_FILE:?REPORT_FILE must be set}
+  mkdir -p "$(dirname "$report_file")"
+  {
+    printf '# %s\n\n' "$E2E_REPORT_TITLE"
+    printf '**Date:** %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    run_mode="port-forward"
+    [ "${IN_CLUSTER:-0}" = "1" ] && run_mode="in-cluster"
+    printf '**Cluster:** %s (%s, mode=%s)\n' "$KUBE_CTX" "$E2E_CLUSTER_LABEL" "$run_mode"
+    printf '**Database:** %s\n\n' "$DB"
+    printf '| Goal | Result | Evidence |\n'
+    printf '|------|--------|----------|\n'
+    while IFS='|' read -r goal_id result evidence; do
+      printf '| %s | %s | %s |\n' "$goal_id" "$result" "$evidence"
+    done < "$GOALS_FILE"
+    printf '\n'
+    if [ "$FAILURES" -eq 0 ]; then
+      printf '**Overall:** PASS\n'
+    else
+      printf '**Overall:** FAIL (%s failures)\n' "$FAILURES"
+    fi
+  } >"$report_file"
+  log "Report: $report_file"
+}

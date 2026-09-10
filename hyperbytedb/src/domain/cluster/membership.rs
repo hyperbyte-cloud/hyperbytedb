@@ -135,6 +135,29 @@ impl ClusterMembership {
         legal && self.set_state(node_id, to)
     }
 
+    /// Promote to `Active` after sync completes. Refuses when the node is
+    /// evacuating — background sync must not undo `/internal/decommission`.
+    pub fn complete_sync_to_active(&mut self, node_id: u64) -> bool {
+        let Some(node) = self.nodes.get(&node_id) else {
+            return false;
+        };
+        if matches!(node.state, NodeState::Decommissioning | NodeState::Leaving) {
+            return false;
+        }
+        self.set_state(node_id, NodeState::Active)
+    }
+
+    /// Enter `Syncing` for a catch-up. Refuses when the node is evacuating.
+    pub fn begin_sync_to_syncing(&mut self, node_id: u64) -> bool {
+        let Some(node) = self.nodes.get(&node_id) else {
+            return false;
+        };
+        if matches!(node.state, NodeState::Decommissioning | NodeState::Leaving) {
+            return false;
+        }
+        self.set_state(node_id, NodeState::Syncing)
+    }
+
     /// Count a failed probe. Returns the new consecutive-miss total.
     pub fn record_probe_miss(&mut self, node_id: u64) -> u32 {
         match self.nodes.get_mut(&node_id) {
@@ -396,6 +419,18 @@ mod tests {
         );
         assert!(!m.transition(1, NodeState::Draining));
         assert!(!m.transition(1, NodeState::Active));
+    }
+
+    #[test]
+    fn sync_completion_does_not_resurrect_a_decommissioning_node() {
+        let mut m = ClusterMembership::new();
+        m.add_node(make_node(1, NodeState::Decommissioning));
+        assert!(
+            !m.complete_sync_to_active(1),
+            "background sync must not undo decommission"
+        );
+        assert_eq!(m.get_node(1).unwrap().state, NodeState::Decommissioning);
+        assert!(!m.begin_sync_to_syncing(1));
     }
 
     #[test]

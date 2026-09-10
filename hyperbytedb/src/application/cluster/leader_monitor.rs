@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use crate::adapters::http::router::AppState;
 use crate::application::cluster::sync_manifest;
+use crate::domain::cluster::membership::is_departing;
 use crate::domain::cluster::sync::SyncManifest;
 
 /// Periodically checks if this node is the Raft leader; if so, queries each
@@ -71,6 +72,7 @@ pub async fn run_leader_replication_monitor(
             let m = membership.read().await;
             m.all_peers(node_id)
                 .iter()
+                .filter(|p| !is_departing(p))
                 .map(|p| (p.node_id, p.addr.clone(), p.needs_sync))
                 .collect::<Vec<_>>()
         };

@@ -1,0 +1,47 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sharding-scaledown-e2e
+  namespace: hyperbytedb
+spec:
+  ttlSecondsAfterFinished: 600
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: sharding-scaledown-e2e
+        job-name: sharding-scaledown-e2e
+    spec:
+      serviceAccountName: sharding-e2e-runner
+      restartPolicy: Never
+      containers:
+        - name: runner
+          image: python:3.12-alpine
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: IN_CLUSTER
+              value: "1"
+            - name: NS
+              value: hyperbytedb
+            - name: REPORT_DIR
+              value: /tmp
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              set -e
+              apk add --no-cache curl >/dev/null
+              KVER="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
+              curl -fsSL -o /usr/local/bin/kubectl \
+                "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl"
+              chmod +x /usr/local/bin/kubectl
+              exec /scripts/run-sharding-scaledown-e2e.sh --in-cluster
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: script
+          configMap:
+            name: sharding-scaledown-e2e-script
+            defaultMode: 0755

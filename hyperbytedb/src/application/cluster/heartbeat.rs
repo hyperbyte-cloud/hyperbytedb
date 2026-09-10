@@ -92,7 +92,13 @@ pub(crate) fn decide_transition(
                 }
             }
             Syncing => b.ready().then_some(Active),
-            Active => (b.state == Some(Syncing)).then_some(Syncing),
+            Active => match b.state {
+                Some(Syncing) => Some(Syncing),
+                Some(Draining) => Some(Draining),
+                Some(Decommissioning) => Some(Decommissioning),
+                Some(Leaving) => Some(Leaving),
+                _ => None,
+            },
             // A drained node is restarting, not leaving: it must be able to
             // rejoin. Without this it stays `Draining` in its peers' views
             // forever, and since `Draining` keeps its placement seat, the
@@ -516,6 +522,19 @@ mod tests {
                 THRESHOLD
             ),
             None
+        );
+    }
+
+    #[test]
+    fn active_converges_to_peer_decommissioning() {
+        assert_eq!(
+            decide_transition(
+                NodeState::Active,
+                &body(Some(NodeState::Decommissioning), Some(false)),
+                0,
+                THRESHOLD
+            ),
+            Some(NodeState::Decommissioning)
         );
     }
 

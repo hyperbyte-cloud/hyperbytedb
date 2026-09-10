@@ -729,7 +729,7 @@ pub async fn handle_sync_trigger(State(state): State<Arc<AppState>>) -> impl Int
             tracing::info!("sync trigger: new node, running join_and_sync");
             {
                 let mut m = membership_clone.write().await;
-                m.set_state(node_id, NodeState::Syncing);
+                m.begin_sync_to_syncing(node_id);
             }
             gauge!("hyperbytedb_cluster_node_state").set(3.0);
             sync_client.join_and_sync().await
@@ -758,7 +758,8 @@ pub async fn handle_sync_trigger(State(state): State<Arc<AppState>>) -> impl Int
             // the leader from reaching us), but a failed sync must keep the
             // `needs_sync` flag set: peers parse it to avoid promoting this
             // node as caught-up, and the leader keeps triggering re-syncs.
-            m.set_state(node_id, NodeState::Active);
+            // Never clobber Decommissioning/Leaving — that would undo scale-down.
+            m.complete_sync_to_active(node_id);
             m.set_needs_sync(node_id, sync_failed);
         }
         gauge!("hyperbytedb_cluster_node_state").set(1.0);
