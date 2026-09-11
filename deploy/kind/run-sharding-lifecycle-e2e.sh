@@ -196,6 +196,12 @@ main() {
   verify_data L8
 
   # ── L9 final invariants ─────────────────────────────────────────────────────
+  # Pods 2 and 5 were killed/recreated above, which leaves their port-forwards
+  # pointing at pods that no longer exist. Rebuild before reading the final
+  # invariants, at top level -- setup_port_forwards backgrounds processes and
+  # must never run inside a command substitution.
+  setup_port_forwards
+
   rf=$(wait_for_regions_rf_ok 2 "$((HEARTBEAT_INTERVAL_SECS * 12))")
   if [ "$rf" = "OK" ]; then
     pass L9 "all regions RF>=2 after the full lifecycle"

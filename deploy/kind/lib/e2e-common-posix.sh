@@ -63,6 +63,13 @@ api_url() {
 
 PF_PIDS=""
 
+# Start (or restart) one port-forward per pod. Safe to call repeatedly -- each
+# port is freed first -- so call it again after any pod is killed or recreated,
+# which leaves its forward pointing at a pod that no longer exists.
+#
+# MUST be called at top level, never inside `$(...)`. It backgrounds
+# long-lived processes that inherit the command substitution's stdout pipe,
+# and the substitution then blocks on an EOF that never comes.
 setup_port_forwards() {
   [ "${IN_CLUSTER:-0}" = "1" ] && return 0
   max=$((E2E_EXPECT_REPLICAS - 1))
@@ -259,39 +266,35 @@ metric_counter() {
   fi
 }
 
-# Highest value of `name` across pods, or ERR:unreachable=<list> when any pod
-# could not be scraped even after rebuilding port-forwards.
+# Highest value of `name` across pods, or ERR:unreachable=<list> naming the
+# pods that could not be scraped.
+#
+# A pure reader on purpose. It must NOT rebuild port-forwards itself: callers
+# read it as `v=$(metric_max_across_pods ...)`, and a background process
+# started inside a command substitution inherits the substitution's stdout
+# pipe, so the shell waits for EOF that a long-lived `kubectl port-forward`
+# never delivers -- the read hangs forever. Refresh forwards at top level
+# BEFORE calling this (see setup_port_forwards).
 metric_max_across_pods() {
   name=$1
   max_pods=${2:-$E2E_EXPECT_REPLICAS}
-  attempt=1
-  while [ "$attempt" -le 2 ]; do
-    max=0
-    unreachable=""
-    i=0
-    while [ "$i" -lt "$max_pods" ]; do
-      v=$(metric_counter "$i" "$name")
-      if [ "$v" = "ERR" ]; then
-        unreachable="${unreachable}${i} "
-      elif [ "$v" -gt "$max" ] 2>/dev/null; then
-        max=$v
-      fi
-      i=$((i + 1))
-    done
-    if [ -z "$unreachable" ]; then
-      echo "$max"
-      return 0
+  max=0
+  unreachable=""
+  i=0
+  while [ "$i" -lt "$max_pods" ]; do
+    v=$(metric_counter "$i" "$name")
+    if [ "$v" = "ERR" ]; then
+      unreachable="${unreachable}${i},"
+    elif [ "$v" -gt "$max" ] 2>/dev/null; then
+      max=$v
     fi
-    # A pod recreated by a kill or a scale event leaves a stale forward behind.
-    # Rebuild them once before declaring the read unusable.
-    if [ "$attempt" -eq 2 ]; then
-      break
-    fi
-    warn "metrics unreachable on pods: ${unreachable}- refreshing port-forwards"
-    setup_port_forwards
-    attempt=$((attempt + 1))
+    i=$((i + 1))
   done
-  echo "ERR:unreachable=$(echo "$unreachable" | tr -s ' ' ',' | sed 's/,$//')"
+  if [ -n "$unreachable" ]; then
+    echo "ERR:unreachable=${unreachable%,}"
+  else
+    echo "$max"
+  fi
 }
 
 wait_for_pod_ping() {
