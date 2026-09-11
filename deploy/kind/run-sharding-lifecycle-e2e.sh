@@ -203,12 +203,21 @@ main() {
     fail L9 "RF violation after lifecycle: $rf"
   fi
 
-  stalled=$(metric_max_across_pods 'hyperbytedb_shard_placement_stalled_total' || echo 0)
-  if [ "${stalled:-0}" -eq 0 ] 2>/dev/null; then
-    pass L10 "placement_stalled_total=0"
-  else
-    fail L10 "placement stalled: $stalled"
-  fi
+  # No `|| echo 0` and no default: an unreadable counter is not a zero one.
+  # This gate asserts an absence, so it is the one gate a failed scrape can
+  # turn green by accident.
+  stalled=$(metric_max_across_pods 'hyperbytedb_shard_placement_stalled_total')
+  case "$stalled" in
+    ERR:*)
+      fail L10 "could not read placement_stalled_total ($stalled) -- gate is inconclusive, not passing"
+      ;;
+    0)
+      pass L10 "placement_stalled_total=0 on all ${FULL_REPLICAS} pods"
+      ;;
+    *)
+      fail L10 "placement stalled: $stalled"
+      ;;
+  esac
 
   write_report
   if [ "$FAILURES" -eq 0 ]; then

@@ -195,7 +195,7 @@ if val is None:
   print('')
 else:
   # Normalise numeric type. The engine returns SUM as an int but MIN/MAX as
-  # floats, so a shell string compare against an expected `0` fails on `0.0`.
+  # floats, so a shell string compare against an expected 0 fails on 0.0.
   try:
     f=float(val)
     print(int(f) if f == int(f) else f)
@@ -221,36 +221,77 @@ print(len(res.get('series') or []))
 " 2>/dev/null || echo -1
 }
 
+# Scrape one pod's /metrics. Prints the body; returns non-zero if the scrape
+# itself failed.
+#
+# The distinction is the whole point. The metrics crate emits a counter only
+# after its first increment, so an ABSENT counter is legitimately zero -- but
+# an unreachable pod yields nothing either. Collapsing the two is how a gate
+# asserting "counter == 0" passes because nobody could be asked. Not
+# hypothetical: a killed pod's port-forward stays dead for the rest of the run,
+# and the lifecycle suite reported placement_stalled_total=0 having reached
+# only two of six pods.
+metrics_scrape() {
+  pod_idx=$1
+  body=$(curl -sS -m "${CURL_TIMEOUT:-15}" "$(api_url "$pod_idx")/metrics" 2>/dev/null) || return 1
+  [ -n "$body" ] || return 1
+  printf '%s\n' "$body"
+}
+
 metric_value() {
   pod_idx=$1
   name=$2
-  curl_api "$pod_idx" "/metrics" | grep "^${name}" | awk '{print $2}' | head -1
+  metrics_scrape "$pod_idx" | grep "^${name}" | awk '{print $2}' | head -1
 }
 
+# A pod's counter as an integer, or the literal string ERR when the pod could
+# not be scraped. Callers must treat ERR as unknown, never as zero.
 metric_counter() {
   pod_idx=$1
   name=$2
-  v=$(metric_value "$pod_idx" "$name" || true)
+  body=$(metrics_scrape "$pod_idx") || { echo ERR; return 0; }
+  v=$(printf '%s\n' "$body" | grep "^${name}" | awk '{print $2}' | head -1)
   if [ -n "$v" ]; then
-    echo "$v"
+    # The exposition format renders counters as floats; gates compare integers.
+    printf '%s\n' "$v" | cut -d. -f1
   else
-    echo "0"
+    echo 0
   fi
 }
 
+# Highest value of `name` across pods, or ERR:unreachable=<list> when any pod
+# could not be scraped even after rebuilding port-forwards.
 metric_max_across_pods() {
   name=$1
   max_pods=${2:-$E2E_EXPECT_REPLICAS}
-  max=0
-  i=0
-  while [ "$i" -lt "$max_pods" ]; do
-    v=$(metric_counter "$i" "$name")
-    if [ "$v" -gt "$max" ]; then
-      max=$v
+  attempt=1
+  while [ "$attempt" -le 2 ]; do
+    max=0
+    unreachable=""
+    i=0
+    while [ "$i" -lt "$max_pods" ]; do
+      v=$(metric_counter "$i" "$name")
+      if [ "$v" = "ERR" ]; then
+        unreachable="${unreachable}${i} "
+      elif [ "$v" -gt "$max" ] 2>/dev/null; then
+        max=$v
+      fi
+      i=$((i + 1))
+    done
+    if [ -z "$unreachable" ]; then
+      echo "$max"
+      return 0
     fi
-    i=$((i + 1))
+    # A pod recreated by a kill or a scale event leaves a stale forward behind.
+    # Rebuild them once before declaring the read unusable.
+    if [ "$attempt" -eq 2 ]; then
+      break
+    fi
+    warn "metrics unreachable on pods: ${unreachable}- refreshing port-forwards"
+    setup_port_forwards
+    attempt=$((attempt + 1))
   done
-  echo "$max"
+  echo "ERR:unreachable=$(echo "$unreachable" | tr -s ' ' ',' | sed 's/,$//')"
 }
 
 wait_for_pod_ping() {

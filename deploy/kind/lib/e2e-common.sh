@@ -185,27 +185,59 @@ print(v if v is not None else 'ERR:null value')
 " 2>/dev/null || echo "ERR:curl failed"
 }
 
+# Scrape one pod's /metrics. Prints the body; returns non-zero if the scrape
+# itself failed.
+#
+# An ABSENT counter is legitimately zero -- the metrics crate emits one only
+# after its first increment -- but an unreachable pod yields nothing either.
+# Collapsing the two lets a gate asserting "counter == 0" pass because nobody
+# could be asked. See the matching note in e2e-common-posix.sh.
+metrics_scrape() {
+  local pod_idx="$1" body
+  body=$(curl -sS -m "${CURL_TIMEOUT:-15}" "$(api_url "$pod_idx")/metrics" 2>/dev/null) || return 1
+  [[ -n "$body" ]] || return 1
+  printf '%s\n' "$body"
+}
+
 metric_value() {
   local pod_idx="$1"
   local name="$2"
-  curl_api "$pod_idx" "/metrics" | grep "^${name}" | awk '{print $2}' | head -1
+  metrics_scrape "$pod_idx" | grep "^${name}" | awk '{print $2}' | head -1
 }
 
+# A pod's counter as an integer, or the literal string ERR when the pod could
+# not be scraped. Callers must treat ERR as unknown, never as zero.
 metric_counter() {
-  local v
-  v=$(metric_value "$1" "$2" || true)
-  [[ -n "$v" && "$v" != "" ]] && echo "$v" || echo "0"
+  local pod_idx="$1" name="$2" body v
+  body=$(metrics_scrape "$pod_idx") || { echo ERR; return 0; }
+  v=$(printf '%s\n' "$body" | grep "^${name}" | awk '{print $2}' | head -1)
+  if [[ -n "$v" ]]; then
+    # The exposition format renders counters as floats; gates compare integers.
+    printf '%s\n' "${v%%.*}"
+  else
+    echo 0
+  fi
 }
 
+# Highest value of `name` across pods, or ERR:unreachable=<list> when any pod
+# could not be scraped.
 metric_max_across_pods() {
   local name="$1"
-  local max=0 v
+  local max=0 v unreachable=""
   local i
   for ((i = 0; i < E2E_EXPECT_REPLICAS; i++)); do
     v=$(metric_counter "$i" "$name")
-    if [[ "$v" -gt "$max" ]]; then max=$v; fi
+    if [[ "$v" == "ERR" ]]; then
+      unreachable="${unreachable}${i},"
+    elif [[ "$v" -gt "$max" ]] 2>/dev/null; then
+      max=$v
+    fi
   done
-  echo "$max"
+  if [[ -n "$unreachable" ]]; then
+    echo "ERR:unreachable=${unreachable%,}"
+  else
+    echo "$max"
+  fi
 }
 
 wait_for_count() {
