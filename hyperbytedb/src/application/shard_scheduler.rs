@@ -132,7 +132,20 @@ pub struct ShardScheduler {
     /// cleared when each tick starts. `/internal/shard/map` serializes every
     /// space and region in the cluster to answer one `u64`, so probing per
     /// region cost O(regions x map size) bytes on every tick of a join.
-    peer_map_versions: tokio::sync::RwLock<HashMap<u64, u64>>,
+    ///
+    /// The value is `(peer map_version, cluster map_version when probed)`. The
+    /// second half is load-bearing: a placement committing earlier in the same
+    /// tick advances the cluster version, and judging a cached probe against
+    /// the newer number rejects a peer that never lagged — a permanent
+    /// "no caught-up replica candidate" stall on a cluster whose maps all
+    /// agree and whose probes all return 200.
+    ///
+    /// `None` caches a *failed* probe for the rest of the tick. An unreachable
+    /// node is still a placement candidate — `holds_placement` deliberately
+    /// keeps `Disconnected` — so without this a restarting node is re-probed
+    /// once per region at up to `connect_timeout` each, and enough regions
+    /// means the tick never finishes.
+    peer_map_versions: tokio::sync::RwLock<HashMap<u64, Option<(u64, u64)>>>,
     /// Consecutive ticks a region skipped placement with no caught-up
     /// candidate, keyed by region id. A cluster-wide placement stall is
     /// otherwise only visible at `debug!`.
@@ -208,19 +221,41 @@ impl ShardScheduler {
         self
     }
 
-    /// `peer`'s committed `map_version`, probed at most once per tick.
+    /// `peer`'s committed `map_version`, probed at most once per tick, paired
+    /// with the cluster `map_version` the probe was taken against. `None` if
+    /// the probe failed — also remembered for the rest of the tick.
+    ///
+    /// A probe only ever says "this peer had applied up to X when asked". The
+    /// caller must judge it against the cluster version at that moment, not
+    /// against one a later commit in the same tick moved underneath it.
     async fn cached_peer_map_version(
         &self,
         peer: u64,
         addr: &str,
+        cluster_ver: u64,
         client: &reqwest::Client,
-    ) -> Result<u64, HyperbytedbError> {
+    ) -> Option<(u64, u64)> {
         if let Some(v) = self.peer_map_versions.read().await.get(&peer) {
-            return Ok(*v);
+            return *v;
         }
-        let version = fetch_peer_map_version(client, addr).await?;
-        self.peer_map_versions.write().await.insert(peer, version);
-        Ok(version)
+        let probed = match fetch_peer_map_version(client, addr).await {
+            Ok(version) => Some((version, cluster_ver)),
+            Err(e) => {
+                // Warn, not debug: the shipped image pins the log level to
+                // `info` (`ENV HYPERBYTEDB__LOGGING__LEVEL=info`, which the
+                // env overlay applies over the ConfigMap), so a candidate that
+                // can never be probed was previously invisible in production.
+                // Caching the failure caps this at one line per peer per tick.
+                tracing::warn!(
+                    error = %e,
+                    candidate = peer,
+                    "map version probe failed; candidate skipped for placement this tick"
+                );
+                None
+            }
+        };
+        self.peer_map_versions.write().await.insert(peer, probed);
+        probed
     }
 
     /// Record that `region_id` could not place a replica this tick, and warn
@@ -1398,17 +1433,17 @@ impl ShardScheduler {
             return None;
         }
         for (id, addr) in candidates {
-            let ver = match self
-                .cached_peer_map_version(*id, addr, pc.http_client())
+            let Some((ver, probed_against)) = self
+                .cached_peer_map_version(*id, addr, cluster_ver, pc.http_client())
                 .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::debug!(error = %e, candidate = id, "map version probe failed");
-                    continue;
-                }
+            else {
+                continue;
             };
-            if joiner_map_caught_up(cluster_ver, ver) {
+            // `probed_against`, not `cluster_ver`: the probe answers for the
+            // map version that was current when it was taken. A placement that
+            // committed later in this same tick must not retroactively make a
+            // caught-up peer look behind.
+            if joiner_map_caught_up(probed_against, ver) {
                 self.clear_placement_stall(region_id).await;
                 return Some(*id);
             }
@@ -1416,6 +1451,7 @@ impl ShardScheduler {
                 region_id,
                 candidate = id,
                 cluster_ver,
+                probed_against,
                 candidate_ver = ver,
                 "candidate map not caught up"
             );
@@ -3011,6 +3047,64 @@ mod tests {
         (addr, probes)
     }
 
+    /// Like [`spawn_mock_peer`], but answers every probe from `version` as it
+    /// stands at that moment — a peer that keeps up with the cluster rather
+    /// than one frozen at a fixed number.
+    async fn spawn_tracking_mock_peer(
+        version: Arc<std::sync::atomic::AtomicU64>,
+    ) -> (String, Arc<std::sync::atomic::AtomicU64>) {
+        use axum::routing::get;
+        let probes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let probe_counter = probes.clone();
+        let app = axum::Router::new().route(
+            "/internal/shard/map",
+            get(move || {
+                let probes = probe_counter.clone();
+                let version = version.clone();
+                async move {
+                    probes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    axum::Json(serde_json::json!({
+                        "map_version": version.load(std::sync::atomic::Ordering::Relaxed),
+                        "next_region_id": 2,
+                        "spaces": [],
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, probes)
+    }
+
+    /// A peer that is reachable but cannot answer — the cheap, deterministic
+    /// stand-in for an unreachable one. `fetch_shard_map` turns any non-2xx
+    /// into an error on the same path a connect failure takes, and unlike a
+    /// closed port it can count how many times it was asked.
+    async fn spawn_failing_mock_peer() -> (String, Arc<std::sync::atomic::AtomicU64>) {
+        use axum::routing::get;
+        let probes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let probe_counter = probes.clone();
+        let app = axum::Router::new().route(
+            "/internal/shard/map",
+            get(move || {
+                let probes = probe_counter.clone();
+                async move {
+                    probes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, probes)
+    }
+
     struct ReconcileTestHarness {
         _dir: tempfile::TempDir,
         shard_map: Arc<RocksDbShardMap>,
@@ -3281,6 +3375,137 @@ mod tests {
             harness.probe_count(2),
             1,
             "four regions must share one probe, not one probe each"
+        );
+    }
+
+    /// A placement that commits partway through a tick advances the cluster's
+    /// `map_version`, but `peer_map_versions` still holds the probe taken
+    /// before that commit. Every region processed later in the same tick then
+    /// compares the *new* cluster version against the *old* probe and rejects
+    /// a peer that is perfectly caught up.
+    ///
+    /// That is the stall signature that cannot be explained from outside: by
+    /// the time anyone samples, every node's `/internal/shard/map` reports the
+    /// same version and every probe returns 200 — yet `first_caught_up`
+    /// returned `None` and the region was recorded as having "no caught-up
+    /// replica candidate". The probe must be judged against the map version it
+    /// was taken against, not one this tick moved underneath it.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn a_commit_mid_tick_must_not_reject_a_peer_that_kept_up() {
+        let harness = PlacementTestHarness::new(true, &[(2, 0)], 2).await;
+        let sched = &harness.scheduler;
+
+        let reported = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (addr, probes) = spawn_tracking_mock_peer(reported.clone()).await;
+        {
+            let mut m = sched.membership.write().await;
+            m.nodes
+                .get_mut(&2)
+                .expect("harness put peer 2 in membership")
+                .addr = addr.clone();
+        }
+
+        // Start of a tick: the probe cache is cleared, exactly as `tick` does.
+        sched.peer_map_versions.write().await.clear();
+        let before = sched.shard_map.snapshot().await.unwrap().map_version;
+        reported.store(before, std::sync::atomic::Ordering::Relaxed);
+
+        // First region of the tick: peer 2 is caught up, so it is chosen and
+        // its version is cached for the rest of the tick.
+        assert_eq!(
+            sched.first_caught_up(1, before, &[(2, addr.clone())]).await,
+            Some(2),
+            "a caught-up peer must be accepted"
+        );
+
+        // That placement commits. The cluster map version advances, and the
+        // peer applies the same op, so it is still caught up.
+        let region = harness.region().await;
+        sched
+            .shard_map
+            .apply_op(ShardMapOp::AddPeer {
+                key: PlacementTestHarness::key(),
+                region_id: region.region_id,
+                to_peer: 2,
+                epoch: region.epoch,
+            })
+            .await
+            .unwrap();
+        let after = sched.shard_map.snapshot().await.unwrap().map_version;
+        assert_eq!(
+            after,
+            before + 1,
+            "the commit must advance the cluster map version"
+        );
+        reported.store(after, std::sync::atomic::Ordering::Relaxed);
+
+        // Second region, same tick, same peer.
+        assert_eq!(
+            sched.first_caught_up(2, after, &[(2, addr)]).await,
+            Some(2),
+            "a peer that applied this tick's own commit must not be rejected \
+             because its probe was cached before that commit"
+        );
+        assert_eq!(
+            probes.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the one-probe-per-peer-per-tick contract must still hold"
+        );
+    }
+
+    /// A candidate that cannot be probed must be given up on for the whole
+    /// tick, not retried once per region.
+    ///
+    /// `holds_placement` deliberately keeps `Disconnected` nodes as placement
+    /// candidates, so a restarting node stays in `missing` for every region
+    /// that targets it. Each probe costs up to `connect_timeout` (3s) against
+    /// a dead address; at `max_regions_per_measurement = 128` that is several
+    /// minutes of blocking inside a 10s tick, and the scheduler stops doing
+    /// anything else at exactly the moment the cluster needs it to heal. The
+    /// field's own doc comment already promised "at most once per tick" —
+    /// before this it held only for probes that succeeded.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn a_failed_probe_is_not_retried_for_every_region_in_the_tick() {
+        let harness = PlacementTestHarness::new(true, &[(2, 0)], 2).await;
+        let sched = &harness.scheduler;
+
+        let (addr, probes) = spawn_failing_mock_peer().await;
+        {
+            let mut m = sched.membership.write().await;
+            m.nodes
+                .get_mut(&2)
+                .expect("harness put peer 2 in membership")
+                .addr = addr.clone();
+        }
+        sched.peer_map_versions.write().await.clear();
+        let ver = sched.shard_map.snapshot().await.unwrap().map_version;
+
+        for region_id in 1..=5 {
+            assert_eq!(
+                sched
+                    .first_caught_up(region_id, ver, &[(2, addr.clone())])
+                    .await,
+                None,
+                "an unprobeable candidate cannot be chosen"
+            );
+        }
+
+        assert_eq!(
+            probes.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "a failed probe must be remembered for the rest of the tick"
+        );
+
+        // The next tick clears the cache and is free to try again: this is a
+        // per-tick suppression, not a permanent blacklist.
+        sched.peer_map_versions.write().await.clear();
+        assert_eq!(sched.first_caught_up(1, ver, &[(2, addr)]).await, None);
+        assert_eq!(
+            probes.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "a new tick must re-probe the candidate"
         );
     }
 
