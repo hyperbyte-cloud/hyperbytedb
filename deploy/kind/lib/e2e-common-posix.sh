@@ -63,6 +63,39 @@ api_url() {
 
 PF_PIDS=""
 
+# True if something is listening on `port` locally.
+port_is_bound() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn "sport = :$1" 2>/dev/null | grep -q ":$1\b"
+  else
+    # No ss: a successful connect proves a listener; anything else assumes free.
+    curl -sS -o /dev/null -m 1 "http://127.0.0.1:$1/" >/dev/null 2>&1
+  fi
+}
+
+# Free a forwarded port before rebinding it.
+#
+# This used to call `fuser -k`, which is NOT installed here -- and the
+# `|| true` swallowed that silently. A stale forward therefore kept its port,
+# the replacement `kubectl port-forward` died with "address already in use",
+# and that pod dropped out of every later read while the suite carried on. It
+# surfaced as L10 reporting ERR:unreachable=5 long after the real failure.
+#
+# The [k] bracket keeps the pattern from matching this shell's own command
+# line, which would make pkill kill its own parent.
+free_forward_port() {
+  port=$1
+  pod_idx=$2
+  pkill -f "[k]ubectl.*port-forward pod/hyperbytedb-${pod_idx} ${port}:" 2>/dev/null || true
+  n=0
+  while [ "$n" -lt 10 ]; do
+    port_is_bound "$port" || return 0
+    sleep 1
+    n=$((n + 1))
+  done
+  warn "port ${port} still bound after kill; forward for pod ${pod_idx} may fail to bind"
+}
+
 # Start (or restart) one port-forward per pod. Safe to call repeatedly -- each
 # port is freed first -- so call it again after any pod is killed or recreated,
 # which leaves its forward pointing at a pod that no longer exists.
@@ -77,7 +110,7 @@ setup_port_forwards() {
   i=0
   while [ "$i" -le "$max" ]; do
     port=$(api_port "$i")
-    fuser -k "${port}/tcp" 2>/dev/null || true
+    free_forward_port "$port" "$i"
     kubectl_ctx port-forward "pod/hyperbytedb-$i" "${port}:8086" \
       >/tmp/pf-hdb-"$i".log 2>&1 &
     PF_PIDS="${PF_PIDS} $!"
@@ -474,6 +507,9 @@ else:
 " "$min_rf"
 }
 
+E2E_REPORT_BEGIN_MARKER="-----8<----- E2E REPORT BEGIN -----8<-----"
+E2E_REPORT_END_MARKER="-----8<----- E2E REPORT END -----8<-----"
+
 write_report() {
   report_file=${REPORT_FILE:?REPORT_FILE must be set}
   mkdir -p "$(dirname "$report_file")"
@@ -497,4 +533,10 @@ write_report() {
     fi
   } >"$report_file"
   log "Report: $report_file"
+  # Also emit it to stdout between markers. `kubectl cp` execs tar inside the
+  # container, so it cannot retrieve anything from a pod that has already
+  # Completed -- which a finished Job pod always has. The logs survive.
+  printf '%s\n' "$E2E_REPORT_BEGIN_MARKER"
+  cat "$report_file"
+  printf '%s\n' "$E2E_REPORT_END_MARKER"
 }

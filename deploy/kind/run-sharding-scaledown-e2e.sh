@@ -123,16 +123,27 @@ run_in_cluster_job() {
     err "Job did not finish within ${JOB_WAIT_SECS}s (pod phase=$phase)"
     exit 1
   fi
-  kubectl_ctx logs "$pod" 2>&1 || true
-  # Remove any report from a previous run BEFORE copying. kubectl cp failures
-  # are swallowed below, so a stale file left in place would be read as this
-  # run's verdict -- and the launcher's own exit trap writes an empty-goals
-  # report saying PASS, which would turn any copy failure into a false green.
+  # Remove any report from a previous run BEFORE recovering this one. A stale
+  # file left in place would be read as this run's verdict -- and the
+  # launcher's own exit trap writes an empty-goals report saying PASS, which
+  # would turn any recovery failure into a false green.
   GOALS_FILE=""
   rm -f "$REPORT_FILE"
-  kubectl_ctx cp "$NS/$pod:/tmp/scaledown-e2e-report.md" "$REPORT_FILE" 2>/dev/null || true
-  if [ ! -f "$REPORT_FILE" ]; then
-    err "No report copied from job pod — see kubectl logs above"
+  job_log=$(mktemp)
+  kubectl_ctx logs "$pod" >"$job_log" 2>&1 || true
+  cat "$job_log"
+  # Prefer the markers the run prints to stdout. `kubectl cp` execs tar inside
+  # the container, so it can retrieve nothing from a pod that has already
+  # Completed -- which every finished Job pod has. That is why the copy failed
+  # on a run whose gates all passed. Fall back to cp for an older image.
+  if grep -q 'E2E REPORT BEGIN' "$job_log"; then
+    sed -n '/E2E REPORT BEGIN/,/E2E REPORT END/p' "$job_log" | sed '1d;$d' >"$REPORT_FILE"
+  else
+    kubectl_ctx cp "$NS/$pod:/tmp/scaledown-e2e-report.md" "$REPORT_FILE" 2>/dev/null || true
+  fi
+  rm -f "$job_log"
+  if [ ! -f "$REPORT_FILE" ] || [ ! -s "$REPORT_FILE" ]; then
+    err "No report recovered from job pod — see kubectl logs above"
     exit 1
   fi
   if ! grep -qE '^\| D[0-9]' "$REPORT_FILE" 2>/dev/null; then
@@ -241,9 +252,16 @@ main() {
     if [ "$st_after_patch" = "leaving" ]; then
       saw_leaving=1
       v=$(metric_counter "$DEPARTING_ORDINAL" 'hyperbytedb_shard_decommission_completed_total')
-      if [ "$v" -gt "$decomm_metric_captured" ]; then
-        decomm_metric_captured=$v
-      fi
+      # The departing pod goes away mid-loop by design, so ERR is expected
+      # here rather than exceptional; just skip that poll.
+      case "$v" in
+        ''|*[!0-9]*) : ;;
+        *)
+          if [ "$v" -gt "$decomm_metric_captured" ]; then
+            decomm_metric_captured=$v
+          fi
+          ;;
+      esac
     fi
     # Success: saw leaving, STS shrunk, departing pod gone.
     if [ "$saw_leaving" -eq 1 ] && [ "$sts_now" = "$TO_REPLICAS" ] && [ "$departing_up" -eq 0 ]; then
@@ -274,9 +292,20 @@ main() {
 
   decomm_metric=$decomm_metric_captured
   v=$(metric_max_across_pods 'hyperbytedb_shard_decommission_completed_total' "$FROM_REPLICAS")
-  if [ "$v" -gt "$decomm_metric" ]; then
-    decomm_metric=$v
-  fi
+  # An unscrapable pod reports ERR:unreachable=..., which is not a number.
+  # The loop above already captured this counter off the departing node while
+  # it was still up, so an unreadable cluster-wide max is survivable here --
+  # but it must never reach an arithmetic test ("out of range").
+  case "$v" in
+    ''|*[!0-9]*)
+      warn "decommission counter unreadable across pods ($v); using captured=$decomm_metric"
+      ;;
+    *)
+      if [ "$v" -gt "$decomm_metric" ]; then
+        decomm_metric=$v
+      fi
+      ;;
+  esac
   if [ "$decomm_metric" -ge 1 ]; then
     pass D6 "decommission_completed_total=$decomm_metric"
   elif [ "$saw_leaving" -eq 1 ]; then
