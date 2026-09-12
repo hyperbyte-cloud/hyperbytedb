@@ -42,6 +42,11 @@ const HEARTBEAT_TTL_INTERVALS: u64 = 3;
 /// available but none caught up to the committed map.
 const PLACEMENT_STALL_WARN_TICKS: u32 = 5;
 
+/// After the first failure, repeat the convergence warning every this many
+/// consecutive ticks. Every region failing every tick would otherwise be a
+/// log flood; never warning at all was the bug.
+const PLACEMENT_ERROR_WARN_EVERY: u32 = 30;
+
 /// Split only after the region's cooldown has elapsed. `last_split_at == 0`
 /// means "never split" (bootstrap must stamp wall-clock time); treating 0 as
 /// "long ago" let a single hot region binary-split every tick (1→2→4→8).
@@ -150,6 +155,9 @@ pub struct ShardScheduler {
     /// candidate, keyed by region id. A cluster-wide placement stall is
     /// otherwise only visible at `debug!`.
     placement_stalls: tokio::sync::RwLock<HashMap<u64, u32>>,
+    /// Consecutive ticks a region's placement convergence returned an error,
+    /// keyed by region id. Throttles the warning without hiding it.
+    placement_errors: tokio::sync::RwLock<HashMap<u64, u32>>,
     /// Bytes staged by convergence-tier moves during the current tick.
     ///
     /// A bare `AtomicU64`: the scheduler is already shared behind an `Arc`, so
@@ -200,6 +208,7 @@ impl ShardScheduler {
             rollup_dests: tokio::sync::RwLock::new(HashMap::new()),
             peer_map_versions: tokio::sync::RwLock::new(HashMap::new()),
             placement_stalls: tokio::sync::RwLock::new(HashMap::new()),
+            placement_errors: tokio::sync::RwLock::new(HashMap::new()),
             tick_moved_bytes: std::sync::atomic::AtomicU64::new(0),
             tick_interval_secs: std::sync::atomic::AtomicU64::new(1),
             #[cfg(test)]
@@ -274,6 +283,33 @@ impl ShardScheduler {
                 "region has no caught-up replica candidate; placement stalled"
             );
         }
+    }
+
+    /// Record that `region_id`'s placement convergence failed, and warn.
+    ///
+    /// Warns on the first failure, then every `PLACEMENT_ERROR_WARN_EVERY`
+    /// consecutive ticks. Convergence carries the staging error -- the one
+    /// signal that says WHY a region will not reach its replication factor --
+    /// and it was logged at `debug!`, which the shipped image's pinned `info`
+    /// level discards. A cluster could fail to place every region, every tick,
+    /// in complete silence.
+    async fn note_placement_error(&self, region_id: u64, err: &HyperbytedbError) {
+        counter!("hyperbytedb_shard_placement_errors_total").increment(1);
+        let mut errs = self.placement_errors.write().await;
+        let count = errs.entry(region_id).or_insert(0);
+        *count = count.saturating_add(1);
+        if *count == 1 || *count % PLACEMENT_ERROR_WARN_EVERY == 0 {
+            tracing::warn!(
+                error = %err,
+                region_id,
+                consecutive = *count,
+                "placement convergence failed"
+            );
+        }
+    }
+
+    async fn clear_placement_error(&self, region_id: u64) {
+        self.placement_errors.write().await.remove(&region_id);
     }
 
     async fn clear_placement_stall(&self, region_id: u64) {
@@ -503,13 +539,12 @@ impl ShardScheduler {
                 // proposal failed the epoch CAS — so yield the region and pick
                 // it up fresh on the next tick.
                 let placed = match self.try_converge_placement(&space.key, region).await {
-                    Ok(placed) => placed,
+                    Ok(placed) => {
+                        self.clear_placement_error(region.region_id).await;
+                        placed
+                    }
                     Err(e) => {
-                        tracing::debug!(
-                            error = %e,
-                            region_id = region.region_id,
-                            "placement convergence skipped"
-                        );
+                        self.note_placement_error(region.region_id, &e).await;
                         false
                     }
                 };
@@ -1401,7 +1436,10 @@ impl ShardScheduler {
             }
             Ok(outcome.exported)
         } else {
-            request_region_stage(
+            // The remote staging path had no failure signal whatsoever: no
+            // counter, and its only error log was the `debug!` in the tick. A
+            // leader failing to stage onto every region's primary was silent.
+            match request_region_stage(
                 pc.as_ref(),
                 &self.membership,
                 region.primary,
@@ -1410,7 +1448,16 @@ impl ShardScheduler {
                 to_peer,
             )
             .await
-            .map(|()| 0)
+            {
+                Ok(()) => {
+                    counter!("hyperbytedb_shard_remote_stage_total").increment(1);
+                    Ok(0)
+                }
+                Err(e) => {
+                    counter!("hyperbytedb_shard_remote_stage_failures_total").increment(1);
+                    Err(e)
+                }
+            }
         }
     }
 
