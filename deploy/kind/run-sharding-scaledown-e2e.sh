@@ -200,7 +200,9 @@ main() {
 
   seed_errors=$(seed_data)
   wait_flush_boundary
-  baseline=$(count_from_query_checked 0 "SELECT COUNT(value) FROM cpu")
+  # Not a single read: 5000 series splits into ~128 regions and queries
+  # under-report silently until placement settles.
+  baseline=$(wait_for_query_count 0 "SELECT COUNT(value) FROM cpu" 5000 "${SEED_SETTLE_SECS:-420}")
   case $baseline in
     ERR:*)
       fail D1 "seed/count failed: $baseline"

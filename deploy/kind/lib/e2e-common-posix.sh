@@ -37,6 +37,40 @@ wait_flush_boundary() {
   sleep "${FLUSH_WAIT_SECS:-6}"
 }
 
+# Poll until a count query reaches `want`, echoing the last value seen.
+#
+# A flush boundary is not a convergence boundary. Seeding 5000 series splits the
+# measurement into ~128 regions, and while those are being created, staged and
+# placed a scatter-gather query silently under-reports -- no error, just a
+# smaller number. Reading once after a 6s sleep therefore fails a gate whose
+# data is entirely intact; observed directly as 4918-4997 of 5000, settling to
+# exactly 5000 on every node once convergence finished.
+#
+# This keeps the assertion -- the caller still fails if `want` never arrives --
+# and only stops the gate from firing on a read taken too early.
+wait_for_query_count() {
+  pod_idx=$1
+  q=$2
+  want=$3
+  timeout_secs=${4:-300}
+  deadline=$(( $(date +%s) + timeout_secs ))
+  last=""
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    last=$(count_from_query_checked "$pod_idx" "$q")
+    case $last in
+      ERR:*) : ;;
+      *)
+        if [ "$last" -ge "$want" ] 2>/dev/null; then
+          echo "$last"
+          return 0
+        fi
+        ;;
+    esac
+    sleep 5
+  done
+  echo "$last"
+}
+
 kubectl_ctx() {
   if [ "${IN_CLUSTER:-0}" = "1" ]; then
     kubectl -n "$NS" "$@"
