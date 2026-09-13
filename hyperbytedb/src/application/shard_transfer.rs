@@ -534,8 +534,10 @@ pub async fn push_region_transfer(
         .await
         .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
     if !resp.status().is_success() {
+        let status = resp.status().as_u16();
         return Err(HyperbytedbError::TransferRejected {
-            status: resp.status().as_u16(),
+            status,
+            reason: rejection_reason(resp).await,
         });
     }
     let applied = parse_applied_from_response(&resp.text().await.unwrap_or_default());
@@ -794,6 +796,37 @@ pub async fn stage_region_transfer_data(
     }
 }
 
+/// The `{"error": ...}` a rehome/transfer handler puts in a rejection body, or
+/// the raw body, truncated on a char boundary.
+///
+/// Without this a rejection reads "shard transfer rejected with status 500"
+/// and nothing else: the handler already serialised the cause into the body,
+/// and every caller threw it away at the one place anyone would look. That is
+/// why a cluster could report 49 staging rejections across 27 regions without
+/// a single line saying what was actually wrong.
+pub(crate) async fn rejection_reason(resp: reqwest::Response) -> Box<str> {
+    let body = resp.text().await.unwrap_or_default();
+    let mut reason = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| {
+            v.get("error")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or(body);
+    if reason.trim().is_empty() {
+        reason = "no body".to_owned();
+    }
+    if reason.len() > 300 {
+        let end = (0..=300)
+            .rev()
+            .find(|i| reason.is_char_boundary(*i))
+            .unwrap_or(0);
+        reason.truncate(end);
+    }
+    reason.into_boxed_str()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn complete_region_transfer(
     peer_client: &Arc<crate::adapters::cluster::peer_client::PeerClient>,
@@ -883,6 +916,58 @@ pub async fn run_region_transfer(
 
 #[cfg(test)]
 mod tests {
+
+    /// A rejection must carry WHY, not just a status code.
+    ///
+    /// The rehome handler serialises its cause into `{"error": ...}` and every
+    /// caller used to discard the body, so a cluster could log 49 staging
+    /// rejections across 27 regions and never say what was wrong.
+    #[tokio::test]
+    async fn rejection_reason_prefers_the_handlers_error_field() {
+        let resp = axum::http::Response::builder()
+            .status(500)
+            .body(r#"{"error":"region range not found"}"#)
+            .unwrap();
+        let got = super::rejection_reason(reqwest::Response::from(resp)).await;
+        assert_eq!(&*got, "region range not found");
+    }
+
+    #[tokio::test]
+    async fn rejection_reason_falls_back_to_the_raw_body() {
+        let resp = axum::http::Response::builder()
+            .status(502)
+            .body("upstream exploded")
+            .unwrap();
+        let got = super::rejection_reason(reqwest::Response::from(resp)).await;
+        assert_eq!(&*got, "upstream exploded");
+    }
+
+    /// An empty body must still say something; "" in a log line is
+    /// indistinguishable from the bug this fixes.
+    #[tokio::test]
+    async fn rejection_reason_reports_an_empty_body() {
+        let resp = axum::http::Response::builder()
+            .status(500)
+            .body("")
+            .unwrap();
+        let got = super::rejection_reason(reqwest::Response::from(resp)).await;
+        assert_eq!(&*got, "no body");
+    }
+
+    /// Truncation must land on a char boundary -- a multi-byte body would
+    /// otherwise panic the scheduler tick that is reporting the failure.
+    #[tokio::test]
+    async fn rejection_reason_truncates_on_a_char_boundary() {
+        let body = "\u{e9}".repeat(400);
+        let resp = axum::http::Response::builder()
+            .status(500)
+            .body(body)
+            .unwrap();
+        let got = super::rejection_reason(reqwest::Response::from(resp)).await;
+        assert!(got.len() <= 300, "len {}", got.len());
+        assert!(!got.is_empty());
+    }
+
     use super::*;
     use crate::adapters::metadata::rocksdb_meta::RocksDbMetadata;
     use crate::domain::measurement::MeasurementMeta;

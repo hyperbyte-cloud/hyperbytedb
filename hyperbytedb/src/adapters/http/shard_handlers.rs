@@ -730,6 +730,15 @@ pub async fn handle_shard_rehome(
         Ok(o) => o,
         Err(e) => {
             counter!("hyperbytedb_shard_transfer_failures_total").increment(1);
+            // The serving side used to answer 500 and log nothing, so the only
+            // trace of a failed rehome was the caller's bare status code.
+            tracing::warn!(
+                error = %e,
+                region_id = region.region_id,
+                dest_primary = req.dest_primary,
+                stage = req.stage,
+                "shard rehome rejected: transfer failed"
+            );
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": e.to_string()})),
@@ -753,6 +762,12 @@ pub async fn handle_shard_rehome(
         .await
     {
         counter!("hyperbytedb_shard_transfer_failures_total").increment(1);
+        tracing::warn!(
+            error = %e,
+            region_id = region.region_id,
+            dest_primary = req.dest_primary,
+            "shard rehome rejected: completing the transfer failed"
+        );
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),

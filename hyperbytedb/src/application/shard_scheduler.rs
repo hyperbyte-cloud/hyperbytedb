@@ -1830,8 +1830,10 @@ async fn request_region_rehome(
         .await
         .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
     if !resp.status().is_success() {
+        let status = resp.status().as_u16();
         return Err(HyperbytedbError::TransferRejected {
-            status: resp.status().as_u16(),
+            status,
+            reason: crate::application::shard_transfer::rejection_reason(resp).await,
         });
     }
     Ok(())
@@ -1875,8 +1877,10 @@ async fn request_region_stage(
         .await
         .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
     if !resp.status().is_success() {
+        let status = resp.status().as_u16();
         return Err(HyperbytedbError::TransferRejected {
-            status: resp.status().as_u16(),
+            status,
+            reason: crate::application::shard_transfer::rejection_reason(resp).await,
         });
     }
     Ok(())
@@ -1899,7 +1903,7 @@ pub(crate) fn classify_transfer_error(err: &HyperbytedbError) -> TransferDisposi
         HyperbytedbError::PeerUnreachable(_) | HyperbytedbError::ReplicationTimeout(_) => {
             TransferDisposition::Retryable
         }
-        HyperbytedbError::TransferRejected { status } => match status {
+        HyperbytedbError::TransferRejected { status, .. } => match status {
             400 => TransferDisposition::Reresolve,
             404 | 409 => TransferDisposition::Retryable,
             s if *s >= 500 => TransferDisposition::Retryable,
@@ -2841,19 +2845,31 @@ mod tests {
             TransferDisposition::Retryable
         );
         assert_eq!(
-            classify_transfer_error(&TransferRejected { status: 404 }),
+            classify_transfer_error(&TransferRejected {
+                status: 404,
+                reason: "test".into()
+            }),
             TransferDisposition::Retryable
         );
         assert_eq!(
-            classify_transfer_error(&TransferRejected { status: 409 }),
+            classify_transfer_error(&TransferRejected {
+                status: 409,
+                reason: "test".into()
+            }),
             TransferDisposition::Retryable
         );
         assert_eq!(
-            classify_transfer_error(&TransferRejected { status: 503 }),
+            classify_transfer_error(&TransferRejected {
+                status: 503,
+                reason: "test".into()
+            }),
             TransferDisposition::Retryable
         );
         assert_eq!(
-            classify_transfer_error(&TransferRejected { status: 400 }),
+            classify_transfer_error(&TransferRejected {
+                status: 400,
+                reason: "test".into(),
+            }),
             TransferDisposition::Reresolve
         );
         assert_eq!(
@@ -2861,7 +2877,10 @@ mod tests {
             TransferDisposition::Reresolve
         );
         assert_eq!(
-            classify_transfer_error(&TransferRejected { status: 403 }),
+            classify_transfer_error(&TransferRejected {
+                status: 403,
+                reason: "test".into(),
+            }),
             TransferDisposition::Park
         );
         assert_eq!(
