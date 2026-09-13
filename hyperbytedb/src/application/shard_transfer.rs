@@ -318,6 +318,12 @@ pub async fn export_region_points_from_chdb(
         let phys = mapping.physical_tag_column_name(tag);
         select_cols.push(format!("s.{}", quote_backticks(&phys)));
     }
+    // Witness for the ANY LEFT JOIN below. A LEFT JOIN that finds no series row
+    // does not fail -- it substitutes column defaults, so every tag comes back
+    // as an empty string and the row looks like a legitimately untagged series.
+    // Selecting the joined key lets us tell "this series has no host" from
+    // "this node has no series row for this series_id at all".
+    select_cols.push("s.`series_id` AS `__joined_series_id`".to_string());
 
     let mut predicates = Vec::new();
     match after_series_id {
@@ -359,10 +365,43 @@ pub async fn export_region_points_from_chdb(
             continue;
         };
 
+        // The series dictionary entry must exist, or every tag on this row is a
+        // LEFT JOIN default rather than data. Both ways of carrying that
+        // forward corrupt: emitting `host=` produces invalid line protocol and
+        // the destination rejects the whole payload with 500, while dropping
+        // the tag changes the point's series_id, so `apply_transfer_push`
+        // recomputes it, finds it outside [start, end) and discards the row.
+        // Fail the chunk instead -- the disposition for a 500 is Retryable, so
+        // the movement is retried rather than silently losing rows.
+        let fact_sid = obj
+            .get("series_id")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        let joined_sid = obj
+            .get("__joined_series_id")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        if !mapping.tag_keys.is_empty() && joined_sid != fact_sid {
+            counter!("hyperbytedb_shard_transfer_missing_series_total").increment(1);
+            return Err(HyperbytedbError::Internal(
+                format!(
+                    "transfer export: no series row for series_id {fact_sid} in \
+                     {}.{}.{}; tags would be empty defaults",
+                    key.db, key.rp, key.measurement
+                )
+                .into(),
+            ));
+        }
+
         let mut tags = BTreeMap::new();
         for tag in &mapping.tag_keys {
             let phys = mapping.physical_tag_column_name(tag);
-            if let Some(serde_json::Value::String(v)) = obj.get(&phys) {
+            if let Some(serde_json::Value::String(v)) = obj.get(&phys)
+                && !v.is_empty()
+            {
+                // An empty value is a tag this series does not carry. Line
+                // protocol has no representation for `host=`, so it must be
+                // omitted, not emitted empty.
                 tags.insert(tag.clone(), v.clone());
             }
         }

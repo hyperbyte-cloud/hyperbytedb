@@ -182,6 +182,14 @@ pub fn encode_points_to_line_protocol(
 
         let mut line = escape_measurement(&p.measurement);
         for (k, v) in &p.tags {
+            // Line protocol has no representation for an empty tag value:
+            // `cpu,host= value=1` is a parse error, and a peer handed one
+            // rejects the entire payload. A tag with no value is a tag the
+            // series does not carry, so omit it rather than emit something no
+            // parser -- including ours -- will accept.
+            if v.is_empty() {
+                continue;
+            }
             line.push(',');
             line.push_str(&escape_tag_key(k));
             line.push('=');
@@ -274,6 +282,45 @@ fn escape_string_field(s: &str) -> String {
 
 #[cfg(test)]
 mod encode_tests {
+
+    /// `cpu,host= value=1` is invalid line protocol: our own parser rejects it,
+    /// and a peer handed it rejects the ENTIRE payload with 500. A region
+    /// transfer hit exactly this, wedging that region's movement in a retry
+    /// loop with no line above debug to say why.
+    #[test]
+    fn empty_tag_values_are_omitted_not_emitted() {
+        use std::collections::BTreeMap;
+        let mut tags = BTreeMap::new();
+        tags.insert("host".to_string(), String::new());
+        tags.insert("region".to_string(), "eu".to_string());
+        let mut fields = BTreeMap::new();
+        fields.insert("value".to_string(), FieldValue::Float(1.0));
+        let p = Point {
+            measurement: "cpu".to_string(),
+            tags,
+            fields,
+            timestamp: 1_700_000_000_000_000_000,
+        };
+
+        let encoded = encode_points_to_line_protocol(&[p], Precision::Nanosecond).unwrap();
+        let text = String::from_utf8(encoded).unwrap();
+        assert!(
+            !text.contains("host="),
+            "empty tag must be omitted entirely, got: {text}"
+        );
+        assert!(text.contains("region=eu"), "got: {text}");
+
+        // The real requirement: what we emit, we can read back.
+        let reparsed = parse_line_body_to_points_limited(text.as_bytes(), None, 10)
+            .expect("encoder output must be parseable");
+        assert_eq!(reparsed.len(), 1);
+        assert_eq!(
+            reparsed[0].tags.get("region").map(String::as_str),
+            Some("eu")
+        );
+        assert!(!reparsed[0].tags.contains_key("host"));
+    }
+
     use super::*;
 
     #[test]
