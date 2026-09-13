@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::types::{MeasurementKey, ShardEpoch, ShardRegion};
+use super::types::{MeasurementKey, RegionState, ShardEpoch, ShardRegion};
 
 #[derive(Debug, Error)]
 pub enum ShardMapApplyError {
@@ -99,6 +99,18 @@ pub enum ShardMapOp {
         #[serde(default)]
         epoch: ShardEpoch,
     },
+    /// Cutover: make a staging region routable.
+    ///
+    /// The single atomic step of a split. Until this commits the donor serves
+    /// the child's range; after it, the child does. Every node's location cache
+    /// is refreshed by the same Raft apply, so no node sees a half-applied
+    /// handover.
+    ActivateRegion {
+        key: MeasurementKey,
+        region_id: u64,
+        #[serde(default)]
+        epoch: ShardEpoch,
+    },
 }
 
 impl ShardMapOp {
@@ -111,7 +123,8 @@ impl ShardMapOp {
             | ShardMapOp::AddPeer { key, .. }
             | ShardMapOp::RemovePeer { key, .. }
             | ShardMapOp::TransferPrimary { key, .. }
-            | ShardMapOp::ClearVerified { key, .. } => key,
+            | ShardMapOp::ClearVerified { key, .. }
+            | ShardMapOp::ActivateRegion { key, .. } => key,
         }
     }
 }
@@ -413,6 +426,30 @@ pub fn apply_shard_map_op(
             }
             region.transfer_verified = Some(true);
             region.transfer_first_seen = None;
+            region.epoch = epoch.bump_conf_ver();
+            sort_space_regions(space);
+        }
+        ShardMapOp::ActivateRegion {
+            key,
+            region_id,
+            epoch,
+        } => {
+            let space = map
+                .spaces
+                .get_mut(&key)
+                .ok_or(ShardMapApplyError::UnknownSpace)?;
+            let region = space
+                .regions
+                .iter_mut()
+                .find(|r| r.region_id == region_id)
+                .ok_or(ShardMapApplyError::UnknownRegion(region_id))?;
+            if region.epoch != epoch {
+                return Err(ShardMapApplyError::StaleEpoch("ActivateRegion"));
+            }
+            // Idempotent rather than an error: a retried activation after a
+            // leadership change must not wedge the region in Staging.
+            region.state = RegionState::Serving;
+            region.staged_from = None;
             region.epoch = epoch.bump_conf_ver();
             sort_space_regions(space);
         }
@@ -1109,5 +1146,73 @@ mod tests {
             apply_shard_map_op(&mut map, remove_op(&key, 3, epoch)).unwrap_err(),
             ShardMapApplyError::Invalid(_)
         ));
+    }
+
+    /// Cutover is one committed op: the region becomes routable and forgets the
+    /// donor it was staged from, and the epoch bumps so a concurrent proposal
+    /// built on the old view is rejected.
+    #[test]
+    fn activate_region_makes_a_staging_region_serving() {
+        let mut map = ShardMap::default();
+        let key = MeasurementKey::new("db", "rp", "cpu");
+        let mut region = sample_region(1, 0, u64::MAX, 1);
+        region.state = RegionState::Staging;
+        region.staged_from = Some(7);
+        let epoch = region.epoch;
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::BootstrapMeasurement {
+                key: key.clone(),
+                region,
+            },
+        )
+        .unwrap();
+
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::ActivateRegion {
+                key: key.clone(),
+                region_id: 1,
+                epoch,
+            },
+        )
+        .unwrap();
+
+        let r = &map.spaces[&key].regions[0];
+        assert!(r.is_serving(), "cutover must make the region routable");
+        assert_eq!(r.staged_from, None, "the donor link must be cleared");
+        assert_ne!(r.epoch, epoch, "the epoch must bump");
+    }
+
+    /// A cutover proposed against a stale view must be refused, or two leaders
+    /// could activate a child whose movement was restarted underneath them.
+    #[test]
+    fn activate_region_refuses_a_stale_epoch() {
+        let mut map = ShardMap::default();
+        let key = MeasurementKey::new("db", "rp", "cpu");
+        let mut region = sample_region(1, 0, u64::MAX, 1);
+        region.state = RegionState::Staging;
+        let stale = region.epoch;
+        region.epoch = region.epoch.bump_conf_ver();
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::BootstrapMeasurement {
+                key: key.clone(),
+                region,
+            },
+        )
+        .unwrap();
+
+        let err = apply_shard_map_op(
+            &mut map,
+            ShardMapOp::ActivateRegion {
+                key: key.clone(),
+                region_id: 1,
+                epoch: stale,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ShardMapApplyError::StaleEpoch(_)), "{err:?}");
+        assert!(!map.spaces[&key].regions[0].is_serving());
     }
 }

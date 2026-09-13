@@ -21,6 +21,7 @@ use crate::domain::cluster::membership::{
 use crate::domain::sharding::placement::{
     PlacementStep, budget_exhausted, move_tier, next_placement_step, target_placement,
 };
+use crate::domain::sharding::types::RegionState;
 use crate::domain::sharding::{
     MeasurementKey, ShardMap, ShardMapOp, ShardRegion, ShardRehomeRequest,
 };
@@ -336,6 +337,55 @@ impl ShardScheduler {
             .retain(|id, _| live.contains(id));
     }
 
+    /// Cut over any staging region whose data has finished moving.
+    ///
+    /// A split publishes its child NOT serving: until this fires the donor
+    /// still holds and serves the range, so readers never see a region that is
+    /// missing rows. Activation is gated on the movement being verified --
+    /// `transfer_verified` is the reconciliation machinery's own completion
+    /// signal -- so the child only becomes routable once it actually holds the
+    /// data. A child that kept the donor's primary carries no debt and
+    /// activates on the next tick.
+    ///
+    /// The flip is one committed op, so every node's location cache applies it
+    /// in the same apply: no node sees a half-applied handover.
+    async fn try_activate_staged_regions(&self, map: &ShardMap) {
+        for space in map.spaces.values() {
+            for region in &space.regions {
+                if region.is_serving() {
+                    continue;
+                }
+                if region.transfer_outstanding() {
+                    continue;
+                }
+                match self
+                    .propose(ShardMapOp::ActivateRegion {
+                        key: space.key.clone(),
+                        region_id: region.region_id,
+                        epoch: region.epoch,
+                    })
+                    .await
+                {
+                    Ok(()) => {
+                        counter!("hyperbytedb_shard_region_activations_total").increment(1);
+                        tracing::info!(
+                            region_id = region.region_id,
+                            primary = region.primary,
+                            "staging region cut over to serving"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            region_id = region.region_id,
+                            error = %e,
+                            "staging region cutover failed; will retry"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     async fn clear_placement_stall(&self, region_id: u64) {
         self.placement_stalls.write().await.remove(&region_id);
     }
@@ -464,6 +514,10 @@ impl ShardScheduler {
         let map = self.shard_map.snapshot().await?;
         self.prune_region_counters(&map).await;
         self.drain_reconciliation(&map).await;
+        // After reconciliation: a child whose movement just verified becomes
+        // routable in this same tick rather than waiting for the next.
+        let map = self.shard_map.snapshot().await?;
+        self.try_activate_staged_regions(&map).await;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -873,14 +927,23 @@ impl ShardScheduler {
             false
         };
 
-        if !child_ready {
-            return Err(HyperbytedbError::ShardMap(
-                format!(
-                    "split of region {} aborted: child primary {} does not hold the range",
-                    region.region_id, right.primary
-                )
-                .into(),
-            ));
+        // The child is published NOT serving, whatever the staging outcome.
+        //
+        // Until cutover the donor still holds and serves this range -- the
+        // location cache materialises a staging region away and extends its
+        // donor back over it -- so publishing an unfilled child is safe, and
+        // waiting for it is unnecessary. Cutover happens once the movement has
+        // been verified, in `try_activate_staged_regions`.
+        if child_needs_data {
+            right.state = RegionState::Staging;
+            right.staged_from = Some(region.region_id);
+            if !child_ready {
+                tracing::info!(
+                    region_id = region.region_id,
+                    child_primary = right.primary,
+                    "split child published staging; data not yet moved"
+                );
+            }
         }
 
         let op = ShardMapOp::Split {
@@ -2903,7 +2966,7 @@ mod tests {
         );
     }
 
-    /// A split must not commit while the child's primary has no data.
+    /// A split must not publish a routable child while its primary has no data.
     ///
     /// Committing first publishes a region whose primary is empty, and a
     /// scatter read for that range then returns zero rows *successfully* --
@@ -2915,11 +2978,12 @@ mod tests {
     /// Here the donor (node 9) is absent from membership, so the only
     /// candidate is this node: `target_placement` must choose 1, which differs
     /// from the donor, so the child needs data. The leader is not the donor, so
-    /// it asks node 9 to push -- and node 9 cannot be resolved. The split must
-    /// be abandoned, not published.
+    /// it asks node 9 to push -- and node 9 cannot be resolved. The split still
+    /// happens, but the child must be published `Staging`, naming the donor
+    /// that continues to serve its range until cutover.
     #[tokio::test]
     #[serial_test::serial(chdb)]
-    async fn split_is_abandoned_when_the_child_primary_cannot_be_staged() {
+    async fn split_publishes_an_unstaged_child_as_not_serving() {
         use std::sync::Arc;
         use std::time::Duration;
 
@@ -3034,11 +3098,144 @@ mod tests {
         scheduler.tick_once_for_test().await.unwrap();
 
         let captured = proposals.lock().unwrap();
+        let split = captured
+            .iter()
+            .find_map(|op| match op {
+                ShardMapOp::Split { right, .. } => Some(right),
+                _ => None,
+            })
+            .expect("the split still happens; the child is just not routable yet");
         assert!(
-            !captured
+            !split.is_serving(),
+            "a child whose primary holds no data must be published staging, not serving: {split:?}"
+        );
+        assert_eq!(
+            split.staged_from,
+            Some(1),
+            "a staging child must name the donor that still serves its range"
+        );
+    }
+
+    /// A staging region whose movement has finished must be cut over.
+    ///
+    /// Until it is, the donor serves the range -- correct, but the split never
+    /// actually takes effect and the cluster cannot scale past the donor. The
+    /// gate is `transfer_outstanding`: the reconciliation machinery's own
+    /// completion signal, so the child becomes routable exactly when it holds
+    /// the data.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn a_staging_region_with_no_debt_is_cut_over() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use crate::adapters::chdb::native_adapter::ChdbNativeAdapter;
+        use crate::adapters::chdb::query_adapter::ChdbQueryAdapter;
+        use crate::adapters::chdb::session::SharedSession;
+        use crate::adapters::metadata::rocksdb_meta::RocksDbMetadata;
+        use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
+        use crate::adapters::wal::rocksdb_wal::RocksDbWal;
+        use crate::application::cluster::bootstrap::ClusterBootstrap;
+        use crate::application::materialized_view_service::MaterializedViewService;
+        use crate::domain::sharding::{MeasurementKey, ShardLocationCache, ShardMapOp};
+        use crate::ports::points_sink::PointsSinkPort;
+
+        let dir = tempfile::tempdir().unwrap();
+        let meta_dir = dir.path().join("meta");
+        let wal_dir = dir.path().join("wal");
+        let chdb_dir = dir.path().join("chdb");
+        for p in [&meta_dir, &wal_dir, &chdb_dir] {
+            std::fs::create_dir_all(p).unwrap();
+        }
+
+        let chdb = SharedSession::new_eager(chdb_dir.to_str().unwrap(), 1).unwrap();
+        let chdb_adapter = Arc::new(ChdbQueryAdapter::from_shared(chdb.clone(), 0));
+        let sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(chdb));
+        let wal = Arc::new(RocksDbWal::open(&wal_dir).unwrap());
+        let metadata = Arc::new(RocksDbMetadata::open(&meta_dir).unwrap());
+        let mv_service = Arc::new(MaterializedViewService::new(
+            metadata.clone(),
+            chdb_adapter,
+            sink.clone(),
+        ));
+
+        let mut cluster_cfg = crate::config::HyperbytedbConfig::load(None)
+            .unwrap()
+            .cluster;
+        cluster_cfg.enabled = true;
+        cluster_cfg.node_id = 1;
+        cluster_cfg.cluster_addr = "127.0.0.1:18099".into();
+        cluster_cfg.replication_log_dir = dir.path().join("repl").to_string_lossy().into();
+        cluster_cfg.raft_dir = dir.path().join("raft").to_string_lossy().into();
+        cluster_cfg.raft_heartbeat_interval_ms = Some(200);
+        cluster_cfg.raft_election_timeout_ms = Some(500);
+
+        let bootstrap = ClusterBootstrap::init(&cluster_cfg, 1000).unwrap();
+        let shard_map = Arc::new(RocksDbShardMap::open(&meta_dir, true).unwrap());
+        let location_cache = Arc::new(ShardLocationCache::new());
+        let raft = bootstrap
+            .start_raft(
+                &cluster_cfg,
+                metadata.clone(),
+                mv_service,
+                sink.clone(),
+                wal.clone(),
+                Some((shard_map.clone(), location_cache.clone())),
+                None,
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let key = MeasurementKey::new("db", "autogen", "cpu");
+        // Staging, and no transfer debt: the movement is done.
+        let region = ShardRegion {
+            region_id: 1,
+            start: 0,
+            end: u64::MAX,
+            epoch: ShardEpoch::default(),
+            peers: vec![1],
+            primary: 1,
+            last_split_at: 1,
+            transfer_verified: None,
+            transfer_first_seen: None,
+            state: RegionState::Staging,
+            staged_from: Some(42),
+        };
+        shard_map
+            .apply_op(ShardMapOp::BootstrapMeasurement {
+                key: key.clone(),
+                region,
+            })
+            .await
+            .unwrap();
+
+        let proposals = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let scheduler = ShardScheduler::new(
+            shard_map,
+            bootstrap.membership.clone(),
+            raft,
+            None,
+            metadata,
+            wal,
+            None,
+            Some(sink),
+            1,
+            ShardingConfig::default(),
+            0,
+        )
+        .with_test_force_leader(true)
+        .with_test_propose_sink(proposals.clone());
+
+        scheduler.tick_once_for_test().await.unwrap();
+
+        let captured = proposals.lock().unwrap();
+        assert!(
+            captured
                 .iter()
-                .any(|op| matches!(op, ShardMapOp::Split { .. })),
-            "a split whose child primary holds no data must not be published: {captured:?}"
+                .any(|op| matches!(op, ShardMapOp::ActivateRegion { region_id: 1, .. })),
+            "a staging region with no outstanding transfer must be cut over: {captured:?}"
         );
     }
 
