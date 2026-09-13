@@ -67,7 +67,14 @@ pub async fn scatter_mv_backfill(
             )
         })?;
 
-    for region in &space.regions {
+    // The serving view, not the raw snapshot: a staging region is in the map
+    // but must not be routed to, and its range is served by the donor.
+    let serving =
+        ctx.location_cache
+            .serving_regions(&map, source.db, source.rp, source.measurement);
+    let _ = space;
+
+    for region in &serving {
         let fact_sql = inject_region_series_id_predicate_with_alias(
             plan.fact_sql.to_string(),
             region.start,

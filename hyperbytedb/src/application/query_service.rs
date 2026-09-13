@@ -2474,7 +2474,19 @@ async fn execute_sharded_measurement_query(
     group_by_tags: &[String],
 ) -> Result<Vec<SeriesResult>, HyperbytedbError> {
     let map = ctx.shard_map.snapshot().await?;
-    let space = match map.space(db, rp, measurement) {
+    // Region selection runs over the SERVING view, not the raw snapshot. A
+    // staging region is in the map but must not be routed to: scattering to
+    // one fails with "no active peers", and its range is served by the donor
+    // that this view materialises in its place.
+    let serving_space = map.space(db, rp, measurement).map(|s| {
+        crate::domain::sharding::types::MeasurementShardSpace {
+            key: s.key.clone(),
+            regions: ctx
+                .location_cache
+                .serving_regions(&map, db, rp, measurement),
+        }
+    });
+    let space = match serving_space.as_ref() {
         Some(s) => s,
         None => {
             return execute_local_measurement_query(

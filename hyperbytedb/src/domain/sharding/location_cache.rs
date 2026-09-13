@@ -167,6 +167,45 @@ impl ShardLocationCache {
             .remove(&Self::measurement_key(&key.db, &key.rp, &key.measurement));
     }
 
+    /// The routable regions for a measurement.
+    ///
+    /// Callers that iterate regions in order to scatter MUST use this rather
+    /// than `map.space(..).regions`: a raw snapshot contains staging regions,
+    /// which are in the map but must not be routed to. Sending a query to one
+    /// fails with "no active peers" -- correct, but needless, because the
+    /// donor still serves that range and this view says so.
+    pub fn serving_regions(
+        &self,
+        map: &ShardMap,
+        db: &str,
+        rp: &str,
+        measurement: &str,
+    ) -> Vec<ShardRegion> {
+        let cache_key = Self::measurement_key(db, rp, measurement);
+        {
+            let inner = self.read_inner();
+            if let Some(cached) = inner.by_measurement.get(&cache_key)
+                && cached.map_version == map.map_version
+            {
+                return cached.regions.clone();
+            }
+        }
+        let Some(space) = map.space(db, rp, measurement) else {
+            return Vec::new();
+        };
+        let regions = materialise_serving(&space.regions);
+        let mut inner = self.write_inner();
+        inner.map_version = inner.map_version.max(map.map_version);
+        inner.by_measurement.insert(
+            cache_key,
+            CachedMeasurement {
+                map_version: map.map_version,
+                regions: regions.clone(),
+            },
+        );
+        regions
+    }
+
     pub fn locate(
         &self,
         map: &ShardMap,
@@ -370,6 +409,49 @@ mod tests {
         assert_eq!(view.len(), 1);
         assert_eq!(view[0].region_id, 2);
         assert!(locate_in_regions(&view, 150).is_some());
+    }
+
+    /// Callers that iterate regions to scatter must get the serving view.
+    ///
+    /// A raw snapshot contains staging regions; scattering to one fails with
+    /// "no active peers" -- correct, but needless, because the donor still
+    /// serves that range. Observed live as
+    /// `ERR:peer unreachable: no active peers for region 2` during churn.
+    #[test]
+    fn serving_regions_hides_staging_from_scatter_callers() {
+        let mut map = ShardMap::default();
+        let key = MeasurementKey::new("db", "rp", "cpu");
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::BootstrapMeasurement {
+                key: key.clone(),
+                region: sample_region(1, 0, u64::MAX),
+            },
+        )
+        .unwrap();
+        // Post-split shape: donor shrunk, staging child covering the rest.
+        let regions = &mut map.spaces.get_mut(&key).unwrap().regions;
+        regions[0].end = 100;
+        regions.push(staging_region(2, 100, u64::MAX, 1, 7));
+
+        let cache = ShardLocationCache::new();
+        let view = cache.serving_regions(&map, "db", "rp", "cpu");
+
+        assert_eq!(
+            view.len(),
+            1,
+            "staging must not be offered to scatter: {view:?}"
+        );
+        assert_eq!(view[0].region_id, 1);
+        assert_eq!(
+            view[0].end,
+            u64::MAX,
+            "the donor must cover the staged range"
+        );
+        assert!(
+            view.iter().all(ShardRegion::is_serving),
+            "every region offered to scatter must be routable"
+        );
     }
 
     #[test]

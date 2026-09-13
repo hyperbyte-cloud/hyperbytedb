@@ -135,6 +135,16 @@ check_exactly_once() {
   wait_flush_boundary
   rows=$(count_from_query_checked 0 "SELECT COUNT(value) FROM churn")
   after=$(acked_total)
+  # An unreadable count is not a passing count. Both numeric tests below error
+  # on a non-numeric value, and with stderr suppressed the chain falls through
+  # to `pass` -- which is how "ERR:peer unreachable: no active peers for
+  # region 2" was reported as exactly-once.
+  case "$rows" in
+    ''|*[!0-9]*)
+      fail "$gate" "UNREADABLE ${when}: count query returned [${rows}]"
+      return
+      ;;
+  esac
   if [ "$rows" -lt "$before" ] 2>/dev/null; then
     fail "$gate" "LOST ${when}: ${rows} rows, ${before} acked before the check (missing $((before - rows)))"
   elif [ "$rows" -gt "$after" ] 2>/dev/null; then

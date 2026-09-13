@@ -89,13 +89,18 @@ pub async fn scatter_tag_keys(
     measurement: &str,
 ) -> Result<Vec<String>, HyperbytedbError> {
     let map = ctx.shard_map.snapshot().await?;
-    let Some(space) = map.space(db, rp, measurement) else {
+    // The serving view, not the raw snapshot: a snapshot contains staging
+    // regions, which are in the map but must not be routed to -- the donor
+    // still serves their range and this view reflects that.
+    let serving = ctx
+        .location_cache
+        .serving_regions(&map, db, rp, measurement);
+    if serving.is_empty() {
         return metadata.list_tag_keys(db, rp, Some(measurement)).await;
-    };
+    }
 
     let mut keys = BTreeSet::new();
-    let has_local_peer = space
-        .regions
+    let has_local_peer = serving
         .iter()
         .any(|region| region.peers.contains(&ctx.node_id));
     if has_local_peer {
@@ -104,8 +109,7 @@ pub async fn scatter_tag_keys(
         }
     }
 
-    let remote_regions: Vec<_> = space
-        .regions
+    let remote_regions: Vec<_> = serving
         .iter()
         .filter(|region| !region.peers.contains(&ctx.node_id))
         .collect();
@@ -134,15 +138,20 @@ pub async fn scatter_tag_values(
     tag_key: &str,
 ) -> Result<Vec<String>, HyperbytedbError> {
     let map = ctx.shard_map.snapshot().await?;
-    let Some(space) = map.space(db, rp, measurement) else {
+    // The serving view, not the raw snapshot: a snapshot contains staging
+    // regions, which are in the map but must not be routed to -- the donor
+    // still serves their range and this view reflects that.
+    let serving = ctx
+        .location_cache
+        .serving_regions(&map, db, rp, measurement);
+    if serving.is_empty() {
         return metadata
             .list_tag_values(db, rp, tag_key, Some(measurement))
             .await;
-    };
+    }
 
     let mut values = BTreeSet::new();
-    let has_local_peer = space
-        .regions
+    let has_local_peer = serving
         .iter()
         .any(|region| region.peers.contains(&ctx.node_id));
     if has_local_peer {
@@ -154,8 +163,7 @@ pub async fn scatter_tag_values(
         }
     }
 
-    let remote_regions: Vec<_> = space
-        .regions
+    let remote_regions: Vec<_> = serving
         .iter()
         .filter(|region| !region.peers.contains(&ctx.node_id))
         .collect();
@@ -192,17 +200,22 @@ pub async fn scatter_series_keys(
     measurement: &str,
 ) -> Result<Vec<String>, HyperbytedbError> {
     let map = ctx.shard_map.snapshot().await?;
-    let Some(space) = map.space(db, rp, measurement) else {
+    // The serving view, not the raw snapshot: a snapshot contains staging
+    // regions, which are in the map but must not be routed to -- the donor
+    // still serves their range and this view reflects that.
+    let serving = ctx
+        .location_cache
+        .serving_regions(&map, db, rp, measurement);
+    if serving.is_empty() {
         let series = metadata.list_series(db, rp, measurement).await?;
         return Ok(series
             .into_iter()
             .map(|(id, tags)| format!("{id}:{tags:?}"))
             .collect());
-    };
+    }
 
     let mut keys = BTreeSet::new();
-    let has_local_peer = space
-        .regions
+    let has_local_peer = serving
         .iter()
         .any(|region| region.peers.contains(&ctx.node_id));
     if has_local_peer {
@@ -211,8 +224,7 @@ pub async fn scatter_series_keys(
         }
     }
 
-    let remote_regions: Vec<_> = space
-        .regions
+    let remote_regions: Vec<_> = serving
         .iter()
         .filter(|region| !region.peers.contains(&ctx.node_id))
         .collect();

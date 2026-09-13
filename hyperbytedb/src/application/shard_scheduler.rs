@@ -910,7 +910,7 @@ impl ShardScheduler {
                     true
                 }
                 Err(e) => {
-                    counter!("hyperbytedb_shard_split_unstaged_aborts_total").increment(1);
+                    counter!("hyperbytedb_shard_split_stage_failures_total").increment(1);
                     tracing::warn!(
                         region_id = region.region_id,
                         child_primary = right.primary,
@@ -923,7 +923,7 @@ impl ShardScheduler {
         } else {
             // No peer client means nothing can be staged, so nothing may be
             // published either.
-            counter!("hyperbytedb_shard_split_unstaged_aborts_total").increment(1);
+            counter!("hyperbytedb_shard_split_stage_failures_total").increment(1);
             false
         };
 
