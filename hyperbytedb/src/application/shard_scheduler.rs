@@ -799,45 +799,88 @@ impl ShardScheduler {
             }
         }
 
-        // Pre-commit staging (best-effort): when this node holds the historical
-        // rows, push the future right-child range to its new primary BEFORE the
-        // Split commits, shrinking the empty-read window to commit latency.
-        // Rows land via a `stage` transfer that skips ownership checks; the
-        // post-commit verified re-push below remains authoritative and cleans
-        // up the source copy.
-        if region.primary == self.node_id
-            && right.primary != self.node_id
-            && let Some(pc) = self.peer_client.as_ref()
-        {
-            match stage_region_transfer_data(
-                pc,
-                &self.metadata,
-                &self.wal,
-                self.query_port.as_ref(),
-                self.node_id,
-                key,
-                &right,
-                right.primary,
-                self.max_points_per_request,
-            )
-            .await
-            {
-                Ok(o) => {
+        // A split may only commit once the child's primary already holds the
+        // child's rows.
+        //
+        // Committing first publishes a region whose primary is empty, and a
+        // scatter read for that range then returns zero rows *successfully* --
+        // the query is wrong, not failed, and nothing in the read path can tell
+        // the difference. This used to commit regardless: "committing split
+        // anyway" on a staging failure, and no staging attempted at all when
+        // the leader was not the donor.
+        //
+        // The child keeping the donor's primary needs no movement; anything
+        // else must be staged first, by this node when it is the donor and by
+        // asking the donor when it is not.
+        let child_needs_data = right.primary != region.primary;
+        let child_ready = if !child_needs_data {
+            true
+        } else if let Some(pc) = self.peer_client.as_ref() {
+            let staged = if region.primary == self.node_id {
+                stage_region_transfer_data(
+                    pc,
+                    &self.metadata,
+                    &self.wal,
+                    self.query_port.as_ref(),
+                    self.node_id,
+                    key,
+                    &right,
+                    right.primary,
+                    self.max_points_per_request,
+                )
+                .await
+                .map(|o| o.exported)
+            } else {
+                // Not the donor: the rows live on `region.primary`, so ask it
+                // to push them. Skipping this was why a leader that did not
+                // own the region committed splits whose child was never staged.
+                request_region_stage(
+                    pc.as_ref(),
+                    &self.membership,
+                    region.primary,
+                    key,
+                    &right,
+                    right.primary,
+                )
+                .await
+                .map(|()| 0)
+            };
+            match staged {
+                Ok(exported) => {
                     counter!("hyperbytedb_shard_stage_total").increment(1);
                     tracing::info!(
                         region_id = region.region_id,
-                        staged = o.exported,
+                        staged = exported,
                         "split child data staged pre-commit"
                     );
+                    true
                 }
                 Err(e) => {
+                    counter!("hyperbytedb_shard_split_unstaged_aborts_total").increment(1);
                     tracing::warn!(
                         region_id = region.region_id,
+                        child_primary = right.primary,
                         error = %e,
-                        "split pre-commit staging failed; committing split anyway"
+                        "split aborted: child data could not be staged"
                     );
+                    false
                 }
             }
+        } else {
+            // No peer client means nothing can be staged, so nothing may be
+            // published either.
+            counter!("hyperbytedb_shard_split_unstaged_aborts_total").increment(1);
+            false
+        };
+
+        if !child_ready {
+            return Err(HyperbytedbError::ShardMap(
+                format!(
+                    "split of region {} aborted: child primary {} does not hold the range",
+                    region.region_id, right.primary
+                )
+                .into(),
+            ));
         }
 
         let op = ShardMapOp::Split {
@@ -2843,6 +2886,143 @@ mod tests {
                 .iter()
                 .any(|op| matches!(op, ShardMapOp::Split { .. })),
             "expected Split proposal when series_count exceeds threshold: {captured:?}"
+        );
+    }
+
+    /// A split must not commit while the child's primary has no data.
+    ///
+    /// Committing first publishes a region whose primary is empty, and a
+    /// scatter read for that range then returns zero rows *successfully* --
+    /// the query is wrong, not failed, and nothing in the read path can tell
+    /// the difference. The old code committed regardless, logging
+    /// "committing split anyway", and did not even attempt to stage when the
+    /// leader was not the donor.
+    ///
+    /// Here the donor (node 9) is absent from membership, so the only
+    /// candidate is this node: `target_placement` must choose 1, which differs
+    /// from the donor, so the child needs data. The leader is not the donor, so
+    /// it asks node 9 to push -- and node 9 cannot be resolved. The split must
+    /// be abandoned, not published.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn split_is_abandoned_when_the_child_primary_cannot_be_staged() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use crate::adapters::chdb::native_adapter::ChdbNativeAdapter;
+        use crate::adapters::chdb::query_adapter::ChdbQueryAdapter;
+        use crate::adapters::chdb::session::SharedSession;
+        use crate::adapters::metadata::rocksdb_meta::RocksDbMetadata;
+        use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
+        use crate::adapters::wal::rocksdb_wal::RocksDbWal;
+        use crate::application::cluster::bootstrap::ClusterBootstrap;
+        use crate::application::materialized_view_service::MaterializedViewService;
+        use crate::domain::sharding::{MeasurementKey, ShardLocationCache, ShardMapOp};
+        use crate::ports::points_sink::PointsSinkPort;
+
+        let dir = tempfile::tempdir().unwrap();
+        let meta_dir = dir.path().join("meta");
+        let wal_dir = dir.path().join("wal");
+        let chdb_dir = dir.path().join("chdb");
+        for p in [&meta_dir, &wal_dir, &chdb_dir] {
+            std::fs::create_dir_all(p).unwrap();
+        }
+
+        let chdb = SharedSession::new_eager(chdb_dir.to_str().unwrap(), 1).unwrap();
+        let chdb_adapter = Arc::new(ChdbQueryAdapter::from_shared(chdb.clone(), 0));
+        let sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(chdb));
+        let wal = Arc::new(RocksDbWal::open(&wal_dir).unwrap());
+        let metadata = Arc::new(RocksDbMetadata::open(&meta_dir).unwrap());
+        let mv_service = Arc::new(MaterializedViewService::new(
+            metadata.clone(),
+            chdb_adapter,
+            sink.clone(),
+        ));
+
+        let mut cluster_cfg = crate::config::HyperbytedbConfig::load(None)
+            .unwrap()
+            .cluster;
+        cluster_cfg.enabled = true;
+        cluster_cfg.node_id = 1;
+        cluster_cfg.cluster_addr = "127.0.0.1:18097".into();
+        cluster_cfg.replication_log_dir = dir.path().join("repl").to_string_lossy().into();
+        cluster_cfg.raft_dir = dir.path().join("raft").to_string_lossy().into();
+        cluster_cfg.raft_heartbeat_interval_ms = Some(200);
+        cluster_cfg.raft_election_timeout_ms = Some(500);
+
+        let bootstrap = ClusterBootstrap::init(&cluster_cfg, 1000).unwrap();
+        let shard_map = Arc::new(RocksDbShardMap::open(&meta_dir, true).unwrap());
+        let location_cache = Arc::new(ShardLocationCache::new());
+        let raft = bootstrap
+            .start_raft(
+                &cluster_cfg,
+                metadata.clone(),
+                mv_service,
+                sink.clone(),
+                wal.clone(),
+                Some((shard_map.clone(), location_cache.clone())),
+                None,
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let key = MeasurementKey::new("db", "autogen", "cpu");
+        // Donor is node 9, which is not in membership and so cannot be asked
+        // to stage; node 1 is the only placement candidate.
+        let region = ShardRegion {
+            region_id: 1,
+            start: 0,
+            end: u64::MAX,
+            epoch: ShardEpoch::default(),
+            peers: vec![9, 1],
+            primary: 9,
+            last_split_at: 1,
+            transfer_verified: None,
+            transfer_first_seen: None,
+        };
+        shard_map
+            .apply_op(ShardMapOp::BootstrapMeasurement {
+                key: key.clone(),
+                region: region.clone(),
+            })
+            .await
+            .unwrap();
+
+        let sharding = ShardingConfig {
+            region_split_series: 10,
+            region_max_series: 1_000,
+            split_merge_interval_secs: 0,
+            ..Default::default()
+        };
+
+        let proposals = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let scheduler = ShardScheduler::new(
+            shard_map,
+            bootstrap.membership.clone(),
+            raft,
+            None,
+            metadata,
+            wal,
+            None,
+            Some(sink),
+            1,
+            sharding,
+            0,
+        )
+        .with_test_force_leader(true)
+        .with_test_propose_sink(proposals.clone());
+
+        scheduler.record_heartbeat(1, 1, 50, 0, 0).await;
+        scheduler.tick_once_for_test().await.unwrap();
+
+        let captured = proposals.lock().unwrap();
+        assert!(
+            !captured
+                .iter()
+                .any(|op| matches!(op, ShardMapOp::Split { .. })),
+            "a split whose child primary holds no data must not be published: {captured:?}"
         );
     }
 
