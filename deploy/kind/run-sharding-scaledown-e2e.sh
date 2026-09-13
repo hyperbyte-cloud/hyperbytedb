@@ -284,7 +284,13 @@ main() {
   fi
 
   wait_flush_boundary
-  final_count=$(count_from_query_checked 0 "SELECT COUNT(value) FROM cpu")
+  # Same bounded poll as D1, for the same reason: evacuating a node re-places
+  # regions, and a scatter-gather query silently under-reports until placement
+  # settles. A single read here reported 4992 of 5000 on a run whose data was
+  # intact -- the same query 20s later returned exactly 5000 with zero empty
+  # tags. The assertion is unchanged; it just stops firing on a read taken
+  # mid-convergence.
+  final_count=$(wait_for_query_count 0 "SELECT COUNT(value) FROM cpu" "$baseline" "${SEED_SETTLE_SECS:-420}")
   rf_after=$(wait_for_regions_rf_ok 2 "$((HEARTBEAT_INTERVAL_SECS * 12))")
   if [ "$final_count" = "$baseline" ] && [ "$rf_after" = "OK" ]; then
     pass D5 "COUNT=$final_count unchanged; RF ok"
