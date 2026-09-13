@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -312,6 +312,30 @@ impl ShardScheduler {
         self.placement_errors.write().await.remove(&region_id);
     }
 
+    /// Drop per-region counters for regions the map no longer has.
+    ///
+    /// `placement_stalls` and `placement_errors` are keyed by `region_id` and
+    /// cleared only when a region converges. A region that splits, merges or
+    /// has its measurement dropped never converges again, and `next_region_id`
+    /// only ever increases -- so without this the maps grow for the life of
+    /// the process on any cluster that reshapes regions, which is every
+    /// sharded cluster under load.
+    async fn prune_region_counters(&self, map: &ShardMap) {
+        let live: HashSet<u64> = map
+            .spaces
+            .values()
+            .flat_map(|space| space.regions.iter().map(|r| r.region_id))
+            .collect();
+        self.placement_stalls
+            .write()
+            .await
+            .retain(|id, _| live.contains(id));
+        self.placement_errors
+            .write()
+            .await
+            .retain(|id, _| live.contains(id));
+    }
+
     async fn clear_placement_stall(&self, region_id: u64) {
         self.placement_stalls.write().await.remove(&region_id);
     }
@@ -438,6 +462,7 @@ impl ShardScheduler {
         self.tick_moved_bytes
             .store(0, std::sync::atomic::Ordering::Relaxed);
         let map = self.shard_map.snapshot().await?;
+        self.prune_region_counters(&map).await;
         self.drain_reconciliation(&map).await;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3572,6 +3597,47 @@ mod tests {
             probes.load(std::sync::atomic::Ordering::Relaxed),
             2,
             "a new tick must re-probe the candidate"
+        );
+    }
+
+    /// Per-region counters must not outlive their regions.
+    ///
+    /// Both maps are cleared only when a region converges, but a region that
+    /// splits, merges or has its measurement dropped never converges again --
+    /// and `next_region_id` only ever increases, so entries for dead regions
+    /// accumulate for the life of the process. On a sharded cluster under load
+    /// regions reshape constantly, so this grows without bound.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn counters_for_vanished_regions_are_pruned() {
+        let harness = PlacementTestHarness::new(true, &[(2, 0)], 2).await;
+        let sched = &harness.scheduler;
+
+        let live_id = harness.region().await.region_id;
+        let dead_id = live_id + 9_999;
+
+        sched.note_placement_stall(live_id, 1).await;
+        sched.note_placement_stall(dead_id, 1).await;
+        let err = HyperbytedbError::ShardMap("boom".into());
+        sched.note_placement_error(live_id, &err).await;
+        sched.note_placement_error(dead_id, &err).await;
+
+        // Through the tick, not by calling prune directly: the wiring is half
+        // the behaviour, and a test that calls the helper itself still passes
+        // when the tick stops calling it.
+        sched.tick_once_for_test().await.unwrap();
+
+        let stalls = sched.placement_stalls.read().await;
+        let errs = sched.placement_errors.read().await;
+        // Only the vanished region is asserted. The live one's counters are
+        // legitimately cleared by convergence during the same tick, so
+        // asserting it survives would be testing convergence, not pruning.
+        // `dead_id` is not in the map at all, so nothing but the prune can
+        // remove it -- which is exactly what makes this discriminate.
+        assert!(
+            !stalls.contains_key(&dead_id) && !errs.contains_key(&dead_id),
+            "a region the map no longer has must not keep counters: \
+             stalls={stalls:?} errors={errs:?}"
         );
     }
 
