@@ -48,6 +48,8 @@ async fn location_cache_locates_after_bootstrap() {
         last_split_at: 0,
         transfer_verified: None,
         transfer_first_seen: None,
+        state: Default::default(),
+        staged_from: None,
     };
     map_store
         .apply_op(ShardMapOp::BootstrapMeasurement {
@@ -109,6 +111,8 @@ fn split_op_divides_region_range() {
         last_split_at: 0,
         transfer_verified: None,
         transfer_first_seen: None,
+        state: Default::default(),
+        staged_from: None,
     };
     let mut map = ShardMap::default();
     apply_shard_map_op(
@@ -158,6 +162,8 @@ fn merge_op_consolidates_adjacent_regions() {
         last_split_at: 0,
         transfer_verified: None,
         transfer_first_seen: None,
+        state: Default::default(),
+        staged_from: None,
     };
     let right = ShardRegion {
         region_id: 2,
@@ -169,6 +175,8 @@ fn merge_op_consolidates_adjacent_regions() {
         last_split_at: 0,
         transfer_verified: None,
         transfer_first_seen: None,
+        state: Default::default(),
+        staged_from: None,
     };
     let mut map = ShardMap::default();
     apply_shard_map_op(
@@ -185,6 +193,8 @@ fn merge_op_consolidates_adjacent_regions() {
                 last_split_at: 0,
                 transfer_verified: None,
                 transfer_first_seen: None,
+                state: Default::default(),
+                staged_from: None,
             },
         },
     )
@@ -211,6 +221,8 @@ fn merge_op_consolidates_adjacent_regions() {
         last_split_at: 0,
         transfer_verified: None,
         transfer_first_seen: None,
+        state: Default::default(),
+        staged_from: None,
     };
     apply_shard_map_op(
         &mut map,
@@ -241,6 +253,8 @@ fn four_region_space() -> hyperbytedb::domain::sharding::MeasurementShardSpace {
                 last_split_at: 0,
                 transfer_verified: None,
                 transfer_first_seen: None,
+                state: Default::default(),
+                staged_from: None,
             },
             ShardRegion {
                 region_id: 2,
@@ -252,6 +266,8 @@ fn four_region_space() -> hyperbytedb::domain::sharding::MeasurementShardSpace {
                 last_split_at: 0,
                 transfer_verified: None,
                 transfer_first_seen: None,
+                state: Default::default(),
+                staged_from: None,
             },
             ShardRegion {
                 region_id: 3,
@@ -263,6 +279,8 @@ fn four_region_space() -> hyperbytedb::domain::sharding::MeasurementShardSpace {
                 last_split_at: 0,
                 transfer_verified: None,
                 transfer_first_seen: None,
+                state: Default::default(),
+                staged_from: None,
             },
             ShardRegion {
                 region_id: 4,
@@ -274,6 +292,8 @@ fn four_region_space() -> hyperbytedb::domain::sharding::MeasurementShardSpace {
                 last_split_at: 0,
                 transfer_verified: None,
                 transfer_first_seen: None,
+                state: Default::default(),
+                staged_from: None,
             },
         ],
     }
@@ -359,6 +379,8 @@ fn resolve_region_peers_skips_disconnected_primary() {
         last_split_at: 0,
         transfer_verified: None,
         transfer_first_seen: None,
+        state: Default::default(),
+        staged_from: None,
     };
     let membership = sample_membership(&[
         (1, NodeState::Disconnected),
@@ -382,6 +404,8 @@ fn active_replication_targets_skip_disconnected_peers() {
         last_split_at: 0,
         transfer_verified: None,
         transfer_first_seen: None,
+        state: Default::default(),
+        staged_from: None,
     };
     let membership = sample_membership(&[
         (1, NodeState::Active),

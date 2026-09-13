@@ -20,6 +20,8 @@ fn region(start: u64, end: u64, peers: Vec<u64>, primary: u64) -> ShardRegion {
         last_split_at: 0,
         transfer_verified: None,
         transfer_first_seen: None,
+        state: Default::default(),
+        staged_from: None,
     }
 }
 

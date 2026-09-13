@@ -253,6 +253,8 @@ pub async fn build_bootstrap_op(
         last_split_at,
         transfer_verified: None,
         transfer_first_seen: None,
+        state: Default::default(),
+        staged_from: None,
     };
     Ok(ShardMapOp::BootstrapMeasurement {
         key: MeasurementKey::new(db, rp, measurement),
@@ -786,6 +788,8 @@ mod scatter_tests {
             last_split_at: 0,
             transfer_verified: None,
             transfer_first_seen: None,
+            state: Default::default(),
+            staged_from: None,
         }
     }
 

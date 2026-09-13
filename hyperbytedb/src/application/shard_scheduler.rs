@@ -2470,6 +2470,8 @@ mod tests {
             last_split_at: 0,
             transfer_verified: None,
             transfer_first_seen: None,
+            state: Default::default(),
+            staged_from: None,
         };
         let hb = vec![
             (1, 1, 0, 0, 0, 0),
@@ -2514,6 +2516,8 @@ mod tests {
             last_split_at: 0,
             transfer_verified: None,
             transfer_first_seen: None,
+            state: Default::default(),
+            staged_from: None,
         };
 
         assert_eq!(
@@ -2538,6 +2542,8 @@ mod tests {
             last_split_at: 0,
             transfer_verified: None,
             transfer_first_seen: None,
+            state: Default::default(),
+            staged_from: None,
         };
 
         // Peer 2 is active but self_id excludes it; peer 1 is not in membership.
@@ -2561,6 +2567,8 @@ mod tests {
             last_split_at: 0,
             transfer_verified: None,
             transfer_first_seen: None,
+            state: Default::default(),
+            staged_from: None,
         };
 
         assert_eq!(pick_alternate_primary(&membership, &region, 99).await, None);
@@ -2602,6 +2610,8 @@ mod tests {
             last_split_at: 0,
             transfer_verified: None,
             transfer_first_seen: None,
+            state: Default::default(),
+            staged_from: None,
         }
     }
 
@@ -2702,6 +2712,8 @@ mod tests {
             last_split_at: 0,
             transfer_verified: None,
             transfer_first_seen: None,
+            state: Default::default(),
+            staged_from: None,
         };
         shard_map
             .apply_op(ShardMapOp::BootstrapMeasurement {
@@ -2844,6 +2856,8 @@ mod tests {
             last_split_at: 1,
             transfer_verified: None,
             transfer_first_seen: None,
+            state: Default::default(),
+            staged_from: None,
         };
         shard_map
             .apply_op(ShardMapOp::BootstrapMeasurement {
@@ -2981,6 +2995,8 @@ mod tests {
             last_split_at: 1,
             transfer_verified: None,
             transfer_first_seen: None,
+            state: Default::default(),
+            staged_from: None,
         };
         shard_map
             .apply_op(ShardMapOp::BootstrapMeasurement {
@@ -3394,6 +3410,8 @@ mod tests {
             last_split_at: 0,
             transfer_verified: Some(false),
             transfer_first_seen: Some(first_seen),
+            state: Default::default(),
+            staged_from: None,
         }
     }
 

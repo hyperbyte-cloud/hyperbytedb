@@ -56,6 +56,17 @@ pub fn resolve_region_peers(
     membership: &ClusterMembership,
     role: RegionTargetRole,
 ) -> Vec<u64> {
+    // A region that is not serving has no targets, for any role.
+    //
+    // The location cache already materialises staging regions away, so routing
+    // should never see one -- this is the backstop for the paths that resolve
+    // from a raw map snapshot instead. Returning nothing makes the caller fail
+    // with "no active peers", which is the right outcome: a staging region's
+    // peers would answer zero rows *successfully*, and a wrong answer is worse
+    // than a failed one.
+    if !region.is_serving() {
+        return Vec::new();
+    }
     if matches!(
         role,
         RegionTargetRole::Write | RegionTargetRole::PrimaryRead
@@ -132,6 +143,8 @@ mod tests {
             last_split_at: 0,
             transfer_verified: None,
             transfer_first_seen: None,
+            state: Default::default(),
+            staged_from: None,
         }
     }
 
@@ -211,5 +224,42 @@ mod tests {
         ]);
         let peers = resolve_region_peers(&r, 2, &m, RegionTargetRole::PrimaryRead);
         assert_eq!(peers, vec![1]);
+    }
+
+    /// A region that is not serving has no targets, for any role.
+    ///
+    /// The location cache materialises staging regions away, so routing should
+    /// never see one -- this is the backstop for paths that resolve from a raw
+    /// map snapshot. Returning nothing makes the caller fail with "no active
+    /// peers"; letting its peers answer would return zero rows *successfully*,
+    /// and a wrong answer is worse than a failed one.
+    #[test]
+    fn a_staging_region_has_no_targets_for_any_role() {
+        use crate::domain::sharding::types::RegionState;
+
+        let mut membership = ClusterMembership::default();
+        for id in [1, 2, 3] {
+            membership.nodes.insert(id, node(id, NodeState::Active));
+        }
+
+        let mut r = region(1, &[1, 2, 3]);
+        assert!(
+            !resolve_region_peers(&r, 2, &membership, RegionTargetRole::Read).is_empty(),
+            "a serving region must still resolve targets"
+        );
+
+        r.state = RegionState::Staging;
+        r.staged_from = Some(9);
+        for role in [
+            RegionTargetRole::Write,
+            RegionTargetRole::PrimaryRead,
+            RegionTargetRole::Read,
+            RegionTargetRole::Replicate,
+        ] {
+            assert!(
+                resolve_region_peers(&r, 2, &membership, role).is_empty(),
+                "a staging region must not be routable for {role:?}"
+            );
+        }
     }
 }

@@ -228,6 +228,8 @@ mod tests {
                     last_split_at: 0,
                     transfer_verified: None,
                     transfer_first_seen: None,
+                    state: Default::default(),
+                    staged_from: None,
                 },
                 ShardRegion {
                     region_id: 2,
@@ -239,6 +241,8 @@ mod tests {
                     last_split_at: 0,
                     transfer_verified: None,
                     transfer_first_seen: None,
+                    state: Default::default(),
+                    staged_from: None,
                 },
                 ShardRegion {
                     region_id: 3,
@@ -250,6 +254,8 @@ mod tests {
                     last_split_at: 0,
                     transfer_verified: None,
                     transfer_first_seen: None,
+                    state: Default::default(),
+                    staged_from: None,
                 },
                 ShardRegion {
                     region_id: 4,
@@ -261,6 +267,8 @@ mod tests {
                     last_split_at: 0,
                     transfer_verified: None,
                     transfer_first_seen: None,
+                    state: Default::default(),
+                    staged_from: None,
                 },
             ],
         }

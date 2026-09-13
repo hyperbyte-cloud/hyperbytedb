@@ -25,6 +25,30 @@ impl ShardEpoch {
     }
 }
 
+/// Whether a region may serve reads and writes.
+///
+/// A split creates its child `Staging`: the region exists in the map with a
+/// primary and peers and is being filled, but the donor still physically holds
+/// its rows, so readers must not be sent to it. Publishing a child before its
+/// data has moved is not a slow answer -- a scatter read returns zero rows
+/// *successfully*, and nothing in the read path can tell that from a correct
+/// empty result.
+///
+/// Cutover flips the child to `Serving` in one committed op, which every
+/// node's location cache applies atomically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegionState {
+    /// Routable. The default, so every region in an already-serialized map
+    /// deserializes as serving -- which is correct: anything published today
+    /// is serving.
+    #[default]
+    Serving,
+    /// Present in the map but not routable; reads and writes for its range go
+    /// to [`ShardRegion::staged_from`] until cutover.
+    Staging,
+}
+
 /// Contiguous `[start, end)` range over `series_id` for one measurement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShardRegion {
@@ -50,9 +74,22 @@ pub struct ShardRegion {
     /// be reset by failover.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transfer_first_seen: Option<i64>,
+    /// Whether this region may serve reads and writes. See [`RegionState`].
+    #[serde(default)]
+    pub state: RegionState,
+    /// While [`Self::state`] is `Staging`, the region whose primary still holds
+    /// this range and must serve it. Cleared at cutover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_from: Option<u64>,
 }
 
 impl ShardRegion {
+    /// True when this region may be routed to.
+    #[must_use]
+    pub fn is_serving(&self) -> bool {
+        matches!(self.state, RegionState::Serving)
+    }
+
     pub fn contains(&self, series_id: u64) -> bool {
         series_id >= self.start && series_id < self.end
     }
@@ -246,6 +283,8 @@ mod locate_tests {
             last_split_at: 0,
             transfer_verified: None,
             transfer_first_seen: None,
+            state: Default::default(),
+            staged_from: None,
         }
     }
 

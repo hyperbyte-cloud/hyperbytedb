@@ -30,6 +30,8 @@ async fn bootstrap_two_regions(nodes: &[ShardedTestNode], db: &str, rp: &str, me
         last_split_at: 0,
         transfer_verified: None,
         transfer_first_seen: None,
+        state: Default::default(),
+        staged_from: None,
     };
     let region_b = ShardRegion {
         region_id: 2,
@@ -44,6 +46,8 @@ async fn bootstrap_two_regions(nodes: &[ShardedTestNode], db: &str, rp: &str, me
         last_split_at: 0,
         transfer_verified: None,
         transfer_first_seen: None,
+        state: Default::default(),
+        staged_from: None,
     };
     let split = ShardMapOp::Split {
         key: MeasurementKey::new(db, rp, measurement),

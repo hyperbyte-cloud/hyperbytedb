@@ -292,6 +292,8 @@ async fn transfer_moves_flushed_data_and_drops_source_range() {
         last_split_at: 0,
         transfer_verified: None,
         transfer_first_seen: None,
+        state: Default::default(),
+        staged_from: None,
     };
     let key = MeasurementKey::new("sharddb", "autogen", "cpu");
 
@@ -370,6 +372,8 @@ async fn bootstrap_two_regions(nodes: &[ShardedTestNode], db: &str, rp: &str, me
         last_split_at: 0,
         transfer_verified: None,
         transfer_first_seen: None,
+        state: Default::default(),
+        staged_from: None,
     };
     let region_b = ShardRegion {
         region_id: 2,
@@ -384,6 +388,8 @@ async fn bootstrap_two_regions(nodes: &[ShardedTestNode], db: &str, rp: &str, me
         last_split_at: 0,
         transfer_verified: None,
         transfer_first_seen: None,
+        state: Default::default(),
+        staged_from: None,
     };
     let split = ShardMapOp::Split {
         key: MeasurementKey::new(db, rp, measurement),
