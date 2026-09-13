@@ -1592,6 +1592,26 @@ impl PointsSinkPort for ChdbNativeAdapter {
             .await?;
         self.execute(format!("ALTER TABLE {series} DELETE WHERE {range}"))
             .await?;
+        // The series rows are gone from the table, so `known_series` must stop
+        // claiming they are registered. `series_known` gates the dimension-row
+        // insert: leave the cache stale and the next write for one of these
+        // ids writes a FACT row with no SERIES row. Queries join fact -> series
+        // and return empty tags for it; region export sees a row whose series
+        // entry is missing and refuses the chunk.
+        //
+        // That is not hypothetical -- it is how a 6-node cluster ended up with
+        // 2575 of 4932 rows reading host='' after region churn, with
+        // hyperbytedb_shard_transfer_missing_series_total at 887.
+        //
+        // Evict the whole table key rather than the dropped range. The cache is
+        // a dedup optimisation, so over-invalidating costs a re-insert of rows
+        // that are still present, while under-invalidating loses tags.
+        // `drop_measurement` already does exactly this.
+        self.known_series.write().pop(&TableKey {
+            db: db.to_string(),
+            rp: rp.to_string(),
+            measurement: measurement.to_string(),
+        });
         Ok(())
     }
 
