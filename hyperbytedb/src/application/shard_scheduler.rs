@@ -1063,7 +1063,11 @@ impl ShardScheduler {
                 key,
                 &right,
                 right.primary,
-                true,
+                // Never drop the donor's copy while the child is staging: the
+                // donor is still SERVING that range until cutover, so dropping
+                // first leaves the range served by a node that no longer holds
+                // it. Cutover flips the map; the copy is GC'd after.
+                right.is_serving(),
             )
             .await
             {
@@ -2387,7 +2391,23 @@ impl ShardScheduler {
                 )
                 .await
             } else {
-                request_region_rehome(pc, &self.membership, source, key, region, dest, true).await
+                // `region.is_serving()`, not `true`: a staging region's range is
+                // still served by its donor, so the donor must keep its rows
+                // until cutover. Dropping first is what left 13 staging regions
+                // serving from a donor that had already deleted their rows.
+                // After activation the donor's leftover rows are inert -- every
+                // region query injects a `series_id` range predicate -- and are
+                // reclaimed by a later GC.
+                request_region_rehome(
+                    pc,
+                    &self.membership,
+                    source,
+                    key,
+                    region,
+                    dest,
+                    region.is_serving(),
+                )
+                .await
             };
 
             match result {
