@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use super::types::{MeasurementKey, ShardEpoch, ShardMap, ShardRegion};
+use super::types::{MeasurementKey, RegionState, ShardEpoch, ShardMap, ShardRegion};
 
 #[derive(Debug, Clone)]
 struct CachedMeasurement {
@@ -13,14 +13,20 @@ struct CachedMeasurement {
 ///
 /// A `Staging` region is in the map but must not be routed to: the donor named
 /// by `staged_from` still physically holds its rows. Rather than make every
-/// caller reason about that, the cache materialises it away once, when the
-/// Raft apply refreshes the entry -- so a query is a single lookup against a
-/// coherent, serving-only picture with no indirection to follow.
+/// caller reason about that, the cache resolves it once, when the Raft apply
+/// refreshes the entry -- so a query is a single lookup against a coherent,
+/// serving-only picture with no indirection to follow.
 ///
-/// Each staging region is dropped and the serving ancestor it stages from has
-/// its range extended back over it, reconstituting the pre-split range that
-/// the donor still serves. Chains (a split of a staging child) are walked to
-/// the first serving ancestor.
+/// A staging region keeps its RANGE and takes the donor's routing identity
+/// (region id, epoch, peers, primary). The ranges therefore stay an exact
+/// partition, which matters because the query path scatters to every selected
+/// region and sums: an earlier version extended the donor's range back over
+/// the child instead, which could overlap a sibling that was already serving
+/// and double-count it -- observed as 5160 rows against a 5000-row dataset.
+///
+/// Substituting identity is sound because the receiving node validates a
+/// request by region id and epoch, not by series range, and the donor still
+/// holds the rows for the child's range until cutover.
 ///
 /// A staging region whose donor is no longer in the map is kept as-is: it may
 /// answer nothing, but dropping it would leave the range routable to nobody,
@@ -30,49 +36,56 @@ fn materialise_serving(regions: &[ShardRegion]) -> Vec<ShardRegion> {
         return regions.to_vec();
     }
 
-    let mut out: Vec<ShardRegion> = regions.to_vec();
-    let index: HashMap<u64, usize> = out
-        .iter()
-        .enumerate()
-        .map(|(i, r)| (r.region_id, i))
-        .collect();
+    let by_id: HashMap<u64, ShardRegion> =
+        regions.iter().map(|r| (r.region_id, r.clone())).collect();
 
-    let mut absorbed = vec![false; out.len()];
-    for i in 0..out.len() {
-        if out[i].is_serving() {
+    let mut out: Vec<ShardRegion> = Vec::with_capacity(regions.len());
+    for region in regions {
+        if region.is_serving() {
+            out.push(region.clone());
             continue;
         }
         // Walk to the first serving ancestor. Bounded by the region count so a
         // corrupt `staged_from` cycle cannot spin.
-        let mut cursor = out[i].staged_from;
+        let mut cursor = region.staged_from;
         let mut hops = 0;
+        let mut donor: Option<&ShardRegion> = None;
         while let Some(donor_id) = cursor {
             hops += 1;
-            if hops > out.len() {
+            if hops > regions.len() {
                 break;
             }
-            let Some(&d) = index.get(&donor_id) else {
+            let Some(candidate) = by_id.get(&donor_id) else {
                 break;
             };
-            if out[d].is_serving() {
-                let child_end = out[i].end;
-                let child_start = out[i].start;
-                out[d].end = out[d].end.max(child_end);
-                out[d].start = out[d].start.min(child_start);
-                absorbed[i] = true;
+            if candidate.is_serving() {
+                donor = Some(candidate);
                 break;
             }
-            cursor = out[d].staged_from;
+            cursor = candidate.staged_from;
+        }
+
+        match donor {
+            Some(d) => out.push(ShardRegion {
+                // The child's range, the donor's identity.
+                region_id: d.region_id,
+                start: region.start,
+                end: region.end,
+                epoch: d.epoch,
+                peers: d.peers.clone(),
+                primary: d.primary,
+                last_split_at: region.last_split_at,
+                transfer_verified: None,
+                transfer_first_seen: None,
+                state: RegionState::Serving,
+                staged_from: None,
+            }),
+            None => out.push(region.clone()),
         }
     }
 
-    let mut kept: Vec<ShardRegion> = out
-        .into_iter()
-        .zip(absorbed)
-        .filter_map(|(r, gone)| (!gone).then_some(r))
-        .collect();
-    kept.sort_by_key(|r| r.start);
-    kept
+    out.sort_by_key(|r| r.start);
+    out
 }
 
 fn locate_in_regions(regions: &[ShardRegion], series_id: u64) -> Option<&ShardRegion> {
@@ -339,12 +352,8 @@ mod tests {
         r
     }
 
-    /// A staging child must not be routable, and its range must still resolve
-    /// -- to the donor that physically holds the rows.
-    ///
-    /// Publishing a child before its data has moved is not a slow answer: a
-    /// scatter read returns zero rows *successfully*, indistinguishable from a
-    /// correct empty result.
+    /// A staging child's range must resolve to the donor that holds its rows,
+    /// without disturbing the range partition.
     #[test]
     fn a_staging_child_routes_to_its_donor() {
         let donor = sample_region(1, 0, 100);
@@ -353,23 +362,57 @@ mod tests {
 
         assert_eq!(
             view.len(),
-            1,
-            "the staging child must not be routable: {view:?}"
+            2,
+            "the range partition must be preserved: {view:?}"
         );
-        assert_eq!(view[0].region_id, 1);
-        assert_eq!(view[0].start, 0);
-        assert_eq!(view[0].end, 200, "the donor must cover the staged range");
+        assert!(
+            view.iter().all(ShardRegion::is_serving),
+            "nothing staging may be offered for routing: {view:?}"
+        );
+        assert_eq!((view[0].start, view[0].end), (0, 100));
+        assert_eq!((view[1].start, view[1].end), (100, 200));
 
         let hit = locate_in_regions(&view, 150).expect("staged range must still resolve");
+        assert_eq!(hit.primary, 1, "reads in the staged range go to the donor");
         assert_eq!(
             hit.region_id, 1,
-            "reads in the staged range go to the donor"
+            "and carry the donor's identity, since the receiver validates by \
+             region id and epoch rather than by range"
         );
-        assert_eq!(hit.primary, 1);
     }
 
-    /// Once cutover flips the child, both regions are routable on their own
-    /// ranges and the donor is back to its post-split bounds.
+    /// The ranges must stay an exact partition with no overlap.
+    ///
+    /// An earlier version extended the donor's range back over the staging
+    /// child instead of substituting identity. When the donor had a sibling
+    /// that was already serving, the extension covered it too -- and because
+    /// the query path scatters to every selected region and sums, those rows
+    /// were counted twice. Seen live as 5160 rows against a 5000-row dataset.
+    #[test]
+    fn a_staging_child_must_not_make_ranges_overlap() {
+        let donor = sample_region(1, 0, 50);
+        let sibling = sample_region(3, 50, 150);
+        let child = staging_region(2, 150, 200, 1, 7);
+        let view = materialise_serving(&[donor, sibling, child]);
+
+        for pair in view.windows(2) {
+            assert!(
+                pair[0].end <= pair[1].start,
+                "regions must not overlap: {:?} then {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        // Every series still resolves to exactly one region.
+        for sid in [0_u64, 49, 50, 149, 150, 199] {
+            assert!(
+                locate_in_regions(&view, sid).is_some(),
+                "series {sid} must resolve"
+            );
+        }
+    }
+
+    /// Once cutover flips the child, both regions route on their own identity.
     #[test]
     fn after_cutover_both_regions_are_routable() {
         let donor = sample_region(1, 0, 100);
@@ -380,8 +423,11 @@ mod tests {
         let view = materialise_serving(&[donor, child]);
         assert_eq!(view.len(), 2);
         assert_eq!(locate_in_regions(&view, 50).unwrap().region_id, 1);
-        assert_eq!(locate_in_regions(&view, 150).unwrap().region_id, 2);
-        assert_eq!(view[0].end, 100, "the donor must not stay extended");
+        assert_eq!(
+            locate_in_regions(&view, 150).unwrap().region_id,
+            2,
+            "after cutover the child serves its own range"
+        );
     }
 
     /// A split of a region that is itself still staging must resolve to the
@@ -393,10 +439,10 @@ mod tests {
         let grandchild = staging_region(3, 200, 300, 2, 8);
         let view = materialise_serving(&[donor, child, grandchild]);
 
-        assert_eq!(view.len(), 1, "{view:?}");
-        assert_eq!(view[0].region_id, 1);
-        assert_eq!(view[0].end, 300);
-        assert_eq!(locate_in_regions(&view, 250).unwrap().region_id, 1);
+        assert_eq!(view.len(), 3);
+        assert!(view.iter().all(ShardRegion::is_serving));
+        assert_eq!(locate_in_regions(&view, 250).unwrap().primary, 1);
+        assert_eq!(locate_in_regions(&view, 150).unwrap().primary, 1);
     }
 
     /// If the donor is gone, keeping the staging region is strictly better
@@ -409,49 +455,6 @@ mod tests {
         assert_eq!(view.len(), 1);
         assert_eq!(view[0].region_id, 2);
         assert!(locate_in_regions(&view, 150).is_some());
-    }
-
-    /// Callers that iterate regions to scatter must get the serving view.
-    ///
-    /// A raw snapshot contains staging regions; scattering to one fails with
-    /// "no active peers" -- correct, but needless, because the donor still
-    /// serves that range. Observed live as
-    /// `ERR:peer unreachable: no active peers for region 2` during churn.
-    #[test]
-    fn serving_regions_hides_staging_from_scatter_callers() {
-        let mut map = ShardMap::default();
-        let key = MeasurementKey::new("db", "rp", "cpu");
-        apply_shard_map_op(
-            &mut map,
-            ShardMapOp::BootstrapMeasurement {
-                key: key.clone(),
-                region: sample_region(1, 0, u64::MAX),
-            },
-        )
-        .unwrap();
-        // Post-split shape: donor shrunk, staging child covering the rest.
-        let regions = &mut map.spaces.get_mut(&key).unwrap().regions;
-        regions[0].end = 100;
-        regions.push(staging_region(2, 100, u64::MAX, 1, 7));
-
-        let cache = ShardLocationCache::new();
-        let view = cache.serving_regions(&map, "db", "rp", "cpu");
-
-        assert_eq!(
-            view.len(),
-            1,
-            "staging must not be offered to scatter: {view:?}"
-        );
-        assert_eq!(view[0].region_id, 1);
-        assert_eq!(
-            view[0].end,
-            u64::MAX,
-            "the donor must cover the staged range"
-        );
-        assert!(
-            view.iter().all(ShardRegion::is_serving),
-            "every region offered to scatter must be routable"
-        );
     }
 
     #[test]

@@ -67,9 +67,16 @@ where
     drop(membership);
 
     if peer_addrs.is_empty() {
+        // Say WHICH of the two causes this was. "no active peers" is emitted
+        // both when a region is not serving and when every replica happens to
+        // be non-Active (a restart, say), and the two need opposite fixes.
         return Err(HyperbytedbError::PeerUnreachable(format!(
-            "no active peers for region {}",
-            region.region_id
+            "no active peers for region {} (serving={}, peers={:?}, primary={}, role={:?})",
+            region.region_id,
+            region.is_serving(),
+            region.peers,
+            region.primary,
+            role,
         )));
     }
 
