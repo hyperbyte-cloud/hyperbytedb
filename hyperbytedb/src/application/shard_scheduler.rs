@@ -974,17 +974,32 @@ impl ShardScheduler {
             .committed_child_for_range(key, right.start, right.end)
             .await;
         let resolve_at_drain = committed.is_none();
-        let right = match committed {
-            Some(c) => c,
-            None => {
-                tracing::warn!(
-                    region_id = region.region_id,
-                    start = right.start,
-                    end = right.end,
-                    "split commit lookup failed; queueing resolve-at-drain marker"
-                );
-                right
-            }
+        let Some(right) = committed else {
+            // Do NOT attempt the move with the proposed child. Its id and epoch
+            // are provisional -- apply reallocates ids -- so the request is at
+            // best rejected (40 of 88 staging failures were 404s carrying a
+            // proposed id) and at worst names a DIFFERENT region that has since
+            // been allocated that id, moving the wrong range. Leave it to the
+            // drain, which re-resolves before moving anything.
+            counter!("hyperbytedb_shard_split_commit_lookup_failed_total").increment(1);
+            tracing::warn!(
+                region_id = region.region_id,
+                start = right.start,
+                end = right.end,
+                "split commit lookup failed; deferring the move to the drain"
+            );
+            self.enqueue_reconciliation(PendingTransfer {
+                key: key.clone(),
+                region_id: right.region_id,
+                start: right.start,
+                end: right.end,
+                recorded_source: region.primary,
+                resolve_at_drain: true,
+                ticks_without_progress: 0,
+                parked: false,
+                first_seen: right.transfer_first_seen.unwrap_or_else(now_unix),
+            });
+            return Ok(());
         };
 
         // Ownership unchanged (e.g. no active alternate for the child primary):
