@@ -68,6 +68,25 @@ pub enum ShardMapOp {
         to_peer: u64,
         #[serde(default)]
         epoch: ShardEpoch,
+        /// Commit the peer as a LEARNER: a member that receives replicated
+        /// writes but may not serve reads until [`ShardMapOp::PromotePeer`].
+        ///
+        /// This is the ordering that closes the copy gap. Committing
+        /// membership BEFORE the data is copied means replication starts
+        /// flowing immediately, so no write can land in the window between the
+        /// snapshot and the commit. TiKV does the same with AddLearner.
+        #[serde(default)]
+        staging: bool,
+    },
+    /// Promote a learner to a full replica once its copy has landed.
+    ///
+    /// The mirror of `AddPeer { staging: true }`, and TiKV's PromoteLearner.
+    PromotePeer {
+        key: MeasurementKey,
+        region_id: u64,
+        peer: u64,
+        #[serde(default)]
+        epoch: ShardEpoch,
     },
     /// Shrink a region's replica set. Does not change primary.
     ///
@@ -121,6 +140,7 @@ impl ShardMapOp {
             | ShardMapOp::Merge { key, .. }
             | ShardMapOp::MovePeer { key, .. }
             | ShardMapOp::AddPeer { key, .. }
+            | ShardMapOp::PromotePeer { key, .. }
             | ShardMapOp::RemovePeer { key, .. }
             | ShardMapOp::TransferPrimary { key, .. }
             | ShardMapOp::ClearVerified { key, .. }
@@ -297,6 +317,7 @@ pub fn apply_shard_map_op(
                 )));
             }
             region.peers.retain(|p| *p != from_peer);
+            region.staging_peers.retain(|p| *p != from_peer);
             if !region.peers.contains(&to_peer) {
                 region.peers.push(to_peer);
             }
@@ -311,6 +332,7 @@ pub fn apply_shard_map_op(
             region_id,
             to_peer,
             epoch,
+            staging,
         } => {
             let space = map
                 .spaces
@@ -335,6 +357,38 @@ pub fn apply_shard_map_op(
                 )));
             }
             region.peers.push(to_peer);
+            if staging && !region.staging_peers.contains(&to_peer) {
+                region.staging_peers.push(to_peer);
+            }
+            region.epoch = epoch.bump_conf_ver();
+            sort_space_regions(space);
+        }
+        ShardMapOp::PromotePeer {
+            key,
+            region_id,
+            peer,
+            epoch,
+        } => {
+            let space = map
+                .spaces
+                .get_mut(&key)
+                .ok_or(ShardMapApplyError::UnknownSpace)?;
+            let region = space
+                .regions
+                .iter_mut()
+                .find(|r| r.region_id == region_id)
+                .ok_or(ShardMapApplyError::UnknownRegion(region_id))?;
+            if region.epoch != epoch {
+                return Err(ShardMapApplyError::StaleEpoch("PromotePeer"));
+            }
+            if !region.peers.contains(&peer) {
+                return Err(ShardMapApplyError::Invalid(format!(
+                    "cannot promote {peer}: not a member of region {region_id}"
+                )));
+            }
+            // Idempotent: a retry after a leadership change must not wedge a
+            // learner that is already promoted.
+            region.staging_peers.retain(|p| *p != peer);
             region.epoch = epoch.bump_conf_ver();
             sort_space_regions(space);
         }
@@ -377,6 +431,9 @@ pub fn apply_shard_map_op(
                 ));
             }
             region.peers.retain(|p| *p != from_peer);
+            // Drop the learner marker too, or a peer re-added later inherits a
+            // stale "not ready" flag that nothing will ever clear.
+            region.staging_peers.retain(|p| *p != from_peer);
             region.epoch = epoch.bump_conf_ver();
             sort_space_regions(space);
         }
@@ -481,6 +538,7 @@ mod tests {
             transfer_first_seen: None,
             state: Default::default(),
             staged_from: None,
+            staging_peers: Vec::new(),
         }
     }
 
@@ -668,6 +726,7 @@ mod tests {
                 region_id: 1,
                 to_peer: 3,
                 epoch: region.epoch,
+                staging: false,
             },
         )
         .unwrap();
@@ -697,6 +756,7 @@ mod tests {
                 region_id: 1,
                 to_peer: 1,
                 epoch: region.epoch,
+                staging: false,
             },
         )
         .unwrap_err();
@@ -709,6 +769,7 @@ mod tests {
                 region_id: 1,
                 to_peer: 3,
                 epoch: region.epoch,
+                staging: false,
             },
         )
         .unwrap();
@@ -719,6 +780,7 @@ mod tests {
                 region_id: 1,
                 to_peer: 4,
                 epoch: region.epoch,
+                staging: false,
             },
         )
         .unwrap_err();
@@ -856,6 +918,7 @@ mod tests {
             transfer_first_seen: Some(first_seen),
             state: Default::default(),
             staged_from: None,
+            staging_peers: Vec::new(),
             ..sample_region(id, start, end, primary)
         }
     }
@@ -880,6 +943,7 @@ mod tests {
                 region_id: 1,
                 to_peer: 3,
                 epoch: region.epoch,
+                staging: false,
             },
         )
         .unwrap_err();
@@ -1214,5 +1278,183 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, ShardMapApplyError::StaleEpoch(_)), "{err:?}");
         assert!(!map.spaces[&key].regions[0].is_serving());
+    }
+
+    /// A learner is a member -- it receives replicated writes -- but must not
+    /// serve reads until promoted.
+    ///
+    /// The ordering is the point: committing membership BEFORE copying is what
+    /// closes the gap. Copy-then-commit leaves every write between the snapshot
+    /// and the commit reaching the primary alone, and a later TransferPrimary
+    /// strands them.
+    #[test]
+    fn a_learner_is_a_member_but_not_a_read_target() {
+        let mut map = ShardMap::default();
+        let key = MeasurementKey::new("db", "rp", "cpu");
+        let region = sample_region(1, 0, u64::MAX, 1);
+        let epoch = region.epoch;
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::BootstrapMeasurement {
+                key: key.clone(),
+                region,
+            },
+        )
+        .unwrap();
+
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::AddPeer {
+                key: key.clone(),
+                region_id: 1,
+                to_peer: 7,
+                epoch,
+                staging: true,
+            },
+        )
+        .unwrap();
+
+        let r = &map.spaces[&key].regions[0];
+        assert!(
+            r.peers.contains(&7),
+            "a learner must be a MEMBER so writes replicate to it"
+        );
+        assert!(!r.is_serving_peer(7), "a learner must not be a read target");
+        let after_add = r.epoch;
+
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::PromotePeer {
+                key: key.clone(),
+                region_id: 1,
+                peer: 7,
+                epoch: after_add,
+            },
+        )
+        .unwrap();
+
+        let r = &map.spaces[&key].regions[0];
+        assert!(r.is_serving_peer(7), "promotion must make it a read target");
+        assert!(r.staging_peers.is_empty());
+    }
+
+    /// Without `staging` the peer is immediately a read target -- the existing
+    /// behaviour, which the drain and rebalance paths still rely on.
+    #[test]
+    fn add_peer_without_staging_serves_immediately() {
+        let mut map = ShardMap::default();
+        let key = MeasurementKey::new("db", "rp", "cpu");
+        let region = sample_region(1, 0, u64::MAX, 1);
+        let epoch = region.epoch;
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::BootstrapMeasurement {
+                key: key.clone(),
+                region,
+            },
+        )
+        .unwrap();
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::AddPeer {
+                key: key.clone(),
+                region_id: 1,
+                to_peer: 7,
+                epoch,
+                staging: false,
+            },
+        )
+        .unwrap();
+        assert!(map.spaces[&key].regions[0].is_serving_peer(7));
+    }
+
+    /// A retry after a leadership change must not wedge an already-promoted
+    /// learner, and a non-member must never be promoted into service.
+    #[test]
+    fn promote_peer_is_idempotent_and_refuses_a_non_member() {
+        let mut map = ShardMap::default();
+        let key = MeasurementKey::new("db", "rp", "cpu");
+        let region = sample_region(1, 0, u64::MAX, 1);
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::BootstrapMeasurement {
+                key: key.clone(),
+                region,
+            },
+        )
+        .unwrap();
+
+        let epoch = map.spaces[&key].regions[0].epoch;
+        // Already serving: promoting again is a no-op, not an error.
+        let primary = map.spaces[&key].regions[0].primary;
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::PromotePeer {
+                key: key.clone(),
+                region_id: 1,
+                peer: primary,
+                epoch,
+            },
+        )
+        .expect("promoting an already-serving member must be idempotent");
+
+        let epoch = map.spaces[&key].regions[0].epoch;
+        let err = apply_shard_map_op(
+            &mut map,
+            ShardMapOp::PromotePeer {
+                key: key.clone(),
+                region_id: 1,
+                peer: 999,
+                epoch,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ShardMapApplyError::Invalid(_)), "{err:?}");
+    }
+
+    /// Removing a peer must drop its learner marker too, or a re-added peer
+    /// would inherit a stale "not ready" flag it can never clear.
+    #[test]
+    fn remove_peer_clears_the_learner_marker() {
+        let mut map = ShardMap::default();
+        let key = MeasurementKey::new("db", "rp", "cpu");
+        let region = sample_region(1, 0, u64::MAX, 1);
+        let epoch = region.epoch;
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::BootstrapMeasurement {
+                key: key.clone(),
+                region,
+            },
+        )
+        .unwrap();
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::AddPeer {
+                key: key.clone(),
+                region_id: 1,
+                to_peer: 7,
+                epoch,
+                staging: true,
+            },
+        )
+        .unwrap();
+        let epoch = map.spaces[&key].regions[0].epoch;
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::RemovePeer {
+                key: key.clone(),
+                region_id: 1,
+                from_peer: 7,
+                epoch,
+            },
+        )
+        .unwrap();
+        let r = &map.spaces[&key].regions[0];
+        assert!(!r.peers.contains(&7));
+        assert!(
+            r.staging_peers.is_empty(),
+            "stale learner marker left behind"
+        );
     }
 }

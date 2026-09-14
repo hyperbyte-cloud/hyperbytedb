@@ -1209,19 +1209,54 @@ impl ShardScheduler {
                 else {
                     return Ok(false);
                 };
-                // Stage before committing. The heal path's commit-then-stage
-                // ordering publishes a peer holding no rows, and scatter falls
-                // back to replicas, so that surfaces as silent empty results.
-                let staged = self.stage_region_onto(key, region, to_peer).await?;
-                self.tick_moved_bytes
-                    .fetch_add(staged, std::sync::atomic::Ordering::Relaxed);
+                // Commit membership FIRST, as a learner, then copy.
+                //
+                // Staging before committing leaves a gap: the peer is not a
+                // replication target until AddPeer applies, so every write
+                // landing between the snapshot and the commit reaches the
+                // primary alone. A later TransferPrimary then hands primacy to
+                // a node missing exactly those writes, and since aggregates use
+                // PrimaryRead they simply vanish. Measured at 628 lost writes
+                // in one 3-minute run, concentrated at the end when
+                // convergence was busiest.
+                //
+                // The reason it was written that way is real -- a committed
+                // peer holding no rows gets used by scatter and returns silent
+                // empty results -- and `staging_peers` is what resolves it: the
+                // learner is a member, so replication flows to it immediately,
+                // but `resolve_region_peers` refuses it until it is promoted.
+                //
+                // This is TiKV's AddLearner -> snapshot -> PromoteLearner.
                 self.propose(ShardMapOp::AddPeer {
                     key: key.clone(),
                     region_id: region.region_id,
                     to_peer,
                     epoch: region.epoch,
+                    staging: true,
                 })
                 .await?;
+                counter!("hyperbytedb_shard_learners_added_total").increment(1);
+
+                // Re-read: AddPeer bumped the epoch, and PromotePeer must carry
+                // the current one.
+                let staged = self.stage_region_onto(key, region, to_peer).await?;
+                self.tick_moved_bytes
+                    .fetch_add(staged, std::sync::atomic::Ordering::Relaxed);
+
+                let promoted = self.shard_map.snapshot().await?;
+                let Some(current) = current_region(&promoted, key, region.region_id) else {
+                    // Region vanished mid-flight; the learner is harmless -- it
+                    // receives writes and serves nothing.
+                    return Ok(true);
+                };
+                self.propose(ShardMapOp::PromotePeer {
+                    key: key.clone(),
+                    region_id: region.region_id,
+                    peer: to_peer,
+                    epoch: current.epoch,
+                })
+                .await?;
+                counter!("hyperbytedb_shard_learners_promoted_total").increment(1);
             }
             PlacementStep::Promote(new_primary) => {
                 self.propose(ShardMapOp::TransferPrimary {
@@ -2278,6 +2313,7 @@ mod tests {
             transfer_first_seen: None,
             state: Default::default(),
             staged_from: None,
+            staging_peers: Vec::new(),
         };
         let hb = vec![
             (1, 1, 0, 0, 0, 0),
@@ -2324,6 +2360,7 @@ mod tests {
             transfer_first_seen: None,
             state: Default::default(),
             staged_from: None,
+            staging_peers: Vec::new(),
         };
 
         assert_eq!(
@@ -2350,6 +2387,7 @@ mod tests {
             transfer_first_seen: None,
             state: Default::default(),
             staged_from: None,
+            staging_peers: Vec::new(),
         };
 
         // Peer 2 is active but self_id excludes it; peer 1 is not in membership.
@@ -2375,6 +2413,7 @@ mod tests {
             transfer_first_seen: None,
             state: Default::default(),
             staged_from: None,
+            staging_peers: Vec::new(),
         };
 
         assert_eq!(pick_alternate_primary(&membership, &region, 99).await, None);
@@ -2418,6 +2457,7 @@ mod tests {
             transfer_first_seen: None,
             state: Default::default(),
             staged_from: None,
+            staging_peers: Vec::new(),
         }
     }
 
@@ -2520,6 +2560,7 @@ mod tests {
             transfer_first_seen: None,
             state: Default::default(),
             staged_from: None,
+            staging_peers: Vec::new(),
         };
         shard_map
             .apply_op(ShardMapOp::BootstrapMeasurement {
@@ -2664,6 +2705,7 @@ mod tests {
             transfer_first_seen: None,
             state: Default::default(),
             staged_from: None,
+            staging_peers: Vec::new(),
         };
         shard_map
             .apply_op(ShardMapOp::BootstrapMeasurement {
@@ -2802,6 +2844,7 @@ mod tests {
             transfer_first_seen: None,
             state: Default::default(),
             staged_from: None,
+            staging_peers: Vec::new(),
         };
         shard_map
             .apply_op(ShardMapOp::BootstrapMeasurement {
@@ -3238,6 +3281,7 @@ mod tests {
             transfer_first_seen: Some(first_seen),
             state: Default::default(),
             staged_from: None,
+            staging_peers: Vec::new(),
         }
     }
 
@@ -3427,6 +3471,7 @@ mod tests {
                     region_id: region.region_id,
                     to_peer: peer,
                     epoch: region.epoch,
+                    staging: false,
                 })
                 .await
                 .unwrap();
@@ -3544,6 +3589,7 @@ mod tests {
                 region_id: region.region_id,
                 to_peer: 2,
                 epoch: region.epoch,
+                staging: false,
             })
             .await
             .unwrap();

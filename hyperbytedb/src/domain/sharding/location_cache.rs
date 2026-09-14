@@ -79,6 +79,7 @@ fn materialise_serving(regions: &[ShardRegion]) -> Vec<ShardRegion> {
                 transfer_first_seen: None,
                 state: RegionState::Serving,
                 staged_from: None,
+                staging_peers: Vec::new(),
             }),
             None => out.push(region.clone()),
         }
@@ -340,6 +341,7 @@ mod tests {
             transfer_first_seen: None,
             state: Default::default(),
             staged_from: None,
+            staging_peers: Vec::new(),
         }
     }
 

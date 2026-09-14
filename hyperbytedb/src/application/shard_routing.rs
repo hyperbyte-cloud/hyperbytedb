@@ -262,6 +262,7 @@ pub async fn build_bootstrap_op(
         transfer_first_seen: None,
         state: Default::default(),
         staged_from: None,
+        staging_peers: Vec::new(),
     };
     Ok(ShardMapOp::BootstrapMeasurement {
         key: MeasurementKey::new(db, rp, measurement),
@@ -797,6 +798,7 @@ mod scatter_tests {
             transfer_first_seen: None,
             state: Default::default(),
             staged_from: None,
+            staging_peers: Vec::new(),
         }
     }
 

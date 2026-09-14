@@ -230,6 +230,7 @@ mod tests {
                     transfer_first_seen: None,
                     state: Default::default(),
                     staged_from: None,
+                    staging_peers: Vec::new(),
                 },
                 ShardRegion {
                     region_id: 2,
@@ -243,6 +244,7 @@ mod tests {
                     transfer_first_seen: None,
                     state: Default::default(),
                     staged_from: None,
+                    staging_peers: Vec::new(),
                 },
                 ShardRegion {
                     region_id: 3,
@@ -256,6 +258,7 @@ mod tests {
                     transfer_first_seen: None,
                     state: Default::default(),
                     staged_from: None,
+                    staging_peers: Vec::new(),
                 },
                 ShardRegion {
                     region_id: 4,
@@ -269,6 +272,7 @@ mod tests {
                     transfer_first_seen: None,
                     state: Default::default(),
                     staged_from: None,
+                    staging_peers: Vec::new(),
                 },
             ],
         }

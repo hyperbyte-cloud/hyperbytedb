@@ -81,6 +81,19 @@ pub struct ShardRegion {
     /// this range and must serve it. Cleared at cutover.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub staged_from: Option<u64>,
+    /// Members of [`Self::peers`] that must NOT serve reads yet.
+    ///
+    /// The learner set. A peer is committed into `peers` BEFORE its data is
+    /// copied, so replication starts flowing to it immediately and no write can
+    /// slip through the gap -- this is TiKV's `AddLearner` ordering. Until it is
+    /// promoted it must not answer reads, because it holds only a prefix of the
+    /// range and scatter cannot tell a partial answer from a correct one.
+    ///
+    /// Copying first and committing afterwards (the obvious alternative) leaves
+    /// exactly that gap: writes landing between the snapshot and the commit
+    /// reach the primary alone, and a later primary transfer strands them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub staging_peers: Vec<u64>,
 }
 
 impl ShardRegion {
@@ -88,6 +101,16 @@ impl ShardRegion {
     #[must_use]
     pub fn is_serving(&self) -> bool {
         matches!(self.state, RegionState::Serving)
+    }
+
+    /// True when `peer` is a member that may serve reads.
+    ///
+    /// A learner in [`Self::staging_peers`] is a member -- it receives
+    /// replicated writes -- but holds only a prefix of the range until its
+    /// copy finishes, so it must not answer.
+    #[must_use]
+    pub fn is_serving_peer(&self, peer: u64) -> bool {
+        self.peers.contains(&peer) && !self.staging_peers.contains(&peer)
     }
 
     pub fn contains(&self, series_id: u64) -> bool {
@@ -285,6 +308,7 @@ mod locate_tests {
             transfer_first_seen: None,
             state: Default::default(),
             staged_from: None,
+            staging_peers: Vec::new(),
         }
     }
 
