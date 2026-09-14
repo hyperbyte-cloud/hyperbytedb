@@ -21,7 +21,6 @@ use crate::domain::cluster::membership::{
 use crate::domain::sharding::placement::{
     PlacementStep, budget_exhausted, move_tier, next_placement_step, target_placement,
 };
-use crate::domain::sharding::types::RegionState;
 use crate::domain::sharding::{
     MeasurementKey, ShardMap, ShardMapOp, ShardRegion, ShardRehomeRequest,
 };
@@ -793,158 +792,33 @@ impl ShardScheduler {
         right.start = split_key;
         right.epoch = child_epoch;
         right.last_split_at = left.last_split_at;
-        // The left child keeps the parent's `start`, so its placement is
-        // unchanged by construction and its rows never move. Only the right
-        // child is re-placed, keyed on `start` rather than `region_id` because
-        // Split allocates the child's id at apply time.
+        // TiKV-style: a split moves no data.
         //
-        // The child KEEPS THE PARENT'S PEER SET. Those nodes replicated the
-        // parent's whole range, so they already hold the child's rows -- no
-        // peer is published empty, and replication factor never dips. Setting
-        // the child's peers to the hash target instead publishes nodes that
-        // have never seen this range: with RF-1 of them empty it reads as
-        // silently missing rows, and because a split child also carries
-        // transfer debt, convergence skips it and cannot repair it.
+        // `right` is a clone of the parent, so it inherits the parent's peers
+        // AND primary. The rows for its range are already on exactly those
+        // nodes, so the split is metadata only: propose it, and both children
+        // are immediately correct and routable. This is what
+        // `exec_batch_split` does in TiKV -- it clones the parent's peers into
+        // each new region and copies no KV data, because a region's placement
+        // IS its Raft group's stores.
         //
-        // Only the primary moves eagerly, and only to a peer that already has
-        // the data. Convergence then walks the child to its hash target over
-        // the following ticks, staging each new peer before committing it.
-        let candidates = self.active_candidate_ids().await;
-        let rf = effective_replication_factor(self.config.replication_factor, candidates.len());
-        let target = target_placement(key, split_key, &candidates, rf);
-        let hashed_primary = target
-            .iter()
-            .find(|t| right.peers.contains(t))
-            .copied()
-            .or_else(|| {
-                // No target member holds this range yet. Rank the peers that do
-                // by the same function, so the choice is still deterministic.
-                let mut owned: Vec<u64> = right.peers.clone();
-                owned.sort_by_key(|p| {
-                    std::cmp::Reverse(crate::domain::sharding::placement::placement_hash(
-                        key, split_key, *p,
-                    ))
-                });
-                owned.first().copied()
-            });
-        if let Some(new_primary) = hashed_primary {
-            right.primary = new_primary;
-        } else if let Some(new_primary) = pick_best_primary(
-            &self.membership,
-            region,
-            self.node_id,
-            self.peer_client.as_deref(),
-        )
-        .await
-        {
-            right.primary = new_primary;
-        }
-
-        if right.primary != region.primary {
-            right.transfer_verified = Some(false);
-            if right.transfer_first_seen.is_none() {
-                right.transfer_first_seen = Some(now_unix());
-            }
-        }
-        if left.primary != region.primary {
-            left.transfer_verified = Some(false);
-            if left.transfer_first_seen.is_none() {
-                left.transfer_first_seen = Some(now_unix());
-            }
-        }
-
-        // A split may only commit once the child's primary already holds the
-        // child's rows.
+        // Re-placing the right child HERE is what made splits lossy. HRW hashes
+        // it to a different node, which forced a one-shot bulk copy, which
+        // needed a staging state and a cutover -- and the writes that landed on
+        // the donor between the copy and the cutover were never forwarded.
+        // Measured at 33 lost writes per run, almost exactly one Raft
+        // round-trip of ingest.
         //
-        // Committing first publishes a region whose primary is empty, and a
-        // scatter read for that range then returns zero rows *successfully* --
-        // the query is wrong, not failed, and nothing in the read path can tell
-        // the difference. This used to commit regardless: "committing split
-        // anyway" on a staging failure, and no staging attempted at all when
-        // the leader was not the donor.
+        // Placement is convergence's job, not the split's. `try_converge_placement`
+        // walks the child to its HRW target afterwards by staging a peer BEFORE
+        // committing `AddPeer` and then transferring the primary -- and a
+        // committed peer receives ongoing writes through normal replication, so
+        // there is no "copy finished" instant that can be stale. That is the
+        // analogue of TiKV's learner catching up on the Raft log before PD
+        // promotes it.
         //
-        // The child keeping the donor's primary needs no movement; anything
-        // else must be staged first, by this node when it is the donor and by
-        // asking the donor when it is not.
-        let child_needs_data = right.primary != region.primary;
-        let child_ready = if !child_needs_data {
-            true
-        } else if let Some(pc) = self.peer_client.as_ref() {
-            let staged = if region.primary == self.node_id {
-                stage_region_transfer_data(
-                    pc,
-                    &self.metadata,
-                    &self.wal,
-                    self.query_port.as_ref(),
-                    self.node_id,
-                    key,
-                    &right,
-                    right.primary,
-                    self.max_points_per_request,
-                )
-                .await
-                .map(|o| o.exported)
-            } else {
-                // Not the donor: the rows live on `region.primary`, so ask it
-                // to push them. Skipping this was why a leader that did not
-                // own the region committed splits whose child was never staged.
-                request_region_stage(
-                    pc.as_ref(),
-                    &self.membership,
-                    region.primary,
-                    key,
-                    &right,
-                    right.primary,
-                )
-                .await
-                .map(|()| 0)
-            };
-            match staged {
-                Ok(exported) => {
-                    counter!("hyperbytedb_shard_stage_total").increment(1);
-                    tracing::info!(
-                        region_id = region.region_id,
-                        staged = exported,
-                        "split child data staged pre-commit"
-                    );
-                    true
-                }
-                Err(e) => {
-                    counter!("hyperbytedb_shard_split_stage_failures_total").increment(1);
-                    tracing::warn!(
-                        region_id = region.region_id,
-                        child_primary = right.primary,
-                        error = %e,
-                        "split aborted: child data could not be staged"
-                    );
-                    false
-                }
-            }
-        } else {
-            // No peer client means nothing can be staged, so nothing may be
-            // published either.
-            counter!("hyperbytedb_shard_split_stage_failures_total").increment(1);
-            false
-        };
-
-        // The child is published NOT serving, whatever the staging outcome.
-        //
-        // Until cutover the donor still holds and serves this range -- the
-        // location cache materialises a staging region away and extends its
-        // donor back over it -- so publishing an unfilled child is safe, and
-        // waiting for it is unnecessary. Cutover happens once the movement has
-        // been verified, in `try_activate_staged_regions`.
-        if child_needs_data {
-            right.state = RegionState::Staging;
-            right.staged_from = Some(region.region_id);
-            if !child_ready {
-                tracing::info!(
-                    region_id = region.region_id,
-                    child_primary = right.primary,
-                    "split child published staging; data not yet moved"
-                );
-            }
-        }
+        // The tradeoff, accepted deliberately: load does not spread until
+        // convergence runs, rather than instantly at split time.
 
         let op = ShardMapOp::Split {
             key: key.clone(),
@@ -964,174 +838,24 @@ impl ShardScheduler {
         }
         counter!("hyperbytedb_shard_splits_total").increment(1);
 
-        // Region ids are reallocated at apply time, so the committed right
-        // child may differ from the proposed one. Resolve it by range — the
-        // transfer payload must carry the committed id/epoch or the
-        // destination rejects it. Unresolved lookups enqueue as
-        // resolve-at-drain markers; the proposed child (possibly wrong
-        // epoch/id) is never baked into a queue entry.
-        let committed = self
-            .committed_child_for_range(key, right.start, right.end)
-            .await;
-        let resolve_at_drain = committed.is_none();
-        let Some(right) = committed else {
-            // Do NOT attempt the move with the proposed child. Its id and epoch
-            // are provisional -- apply reallocates ids -- so the request is at
-            // best rejected (40 of 88 staging failures were 404s carrying a
-            // proposed id) and at worst names a DIFFERENT region that has since
-            // been allocated that id, moving the wrong range. Leave it to the
-            // drain, which re-resolves before moving anything.
-            counter!("hyperbytedb_shard_split_commit_lookup_failed_total").increment(1);
-            tracing::warn!(
-                region_id = region.region_id,
-                start = right.start,
-                end = right.end,
-                "split commit lookup failed; deferring the move to the drain"
-            );
-            self.enqueue_reconciliation(PendingTransfer {
-                key: key.clone(),
-                region_id: right.region_id,
-                start: right.start,
-                end: right.end,
-                recorded_source: region.primary,
-                resolve_at_drain: true,
-                ticks_without_progress: 0,
-                parked: false,
-                first_seen: right.transfer_first_seen.unwrap_or_else(now_unix),
-            });
-            return Ok(());
-        };
-
-        // Ownership unchanged (e.g. no active alternate for the child primary):
-        // the data already lives on the surviving primary.
-        if right.primary == region.primary {
-            return Ok(());
-        }
-
-        let recorded_source = region.primary;
-        if region.primary == self.node_id {
-            // This node is the old primary and holds the historical rows.
-            let Some(pc) = self.peer_client.as_ref() else {
-                return Ok(());
-            };
-            match push_and_drop_range(
-                pc,
-                &self.metadata,
-                &self.wal,
-                self.query_port.as_ref(),
-                self.points_sink.as_ref(),
-                self.node_id,
-                key,
-                &right,
-                right.primary,
-                self.max_points_per_request,
-            )
-            .await
-            {
-                Ok(()) => {
-                    if let Err(e) = self.propose_clear_verified(key, &right).await {
-                        tracing::warn!(
-                            region_id = right.region_id,
-                            error = %e,
-                            "transfer verified but ClearVerified proposal failed"
-                        );
-                        self.enqueue_reconciliation(PendingTransfer {
-                            key: key.clone(),
-                            region_id: right.region_id,
-                            start: right.start,
-                            end: right.end,
-                            recorded_source,
-                            resolve_at_drain,
-                            ticks_without_progress: 0,
-                            parked: false,
-                            first_seen: right.transfer_first_seen.unwrap_or_else(now_unix),
-                        });
-                    }
-                }
-                Err(e) => {
-                    counter!("hyperbytedb_shard_transfer_failures_total").increment(1);
-                    tracing::warn!(
-                        region_id = right.region_id,
-                        error = %e,
-                        "shard split post-transfer failed; split committed"
-                    );
-                    self.enqueue_reconciliation(PendingTransfer {
-                        key: key.clone(),
-                        region_id: right.region_id,
-                        start: right.start,
-                        end: right.end,
-                        recorded_source,
-                        resolve_at_drain,
-                        ticks_without_progress: 0,
-                        parked: false,
-                        first_seen: right.transfer_first_seen.unwrap_or_else(now_unix),
-                    });
-                }
-            }
-        } else if let Some(pc) = self.peer_client.as_ref() {
-            // Leader is neither source nor destination: only the old primary
-            // can export historical rows, so ask it to re-home them.
-            match request_region_rehome(
-                pc,
-                &self.membership,
-                region.primary,
-                key,
-                &right,
-                right.primary,
-                // Never drop the donor's copy while the child is staging: the
-                // donor is still SERVING that range until cutover, so dropping
-                // first leaves the range served by a node that no longer holds
-                // it. Cutover flips the map; the copy is GC'd after.
-                right.is_serving(),
-            )
-            .await
-            {
-                Ok(()) => {
-                    counter!("hyperbytedb_shard_rehome_total").increment(1);
-                    if let Err(e) = self.propose_clear_verified(key, &right).await {
-                        tracing::warn!(
-                            region_id = right.region_id,
-                            error = %e,
-                            "rehome verified but ClearVerified proposal failed"
-                        );
-                        self.enqueue_reconciliation(PendingTransfer {
-                            key: key.clone(),
-                            region_id: right.region_id,
-                            start: right.start,
-                            end: right.end,
-                            recorded_source,
-                            resolve_at_drain,
-                            ticks_without_progress: 0,
-                            parked: false,
-                            first_seen: right.transfer_first_seen.unwrap_or_else(now_unix),
-                        });
-                    }
-                }
-                Err(e) => {
-                    counter!("hyperbytedb_shard_rehome_failures_total").increment(1);
-                    tracing::warn!(
-                        region_id = right.region_id,
-                        old_primary = region.primary,
-                        error = %e,
-                        "split rehome RPC failed; split committed"
-                    );
-                    self.enqueue_reconciliation(PendingTransfer {
-                        key: key.clone(),
-                        region_id: right.region_id,
-                        start: right.start,
-                        end: right.end,
-                        recorded_source,
-                        resolve_at_drain,
-                        ticks_without_progress: 0,
-                        parked: false,
-                        first_seen: right.transfer_first_seen.unwrap_or_else(now_unix),
-                    });
-                }
-            }
-        }
         Ok(())
     }
 
+    /// Propose clearing a verified split-transfer debt. No-op success when
+    /// the region carries no outstanding flag. Gated behind
+    /// `transfer_clear_proposals_enabled` for mixed-version rolling upgrades:
+    /// old binaries cannot decode the `ClearVerified` op from the Raft log.
+    // Unreachable in production since splits became metadata-only: the split
+    // was its only caller. Nothing now creates transfer debt either --
+    // apply-time normalization flags a child only when its primary differs
+    // from the parent's, which a TiKV-style split never does, and
+    // TransferPrimary does not set it. So the reconciliation queue, its drain,
+    // and ClearVerified are all currently dead paths.
+    //
+    // Retained rather than deleted in the same change as the behaviour switch:
+    // removing that machinery is a large, separate deletion that deserves its
+    // own review. The test below still covers the rollup-destination exclusion.
+    #[allow(dead_code)]
     fn enqueue_reconciliation(&self, entry: PendingTransfer) {
         match self.rollup_dests.try_read() {
             Ok(set) if set.contains_key(&entry.key) => {
@@ -1175,10 +899,6 @@ impl ShardScheduler {
         q.push(entry);
     }
 
-    /// Propose clearing a verified split-transfer debt. No-op success when
-    /// the region carries no outstanding flag. Gated behind
-    /// `transfer_clear_proposals_enabled` for mixed-version rolling upgrades:
-    /// old binaries cannot decode the `ClearVerified` op from the Raft log.
     async fn propose_clear_verified(
         &self,
         key: &MeasurementKey,
@@ -1198,20 +918,6 @@ impl ShardScheduler {
             epoch: region.epoch,
         })
         .await
-    }
-
-    /// Locate the committed child region matching a proposed `[start, end)`
-    /// range in this node's shard map snapshot.
-    async fn committed_child_for_range(
-        &self,
-        key: &MeasurementKey,
-        start: u64,
-        end: u64,
-    ) -> Option<ShardRegion> {
-        let map = self.shard_map.snapshot().await.ok()?;
-        map.space(&key.db, &key.rp, &key.measurement)?
-            .region_with_range(start, end)
-            .cloned()
     }
 
     async fn compute_split_key(
@@ -3003,24 +2709,22 @@ mod tests {
         );
     }
 
-    /// A split must not publish a routable child while its primary has no data.
+    /// A split moves no data: both children inherit the parent's placement.
     ///
-    /// Committing first publishes a region whose primary is empty, and a
-    /// scatter read for that range then returns zero rows *successfully* --
-    /// the query is wrong, not failed, and nothing in the read path can tell
-    /// the difference. The old code committed regardless, logging
-    /// "committing split anyway", and did not even attempt to stage when the
-    /// leader was not the donor.
+    /// TiKV-style. `exec_batch_split` clones the parent's peers into each new
+    /// region and copies no KV data, because a region's placement IS its Raft
+    /// group's stores. Re-placing the right child at split time is what forced
+    /// a bulk copy, which needed a staging state and a cutover, and the writes
+    /// that landed on the donor in between were never forwarded -- 33 lost per
+    /// run, about one Raft round-trip of ingest.
     ///
-    /// Here the donor (node 9) is absent from membership, so the only
-    /// candidate is this node: `target_placement` must choose 1, which differs
-    /// from the donor, so the child needs data. The leader is not the donor, so
-    /// it asks node 9 to push -- and node 9 cannot be resolved. The split still
-    /// happens, but the child must be published `Staging`, naming the donor
-    /// that continues to serve its range until cutover.
+    /// Here the donor (node 9) is not in membership, so any HRW re-placement
+    /// would have to move the child somewhere reachable. It must not: the child
+    /// keeps node 9 as primary, carries the parent's peers, and is immediately
+    /// routable. Moving it to its hash target is convergence's job.
     #[tokio::test]
     #[serial_test::serial(chdb)]
-    async fn split_publishes_an_unstaged_child_as_not_serving() {
+    async fn a_split_moves_no_data_and_both_children_serve() {
         use std::sync::Arc;
         use std::time::Duration;
 
@@ -3141,138 +2845,26 @@ mod tests {
                 ShardMapOp::Split { right, .. } => Some(right),
                 _ => None,
             })
-            .expect("the split still happens; the child is just not routable yet");
-        assert!(
-            !split.is_serving(),
-            "a child whose primary holds no data must be published staging, not serving: {split:?}"
+            .expect("the split must still happen");
+
+        assert_eq!(
+            split.primary, 9,
+            "the child must inherit the parent's primary -- re-placing it here \
+             is what forced a copy: {split:?}"
         );
         assert_eq!(
-            split.staged_from,
-            Some(1),
-            "a staging child must name the donor that still serves its range"
+            split.peers,
+            vec![9, 1],
+            "the child must inherit the parent's peers: {split:?}"
         );
-    }
-
-    /// A staging region whose movement has finished must be cut over.
-    ///
-    /// Until it is, the donor serves the range -- correct, but the split never
-    /// actually takes effect and the cluster cannot scale past the donor. The
-    /// gate is `transfer_outstanding`: the reconciliation machinery's own
-    /// completion signal, so the child becomes routable exactly when it holds
-    /// the data.
-    #[tokio::test]
-    #[serial_test::serial(chdb)]
-    async fn a_staging_region_with_no_debt_is_cut_over() {
-        use std::sync::Arc;
-        use std::time::Duration;
-
-        use crate::adapters::chdb::native_adapter::ChdbNativeAdapter;
-        use crate::adapters::chdb::query_adapter::ChdbQueryAdapter;
-        use crate::adapters::chdb::session::SharedSession;
-        use crate::adapters::metadata::rocksdb_meta::RocksDbMetadata;
-        use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
-        use crate::adapters::wal::rocksdb_wal::RocksDbWal;
-        use crate::application::cluster::bootstrap::ClusterBootstrap;
-        use crate::application::materialized_view_service::MaterializedViewService;
-        use crate::domain::sharding::{MeasurementKey, ShardLocationCache, ShardMapOp};
-        use crate::ports::points_sink::PointsSinkPort;
-
-        let dir = tempfile::tempdir().unwrap();
-        let meta_dir = dir.path().join("meta");
-        let wal_dir = dir.path().join("wal");
-        let chdb_dir = dir.path().join("chdb");
-        for p in [&meta_dir, &wal_dir, &chdb_dir] {
-            std::fs::create_dir_all(p).unwrap();
-        }
-
-        let chdb = SharedSession::new_eager(chdb_dir.to_str().unwrap(), 1).unwrap();
-        let chdb_adapter = Arc::new(ChdbQueryAdapter::from_shared(chdb.clone(), 0));
-        let sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(chdb));
-        let wal = Arc::new(RocksDbWal::open(&wal_dir).unwrap());
-        let metadata = Arc::new(RocksDbMetadata::open(&meta_dir).unwrap());
-        let mv_service = Arc::new(MaterializedViewService::new(
-            metadata.clone(),
-            chdb_adapter,
-            sink.clone(),
-        ));
-
-        let mut cluster_cfg = crate::config::HyperbytedbConfig::load(None)
-            .unwrap()
-            .cluster;
-        cluster_cfg.enabled = true;
-        cluster_cfg.node_id = 1;
-        cluster_cfg.cluster_addr = "127.0.0.1:18099".into();
-        cluster_cfg.replication_log_dir = dir.path().join("repl").to_string_lossy().into();
-        cluster_cfg.raft_dir = dir.path().join("raft").to_string_lossy().into();
-        cluster_cfg.raft_heartbeat_interval_ms = Some(200);
-        cluster_cfg.raft_election_timeout_ms = Some(500);
-
-        let bootstrap = ClusterBootstrap::init(&cluster_cfg, 1000).unwrap();
-        let shard_map = Arc::new(RocksDbShardMap::open(&meta_dir, true).unwrap());
-        let location_cache = Arc::new(ShardLocationCache::new());
-        let raft = bootstrap
-            .start_raft(
-                &cluster_cfg,
-                metadata.clone(),
-                mv_service,
-                sink.clone(),
-                wal.clone(),
-                Some((shard_map.clone(), location_cache.clone())),
-                None,
-            )
-            .await
-            .unwrap();
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        let key = MeasurementKey::new("db", "autogen", "cpu");
-        // Staging, and no transfer debt: the movement is done.
-        let region = ShardRegion {
-            region_id: 1,
-            start: 0,
-            end: u64::MAX,
-            epoch: ShardEpoch::default(),
-            peers: vec![1],
-            primary: 1,
-            last_split_at: 1,
-            transfer_verified: None,
-            transfer_first_seen: None,
-            state: RegionState::Staging,
-            staged_from: Some(42),
-        };
-        shard_map
-            .apply_op(ShardMapOp::BootstrapMeasurement {
-                key: key.clone(),
-                region,
-            })
-            .await
-            .unwrap();
-
-        let proposals = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let scheduler = ShardScheduler::new(
-            shard_map,
-            bootstrap.membership.clone(),
-            raft,
-            None,
-            metadata,
-            wal,
-            None,
-            Some(sink),
-            1,
-            ShardingConfig::default(),
-            0,
-        )
-        .with_test_force_leader(true)
-        .with_test_propose_sink(proposals.clone());
-
-        scheduler.tick_once_for_test().await.unwrap();
-
-        let captured = proposals.lock().unwrap();
         assert!(
-            captured
-                .iter()
-                .any(|op| matches!(op, ShardMapOp::ActivateRegion { region_id: 1, .. })),
-            "a staging region with no outstanding transfer must be cut over: {captured:?}"
+            split.is_serving(),
+            "a split moves no data, so the child is routable immediately: {split:?}"
+        );
+        assert_eq!(split.staged_from, None, "nothing is staged by a split");
+        assert!(
+            !split.transfer_outstanding(),
+            "a split creates no transfer debt: {split:?}"
         );
     }
 
