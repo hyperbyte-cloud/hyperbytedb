@@ -677,11 +677,16 @@ pub async fn handle_shard_rehome(
     // pins the real apply-allocated region_id into the transfer payloads.
     let region = map
         .space(&req.db, &req.rp, &req.measurement)
-        .and_then(|space| space.region_with_range(req.start, req.end));
+        .and_then(|space| resolve_rehome_region(space, req.region_id, req.start, req.end));
     let Some(region) = region else {
         return (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "region range not found"})),
+            Json(serde_json::json!({
+                "error": format!(
+                    "region not found (region_id={}, range=[{}, {}))",
+                    req.region_id, req.start, req.end
+                )
+            })),
         )
             .into_response();
     };
@@ -949,4 +954,102 @@ pub async fn handle_shard_delete(
     }
     counter!("hyperbytedb_shard_delete_applied_total").increment(1);
     (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
+}
+
+/// Resolve the region a rehome request names.
+///
+/// Prefers `region_id`. Addressing by exact range alone fails under load: a
+/// child that splits again before the request lands no longer has a region
+/// spanning that range, so the receiver answered 404 and the movement was
+/// abandoned -- 40 of 88 staging failures on a run that split 70 times while
+/// writing. `Split` keeps the parent's id on the LEFT child, so the id survives
+/// a re-split and names a region carrying whatever range it now spans; the rest
+/// belongs to the grandchild's own transfer.
+///
+/// `region_id == 0` means the caller did not supply one, and the range is used.
+fn resolve_rehome_region(
+    space: &crate::domain::sharding::types::MeasurementShardSpace,
+    region_id: u64,
+    start: u64,
+    end: u64,
+) -> Option<&crate::domain::sharding::types::ShardRegion> {
+    if region_id != 0
+        && let Some(by_id) = space.regions.iter().find(|r| r.region_id == region_id)
+    {
+        return Some(by_id);
+    }
+    space.region_with_range(start, end)
+}
+
+#[cfg(test)]
+mod rehome_resolution_tests {
+    use super::resolve_rehome_region;
+    use crate::domain::sharding::types::{
+        MeasurementKey, MeasurementShardSpace, ShardEpoch, ShardRegion,
+    };
+
+    fn region(id: u64, start: u64, end: u64) -> ShardRegion {
+        ShardRegion {
+            region_id: id,
+            start,
+            end,
+            epoch: ShardEpoch::default(),
+            peers: vec![1, 2],
+            primary: 1,
+            last_split_at: 0,
+            transfer_verified: None,
+            transfer_first_seen: None,
+            state: Default::default(),
+            staged_from: None,
+        }
+    }
+
+    fn space(regions: Vec<ShardRegion>) -> MeasurementShardSpace {
+        MeasurementShardSpace {
+            key: MeasurementKey::new("db", "rp", "cpu"),
+            regions,
+        }
+    }
+
+    /// The whole point: after the named region splits again, its range no
+    /// longer matches the request, but the id still finds it.
+    #[test]
+    fn a_region_that_split_again_is_still_found_by_id() {
+        let s = space(vec![region(7, 0, 100), region(9, 100, 200)]);
+
+        let got = resolve_rehome_region(&s, 7, 0, 200).expect("id must resolve");
+        assert_eq!(got.region_id, 7);
+        assert_eq!(
+            (got.start, got.end),
+            (0, 100),
+            "the mover must use the range the region NOW spans"
+        );
+
+        assert!(
+            resolve_rehome_region(&s, 0, 0, 200).is_none(),
+            "range-only addressing is what used to 404 here"
+        );
+    }
+
+    #[test]
+    fn range_is_used_when_no_id_is_supplied() {
+        let s = space(vec![region(7, 0, 100), region(9, 100, 200)]);
+        let got = resolve_rehome_region(&s, 0, 100, 200).expect("range must resolve");
+        assert_eq!(got.region_id, 9);
+    }
+
+    /// An id naming a region that is gone falls back to the range rather than
+    /// failing outright -- the range may still match after a merge.
+    #[test]
+    fn an_unknown_id_falls_back_to_the_range() {
+        let s = space(vec![region(7, 0, 100)]);
+        let got = resolve_rehome_region(&s, 999, 0, 100).expect("fallback must resolve");
+        assert_eq!(got.region_id, 7);
+    }
+
+    #[test]
+    fn neither_id_nor_range_resolves_to_nothing() {
+        let s = space(vec![region(7, 0, 100)]);
+        assert!(resolve_rehome_region(&s, 999, 500, 600).is_none());
+    }
 }

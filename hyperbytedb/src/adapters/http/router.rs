@@ -200,7 +200,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
                 )
                 .route(
                     "/internal/shard/write",
-                    post(shard_handlers::handle_shard_write),
+                    post(shard_handlers::handle_shard_write)
+                        .layer(DefaultBodyLimit::max(replicate_body_limit)),
                 )
                 .route(
                     "/internal/shard/query",
@@ -214,9 +215,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
                     "/internal/shard/heartbeat",
                     post(shard_handlers::handle_shard_heartbeat),
                 )
+                // Region transfers carry bulk line protocol, sized like
+                // replication rather than like a control message. Without an
+                // explicit limit these fell back to axum's 2 MiB default and a
+                // large region could NEVER move: the receiver answered
+                // "413 Failed to buffer the request body: length limit
+                // exceeded", the split committed anyway, and the child sat
+                // staging while its transfer retried forever.
                 .route(
                     "/internal/shard/transfer",
-                    post(shard_handlers::handle_shard_transfer),
+                    post(shard_handlers::handle_shard_transfer)
+                        .layer(DefaultBodyLimit::max(replicate_body_limit)),
                 )
                 .route(
                     "/internal/shard/rehome",

@@ -161,6 +161,18 @@ pub struct ShardRehomeRequest {
     pub measurement: String,
     pub start: u64,
     pub end: u64,
+    /// Authoritative identity of the region to move.
+    ///
+    /// `start`/`end` alone cannot address a region under load: a child that
+    /// splits again before this request lands no longer has a region matching
+    /// that exact range, and the receiver answers 404. The id survives a
+    /// re-split -- `Split` keeps the parent's id on the LEFT child -- so the
+    /// receiver resolves by id and moves whatever range that region now spans,
+    /// leaving the rest to the grandchild's own transfer.
+    ///
+    /// `0` means "not supplied"; the receiver falls back to the range.
+    #[serde(default)]
+    pub region_id: u64,
     pub epoch: ShardEpoch,
     pub dest_primary: u64,
     #[serde(default)]
