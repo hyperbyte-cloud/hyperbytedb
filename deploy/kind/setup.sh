@@ -172,7 +172,17 @@ build_hyperbytedb_image() {
         err "hyperbytedb depends on it via a path dependency; clone it next to hyperbytedb/."
         exit 1
     fi
-    docker build -t "$HYPERBYTEDB_IMAGE" -f "$PROJECT_ROOT/Dockerfile" "$build_ctx"
+    # CARGO_BUILD_JOBS bounds build parallelism when set. Unset keeps cargo's
+    # default of one job per CPU. On a shared machine the release build spawns a
+    # rustc per core and can exhaust memory alongside everything else running --
+    # this build has been OOM-killed twice that way.
+    build_args=""
+    if [[ -n "${CARGO_BUILD_JOBS:-}" ]]; then
+        build_args="--build-arg CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}"
+        log "Limiting cargo to ${CARGO_BUILD_JOBS} parallel jobs"
+    fi
+    # shellcheck disable=SC2086
+    docker build $build_args -t "$HYPERBYTEDB_IMAGE" -f "$PROJECT_ROOT/Dockerfile" "$build_ctx"
     log "Image built: $HYPERBYTEDB_IMAGE"
 }
 
