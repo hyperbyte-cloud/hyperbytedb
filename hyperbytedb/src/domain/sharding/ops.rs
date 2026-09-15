@@ -455,6 +455,17 @@ pub fn apply_shard_map_op(
             if region.epoch != epoch {
                 return Err(ShardMapApplyError::StaleEpoch("TransferPrimary"));
             }
+            // A learner holds only a prefix of the range until it is promoted.
+            // Making it primary is the data-less-primary bug: PrimaryRead then
+            // resolves to NOTHING, because resolve_region_peers refuses a
+            // learner, and every aggregate for the region fails with
+            // "no active peers" even though the region is serving and the
+            // node is a member. Observed exactly that way on region 64.
+            if region.staging_peers.contains(&new_primary) {
+                return Err(ShardMapApplyError::Invalid(format!(
+                    "cannot make learner {new_primary} the primary of region {region_id}"
+                )));
+            }
             if !region.peers.contains(&new_primary) {
                 return Err(ShardMapApplyError::Invalid(format!(
                     "new primary {new_primary} not a peer"
@@ -1456,5 +1467,77 @@ mod tests {
             r.staging_peers.is_empty(),
             "stale learner marker left behind"
         );
+    }
+
+    /// A learner must never become the primary.
+    ///
+    /// It holds only a prefix until promoted, and `resolve_region_peers`
+    /// refuses a learner -- so a learner primary makes PrimaryRead resolve to
+    /// NOTHING and every aggregate for the region fails with "no active peers"
+    /// while the region is serving and the node is a member. Seen exactly that
+    /// way on region 64: serving=true, peers=[5, 4], primary=4.
+    #[test]
+    fn a_learner_must_not_become_the_primary() {
+        let mut map = ShardMap::default();
+        let key = MeasurementKey::new("db", "rp", "cpu");
+        let region = sample_region(1, 0, u64::MAX, 1);
+        let epoch = region.epoch;
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::BootstrapMeasurement {
+                key: key.clone(),
+                region,
+            },
+        )
+        .unwrap();
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::AddPeer {
+                key: key.clone(),
+                region_id: 1,
+                to_peer: 7,
+                epoch,
+                staging: true,
+            },
+        )
+        .unwrap();
+
+        let epoch = map.spaces[&key].regions[0].epoch;
+        let err = apply_shard_map_op(
+            &mut map,
+            ShardMapOp::TransferPrimary {
+                key: key.clone(),
+                region_id: 1,
+                new_primary: 7,
+                epoch,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ShardMapApplyError::Invalid(_)), "{err:?}");
+
+        // Once promoted it is a legitimate primary.
+        let epoch = map.spaces[&key].regions[0].epoch;
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::PromotePeer {
+                key: key.clone(),
+                region_id: 1,
+                peer: 7,
+                epoch,
+            },
+        )
+        .unwrap();
+        let epoch = map.spaces[&key].regions[0].epoch;
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::TransferPrimary {
+                key: key.clone(),
+                region_id: 1,
+                new_primary: 7,
+                epoch,
+            },
+        )
+        .expect("a promoted peer may become primary");
+        assert_eq!(map.spaces[&key].regions[0].primary, 7);
     }
 }

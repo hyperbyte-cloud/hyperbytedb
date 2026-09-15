@@ -336,6 +336,53 @@ impl ShardScheduler {
             .retain(|id, _| live.contains(id));
     }
 
+    /// Finish any learner left outstanding by an earlier tick.
+    ///
+    /// Nothing else will: once the peer is in `peers`, `next_placement_step`
+    /// considers the region converged and never revisits it, so a learner whose
+    /// PromotePeer failed -- a moved epoch, a leadership change mid-flight --
+    /// stays a learner forever, receiving writes and serving nothing. One run
+    /// added 10 learners and promoted 6.
+    ///
+    /// Re-staging before promoting is deliberate: the learner has been
+    /// receiving replicated writes since it joined, so this only has to close
+    /// whatever the first copy missed, and staging is idempotent at the
+    /// destination.
+    async fn try_promote_learners(&self, map: &ShardMap) {
+        for space in map.spaces.values() {
+            for region in &space.regions {
+                for peer in region.staging_peers.clone() {
+                    if self
+                        .stage_region_onto(&space.key, region, peer)
+                        .await
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    let fresh = match self.shard_map.snapshot().await {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    let Some(current) = current_region(&fresh, &space.key, region.region_id) else {
+                        continue;
+                    };
+                    if self
+                        .propose(ShardMapOp::PromotePeer {
+                            key: space.key.clone(),
+                            region_id: region.region_id,
+                            peer,
+                            epoch: current.epoch,
+                        })
+                        .await
+                        .is_ok()
+                    {
+                        counter!("hyperbytedb_shard_learners_promoted_total").increment(1);
+                    }
+                }
+            }
+        }
+    }
+
     /// Cut over any staging region whose data has finished moving.
     ///
     /// A split publishes its child NOT serving: until this fires the donor
@@ -517,6 +564,9 @@ impl ShardScheduler {
         // routable in this same tick rather than waiting for the next.
         let map = self.shard_map.snapshot().await?;
         self.try_activate_staged_regions(&map).await;
+        // Learners left behind by a failed promote would otherwise never be
+        // revisited: once in `peers`, the region looks converged.
+        self.try_promote_learners(&map).await;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
