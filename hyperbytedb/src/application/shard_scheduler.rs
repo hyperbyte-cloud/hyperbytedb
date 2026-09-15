@@ -1319,7 +1319,25 @@ impl ShardScheduler {
                 // PrimaryRead those rows simply stop being counted. That is the
                 // residual this suite kept measuring after the learner ordering
                 // closed the join gap: 123 of 112980.
-                if let Some(pc) = self.peer_client.as_ref() {
+                // Not while evacuating. A node being decommissioned must hand
+                // its primaries off, and a peer populated by bulk transfer
+                // legitimately has NO WAL entries for the region -- watermark
+                // 0 -- so this guard reads it as infinitely behind and defers
+                // forever. That deadlocked decommission: the departing node
+                // sat in `decommissioning` until the suite timed out, with
+                // decommission_completed_total stuck at 0.
+                //
+                // The guard is a rebalancing heuristic; evacuation outranks it.
+                let evacuating = departing.contains(&region.primary);
+                if evacuating {
+                    tracing::info!(
+                        region_id = region.region_id,
+                        new_primary,
+                        departing_primary = region.primary,
+                        "promoting despite watermark guard: primary is departing"
+                    );
+                }
+                if !evacuating && let Some(pc) = self.peer_client.as_ref() {
                     let candidate_wm =
                         peer_region_wal_watermark(pc, new_primary, region.region_id).await;
                     let mut max_wm = candidate_wm;
