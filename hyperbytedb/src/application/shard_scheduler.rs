@@ -1309,6 +1309,40 @@ impl ShardScheduler {
                 counter!("hyperbytedb_shard_learners_promoted_total").increment(1);
             }
             PlacementStep::Promote(new_primary) => {
+                // Same watermark guard the emergency failover path has used all
+                // along -- planned promotion needs it just as much, and did not
+                // have it.
+                //
+                // Replication is asynchronous, so a peer that joined recently
+                // can trail the primary. Handing it primacy strands whatever it
+                // has not received yet, and because aggregates resolve with
+                // PrimaryRead those rows simply stop being counted. That is the
+                // residual this suite kept measuring after the learner ordering
+                // closed the join gap: 123 of 112980.
+                if let Some(pc) = self.peer_client.as_ref() {
+                    let candidate_wm =
+                        peer_region_wal_watermark(pc, new_primary, region.region_id).await;
+                    let mut max_wm = candidate_wm;
+                    for p in &region.peers {
+                        max_wm =
+                            max_wm.max(peer_region_wal_watermark(pc, *p, region.region_id).await);
+                    }
+                    if !failover_watermark_safe(candidate_wm, max_wm) {
+                        counter!(
+                            "hyperbytedb_shard_promote_skipped_total",
+                            "reason" => "watermark_lag"
+                        )
+                        .increment(1);
+                        tracing::info!(
+                            region_id = region.region_id,
+                            new_primary,
+                            candidate_wm,
+                            max_wm,
+                            "planned promotion deferred: candidate behind"
+                        );
+                        return Ok(false);
+                    }
+                }
                 self.propose(ShardMapOp::TransferPrimary {
                     key: key.clone(),
                     region_id: region.region_id,

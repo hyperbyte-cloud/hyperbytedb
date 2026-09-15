@@ -224,11 +224,20 @@ main() {
   else
     fail W6 "only $(running_pod_count)/${DOWN_REPLICAS} running"
   fi
+  # Poll rather than sample once. The assertion is that writes RESUME across
+  # the restart; sampling the instant the pod reports ready fails whenever the
+  # restart is quicker than the writer's batch interval, which is a property of
+  # the harness, not of the cluster. It still fails if writes never resume.
   after_kill=$(acked_total)
+  w7_deadline=$(( $(date +%s) + 60 ))
+  while [ "$after_kill" -le "$before_kill" ] && [ "$(date +%s)" -lt "$w7_deadline" ]; do
+    sleep 2
+    after_kill=$(acked_total)
+  done
   if [ "$after_kill" -gt "$before_kill" ]; then
     pass W7 "writes acknowledged across the restart (${before_kill} → ${after_kill})"
   else
-    fail W7 "no writes acknowledged across the restart — window not exercised"
+    fail W7 "writes never resumed after the restart within 60s (acked stuck at ${before_kill})"
   fi
   check_exactly_once W8 "after node restart"
 
