@@ -158,6 +158,14 @@ pub struct ShardScheduler {
     /// Consecutive ticks a region's placement convergence returned an error,
     /// keyed by region id. Throttles the warning without hiding it.
     placement_errors: tokio::sync::RwLock<HashMap<u64, u32>>,
+    /// Learners `(region_id, peer)` seen outstanding on the previous tick.
+    ///
+    /// The convergence path stages and promotes a learner inline, so one that
+    /// is still outstanding on the NEXT tick is one whose inline promote
+    /// failed. Re-staging every outstanding learner on every tick instead
+    /// re-copies regions that are merely mid-flight, and that competes with
+    /// evacuation for the same movement budget.
+    learners_seen: tokio::sync::RwLock<HashSet<(u64, u64)>>,
     /// Bytes staged by convergence-tier moves during the current tick.
     ///
     /// A bare `AtomicU64`: the scheduler is already shared behind an `Arc`, so
@@ -209,6 +217,7 @@ impl ShardScheduler {
             peer_map_versions: tokio::sync::RwLock::new(HashMap::new()),
             placement_stalls: tokio::sync::RwLock::new(HashMap::new()),
             placement_errors: tokio::sync::RwLock::new(HashMap::new()),
+            learners_seen: tokio::sync::RwLock::new(HashSet::new()),
             tick_moved_bytes: std::sync::atomic::AtomicU64::new(0),
             tick_interval_secs: std::sync::atomic::AtomicU64::new(1),
             #[cfg(test)]
@@ -349,9 +358,37 @@ impl ShardScheduler {
     /// whatever the first copy missed, and staging is idempotent at the
     /// destination.
     async fn try_promote_learners(&self, map: &ShardMap) {
+        // Only act on a learner that was ALSO outstanding last tick. The
+        // convergence path stages and promotes inline, so a learner seen once
+        // is usually just mid-flight; re-staging it immediately re-copies the
+        // region for nothing and competes with evacuation for the movement
+        // budget. One left over on two consecutive ticks is one whose inline
+        // promote actually failed.
+        let current: HashSet<(u64, u64)> = map
+            .spaces
+            .values()
+            .flat_map(|space| {
+                space
+                    .regions
+                    .iter()
+                    .flat_map(|r| r.staging_peers.iter().map(move |p| (r.region_id, *p)))
+            })
+            .collect();
+        let stale: HashSet<(u64, u64)> = {
+            let seen = self.learners_seen.read().await;
+            current.intersection(&seen).copied().collect()
+        };
+        *self.learners_seen.write().await = current;
+        if stale.is_empty() {
+            return;
+        }
+
         for space in map.spaces.values() {
             for region in &space.regions {
                 for peer in region.staging_peers.clone() {
+                    if !stale.contains(&(region.region_id, peer)) {
+                        continue;
+                    }
                     if self
                         .stage_region_onto(&space.key, region, peer)
                         .await
