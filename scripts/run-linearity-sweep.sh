@@ -82,6 +82,23 @@ print(sum(1 for p in d.get('items',[]) if all(c.get('ready') for c in p['status'
   done
   sleep 60
   kubectl_port_forward "$N"
+
+  # Clear the dataset between sweep points.
+  #
+  # The sweep patches replicas and re-seeds into the SAME database, so without
+  # this each N inherits every earlier N's series: the N=6 point carried N=3's
+  # 375k on top of its own 750k. That made throughput across N incomparable
+  # (each point measures a bigger dataset than the last) and pushed node 0 over
+  # its memory limit — an isolated N=6 run on a fresh cluster survives where
+  # the same point inside a sweep does not.
+  #
+  # DROP DATABASE now removes the shard spaces too, so region counts start from
+  # zero rather than inheriting the previous point's.
+  first_api="${API_LIST%%,*}"
+  curl -sf -X POST "${first_api}/query" \
+    --data-urlencode "q=DROP DATABASE linearity" >/dev/null 2>&1 || true
+  sleep 10
+
   # Total series scales with N so each node can own multiple regions.
   series=$(( SERIES_PER_NODE * N ))
   echo "[sweep] N=$N series=$series"
