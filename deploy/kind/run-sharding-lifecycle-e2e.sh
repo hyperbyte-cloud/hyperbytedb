@@ -124,7 +124,25 @@ verify_data() {
   fi
 }
 
-wait_for_replicas() {
+wait_for_scale_down_complete() {
+  deadline=$(( $(date +%s) + CONVERGE_WAIT_SECS ))
+  saw_leaving=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    st=$(node_health_state "$DEPARTING_ORDINAL")
+    departing_up=$(pod_exists "$DEPARTING_ORDINAL")
+    sts_now=$(sts_replicas)
+    if [ "$st" = "leaving" ]; then
+      saw_leaving=1
+    fi
+    if [ "$saw_leaving" -eq 1 ] && [ "$sts_now" = "$DOWN_REPLICAS" ] && [ "$departing_up" -eq 0 ]; then
+      return 0
+    fi
+    sleep 3
+  done
+  return 1
+}
+
+wait_for_scale_up_complete() {
   want=$1
   deadline=$(( $(date +%s) + CONVERGE_WAIT_SECS ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -161,10 +179,10 @@ main() {
   log "Scaling down ${FULL_REPLICAS}→${DOWN_REPLICAS}"
   kubectl_ctx patch hyperbytedbcluster hyperbytedb --type merge \
     -p "{\"spec\":{\"replicas\":${DOWN_REPLICAS}}}" >/dev/null
-  if wait_for_replicas "$DOWN_REPLICAS"; then
-    pass L3 "scaled to ${DOWN_REPLICAS} within ${CONVERGE_WAIT_SECS}s"
+  if wait_for_scale_down_complete; then
+    pass L3 "scaled to ${DOWN_REPLICAS} (decommission complete) within ${CONVERGE_WAIT_SECS}s"
   else
-    fail L3 "still at sts=$(sts_replicas) pods=$(running_pod_count) after ${CONVERGE_WAIT_SECS}s"
+    fail L3 "scale-down incomplete: sts=$(sts_replicas) pods=$(running_pod_count) departing=$(node_health_state "$DEPARTING_ORDINAL")"
   fi
   verify_data L4
 
@@ -188,10 +206,10 @@ main() {
   log "Scaling up ${DOWN_REPLICAS}→${FULL_REPLICAS}"
   kubectl_ctx patch hyperbytedbcluster hyperbytedb --type merge \
     -p "{\"spec\":{\"replicas\":${FULL_REPLICAS}}}" >/dev/null
-  if wait_for_replicas "$FULL_REPLICAS"; then
+  if wait_for_scale_up_complete "$FULL_REPLICAS"; then
     pass L7 "scaled back to ${FULL_REPLICAS}"
   else
-    fail L7 "still at sts=$(sts_replicas) pods=$(running_pod_count)"
+    fail L7 "scale-up incomplete: sts=$(sts_replicas) pods=$(running_pod_count)"
   fi
   verify_data L8
 

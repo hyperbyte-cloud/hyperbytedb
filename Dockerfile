@@ -76,7 +76,7 @@ COPY hyperbytedb/hyperbytedb-cli/tests/ hyperbytedb-cli/tests/
 # build of this workspace will spawn a rustc per core and can exhaust memory
 # alongside whatever else is running -- set CARGO_BUILD_JOBS to bound it:
 #   docker build --build-arg CARGO_BUILD_JOBS=4 ...
-ARG CARGO_BUILD_JOBS
+ARG CARGO_BUILD_JOBS=default
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 
 # target/ is a cache mount — artifacts are not in the image layer unless copied out.

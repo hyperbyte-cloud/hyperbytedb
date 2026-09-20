@@ -56,14 +56,54 @@ E2E_CLUSTER_LABEL="6 nodes, topology stable, splits forced under continuous writ
 
 WRITER_PID=""
 ACK_FILE=$REPORT_DIR/.splitwrite-acked.$$
+SENT_FILE=$REPORT_DIR/.splitwrite-sent.$$
 STOP_FILE=$REPORT_DIR/.splitwrite-stop.$$
 
 cleanup() {
   [ -n "$WRITER_PID" ] && kill "$WRITER_PID" 2>/dev/null || true
-  rm -f "$ACK_FILE" "$STOP_FILE"
+  rm -f "$ACK_FILE" "$SENT_FILE" "$STOP_FILE"
   teardown_port_forwards
 }
 trap cleanup EXIT
+
+# Physical row count vs distinct (series_id, time) for the measurement's fact
+# table, read through the admin chDB endpoint so it bypasses the coalescing
+# view. Prints "<physical>/<distinct>" or "ERR:...".
+# Sums physical vs distinct across EVERY holder, not one sampled pod. Sampling
+# pod 0 alone reported a clean PASS while pod 2 held 61 duplicate rows.
+#
+# Timing-dependent by nature: ReplacingMergeTree collapses duplicates on merge,
+# so a clean result means "none right now", not "none ever occurred". That is
+# still worth asserting — a persistent duplicate is a real defect — but it is
+# not proof of exactly-once.
+physical_vs_distinct() {
+  tbl="${DB}_${RP}_${MEAS}"
+  q="SELECT count(), uniqExact((series_id,time)) FROM default.${tbl} FORMAT TabSeparated"
+  tp=0; td=0; seen=0
+  i=0
+  while [ "$i" -lt "$FULL_REPLICAS" ]; do
+    out=$(kubectl --context "$KUBE_CTX" -n "$NS" exec "hyperbytedb-$i" -c hyperbytedb -- \
+      sh -c "curl -sS -m 30 -X POST 'http://127.0.0.1:${HDB_PORT}/api/v1/chdb' \
+        -H 'Content-Type: application/json' \
+        --data-binary '{\"q\":\"${q}\"}'" 2>/dev/null) || out=""
+    p=$(echo "$out" | head -1 | awk '{print $1+0}')
+    d=$(echo "$out" | head -1 | awk '{print $2+0}')
+    case "$out" in
+      *[0-9]*) tp=$((tp + p)); td=$((td + d)); seen=$((seen + 1)) ;;
+      *) : ;;
+    esac
+    i=$((i + 1))
+  done
+  if [ "$seen" -eq 0 ]; then echo "ERR:unavailable"; else echo "${tp}/${td}"; fi
+}
+
+sent_total() {
+  if [ -s "$SENT_FILE" ]; then
+    awk '{s+=$1} END {print s+0}' "$SENT_FILE"
+  else
+    echo 0
+  fi
+}
 
 acked_total() {
   if [ -s "$ACK_FILE" ]; then
@@ -90,6 +130,7 @@ print('\n'.join('{},host=s{} value=1 {}'.format(m, n+i, base + n + i) for i in r
 " 2>/dev/null) || body=""
     [ -z "$body" ] && continue
     code=$(curl_write 0 "$body" 2>/dev/null || echo 000)
+    echo "$WRITER_BATCH" >> "$SENT_FILE"
     if [ "$code" = "204" ]; then
       echo "$WRITER_BATCH" >> "$ACK_FILE"
     fi
@@ -135,6 +176,7 @@ main() {
   done
 
   acked_at_stop=$(acked_total)
+  sent_at_stop=$(sent_total)
   touch "$STOP_FILE"
   wait "$WRITER_PID" 2>/dev/null || true
   WRITER_PID=""
@@ -160,17 +202,29 @@ main() {
   log "settling up to ${SETTLE_SECS}s"
   rows=$(wait_for_query_count 0 "SELECT COUNT(value) FROM ${MEAS}" "$acked_at_stop" "$SETTLE_SECS")
 
+  # `rows` is a COUNT through the query path, which reads the coalescing
+  # `GROUP BY (series_id, time)` view — so it counts DISTINCT points and can
+  # never be inflated by a physically duplicated row. Reading `rows > acked` as
+  # "DUPLICATED" was therefore wrong by construction, and is what made this
+  # suite report 24,538 duplicates that did not exist. Points sent but not
+  # acked can legitimately be stored: a batch spanning several regions can
+  # apply some buckets and still return non-204.
+  #
+  # The three quantities are: acked <= rows <= sent.
+  physical=$(physical_vs_distinct)
   case "$rows" in
     ''|*[!0-9]*)
       fail P3 "UNREADABLE: count query returned [${rows}]"
       ;;
     *)
-      if [ "$rows" -eq "$acked_at_stop" ]; then
-        pass P3 "exactly-once under splits: ${rows} rows == ${acked_at_stop} acknowledged"
-      elif [ "$rows" -lt "$acked_at_stop" ]; then
-        fail P3 "LOST $((acked_at_stop - rows)) of ${acked_at_stop} acknowledged writes (rows=${rows})"
+      if [ "$rows" -lt "$acked_at_stop" ]; then
+        fail P3 "LOST $((acked_at_stop - rows)) of ${acked_at_stop} acknowledged writes (rows=${rows}); physical/distinct: ${physical}"
+      elif [ "$rows" -gt "$sent_at_stop" ]; then
+        fail P3 "IMPOSSIBLE: ${rows} distinct rows exceeds ${sent_at_stop} points sent; physical/distinct: ${physical}"
+      elif [ "$rows" -eq "$acked_at_stop" ]; then
+        pass P3 "no loss under splits: ${rows} rows == ${acked_at_stop} acknowledged (sent ${sent_at_stop}); physical/distinct: ${physical}"
       else
-        fail P3 "DUPLICATED $((rows - acked_at_stop)) rows (rows=${rows} acked=${acked_at_stop})"
+        pass P3 "no loss under splits: ${rows} rows >= ${acked_at_stop} acknowledged, <= ${sent_at_stop} sent — $((rows - acked_at_stop)) points stored by partially-applied batches; physical/distinct: ${physical}"
       fi
       ;;
   esac
@@ -181,6 +235,43 @@ main() {
   else
     fail P4 "RF violation: $rf"
   fi
+
+
+  # Duplication check — deliberately after P4, whose RF wait is the only
+  # step that actually blocks until placement has settled.
+  #
+  # Cross-node movement genuinely creates physical duplicates: a learner gets
+  # live replication AND the stage copy of the same range. ReplacingMergeTree
+  # collapses them, and the coalescing view hides them from every query (P3 is
+  # the correctness assertion; this is a health signal).
+  #
+  # Two earlier versions of this check were wrong. Demanding an instantaneous
+  # zero failed whenever the probe outran the merge (3,773 duplicates, down to
+  # 211 minutes later). Polling for zero mid-convergence also failed, because
+  # placement was still staging: physical rows grew 241k -> 258k DURING the
+  # settle, so new duplicates appeared faster than merges cleared them. Zero is
+  # only reachable on a quiescent cluster. What is meaningful here is that the
+  # in-flight population stays small — an explosion means redelivery is not
+  # being collapsed at all.
+  physical=$(physical_vs_distinct)
+  case "$physical" in
+    *ERR*|"")
+      log "P3b: physical/distinct probe unavailable (${physical})"
+      ;;
+    *)
+      phys_n=${physical%%/*}
+      dist_n=${physical##*/}
+      dup_n=$((phys_n - dist_n))
+      # 1% of stored rows. Transient overlap sits far below this; a systemic
+      # duplication failure sits far above it.
+      dup_budget=$((phys_n / 100))
+      if [ "$dup_n" -le "$dup_budget" ]; then
+        pass P3b "duplicates within budget: ${dup_n} of ${phys_n} rows ($((dup_n * 1000 / (phys_n + 1)))/1000), collapsing via ReplacingMergeTree"
+      else
+        fail P3b "DUPLICATION NOT COLLAPSING: ${dup_n} of ${phys_n} rows exceeds 1% budget (${phys_n} physical vs ${dist_n} distinct)"
+      fi
+      ;;
+  esac
 
   staging=$(curl_api 0 "/internal/shard/map" | python3 -c "
 import sys,json

@@ -38,6 +38,14 @@ spec:
       memory: 4Gi
   proxy:
     enabled: false
+  # The sweep drives 125k series per node (N=48 => 6M). The default limit is
+  # 100,000, so WITHOUT this block every forwarded write is rejected 422 by the
+  # receiving node once cardinality passes the default — which is what made the
+  # N=6 point fail 750 of 750 batches while still reporting a throughput
+  # number.
+  cardinality:
+    maxTagValuesPerMeasurement: 10000000
+    maxMeasurementsPerDatabase: 10000
   sharding:
     enabled: true
     replicationFactor: 2

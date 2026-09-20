@@ -141,26 +141,26 @@ setup_port_forwards() {
   [ "${IN_CLUSTER:-0}" = "1" ] && return 0
   max=$((E2E_EXPECT_REPLICAS - 1))
   log "Starting port-forwards hyperbytedb-0..${max}"
-  i=0
-  while [ "$i" -le "$max" ]; do
-    port=$(api_port "$i")
-    free_forward_port "$port" "$i"
-    kubectl_ctx port-forward "pod/hyperbytedb-$i" "${port}:8086" \
-      >/tmp/pf-hdb-"$i".log 2>&1 &
+  _pf_i=0
+  while [ "$_pf_i" -le "$max" ]; do
+    port=$(api_port "$_pf_i")
+    free_forward_port "$port" "$_pf_i"
+    kubectl_ctx port-forward "pod/hyperbytedb-$_pf_i" "${port}:8086" \
+      >/tmp/pf-hdb-"$_pf_i".log 2>&1 &
     PF_PIDS="${PF_PIDS} $!"
-    i=$((i + 1))
+    _pf_i=$((_pf_i + 1))
   done
   deadline=$(( $(date +%s) + 45 ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
     all_ok=1
-    i=0
-    while [ "$i" -le "$max" ]; do
-      code=$(curl -sS -o /dev/null -w '%{http_code}' -m 3 "$(api_url "$i")/ping" 2>/dev/null || echo 000)
+    _pf_i=0
+    while [ "$_pf_i" -le "$max" ]; do
+      code=$(curl -sS -o /dev/null -w '%{http_code}' -m 3 "$(api_url "$_pf_i")/ping" 2>/dev/null || echo 000)
       if [ "$code" != "204" ]; then
         all_ok=0
         break
       fi
-      i=$((i + 1))
+      _pf_i=$((_pf_i + 1))
     done
     if [ "$all_ok" -eq 1 ]; then
       log "All port-forwards responding"
@@ -178,10 +178,10 @@ teardown_port_forwards() {
     kill "$pid" 2>/dev/null || true
   done
   PF_PIDS=""
-  i=0
-  while [ "$i" -lt "$E2E_EXPECT_REPLICAS" ]; do
-    fuser -k "$(api_port "$i")/tcp" 2>/dev/null || true
-    i=$((i + 1))
+  _tpf_i=0
+  while [ "$_tpf_i" -lt "$E2E_EXPECT_REPLICAS" ]; do
+    fuser -k "$(api_port "$_tpf_i")/tcp" 2>/dev/null || true
+    _tpf_i=$((_tpf_i + 1))
   done
 }
 
@@ -347,15 +347,15 @@ metric_max_across_pods() {
   max_pods=${2:-$E2E_EXPECT_REPLICAS}
   max=0
   unreachable=""
-  i=0
-  while [ "$i" -lt "$max_pods" ]; do
-    v=$(metric_counter "$i" "$name")
+  _mm_i=0
+  while [ "$_mm_i" -lt "$max_pods" ]; do
+    v=$(metric_counter "$_mm_i" "$name")
     if [ "$v" = "ERR" ]; then
-      unreachable="${unreachable}${i},"
+      unreachable="${unreachable}${_mm_i},"
     elif [ "$v" -gt "$max" ] 2>/dev/null; then
       max=$v
     fi
-    i=$((i + 1))
+    _mm_i=$((_mm_i + 1))
   done
   if [ -n "$unreachable" ]; then
     echo "ERR:unreachable=${unreachable%,}"
