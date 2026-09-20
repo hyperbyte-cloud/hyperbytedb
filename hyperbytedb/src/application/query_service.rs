@@ -34,7 +34,7 @@ use crate::domain::query_result::{QueryResponse, SeriesResult, StatementResult};
 use crate::domain::sharding::query_merge::{
     merge_materialized_rollup_results, merge_sharded_query_results, prepare_sharded_region_query,
 };
-use crate::domain::sharding::{ShardQueryRequest, ShardRegion};
+use crate::domain::sharding::{ShardMapOp, ShardQueryRequest, ShardRegion};
 use crate::error::HyperbytedbError;
 use crate::ports::metadata::MetadataPort;
 use crate::ports::query::{CqRunResult, QueryPort, QueryService};
@@ -80,6 +80,11 @@ pub struct QueryServiceImpl {
     max_points_per_request: usize,
     mv_service: Arc<MaterializedViewService>,
     shard_routing: Option<Arc<ShardRoutingContext>>,
+    /// Leader probes for proposing shard-map ops from the statement path.
+    /// Only `DropSpace` needs them today: every other shard-map op is proposed
+    /// by the scheduler, which has its own Raft handle.
+    shard_is_leader: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    shard_leader_addr: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
 }
 
 impl QueryServiceImpl {
@@ -109,6 +114,8 @@ impl QueryServiceImpl {
             max_points_per_request: 0,
             mv_service,
             shard_routing: None,
+            shard_is_leader: None,
+            shard_leader_addr: None,
         }
     }
 
@@ -126,6 +133,8 @@ impl QueryServiceImpl {
         leader_addr: Arc<dyn Fn() -> Option<String> + Send + Sync>,
     ) -> Self {
         self.shard_routing = Some(ctx.clone());
+        self.shard_is_leader = Some(is_leader.clone());
+        self.shard_leader_addr = Some(leader_addr.clone());
         self.mv_service = Arc::new(
             MaterializedViewService::new(
                 self.metadata.clone(),
@@ -135,6 +144,47 @@ impl QueryServiceImpl {
             .with_sharding(ctx, is_leader, leader_addr),
         );
         self
+    }
+
+    /// Garbage-collect the shard spaces a drop just emptied.
+    ///
+    /// Best-effort by design: the data is already gone when this runs, and a
+    /// map entry that outlives it is a scheduling and accounting problem, not
+    /// a correctness one. Failing the user's `DROP` because the map could not
+    /// be updated would be the worse trade. Proposed once, from the node that
+    /// served the statement — the op reaches every other node through the
+    /// shard-map Raft log, not through the schema-mutation replication that
+    /// carries the drop itself.
+    async fn drop_shard_spaces(&self, db: &str, rp: Option<&str>, measurement: Option<&str>) {
+        let Some(ctx) = self.shard_routing.as_ref() else {
+            return;
+        };
+        let op = ShardMapOp::DropSpace {
+            db: db.to_string(),
+            rp: rp.map(str::to_string),
+            measurement: measurement.map(str::to_string),
+        };
+        let is_leader = self.shard_is_leader.as_ref().is_some_and(|f| f());
+        let leader_addr = self.shard_leader_addr.as_ref().and_then(|f| f());
+        let result = match (is_leader, leader_addr) {
+            // Raft-less sharding: this node's map is the placement authority.
+            (_, None) => ctx.shard_map.apply_op(op).await.map(|_| ()),
+            (_, Some(addr)) => {
+                crate::application::shard_routing::propose_shard_map_op_via_raft(&addr, op)
+                    .await
+                    .map(|_| ())
+            }
+        };
+        if let Err(e) = result {
+            tracing::warn!(
+                db,
+                rp,
+                measurement,
+                error = %e,
+                "failed to drop shard spaces after drop; regions stay in the map \
+                 until the next successful drop of the same scope"
+            );
+        }
     }
 
     #[must_use]
@@ -559,13 +609,13 @@ impl QueryService for QueryServiceImpl {
                         let db_arc = Arc::clone(&db_arc);
                         let epoch_arc = epoch_arc.clone();
                         let rp_arc = rp_arc.clone();
-                        let stmt = &stmts[j];
+                        let stmt = stmts[j].clone();
 
                         async move {
                             execute_statement(
                                 &svc,
                                 db_arc.as_ref(),
-                                stmt,
+                                &stmt,
                                 epoch_arc.as_deref(),
                                 rp_arc.as_deref(),
                                 statement_id,
@@ -930,6 +980,7 @@ async fn execute_statement(
                 name,
             )
             .await?;
+            svc.drop_shard_spaces(name, None, None).await;
             Ok(StatementResult {
                 statement_id,
                 series: Some(vec![]),
@@ -1102,6 +1153,7 @@ async fn execute_statement(
                     "failed to drop chDB native table for measurement (metadata already cleared)"
                 );
             }
+            svc.drop_shard_spaces(db, Some(&rp), Some(name)).await;
             Ok(StatementResult {
                 statement_id,
                 series: Some(vec![]),
@@ -1400,6 +1452,7 @@ async fn execute_statement(
         Statement::DropRetentionPolicyStmt { name, db: rp_db } => {
             let target_db = if rp_db.is_empty() { db } else { rp_db.as_str() };
             svc.metadata.drop_retention_policy(target_db, name).await?;
+            svc.drop_shard_spaces(target_db, Some(name), None).await;
             Ok(StatementResult {
                 statement_id,
                 series: Some(vec![]),
@@ -2358,31 +2411,21 @@ async fn query_materialized_region_all_peers(
     };
 
     let membership = ctx.peer_client.membership().read().await;
-    let peer_ids: Vec<u64> = region
-        .peers
-        .iter()
-        .copied()
-        .filter(|id| is_active_peer(&membership, *id))
-        .collect();
+    let primary = region.primary;
+    let primary_active = is_active_peer(&membership, primary) && region.is_serving_peer(primary);
     drop(membership);
 
+    if !primary_active {
+        return Ok(Vec::new());
+    }
+
     let timeout = std::time::Duration::from_millis(ctx.config.scatter_peer_timeout_ms.max(1));
-    let mut parts = Vec::new();
-
-    for peer_id in peer_ids {
-        if peer_id == ctx.node_id {
-            let raw = svc.query_port.execute_sql(region_sql).await?;
-            let series =
-                parse_json_each_row_to_series(&raw, measurement, epoch, resolved_group_by_tags)?;
-            if !series.is_empty() {
-                parts.push(QueryResponse::single(0, series));
-            }
-            continue;
-        }
-
+    let raw = if primary == ctx.node_id {
+        svc.query_port.execute_sql(region_sql).await?
+    } else {
         let membership = ctx.peer_client.membership().read().await;
-        let Some(addr) = peer_addr(&membership, peer_id) else {
-            continue;
+        let Some(addr) = peer_addr(&membership, primary) else {
+            return Ok(Vec::new());
         };
         drop(membership);
         let url = format!("http://{addr}/internal/shard/query");
@@ -2402,31 +2445,20 @@ async fn query_materialized_region_all_peers(
         }
         if !resp.status().is_success() {
             return Err(HyperbytedbError::PeerUnreachable(format!(
-                "materialized shard query to peer {peer_id} failed: {}",
+                "materialized shard query to primary {primary} failed: {}",
                 resp.status()
             )));
         }
-        let raw = resp
-            .text()
+        resp.text()
             .await
-            .map_err(|e| HyperbytedbError::Internal(e.to_string().into()))?;
-        let series =
-            parse_json_each_row_to_series(&raw, measurement, epoch, resolved_group_by_tags)?;
-        if !series.is_empty() {
-            parts.push(QueryResponse::single(0, series));
-        }
-    }
+            .map_err(|e| HyperbytedbError::Internal(e.to_string().into()))?
+    };
 
-    if parts.is_empty() {
+    let series = parse_json_each_row_to_series(&raw, measurement, epoch, resolved_group_by_tags)?;
+    if series.is_empty() {
         return Ok(Vec::new());
     }
-    if parts.len() == 1 {
-        let Some(part) = parts.pop() else {
-            return Ok(Vec::new());
-        };
-        return Ok(first_statement_series(part));
-    }
-    let merged = merge_materialized_rollup_results(parts, meta)?;
+    let merged = merge_materialized_rollup_results(vec![QueryResponse::single(0, series)], meta)?;
     Ok(first_statement_series(merged))
 }
 
@@ -2541,18 +2573,14 @@ async fn execute_sharded_measurement_query(
     let region_selection = if is_materialized_dest {
         select_regions_for_materialized_dest(space)
     } else {
-        select_regions_for_query(space, measurement, &effective_stmt)
+        select_regions_for_query(space, measurement, &series_tag_columns, &effective_stmt)
     };
     let is_global_aggregate = !is_materialized_dest && select_has_true_aggregate(&effective_stmt);
-    let selected_regions: Vec<ShardRegion> = if space.regions.len() > 1 && is_global_aggregate {
-        space.regions.clone()
-    } else {
-        region_selection
-            .regions(space)
-            .into_iter()
-            .cloned()
-            .collect()
-    };
+    let selected_regions: Vec<ShardRegion> = region_selection
+        .regions(space)
+        .into_iter()
+        .cloned()
+        .collect();
 
     let sharded_plan = if !is_materialized_dest
         && (selected_regions.len() > 1 || (space.regions.len() > 1 && is_global_aggregate))
@@ -2599,29 +2627,46 @@ async fn execute_sharded_measurement_query(
 
     let materialized_meta_ref = measurement_meta.as_ref().filter(|_| is_materialized_dest);
 
-    let region_futures = selected_regions.iter().map(|region| {
-        let region_sql = if is_materialized_dest {
-            sql.clone()
-        } else {
-            inject_region_series_id_predicate(sql.clone(), region.start, region.end)
-        };
-        query_sharded_region(
-            svc,
-            ctx,
-            db,
-            rp,
-            measurement,
-            region,
-            region_sql,
-            t_min,
-            t_max,
-            epoch,
-            &resolved_group_by_tags,
-            materialized_meta_ref,
-            is_global_aggregate,
-        )
-    });
-    let region_results = futures::future::try_join_all(region_futures).await?;
+    const SHARD_QUERY_REGION_CONCURRENCY: usize = 32;
+    let resolved_tags_owned = resolved_group_by_tags.to_vec();
+    let materialized_meta_owned = materialized_meta_ref.cloned();
+    let epoch_owned = epoch.map(str::to_string);
+    let mut region_results = Vec::with_capacity(selected_regions.len());
+    for chunk in selected_regions.chunks(SHARD_QUERY_REGION_CONCURRENCY) {
+        let chunk_futures: Vec<_> = chunk
+            .iter()
+            .map(|region| {
+                let region = region.clone();
+                let region_sql = if is_materialized_dest {
+                    sql.clone()
+                } else {
+                    inject_region_series_id_predicate(sql.clone(), region.start, region.end)
+                };
+                let tags = resolved_tags_owned.clone();
+                let meta = materialized_meta_owned.clone();
+                let epoch = epoch_owned.as_deref();
+                async move {
+                    query_sharded_region(
+                        svc,
+                        ctx,
+                        db,
+                        rp,
+                        measurement,
+                        &region,
+                        region_sql,
+                        t_min,
+                        t_max,
+                        epoch,
+                        &tags,
+                        meta.as_ref(),
+                        is_global_aggregate,
+                    )
+                    .await
+                }
+            })
+            .collect();
+        region_results.extend(futures::future::try_join_all(chunk_futures).await?);
+    }
     let mut parts = Vec::with_capacity(region_results.len());
     for series in region_results {
         if !series.is_empty() {
@@ -3083,14 +3128,15 @@ async fn write_series_as_points(
             use crate::application::ingest_metadata::prepare_batch_metadata;
             use crate::application::replication_dispatch::dispatch_outbound_replication;
             use crate::application::shard_routing::{
-                forward_shard_write_to_region, partition_points, region_replication_targets,
+                forward_shard_write_to_region, partition_points, region_by_id,
+                region_replication_targets,
             };
             use crate::application::wal_append::append_points_with_prepared;
 
             let buckets = partition_points(ctx, db, rp, all_points).await?;
 
             // Concurrent forward fan-out (bounded), matching the ingestion path.
-            const FORWARD_CONCURRENCY: usize = 8;
+            const FORWARD_CONCURRENCY: usize = 32;
             let forwards = buckets.forward.into_values().map(|fwd_points| async move {
                 forward_shard_write_to_region(ctx, db, rp, Some("ns"), &fwd_points).await
             });
@@ -3101,11 +3147,15 @@ async fn write_series_as_points(
                 .await?;
 
             if !buckets.local.is_empty() {
+                let mut all_local = Vec::new();
+                for pts in buckets.local.values() {
+                    all_local.extend(pts.iter().cloned());
+                }
                 prepare_batch_metadata(
                     &svc.metadata,
                     db,
                     rp,
-                    &buckets.local,
+                    &all_local,
                     crate::application::ingest_metadata::IngestCardinalityLimits {
                         max_tag_values_per_measurement: 0,
                         max_measurements_per_database: 0,
@@ -3118,16 +3168,18 @@ async fn write_series_as_points(
                     Some(&svc.points_sink),
                     db,
                     rp,
-                    buckets.local.clone(),
+                    all_local,
                     svc.node_id,
                     svc.max_points_per_request,
                 )
                 .await?;
-                let local_body =
-                    encode_points_to_line_protocol(&buckets.local, Precision::Nanosecond)?;
-                let sid = crate::domain::series::series_id_for_point(&buckets.local[0]);
                 let map = ctx.shard_map.snapshot().await?;
-                if let Some(region) = ctx.location_cache.locate(&map, db, rp, measurement, sid) {
+                for (region_id, region_points) in buckets.local {
+                    let Some(region) = region_by_id(&map, region_id) else {
+                        continue;
+                    };
+                    let local_body =
+                        encode_points_to_line_protocol(&region_points, Precision::Nanosecond)?;
                     let targets = region_replication_targets(ctx, &region).await;
                     if let Some(ref replication_port) = svc.replication_port {
                         dispatch_outbound_replication(
@@ -3141,6 +3193,7 @@ async fn write_series_as_points(
                                 body: local_body,
                                 wal_seq,
                                 target_node_ids: Some(targets),
+                                region_id: Some(region.region_id),
                             },
                         )
                         .await?;
@@ -3180,6 +3233,8 @@ async fn write_series_as_points(
                     body,
                     wal_seq,
                     target_node_ids: None,
+                    // Unsharded SELECT..INTO: no region scoping.
+                    region_id: None,
                 },
             )
             .await?;

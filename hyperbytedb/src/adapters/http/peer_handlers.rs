@@ -11,7 +11,7 @@ use metrics::{counter, gauge};
 use crate::application::replication_apply::ReplicationApplyError;
 use crate::domain::cluster::membership::{ClusterMembership, NodeInfo, NodeState};
 use crate::domain::cluster::replication_wire::{
-    HTTP_HEADER_DATABASE, HTTP_HEADER_ORIGIN_NODE, HTTP_HEADER_PRECISION,
+    HTTP_HEADER_DATABASE, HTTP_HEADER_ORIGIN_NODE, HTTP_HEADER_PRECISION, HTTP_HEADER_REGION,
     HTTP_HEADER_RETENTION_POLICY, HTTP_HEADER_SYNC, LINE_PROTOCOL_MEDIA_TYPE_V1,
 };
 use crate::domain::cluster::sync::{
@@ -20,6 +20,7 @@ use crate::domain::cluster::sync::{
 };
 use crate::domain::cluster::types::{MutationReplicateRequest, MutationRequest};
 use crate::ports::metadata::MetadataPort;
+use crate::ports::sharding::ShardMapPort as _;
 
 use super::router::AppState;
 
@@ -67,6 +68,44 @@ pub async fn handle_replicate_write(
         return (
             status,
             Json(serde_json::json!({"error": "invalid origin node id"})),
+        );
+    }
+
+    // B.4 — region check, deliberately narrow.
+    //
+    // Absent header means "no region scoping available": unsharded writes, and
+    // replayed hinted-handoff records, whose on-disk format predates the
+    // region being carried. Those apply as before. Rejecting them would turn
+    // a permanent 4xx into permanent unavailability, because the hint drain
+    // re-enqueues on ANY non-success and retries the same head-of-queue record
+    // forever, wedging every hint behind it.
+    //
+    // Epoch is NOT checked here. The sender is authoritative about which
+    // region a row belongs to; the receiver's shard map merely lags, and every
+    // AddPeer/Split/PromotePeer moves the epoch. Rejecting on skew would drop
+    // legitimate writes during exactly the window convergence is busiest —
+    // and those writes then burn the retry budget into the hint queue. Only a
+    // sender that is not a member of the region at all is refused.
+    if let Some(region_id) = headers
+        .get(HTTP_HEADER_REGION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        && let Some(ctx) = state.shard_routing.as_ref()
+        && let Ok(map) = ctx.shard_map.snapshot().await
+        && let Some(region) = crate::application::shard_routing::region_by_id(&map, region_id)
+        && !region.peers.contains(&state.node_id)
+    {
+        counter!(
+            "hyperbytedb_replicate_rejected_total",
+            "reason" => "not_a_region_peer"
+        )
+        .increment(1);
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "not a peer of this region",
+                "region_id": region_id,
+            })),
         );
     }
 

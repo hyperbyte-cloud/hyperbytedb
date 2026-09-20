@@ -174,10 +174,16 @@ pub async fn run_raft_cluster_formation(
         if discovered_ids.len() >= expected_size {
             let metrics = raft.metrics().borrow().clone();
             if learners_caught_up(&metrics, &discovered_ids, node_id) {
-                match raft.change_membership(discovered_ids.clone(), false).await {
+                // Phase 2: keep a fixed voter set (bootstrap node + up to four
+                // others) and leave the rest as learners.
+                const MAX_VOTERS: usize = 5;
+                let mut voters: BTreeSet<u64> =
+                    discovered_ids.iter().take(MAX_VOTERS).copied().collect();
+                voters.insert(node_id);
+                match raft.change_membership(voters.clone(), false).await {
                     Ok(_) => {
                         tracing::info!(
-                            voters = ?discovered_ids,
+                            voters = ?voters,
                             "raft membership promotion succeeded"
                         );
                         break;

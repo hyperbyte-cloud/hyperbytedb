@@ -30,6 +30,14 @@ pub struct RegionTransferOutcome {
     pub exported: u64,
     /// Points the destination confirmed applying across all pushed chunks.
     pub applied: u64,
+    /// Wire bytes pushed to the destination across all chunks.
+    ///
+    /// The movement budget is a bandwidth throttle, so it has to be spent in
+    /// the unit bandwidth is measured in. Counting points charged a region of
+    /// 40-column rows the same as one of single-field rows, which is how a
+    /// tick could blow its allowance by an order of magnitude while the
+    /// counter looked healthy.
+    pub bytes: u64,
 }
 
 impl RegionTransferOutcome {
@@ -181,6 +189,8 @@ pub async fn export_region_points_from_wal_chunked(
     region: &ShardRegion,
     cursor: WalExportCursor,
     max_points: usize,
+    // Skip WAL entries at or below this seq when staging onto a replicating learner.
+    skip_wal_through: u64,
 ) -> Result<(Vec<u8>, usize, WalExportCursor), HyperbytedbError> {
     let max_points = max_points.max(1);
     let mut points: Vec<Point> = Vec::new();
@@ -199,6 +209,13 @@ pub async fn export_region_points_from_wal_chunked(
         // value so exported points MOVE into the chunk buffer instead of
         // being deep-cloned per point.
         for (seq, entry) in page.into_iter() {
+            if seq <= skip_wal_through {
+                next = WalExportCursor {
+                    from_seq: seq.saturating_add(1),
+                    skip_points_in_head_entry: 0,
+                };
+                continue;
+            }
             if entry.database != key.db || entry.retention_policy != key.rp {
                 next = WalExportCursor {
                     from_seq: seq.saturating_add(1),
@@ -524,7 +541,7 @@ pub async fn push_region_transfer(
     seq: u64,
     done: bool,
     stage: bool,
-) -> Result<u64, HyperbytedbError> {
+) -> Result<(u64, u64), HyperbytedbError> {
     let membership = peer_client.membership().read().await;
     let addr = membership
         .get_node(dest_primary)
@@ -533,6 +550,7 @@ pub async fn push_region_transfer(
     drop(membership);
 
     let body_len = body.len();
+    let wire_bytes = body_len as u64;
     let payload = if stage {
         ShardTransferPayload::stage_push(
             &key.db,
@@ -580,9 +598,9 @@ pub async fn push_region_transfer(
         });
     }
     let applied = parse_applied_from_response(&resp.text().await.unwrap_or_default());
-    counter!("hyperbytedb_shard_transfer_bytes").increment(body_len as u64);
+    counter!("hyperbytedb_shard_transfer_bytes").increment(wire_bytes);
     counter!("hyperbytedb_shard_transfers_total").increment(1);
-    Ok(applied)
+    Ok((applied, wire_bytes))
 }
 
 pub async fn ack_region_transfer(
@@ -654,12 +672,14 @@ async fn transfer_region_data(
             transfer_id: 0,
             exported: 0,
             applied: 0,
+            bytes: 0,
         });
     }
     let max_points = max_points.max(1);
     let transfer_id = new_transfer_id();
     let mut seq = 0u64;
     let mut exported = 0u64;
+    let mut bytes = 0u64;
     let mut applied = 0u64;
 
     // Unflushed WAL rows: chunked and resumable so regions with more pending
@@ -667,9 +687,9 @@ async fn transfer_region_data(
     let mut cursor = WalExportCursor::default();
     loop {
         let (body, count, next_cursor) =
-            export_region_points_from_wal_chunked(wal, key, region, cursor, max_points).await?;
+            export_region_points_from_wal_chunked(wal, key, region, cursor, max_points, 0).await?;
         if !body.is_empty() {
-            let chunk_applied = push_region_transfer(
+            let (chunk_applied, chunk_bytes) = push_region_transfer(
                 peer_client.as_ref(),
                 source_node_id,
                 key,
@@ -684,6 +704,7 @@ async fn transfer_region_data(
             .await?;
             exported += count as u64;
             applied += chunk_applied;
+            bytes += chunk_bytes;
             seq = seq.saturating_add(1);
         }
         if next_cursor == cursor {
@@ -692,7 +713,17 @@ async fn transfer_region_data(
         cursor = next_cursor;
     }
 
-    // Flushed chDB rows: keyset-paginated on series_id (M9).
+    // Flushed chDB rows: keyset-paginated on series_id (M9). Exported
+    // unconditionally.
+    //
+    // This used to be skipped whenever the destination reported a non-zero WAL
+    // watermark, on the theory that replication had already delivered the hot
+    // rows. The number compared was the learner's *node-wide* sequence against
+    // the donor's, so a learner busy with any other region skipped its own cold
+    // backfill entirely — trading a duplicate for a missing row. The duplicate
+    // it was avoiding was never visible in the first place: reads go through a
+    // `GROUP BY (series_id, time)` coalescing view, so a re-exported row
+    // collapses against the replicated one before any aggregate sees it.
     if let Some(query) = query_port {
         let mut after_series_id: Option<u64> = None;
         loop {
@@ -709,7 +740,7 @@ async fn transfer_region_data(
                 break;
             }
             let done = count < max_points;
-            let chunk_applied = push_region_transfer(
+            let (chunk_applied, chunk_bytes) = push_region_transfer(
                 peer_client.as_ref(),
                 source_node_id,
                 key,
@@ -724,6 +755,7 @@ async fn transfer_region_data(
             .await?;
             exported += count as u64;
             applied += chunk_applied;
+            bytes += chunk_bytes;
             seq = seq.saturating_add(1);
             if done {
                 break;
@@ -753,6 +785,7 @@ async fn transfer_region_data(
         transfer_id,
         exported,
         applied,
+        bytes,
     };
     // Verified handoff: refuse to bless the transfer unless the destination
     // confirmed every exported point. Callers must not drop source data on Err.
@@ -1126,19 +1159,54 @@ mod tests {
             transfer_id: 1,
             exported: 10,
             applied: 10,
+            bytes: 4_096,
         };
         let short = RegionTransferOutcome {
             transfer_id: 1,
             exported: 10,
             applied: 9,
+            bytes: 4_096,
         };
         let nothing = RegionTransferOutcome {
             transfer_id: 0,
             exported: 0,
             applied: 0,
+            bytes: 0,
         };
         assert!(ok.verified());
         assert!(!short.verified());
         assert!(nothing.verified(), "nothing to move is trivially verified");
+        // Verification is about points delivered, not bandwidth spent: bytes
+        // must never enter the predicate.
+        let same_points_more_bytes = RegionTransferOutcome {
+            bytes: 1_000_000,
+            ..ok
+        };
+        assert!(same_points_more_bytes.verified());
+    }
+
+    /// The movement budget is a bandwidth throttle, so two regions with equal
+    /// point counts but very different row widths must not cost the same.
+    /// Charging points made a wide-row region look as cheap as a narrow one.
+    #[test]
+    fn the_budget_unit_is_bytes_not_points() {
+        let narrow = RegionTransferOutcome {
+            transfer_id: 1,
+            exported: 1_000,
+            applied: 1_000,
+            bytes: 20_000,
+        };
+        let wide = RegionTransferOutcome {
+            transfer_id: 2,
+            exported: 1_000,
+            applied: 1_000,
+            bytes: 900_000,
+        };
+        assert_eq!(narrow.exported, wide.exported);
+        assert!(
+            wide.bytes > narrow.bytes * 10,
+            "equal point counts must be able to differ hugely in bytes, which \
+             is exactly why the budget cannot be charged in points"
+        );
     }
 }

@@ -181,6 +181,18 @@ pub struct ShardRehomeRequest {
     /// staging). Uses the stage transfer that skips dest ownership checks.
     #[serde(default)]
     pub stage: bool,
+    /// Accepted and ignored. Retained only so a new binary can still decode a
+    /// payload from an older one: `ShardRehomeRequest` is
+    /// `deny_unknown_fields`, so removing the name would make the whole
+    /// request fail to parse mid-rolling-upgrade rather than defaulting it.
+    ///
+    /// It formerly skipped WAL entries at or below the destination's reported
+    /// watermark, comparing the learner's *node-wide* sequence against the
+    /// donor's — so a learner busy on any other region skipped its own
+    /// backfill and lost rows. Nothing reads it now; drop the field once no
+    /// supported version still sends it.
+    #[serde(default, skip_serializing)]
+    pub dest_skip_wal_through: u64,
 }
 
 #[cfg(test)]

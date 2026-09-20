@@ -940,11 +940,18 @@ impl RaftStore {
             }
             ClusterRequest::ShardMapMutation(op) => {
                 if let Some(ref shard_map) = self.shard_map {
-                    let measurement_key = op.measurement_key().clone();
+                    // Against the pre-apply map: a `DropSpace` removes spaces,
+                    // and every one of them needs its cache entry refreshed.
+                    let changed = match shard_map.snapshot().await {
+                        Ok(before) => op.affected_space_keys(&before),
+                        Err(_) => op.measurement_key().cloned().into_iter().collect(),
+                    };
                     match shard_map.apply_op(*op).await {
                         Ok(map) => {
                             if let Some(ref cache) = self.shard_location_cache {
-                                cache.refresh_measurement(&map, &measurement_key);
+                                for key in &changed {
+                                    cache.refresh_measurement(&map, key);
+                                }
                             }
                             ClusterResponse::success()
                         }

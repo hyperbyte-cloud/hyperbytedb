@@ -20,7 +20,7 @@ use crate::domain::point::Point;
 use crate::domain::series::series_id_for_point;
 use crate::domain::sharding::ShardLocationCache;
 use crate::domain::sharding::{
-    MeasurementKey, ShardBootstrapRequest, ShardEpoch, ShardMapOp, ShardRegion, ShardWriteRequest,
+    MeasurementKey, ShardBootstrapRequest, ShardEpoch, ShardMap, ShardMapOp, ShardRegion,
 };
 use crate::error::HyperbytedbError;
 use crate::ports::metadata::MetadataPort;
@@ -36,9 +36,20 @@ pub struct ShardRoutingContext {
 }
 
 pub struct PointBuckets {
-    pub local: Vec<Point>,
+    /// region_id -> points this node primaries locally
+    pub local: HashMap<u64, Vec<Point>>,
     /// region_id -> points for regions this node is not a peer of
     pub forward: HashMap<u64, Vec<Point>>,
+}
+
+/// Find a region by id anywhere in the map (region ids are globally unique).
+#[must_use]
+pub fn region_by_id(map: &ShardMap, region_id: u64) -> Option<ShardRegion> {
+    map.spaces
+        .values()
+        .flat_map(|s| s.regions.iter())
+        .find(|r| r.region_id == region_id)
+        .cloned()
 }
 
 /// Try remote peers in Active-only order until one succeeds.
@@ -360,7 +371,7 @@ pub async fn partition_points(
         }
     }
 
-    let mut local = Vec::new();
+    let mut local: HashMap<u64, Vec<Point>> = HashMap::new();
     let mut forward: HashMap<u64, Vec<Point>> = HashMap::new();
 
     for p in points {
@@ -374,7 +385,7 @@ pub async fn partition_points(
                 HyperbytedbError::ShardMap(format!("no region for series_id {sid}").into())
             })?;
         if route.self_is_peer && route.primary == ctx.node_id {
-            local.push(p);
+            local.entry(route.region_id).or_default().push(p);
         } else {
             forward.entry(route.region_id).or_default().push(p);
         }
@@ -446,17 +457,15 @@ async fn try_forward_shard_write_to_region(
 
     let precision_val = Precision::from_str_opt(precision);
     let body = encode_points_to_line_protocol(points, precision_val)?;
-    let req = ShardWriteRequest {
-        db: db.to_string(),
-        rp: rp.to_string(),
-        precision: precision.map(|s| s.to_string()),
-        epoch: region.epoch,
-        region_id: region.region_id,
-        body,
-    };
+    let epoch_json = serde_json::to_string(&region.epoch)
+        .map_err(|e| HyperbytedbError::Internal(e.to_string().into()))?;
 
     let region_id = region.region_id;
     let meas_owned = meas.clone();
+    let db_owned = db.to_string();
+    let rp_owned = rp.to_string();
+    let precision_owned = precision.map(|s| s.to_string());
+    let epoch_header = epoch_json.clone();
 
     scatter_to_region_peers(
         ctx,
@@ -464,18 +473,29 @@ async fn try_forward_shard_write_to_region(
         RegionTargetRole::Write,
         ScatterKind::Write,
         |peer_id, addr, timeout| {
-            let req = req.clone();
+            let body = body.clone();
             let addr = addr.to_string();
-            let db = db.to_string();
-            let rp = rp.to_string();
+            let db = db_owned.clone();
+            let rp = rp_owned.clone();
             let meas = meas_owned.clone();
+            let precision = precision_owned.clone();
+            let epoch_header = epoch_header.clone();
             async move {
                 let url = format!("http://{addr}/internal/shard/write");
-                let resp = ctx
+                let mut req = ctx
                     .peer_client
                     .http_client()
                     .post(&url)
-                    .json(&req)
+                    .header("Content-Type", "application/octet-stream")
+                    .header("X-HyperbyteDB-Shard-Db", &db)
+                    .header("X-HyperbyteDB-Shard-Rp", &rp)
+                    .header("X-HyperbyteDB-Shard-Region-Id", region_id.to_string())
+                    .header("X-HyperbyteDB-Shard-Epoch", epoch_header)
+                    .body(body);
+                if let Some(p) = precision.as_deref() {
+                    req = req.header("X-HyperbyteDB-Shard-Precision", p);
+                }
+                let resp = req
                     .timeout(timeout)
                     .send()
                     .await

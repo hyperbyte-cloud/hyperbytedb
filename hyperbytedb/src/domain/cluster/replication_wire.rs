@@ -7,6 +7,9 @@ pub const HTTP_HEADER_DATABASE: &str = "X-Hyperbytedb-DB";
 pub const HTTP_HEADER_RETENTION_POLICY: &str = "X-Hyperbytedb-RP";
 pub const HTTP_HEADER_PRECISION: &str = "X-Hyperbytedb-Precision";
 pub const HTTP_HEADER_ORIGIN_NODE: &str = "X-Hyperbytedb-Origin-Node";
+/// Shard region the replicated body belongs to. Absent on replayed
+/// hinted-handoff records, which predate the region being recorded.
+pub const HTTP_HEADER_REGION: &str = "X-Hyperbytedb-Region";
 pub const HTTP_HEADER_REPLICATED: &str = "X-Hyperbytedb-Replicated";
 /// When the coordinator wants to wait for the receiver to durably append the
 /// batch to the local WAL before responding (used by `sync_quorum`). Receiver

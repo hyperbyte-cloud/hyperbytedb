@@ -15,6 +15,14 @@ pub struct OutboundReplicationBatch {
     pub wal_seq: u64,
     /// When set, replicate only to these node ids (sharding region peers).
     pub target_node_ids: Option<Vec<u64>>,
+    /// The shard region this body belongs to, when sharding is on.
+    ///
+    /// A batch is built per region, and the receiver needs it to check that
+    /// the sender still holds the region. It is also part of the coalescing
+    /// key: two regions can legitimately share a peer set, so matching targets
+    /// alone would merge two regions' rows into one body and make the header a
+    /// lie about half of it.
+    pub region_id: Option<u64>,
 }
 
 /// Outbound write/mutation replication to cluster peers.

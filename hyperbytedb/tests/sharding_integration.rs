@@ -50,6 +50,7 @@ async fn location_cache_locates_after_bootstrap() {
         transfer_first_seen: None,
         state: Default::default(),
         staged_from: None,
+        staging_peers: Vec::new(),
     };
     map_store
         .apply_op(ShardMapOp::BootstrapMeasurement {
@@ -113,6 +114,7 @@ fn split_op_divides_region_range() {
         transfer_first_seen: None,
         state: Default::default(),
         staged_from: None,
+        staging_peers: Vec::new(),
     };
     let mut map = ShardMap::default();
     apply_shard_map_op(
@@ -164,6 +166,7 @@ fn merge_op_consolidates_adjacent_regions() {
         transfer_first_seen: None,
         state: Default::default(),
         staged_from: None,
+        staging_peers: Vec::new(),
     };
     let right = ShardRegion {
         region_id: 2,
@@ -177,6 +180,7 @@ fn merge_op_consolidates_adjacent_regions() {
         transfer_first_seen: None,
         state: Default::default(),
         staged_from: None,
+        staging_peers: Vec::new(),
     };
     let mut map = ShardMap::default();
     apply_shard_map_op(
@@ -195,6 +199,7 @@ fn merge_op_consolidates_adjacent_regions() {
                 transfer_first_seen: None,
                 state: Default::default(),
                 staged_from: None,
+                staging_peers: Vec::new(),
             },
         },
     )
@@ -223,6 +228,7 @@ fn merge_op_consolidates_adjacent_regions() {
         transfer_first_seen: None,
         state: Default::default(),
         staged_from: None,
+        staging_peers: Vec::new(),
     };
     apply_shard_map_op(
         &mut map,
@@ -255,6 +261,7 @@ fn four_region_space() -> hyperbytedb::domain::sharding::MeasurementShardSpace {
                 transfer_first_seen: None,
                 state: Default::default(),
                 staged_from: None,
+                staging_peers: Vec::new(),
             },
             ShardRegion {
                 region_id: 2,
@@ -268,6 +275,7 @@ fn four_region_space() -> hyperbytedb::domain::sharding::MeasurementShardSpace {
                 transfer_first_seen: None,
                 state: Default::default(),
                 staged_from: None,
+                staging_peers: Vec::new(),
             },
             ShardRegion {
                 region_id: 3,
@@ -281,6 +289,7 @@ fn four_region_space() -> hyperbytedb::domain::sharding::MeasurementShardSpace {
                 transfer_first_seen: None,
                 state: Default::default(),
                 staged_from: None,
+                staging_peers: Vec::new(),
             },
             ShardRegion {
                 region_id: 4,
@@ -294,6 +303,7 @@ fn four_region_space() -> hyperbytedb::domain::sharding::MeasurementShardSpace {
                 transfer_first_seen: None,
                 state: Default::default(),
                 staged_from: None,
+                staging_peers: Vec::new(),
             },
         ],
     }
@@ -309,7 +319,8 @@ fn region_selection_equality_where_hits_single_region() {
         hyperbytedb::timeseriesql::ast::Statement::Select(s) => s,
         _ => panic!("expected select"),
     };
-    let sel = select_regions_for_query(&space, "metrics", &stmt);
+    let tag_keys = vec!["host".to_string()];
+    let sel = select_regions_for_query(&space, "metrics", &tag_keys, &stmt);
     assert!(matches!(sel, RegionSelection::Single(_)));
     assert_eq!(sel.region_count(space.regions.len()), 1);
 }
@@ -324,7 +335,8 @@ fn region_selection_count_without_where_uses_all_regions() {
         hyperbytedb::timeseriesql::ast::Statement::Select(s) => s,
         _ => panic!("expected select"),
     };
-    let sel = select_regions_for_query(&space, "metrics", &stmt);
+    let tag_keys = vec!["host".to_string()];
+    let sel = select_regions_for_query(&space, "metrics", &tag_keys, &stmt);
     assert!(matches!(sel, RegionSelection::All));
     assert_eq!(sel.region_count(space.regions.len()), 4);
 }
@@ -344,7 +356,8 @@ fn region_selection_point_lookup_series_id_in_one_region() {
         hyperbytedb::timeseriesql::ast::Statement::Select(s) => s,
         _ => panic!("expected select"),
     };
-    let sel = select_regions_for_query(&space, "metrics", &stmt);
+    let tag_keys = vec!["host".to_string()];
+    let sel = select_regions_for_query(&space, "metrics", &tag_keys, &stmt);
     match sel {
         RegionSelection::Single(region) => assert_eq!(region.region_id, expected_region.region_id),
         other => panic!("expected single region, got {other:?}"),
@@ -381,6 +394,7 @@ fn resolve_region_peers_skips_disconnected_primary() {
         transfer_first_seen: None,
         state: Default::default(),
         staged_from: None,
+        staging_peers: Vec::new(),
     };
     let membership = sample_membership(&[
         (1, NodeState::Disconnected),
@@ -406,6 +420,7 @@ fn active_replication_targets_skip_disconnected_peers() {
         transfer_first_seen: None,
         state: Default::default(),
         staged_from: None,
+        staging_peers: Vec::new(),
     };
     let membership = sample_membership(&[
         (1, NodeState::Active),

@@ -38,13 +38,19 @@ impl<'a> RegionSelection<'a> {
 }
 
 /// Choose regions for a sharded measurement query.
+///
+/// Pruning by `series_id` is only sound when the WHERE clause fixes every tag
+/// key on the measurement (not a subset, and not a field column).
 #[must_use]
 pub fn select_regions_for_query<'a>(
     space: &'a MeasurementShardSpace,
     measurement: &str,
+    measurement_tag_keys: &[String],
     stmt: &SelectStatement,
 ) -> RegionSelection<'a> {
-    let Some(series_ids) = routable_series_ids(measurement, stmt.condition.as_ref()) else {
+    let Some(series_ids) =
+        routable_series_ids(measurement, measurement_tag_keys, stmt.condition.as_ref())
+    else {
         return RegionSelection::All;
     };
     if series_ids.is_empty() {
@@ -82,12 +88,30 @@ pub fn select_regions_for_materialized_dest<'a>(
 }
 
 /// Extract routable series_id values from a WHERE clause, if the predicate is exact enough.
-fn routable_series_ids(measurement: &str, condition: Option<&Expr>) -> Option<Vec<u64>> {
+fn routable_series_ids(
+    measurement: &str,
+    measurement_tag_keys: &[String],
+    condition: Option<&Expr>,
+) -> Option<Vec<u64>> {
     let expr = condition?;
     if let Some(tags) = tag_equalities_from_and(expr) {
+        if !tag_equalities_cover_all_keys(measurement_tag_keys, &tags) {
+            return None;
+        }
         return Some(vec![series_id(measurement, &tags)]);
     }
-    same_tag_or_series_ids(measurement, expr)
+    same_tag_or_series_ids(measurement, measurement_tag_keys, expr)
+}
+
+fn tag_equalities_cover_all_keys(
+    measurement_tag_keys: &[String],
+    equality_tags: &BTreeMap<String, String>,
+) -> bool {
+    let mut want: Vec<_> = measurement_tag_keys.to_vec();
+    want.sort();
+    let mut have: Vec<_> = equality_tags.keys().cloned().collect();
+    have.sort();
+    want == have
 }
 
 /// `tag = 'a' AND region = 'b' AND time > 1` → tag map; non-tag equalities on `time` are ignored.
@@ -108,7 +132,7 @@ fn collect_and_tag_equalities(expr: &Expr, tags: &mut BTreeMap<String, String>) 
                     && collect_and_tag_equalities(&be.right, tags)
             }
             BinaryOp::Eq => {
-                if let Some((tag, value)) = parse_tag_string_eq(&be.left, &be.right) {
+                if let Some((tag, value)) = parse_tag_identifier_eq(&be.left, &be.right) {
                     if is_time_identifier(&tag) {
                         return true;
                     }
@@ -128,13 +152,20 @@ fn collect_and_tag_equalities(expr: &Expr, tags: &mut BTreeMap<String, String>) 
 }
 
 /// `(host = 'a' OR host = 'b')` → two series_ids for the same tag.
-fn same_tag_or_series_ids(measurement: &str, expr: &Expr) -> Option<Vec<u64>> {
+fn same_tag_or_series_ids(
+    measurement: &str,
+    measurement_tag_keys: &[String],
+    expr: &Expr,
+) -> Option<Vec<u64>> {
     let mut values = Vec::new();
     let mut tag_name: Option<String> = None;
     if !collect_or_tag_values(expr, &mut tag_name, &mut values) {
         return None;
     }
     let tag = tag_name?;
+    if measurement_tag_keys.len() != 1 || measurement_tag_keys[0] != tag {
+        return None;
+    }
     if values.is_empty() || values.len() > MAX_SERIES_IDS_FOR_ROUTING {
         return None;
     }
@@ -162,7 +193,7 @@ fn collect_or_tag_values(
                     && collect_or_tag_values(&be.right, tag_name, values)
             }
             BinaryOp::Eq => {
-                let Some((tag, value)) = parse_tag_string_eq(&be.left, &be.right) else {
+                let Some((tag, value)) = parse_tag_identifier_eq(&be.left, &be.right) else {
                     return false;
                 };
                 if is_time_identifier(&tag) {
@@ -182,12 +213,10 @@ fn collect_or_tag_values(
     }
 }
 
-fn parse_tag_string_eq(left: &Expr, right: &Expr) -> Option<(String, String)> {
+fn parse_tag_identifier_eq(left: &Expr, right: &Expr) -> Option<(String, String)> {
     match (left, right) {
-        (Expr::Identifier(tag) | Expr::FieldRef { name: tag, .. }, Expr::StringLiteral(val))
-        | (Expr::StringLiteral(val), Expr::Identifier(tag) | Expr::FieldRef { name: tag, .. }) => {
-            Some((tag.clone(), val.clone()))
-        }
+        (Expr::Identifier(tag), Expr::StringLiteral(val))
+        | (Expr::StringLiteral(val), Expr::Identifier(tag)) => Some((tag.clone(), val.clone())),
         _ => None,
     }
 }
@@ -285,11 +314,15 @@ mod tests {
         }
     }
 
+    fn host_only_tags() -> Vec<String> {
+        vec!["host".into()]
+    }
+
     #[test]
     fn equality_where_selects_single_region() {
         let space = four_region_space();
         let stmt = select_stmt(r#"SELECT value FROM metrics WHERE host = 's50000'"#);
-        let sel = select_regions_for_query(&space, "metrics", &stmt);
+        let sel = select_regions_for_query(&space, "metrics", &host_only_tags(), &stmt);
         assert!(matches!(sel, RegionSelection::Single(_)));
         assert_eq!(sel.region_count(space.regions.len()), 1);
     }
@@ -298,7 +331,7 @@ mod tests {
     fn count_without_where_selects_all_regions() {
         let space = four_region_space();
         let stmt = select_stmt("SELECT count(value) FROM metrics");
-        let sel = select_regions_for_query(&space, "metrics", &stmt);
+        let sel = select_regions_for_query(&space, "metrics", &host_only_tags(), &stmt);
         assert!(matches!(sel, RegionSelection::All));
         assert_eq!(sel.region_count(space.regions.len()), 4);
     }
@@ -307,7 +340,7 @@ mod tests {
     fn regex_where_selects_all_regions() {
         let space = four_region_space();
         let stmt = select_stmt(r#"SELECT value FROM metrics WHERE host =~ /^prod/"#);
-        let sel = select_regions_for_query(&space, "metrics", &stmt);
+        let sel = select_regions_for_query(&space, "metrics", &host_only_tags(), &stmt);
         assert!(matches!(sel, RegionSelection::All));
     }
 
@@ -316,7 +349,7 @@ mod tests {
         let space = four_region_space();
         let stmt =
             select_stmt(r#"SELECT value FROM metrics WHERE host = 's1' AND time > now() - 1h"#);
-        let sel = select_regions_for_query(&space, "metrics", &stmt);
+        let sel = select_regions_for_query(&space, "metrics", &host_only_tags(), &stmt);
         assert!(matches!(sel, RegionSelection::Single(_)));
     }
 
@@ -327,7 +360,7 @@ mod tests {
         let stmt = select_stmt(&format!(
             r#"SELECT value FROM metrics WHERE host = '{h1}' OR host = '{h2}'"#
         ));
-        let sel = select_regions_for_query(&space, "metrics", &stmt);
+        let sel = select_regions_for_query(&space, "metrics", &host_only_tags(), &stmt);
         assert!(matches!(sel, RegionSelection::Subset(_)));
         assert_eq!(sel.region_count(space.regions.len()), 2);
     }
@@ -364,7 +397,16 @@ mod tests {
     fn mixed_tag_or_falls_back_to_all() {
         let space = four_region_space();
         let stmt = select_stmt(r#"SELECT value FROM metrics WHERE host = 'a' OR region = 'b'"#);
-        let sel = select_regions_for_query(&space, "metrics", &stmt);
+        let sel = select_regions_for_query(&space, "metrics", &host_only_tags(), &stmt);
+        assert!(matches!(sel, RegionSelection::All));
+    }
+
+    #[test]
+    fn partial_tag_equality_falls_back_to_all_regions() {
+        let space = four_region_space();
+        let stmt = select_stmt(r#"SELECT value FROM metrics WHERE host = 's50000'"#);
+        let tags = vec!["host".into(), "region".into()];
+        let sel = select_regions_for_query(&space, "metrics", &tags, &stmt);
         assert!(matches!(sel, RegionSelection::All));
     }
 

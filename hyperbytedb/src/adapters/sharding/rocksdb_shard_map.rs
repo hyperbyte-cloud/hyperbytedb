@@ -359,10 +359,14 @@ impl ShardMapPort for RocksDbShardMap {
 
     async fn apply_op(&self, op: ShardMapOp) -> Result<ShardMap, HyperbytedbError> {
         let _guard = self.apply_lock.lock().await;
-        let changed = op.measurement_key().clone();
         let mut map = (*self.cache.read()).as_ref().clone();
+        // Resolved against the pre-apply map: `DropSpace` removes spaces, and
+        // their rows can only be found while they are still there.
+        let changed = op.affected_space_keys(&map);
         apply_shard_map_op(&mut map, op).map_err(HyperbytedbError::from)?;
-        persist_space(&self.db, &map, &changed)?;
+        for key in &changed {
+            persist_space(&self.db, &map, key)?;
+        }
         *self.cache.write() = Arc::new(map.clone());
         Ok(map)
     }
@@ -540,5 +544,59 @@ mod tests {
             .unwrap();
         }
         assert!(RocksDbShardMap::open(dir.path(), true).is_err());
+    }
+    /// The map is persisted one row per space, so a `DropSpace` has to delete
+    /// every row it removed — otherwise the spaces come straight back on the
+    /// next reopen, which is the same leak as never dropping them at all.
+    #[tokio::test]
+    async fn drop_space_deletes_the_persisted_rows_not_just_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let sm = RocksDbShardMap::open(dir.path(), true).unwrap();
+            for (rp, measurement, id) in [
+                ("autogen", "cpu", 1u64),
+                ("hourly", "mem", 2),
+                ("autogen", "disk", 3),
+            ] {
+                sm.apply_op(ShardMapOp::BootstrapMeasurement {
+                    key: MeasurementKey::new("db", rp, measurement),
+                    region: region(id, 0, u64::MAX),
+                })
+                .await
+                .unwrap();
+            }
+            sm.apply_op(ShardMapOp::BootstrapMeasurement {
+                key: MeasurementKey::new("keep", "autogen", "cpu"),
+                region: region(4, 0, u64::MAX),
+            })
+            .await
+            .unwrap();
+
+            sm.apply_op(ShardMapOp::DropSpace {
+                db: "db".into(),
+                rp: None,
+                measurement: None,
+            })
+            .await
+            .unwrap();
+
+            let map = sm.snapshot().await.unwrap();
+            assert!(map.space("db", "autogen", "cpu").is_none());
+            assert!(map.space("keep", "autogen", "cpu").is_some());
+        }
+
+        let reopened = RocksDbShardMap::open(dir.path(), true).unwrap();
+        let map = reopened.snapshot().await.unwrap();
+        assert!(
+            map.space("db", "autogen", "cpu").is_none()
+                && map.space("db", "hourly", "mem").is_none()
+                && map.space("db", "autogen", "disk").is_none(),
+            "dropped spaces came back on reopen: {:?}",
+            map.spaces.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            map.space("keep", "autogen", "cpu").is_some(),
+            "another database's space must survive the drop"
+        );
     }
 }

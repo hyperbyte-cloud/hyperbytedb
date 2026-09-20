@@ -47,6 +47,9 @@ pub struct ShardedTestNode {
     pub location_cache: Arc<ShardLocationCache>,
     pub membership: SharedMembership,
     pub query_port: Arc<ChdbQueryAdapter>,
+    /// Present only when the node was started with a Raft handle; the
+    /// heartbeat endpoint is a no-op without it.
+    pub scheduler: Option<Arc<hyperbytedb::application::shard_scheduler::ShardScheduler>>,
     /// Shared with other in-process peers — libchdb allows one session per process.
     pub chdb: SharedSession,
     flush: Arc<FlushServiceImpl>,
@@ -224,6 +227,27 @@ pub async fn start_sharded_node(
         peer_client.clone(),
     ));
 
+    // Only with a Raft handle: the scheduler owns proposals, and there is
+    // nothing to propose through without one. Its presence is what makes the
+    // heartbeat endpoint record anything.
+    let scheduler = opts.raft.clone().map(|raft| {
+        Arc::new(
+            hyperbytedb::application::shard_scheduler::ShardScheduler::new(
+                shard_map.clone(),
+                shared_membership.clone(),
+                raft,
+                Some(peer_client.clone()),
+                metadata.clone(),
+                wal.clone(),
+                Some(chdb_adapter.clone() as Arc<dyn QueryPort>),
+                Some(sink.clone()),
+                node_id,
+                opts.sharding.clone(),
+                0,
+            ),
+        )
+    });
+
     let (shutdown_tx, _) = watch::channel(false);
 
     let app_state = Arc::new(AppState {
@@ -264,7 +288,7 @@ pub async fn start_sharded_node(
         shard_map: Some(shard_map.clone() as Arc<dyn ShardMapPort>),
         shard_location_cache: location_cache.clone(),
         shard_routing: Some(shard_routing),
-        shard_scheduler: None,
+        shard_scheduler: scheduler.clone().map(|s| s as Arc<_>),
         ingest_cardinality: IngestCardinalityLimits::default(),
         ingest_schema_cache: Default::default(),
         cluster_replication: opts.replication.clone(),
@@ -287,6 +311,7 @@ pub async fn start_sharded_node(
         location_cache,
         membership: shared_membership,
         query_port: chdb_adapter,
+        scheduler,
         chdb,
         flush,
         handle,
@@ -376,6 +401,7 @@ pub async fn apply_add_peer_on_nodes(
             region_id: region.region_id,
             to_peer,
             epoch: region.epoch,
+            staging: false,
         };
         node.shard_map.apply_op(op).await.unwrap();
         let snap = node.shard_map.snapshot().await.unwrap();
@@ -485,6 +511,7 @@ pub async fn bootstrap_region_on_all_nodes(
         transfer_first_seen: None,
         state: Default::default(),
         staged_from: None,
+        staging_peers: Vec::new(),
     };
     let op = ShardMapOp::BootstrapMeasurement {
         key: MeasurementKey::new(db, rp, measurement),

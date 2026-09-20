@@ -9,9 +9,9 @@ use crate::adapters::cluster::hinted_handoff::HintedHandoff;
 use crate::adapters::cluster::replication_log::ReplicationLog;
 use crate::domain::cluster::membership::SharedMembership;
 use crate::domain::cluster::replication_wire::{
-    HTTP_HEADER_DATABASE, HTTP_HEADER_ORIGIN_NODE, HTTP_HEADER_PRECISION, HTTP_HEADER_REPLICATED,
-    HTTP_HEADER_RETENTION_POLICY, HTTP_HEADER_SYNC, LINE_PROTOCOL_MEDIA_TYPE_V1,
-    ReplicationHintPayload,
+    HTTP_HEADER_DATABASE, HTTP_HEADER_ORIGIN_NODE, HTTP_HEADER_PRECISION, HTTP_HEADER_REGION,
+    HTTP_HEADER_REPLICATED, HTTP_HEADER_RETENTION_POLICY, HTTP_HEADER_SYNC,
+    LINE_PROTOCOL_MEDIA_TYPE_V1, ReplicationHintPayload,
 };
 use crate::domain::cluster::types::{
     MutationReplicateRequest, MutationReplicateResponse, MutationRequest,
@@ -311,6 +311,7 @@ impl PeerClient {
                     job.wal_seq,
                     hint_payload.clone(),
                     /* sync = */ false,
+                    job.region_id,
                 );
                 async move {
                     let _ = ctx.run().await;
@@ -399,6 +400,7 @@ impl PeerClient {
                 batch.wal_seq,
                 hint_payload.clone(),
                 /* sync = */ true,
+                batch.region_id,
             );
             tokio::spawn(async move {
                 let res = ctx.run().await;
@@ -479,6 +481,7 @@ impl PeerClient {
         wal_seq: u64,
         hint_payload: ReplicationHintPayload,
         sync: bool,
+        region_id: Option<u64>,
     ) -> PeerReplicateCtx {
         PeerReplicateCtx {
             url: format!("http://{}/internal/replicate", peer_addr),
@@ -494,6 +497,7 @@ impl PeerClient {
             wal_seq,
             hint_payload,
             sync,
+            region_id,
             max_attempts: self.max_retries,
         }
     }
@@ -752,6 +756,24 @@ fn coalesce_ok(
     {
         return false;
     }
+    // Two regions can legitimately share a peer set, so matching targets is
+    // not enough to make a merged body single-region — and the region travels
+    // on the wire as a header describing the WHOLE body. Merging across
+    // regions would make that header a lie about half the rows.
+    if a.region_id != b.region_id {
+        return false;
+    }
+    // Targets are part of the identity of a batch, not incidental to it.
+    // Under sharding each region gets its own batch with its own peer set, and
+    // the merge keeps the FIRST batch's targets — so coalescing two regions'
+    // batches sent one WAL sequence apart delivered region B's rows to region
+    // A's peers and never to B's own. That is an RF hole, not a duplicate:
+    // it reads as loss the moment B fails over. Batches from one request share
+    // a WAL sequence and so were never at risk; consecutive sequences from
+    // concurrent requests were.
+    if a.target_node_ids != b.target_node_ids {
+        return false;
+    }
     if b.wal_seq != a.wal_seq + 1 {
         return false;
     }
@@ -777,6 +799,10 @@ struct PeerReplicateCtx {
     wal_seq: u64,
     hint_payload: ReplicationHintPayload,
     sync: bool,
+    /// Region this body belongs to, when sharding is on. `None` for
+    /// unsharded writes; a replayed hint also arrives without one, since the
+    /// on-disk hint record predates the region being carried.
+    region_id: Option<u64>,
     max_attempts: u32,
 }
 
@@ -805,6 +831,9 @@ impl PeerReplicateCtx {
                 .header(HTTP_HEADER_RETENTION_POLICY, &self.retention_policy)
                 .header(HTTP_HEADER_ORIGIN_NODE, self.origin_node.to_string())
                 .body(self.body.clone());
+            if let Some(region_id) = self.region_id {
+                req = req.header(HTTP_HEADER_REGION, region_id.to_string());
+            }
             if let Some(ref p) = self.precision {
                 req = req.header(HTTP_HEADER_PRECISION, p);
             }
@@ -896,5 +925,105 @@ impl PeerReplicateCtx {
             tokio::time::sleep(delay).await;
             delay = (delay * 2).min(Duration::from_secs(30));
         }
+    }
+}
+
+#[cfg(test)]
+mod coalesce_tests {
+    use super::coalesce_ok;
+    use crate::ports::replication::OutboundReplicationBatch;
+
+    fn batch(wal_seq: u64, targets: Option<Vec<u64>>) -> OutboundReplicationBatch {
+        OutboundReplicationBatch {
+            database: "db".into(),
+            retention_policy: "autogen".into(),
+            precision: None,
+            body: b"cpu,host=h v=1".to_vec(),
+            wal_seq,
+            target_node_ids: targets,
+            region_id: None,
+        }
+    }
+
+    /// Two regions' batches must never merge: the merge keeps the first
+    /// batch's targets, so region B's rows would be delivered to region A's
+    /// peer set and never to B's own. That is an RF hole that surfaces as loss
+    /// on failover, not a duplicate.
+    #[test]
+    fn batches_for_different_region_peer_sets_do_not_coalesce() {
+        let a = batch(10, Some(vec![2, 3]));
+        let b = batch(11, Some(vec![4, 5]));
+        assert!(
+            !coalesce_ok(&a, &b, 1 << 20),
+            "batches with different targets were merged; the merged body would \
+             go only to {:?}",
+            a.target_node_ids
+        );
+    }
+
+    /// The unsharded case (no targets) and the same-peer-set case must still
+    /// coalesce — this fix must not cost the batching it exists for.
+    #[test]
+    fn batches_sharing_a_peer_set_still_coalesce() {
+        assert!(
+            coalesce_ok(
+                &batch(10, Some(vec![2, 3])),
+                &batch(11, Some(vec![2, 3])),
+                1 << 20
+            ),
+            "identical target sets must still merge"
+        );
+        assert!(
+            coalesce_ok(&batch(10, None), &batch(11, None), 1 << 20),
+            "unsharded batches must still merge"
+        );
+    }
+
+    fn region_batch(
+        wal_seq: u64,
+        targets: Option<Vec<u64>>,
+        region: Option<u64>,
+    ) -> OutboundReplicationBatch {
+        OutboundReplicationBatch {
+            region_id: region,
+            ..batch(wal_seq, targets)
+        }
+    }
+
+    /// Two regions can share a peer set, so matching targets is NOT enough to
+    /// make a merged body single-region. The region travels as a header
+    /// describing the whole body, so merging across regions would make that
+    /// header wrong about half the rows — and the receiver's membership check
+    /// would then judge them against the wrong region.
+    #[test]
+    fn batches_for_different_regions_do_not_coalesce_even_with_equal_targets() {
+        let a = region_batch(10, Some(vec![2, 3]), Some(7));
+        let b = region_batch(11, Some(vec![2, 3]), Some(8));
+        assert_eq!(a.target_node_ids, b.target_node_ids, "same peer set");
+        assert!(
+            !coalesce_ok(&a, &b, 1 << 20),
+            "two regions sharing a peer set must still not merge"
+        );
+        // Same region, same targets: merging is the whole point of coalescing.
+        assert!(coalesce_ok(
+            &region_batch(10, Some(vec![2, 3]), Some(7)),
+            &region_batch(11, Some(vec![2, 3]), Some(7)),
+            1 << 20
+        ));
+    }
+
+    /// Targets differing only by presence are still different targets.
+    #[test]
+    fn a_targeted_batch_never_merges_with_an_untargeted_one() {
+        assert!(!coalesce_ok(
+            &batch(10, None),
+            &batch(11, Some(vec![2])),
+            1 << 20
+        ));
+        assert!(!coalesce_ok(
+            &batch(10, Some(vec![2])),
+            &batch(11, None),
+            1 << 20
+        ));
     }
 }

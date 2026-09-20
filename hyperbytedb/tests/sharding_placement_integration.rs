@@ -22,6 +22,7 @@ fn region(start: u64, end: u64, peers: Vec<u64>, primary: u64) -> ShardRegion {
         transfer_first_seen: None,
         state: Default::default(),
         staged_from: None,
+        staging_peers: Vec::new(),
     }
 }
 

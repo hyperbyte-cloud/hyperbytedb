@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::stream::{StreamExt, TryStreamExt};
+use futures::stream::StreamExt;
 use metrics::{counter, histogram};
 
 #[cfg(feature = "columnar-ingest")]
@@ -193,31 +193,69 @@ impl PeerIngestionService {
 
         // Forward every non-local region bucket concurrently with bounded
         // parallelism: a batch spanning many regions must not pay serial
-        // HTTP round-trips. First error fails the ingest (same semantics as
-        // the previous sequential loop).
-        const FORWARD_CONCURRENCY: usize = 8;
+        // HTTP round-trips.
+        //
+        // Every bucket is attempted, and the local append below runs whatever
+        // the forwards did. This used to abort on the first error, which made a
+        // multi-region write fail in the worst possible way: the buckets that
+        // had already been forwarded stayed durable, the local bucket was
+        // discarded even though it would have succeeded, and the client was
+        // told the whole write failed. A write reported as failed that left
+        // rows behind is what produced the 24,538 "duplicated rows" reading in
+        // the split-write suite — 24,538 points stored whose batches returned
+        // non-204. There is no distributed transaction available here, so a
+        // partial write is still possible; what changes is that it is as small
+        // as we can make it and the error says so.
+        const FORWARD_CONCURRENCY: usize = 32;
+        let forward_region_count = buckets.forward.len();
         let forwards = buckets.forward.into_values().map(|fwd_points| async move {
             forward_shard_write_to_region(ctx, db, rp, precision, &fwd_points).await
         });
-        futures::stream::iter(forwards)
+        let forward_results: Vec<Result<(), HyperbytedbError>> = futures::stream::iter(forwards)
             .buffer_unordered(FORWARD_CONCURRENCY)
-            .try_collect::<Vec<()>>()
-            .await?;
+            .collect()
+            .await;
+        let mut forward_failures = 0usize;
+        let mut first_forward_error: Option<HyperbytedbError> = None;
+        for result in forward_results {
+            if let Err(e) = result {
+                forward_failures += 1;
+                // Classify before deciding anything about retries. A forward
+                // targets the region's primary only (`RegionTargetRole::Write`
+                // resolves to it alone), so the interesting question is whether
+                // these are "primary momentarily unreachable mid-failover" —
+                // which a bounded retry would recover — or rejections, which it
+                // would not. Guessing would just amplify load during exactly
+                // the window convergence is busiest.
+                let reason = match &e {
+                    HyperbytedbError::PeerUnreachable(_) => "peer_unreachable",
+                    HyperbytedbError::StaleShardEpoch { .. } => "stale_epoch",
+                    HyperbytedbError::TransferRejected { .. } => "rejected",
+                    HyperbytedbError::ShardMap(_) => "shard_map",
+                    _ => "other",
+                };
+                counter!(
+                    "hyperbytedb_shard_forward_failed_total",
+                    "reason" => reason
+                )
+                .increment(1);
+                if first_forward_error.is_none() {
+                    first_forward_error = Some(e);
+                }
+            }
+        }
 
         if !buckets.local.is_empty() {
-            // Capture routing identity before the bucket is moved into the WAL
-            // append; encode the replica body before the move too, avoiding a
-            // full clone of the local bucket.
-            let first = &buckets.local[0];
-            let first_measurement = first.measurement.clone();
-            let first_sid = crate::domain::series::series_id_for_point(first);
-            let local_body = encode_points_to_line_protocol(&buckets.local, precision_val)?;
+            let mut all_local: Vec<crate::domain::point::Point> = Vec::new();
+            for pts in buckets.local.values() {
+                all_local.extend(pts.iter().cloned());
+            }
 
             prepare_batch_metadata(
                 &self.metadata,
                 db,
                 rp,
-                &buckets.local,
+                &all_local,
                 self.limits,
                 Some(&self.schema_cache),
             )
@@ -227,28 +265,52 @@ impl PeerIngestionService {
                 self.sink.as_ref(),
                 db,
                 rp,
-                buckets.local,
+                all_local,
                 self.node_id,
                 self.max_points_per_request,
             )
             .await?;
 
             let map = ctx.shard_map.snapshot().await?;
-            let region = ctx
-                .location_cache
-                .locate(&map, db, rp, &first_measurement, first_sid)
-                .ok_or_else(|| HyperbytedbError::ShardMap("no region".into()))?;
-            drop(map);
-            let targets = region_replication_targets(ctx, &region).await;
-            self.dispatch_replication(OutboundReplicationBatch {
-                database: db.to_string(),
-                retention_policy: rp.to_string(),
-                precision: precision.map(|s| s.to_string()),
-                body: local_body,
-                wal_seq,
-                target_node_ids: Some(targets),
-            })
-            .await?;
+            for (region_id, region_points) in buckets.local {
+                let Some(region) = crate::application::shard_routing::region_by_id(&map, region_id)
+                else {
+                    return Err(HyperbytedbError::ShardMap(
+                        format!("no region {region_id}").into(),
+                    ));
+                };
+                let local_body = encode_points_to_line_protocol(&region_points, precision_val)?;
+                let targets = region_replication_targets(ctx, &region).await;
+                self.dispatch_replication(OutboundReplicationBatch {
+                    database: db.to_string(),
+                    retention_policy: rp.to_string(),
+                    precision: precision.map(|s| s.to_string()),
+                    body: local_body,
+                    wal_seq,
+                    target_node_ids: Some(targets),
+                    region_id: Some(region_id),
+                })
+                .await?;
+            }
+        }
+
+        // Reported after the local append, so a remote region's failure never
+        // costs the local one its write. Still an error: some of the batch did
+        // not land, and the caller has to know that. Naming the counts is what
+        // lets a reader tell a partial write from a total one — the split-write
+        // suite could not, and read the difference as duplication.
+        if let Some(err) = first_forward_error {
+            counter!("hyperbytedb_shard_ingest_partial_total").increment(1);
+            metrics::counter!("hyperbytedb_shard_ingest_forward_region_failures_total")
+                .increment(forward_failures as u64);
+            return Err(HyperbytedbError::ShardMap(
+                format!(
+                    "write partially applied: {forward_failures} of \
+                     {forward_region_count} forwarded regions failed \
+                     (local bucket applied); first error: {err}"
+                )
+                .into(),
+            ));
         }
 
         Ok(())
@@ -392,6 +454,7 @@ impl IngestionPort for PeerIngestionService {
                     body: replication_body,
                     wal_seq,
                     target_node_ids: None,
+                    region_id: None,
                 })
                 .await;
             return result;
@@ -500,6 +563,7 @@ impl IngestionPort for PeerIngestionService {
             body: replication_body,
             wal_seq,
             target_node_ids: None,
+            region_id: None,
         })
         .await
     }

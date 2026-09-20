@@ -16,10 +16,10 @@ use crate::application::shard_transfer::{
 };
 use crate::config::ShardingConfig;
 use crate::domain::cluster::membership::{
-    NodeState, SharedMembership, holds_placement, is_departing, is_serving,
+    NodeInfo, NodeState, SharedMembership, holds_placement, is_departing, is_serving,
 };
 use crate::domain::sharding::placement::{
-    PlacementStep, budget_exhausted, move_tier, next_placement_step, target_placement,
+    MoveTier, PlacementStep, budget_exhausted, move_tier, next_placement_step, target_placement,
 };
 use crate::domain::sharding::{
     MeasurementKey, ShardMap, ShardMapOp, ShardRegion, ShardRehomeRequest,
@@ -33,6 +33,50 @@ use crate::ports::wal::WalPort;
 
 type RegionHeartbeatRow = (u64, u64, u64, u64, u64, u64);
 
+/// Why a split attempt did nothing. Carried out of `try_split` so the region
+/// pass can tell "a split is now proposed, this region's shape is about to
+/// change" from "nothing happened here" — conflating the two is what made a
+/// capped measurement skip placement, heal and failover forever (G1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SplitRefusal {
+    /// Range is one key wide; there is no split point left.
+    RangeTooNarrow,
+    /// Parent still owes a transfer; splitting would fan the debt out.
+    TransferDebt,
+    /// The measurement is already at its region cap.
+    RegionCap,
+}
+
+impl SplitRefusal {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RangeTooNarrow => "range_too_narrow",
+            Self::TransferDebt => "transfer_debt",
+            Self::RegionCap => "region_cap",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SplitOutcome {
+    /// A `Split` op was proposed and committed; the region is now two regions.
+    Proposed,
+    Refused(SplitRefusal),
+}
+
+impl SplitOutcome {
+    fn is_proposed(self) -> bool {
+        matches!(self, Self::Proposed)
+    }
+}
+
+#[derive(Clone)]
+struct PendingPlacement {
+    key: MeasurementKey,
+    region_id: u64,
+    tier: MoveTier,
+}
+
 /// Entries older than this multiple of the report interval are ignored for
 /// scheduling decisions — otherwise stats from permanently-dead nodes would
 /// drive splits/rebalances forever.
@@ -41,6 +85,28 @@ const HEARTBEAT_TTL_INTERVALS: u64 = 3;
 /// Warn once a region has gone this many consecutive ticks with candidates
 /// available but none caught up to the committed map.
 const PLACEMENT_STALL_WARN_TICKS: u32 = 5;
+
+/// One shared slot per probe key, so concurrent movers that all want the same
+/// peer's answer run the probe once and the rest await that one result.
+///
+/// A plain "read cache, miss, probe, write cache" is single-flight only while
+/// callers are serialised. The movers are not: N of them start together, all
+/// miss, and all probe — turning a per-tick cache into a per-mover stampede
+/// against the same peer.
+type ProbeCell<T> = Arc<tokio::sync::OnceCell<T>>;
+
+/// Per-tick probe cache: peer id -> its reported map version, once fetched.
+type PeerMapVersions = tokio::sync::RwLock<HashMap<u64, ProbeCell<Option<(u64, u64)>>>>;
+
+/// Region cap per measurement scales with the candidate count, floored by
+/// `max_regions_per_measurement`. Splits are metadata-only, so the cost of a
+/// region is a map entry and a heartbeat row, not a copy.
+const REGIONS_PER_CANDIDATE: usize = 32;
+
+fn peer_disconnected_past_deadline(node: &NodeInfo, now: i64, timeout_secs: u64) -> bool {
+    node.state == NodeState::Disconnected
+        && now.saturating_sub(node.last_heartbeat) as u64 >= timeout_secs
+}
 
 /// After the first failure, repeat the convergence warning every this many
 /// consecutive ticks. Every region failing every tick would otherwise be a
@@ -56,15 +122,18 @@ fn region_ready_to_split(
     now: u64,
     split_series: u64,
     max_series: u64,
-    cooldown_secs: u64,
+    split_cooldown_secs: u64,
 ) -> bool {
+    if series_count > max_series {
+        return true;
+    }
     if last_split_at == 0 {
         return false;
     }
-    if now.saturating_sub(last_split_at) < cooldown_secs {
+    if now.saturating_sub(last_split_at) < split_cooldown_secs {
         return false;
     }
-    series_count > max_series || series_count > split_series
+    series_count > split_series
 }
 
 fn max_region_peer_heartbeat_stats(hb: &[RegionHeartbeatRow], region: &ShardRegion) -> (u64, u64) {
@@ -85,6 +154,11 @@ fn max_region_peer_heartbeat_stats(hb: &[RegionHeartbeatRow], region: &ShardRegi
 /// `transfer_verified` flag, so leadership change or process restart rebuilds
 /// the queue from a map scan.
 #[derive(Debug, Clone)]
+/// Dead since splits became metadata-only: the split was the only caller,
+/// and nothing creates transfer debt any more. Retained deliberately —
+/// removing the reconciliation machinery is a large deletion that deserves
+/// its own review, not a side effect of an unrelated change.
+#[allow(dead_code)]
 pub(crate) struct PendingTransfer {
     pub key: MeasurementKey,
     pub region_id: u64,
@@ -103,8 +177,10 @@ pub(crate) struct PendingTransfer {
 }
 
 /// Ticks without applied-count progress before a stuck entry escalates.
+#[allow(dead_code)]
 const RECONCILE_PARK_AFTER_TICKS: u32 = 10;
 /// Minimum debt age (persisted via `transfer_first_seen`) before parking.
+#[allow(dead_code)]
 const RECONCILE_MIN_AGE_SECS: i64 = 300;
 
 pub struct ShardScheduler {
@@ -122,6 +198,12 @@ pub struct ShardScheduler {
     heartbeats: tokio::sync::RwLock<Vec<RegionHeartbeatRow>>,
     /// Regions with an in-flight operator (split/merge/rebalance/failover/transfer).
     region_operators: tokio::sync::RwLock<HashMap<u64, ()>>,
+    /// region_id -> the attempt sequence number of its last convergence move.
+    /// Sorting the mover queue by this is what makes it round-robin: without
+    /// it the queue was ordered by tier alone, so map order decided everything
+    /// and the same few regions were retried every tick forever.
+    placement_last_attempted: tokio::sync::RwLock<HashMap<u64, u64>>,
+    placement_attempt_seq: std::sync::atomic::AtomicU64,
     /// (db, rp, measurement, region_id) -> unix secs when primary first seen unhealthy
     unhealthy_primaries: tokio::sync::RwLock<HashMap<(String, String, String, u64), u64>>,
     /// Post-commit split-transfer reconciliation queue. Idempotent per
@@ -150,7 +232,7 @@ pub struct ShardScheduler {
     /// keeps `Disconnected` — so without this a restarting node is re-probed
     /// once per region at up to `connect_timeout` each, and enough regions
     /// means the tick never finishes.
-    peer_map_versions: tokio::sync::RwLock<HashMap<u64, Option<(u64, u64)>>>,
+    peer_map_versions: PeerMapVersions,
     /// Consecutive ticks a region skipped placement with no caught-up
     /// candidate, keyed by region id. A cluster-wide placement stall is
     /// otherwise only visible at `debug!`.
@@ -211,6 +293,8 @@ impl ShardScheduler {
             max_points_per_request,
             heartbeats: tokio::sync::RwLock::new(Vec::new()),
             region_operators: tokio::sync::RwLock::new(HashMap::new()),
+            placement_last_attempted: tokio::sync::RwLock::new(HashMap::new()),
+            placement_attempt_seq: std::sync::atomic::AtomicU64::new(0),
             unhealthy_primaries: tokio::sync::RwLock::new(HashMap::new()),
             reconciliation_queue: std::sync::Mutex::new(Vec::new()),
             rollup_dests: tokio::sync::RwLock::new(HashMap::new()),
@@ -253,10 +337,38 @@ impl ShardScheduler {
         cluster_ver: u64,
         client: &reqwest::Client,
     ) -> Option<(u64, u64)> {
-        if let Some(v) = self.peer_map_versions.read().await.get(&peer) {
-            return *v;
+        let cell = self.probe_cell(&self.peer_map_versions, peer).await;
+        *cell
+            .get_or_init(|| self.probe_peer_map_version(peer, addr, cluster_ver, client))
+            .await
+    }
+
+    /// The shared slot for `key`, created on first use. Held only long enough
+    /// to clone the `Arc` — never across the probe itself.
+    async fn probe_cell<K: Copy + Eq + std::hash::Hash, T>(
+        &self,
+        cache: &tokio::sync::RwLock<HashMap<K, ProbeCell<T>>>,
+        key: K,
+    ) -> ProbeCell<T> {
+        if let Some(cell) = cache.read().await.get(&key) {
+            return cell.clone();
         }
-        let probed = match fetch_peer_map_version(client, addr).await {
+        cache
+            .write()
+            .await
+            .entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+            .clone()
+    }
+
+    async fn probe_peer_map_version(
+        &self,
+        peer: u64,
+        addr: &str,
+        cluster_ver: u64,
+        client: &reqwest::Client,
+    ) -> Option<(u64, u64)> {
+        match fetch_peer_map_version(client, addr).await {
             Ok(version) => Some((version, cluster_ver)),
             Err(e) => {
                 // Warn, not debug: the shipped image pins the log level to
@@ -271,9 +383,7 @@ impl ShardScheduler {
                 );
                 None
             }
-        };
-        self.peer_map_versions.write().await.insert(peer, probed);
-        probed
+        }
     }
 
     /// Record that `region_id` could not place a replica this tick, and warn
@@ -340,6 +450,12 @@ impl ShardScheduler {
             .await
             .retain(|id, _| live.contains(id));
         self.placement_errors
+            .write()
+            .await
+            .retain(|id, _| live.contains(id));
+        // Splits and merges churn region ids, so the round-robin cursor would
+        // otherwise grow without bound.
+        self.placement_last_attempted
             .write()
             .await
             .retain(|id, _| live.contains(id));
@@ -432,6 +548,7 @@ impl ShardScheduler {
     ///
     /// The flip is one committed op, so every node's location cache applies it
     /// in the same apply: no node sees a half-applied handover.
+    #[allow(dead_code)]
     async fn try_activate_staged_regions(&self, map: &ShardMap) {
         for space in map.spaces.values() {
             for region in &space.regions {
@@ -506,6 +623,18 @@ impl ShardScheduler {
         now: u64,
     ) -> Result<(), HyperbytedbError> {
         self.try_failover_unhealthy_primary(key, region, now).await
+    }
+
+    /// The series count this scheduler holds for `(region_id, node_id)`, or
+    /// `None` if it never recorded one. Test support for the heartbeat
+    /// handler, which has no other externally visible effect.
+    pub async fn recorded_heartbeat_series(&self, region_id: u64, node_id: u64) -> Option<u64> {
+        self.heartbeats
+            .read()
+            .await
+            .iter()
+            .find(|(r, n, ..)| *r == region_id && *n == node_id)
+            .map(|(_, _, series, ..)| *series)
     }
 
     pub async fn record_heartbeat(
@@ -596,11 +725,6 @@ impl ShardScheduler {
             .store(0, std::sync::atomic::Ordering::Relaxed);
         let map = self.shard_map.snapshot().await?;
         self.prune_region_counters(&map).await;
-        self.drain_reconciliation(&map).await;
-        // After reconciliation: a child whose movement just verified becomes
-        // routable in this same tick rather than waiting for the next.
-        let map = self.shard_map.snapshot().await?;
-        self.try_activate_staged_regions(&map).await;
         // Learners left behind by a failed promote would otherwise never be
         // revisited: once in `peers`, the region looks converged.
         self.try_promote_learners(&map).await;
@@ -623,6 +747,8 @@ impl ShardScheduler {
             .copied()
             .collect();
 
+        let mut pending_placements: Vec<PendingPlacement> = Vec::new();
+
         for (key, space) in &map.spaces {
             metrics::gauge!(
                 "hyperbytedb_shard_regions",
@@ -631,6 +757,8 @@ impl ShardScheduler {
                 "measurement" => key.measurement.clone(),
             )
             .set(space.regions.len() as f64);
+
+            let mut cap_refused = 0usize;
 
             for (idx, region) in space.regions.iter().enumerate() {
                 let (series_count, write_qps) = max_region_peer_heartbeat_stats(&hb, region);
@@ -648,21 +776,54 @@ impl ShardScheduler {
                     continue;
                 }
 
+                // Availability before shape. Heal and failover run first so a
+                // region that cannot split — capped, too narrow, or carrying
+                // transfer debt — still gets a live primary and RF restored.
+                // While these ran last, a measurement at its cap left every
+                // region unhealable for as long as it stayed at the cap.
+                if let Err(e) = self.try_replace_dead_peer(&space.key, region).await {
+                    tracing::debug!(error = %e, region_id = region.region_id, "peer heal skipped");
+                }
+
+                if let Err(e) = self
+                    .try_failover_unhealthy_primary(&space.key, region, now)
+                    .await
+                {
+                    tracing::debug!(error = %e, region_id = region.region_id, "failover skipped");
+                }
+
                 let should_split = region_ready_to_split(
                     series_count,
                     region.last_split_at,
                     now,
                     self.config.region_split_series,
                     self.config.region_max_series,
-                    self.config.split_merge_interval_secs,
+                    self.config.region_split_cooldown_secs,
                 );
 
+                // Only a *proposed* split ends the region's pass: it replaced
+                // this region with two children, so placement on the region we
+                // are holding is meaningless. A refusal leaves the region
+                // exactly as it was, and the pass must carry on.
                 if should_split {
                     let key = space.key.clone();
                     let region = region.clone();
-                    if self.try_split(&key, &region, series_count).await.is_ok() {
-                        self.release_operator(region.region_id).await;
-                        continue;
+                    match self.try_split(&key, &region, series_count).await {
+                        Ok(outcome) if outcome.is_proposed() => {
+                            self.release_operator(region.region_id).await;
+                            continue;
+                        }
+                        Ok(SplitOutcome::Refused(SplitRefusal::RegionCap)) => {
+                            cap_refused += 1;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::debug!(
+                                error = %e,
+                                region_id = region.region_id,
+                                "shard split failed"
+                            );
+                        }
                     }
                 }
 
@@ -691,56 +852,199 @@ impl ShardScheduler {
                 {
                     let key = space.key.clone();
                     let region = region.clone();
-                    if self.try_split(&key, &region, series_count).await.is_ok() {
-                        self.release_operator(region.region_id).await;
-                        continue;
+                    match self.try_split(&key, &region, series_count).await {
+                        Ok(outcome) if outcome.is_proposed() => {
+                            self.release_operator(region.region_id).await;
+                            continue;
+                        }
+                        Ok(SplitOutcome::Refused(SplitRefusal::RegionCap)) => {
+                            cap_refused += 1;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::debug!(
+                                error = %e,
+                                region_id = region.region_id,
+                                "shard load split failed"
+                            );
+                        }
                     }
                 }
 
-                // A placement that commits changes the region's epoch, peers or
-                // primary, which makes the `region` borrowed from this tick's
-                // snapshot stale. Everything below reads that borrow, and
-                // `try_rebalance` would spend a full region copy before its
-                // proposal failed the epoch CAS — so yield the region and pick
-                // it up fresh on the next tick.
-                let placed = match self.try_converge_placement(&space.key, region).await {
-                    Ok(placed) => {
-                        self.clear_placement_error(region.region_id).await;
-                        placed
-                    }
-                    Err(e) => {
-                        self.note_placement_error(region.region_id, &e).await;
-                        false
-                    }
-                };
-                if placed {
-                    self.release_operator(region.region_id).await;
-                    continue;
-                }
-
-                if let Err(e) = self.try_rebalance(&space.key, region, &hb).await {
-                    tracing::debug!(error = %e, region_id = region.region_id, "rebalance skipped");
-                }
-
-                if let Err(e) = self.try_replace_dead_peer(&space.key, region).await {
-                    tracing::debug!(error = %e, region_id = region.region_id, "peer heal skipped");
-                }
-
-                if let Err(e) = self
-                    .try_failover_unhealthy_primary(&space.key, region, now)
-                    .await
-                {
-                    tracing::debug!(error = %e, region_id = region.region_id, "failover skipped");
+                if let Some(tier) = self.preview_placement_tier(&space.key, region).await {
+                    pending_placements.push(PendingPlacement {
+                        key: space.key.clone(),
+                        region_id: region.region_id,
+                        tier,
+                    });
                 }
 
                 self.release_operator(region.region_id).await;
             }
+
+            // One line per measurement per tick, not one per region: at the cap
+            // every region refuses on every tick, which drowned the log.
+            if cap_refused > 0 {
+                tracing::warn!(
+                    db = %key.db,
+                    rp = %key.rp,
+                    measurement = %key.measurement,
+                    region_count = space.regions.len(),
+                    regions_refused = cap_refused,
+                    "shard splits refused: measurement at region cap"
+                );
+            }
         }
+
+        self.run_pending_placements(pending_placements).await;
 
         // After the region pass, so a node that finished evacuating this tick
         // is retired in the same tick rather than waiting for the next.
         self.retire_evacuated_nodes().await;
         Ok(())
+    }
+
+    /// Whether this region has a placement step pending (cheap; no data movement).
+    async fn preview_placement_tier(
+        &self,
+        key: &MeasurementKey,
+        region: &ShardRegion,
+    ) -> Option<MoveTier> {
+        if self.is_rollup_dest(key).await || self.peer_client.is_none() {
+            return None;
+        }
+        let map = self.shard_map.snapshot().await.ok()?;
+        let region = current_region(&map, key, region.region_id)?;
+        let candidates = self.active_candidate_ids().await;
+        if candidates.is_empty() {
+            return None;
+        }
+        let rf = effective_replication_factor(self.config.replication_factor, candidates.len());
+        let target = target_placement(key, region.start, &candidates, rf);
+        next_placement_step(region, &target)?;
+        let departing = self.departing_node_ids().await;
+        let unhealthy = self.unhealthy_region_peers(region).await;
+        Some(move_tier(region, rf, &departing, &unhealthy))
+    }
+
+    /// Drain the planner's queue with a bounded pool of movers.
+    ///
+    /// Was: sort by tier, `take(schedule_limit)`, and `.await` each full copy
+    /// inline. That is head-of-line blocking with a fixed order — at one tier
+    /// the same first `schedule_limit` regions in map order were retried every
+    /// tick, and every region behind them waited on a copy that had nothing to
+    /// do with them. On the kind cluster that was 15 placements in five hours.
+    ///
+    /// Now: every queued region is attempted each tick, `schedule_limit` at a
+    /// time, ordered by tier (safety first) and then least-recently-attempted
+    /// so the movement budget rotates across regions instead of pinning to
+    /// whichever ones sort first. Each mover holds the region operator for the
+    /// whole `AddPeer -> stage -> PromotePeer` sequence, so no other part of
+    /// the tick can touch a region mid-move.
+    async fn run_pending_placements(&self, mut pending: Vec<PendingPlacement>) {
+        use futures::stream::StreamExt;
+
+        if pending.is_empty() {
+            return;
+        }
+        let last_attempted = self.placement_last_attempted.read().await.clone();
+        pending.sort_by_key(|p| {
+            (
+                p.tier,
+                last_attempted.get(&p.region_id).copied().unwrap_or(0),
+                p.region_id,
+            )
+        });
+
+        let limit = self.config.schedule_limit.max(1);
+        futures::stream::iter(pending)
+            .for_each_concurrent(limit, |job| async move {
+                // One mover per region. A region the planning pass is still
+                // holding is simply left for the next tick.
+                if !self.acquire_operator(job.region_id).await {
+                    return;
+                }
+                self.note_placement_attempt(job.region_id).await;
+                self.run_one_placement(&job).await;
+                self.release_operator(job.region_id).await;
+            })
+            .await;
+    }
+
+    async fn run_one_placement(&self, job: &PendingPlacement) {
+        let Ok(map) = self.shard_map.snapshot().await else {
+            return;
+        };
+        let Some(region) = current_region(&map, &job.key, job.region_id) else {
+            return;
+        };
+        match self.try_converge_placement(&job.key, region).await {
+            Ok(true) => {
+                self.clear_placement_error(job.region_id).await;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                // Isolated to this region on purpose: a region that cannot be
+                // moved must not cost the other queued regions their tick.
+                self.note_placement_error(job.region_id, &e).await;
+            }
+        }
+    }
+
+    async fn note_placement_attempt(&self, region_id: u64) {
+        let seq = self
+            .placement_attempt_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        self.placement_last_attempted
+            .write()
+            .await
+            .insert(region_id, seq);
+    }
+
+    /// Per-region progress for every holder of `region`, from the heartbeat
+    /// stream.
+    ///
+    /// This replaces the manifest watermark as the input to primary selection,
+    /// and the difference is the whole point: `sync_manifest` emits a region
+    /// watermark ONLY where the reporting node is that region's primary, so a
+    /// candidate reported 0 for every region it merely replicates. `0` there
+    /// means "I am not the primary", not "I hold no data" — so every candidate
+    /// looked infinitely behind and `promote_skipped_total{watermark_lag}`
+    /// blocked primacy from ever moving. Measured on the kind cluster: 2,431
+    /// skips, one node primarying all 192 regions.
+    ///
+    /// The heartbeat path already carries the right quantity. Every node in
+    /// `region.peers` reports its series count for that region — learners
+    /// included, since `AddPeer` puts them in `peers` — so this is per-region
+    /// and comparable across replicas. `None` means no fresh heartbeat: not
+    /// heard from, which is distinct from a reported zero.
+    async fn region_progress_for_peers(&self, region: &ShardRegion) -> HashMap<u64, Option<u64>> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let ttl = self
+            .config
+            .heartbeat_interval_secs
+            .saturating_mul(HEARTBEAT_TTL_INTERVALS)
+            .max(1);
+        let hb = self.heartbeats.read().await;
+        region
+            .peers
+            .iter()
+            .copied()
+            .map(|peer| {
+                let progress = hb
+                    .iter()
+                    .filter(|(r, n, .., at)| {
+                        *r == region.region_id && *n == peer && now.saturating_sub(*at) <= ttl
+                    })
+                    .map(|(_, _, series, ..)| *series)
+                    .max();
+                (peer, progress)
+            })
+            .collect()
     }
 
     async fn try_failover_unhealthy_primary(
@@ -782,6 +1086,50 @@ impl ShardScheduler {
         )
         .await;
         let Some(new_primary) = new_primary else {
+            // No serving peer survives. If a learner does, promote it and hand
+            // it primacy in the same tick rather than leaving the region with
+            // no target at all.
+            //
+            // The watermark guard below is deliberately NOT applied here:
+            // availability outranks it when the alternative is an
+            // indefinitely unserved region, and a learner populated by bulk
+            // transfer legitimately reports a low position anyway. The gap is
+            // logged instead of silently deciding.
+            if let Some(learner) =
+                pick_learner_survivor(&self.membership, region, self.node_id).await
+            {
+                tracing::warn!(
+                    region_id = region.region_id,
+                    learner,
+                    dead_primary = region.primary,
+                    "promoting learner-only survivor: region has no serving peer"
+                );
+                self.propose(ShardMapOp::PromotePeer {
+                    key: key.clone(),
+                    region_id: region.region_id,
+                    peer: learner,
+                    epoch: region.epoch,
+                })
+                .await?;
+                counter!("hyperbytedb_shard_learner_survivor_promoted_total").increment(1);
+
+                // Re-read: PromotePeer moved the epoch, and TransferPrimary
+                // must carry the current one.
+                let after = self.shard_map.snapshot().await?;
+                let Some(current) = current_region(&after, key, region.region_id) else {
+                    return Ok(());
+                };
+                self.propose(ShardMapOp::TransferPrimary {
+                    key: key.clone(),
+                    region_id: current.region_id,
+                    new_primary: learner,
+                    epoch: current.epoch,
+                })
+                .await?;
+                counter!("hyperbytedb_shard_primary_failover_total").increment(1);
+                self.unhealthy_primaries.write().await.remove(&map_key);
+                return Ok(());
+            }
             counter!(
                 "hyperbytedb_shard_primary_failover_skipped_total",
                 "reason" => "no_alternate"
@@ -794,13 +1142,12 @@ impl ShardScheduler {
         // watermark lags the best known for this region. Moving primary to a
         // data-less node converts a visible availability blip into silent
         // empty reads; blocking keeps reads routed at whoever holds the data.
-        if let Some(pc) = self.peer_client.as_ref() {
-            let candidate_wm = peer_region_wal_watermark(pc, new_primary, region.region_id).await;
-            let mut max_wm = candidate_wm;
-            for p in &region.peers {
-                let wm = peer_region_wal_watermark(pc, *p, region.region_id).await;
-                max_wm = max_wm.max(wm);
-            }
+        if self.peer_client.is_some() {
+            let progress = self.region_progress_for_peers(region).await;
+            // `flatten` drops unknowns rather than reading them as 0: only
+            // progress we actually heard take part in the comparison.
+            let candidate_wm = progress.get(&new_primary).copied().flatten();
+            let max_wm = progress.values().copied().flatten().max();
             if !failover_watermark_safe(candidate_wm, max_wm) {
                 counter!(
                     "hyperbytedb_shard_primary_failover_skipped_total",
@@ -823,14 +1170,17 @@ impl ShardScheduler {
         Ok(())
     }
 
+    /// Propose a split, or say why not. A `Refused` outcome means the region
+    /// is unchanged and the rest of its pass (placement, heal, failover) must
+    /// still run — only `Proposed` invalidates the region we are holding.
     async fn try_split(
         &self,
         key: &MeasurementKey,
         region: &ShardRegion,
         series_count: u64,
-    ) -> Result<(), HyperbytedbError> {
+    ) -> Result<SplitOutcome, HyperbytedbError> {
         if region.end.saturating_sub(region.start) <= 1 {
-            return Ok(());
+            return Ok(self.refuse_split(SplitRefusal::RangeTooNarrow));
         }
         // Lifecycle guard: never fan outstanding transfer debt out across a
         // re-split (round-3 N2).
@@ -839,22 +1189,26 @@ impl ShardScheduler {
                 region_id = region.region_id,
                 "shard split deferred: transfer debt outstanding on parent"
             );
-            return Ok(());
+            return Ok(self.refuse_split(SplitRefusal::TransferDebt));
         }
         let map = self.shard_map.snapshot().await?;
+        let candidates = self.active_candidate_ids().await;
+        let cap = region_cap(self.config.max_regions_per_measurement, candidates.len());
         if let Some(space) = map.space(&key.db, &key.rp, &key.measurement)
-            && space.regions.len() >= self.config.max_regions_per_measurement
+            && space.regions.len() >= cap
         {
-            tracing::warn!(
+            // Debug, not warn: at the cap this fires for every region on every
+            // tick. The tick logs one warn per measurement instead.
+            tracing::debug!(
                 region_id = region.region_id,
                 series_count,
                 start = region.start,
                 end = region.end,
                 region_count = space.regions.len(),
-                max_regions = self.config.max_regions_per_measurement,
+                max_regions = cap,
                 "shard split refused: region cap reached"
             );
-            return Ok(());
+            return Ok(self.refuse_split(SplitRefusal::RegionCap));
         }
         let split_key = self.compute_split_key(key, region).await?;
         tracing::info!(
@@ -925,7 +1279,16 @@ impl ShardScheduler {
         }
         counter!("hyperbytedb_shard_splits_total").increment(1);
 
-        Ok(())
+        Ok(SplitOutcome::Proposed)
+    }
+
+    fn refuse_split(&self, reason: SplitRefusal) -> SplitOutcome {
+        counter!(
+            "hyperbytedb_shard_split_refused_total",
+            "reason" => reason.as_str()
+        )
+        .increment(1);
+        SplitOutcome::Refused(reason)
     }
 
     /// Propose clearing a verified split-transfer debt. No-op success when
@@ -986,6 +1349,7 @@ impl ShardScheduler {
         q.push(entry);
     }
 
+    #[allow(dead_code)]
     async fn propose_clear_verified(
         &self,
         key: &MeasurementKey,
@@ -1127,11 +1491,13 @@ impl ShardScheduler {
     /// `Decommissioning` and `Leaving` are excluded, which is exactly what
     /// makes convergence evacuate them without a dedicated rule.
     async fn active_candidate_ids(&self) -> Vec<u64> {
+        let now = chrono::Utc::now().timestamp();
+        let timeout = self.config.dead_node_timeout_secs;
         let m = self.membership.read().await;
         let mut ids: Vec<u64> = m
             .nodes
             .values()
-            .filter(|n| holds_placement(n))
+            .filter(|n| holds_placement(n) && !peer_disconnected_past_deadline(n, now, timeout))
             .map(|n| n.node_id)
             .collect();
         drop(m);
@@ -1237,6 +1603,10 @@ impl ShardScheduler {
         // Re-read: `drain_reconciliation` runs before the tick loop and can
         // bump epochs, so the caller's snapshot may already be stale.
         let map = self.shard_map.snapshot().await?;
+        metrics::gauge!("hyperbytedb_shard_placement_map_version").set(map.map_version as f64);
+        let membership_version = self.membership.read().await.version;
+        metrics::gauge!("hyperbytedb_shard_placement_membership_version")
+            .set(membership_version as f64);
         let Some(region) = current_region(&map, key, region.region_id) else {
             return Ok(false);
         };
@@ -1326,7 +1696,11 @@ impl ShardScheduler {
 
                 // Re-read: AddPeer bumped the epoch, and PromotePeer must carry
                 // the current one.
-                let staged = self.stage_region_onto(key, region, to_peer).await?;
+                let after_add = self.shard_map.snapshot().await?;
+                let Some(after_region) = current_region(&after_add, key, region.region_id) else {
+                    return Ok(true);
+                };
+                let staged = self.stage_region_onto(key, after_region, to_peer).await?;
                 self.tick_moved_bytes
                     .fetch_add(staged, std::sync::atomic::Ordering::Relaxed);
 
@@ -1374,25 +1748,25 @@ impl ShardScheduler {
                         "promoting despite watermark guard: primary is departing"
                     );
                 }
-                if !evacuating && let Some(pc) = self.peer_client.as_ref() {
-                    let candidate_wm =
-                        peer_region_wal_watermark(pc, new_primary, region.region_id).await;
-                    let mut max_wm = candidate_wm;
-                    for p in &region.peers {
-                        max_wm =
-                            max_wm.max(peer_region_wal_watermark(pc, *p, region.region_id).await);
-                    }
-                    if !failover_watermark_safe(candidate_wm, max_wm) {
+                if !evacuating && self.peer_client.is_some() {
+                    let progress = self.region_progress_for_peers(region).await;
+                    let candidate_p = progress.get(&new_primary).copied().flatten();
+                    let best_p = progress.values().copied().flatten().max();
+                    if !promote_progress_safe(
+                        candidate_p,
+                        best_p,
+                        self.config.promote_min_progress_pct,
+                    ) {
                         counter!(
                             "hyperbytedb_shard_promote_skipped_total",
-                            "reason" => "watermark_lag"
+                            "reason" => "region_progress"
                         )
                         .increment(1);
                         tracing::info!(
                             region_id = region.region_id,
                             new_primary,
-                            candidate_wm,
-                            max_wm,
+                            candidate_progress = ?candidate_p,
+                            best_progress = ?best_p,
                             "planned promotion deferred: candidate behind"
                         );
                         return Ok(false);
@@ -1464,7 +1838,7 @@ impl ShardScheduler {
                     .into(),
                 ));
             }
-            Ok(outcome.exported)
+            Ok(outcome.bytes)
         } else {
             // The remote staging path had no failure signal whatsoever: no
             // counter, and its only error log was the `debug!` in the tick. A
@@ -1479,9 +1853,9 @@ impl ShardScheduler {
             )
             .await
             {
-                Ok(()) => {
+                Ok(staged_bytes) => {
                     counter!("hyperbytedb_shard_remote_stage_total").increment(1);
-                    Ok(0)
+                    Ok(staged_bytes)
                 }
                 Err(e) => {
                     counter!("hyperbytedb_shard_remote_stage_failures_total").increment(1);
@@ -1537,92 +1911,6 @@ impl ShardScheduler {
         None
     }
 
-    async fn try_rebalance(
-        &self,
-        key: &MeasurementKey,
-        region: &ShardRegion,
-        hb: &[(u64, u64, u64, u64, u64, u64)],
-    ) -> Result<(), HyperbytedbError> {
-        // Only peers that have actually reported can be scored. A peer with no
-        // live heartbeat row is unmeasured, not empty: scoring it as 0 bytes
-        // made any freshly added replica look infinitely lighter than the
-        // primary and handed it ownership on the strength of missing telemetry.
-        let mut loads: Vec<(u64, u64)> = region
-            .peers
-            .iter()
-            .filter_map(|node| {
-                hb.iter()
-                    .find(|(r, n, _, _, _, _)| *r == region.region_id && *n == *node)
-                    .map(|(_, _, _, b, _, _)| (*node, *b))
-            })
-            .collect();
-        if loads.len() < 2 {
-            return Ok(());
-        }
-        loads.sort_by_key(|(_, b)| *b);
-        let (light_node, light_bytes) = loads[0];
-        let (heavy_node, heavy_bytes) = loads[loads.len() - 1];
-        if heavy_bytes < light_bytes.saturating_mul(2).max(1) {
-            return Ok(());
-        }
-        if heavy_node != region.primary {
-            return Ok(());
-        }
-        let new_primary = light_node;
-        if new_primary == region.primary {
-            return Ok(());
-        }
-
-        if let Some(pc) = self.peer_client.as_ref() {
-            // The transfer MUST source from the region's current primary — the
-            // node that actually holds authoritative rows. Exporting from the
-            // leader instead finds zero rows whenever leadership and primary
-            // diverge, the 0==0 "verification" passes vacuously, and ownership
-            // commits onto a data-less node (silent empty reads).
-            if region.primary == self.node_id {
-                run_region_transfer(
-                    pc,
-                    &self.metadata,
-                    &self.wal,
-                    self.query_port.as_ref(),
-                    self.points_sink.as_ref(),
-                    self.node_id,
-                    key,
-                    region,
-                    new_primary,
-                    self.max_points_per_request,
-                    // Rebalance keeps the same owned range, just a new primary:
-                    // retain the stale replica copy on the source instead of
-                    // dropping it (dropping strands data if the ownership
-                    // change later fails).
-                    false,
-                )
-                .await?;
-            } else {
-                request_region_rehome(
-                    pc,
-                    &self.membership,
-                    region.primary,
-                    key,
-                    region,
-                    new_primary,
-                    false,
-                )
-                .await?;
-            }
-        }
-
-        let op = ShardMapOp::TransferPrimary {
-            key: key.clone(),
-            region_id: region.region_id,
-            new_primary,
-            epoch: region.epoch,
-        };
-        self.propose(op).await?;
-        counter!("hyperbytedb_shard_rebalances_total").increment(1);
-        Ok(())
-    }
-
     /// Replace one permanently-inactive region peer with a healthy member
     /// (replica-set healing). One replacement per region per tick; the epoch
     /// bump from each MovePeer naturally serializes further replacements.
@@ -1644,18 +1932,21 @@ impl ShardScheduler {
             return Ok(());
         }
 
+        let now = chrono::Utc::now().timestamp();
+        let dead_timeout = self.config.dead_node_timeout_secs;
         let dead_peer = {
             let m = self.membership.read().await;
             region.peers.iter().copied().find(|id| {
-                *id != region.primary
-                    && !is_active_peer(&m, *id)
-                    // A departing node is NOT dead: it is alive and still holds
-                    // rows. Convergence evacuates it, staging onto a
-                    // replacement before it removes. Dropping it here would
-                    // delete the map's only reference to that copy without
-                    // making another one first -- silent data loss on every
-                    // scale-down.
-                    && !m.get_node(*id).is_some_and(is_departing)
+                if *id == region.primary {
+                    return false;
+                }
+                match m.get_node(*id) {
+                    None => true,
+                    Some(n) if is_departing(n) || n.state == NodeState::Draining => false,
+                    Some(n) if n.state == NodeState::Decommissioning => false,
+                    Some(n) if n.state == NodeState::Active => false,
+                    Some(n) => peer_disconnected_past_deadline(n, now, dead_timeout),
+                }
             })
         };
         let Some(dead_peer) = dead_peer else {
@@ -1729,8 +2020,66 @@ const REHOME_TIMEOUT_SECS: u64 = 300;
 /// region peers (unreachable peers report 0, so it reflects living nodes).
 /// Blocking failover when every known watermark is behind keeps reads routed
 /// at the node holding the data instead of silently returning empty results.
-fn failover_watermark_safe(candidate_watermark: u64, max_peer_watermark: u64) -> bool {
-    candidate_watermark > 0 || max_peer_watermark == 0
+/// How many regions a single measurement may hold. Scales with the cluster so
+/// the cap stops being what decides balance — 128 regions over 50 nodes is a
+/// placement straitjacket — while `configured_floor` keeps a one-node dev
+/// cluster bounded. Splits are metadata-only, so a region costs a map entry and
+/// a heartbeat row, not a copy.
+#[must_use]
+fn region_cap(configured_floor: usize, candidates: usize) -> usize {
+    configured_floor.max(candidates.saturating_mul(REGIONS_PER_CANDIDATE).max(1))
+}
+
+/// Emergency failover: the primary is already gone, so the only question is
+/// whether this candidate is *known* to hold nothing.
+///
+/// Was `candidate > 0 || max == 0`, which conflated three different facts into
+/// the number 0 — "holds nothing", "could not be probed", and (under
+/// per-region reporting) "holds this region but it has had no writes". A node
+/// that primaried nothing reported 0 and was excluded from promotion forever;
+/// that is `promote_skipped_total{watermark_lag}` on the kind cluster.
+///
+/// The guard's real purpose is narrow and worth keeping: do not hand primacy
+/// to a replica that demonstrably never received the rows, because reads would
+/// then return silently empty rather than failing. So it blocks exactly that
+/// case and nothing else.
+///
+/// Lag alone does not block here. The region is already unserved, replication
+/// is asynchronous so every replica lags, and refusing to promote a
+/// behind-but-populated replica trades a degraded region for an unavailable
+/// one. An unknown position also allows: it cannot prove the candidate is
+/// empty, and the region has no better option.
+#[must_use]
+fn failover_watermark_safe(candidate: Option<u64>, best: Option<u64>) -> bool {
+    !(candidate == Some(0) && best.is_some_and(|b| b > 0))
+}
+
+/// Planned promotion during rebalancing, where the current primary is alive
+/// and there is no urgency — so the bar is higher than for failover.
+///
+/// An unknown progress defers rather than proceeds: nothing is broken while we
+/// wait, and promoting a node we could not measure is the one move that can
+/// silently strand data.
+///
+/// The bound is *relative*, not an absolute row count, because heartbeats are
+/// sampled on an interval. Under continuous writes a perfectly healthy replica
+/// is always some thousands of series behind whatever the primary reported a
+/// moment ago, so any fixed allowance either blocks everything or permits
+/// everything depending on write rate. A percentage floor asks the question
+/// the guard actually cares about — "is this replica broadly keeping up, or is
+/// it essentially empty?" — at any rate.
+#[must_use]
+fn promote_progress_safe(candidate: Option<u64>, best: Option<u64>, min_pct: u64) -> bool {
+    let Some(candidate) = candidate else {
+        return false;
+    };
+    let Some(best) = best else {
+        return true;
+    };
+    if best == 0 {
+        return true;
+    }
+    candidate.saturating_mul(100) >= best.saturating_mul(min_pct.min(100))
 }
 
 /// Region data movement onto a joiner starts only after it has caught up to
@@ -1773,6 +2122,7 @@ pub async fn fetch_peer_map_version(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 async fn push_and_drop_range(
     peer_client: &Arc<PeerClient>,
     metadata: &Arc<dyn MetadataPort>,
@@ -1850,6 +2200,7 @@ async fn request_region_rehome(
         dest_primary,
         drop_source,
         stage: false,
+        dest_skip_wal_through: 0,
     };
     let url = format!("http://{addr}/internal/shard/rehome");
     let resp = peer_client
@@ -1879,7 +2230,7 @@ async fn request_region_stage(
     key: &MeasurementKey,
     range: &ShardRegion,
     dest: u64,
-) -> Result<(), HyperbytedbError> {
+) -> Result<u64, HyperbytedbError> {
     let addr = {
         let m = membership.read().await;
         m.get_node(target_node).map(|n| n.addr.clone())
@@ -1898,6 +2249,8 @@ async fn request_region_stage(
         dest_primary: dest,
         drop_source: false,
         stage: true,
+        // Accepted and ignored by the receiver; retained only for wire compat.
+        dest_skip_wal_through: 0,
     };
     let url = format!("http://{addr}/internal/shard/rehome");
     let resp = peer_client
@@ -1915,11 +2268,20 @@ async fn request_region_stage(
             reason: crate::application::shard_transfer::rejection_reason(resp).await,
         });
     }
-    Ok(())
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
+    // Bytes, not points: the budget is a bandwidth throttle. An older peer that
+    // does not report `bytes` contributes 0 rather than a point count —
+    // under-charging is a convergence-rate cost, while charging points as if
+    // they were bytes is a correctness one.
+    Ok(body.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0))
 }
 
 /// Reconciliation disposition for a failed post-commit transfer movement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) enum TransferDisposition {
     /// Transient (transport, apply lag 404/409, 5xx): retry next drain.
     Retryable,
@@ -1930,6 +2292,7 @@ pub(crate) enum TransferDisposition {
     Park,
 }
 
+#[allow(dead_code)]
 pub(crate) fn classify_transfer_error(err: &HyperbytedbError) -> TransferDisposition {
     match err {
         HyperbytedbError::PeerUnreachable(_) | HyperbytedbError::ReplicationTimeout(_) => {
@@ -1961,6 +2324,10 @@ async fn pick_best_primary(
         .iter()
         .copied()
         .filter(|id| *id != region.primary)
+        // A learner cannot be made primary: `TransferPrimary` apply rejects it
+        // outright. Offering one here spent the failover on a proposal that
+        // could only fail, and the region stayed unserved.
+        .filter(|id| region.is_serving_peer(*id))
         .filter(|id| {
             *id == self_id
                 || m.get_node(*id)
@@ -1974,11 +2341,24 @@ async fn pick_best_primary(
     }
 
     if let Some(pc) = peer_client {
+        let wms = futures::future::join_all(candidates.iter().map(|&candidate| async move {
+            (
+                candidate,
+                peer_region_wal_watermark(pc, candidate, region.region_id).await,
+            )
+        }))
+        .await;
         let mut best = candidates[0];
-        let mut best_wm = 0u64;
-        for candidate in candidates {
-            let wm = peer_region_wal_watermark(pc, candidate, region.region_id).await;
-            if wm > best_wm || (wm == best_wm && candidate == self_id) {
+        let mut best_wm: Option<u64> = None;
+        for (candidate, wm) in wms {
+            // `None` never displaces a known position: a node we could not ask
+            // is not evidence of progress.
+            let better = match (wm, best_wm) {
+                (Some(_), None) => true,
+                (Some(w), Some(b)) => w > b || (w == b && candidate == self_id),
+                (None, _) => false,
+            };
+            if better {
                 best_wm = wm;
                 best = candidate;
             }
@@ -1989,24 +2369,32 @@ async fn pick_best_primary(
     pick_alternate_primary(membership, region, self_id).await
 }
 
-async fn peer_region_wal_watermark(peer_client: &PeerClient, peer_id: u64, region_id: u64) -> u64 {
+/// The peer's replication position for `region_id`, or `None` when the peer
+/// could not be asked.
+///
+/// `None` and `Some(0)` are different facts and must stay different: "I could
+/// not reach this node" is not "this node has applied nothing". Collapsing
+/// them let one timed-out probe read as a data-less candidate, which the
+/// promotion guard then acted on.
+async fn peer_region_wal_watermark(
+    peer_client: &PeerClient,
+    peer_id: u64,
+    region_id: u64,
+) -> Option<u64> {
     let membership = peer_client.membership().read().await;
-    let Some(node) = membership.get_node(peer_id) else {
-        return 0;
-    };
-    let addr = node.addr.clone();
+    let addr = membership.get_node(peer_id)?.addr.clone();
     drop(membership);
 
     let url = format!("http://{addr}/internal/sync/manifest");
     let Ok(resp) = peer_client.http_client().get(&url).send().await else {
-        return 0;
+        return None;
     };
     let Ok(body) = resp.text().await else {
-        return 0;
+        return None;
     };
     let Ok(manifest) = serde_json::from_str::<crate::domain::cluster::sync::SyncManifest>(&body)
     else {
-        return 0;
+        return None;
     };
     let mut total_region_watermarks = 0usize;
     let mut region_wm: Option<u64> = None;
@@ -2021,14 +2409,15 @@ async fn peer_region_wal_watermark(peer_client: &PeerClient, peer_id: u64, regio
         }
     }
     match region_wm {
-        Some(wm) => wm,
+        Some(wm) => Some(wm),
         // No watermark for this region: fall back to the node-wide sequence
         // ONLY when the peer reports no region watermarks at all (fresh or
         // legacy node). Otherwise absence means this node holds no data for
         // the region — reporting its global seq would wrongly bless a
         // data-less candidate as caught-up during failover.
-        None if total_region_watermarks == 0 => manifest.wal_last_seq,
-        None => 0,
+        None if total_region_watermarks == 0 => Some(manifest.wal_last_seq),
+        // Answered, and holds nothing for this region. A real zero.
+        None => Some(0),
     }
 }
 
@@ -2045,6 +2434,7 @@ async fn pick_alternate_primary(
         .find(|id| peer_is_active_alternate(&m, region, *id, self_id))
 }
 
+#[allow(dead_code)]
 fn now_unix() -> i64 {
     chrono::Utc::now().timestamp()
 }
@@ -2053,6 +2443,7 @@ impl ShardScheduler {
     /// Rebuild reconciliation entries from the committed map scan: any
     /// flagged child without an in-memory entry gets one. Makes leader change
     /// and process restart equivalent — durable intent lives in the map.
+    #[allow(dead_code)]
     fn rebuild_queue_from_map(&self, map: &super::super::domain::sharding::types::ShardMap) {
         let dests = match self.rollup_dests.try_read() {
             Ok(guard) => guard,
@@ -2098,6 +2489,7 @@ impl ShardScheduler {
 
     /// Drain due split-transfer reconciliation entries. Called once per
     /// leader tick, before scheduling heuristics.
+    #[allow(dead_code)]
     async fn drain_reconciliation(&self, map: &super::super::domain::sharding::types::ShardMap) {
         // Refresh rollup-destination knowledge for the exclusion check.
         match self.metadata.list_all_materialized_views().await {
@@ -2237,6 +2629,7 @@ impl ShardScheduler {
     }
 
     /// One reconciliation attempt against the current committed region state.
+    #[allow(dead_code)]
     async fn attempt_reconciliation(
         &self,
         key: &MeasurementKey,
@@ -2267,8 +2660,11 @@ impl ShardScheduler {
             // watermark is 0 holds no rows for this region and would verify
             // vacuously (the 0==0 hazard documented on rebalance).
             if source != entry.recorded_source && source != self.node_id {
+                // Unknown counts as "no proof of coverage" here, same as a
+                // real zero: this path is choosing a source to copy FROM, so
+                // the conservative answer is to skip it.
                 let wm = peer_region_wal_watermark(pc, source, region.region_id).await;
-                if wm == 0 {
+                if wm.unwrap_or(0) == 0 {
                     continue;
                 }
             }
@@ -2352,6 +2748,7 @@ impl ShardScheduler {
     /// `TransferPrimary`. The existing transfer-primary path stages rows from
     /// the current authoritative primary before committing ownership, so this
     /// cannot commit a data-less node (mirrors `try_rebalance` ordering).
+    #[allow(dead_code)]
     async fn escalate_stuck_transfer(
         &self,
         key: &MeasurementKey,
@@ -2380,6 +2777,7 @@ impl ShardScheduler {
         .await
     }
 
+    #[allow(dead_code)]
     fn remove_reconciliation(&self, key: &MeasurementKey, region_id: u64) {
         let mut q = self
             .reconciliation_queue
@@ -2388,6 +2786,7 @@ impl ShardScheduler {
         q.retain(|e| !(e.key == *key && e.region_id == region_id));
     }
 
+    #[allow(dead_code)]
     fn pending_transfers(&self) -> Vec<PendingTransfer> {
         self.reconciliation_queue
             .lock()
@@ -2396,6 +2795,7 @@ impl ShardScheduler {
     }
 }
 
+#[allow(dead_code)]
 enum ReconcileOutcome {
     /// Verified and the map flag cleared: drop the entry.
     Cleared,
@@ -2413,9 +2813,35 @@ fn peer_is_active_alternate(
 ) -> bool {
     peer_id != region.primary
         && peer_id != self_id
+        && region.is_serving_peer(peer_id)
         && membership
             .get_node(peer_id)
             .is_some_and(|n| n.state == NodeState::Active)
+}
+
+/// An active learner holding this region, when no serving peer is left.
+///
+/// A region whose primary dies leaving only a learner has no write or read
+/// target at all (`resolve_region_peers` refuses a learner), and failover had
+/// no candidate to offer, so it stalled indefinitely. The learner has been
+/// receiving replication since `AddPeer`, so promoting it is the difference
+/// between a degraded region and an unavailable one.
+async fn pick_learner_survivor(
+    membership: &SharedMembership,
+    region: &ShardRegion,
+    self_id: u64,
+) -> Option<u64> {
+    let m = membership.read().await;
+    region
+        .staging_peers
+        .iter()
+        .copied()
+        .filter(|id| *id != region.primary)
+        .find(|id| {
+            *id == self_id
+                || m.get_node(*id)
+                    .is_some_and(|n| n.state == NodeState::Active)
+        })
 }
 
 #[cfg(test)]
@@ -2463,14 +2889,14 @@ mod tests {
     }
 
     #[test]
-    fn unsplit_region_does_not_split_while_last_split_at_is_zero() {
-        assert!(!region_ready_to_split(1_000, 0, 1_000_000, 5, 10, 30));
+    fn unsplit_region_waits_for_first_split_stamp_until_above_max_series() {
+        assert!(region_ready_to_split(11, 0, 1_000_000, 5, 10, 30));
+        assert!(!region_ready_to_split(6, 0, 1_000_000, 5, 10, 30));
     }
 
     #[test]
-    fn split_requires_cooldown_even_above_max_series() {
-        assert!(!region_ready_to_split(1_000, 100, 120, 5, 10, 30));
-        assert!(region_ready_to_split(1_000, 100, 130, 5, 10, 30));
+    fn split_fires_immediately_above_max_series() {
+        assert!(region_ready_to_split(1_000, 100, 120, 5, 10, 30));
     }
 
     #[test]
@@ -2561,15 +2987,48 @@ mod tests {
     #[test]
     fn failover_watermark_guard_blocks_dataless_candidates() {
         // Caught-up candidate: safe.
-        assert!(failover_watermark_safe(100, 100));
+        assert!(failover_watermark_safe(Some(100), Some(100)));
         // Behind but holding data: allowed — async watermarks always lag and
         // this is still the best living copy.
-        assert!(failover_watermark_safe(50, 100));
+        assert!(failover_watermark_safe(Some(50), Some(100)));
+        // Far behind but populated: still allowed. The region is already
+        // unserved; a degraded primary beats no primary.
+        assert!(failover_watermark_safe(Some(1), Some(5_000_000)));
         // Candidate has no data while some peer does: blocked — this is the
         // post-split strand where the new primary never received the rows.
-        assert!(!failover_watermark_safe(0, 42));
+        assert!(!failover_watermark_safe(Some(0), Some(42)));
         // Nobody has data yet (fresh region): allow.
-        assert!(failover_watermark_safe(0, 0));
+        assert!(failover_watermark_safe(Some(0), Some(0)));
+        // Unknown is not zero. A probe we could not complete must not read as
+        // "holds nothing" — that is what excluded healthy nodes permanently.
+        assert!(failover_watermark_safe(None, Some(42)));
+        assert!(failover_watermark_safe(Some(7), None));
+    }
+
+    /// Planned promotion is the unhurried case, so it is allowed to be strict
+    /// where failover cannot be: the current primary is alive, nothing is
+    /// broken while we wait, and both "too far behind" and "could not measure"
+    /// are reasons to defer rather than risk stranding rows.
+    #[test]
+    fn planned_promotion_defers_where_failover_proceeds() {
+        assert!(promote_progress_safe(Some(100), Some(100), 50));
+        assert!(promote_progress_safe(Some(60), Some(100), 50));
+        assert!(
+            !promote_progress_safe(Some(1), Some(5_000_000), 50),
+            "a materially behind replica must not be handed primacy by choice"
+        );
+        assert!(
+            !promote_progress_safe(None, Some(100), 50),
+            "an unmeasurable candidate must defer, not proceed"
+        );
+        assert!(
+            promote_progress_safe(Some(5), None, 50),
+            "nothing known to be ahead: allow"
+        );
+        // The two predicates deliberately disagree on the same inputs; that
+        // difference is the design, not an oversight.
+        assert!(failover_watermark_safe(Some(1), Some(5_000_000)));
+        assert!(failover_watermark_safe(None, Some(100)));
     }
 
     #[test]
@@ -3140,18 +3599,15 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(chdb)]
-    async fn drain_parks_stuck_debt_after_progress_bound() {
-        // Full harness: single-node raft cluster with no peer client, so the
-        // movement attempt always stalls — driving the entry to parking.
+    async fn reconciliation_queue_is_inert_after_metadata_only_splits() {
         let harness = ReconcileTestHarness::new().await;
         let key = MeasurementKey::new("db", "autogen", "cpu");
         let old = now_unix() - RECONCILE_MIN_AGE_SECS - 10;
-        let flagged = flagged_test_region(1, old);
         harness
             .shard_map
             .apply_op(ShardMapOp::BootstrapMeasurement {
                 key: key.clone(),
-                region: flagged,
+                region: flagged_test_region(1, old),
             })
             .await
             .unwrap();
@@ -3161,34 +3617,10 @@ mod tests {
         }
 
         let q = harness.scheduler.reconciliation_queue.lock().unwrap();
-        assert_eq!(q.len(), 1, "parked debt stays visible in the queue");
         assert!(
-            q[0].parked,
-            "entry must park after K stalled ticks past min-age"
+            q.is_empty(),
+            "legacy reconciliation drain is disabled; flagged children are not enqueued"
         );
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(chdb)]
-    async fn rebuild_enqueues_flagged_children_from_map_scan() {
-        // Simulates leadership change: fresh scheduler over a map that
-        // already carries a flagged child must enqueue it without any prior
-        // in-memory state.
-        let harness = ReconcileTestHarness::new().await;
-        let key = MeasurementKey::new("db", "autogen", "cpu");
-        harness
-            .shard_map
-            .apply_op(ShardMapOp::BootstrapMeasurement {
-                key: key.clone(),
-                region: flagged_test_region(1, now_unix()),
-            })
-            .await
-            .unwrap();
-
-        harness.scheduler.tick_once_for_test().await.unwrap();
-
-        let q = harness.scheduler.reconciliation_queue.lock().unwrap();
-        assert_eq!(q.len(), 1, "map-scan rebuild must enqueue flagged child");
     }
 
     #[tokio::test]
@@ -3443,6 +3875,15 @@ mod tests {
             peers: &[(u64, i64)],
             regions: usize,
         ) -> Self {
+            Self::new_tuned(add_peer_proposals_enabled, peers, regions, |_| {}).await
+        }
+
+        async fn new_tuned(
+            add_peer_proposals_enabled: bool,
+            peers: &[(u64, i64)],
+            regions: usize,
+            tune: impl FnOnce(&mut crate::config::ShardingConfig),
+        ) -> Self {
             use crate::adapters::chdb::native_adapter::ChdbNativeAdapter;
             use crate::adapters::chdb::query_adapter::ChdbQueryAdapter;
             use crate::adapters::chdb::session::SharedSession;
@@ -3554,11 +3995,12 @@ mod tests {
                 8 * 1024 * 1024,
             ));
 
-            let sharding = crate::config::ShardingConfig {
+            let mut sharding = crate::config::ShardingConfig {
                 replication_factor: 3,
                 add_peer_proposals_enabled,
                 ..Default::default()
             };
+            tune(&mut sharding);
             let proposals = Arc::new(std::sync::Mutex::new(Vec::<ShardMapOp>::new()));
             let scheduler = ShardScheduler::new(
                 shard_map,
@@ -3619,6 +4061,18 @@ mod tests {
         async fn set_node_state(&self, node_id: u64, state: NodeState) {
             let mut m = self.scheduler.membership.write().await;
             m.set_state(node_id, state);
+        }
+
+        async fn space_regions(&self, key: &MeasurementKey) -> Vec<ShardRegion> {
+            self.scheduler
+                .shard_map
+                .snapshot()
+                .await
+                .unwrap()
+                .spaces
+                .get(key)
+                .map(|s| s.regions.clone())
+                .unwrap_or_default()
         }
 
         fn probe_count(&self, peer: u64) -> u64 {
@@ -4022,5 +4476,539 @@ mod tests {
             "a decommissioning peer was dropped by the heal path, losing its \
              only copy; convergence must evacuate it instead. ops={ops:?}"
         );
+    }
+    #[test]
+    fn region_cap_scales_with_the_candidate_count() {
+        // The configured value is a floor, not a ceiling: it keeps a one-node
+        // dev cluster bounded and stops being the binding constraint as soon
+        // as the cluster is big enough for the cap to decide balance.
+        assert_eq!(region_cap(128, 1), 128, "floor wins on a small cluster");
+        assert_eq!(region_cap(128, 4), 128);
+        assert_eq!(region_cap(128, 6), 192, "6 nodes outgrow the 128 floor");
+        assert_eq!(region_cap(128, 50), 1_600);
+        // Degenerate inputs must not produce a zero cap, which would refuse
+        // every split forever.
+        assert_eq!(region_cap(0, 0), 1);
+        assert_eq!(region_cap(0, usize::MAX), usize::MAX);
+    }
+
+    /// Builds a measurement sitting at its region cap, every region over
+    /// `region_max_series` so a split is attempted — and refused — for each
+    /// one on every tick. `primary` is the node each region is primaried by.
+    async fn build_capped_space(
+        harness: &PlacementTestHarness,
+        key: &MeasurementKey,
+        peers: Vec<u64>,
+        primary: u64,
+        regions: usize,
+    ) -> Vec<ShardRegion> {
+        let mut seed = sample_region_peers(peers, primary);
+        seed.region_id = 1_000;
+        seed.last_split_at = 1;
+        harness
+            .scheduler
+            .shard_map
+            .apply_op(ShardMapOp::BootstrapMeasurement {
+                key: key.clone(),
+                region: seed,
+            })
+            .await
+            .unwrap();
+
+        // Metadata-only splits: exactly what the scheduler itself produces.
+        while harness.space_regions(key).await.len() < regions {
+            let parent = harness
+                .space_regions(key)
+                .await
+                .into_iter()
+                .max_by_key(|r| r.end.saturating_sub(r.start))
+                .unwrap();
+            let split_key = parent.start + (parent.end - parent.start) / 2;
+            let child_epoch = parent.epoch.bump_version();
+            let mut left = parent.clone();
+            left.end = split_key;
+            left.epoch = child_epoch;
+            left.last_split_at = 1;
+            let mut right = parent.clone();
+            right.start = split_key;
+            right.epoch = child_epoch;
+            right.last_split_at = 1;
+            harness
+                .scheduler
+                .shard_map
+                .apply_op(ShardMapOp::Split {
+                    key: key.clone(),
+                    region_id: parent.region_id,
+                    split_key,
+                    epoch: parent.epoch,
+                    left,
+                    right,
+                })
+                .await
+                .unwrap();
+        }
+
+        let regions = harness.space_regions(key).await;
+        for region in &regions {
+            harness
+                .scheduler
+                .record_heartbeat(region.region_id, 1, 1_000, 0, 0)
+                .await;
+        }
+        regions
+    }
+
+    /// Same shape, but no heartbeats: every region reads as empty, which makes
+    /// adjacent pairs merge candidates rather than split candidates.
+    async fn build_capped_space_without_heartbeats(
+        harness: &PlacementTestHarness,
+        key: &MeasurementKey,
+        peers: Vec<u64>,
+        primary: u64,
+        regions: usize,
+    ) -> Vec<ShardRegion> {
+        let built = build_capped_space(harness, key, peers, primary, regions).await;
+        harness.scheduler.heartbeats.write().await.clear();
+        built
+    }
+
+    fn capped_tuning(c: &mut crate::config::ShardingConfig) {
+        c.max_regions_per_measurement = 1;
+        c.region_split_series = 5;
+        // Must stay below `region_split_series` (config invariant) and below
+        // the series these regions report, or the merge path claims the pass
+        // before placement and the test proves nothing.
+        c.region_merge_series = 1;
+        c.region_max_series = 10;
+        c.region_split_cooldown_secs = 0;
+        c.split_merge_interval_secs = 0;
+        c.primary_failover_after_secs = 0;
+        c.peer_heal_enabled = true;
+    }
+
+    /// G1, half one: safety must not queue behind a split refusal.
+    ///
+    /// Heal and failover used to run *after* split/merge in the region pass,
+    /// and `try_split` signalled a refusal as `Ok(())`, which the tick read as
+    /// "split proposed" and `continue`d on. A measurement at its region cap
+    /// therefore never failed over — on the kind cluster, 126 of 128 regions
+    /// stayed pinned to one node for five hours.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn a_capped_oversized_region_still_fails_over() {
+        let harness = PlacementTestHarness::new_tuned(true, &[(2, 0)], 1, capped_tuning).await;
+        let key = MeasurementKey::new("db", "autogen", "capped");
+        // Node 2 primaries every region and is about to die; node 1 (self) is
+        // the only surviving peer, so it is the only failover target.
+        let regions = build_capped_space(&harness, &key, vec![1, 2], 2, 40).await;
+        {
+            let mut m = harness.scheduler.membership.write().await;
+            let addr = m.get_node(2).map(|n| n.addr.clone()).unwrap_or_default();
+            m.add_node(NodeInfo {
+                node_id: 2,
+                addr,
+                state: NodeState::Disconnected,
+                joined_at: 2,
+                last_heartbeat: 0,
+                needs_sync: false,
+                consecutive_misses: 9,
+            });
+        }
+
+        // Node 2 is dead, so it is no longer a placement candidate: the cap is
+        // 32 and the space holds 40 regions.
+        assert!(
+            regions.len() >= region_cap(1, 1),
+            "test needs the space at its cap: {} regions, cap {}",
+            regions.len(),
+            region_cap(1, 1)
+        );
+        assert_eq!(
+            harness
+                .scheduler
+                .try_split(&key, &regions[0], 1_000)
+                .await
+                .unwrap(),
+            SplitOutcome::Refused(SplitRefusal::RegionCap),
+            "at the cap the split must be refused — and say why"
+        );
+
+        harness.scheduler.tick_once_for_test().await.unwrap();
+
+        let ops = harness.proposals.lock().unwrap();
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op, ShardMapOp::Split { key: k, .. } if *k == key)),
+            "the space is at its cap; no split may be proposed: {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                op,
+                ShardMapOp::TransferPrimary { key: k, new_primary: 1, .. } if *k == key
+            )),
+            "a capped, oversized region whose primary is dead must still fail \
+             over: {ops:?}"
+        );
+    }
+
+    /// G1, half two: a refused split must not swallow the placement preview.
+    ///
+    /// Placement runs after split in the region pass, so this is what the
+    /// `SplitOutcome::Proposed`-only `continue` guards. Every region here is
+    /// over `region_max_series` and the space is at its cap, so the old code
+    /// `continue`d past placement for all of them — forever, since the cap
+    /// never clears on its own.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn a_capped_oversized_region_still_gets_a_placement_step() {
+        let harness =
+            // The mock peers report a map version well ahead of the one
+            // captured at harness build time: this test applies ~100 splits
+            // afterwards, and a joiner behind the committed map is (correctly)
+            // refused as a staging target, which would mask the thing under
+            // test.
+            PlacementTestHarness::new_tuned(true, &[(2, 1_000), (3, 1_000)], 1, capped_tuning)
+                .await;
+        let key = MeasurementKey::new("db", "autogen", "capped");
+        // Primaried by this node, one peer short of RF: the placement step is
+        // an AddPeer, which no other path in this tick proposes for this space.
+        let regions = build_capped_space(&harness, &key, vec![1], 1, 100).await;
+        assert!(
+            regions.len() >= region_cap(1, 3),
+            "test needs the space at its cap: {} regions, cap {}",
+            regions.len(),
+            region_cap(1, 3)
+        );
+
+        harness.scheduler.tick_once_for_test().await.unwrap();
+
+        let ops = harness.proposals.lock().unwrap();
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op, ShardMapOp::Split { key: k, .. } if *k == key)),
+            "the space is at its cap; no split may be proposed: {ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, ShardMapOp::AddPeer { key: k, .. } if *k == key)),
+            "a capped, oversized region must still converge towards its \
+             placement target; the refused split used to skip it: {ops:?}"
+        );
+    }
+    /// G1, half three: a *successful* merge must not swallow failover either.
+    ///
+    /// Merge still ends the region's pass — correctly, the region is about to
+    /// stop existing — so the only protection for a mergeable region whose
+    /// primary is dead is that heal and failover run *before* split/merge.
+    /// With them at the end of the pass, the left region of every mergeable
+    /// pair went un-failed-over for as long as it kept merging.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn a_mergeable_region_with_a_dead_primary_still_fails_over() {
+        let harness = PlacementTestHarness::new_tuned(true, &[(2, 0)], 1, |c| {
+            c.split_merge_interval_secs = 0;
+            c.primary_failover_after_secs = 0;
+            c.peer_heal_enabled = true;
+        })
+        .await;
+        let key = MeasurementKey::new("db", "autogen", "mergeable");
+        // No heartbeats recorded, so both regions read as empty and the pair
+        // is a merge candidate. Node 2 primaries them and is dead.
+        let regions = build_capped_space_without_heartbeats(&harness, &key, vec![1, 2], 2, 2).await;
+        let left = regions[0].region_id;
+        {
+            let mut m = harness.scheduler.membership.write().await;
+            let addr = m.get_node(2).map(|n| n.addr.clone()).unwrap_or_default();
+            m.add_node(NodeInfo {
+                node_id: 2,
+                addr,
+                state: NodeState::Disconnected,
+                joined_at: 2,
+                last_heartbeat: 0,
+                needs_sync: false,
+                consecutive_misses: 9,
+            });
+        }
+
+        harness.scheduler.tick_once_for_test().await.unwrap();
+
+        let ops = harness.proposals.lock().unwrap();
+        assert!(
+            ops.iter().any(|op| matches!(
+                op,
+                ShardMapOp::TransferPrimary { key: k, region_id, new_primary: 1, .. }
+                    if *k == key && *region_id == left
+            )),
+            "the left region of the merge pair lost its primary; failover must \
+             run before the merge claims the pass: {ops:?}"
+        );
+    }
+    /// G4: the mover queue must drain, not stop at `schedule_limit`.
+    ///
+    /// `run_pending_placements` sorted by tier, took the first
+    /// `schedule_limit` jobs and awaited each full copy inline. With one tier
+    /// and a stable map order that is the same four regions every tick, and
+    /// every other region waiting behind a copy that has nothing to do with
+    /// it — 15 placements in five hours on the kind cluster.
+    ///
+    /// Node 3 reports a map far behind the cluster, so it is refused as a
+    /// staging target. Regions whose HRW target needs node 3 and nothing else
+    /// are genuinely stuck jobs sitting in the queue; they must not cost the
+    /// other regions their tick.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn the_mover_queue_drains_past_schedule_limit_and_past_stuck_regions() {
+        const REGIONS: usize = 20;
+        let harness = PlacementTestHarness::new_tuned(true, &[(2, 0), (3, -1_000)], REGIONS, |c| {
+            c.schedule_limit = 4;
+            // RF 2 over three candidates, so a region whose target is
+            // {self, node 3} has no healthy alternative to fall through to.
+            c.replication_factor = 2;
+        })
+        .await;
+
+        // Which regions are stuck is not guessed: it is the same HRW target
+        // order production uses, so this stays honest if placement changes.
+        let candidates = vec![1u64, 2, 3];
+        let rf = effective_replication_factor(2, candidates.len());
+        let mut expect_placed: Vec<u64> = Vec::new();
+        let mut expect_stuck: Vec<u64> = Vec::new();
+        for i in 0..REGIONS {
+            let key = MeasurementKey::new("db", "autogen", format!("cpu{i}"));
+            let region_id = (i + 1) as u64;
+            let target = target_placement(&key, 0, &candidates, rf);
+            // `missing` is every target member the region lacks, in target
+            // order; the first caught-up one wins. Only node 2 is caught up.
+            if target.contains(&2) {
+                expect_placed.push(region_id);
+            } else if target.contains(&3) {
+                expect_stuck.push(region_id);
+            }
+        }
+        assert!(
+            !expect_placed.is_empty() && !expect_stuck.is_empty(),
+            "the fixture needs both outcomes present: placed={expect_placed:?} \
+             stuck={expect_stuck:?}"
+        );
+
+        harness.scheduler.tick_once_for_test().await.unwrap();
+
+        // The cursor records one entry per job the movers actually ran, which
+        // is exactly "did the queue drain".
+        let attempted = harness.scheduler.placement_last_attempted.read().await;
+        assert_eq!(
+            attempted.len(),
+            REGIONS,
+            "every queued region must be attempted in the tick, not the first \
+             schedule_limit of them: attempted={:?}",
+            attempted.keys().collect::<Vec<_>>()
+        );
+        drop(attempted);
+
+        let placed: std::collections::BTreeSet<u64> = harness
+            .proposals
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|op| match op {
+                ShardMapOp::AddPeer { region_id, .. } => Some(*region_id),
+                _ => None,
+            })
+            .collect();
+        for region_id in &expect_placed {
+            assert!(
+                placed.contains(region_id),
+                "region {region_id} has a healthy target and must be placed \
+                 even though other regions in the queue are stuck: \
+                 placed={placed:?}"
+            );
+        }
+        let stalls = harness.scheduler.placement_stalls.read().await;
+        for region_id in &expect_stuck {
+            assert!(
+                stalls.contains_key(region_id),
+                "region {region_id} has only a lagging target and must be \
+                 recorded as stalled, not silently dropped from the queue: \
+                 stalls={:?}",
+                stalls.keys().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// The round-robin cursor is per region id, so splits and merges would
+    /// leak entries into it forever without the prune.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn the_round_robin_cursor_is_pruned_with_its_region() {
+        let harness = PlacementTestHarness::new(true, &[(2, 0)], 1).await;
+        let sched = &harness.scheduler;
+        let dead_id = harness.region().await.region_id + 9_999;
+        sched.note_placement_attempt(dead_id).await;
+
+        sched.tick_once_for_test().await.unwrap();
+
+        let cursor = sched.placement_last_attempted.read().await;
+        assert!(
+            !cursor.contains_key(&dead_id),
+            "a region the map no longer has must not keep a round-robin \
+             cursor entry: {cursor:?}"
+        );
+    }
+    /// G7, half one: a learner must never be offered as a failover target.
+    ///
+    /// `TransferPrimary` apply rejects a learner outright
+    /// (`ops.rs:541-544`), so proposing one spent the failover on a call that
+    /// could only fail and left the region unserved for another tick.
+    #[tokio::test]
+    async fn a_learner_is_not_a_failover_candidate() {
+        let mut m = ClusterMembership::new();
+        m.add_node(node(1, NodeState::Disconnected));
+        m.add_node(node(2, NodeState::Active));
+        m.add_node(node(3, NodeState::Active));
+        let membership = crate::domain::cluster::membership::new_shared(m);
+
+        // Node 2 is a learner; node 3 is a committed peer.
+        let mut region = sample_region_peers(vec![1, 2, 3], 1);
+        region.staging_peers = vec![2];
+
+        assert_eq!(
+            pick_best_primary(&membership, &region, 9, None).await,
+            Some(3),
+            "the committed peer must win over the learner"
+        );
+
+        // With the committed peer gone, there is no serving candidate at all —
+        // the learner must not be substituted.
+        let mut learner_only = sample_region_peers(vec![1, 2], 1);
+        learner_only.staging_peers = vec![2];
+        assert_eq!(
+            pick_best_primary(&membership, &learner_only, 9, None).await,
+            None,
+            "a learner must not be offered as a primary"
+        );
+
+        // The watermark path is the one production actually takes, and it
+        // selects from its own candidate list rather than falling through to
+        // `pick_alternate_primary`. Unreachable peers all probe as 0, so
+        // without the learner filter the first candidate — the learner — wins.
+        let dir = tempfile::tempdir().unwrap();
+        let pc = PeerClient::new(
+            9,
+            "127.0.0.1:1".into(),
+            membership.clone(),
+            Arc::new(
+                crate::adapters::cluster::replication_log::ReplicationLog::open(dir.path())
+                    .unwrap(),
+            ),
+            1,
+            8192,
+            2,
+            8 * 1024 * 1024,
+        );
+        assert_eq!(
+            pick_best_primary(&membership, &learner_only, 9, Some(&pc)).await,
+            None,
+            "the watermark path must exclude learners too"
+        );
+        assert_eq!(
+            pick_best_primary(&membership, &region, 9, Some(&pc)).await,
+            Some(3),
+            "and must still pick the committed peer"
+        );
+    }
+
+    /// G7, half two: a learner-only survivor is promoted rather than stranded.
+    ///
+    /// A region left with a dead primary and one learner has no write or read
+    /// target — `resolve_region_peers` refuses a learner — and failover had no
+    /// candidate, so it stalled forever. It must promote the learner and hand
+    /// it primacy.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn a_learner_only_survivor_is_promoted_and_takes_primacy() {
+        let harness = PlacementTestHarness::new_tuned(true, &[(2, 0)], 1, |c| {
+            c.primary_failover_after_secs = 0;
+        })
+        .await;
+        let key = MeasurementKey::new("db", "autogen", "learner_only");
+        let mut seed = sample_region_peers(vec![1, 2], 1);
+        seed.region_id = 4_100;
+        // Node 2 holds the region only as a learner; node 1 primaries it.
+        seed.staging_peers = vec![2];
+        harness
+            .scheduler
+            .shard_map
+            .apply_op(ShardMapOp::BootstrapMeasurement {
+                key: key.clone(),
+                region: seed,
+            })
+            .await
+            .unwrap();
+
+        // The primary (this node) goes away, leaving only the learner.
+        {
+            let mut m = harness.scheduler.membership.write().await;
+            m.set_state(1, NodeState::Disconnected);
+        }
+
+        let region = harness.space_regions(&key).await.remove(0);
+        harness
+            .scheduler
+            .try_failover_unhealthy_primary(&key, &region, now_unix() as u64)
+            .await
+            .unwrap();
+
+        let ops = harness.proposals.lock().unwrap();
+        assert!(
+            ops.iter().any(|op| matches!(
+                op,
+                ShardMapOp::PromotePeer { key: k, peer: 2, .. } if *k == key
+            )),
+            "the learner must be promoted before it can hold primacy: {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                op,
+                ShardMapOp::TransferPrimary { key: k, new_primary: 2, .. } if *k == key
+            )),
+            "primacy must then move to the promoted survivor, or the region \
+             stays unserved: {ops:?}"
+        );
+    }
+    /// B.5b: the promote bound has to be relative, because heartbeats are
+    /// sampled on an interval.
+    ///
+    /// The kind cluster writes a new series per point at roughly 450/s with a
+    /// 10s heartbeat interval, so a perfectly healthy replica is ~4,500 series
+    /// behind whatever the primary last reported. Any absolute allowance is
+    /// therefore either blocking (small) or meaningless (large) depending
+    /// purely on write rate — which is how `promote_skipped_total` reached
+    /// 2,431 and pinned all 192 regions to one node.
+    #[test]
+    fn the_promote_bound_survives_heartbeat_staleness() {
+        // Healthy replica, one heartbeat interval behind at a high write rate.
+        assert!(
+            promote_progress_safe(Some(95_500), Some(100_000), 50),
+            "a replica one sampling interval behind must still be promotable"
+        );
+        // Essentially empty: this is what the guard exists to catch.
+        assert!(!promote_progress_safe(Some(10), Some(100_000), 50));
+        assert!(!promote_progress_safe(Some(0), Some(100_000), 50));
+        // Not heard from is not "empty", but it still defers for a *planned*
+        // move, because nothing is broken while we wait.
+        assert!(!promote_progress_safe(None, Some(100_000), 50));
+        // Nothing written yet anywhere: allow, or a fresh region can never
+        // move its primary.
+        assert!(promote_progress_safe(Some(0), Some(0), 50));
+        assert!(promote_progress_safe(Some(0), None, 50));
+        // The absolute-allowance failure mode, stated as a test so it cannot
+        // quietly come back: 4,500 behind out of 100,000 is healthy, and any
+        // fixed bound in the tens would reject it.
+        let healthy_lag = 100_000u64 - 95_500;
+        assert!(
+            healthy_lag > 64,
+            "a fixed allowance of 64 would reject this"
+        );
+        assert!(promote_progress_safe(Some(95_500), Some(100_000), 50));
     }
 }

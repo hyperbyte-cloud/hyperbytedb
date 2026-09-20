@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use axum::Json;
+use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{Request, StatusCode, header};
 use axum::response::IntoResponse;
 use metrics::counter;
 
@@ -17,8 +18,8 @@ use crate::application::shard_transfer::apply_transfer;
 use crate::application::sharded_mv_backfill::apply_mv_backfill_sql;
 use crate::application::wal_append::append_points_with_prepared;
 use crate::domain::sharding::{
-    MeasurementKey, RegionHeartbeat, ShardBootstrapRequest, ShardDeleteRequest, ShardMap,
-    ShardMapJson, ShardMetadataKind, ShardMetadataRequest, ShardMvBackfillRequest,
+    MeasurementKey, RegionHeartbeat, ShardBootstrapRequest, ShardDeleteRequest, ShardEpoch,
+    ShardMap, ShardMapJson, ShardMetadataKind, ShardMetadataRequest, ShardMvBackfillRequest,
     ShardQueryRequest, ShardRegion, ShardRehomeRequest, ShardTransferPayload, ShardWriteRequest,
 };
 use crate::ports::replication::OutboundReplicationBatch;
@@ -212,10 +213,92 @@ pub async fn handle_shard_map(State(state): State<Arc<AppState>>) -> impl IntoRe
     }
 }
 
+fn header_value(headers: &axum::http::HeaderMap, name: &str) -> Result<String, String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .ok_or_else(|| format!("missing header {name}"))
+}
+
+fn shard_write_from_line_protocol_request(
+    headers: &axum::http::HeaderMap,
+    body: Bytes,
+) -> Result<ShardWriteRequest, String> {
+    let db = header_value(headers, "x-hyperbytedb-shard-db")?;
+    let rp = header_value(headers, "x-hyperbytedb-shard-rp")?;
+    let region_id = header_value(headers, "x-hyperbytedb-shard-region-id")?
+        .parse::<u64>()
+        .map_err(|_| "invalid x-hyperbytedb-shard-region-id".to_string())?;
+    let epoch: ShardEpoch =
+        serde_json::from_str(&header_value(headers, "x-hyperbytedb-shard-epoch")?)
+            .map_err(|e| format!("invalid x-hyperbytedb-shard-epoch: {e}"))?;
+    let precision = headers
+        .get("x-hyperbytedb-shard-precision")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    Ok(ShardWriteRequest {
+        db,
+        rp,
+        precision,
+        epoch,
+        region_id,
+        body: body.to_vec(),
+    })
+}
+
 pub async fn handle_shard_write(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<ShardWriteRequest>,
+    request: Request<Body>,
 ) -> impl IntoResponse {
+    let (parts, body) = request.into_parts();
+    let body_bytes = match axum::body::to_bytes(body, state.replicate_body_limit_bytes.max(1)).await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let req = if parts
+        .headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("application/octet-stream"))
+    {
+        match shard_write_from_line_protocol_request(&parts.headers, body_bytes) {
+            Ok(r) => r,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": e})),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        match serde_json::from_slice::<ShardWriteRequest>(&body_bytes) {
+            Ok(r) => r,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    apply_shard_write(state, req).await
+}
+
+async fn apply_shard_write(
+    state: Arc<AppState>,
+    req: ShardWriteRequest,
+) -> axum::response::Response {
     let Some(ctx) = state.shard_routing.as_ref() else {
         return (
             StatusCode::BAD_REQUEST,
@@ -338,6 +421,7 @@ pub async fn handle_shard_write(
             body: req.body,
             wal_seq,
             target_node_ids: Some(targets),
+            region_id: Some(region.region_id),
         };
         if let Err(e) = dispatch_outbound_replication(
             pc.clone(),
@@ -484,6 +568,7 @@ pub async fn handle_shard_heartbeat(
         )
             .into_response();
     }
+    let mut stale_epoch = false;
     if let Some(ctx) = state.shard_routing.as_ref() {
         let map = match ctx.shard_map.snapshot().await {
             Ok(m) => m,
@@ -503,13 +588,8 @@ pub async fn handle_shard_heartbeat(
             )
                 .into_response();
         };
-        if region.epoch != req.epoch {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({"error": "stale epoch"})),
-            )
-                .into_response();
-        }
+        // Membership is what authorises the report; epoch only says whose view
+        // is newer. Checked in that order on purpose.
         let reporter = req.node_id;
         if !region.peers.contains(&reporter) {
             return (
@@ -518,6 +598,12 @@ pub async fn handle_shard_heartbeat(
             )
                 .into_response();
         }
+        // A peer's series count is true whatever epoch it thinks it is at, and
+        // the epoch moves on every placement step — so dropping these reports
+        // blinded the scheduler to exactly the regions it was busy moving. The
+        // response is still 409 so the reporter resyncs its map; the row is
+        // recorded first.
+        stale_epoch = region.epoch != req.epoch;
     }
 
     if let Some(scheduler) = state.shard_scheduler.as_ref() {
@@ -531,6 +617,14 @@ pub async fn handle_shard_heartbeat(
                 req.write_qps,
             )
             .await;
+    }
+    if stale_epoch {
+        counter!("hyperbytedb_shard_heartbeat_stale_epoch_total").increment(1);
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "stale epoch", "recorded": true})),
+        )
+            .into_response();
     }
     (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
 }
@@ -787,6 +881,7 @@ pub async fn handle_shard_rehome(
             "ok": true,
             "exported": outcome.exported,
             "applied": outcome.applied,
+            "bytes": outcome.bytes,
         })),
     )
         .into_response()

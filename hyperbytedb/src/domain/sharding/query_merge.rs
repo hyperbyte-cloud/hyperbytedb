@@ -14,6 +14,8 @@ use crate::timeseriesql::ast::{BinaryExpr, BinaryOp, Expr, Field, FunctionCall, 
 use crate::timeseriesql::to_clickhouse::{select_has_true_aggregate, select_output_field_name};
 
 const MULTI_REGION_UNSUPPORTED: &str = "aggregate is not supported across shard regions yet";
+/// Coordinator-side merge refuses unbounded DISTINCT / series fan-in.
+const SHARD_MERGE_MAX_DISTINCT_SERIES: usize = 500_000;
 
 /// Metadata for rewriting a sharded query into per-region partial aggregation
 /// and applying coordinator-side finalization.
@@ -320,15 +322,17 @@ fn build_merge_rules(
 }
 
 /// Merge multiple partial query responses into one, deduplicating series by name+tags.
-pub fn merge_query_results(mut parts: Vec<QueryResponse>) -> QueryResponse {
+pub fn merge_query_results(
+    mut parts: Vec<QueryResponse>,
+) -> Result<QueryResponse, HyperbytedbError> {
     if parts.is_empty() {
-        return QueryResponse::empty(0);
+        return Ok(QueryResponse::empty(0));
     }
     if parts.len() == 1 {
         if let Some(part) = parts.pop() {
-            return part;
+            return Ok(part);
         }
-        return QueryResponse::empty(0);
+        return Ok(QueryResponse::empty(0));
     }
 
     let statement_id = parts[0]
@@ -365,9 +369,14 @@ pub fn merge_query_results(mut parts: Vec<QueryResponse>) -> QueryResponse {
     }
 
     let mut series: Vec<SeriesResult> = merged.into_values().collect();
+    if series.len() > SHARD_MERGE_MAX_DISTINCT_SERIES {
+        return Err(HyperbytedbError::QueryParse(format!(
+            "shard merge would combine more than {SHARD_MERGE_MAX_DISTINCT_SERIES} distinct series; narrow the query"
+        )));
+    }
     series.sort_by(|a, b| a.name.cmp(&b.name));
 
-    QueryResponse::single(statement_id, series)
+    Ok(QueryResponse::single(statement_id, series))
 }
 
 /// Merge sharded partial results, reducing global aggregates across regions.
@@ -377,7 +386,7 @@ pub fn merge_sharded_query_results(
     plan: Option<&ShardedQueryPlan>,
 ) -> Result<QueryResponse, HyperbytedbError> {
     let merged = if !select_has_true_aggregate(stmt) {
-        merge_query_results(parts)
+        merge_query_results(parts)?
     } else {
         merge_aggregate_parts(parts, stmt, plan)?
     };
@@ -1142,7 +1151,7 @@ mod tests {
                 partial: None,
             }],
         );
-        let merged = merge_query_results(vec![a, b]);
+        let merged = merge_query_results(vec![a, b]).unwrap();
         assert_eq!(merged.results[0].series.as_ref().unwrap().len(), 2);
     }
 

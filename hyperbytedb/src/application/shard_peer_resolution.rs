@@ -48,7 +48,10 @@ pub fn is_active_peer(membership: &ClusterMembership, node_id: u64) -> bool {
 ///   primary); falling back to a replica would create two concurrent WAL
 ///   writers and divergent watermarks. An inactive primary yields no targets —
 ///   the caller fails fast until failover promotes a new primary.
-/// - Other roles: self (if Active + in region.peers) → primary → other Active peers.
+/// - [`RegionTargetRole::Replicate`]: every Active member of `peers`, including
+///   learners in `staging_peers`, so live writes reach a copy-in-progress replica.
+/// - [`RegionTargetRole::Read`]: self → primary → other serving peers (learners
+///   excluded — they may hold only a prefix of the range).
 #[must_use]
 pub fn resolve_region_peers(
     region: &ShardRegion,
@@ -75,6 +78,16 @@ pub fn resolve_region_peers(
             return vec![region.primary];
         }
         return Vec::new();
+    }
+
+    if role == RegionTargetRole::Replicate {
+        let mut out = Vec::with_capacity(region.peers.len());
+        for id in &region.peers {
+            if *id != self_id && is_active_peer(membership, *id) {
+                out.push(*id);
+            }
+        }
+        return out;
     }
 
     let mut out = Vec::with_capacity(region.peers.len());
@@ -269,12 +282,6 @@ mod tests {
     }
 
     /// A learner receives replicated writes but must not answer reads.
-    ///
-    /// It holds only a prefix of the range until its copy finishes, and scatter
-    /// cannot tell a partial answer from a correct one -- which is the whole
-    /// reason the old code copied BEFORE committing membership. Marking the
-    /// member as a learner is what lets us commit first (so no write slips
-    /// through the gap) without ever serving from it.
     #[test]
     fn a_learner_is_never_a_read_target() {
         let mut membership = ClusterMembership::default();
@@ -289,7 +296,6 @@ mod tests {
             RegionTargetRole::Read,
             RegionTargetRole::PrimaryRead,
             RegionTargetRole::Write,
-            RegionTargetRole::Replicate,
         ] {
             let got = resolve_region_peers(&r, 2, &membership, role);
             assert!(
@@ -298,12 +304,28 @@ mod tests {
             );
         }
 
-        // ... and it is still a MEMBER, so replication reaches it.
         assert!(r.peers.contains(&3));
 
-        // Promotion makes it eligible.
         r.staging_peers.clear();
         assert!(resolve_region_peers(&r, 2, &membership, RegionTargetRole::Read).contains(&3));
+    }
+
+    #[test]
+    fn a_learner_is_a_replicate_target() {
+        let mut membership = ClusterMembership::default();
+        for id in [1, 2, 3] {
+            membership.nodes.insert(id, node(id, NodeState::Active));
+        }
+
+        let mut r = region(1, &[1, 2, 3]);
+        r.staging_peers = vec![3];
+
+        let targets = resolve_region_peers(&r, 1, &membership, RegionTargetRole::Replicate);
+        assert!(
+            targets.contains(&3),
+            "learner 3 must receive replication, got {targets:?}"
+        );
+        assert!(!targets.contains(&1));
     }
 
     /// A learner that happens to be the primary must not serve either -- that

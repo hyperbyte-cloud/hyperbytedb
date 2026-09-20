@@ -294,6 +294,7 @@ async fn transfer_moves_flushed_data_and_drops_source_range() {
         transfer_first_seen: None,
         state: Default::default(),
         staged_from: None,
+        staging_peers: Vec::new(),
     };
     let key = MeasurementKey::new("sharddb", "autogen", "cpu");
 
@@ -374,6 +375,7 @@ async fn bootstrap_two_regions(nodes: &[ShardedTestNode], db: &str, rp: &str, me
         transfer_first_seen: None,
         state: Default::default(),
         staged_from: None,
+        staging_peers: Vec::new(),
     };
     let region_b = ShardRegion {
         region_id: 2,
@@ -390,6 +392,7 @@ async fn bootstrap_two_regions(nodes: &[ShardedTestNode], db: &str, rp: &str, me
         transfer_first_seen: None,
         state: Default::default(),
         staged_from: None,
+        staging_peers: Vec::new(),
     };
     let split = ShardMapOp::Split {
         key: MeasurementKey::new(db, rp, measurement),
@@ -1506,4 +1509,58 @@ async fn wait_for_database(client: &reqwest::Client, url: &str, db: &str) {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     panic!("database {db} did not appear on {url}");
+}
+
+/// B.11: a write that cannot reach one region's primary must not discard the
+/// buckets it *could* apply, and must report that it was partial.
+///
+/// The forward loop used to `try_collect`, so the first unreachable region
+/// aborted the whole ingest — after other regions' forwards had already been
+/// applied remotely, and before the local bucket was appended at all. The
+/// client was told the write failed while rows were durably stored, which is
+/// what the split-write suite counted as "24,538 duplicated rows": points
+/// stored whose batches returned non-204.
+///
+/// Region A is primaried locally, region B by node 2, which is stopped. One
+/// batch spans both.
+#[tokio::test]
+#[serial(chdb)]
+async fn a_partial_multi_region_write_keeps_the_local_bucket_and_reports_partial() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut nodes =
+        start_sharded_three_node_cluster(dir.path(), ShardedClusterOptions::default()).await;
+    bootstrap_two_regions(&nodes, "sharddb", "autogen", "cpu").await;
+
+    let client = reqwest::Client::new();
+    for node in &nodes {
+        create_db(&client, &node.url, "sharddb").await;
+    }
+
+    let mid = u64::MAX / 2;
+    let (host_low, host_high) = hosts_for_region_split("cpu", mid);
+
+    // Region B's primary is gone, so host_high can never be forwarded.
+    stop_node(&mut nodes[1]);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let body = format!(
+        "cpu,host={host_low} value=11 1000000000\ncpu,host={host_high} value=22 2000000000"
+    );
+    let resp = write_line(&client, &nodes[0].url, "sharddb", &body).await;
+    assert!(
+        !resp.status().is_success(),
+        "a write that lost a region must not report success: {}",
+        resp.status()
+    );
+
+    // The local half must still be there. Under the old abort-on-first-error
+    // the local append never ran, so this row was silently thrown away because
+    // a different region was unreachable.
+    flush_node(&nodes[0]).await;
+    let rows = chdb_row_count(nodes[0].query_port.as_ref(), "sharddb_autogen_cpu").await;
+    assert!(
+        rows >= 1,
+        "the locally-owned region's point must survive another region's \
+         failure; got {rows} rows"
+    );
 }

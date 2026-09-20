@@ -46,6 +46,9 @@ pub struct ShardingConfig {
     /// Cooldown between split and merge on the same region (seconds).
     #[serde(default = "default_split_merge_interval_secs")]
     pub split_merge_interval_secs: u64,
+    /// Minimum seconds between series-driven splits on the same region.
+    #[serde(default = "default_region_split_cooldown_secs")]
+    pub region_split_cooldown_secs: u64,
     /// Max concurrent split/move/merge operators.
     #[serde(default = "default_schedule_limit")]
     pub schedule_limit: usize,
@@ -61,6 +64,18 @@ pub struct ShardingConfig {
     /// Hard cap on regions per measurement (safety guard against runaway splits).
     #[serde(default = "default_max_regions_per_measurement")]
     pub max_regions_per_measurement: usize,
+    /// Minimum percentage of the best-known holder's per-region progress a
+    /// candidate must show before a *planned* promotion will hand it primacy.
+    ///
+    /// Relative rather than absolute on purpose: heartbeats are sampled on an
+    /// interval, so under continuous writes a healthy replica is always some
+    /// thousands of series behind the last reported figure. A fixed allowance
+    /// either blocks every promotion or permits every one depending on write
+    /// rate; a percentage asks whether the replica is broadly keeping up.
+    /// Emergency failover does not consult this — see
+    /// `failover_watermark_safe`.
+    #[serde(default = "default_promote_min_progress_pct")]
+    pub promote_min_progress_pct: u64,
     /// Seconds a region primary may stay non-Active before Raft leader proposes TransferPrimary.
     #[serde(default = "default_primary_failover_after_secs")]
     pub primary_failover_after_secs: u64,
@@ -93,6 +108,10 @@ pub struct ShardingConfig {
     /// evacuation are never throttled.
     #[serde(default = "default_movement_budget_bytes_per_sec")]
     pub movement_budget_bytes_per_sec: u64,
+    /// After this many seconds without a heartbeat while `Disconnected`, a node
+    /// is excluded from placement candidates and may be removed from regions.
+    #[serde(default = "default_dead_node_timeout_secs")]
+    pub dead_node_timeout_secs: u64,
 }
 
 impl Default for ShardingConfig {
@@ -104,11 +123,13 @@ impl Default for ShardingConfig {
             region_max_series: default_region_max_series(),
             region_merge_series: default_region_merge_series(),
             split_merge_interval_secs: default_split_merge_interval_secs(),
+            region_split_cooldown_secs: default_region_split_cooldown_secs(),
             schedule_limit: default_schedule_limit(),
             heartbeat_interval_secs: default_shard_heartbeat_interval_secs(),
             load_split_qps_threshold: 0,
             bootstrap_timeout_ms: default_shard_bootstrap_timeout_ms(),
             max_regions_per_measurement: default_max_regions_per_measurement(),
+            promote_min_progress_pct: default_promote_min_progress_pct(),
             primary_failover_after_secs: default_primary_failover_after_secs(),
             scatter_peer_timeout_ms: default_scatter_peer_timeout_ms(),
             scatter_max_peer_attempts: default_scatter_max_peer_attempts(),
@@ -117,8 +138,17 @@ impl Default for ShardingConfig {
             add_peer_proposals_enabled: default_add_peer_proposals_enabled(),
             remove_peer_proposals_enabled: default_remove_peer_proposals_enabled(),
             movement_budget_bytes_per_sec: default_movement_budget_bytes_per_sec(),
+            dead_node_timeout_secs: default_dead_node_timeout_secs(),
         }
     }
+}
+
+fn default_dead_node_timeout_secs() -> u64 {
+    600
+}
+
+fn default_promote_min_progress_pct() -> u64 {
+    50
 }
 
 fn default_max_regions_per_measurement() -> usize {
@@ -143,6 +173,10 @@ fn default_region_merge_series() -> u64 {
 
 fn default_split_merge_interval_secs() -> u64 {
     3600
+}
+
+fn default_region_split_cooldown_secs() -> u64 {
+    60
 }
 
 fn default_schedule_limit() -> usize {
@@ -197,7 +231,7 @@ fn default_remove_peer_proposals_enabled() -> bool {
 }
 
 fn default_movement_budget_bytes_per_sec() -> u64 {
-    0
+    10 * 1024 * 1024
 }
 
 impl HyperbytedbConfig {
@@ -1293,8 +1327,9 @@ mod replicate_body_limit_tests {
         assert!(s.add_peer_proposals_enabled);
         assert!(s.remove_peer_proposals_enabled);
         assert_eq!(
-            s.movement_budget_bytes_per_sec, 0,
-            "0 means unlimited; a nonzero default would throttle silently"
+            s.movement_budget_bytes_per_sec,
+            10 * 1024 * 1024,
+            "convergence-tier moves share a per-tick byte budget"
         );
         assert!(s.transfer_clear_proposals_enabled);
     }

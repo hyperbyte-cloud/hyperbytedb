@@ -4,6 +4,8 @@ use std::collections::BTreeSet;
 
 use futures::future::try_join_all;
 
+const METADATA_SCATTER_CONCURRENCY: usize = 32;
+
 use crate::application::shard_peer_resolution::{RegionTargetRole, ScatterKind};
 use crate::application::shard_routing::{
     ShardRoutingContext, reload_region, scatter_to_region_peers,
@@ -81,6 +83,29 @@ async fn fetch_remote_metadata(
     ))
 }
 
+async fn fetch_remote_metadata_bounded(
+    ctx: &ShardRoutingContext,
+    db: &str,
+    rp: &str,
+    measurement: &str,
+    regions: Vec<ShardRegion>,
+    kind: ShardMetadataKind,
+) -> Result<Vec<serde_json::Value>, HyperbytedbError> {
+    let mut parts = Vec::with_capacity(regions.len());
+    for chunk in regions.chunks(METADATA_SCATTER_CONCURRENCY) {
+        let chunk_futures: Vec<_> = chunk
+            .iter()
+            .map(|region| {
+                let region = region.clone();
+                let kind = kind.clone();
+                async move { fetch_remote_metadata(ctx, db, rp, measurement, &region, kind).await }
+            })
+            .collect();
+        parts.extend(try_join_all(chunk_futures).await?);
+    }
+    Ok(parts)
+}
+
 pub async fn scatter_tag_keys(
     ctx: &ShardRoutingContext,
     metadata: &dyn MetadataPort,
@@ -109,13 +134,19 @@ pub async fn scatter_tag_keys(
         }
     }
 
-    let remote_regions: Vec<_> = serving
+    let remote_regions: Vec<ShardRegion> = serving
         .iter()
         .filter(|region| !region.peers.contains(&ctx.node_id))
+        .cloned()
         .collect();
-    let remote_parts = try_join_all(remote_regions.iter().map(|region| {
-        fetch_remote_metadata(ctx, db, rp, measurement, region, ShardMetadataKind::TagKeys)
-    }))
+    let remote_parts = fetch_remote_metadata_bounded(
+        ctx,
+        db,
+        rp,
+        measurement,
+        remote_regions,
+        ShardMetadataKind::TagKeys,
+    )
     .await?;
     for part in remote_parts {
         if let Some(arr) = part.get("tag_keys").and_then(|v| v.as_array()) {
@@ -163,22 +194,21 @@ pub async fn scatter_tag_values(
         }
     }
 
-    let remote_regions: Vec<_> = serving
+    let remote_regions: Vec<ShardRegion> = serving
         .iter()
         .filter(|region| !region.peers.contains(&ctx.node_id))
+        .cloned()
         .collect();
-    let remote_parts = try_join_all(remote_regions.iter().map(|region| {
-        fetch_remote_metadata(
-            ctx,
-            db,
-            rp,
-            measurement,
-            region,
-            ShardMetadataKind::TagValues {
-                tag_key: tag_key.to_string(),
-            },
-        )
-    }))
+    let remote_parts = fetch_remote_metadata_bounded(
+        ctx,
+        db,
+        rp,
+        measurement,
+        remote_regions,
+        ShardMetadataKind::TagValues {
+            tag_key: tag_key.to_string(),
+        },
+    )
     .await?;
     for part in remote_parts {
         if let Some(arr) = part.get("values").and_then(|v| v.as_array()) {
@@ -224,13 +254,19 @@ pub async fn scatter_series_keys(
         }
     }
 
-    let remote_regions: Vec<_> = serving
+    let remote_regions: Vec<ShardRegion> = serving
         .iter()
         .filter(|region| !region.peers.contains(&ctx.node_id))
+        .cloned()
         .collect();
-    let remote_parts = try_join_all(remote_regions.iter().map(|region| {
-        fetch_remote_metadata(ctx, db, rp, measurement, region, ShardMetadataKind::Series)
-    }))
+    let remote_parts = fetch_remote_metadata_bounded(
+        ctx,
+        db,
+        rp,
+        measurement,
+        remote_regions,
+        ShardMetadataKind::Series,
+    )
     .await?;
     for part in remote_parts {
         if let Some(arr) = part.get("series").and_then(|v| v.as_array()) {

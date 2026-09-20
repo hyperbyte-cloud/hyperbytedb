@@ -130,11 +130,47 @@ pub enum ShardMapOp {
         #[serde(default)]
         epoch: ShardEpoch,
     },
+    /// Garbage-collect shard spaces after their data is dropped.
+    ///
+    /// Without this, `DROP DATABASE` / `DROP MEASUREMENT` / retention-policy
+    /// deletion tore down metadata, MV, WAL and chDB but left every region in
+    /// the map. The regions kept being counted by heartbeat reporters, kept
+    /// being scheduled for placement, and kept counting against the
+    /// measurement's region cap — so re-creating a measurement started at the
+    /// previous run's region count and hit the cap immediately.
+    ///
+    /// Scope widens as the fields go `None`: `measurement: None` drops every
+    /// measurement under `rp`, and `rp: None` drops every retention policy in
+    /// `db`. Dropping a space that is not in the map is a no-op, not an error
+    /// — the op has to be idempotent because it is replayed from the Raft log.
+    DropSpace {
+        db: String,
+        rp: Option<String>,
+        measurement: Option<String>,
+    },
 }
 
 impl ShardMapOp {
-    pub fn measurement_key(&self) -> &MeasurementKey {
+    /// Whether this op removes the spaces matching `key`'s scope.
+    fn drop_matches(
+        db: &str,
+        rp: &Option<String>,
+        measurement: &Option<String>,
+        key: &MeasurementKey,
+    ) -> bool {
+        key.db == db
+            && rp.as_ref().is_none_or(|r| key.rp == *r)
+            && measurement.as_ref().is_none_or(|m| key.measurement == *m)
+    }
+}
+
+impl ShardMapOp {
+    /// The single space this op mutates, or `None` for ops whose scope is not
+    /// one measurement (`DropSpace`). Prefer [`Self::affected_space_keys`],
+    /// which is correct for every variant.
+    pub fn measurement_key(&self) -> Option<&MeasurementKey> {
         match self {
+            ShardMapOp::DropSpace { .. } => None,
             ShardMapOp::BootstrapMeasurement { key, .. }
             | ShardMapOp::Split { key, .. }
             | ShardMapOp::Merge { key, .. }
@@ -144,7 +180,30 @@ impl ShardMapOp {
             | ShardMapOp::RemovePeer { key, .. }
             | ShardMapOp::TransferPrimary { key, .. }
             | ShardMapOp::ClearVerified { key, .. }
-            | ShardMapOp::ActivateRegion { key, .. } => key,
+            | ShardMapOp::ActivateRegion { key, .. } => Some(key),
+        }
+    }
+
+    /// Every space this op may add, change or remove, resolved against the map
+    /// as it stands *before* the op is applied.
+    ///
+    /// Persistence and the location cache both key off this: a single-key op
+    /// touches one space, but `DropSpace` can remove an entire database's
+    /// worth, and each of those rows has to be deleted.
+    #[must_use]
+    pub fn affected_space_keys(&self, map: &super::types::ShardMap) -> Vec<MeasurementKey> {
+        match self {
+            ShardMapOp::DropSpace {
+                db,
+                rp,
+                measurement,
+            } => map
+                .spaces
+                .keys()
+                .filter(|key| Self::drop_matches(db, rp, measurement, key))
+                .cloned()
+                .collect(),
+            other => other.measurement_key().cloned().into_iter().collect(),
         }
     }
 }
@@ -251,6 +310,14 @@ pub fn apply_shard_map_op(
             map.validate_global_region_ids()
                 .map_err(ShardMapApplyError::Invalid)?;
         }
+        ShardMapOp::DropSpace {
+            db,
+            rp,
+            measurement,
+        } => {
+            map.spaces
+                .retain(|key, _| !ShardMapOp::drop_matches(&db, &rp, &measurement, key));
+        }
         ShardMapOp::Merge {
             key,
             left_region_id,
@@ -314,6 +381,11 @@ pub fn apply_shard_map_op(
             if !region.peers.contains(&from_peer) {
                 return Err(ShardMapApplyError::Invalid(format!(
                     "peer {from_peer} not in region"
+                )));
+            }
+            if region.staging_peers.contains(&to_peer) {
+                return Err(ShardMapApplyError::Invalid(format!(
+                    "cannot move peer to learner {to_peer}"
                 )));
             }
             region.peers.retain(|p| *p != from_peer);
@@ -428,6 +500,16 @@ pub fn apply_shard_map_op(
             if region.peers.len() <= 1 {
                 return Err(ShardMapApplyError::Invalid(
                     "cannot remove the last peer of a region".into(),
+                ));
+            }
+            let remaining_serving = region
+                .peers
+                .iter()
+                .filter(|p| **p != from_peer && region.is_serving_peer(**p))
+                .count();
+            if remaining_serving == 0 {
+                return Err(ShardMapApplyError::Invalid(
+                    "cannot remove peer: no serving replica would remain".into(),
                 ));
             }
             region.peers.retain(|p| *p != from_peer);
@@ -1539,5 +1621,139 @@ mod tests {
         )
         .expect("a promoted peer may become primary");
         assert_eq!(map.spaces[&key].regions[0].primary, 7);
+    }
+    fn bootstrap_space(map: &mut ShardMap, db: &str, rp: &str, measurement: &str, region_id: u64) {
+        apply_shard_map_op(
+            map,
+            ShardMapOp::BootstrapMeasurement {
+                key: MeasurementKey::new(db, rp, measurement),
+                region: sample_region(region_id, 0, u64::MAX, 1),
+            },
+        )
+        .unwrap();
+    }
+
+    fn spaces(map: &ShardMap) -> Vec<String> {
+        let mut out: Vec<String> = map
+            .spaces
+            .keys()
+            .map(|k| format!("{}/{}/{}", k.db, k.rp, k.measurement))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// G6: dropping data has to drop its shard spaces too.
+    ///
+    /// `DROP DATABASE` / `DROP MEASUREMENT` / RP deletion tore down metadata,
+    /// MV, WAL and chDB and left every region in the map — still counted by
+    /// heartbeat reporters, still scheduled, and still charged against the
+    /// measurement's region cap, so re-creating the measurement started at the
+    /// previous run's region count.
+    #[test]
+    fn drop_space_removes_exactly_its_scope() {
+        let mut map = ShardMap::default();
+        bootstrap_space(&mut map, "db", "autogen", "cpu", 1);
+        bootstrap_space(&mut map, "db", "autogen", "mem", 2);
+        bootstrap_space(&mut map, "db", "hourly", "cpu", 3);
+        bootstrap_space(&mut map, "other", "autogen", "cpu", 4);
+
+        // DROP MEASUREMENT: one space.
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::DropSpace {
+                db: "db".into(),
+                rp: Some("autogen".into()),
+                measurement: Some("cpu".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            spaces(&map),
+            vec!["db/autogen/mem", "db/hourly/cpu", "other/autogen/cpu"]
+        );
+
+        // DROP RETENTION POLICY: every measurement under it, and nothing in
+        // the database's other retention policies.
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::DropSpace {
+                db: "db".into(),
+                rp: Some("autogen".into()),
+                measurement: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(spaces(&map), vec!["db/hourly/cpu", "other/autogen/cpu"]);
+
+        // DROP DATABASE: everything in it, and nothing in any other database.
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::DropSpace {
+                db: "db".into(),
+                rp: None,
+                measurement: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(spaces(&map), vec!["other/autogen/cpu"]);
+    }
+
+    /// Replayed from the Raft log on every node, including nodes that already
+    /// applied it, so dropping nothing must succeed rather than error.
+    #[test]
+    fn drop_space_is_idempotent_and_never_errors_on_a_miss() {
+        let mut map = ShardMap::default();
+        bootstrap_space(&mut map, "db", "autogen", "cpu", 1);
+        let op = || ShardMapOp::DropSpace {
+            db: "db".into(),
+            rp: None,
+            measurement: None,
+        };
+        apply_shard_map_op(&mut map, op()).unwrap();
+        apply_shard_map_op(&mut map, op()).unwrap();
+        apply_shard_map_op(
+            &mut map,
+            ShardMapOp::DropSpace {
+                db: "never-existed".into(),
+                rp: None,
+                measurement: None,
+            },
+        )
+        .unwrap();
+        assert!(spaces(&map).is_empty());
+    }
+
+    /// Persistence and the location cache both key off the affected spaces, so
+    /// a `DropSpace` has to name every one it removes — resolved against the
+    /// map as it stands before the op, while those spaces are still there.
+    #[test]
+    fn drop_space_reports_every_space_it_removes() {
+        let mut map = ShardMap::default();
+        bootstrap_space(&mut map, "db", "autogen", "cpu", 1);
+        bootstrap_space(&mut map, "db", "hourly", "mem", 2);
+        bootstrap_space(&mut map, "other", "autogen", "cpu", 3);
+
+        let op = ShardMapOp::DropSpace {
+            db: "db".into(),
+            rp: None,
+            measurement: None,
+        };
+        assert_eq!(op.measurement_key(), None, "no single key to report");
+        let mut affected: Vec<String> = op
+            .affected_space_keys(&map)
+            .iter()
+            .map(|k| format!("{}/{}/{}", k.db, k.rp, k.measurement))
+            .collect();
+        affected.sort();
+        assert_eq!(affected, vec!["db/autogen/cpu", "db/hourly/mem"]);
+
+        // A single-space op still reports exactly its own key.
+        let single = ShardMapOp::DropSpace {
+            db: "other".into(),
+            rp: Some("autogen".into()),
+            measurement: Some("cpu".into()),
+        };
+        assert_eq!(single.affected_space_keys(&map).len(), 1);
     }
 }
