@@ -203,6 +203,41 @@ pub async fn handle_cluster_add_node(
             .into_response();
     }
 
+    // Re-admit a node that was previously scaled away.
+    //
+    // A StatefulSet keeps its PVCs on scale-down, so scaling back up restarts
+    // the same node id with its old membership state: `Leaving`. That state is
+    // terminal on purpose — heartbeats, sync and the preStop drain must never
+    // undo a decommission mid-evacuation — so the node could never leave it,
+    // failed readiness forever, and a cluster that had scaled down could not
+    // scale back up. The operator calling add-node is an explicit decision to
+    // bring the node back, which is the one thing that should be allowed to
+    // supersede an earlier removal. Proposed through Raft so every node,
+    // including the returning one, applies it.
+    let current = match state.membership.as_ref() {
+        Some(m) => m.read().await.get_node(req.node_id).map(|n| n.state),
+        None => None,
+    };
+    if let Some(to) = readmit_state(current) {
+        let proposal = crate::adapters::cluster::raft::types::ClusterRequest::SetNodeState {
+            node_id: req.node_id,
+            state: to,
+        };
+        match raft.client_write(proposal).await {
+            Ok(_) => tracing::info!(
+                node_id = req.node_id,
+                from = ?current,
+                to = ?to,
+                "add-node: re-admitting previously departed node"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                node_id = req.node_id,
+                "add-node: could not re-admit departed node (operator may retry)"
+            ),
+        }
+    }
+
     let mut promoted = false;
     if req.promote {
         // Build the desired voter set: current voters ∪ {new node}.
@@ -236,6 +271,22 @@ pub async fn handle_cluster_add_node(
         leader_id,
     };
     (StatusCode::OK, Json(serde_json::json!(resp))).into_response()
+}
+
+/// The state a re-added node should move to, or `None` to leave it alone.
+///
+/// Only a departed node is touched. A node that is new, or already Active,
+/// syncing or draining, is left exactly as it is: draining is a restart that
+/// rejoins on its own, and rewriting a live node's state would be a regression.
+#[must_use]
+pub(crate) fn readmit_state(
+    current: Option<crate::domain::cluster::membership::NodeState>,
+) -> Option<crate::domain::cluster::membership::NodeState> {
+    use crate::domain::cluster::membership::NodeState;
+    match current {
+        Some(NodeState::Decommissioning | NodeState::Leaving) => Some(NodeState::Joining),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -332,5 +383,45 @@ pub async fn handle_cluster_remove_node(
             })),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod readmit_tests {
+    use super::readmit_state;
+    use crate::domain::cluster::membership::NodeState;
+
+    /// D0: a node scaled away and brought back must be re-admitted.
+    ///
+    /// The StatefulSet keeps the PVC on scale-down, so the pod returns with its
+    /// persisted `Leaving` state — terminal by design — and failed readiness
+    /// forever. An explicit re-add is the one signal allowed to supersede it.
+    #[test]
+    fn a_departed_node_is_readmitted_as_joining() {
+        assert_eq!(
+            readmit_state(Some(NodeState::Leaving)),
+            Some(NodeState::Joining)
+        );
+        assert_eq!(
+            readmit_state(Some(NodeState::Decommissioning)),
+            Some(NodeState::Joining)
+        );
+    }
+
+    /// Everything else is left exactly as it is. Rewriting a live node's state
+    /// on add-node would be a regression, and Draining is a restart that
+    /// rejoins by itself.
+    #[test]
+    fn a_live_or_new_node_is_left_alone() {
+        for s in [
+            NodeState::Active,
+            NodeState::Syncing,
+            NodeState::Joining,
+            NodeState::Draining,
+            NodeState::Disconnected,
+        ] {
+            assert_eq!(readmit_state(Some(s)), None, "{s:?} must not be rewritten");
+        }
+        assert_eq!(readmit_state(None), None, "an unknown node is simply added");
     }
 }
