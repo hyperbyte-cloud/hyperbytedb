@@ -76,6 +76,14 @@ pub struct ShardingConfig {
     /// `failover_watermark_safe`.
     #[serde(default = "default_promote_min_progress_pct")]
     pub promote_min_progress_pct: u64,
+    /// Ceiling on region bytes being staged concurrently by the mover pool.
+    ///
+    /// `schedule_limit` bounds how many moves run at once; this bounds how much
+    /// data they may hold between them. Without it a leader running four
+    /// concurrent movers over large regions was OOM-killed, because the limit
+    /// counted jobs and said nothing about their size.
+    #[serde(default = "default_movement_max_inflight_bytes")]
+    pub movement_max_inflight_bytes: u64,
     /// Seconds a region primary may stay non-Active before Raft leader proposes TransferPrimary.
     #[serde(default = "default_primary_failover_after_secs")]
     pub primary_failover_after_secs: u64,
@@ -130,6 +138,7 @@ impl Default for ShardingConfig {
             bootstrap_timeout_ms: default_shard_bootstrap_timeout_ms(),
             max_regions_per_measurement: default_max_regions_per_measurement(),
             promote_min_progress_pct: default_promote_min_progress_pct(),
+            movement_max_inflight_bytes: default_movement_max_inflight_bytes(),
             primary_failover_after_secs: default_primary_failover_after_secs(),
             scatter_peer_timeout_ms: default_scatter_peer_timeout_ms(),
             scatter_max_peer_attempts: default_scatter_max_peer_attempts(),
@@ -149,6 +158,10 @@ fn default_dead_node_timeout_secs() -> u64 {
 
 fn default_promote_min_progress_pct() -> u64 {
     50
+}
+
+fn default_movement_max_inflight_bytes() -> u64 {
+    256 * 1024 * 1024
 }
 
 fn default_max_regions_per_measurement() -> usize {

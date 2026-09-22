@@ -75,6 +75,8 @@ struct PendingPlacement {
     key: MeasurementKey,
     region_id: u64,
     tier: MoveTier,
+    /// Best known size of the region, for the in-flight byte budget.
+    approx_bytes: u64,
 }
 
 /// Entries older than this multiple of the report interval are ignored for
@@ -147,6 +149,17 @@ fn max_region_peer_heartbeat_stats(hb: &[RegionHeartbeatRow], region: &ShardRegi
                 (acc.0.max(*series_count), acc.1.max(*write_qps))
             },
         )
+}
+
+/// Largest reported size for `region` across its peers, in bytes.
+fn max_region_peer_heartbeat_bytes(hb: &[RegionHeartbeatRow], region: &ShardRegion) -> u64 {
+    hb.iter()
+        .filter(|(region_id, node_id, ..)| {
+            *region_id == region.region_id && region.peers.contains(node_id)
+        })
+        .map(|(_, _, _, approx_bytes, _, _)| *approx_bytes)
+        .max()
+        .unwrap_or(0)
 }
 
 /// One outstanding post-commit split-transfer movement awaiting verified
@@ -872,10 +885,12 @@ impl ShardScheduler {
                 }
 
                 if let Some(tier) = self.preview_placement_tier(&space.key, region).await {
+                    let approx_bytes = max_region_peer_heartbeat_bytes(&hb, region);
                     pending_placements.push(PendingPlacement {
                         key: space.key.clone(),
                         region_id: region.region_id,
                         tier,
+                        approx_bytes,
                     });
                 }
 
@@ -957,16 +972,40 @@ impl ShardScheduler {
         });
 
         let limit = self.config.schedule_limit.max(1);
+
+        // Bound the bytes in flight, not just the number of movers.
+        //
+        // `schedule_limit` alone counts jobs, so N concurrent movers of a large
+        // region hold N staged bodies at once. On the kind cluster that was the
+        // difference between a leader that survived N=6 and one OOM-killed
+        // seven times at a 4Gi limit: the pool ran 4 wide regardless of how big
+        // each region was. Concurrency of 4 over small regions is fine; over
+        // large ones it is not, and only a byte budget can tell those apart.
+        //
+        // Permits are MiB so the counts stay small. A region larger than the
+        // whole budget still runs, alone — never refuse a move outright, or a
+        // big region could never be placed at all.
+        let budget_mib = (self.config.movement_max_inflight_bytes / (1024 * 1024)).max(1) as usize;
+        let byte_budget = Arc::new(tokio::sync::Semaphore::new(budget_mib));
+
         futures::stream::iter(pending)
-            .for_each_concurrent(limit, |job| async move {
-                // One mover per region. A region the planning pass is still
-                // holding is simply left for the next tick.
-                if !self.acquire_operator(job.region_id).await {
-                    return;
+            .for_each_concurrent(limit, |job| {
+                let byte_budget = Arc::clone(&byte_budget);
+                async move {
+                    let want = ((job.approx_bytes / (1024 * 1024)).max(1) as usize).min(budget_mib);
+                    let _permit = match byte_budget.acquire_many_owned(want as u32).await {
+                        Ok(p) => p,
+                        Err(_) => return,
+                    };
+                    // One mover per region. A region the planning pass is still
+                    // holding is simply left for the next tick.
+                    if !self.acquire_operator(job.region_id).await {
+                        return;
+                    }
+                    self.note_placement_attempt(job.region_id).await;
+                    self.run_one_placement(&job).await;
+                    self.release_operator(job.region_id).await;
                 }
-                self.note_placement_attempt(job.region_id).await;
-                self.run_one_placement(&job).await;
-                self.release_operator(job.region_id).await;
             })
             .await;
     }
@@ -5010,5 +5049,40 @@ mod tests {
             "a fixed allowance of 64 would reject this"
         );
         assert!(promote_progress_safe(Some(95_500), Some(100_000), 50));
+    }
+    /// The mover pool's byte budget must bound concurrency by SIZE, and must
+    /// never refuse a move outright.
+    ///
+    /// `schedule_limit` counts jobs, so four concurrent movers hold four staged
+    /// bodies whatever their size — which OOM-killed the leader at a 4Gi limit
+    /// while the same workload survived at a limit of one. The budget makes
+    /// "four small regions" and "four large ones" different, which a job count
+    /// cannot express.
+    #[test]
+    fn the_mover_byte_budget_scales_with_region_size() {
+        let budget_mib = 256usize;
+        let permits =
+            |approx_bytes: u64| ((approx_bytes / (1024 * 1024)).max(1) as usize).min(budget_mib);
+
+        // Small regions barely draw on the budget, so concurrency is unaffected.
+        assert_eq!(permits(4 * 1024 * 1024), 4);
+        assert!(
+            budget_mib / permits(4 * 1024 * 1024) >= 4,
+            "4 small moves fit"
+        );
+
+        // A large region takes a real share, so fewer run together.
+        assert_eq!(permits(128 * 1024 * 1024), 128);
+        assert_eq!(budget_mib / permits(128 * 1024 * 1024), 2, "only two fit");
+
+        // A region with no heartbeat yet still costs something, so an unknown
+        // size cannot smuggle unlimited concurrency past the budget.
+        assert_eq!(permits(0), 1);
+
+        // A region bigger than the entire budget is clamped, NOT refused: it
+        // runs alone. Requesting more permits than the semaphore holds would
+        // otherwise block that region forever and it could never be placed.
+        assert_eq!(permits(4 * 1024 * 1024 * 1024), budget_mib);
+        assert!(permits(u64::MAX) <= budget_mib);
     }
 }
