@@ -16,7 +16,7 @@ This sends concurrently from inside the cluster network, spread across every
 node, which is the only shape in which "does write throughput grow with N?"
 is a meaningful question.
 """
-import argparse, os, queue, sys, threading, time, urllib.error, urllib.parse, urllib.request
+import argparse, os, queue, random, sys, threading, time, urllib.error, urllib.parse, urllib.request
 
 
 def parse_args():
@@ -44,6 +44,12 @@ def parse_args():
     return p.parse_args()
 
 
+# Why writes failed: "<status> <first 120 chars of body>" -> count. A bare
+# count of non-204s said nothing about the cause.
+ERROR_KINDS = {}
+ERROR_LOCK = threading.Lock()
+
+
 def post(url, body, timeout=60, content_type="text/plain"):
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("Content-Type", content_type)
@@ -51,8 +57,19 @@ def post(url, body, timeout=60, content_type="text/plain"):
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status
     except urllib.error.HTTPError as e:
+        if e.code not in (429, 503):
+            try:
+                detail = e.read(120).decode("utf-8", "replace").replace("\n", " ")
+            except Exception:
+                detail = ""
+            with ERROR_LOCK:
+                k = f"{e.code} {detail}"
+                ERROR_KINDS[k] = ERROR_KINDS.get(k, 0) + 1
         return e.code
-    except Exception:
+    except Exception as e:
+        with ERROR_LOCK:
+            k = f"0 {type(e).__name__}: {str(e)[:100]}"
+            ERROR_KINDS[k] = ERROR_KINDS.get(k, 0) + 1
         return 0
 
 
@@ -68,12 +85,14 @@ def run_phase(endpoints, db, meas, start, count, batch, concurrency, ts_base, se
         if n % workers == worker_index:
             work.put(b)
     errors = [0]
+    retries = [0]
     lock = threading.Lock()
 
     def worker(idx):
         ep = endpoints[(idx + worker_index) % len(endpoints)]
         url = f"{ep}/write?db={db}&rp=autogen&precision=ns"
         local_err = 0
+        local_retry = 0
         while True:
             try:
                 base = work.get_nowait()
@@ -89,11 +108,26 @@ def run_phase(endpoints, db, meas, start, count, batch, concurrency, ts_base, se
                 # the run measured the resulting backlog instead of ingest.
                 ts = ts_base + (i // series if series else i)
                 lines.append(f"{meas},host=s{sid} value=1 {ts}{sid % 1_000_000_000:09d}")
-            code = post(url, ("\n".join(lines)).encode())
+            body = ("\n".join(lines)).encode()
+            code = post(url, body)
+            # 503/429 is admission control saying "not now": back off and
+            # retry like a real client. Only a batch that never lands, or a
+            # different failure, is an error.
+            attempt = 0
+            while code in (429, 503) and attempt < 12:
+                time.sleep(min(0.05 * 2 ** min(attempt, 5), 1.6) * (0.5 + random.random()))
+                attempt += 1
+                local_retry += 1
+                code = post(url, body)
+            if code in (429, 503):
+                with ERROR_LOCK:
+                    k = f"{code} still rejected after {attempt} retries"
+                    ERROR_KINDS[k] = ERROR_KINDS.get(k, 0) + 1
             if code != 204:
                 local_err += 1
         with lock:
             errors[0] += local_err
+            retries[0] += local_retry
 
     threads = [threading.Thread(target=worker, args=(i,), daemon=True)
                for i in range(concurrency)]
@@ -102,7 +136,7 @@ def run_phase(endpoints, db, meas, start, count, batch, concurrency, ts_base, se
         t.start()
     for t in threads:
         t.join()
-    return time.monotonic() - t0, errors[0]
+    return time.monotonic() - t0, errors[0], retries[0]
 
 
 def main():
@@ -143,7 +177,7 @@ def main():
 
     if a.phase in ("seed", "all"):
         # Seed: establish cardinality. Untimed.
-        seed_s, seed_err = run_phase(endpoints, a.db, a.measurement, 0, a.series,
+        seed_s, seed_err, _ = run_phase(endpoints, a.db, a.measurement, 0, a.series,
                                      a.batch, a.concurrency, 1_700_000_000,
                                      workers=a.workers, worker_index=a.worker_index)
         print(f"[bench] seed complete in {seed_s:.1f}s (errors={seed_err})", flush=True)
@@ -153,7 +187,7 @@ def main():
         # ingest against the split layout rather than first-touch series
         # creation. (It used to write series 0..measure_points, i.e. mostly
         # NEW series whenever measure_points > series.)
-        dur, errs = run_phase(endpoints, a.db, a.measurement, 0, a.measure_points,
+        dur, errs, retries = run_phase(endpoints, a.db, a.measurement, 0, a.measure_points,
                               a.batch, a.concurrency, 1_800_000_000, series=a.series,
                               workers=a.workers, worker_index=a.worker_index)
         mine = len(range(a.worker_index, -(-a.measure_points // a.batch), a.workers)) * a.batch
@@ -161,10 +195,12 @@ def main():
         # Per-worker line; the sweep sums points and takes the slowest
         # duration across workers.
         print(f"[bench] worker={a.worker_index}/{a.workers} points={mine} "
-              f"duration={dur:.3f}s errors={errs}", flush=True)
+              f"duration={dur:.3f}s errors={errs} retries={retries}", flush=True)
         print(f"[bench] nodes={len(endpoints)} points={mine} "
               f"duration={dur:.1f}s errors={errs}", flush=True)
         print(f"[bench] points_per_sec={pps}", flush=True)
+        for k, n in sorted(ERROR_KINDS.items(), key=lambda kv: -kv[1])[:3]:
+            print(f"[bench] error x{n}: {k}", flush=True)
     return 0
 
 

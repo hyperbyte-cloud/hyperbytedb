@@ -36,17 +36,51 @@ print(len(rs), len({r.get('primary') for r in rs}))" 2>/dev/null || echo "0 0"
 # counts have held for SPLIT_STABLE_SECS, or SPLIT_TIMEOUT_SECS passes.
 wait_for_split() {
   local n=$1 deadline=$(( SECONDS + ${SPLIT_TIMEOUT_SECS:-900} ))
-  local last="" since=$SECONDS regions primaries
+  local last="" since=$SECONDS started=$SECONDS regions primaries
   while (( SECONDS < deadline )); do
     read -r regions primaries < <(map_stats)
     # Primaries too: placement moves them after the split settles, and
     # measuring before that timed one primary node at N=6.
     if [[ "$regions/$primaries" != "$last" ]]; then last="$regions/$primaries"; since=$SECONDS; fi
     echo "[sweep] N=$n regions=$regions primaries=$primaries stable=$(( SECONDS - since ))s"
-    if (( regions >= n && SECONDS - since >= ${SPLIT_STABLE_SECS:-60} )); then return 0; fi
+    # Primaries must actually be spread: children of a split inherit the
+    # parent's primary, and moving primacy (learner, copy, promote) takes
+    # several scheduler ticks per region. A count that merely held still
+    # measured one node holding 7 of 8 primaries.
+    local want=$(( regions < n ? regions : n ))
+    if (( regions >= n && primaries >= want && SECONDS - since >= ${SPLIT_STABLE_SECS:-60} )); then
+      echo "[sweep] N=$n converged in $(( SECONDS - started ))s"
+      return 0
+    fi
     sleep 15
   done
   echo "[sweep] N=$n split wait timed out at regions=$regions"
+}
+
+# Drop every database and wait until the shard map has no spaces left.
+# A drop issued straight after a saturating run can time out; a leftover
+# space then doubles the next point's regions and keeps its transfers
+# running underneath the measurement.
+drop_all_spaces() {
+  local deadline=$(( SECONDS + 300 )) dbs regions
+  while (( SECONDS < deadline )); do
+    dbs=$(kubectl_ctx -n "$NS" exec "${CR_NAME}-0" -c hyperbytedb -- \
+      sh -c "curl -sS -m 20 -G http://127.0.0.1:8086/query --data-urlencode 'q=SHOW DATABASES'" 2>/dev/null \
+      | python3 -c "
+import sys,json
+try: d=json.load(sys.stdin)
+except Exception: raise SystemExit
+for s in d['results'][0].get('series',[]):
+  for v in s.get('values',[]): print(v[0])" 2>/dev/null)
+    for db in $dbs; do
+      kubectl_ctx -n "$NS" exec "${CR_NAME}-0" -c hyperbytedb -- \
+        sh -c "curl -sS -m 60 -X POST http://127.0.0.1:8086/query --data-urlencode 'q=DROP DATABASE ${db}'" >/dev/null 2>&1 || true
+    done
+    read -r regions _ < <(map_stats)
+    if [[ -z "$dbs" && "$regions" == 0 ]]; then return 0; fi
+    sleep 10
+  done
+  echo "[sweep] WARNING: spaces still present after drop (regions=$regions)"
 }
 
 # Run one bench phase as a Job and print its log.
@@ -98,14 +132,15 @@ JOB
   echo "**Date:** $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "**Series per node:** $SERIES_PER_NODE   **Measure points:** $MEASURE_POINTS   **Concurrency:** $CONCURRENCY per client, $CLIENTS_PER_NODE clients per node"
   echo ""
-  echo "| N | series | regions | primaries | points/sec | errors | vs baseline | valid |"
-  echo "|---|--------|---------|-----------|------------|--------|-------------|-------|"
+  echo "| N | series | regions | primaries | points/sec | errors | retries | vs baseline | valid |"
+  echo "|---|--------|---------|-----------|------------|--------|---------|-------------|-------|"
 } >"$RESULTS"
 
 kubectl_ctx -n "$NS" create configmap linearity-bench \
   --from-file=incluster_bench.py="$SCRIPT_DIR/incluster_bench.py" \
   --dry-run=client -o yaml | kubectl_ctx apply -f - >/dev/null
 
+drop_all_spaces
 for N in $NODES_LIST; do
   echo "[sweep] scaling to N=$N"
   kubectl_ctx -n "$NS" patch hyperbytedbcluster "$CR_NAME" --type merge \
@@ -127,7 +162,7 @@ for N in $NODES_LIST; do
   # run reported "N=6 ready=3" and benched anyway against six endpoints, three
   # of which did not resolve -- producing a throughput number from failures.
   if (( ready != N || total != N )); then
-    echo "| $N | - | - | - | - | - | — | NO ($ready ready of $total pods, want $N) |" >>"$RESULTS"
+    echo "| $N | - | - | - | - | - | - | — | NO ($ready ready of $total pods, want $N) |" >>"$RESULTS"
     continue
   fi
   sleep 45
@@ -151,16 +186,31 @@ for N in $NODES_LIST; do
   # measuring straight after the seed timed one primary at every N.
   wait_for_split "$N"
   out=$(run_phase "measure" "$eps" "$series" "$workers")
-  echo "$out" | grep -E '^\[bench\] worker='
+  echo "$out" | grep -E '^\[bench\] (worker=|error x)'
   # Total points over the slowest worker's time: the cluster absorbed all of
   # it within that window. Blank unless every worker reported.
-  read -r pps errs < <(echo "$out" | python3 -c "
+  read -r pps errs retries < <(echo "$out" | python3 -c "
 import re,sys
-rows=[tuple(map(float,m.groups())) for m in re.finditer(r'worker=\d+/\d+ points=(\d+) duration=([0-9.]+)s errors=(\d+)', sys.stdin.read())]
-if len(rows) != $workers or not rows: print('', ''); raise SystemExit
-pts=sum(r[0] for r in rows); dur=max(r[1] for r in rows); err=sum(r[2] for r in rows)
-print(int(pts/dur) if dur>0 else '', int(err))")
+rows=[tuple(float(g or 0) for g in m.groups()) for m in re.finditer(r'worker=\d+/\d+ points=(\d+) duration=([0-9.]+)s errors=(\d+)(?: retries=(\d+))?', sys.stdin.read())]
+if len(rows) != $workers or not rows: print('-', '-', '-'); raise SystemExit
+pts=sum(r[0] for r in rows); dur=max(r[1] for r in rows)
+print(int(pts/dur) if dur>0 else '-', int(sum(r[2] for r in rows)), int(sum(r[3] for r in rows)))")
+  [[ "$pps" == "-" ]] && pps=""
   read -r regions primaries < <(map_stats)
+  # Layout at measure time: per node, regions it is primary of, regions it
+  # holds a replica of, and the share of the hash space it is primary for
+  # (series are uniform in hash space, so that is its share of the load).
+  kubectl_ctx -n "$NS" exec "${CR_NAME}-0" -c hyperbytedb -- \
+    sh -c 'curl -sS -m 20 http://127.0.0.1:8086/internal/shard/map' 2>/dev/null \
+    | python3 -c "
+import sys,json,collections
+d=json.load(sys.stdin); P=collections.Counter(); R=collections.Counter(); W=collections.Counter()
+for sp in d.get('spaces',[]):
+  for r in sp['regions']:
+    P[r['primary']]+=1; W[r['primary']]+=(r['end']-r['start'])/2**64
+    for p in r['peers']:
+      if p!=r['primary']: R[p]+=1
+for n in sorted(set(P)|set(R)): print(f'[layout] node={n} primary={P[n]} replica={R[n]} load_share={W[n]:.2f}')" || true
 
   valid="yes"
   if [[ -z "${pps:-}" ]]; then valid="NO (no numbers)"
@@ -173,10 +223,9 @@ print(int(pts/dur) if dur>0 else '', int(err))")
   elif [[ "$valid" == "yes" ]]; then
     ratio=$(python3 -c "print(f'{$pps/$BASELINE:.2f}x')")
   else ratio="—"; fi
-  echo "| $N | $series | ${regions:-?} | ${primaries:-?} | ${pps:-?} | ${errs:-?} | $ratio | $valid |" >>"$RESULTS"
+  echo "| $N | $series | ${regions:-?} | ${primaries:-?} | ${pps:-?} | ${errs:-?} | ${retries:-?} | $ratio | $valid |" >>"$RESULTS"
   # Drop the dataset so the next N starts clean.
-  kubectl_ctx -n "$NS" exec "${CR_NAME}-0" -c hyperbytedb -- \
-    sh -c "curl -sS -m 60 -X POST http://127.0.0.1:8086/query --data-urlencode 'q=DROP DATABASE ${DB}'" >/dev/null 2>&1 || true
+  drop_all_spaces
   sleep 20
 done
 echo "[sweep] results: $RESULTS"
