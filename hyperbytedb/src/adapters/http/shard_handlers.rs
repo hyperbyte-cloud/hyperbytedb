@@ -617,6 +617,9 @@ pub async fn handle_shard_heartbeat(
                 req.write_qps,
             )
             .await;
+        scheduler
+            .record_split_hint(req.region_id, reporter, req.split_key_hint)
+            .await;
     }
     if stale_epoch {
         counter!("hyperbytedb_shard_heartbeat_stale_epoch_total").increment(1);

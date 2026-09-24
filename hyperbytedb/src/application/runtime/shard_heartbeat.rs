@@ -45,6 +45,7 @@ pub async fn run_region_heartbeat_reporter(
     query_port: Arc<dyn QueryPort>,
     region_write_stats: Arc<RegionWriteStats>,
     interval: Duration,
+    split_hint_min_series: u64,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let mut ticker = tokio::time::interval(interval);
@@ -65,6 +66,7 @@ pub async fn run_region_heartbeat_reporter(
                     query_port.as_ref(),
                     region_write_stats.as_ref(),
                     interval,
+                    split_hint_min_series,
                     &mut byte_estimates,
                 ).await {
                     tracing::warn!(error = %e, "region heartbeat report failed");
@@ -90,6 +92,7 @@ async fn report_once(
     query_port: &dyn QueryPort,
     region_write_stats: &RegionWriteStats,
     interval: Duration,
+    split_hint_min_series: u64,
     byte_estimates: &mut ByteEstimateCache,
 ) -> Result<(), String> {
     let map = shard_map.snapshot().await.map_err(|e| e.to_string())?;
@@ -170,6 +173,24 @@ async fn report_once(
                 }
             };
 
+            // Only regions that may split need the median; it costs a scan
+            // of half the range, so skip it for the rest.
+            let split_key_hint = if series_count > split_hint_min_series {
+                metadata
+                    .median_series_id_in_range(
+                        &space.key.db,
+                        &space.key.rp,
+                        &space.key.measurement,
+                        region.start,
+                        region.end,
+                    )
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+
             let mut hb = RegionHeartbeat {
                 region_id: region.region_id,
                 node_id,
@@ -177,6 +198,7 @@ async fn report_once(
                 approx_bytes,
                 write_qps,
                 epoch: region.epoch,
+                split_key_hint,
             };
             let url = format!("http://{leader_addr}/internal/shard/heartbeat");
             if let Err(reason) = post_region_heartbeat(peer_client, &url, &hb).await {

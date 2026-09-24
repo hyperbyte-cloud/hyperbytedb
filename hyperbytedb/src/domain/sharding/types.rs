@@ -364,6 +364,14 @@ pub struct RegionHeartbeat {
     pub write_qps: u64,
     #[serde(default)]
     pub epoch: ShardEpoch,
+    /// The reporter's median series id in the region, sent only once the
+    /// region is big enough to split. The leader used its OWN index for this,
+    /// which is complete only where the leader is a region peer; elsewhere
+    /// it held a skewed handful of series, the "median" landed just above the
+    /// range start, and a region split into dozens of near-empty slivers
+    /// while the heavy half kept every series (seen at N=6 on n3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_key_hint: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

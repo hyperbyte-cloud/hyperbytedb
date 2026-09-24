@@ -138,6 +138,24 @@ fn region_ready_to_split(
     series_count > split_series
 }
 
+/// Split point for `[start, end)`: a region peer's median, else this node's
+/// own median (only offered when it holds the region), else the midpoint.
+/// Always strictly inside the range.
+fn choose_split_key(
+    start: u64,
+    end: u64,
+    peer_hint: Option<u64>,
+    local_median: Option<u64>,
+) -> u64 {
+    let inside = |k: &u64| *k > start && *k < end;
+    peer_hint
+        .filter(inside)
+        .or(local_median.filter(inside))
+        .unwrap_or(start + (end - start) / 2)
+        .max(start.saturating_add(1))
+        .min(end.saturating_sub(1))
+}
+
 fn max_region_peer_heartbeat_stats(hb: &[RegionHeartbeatRow], region: &ShardRegion) -> (u64, u64) {
     hb.iter()
         .filter(|(region_id, node_id, _, _, _, _)| {
@@ -209,6 +227,8 @@ pub struct ShardScheduler {
     config: ShardingConfig,
     max_points_per_request: usize,
     heartbeats: tokio::sync::RwLock<Vec<RegionHeartbeatRow>>,
+    /// (region_id, reporter) -> that peer's median series id for the region.
+    split_hints: tokio::sync::RwLock<HashMap<(u64, u64), u64>>,
     /// Regions with an in-flight operator (split/merge/rebalance/failover/transfer).
     region_operators: tokio::sync::RwLock<HashMap<u64, ()>>,
     /// region_id -> the attempt sequence number of its last convergence move.
@@ -305,6 +325,7 @@ impl ShardScheduler {
             config,
             max_points_per_request,
             heartbeats: tokio::sync::RwLock::new(Vec::new()),
+            split_hints: tokio::sync::RwLock::new(HashMap::new()),
             region_operators: tokio::sync::RwLock::new(HashMap::new()),
             placement_last_attempted: tokio::sync::RwLock::new(HashMap::new()),
             placement_attempt_seq: std::sync::atomic::AtomicU64::new(0),
@@ -672,6 +693,36 @@ impl ShardScheduler {
             write_qps,
             now,
         ));
+    }
+
+    /// Remember (or forget) a peer's split-key hint for a region.
+    pub async fn record_split_hint(&self, region_id: u64, node_id: u64, hint: Option<u64>) {
+        let mut hints = self.split_hints.write().await;
+        match hint {
+            Some(k) => {
+                hints.insert((region_id, node_id), k);
+            }
+            None => {
+                hints.remove(&(region_id, node_id));
+            }
+        }
+    }
+
+    /// The split hint from the region peer reporting the most series: the
+    /// same peer whose count triggered the split.
+    async fn peer_split_hint(&self, region: &ShardRegion) -> Option<u64> {
+        let hb = self.heartbeats.read().await;
+        let reporter = hb
+            .iter()
+            .filter(|(r, n, ..)| *r == region.region_id && region.peers.contains(n))
+            .max_by_key(|(_, _, series, ..)| *series)
+            .map(|(_, n, ..)| *n)?;
+        drop(hb);
+        self.split_hints
+            .read()
+            .await
+            .get(&(region.region_id, reporter))
+            .copied()
     }
 
     fn is_leader(&self) -> bool {
@@ -1415,18 +1466,29 @@ impl ShardScheduler {
         key: &MeasurementKey,
         region: &ShardRegion,
     ) -> Result<u64, HyperbytedbError> {
-        let fallback = region.start + (region.end - region.start) / 2;
-        let split_key = match self
-            .metadata
-            .median_series_id_in_range(&key.db, &key.rp, &key.measurement, region.start, region.end)
-            .await
-        {
-            Ok(Some(id)) => id,
-            _ => fallback,
+        let peer_hint = self.peer_split_hint(region).await;
+        // The local index is complete only where this node holds the region.
+        let local_median = if region.peers.contains(&self.node_id) {
+            self.metadata
+                .median_series_id_in_range(
+                    &key.db,
+                    &key.rp,
+                    &key.measurement,
+                    region.start,
+                    region.end,
+                )
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
         };
-        Ok(split_key
-            .max(region.start.saturating_add(1))
-            .min(region.end.saturating_sub(1)))
+        Ok(choose_split_key(
+            region.start,
+            region.end,
+            peer_hint,
+            local_median,
+        ))
     }
 
     async fn try_merge(
@@ -3634,6 +3696,44 @@ mod tests {
         }
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].recorded_source, 1);
+    }
+
+    #[test]
+    fn split_key_prefers_the_peer_median_and_stays_inside_the_range() {
+        let (s, e) = (1_000u64, 2_000u64);
+        assert_eq!(choose_split_key(s, e, Some(1_600), Some(1_010)), 1_600);
+        // A hint outside the range (stale, from before a split) is ignored.
+        assert_eq!(choose_split_key(s, e, Some(5_000), Some(1_400)), 1_400);
+        assert_eq!(choose_split_key(s, e, Some(s), None), 1_500);
+        assert_eq!(choose_split_key(s, e, None, None), 1_500);
+        assert_eq!(choose_split_key(0, 2, None, None), 1);
+    }
+
+    /// Through the scheduler: the leader (node 99) is not a region peer, so
+    /// its own index must not pick the split point. At N=6 on n3 it did, and
+    /// a 225k-series region split 20+ times into slivers.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn a_non_peer_leader_splits_on_the_peer_reported_median() {
+        let harness = ReconcileTestHarness::new().await;
+        let key = MeasurementKey::new("db", "autogen", "cpu");
+        let mut region = flagged_test_region(1, now_unix());
+        region.start = 0;
+        region.end = u64::MAX;
+        region.peers = vec![1, 2];
+        region.primary = 1;
+        let hint = u64::MAX / 3;
+        let s = &harness.scheduler;
+        s.record_heartbeat(1, 1, 225_000, 0, 0).await;
+        s.record_heartbeat(1, 2, 224_000, 0, 0).await;
+        s.record_split_hint(1, 1, Some(hint)).await;
+        s.record_split_hint(1, 2, Some(u64::MAX / 4)).await;
+
+        let got = s.compute_split_key(&key, &region).await.unwrap();
+        assert_eq!(
+            got, hint,
+            "must use the hint from the peer with the most series"
+        );
     }
 
     #[tokio::test]

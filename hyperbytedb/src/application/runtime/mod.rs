@@ -259,6 +259,7 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
                 let hb_interval =
                     Duration::from_secs(config.sharding.heartbeat_interval_secs.max(1));
                 let hb_rx = service_shutdown_rx.clone();
+                let split_hint_min_series = config.sharding.region_split_series;
                 Some(tokio::spawn(async move {
                     if let Some(pc) = pc {
                         shard_heartbeat::run_region_heartbeat_reporter(
@@ -271,6 +272,7 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
                             query_port,
                             region_write_stats,
                             hb_interval,
+                            split_hint_min_series,
                             hb_rx,
                         )
                         .await;
