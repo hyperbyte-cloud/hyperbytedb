@@ -132,6 +132,8 @@ impl HttpTestContext {
             max_points_per_request: 0,
             request_timeout_secs: 30,
             rate_limiter: None,
+            write_admission: None,
+            shard_write_admission: None,
             wal_batcher_alive: None,
             disk_read_only: None,
             sharding_enabled: false,

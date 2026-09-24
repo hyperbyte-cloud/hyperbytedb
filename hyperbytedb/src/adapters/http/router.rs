@@ -8,7 +8,6 @@ use axum::{
     middleware,
     routing::{get, post},
 };
-use tower::ServiceBuilder;
 use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
 
 use crate::adapters::cluster::peer_client::PeerClient;
@@ -35,6 +34,24 @@ use super::{
     auth_middleware, chdb, cluster, metrics, middleware as http_middleware, peer_handlers, ping,
     query, raft_handlers, rate_limit, shard_handlers, statements, write,
 };
+
+/// A write admission budget: a semaphore and the size it was created with,
+/// which tokio does not expose and the oversize clamp needs.
+#[derive(Debug)]
+pub struct Admission {
+    pub sem: Arc<tokio::sync::Semaphore>,
+    pub capacity: usize,
+}
+
+impl Admission {
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            sem: Arc::new(tokio::sync::Semaphore::new(capacity)),
+            capacity,
+        }
+    }
+}
 
 pub struct AppState {
     pub ingestion: Arc<dyn IngestionPort>,
@@ -68,6 +85,15 @@ pub struct AppState {
     pub max_points_per_request: usize,
     pub request_timeout_secs: u64,
     pub rate_limiter: Option<Arc<rate_limit::EndpointRateLimiters>>,
+    /// Bounds client `/write` requests in flight; see
+    /// `ServerConfig::max_inflight_writes`. `None` admits everything.
+    pub write_admission: Option<Arc<Admission>>,
+    /// Same bound for writes other nodes forward here as region primary
+    /// (`/internal/shard/write`). Client admission alone left these
+    /// unbounded: at N=6 a hot primary took forwards from five entry nodes,
+    /// its task queue grew until `/ping` missed the liveness deadline, and
+    /// kubelet killed it mid-run.
+    pub shard_write_admission: Option<Arc<Admission>>,
     /// Set when WAL group-commit is enabled; `false` after the writer task exits.
     pub wal_batcher_alive: Option<Arc<AtomicBool>>,
     /// Set when `[disk] enabled`; `true` when free space is below readonly threshold.
@@ -112,6 +138,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/write",
             post(write::handle_write)
                 .layer(DefaultBodyLimit::max(body_limit))
+                // Innermost of the three: a request that fails auth or the
+                // rate limit never holds an admission permit.
+                .layer(axum::middleware::from_fn_with_state(
+                    auth_state.clone(),
+                    auth_middleware::write_admission_layer,
+                ))
                 .layer(axum::middleware::from_fn_with_state(
                     auth_state.clone(),
                     auth_middleware::auth_layer,
@@ -201,7 +233,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
                 .route(
                     "/internal/shard/write",
                     post(shard_handlers::handle_shard_write)
-                        .layer(DefaultBodyLimit::max(replicate_body_limit)),
+                        .layer(DefaultBodyLimit::max(replicate_body_limit))
+                        .layer(axum::middleware::from_fn_with_state(
+                            state.clone(),
+                            auth_middleware::shard_write_admission_layer,
+                        )),
                 )
                 .route(
                     "/internal/shard/query",
@@ -222,15 +258,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
                 // "413 Failed to buffer the request body: length limit
                 // exceeded", the split committed anyway, and the child sat
                 // staging while its transfer retried forever.
-                .route(
-                    "/internal/shard/transfer",
-                    post(shard_handlers::handle_shard_transfer)
-                        .layer(DefaultBodyLimit::max(replicate_body_limit)),
-                )
-                .route(
-                    "/internal/shard/rehome",
-                    post(shard_handlers::handle_shard_rehome),
-                )
                 .route(
                     "/internal/shard/metadata",
                     post(shard_handlers::handle_shard_metadata),
@@ -281,6 +308,37 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             );
     }
 
+    // Region moves: bulk copies that legitimately run for minutes. They sit
+    // outside the router-wide request timeout -- their callers bound them
+    // (120s push, 300s rehome). Under it, any region whose copy took over
+    // 30s came back 408, the learner never finished staging, and primaries
+    // never moved: on n3 one node stayed primary of 26 of 35 regions for 25
+    // minutes.
+    let mut long_router = Router::new();
+    if state.sharding_enabled && state.peer_client.is_some() {
+        long_router = long_router
+            // Region transfers carry bulk line protocol, sized like
+            // replication rather than like a control message. Without an
+            // explicit limit these fell back to axum's 2 MiB default and a
+            // large region could NEVER move: the receiver answered
+            // "413 Failed to buffer the request body: length limit
+            // exceeded", the split committed anyway, and the child sat
+            // staging while its transfer retried forever.
+            .route(
+                "/internal/shard/transfer",
+                post(shard_handlers::handle_shard_transfer)
+                    .layer(DefaultBodyLimit::max(replicate_body_limit)),
+            )
+            .route(
+                "/internal/shard/rehome",
+                post(shard_handlers::handle_shard_rehome),
+            )
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware::internal_auth_layer,
+            ));
+    }
+
     let router = if state.peer_client.is_some() || state.raft.is_some() {
         let internal_auth = state.clone();
         let cluster_router = cluster_router.route_layer(axum::middleware::from_fn_with_state(
@@ -292,27 +350,148 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         public_router
     };
 
-    router
+    layer_routes(router, long_router, timeout_duration)
         .layer(
-            ServiceBuilder::new()
-                .layer(middleware::map_response(
-                    http_middleware::add_version_headers,
-                ))
-                .layer(TimeoutLayer::with_status_code(
-                    StatusCode::REQUEST_TIMEOUT,
-                    timeout_duration,
-                )),
-        )
-        .layer(
-            TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
-                tracing::span!(
-                    tracing::Level::DEBUG,
-                    "request",
-                    method = %request.method(),
-                    path = %request.uri().path(),
-                    version = ?request.version(),
-                )
-            }),
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &axum::http::Request<_>| {
+                    tracing::span!(
+                        tracing::Level::DEBUG,
+                        "request",
+                        method = %request.method(),
+                        path = %request.uri().path(),
+                        version = ?request.version(),
+                    )
+                })
+                .on_failure(log_server_failure),
         )
         .with_state(state)
+}
+
+/// Whether a failed response is expected load shedding (503/429), which is
+/// logged at debug, rather than a server fault, which stays at error.
+fn is_load_shedding(class: &tower_http::classify::ServerErrorsFailureClass) -> bool {
+    matches!(
+        class,
+        tower_http::classify::ServerErrorsFailureClass::StatusCode(c)
+            if *c == StatusCode::SERVICE_UNAVAILABLE || *c == StatusCode::TOO_MANY_REQUESTS
+    )
+}
+
+/// `on_failure` for the HTTP trace layer. At saturation every admission
+/// rejection was an ERROR line: ~10k in five minutes on one node, which cost
+/// CPU and rotated every other log line (the scheduler's included) away.
+fn log_server_failure(
+    class: tower_http::classify::ServerErrorsFailureClass,
+    latency: std::time::Duration,
+    _span: &tracing::Span,
+) {
+    let latency_ms = latency.as_millis() as u64;
+    if is_load_shedding(&class) {
+        tracing::debug!(classification = %class, latency_ms, "response shed load");
+    } else {
+        tracing::error!(classification = %class, latency_ms, "response failed");
+    }
+}
+
+/// Apply the request timeout to `router` only, then merge `long` (routes
+/// bounded by their callers) and add version headers to both.
+fn layer_routes<S>(router: Router<S>, long: Router<S>, timeout: std::time::Duration) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            timeout,
+        ))
+        .merge(long)
+        .layer(middleware::map_response(
+            http_middleware::add_version_headers,
+        ))
+}
+
+/// Routes for the control listener (`cluster.control_port`): liveness and
+/// health probes and the Raft RPCs, served on the control runtime so they
+/// never wait behind write-path work. The same routes stay on the main
+/// listener for peers and probes that still use it.
+pub fn build_control_router(state: Arc<AppState>) -> Router {
+    let raft_routes = Router::new()
+        .route("/internal/raft/vote", post(raft_handlers::handle_raft_vote))
+        .route(
+            "/internal/raft/append",
+            post(raft_handlers::handle_raft_append),
+        )
+        .route(
+            "/internal/raft/snapshot",
+            post(raft_handlers::handle_raft_snapshot),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware::internal_auth_layer,
+        ));
+    Router::new()
+        .route("/ping", get(ping::ping).head(ping::ping))
+        .route("/health", get(ping::health).head(ping::health))
+        .merge(raft_routes)
+        .with_state(state)
+}
+
+#[cfg(test)]
+mod layer_routes_tests {
+    use super::layer_routes;
+    use axum::{Router, http::StatusCode, routing::get};
+    use std::time::Duration;
+
+    async fn slow() -> &'static str {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        "done"
+    }
+
+    async fn status_of(app: Router, path: &str) -> StatusCode {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        reqwest::get(format!("http://{addr}{path}"))
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// Region copies run for minutes; under the router-wide timeout every
+    /// copy over 30s came back 408 and primaries never moved.
+    #[tokio::test]
+    async fn long_routes_escape_the_request_timeout_and_others_do_not() {
+        let app = layer_routes(
+            Router::new().route("/short", get(slow)),
+            Router::new().route("/long", get(slow)),
+            Duration::from_millis(200),
+        );
+        assert_eq!(
+            status_of(app.clone(), "/short").await,
+            StatusCode::REQUEST_TIMEOUT
+        );
+        assert_eq!(status_of(app, "/long").await, StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+mod load_shedding_tests {
+    use super::is_load_shedding;
+    use axum::http::StatusCode;
+    use tower_http::classify::ServerErrorsFailureClass as C;
+
+    #[test]
+    fn only_503_and_429_count_as_load_shedding() {
+        assert!(is_load_shedding(&C::StatusCode(
+            StatusCode::SERVICE_UNAVAILABLE
+        )));
+        assert!(is_load_shedding(&C::StatusCode(
+            StatusCode::TOO_MANY_REQUESTS
+        )));
+        assert!(!is_load_shedding(&C::StatusCode(
+            StatusCode::INTERNAL_SERVER_ERROR
+        )));
+        assert!(!is_load_shedding(&C::StatusCode(StatusCode::BAD_GATEWAY)));
+        assert!(!is_load_shedding(&C::Error("boom".into())));
+    }
 }

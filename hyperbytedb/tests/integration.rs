@@ -118,6 +118,8 @@ fn setup(dir: &tempfile::TempDir) -> (Arc<AppState>, Arc<FlushServiceImpl>) {
         wal_batcher_alive: None,
         disk_read_only: None,
         rate_limiter: None,
+        write_admission: None,
+        shard_write_admission: None,
 
         sharding_enabled: false,
         shard_map: None,
@@ -212,6 +214,8 @@ async fn test_auth_blocks_unauthenticated() {
         wal_batcher_alive: None,
         disk_read_only: None,
         rate_limiter: None,
+        write_admission: None,
+        shard_write_admission: None,
 
         sharding_enabled: false,
         shard_map: None,
@@ -335,6 +339,8 @@ async fn test_cardinality_limit() {
         wal_batcher_alive: None,
         disk_read_only: None,
         rate_limiter: None,
+        write_admission: None,
+        shard_write_admission: None,
 
         sharding_enabled: false,
         shard_map: None,
@@ -493,6 +499,8 @@ async fn test_metrics_endpoint() {
         wal_batcher_alive: None,
         disk_read_only: None,
         rate_limiter: None,
+        write_admission: None,
+        shard_write_admission: None,
 
         sharding_enabled: false,
         shard_map: None,
@@ -773,6 +781,137 @@ fn walkdir_recursive(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     result
 }
 
+/// App state for the admission tests: everything default except the
+/// `/write` admission semaphore.
+async fn admission_app(permits: usize) -> (tempfile::TempDir, Arc<AppState>) {
+    let dir = tempfile::tempdir().unwrap();
+    let wal_dir = dir.path().join("wal_adm");
+    let meta_dir = dir.path().join("meta_adm");
+    let chdb_dir = dir.path().join("chdb_adm");
+    std::fs::create_dir_all(&wal_dir).unwrap();
+    std::fs::create_dir_all(&meta_dir).unwrap();
+    std::fs::create_dir_all(&chdb_dir).unwrap();
+
+    let wal = Arc::new(RocksDbWal::open(&wal_dir).unwrap());
+    let metadata = Arc::new(RocksDbMetadata::open(&meta_dir).unwrap());
+    let shared = SharedSession::new_eager(chdb_dir.to_str().unwrap(), 1).unwrap();
+    let chdb = Arc::new(ChdbQueryAdapter::from_shared(shared.clone(), 0));
+    let sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(shared));
+
+    let prometheus_handle = test_prometheus_handle();
+
+    let ingestion_service: Arc<dyn hyperbytedb::ports::ingestion::IngestionPort> = Arc::new(
+        IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 10_000, 0),
+    );
+    let query_service: Arc<dyn hyperbytedb::adapters::http::router::QueryService> =
+        Arc::new(QueryServiceImpl::new(
+            chdb.clone(),
+            metadata.clone(),
+            wal.clone(),
+            30,
+            sink.clone(),
+        ));
+
+    let _flush = FlushServiceImpl::new(wal.clone(), 0, sink.clone());
+
+    let app_state = Arc::new(AppState {
+        ingestion: ingestion_service,
+        query: query_service,
+        query_port: chdb.clone(),
+        metadata: metadata.clone(),
+        wal: wal.clone(),
+        points_sink: sink.clone(),
+        mv_service: test_mv_service(&(metadata.clone() as Arc<dyn MetadataPort>), &chdb, &sink),
+        auth: Arc::new(hyperbytedb::adapters::auth::MetadataAuthAdapter::new(
+            metadata.clone(),
+        )),
+        peer_client: None,
+        membership: None,
+        replication_log: None,
+        drain_service: None,
+        raft: None,
+        auth_enabled: false,
+        auth_allow_query_param_credentials: false,
+        prometheus_handle: Some(prometheus_handle),
+        statement_summary: None,
+        statement_summary_require_auth: true,
+        replication_apply: None,
+        chdb_session_data_path: chdb_dir.to_string_lossy().into_owned(),
+        node_id: 1,
+        max_body_size_bytes: 25 * 1024 * 1024,
+        replicate_body_limit_bytes: 32 * 1024 * 1024,
+        max_points_per_request: 0,
+        request_timeout_secs: 30,
+        rate_limiter: None,
+        write_admission: Some(Arc::new(
+            hyperbytedb::adapters::http::router::Admission::new(permits),
+        )),
+        shard_write_admission: None,
+        wal_batcher_alive: None,
+        disk_read_only: None,
+
+        sharding_enabled: false,
+        shard_map: None,
+        shard_location_cache: Arc::new(hyperbytedb::domain::sharding::ShardLocationCache::new()),
+        shard_routing: None,
+        shard_scheduler: None,
+        ingest_cardinality: IngestCardinalityLimits::default(),
+        ingest_schema_cache: Default::default(),
+        cluster_replication: ReplicationConfig::default(),
+    });
+
+    (dir, app_state)
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn write_admission_turns_excess_writes_away_at_once() {
+    // No permits: every write is over capacity and must be refused
+    // immediately with Retry-After, not accepted and timed out later.
+    let (_dir, app_state) = admission_app(0).await;
+    let (url, _handle) = start_server(app_state).await;
+    let client = reqwest::Client::new();
+    let started = std::time::Instant::now();
+    let resp = client
+        .post(format!("{url}/write?db=testdb"))
+        .body("cpu,host=a value=1 1700000000000000000")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        resp.headers()
+            .get("retry-after")
+            .map(|v| v.to_str().unwrap()),
+        Some("1")
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn write_admission_admits_within_capacity() {
+    let (_dir, app_state) = admission_app(4).await;
+    let (url, _handle) = start_server(app_state).await;
+    let client = reqwest::Client::new();
+    client
+        .post(format!("{url}/query"))
+        .form(&[("q", "CREATE DATABASE testdb")])
+        .send()
+        .await
+        .unwrap();
+    for _ in 0..8 {
+        // Sequential: a released permit must be reusable.
+        let resp = client
+            .post(format!("{url}/write?db=testdb"))
+            .body("cpu,host=a value=1 1700000000000000000")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+}
+
 #[tokio::test]
 #[serial(chdb)]
 async fn test_rate_limiter_refills_and_denies() {
@@ -837,6 +976,8 @@ async fn test_rate_limiter_refills_and_denies() {
         max_points_per_request: 0,
         request_timeout_secs: 30,
         rate_limiter: Some(Arc::new(EndpointRateLimiters::new(5))),
+        write_admission: None,
+        shard_write_admission: None,
         wal_batcher_alive: None,
         disk_read_only: None,
 
@@ -1005,6 +1146,8 @@ async fn test_cross_database_on_clause_requires_authorization() {
         wal_batcher_alive: None,
         disk_read_only: None,
         rate_limiter: None,
+        write_admission: None,
+        shard_write_admission: None,
 
         sharding_enabled: false,
         shard_map: None,

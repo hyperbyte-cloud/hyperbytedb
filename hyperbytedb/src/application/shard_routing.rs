@@ -506,6 +506,15 @@ async fn try_forward_shard_write_to_region(
                         .invalidate_measurement(&MeasurementKey::new(&db, &rp, &meas));
                     return Err(HyperbytedbError::StaleShardEpoch { region_id });
                 }
+                // The primary is shedding load: say so, as a retryable 503,
+                // rather than a 502 the client counts as a hard failure.
+                if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                    || resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+                {
+                    return Err(HyperbytedbError::ClusterUnavailable(format!(
+                        "region {region_id} primary {peer_id} is at write capacity"
+                    )));
+                }
                 if !resp.status().is_success() {
                     return Err(HyperbytedbError::PeerUnreachable(format!(
                         "forward write to peer {peer_id} failed: {}",

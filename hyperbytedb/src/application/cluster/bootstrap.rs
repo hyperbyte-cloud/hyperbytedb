@@ -275,7 +275,7 @@ impl ClusterBootstrap {
             .await;
         let (log_store, state_machine) = Adaptor::<TypeConfig, RaftStore>::new(raft_store);
 
-        let network = Network::new(config.raft_rpc_timeout_secs);
+        let network = Network::new(config.raft_rpc_timeout_secs, config.control_port);
 
         let raft_config = Arc::new(
             (RaftConfig {
@@ -291,13 +291,15 @@ impl ClusterBootstrap {
             .map_err(|e| anyhow::anyhow!("invalid raft config: {e}"))?,
         );
 
-        let raft = HyperbytedbRaft::new(
-            config.node_id,
-            raft_config,
-            network,
-            log_store,
-            state_machine,
-        )
+        // On the control runtime: `Raft::new` spawns the Raft core, its
+        // state-machine worker and (as leader) its replication tasks on the
+        // runtime it runs on. Left on the main runtime they queued behind
+        // write tasks under saturation, and heartbeats arrived late enough
+        // to trigger elections (~70 in a one-minute run on n3).
+        let node_id = config.node_id;
+        let raft = crate::application::runtime::control::on_control(async move {
+            HyperbytedbRaft::new(node_id, raft_config, network, log_store, state_machine).await
+        })
         .await
         .map_err(|e| anyhow::anyhow!("failed to initialize raft: {e}"))?;
 

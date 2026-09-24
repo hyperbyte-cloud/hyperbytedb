@@ -217,9 +217,13 @@ impl PeerIngestionService {
             .await;
         let mut forward_failures = 0usize;
         let mut first_forward_error: Option<HyperbytedbError> = None;
+        // Every failure was a primary shedding load: the client should back
+        // off and retry, not treat the batch as lost.
+        let mut all_capacity = true;
         for result in forward_results {
             if let Err(e) = result {
                 forward_failures += 1;
+                all_capacity &= matches!(e, HyperbytedbError::ClusterUnavailable(_));
                 // Classify before deciding anything about retries. A forward
                 // targets the region's primary only (`RegionTargetRole::Write`
                 // resolves to it alone), so the interesting question is whether
@@ -232,6 +236,7 @@ impl PeerIngestionService {
                     HyperbytedbError::StaleShardEpoch { .. } => "stale_epoch",
                     HyperbytedbError::TransferRejected { .. } => "rejected",
                     HyperbytedbError::ShardMap(_) => "shard_map",
+                    HyperbytedbError::ClusterUnavailable(_) => "capacity",
                     _ => "other",
                 };
                 counter!(
@@ -303,13 +308,11 @@ impl PeerIngestionService {
             counter!("hyperbytedb_shard_ingest_partial_total").increment(1);
             metrics::counter!("hyperbytedb_shard_ingest_forward_region_failures_total")
                 .increment(forward_failures as u64);
-            return Err(HyperbytedbError::ShardMap(
-                format!(
-                    "write partially applied: {forward_failures} of \
-                     {forward_region_count} forwarded regions failed \
-                     (local bucket applied); first error: {err}"
-                )
-                .into(),
+            return Err(partial_write_error(
+                forward_failures,
+                forward_region_count,
+                all_capacity,
+                &err,
             ));
         }
 
@@ -566,5 +569,53 @@ impl IngestionPort for PeerIngestionService {
             region_id: None,
         })
         .await
+    }
+}
+
+/// The error for a write whose forwards partly failed.
+///
+/// A 503 when every failure was a primary at capacity: retrying the whole
+/// batch is safe (re-applying the local part rewrites identical rows, which
+/// the coalescing view collapses) and is what the client should do. Anything
+/// else stays a 500 that names the counts.
+fn partial_write_error(
+    forward_failures: usize,
+    forward_region_count: usize,
+    all_capacity: bool,
+    first: &HyperbytedbError,
+) -> HyperbytedbError {
+    if all_capacity {
+        return HyperbytedbError::ClusterUnavailable(format!(
+            "{forward_failures} of {forward_region_count} region primaries at write \
+             capacity; retry the batch"
+        ));
+    }
+    HyperbytedbError::ShardMap(
+        format!(
+            "write partially applied: {forward_failures} of \
+             {forward_region_count} forwarded regions failed \
+             (local bucket applied); first error: {first}"
+        )
+        .into(),
+    )
+}
+
+#[cfg(test)]
+mod partial_write_error_tests {
+    use super::partial_write_error;
+    use crate::error::HyperbytedbError;
+
+    #[test]
+    fn capacity_only_failures_are_retryable_everything_else_is_not() {
+        let cap = HyperbytedbError::ClusterUnavailable("at capacity".into());
+        assert!(matches!(
+            partial_write_error(3, 8, true, &cap),
+            HyperbytedbError::ClusterUnavailable(_)
+        ));
+        let down = HyperbytedbError::PeerUnreachable("refused".into());
+        assert!(matches!(
+            partial_write_error(3, 8, false, &down),
+            HyperbytedbError::ShardMap(_)
+        ));
     }
 }

@@ -300,11 +300,39 @@ pub struct ServerConfig {
     #[serde(default = "default_max_points_per_request")]
     pub max_points_per_request: usize,
     pub request_timeout_secs: u64,
+    /// Client `/write` requests allowed in flight on this node at once; the
+    /// rest get an immediate 503 with `Retry-After`. `0` sizes it from the
+    /// CPUs this process may use (see [`resolve_max_inflight_writes`]).
+    ///
+    /// Without a bound, past saturation every request was accepted, CPU hit
+    /// the cgroup limit, Raft heartbeats and probes starved, and throughput
+    /// collapsed from ~860k to ~50k points/s with most batches timing out
+    /// after 5s instead of being turned away at once.
+    #[serde(default)]
+    pub max_inflight_writes: usize,
     pub query_timeout_secs: u64,
     pub max_concurrent_queries: usize,
     pub tls_enabled: bool,
     pub tls_cert_path: String,
     pub tls_key_path: String,
+}
+
+/// Per-CPU in-flight `/write` allowance when `max_inflight_writes` is `0`.
+pub const INFLIGHT_WRITES_PER_CPU: usize = 8;
+
+/// KiB of forwarded write body admitted per client write slot on a region
+/// primary. A 1,000-line batch is ~40 KiB of line protocol.
+pub const SHARD_WRITE_KIB_PER_SLOT: usize = 64;
+
+/// The effective `/write` admission limit: the configured value, or
+/// [`INFLIGHT_WRITES_PER_CPU`] per usable CPU when `configured` is `0`.
+#[must_use]
+pub fn resolve_max_inflight_writes(configured: usize, cpus: usize) -> usize {
+    if configured > 0 {
+        configured
+    } else {
+        INFLIGHT_WRITES_PER_CPU * cpus.max(1)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -527,6 +555,14 @@ pub struct ClusterConfig {
     /// Default HTTP timeout for outbound Raft RPCs when no per-RPC deadline is supplied (seconds).
     #[serde(default = "default_raft_rpc_timeout_secs")]
     pub raft_rpc_timeout_secs: u64,
+    /// Port for the control listener (`/ping`, `/health`, Raft RPCs), served
+    /// with the Raft core on a dedicated runtime so write saturation cannot
+    /// starve heartbeats or probes. `0` (default) disables it; Raft then
+    /// uses the main port only. Every node must agree on the value: Raft
+    /// RPCs go to a peer's host on this port, falling back to its main
+    /// address when nothing listens there (mixed versions mid-roll).
+    #[serde(default)]
+    pub control_port: u16,
     /// Per-node replication mode and tuning. When the entire `[cluster.replication]`
     /// block is omitted, the resolved mode is `async`, exactly preserving today's
     /// fire-and-forget behavior.
@@ -847,6 +883,7 @@ impl HyperbytedbConfig {
                 max_body_size_bytes: 25 * 1024 * 1024,
                 max_points_per_request: default_max_points_per_request(),
                 request_timeout_secs: 30,
+                max_inflight_writes: 0,
                 query_timeout_secs: 30,
                 max_concurrent_queries: 0,
                 tls_enabled: false,
@@ -909,6 +946,7 @@ impl HyperbytedbConfig {
                 raft_election_timeout_ms: None,
                 raft_snapshot_threshold: None,
                 raft_rpc_timeout_secs: default_raft_rpc_timeout_secs(),
+                control_port: 0,
                 replication: ReplicationConfig::default(),
             },
             logging: LoggingConfig {
@@ -1298,6 +1336,7 @@ mod replicate_body_limit_tests {
             raft_election_timeout_ms: None,
             raft_snapshot_threshold: None,
             raft_rpc_timeout_secs: super::default_raft_rpc_timeout_secs(),
+            control_port: 0,
             replication: super::ReplicationConfig::default(),
         }
     }
@@ -1345,5 +1384,20 @@ mod replicate_body_limit_tests {
             "convergence-tier moves share a per-tick byte budget"
         );
         assert!(s.transfer_clear_proposals_enabled);
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::{INFLIGHT_WRITES_PER_CPU, resolve_max_inflight_writes};
+
+    #[test]
+    fn an_explicit_limit_wins_and_zero_scales_with_cpus() {
+        assert_eq!(resolve_max_inflight_writes(100, 6), 100);
+        assert_eq!(
+            resolve_max_inflight_writes(0, 6),
+            6 * INFLIGHT_WRITES_PER_CPU
+        );
+        assert_eq!(resolve_max_inflight_writes(0, 0), INFLIGHT_WRITES_PER_CPU);
     }
 }

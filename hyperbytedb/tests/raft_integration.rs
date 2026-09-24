@@ -155,6 +155,8 @@ async fn start_cluster_node_with_listener(
         max_points_per_request: 0,
         request_timeout_secs: 30,
         rate_limiter: None,
+        write_admission: None,
+        shard_write_admission: None,
         wal_batcher_alive: None,
         disk_read_only: None,
 
@@ -366,6 +368,8 @@ async fn test_cluster_endpoints_without_peers() {
         max_points_per_request: 0,
         request_timeout_secs: 30,
         rate_limiter: None,
+        write_admission: None,
+        shard_write_admission: None,
         wal_batcher_alive: None,
         disk_read_only: None,
 

@@ -59,6 +59,7 @@ impl PeerClient {
             .timeout(Duration::from_secs(10))
             .connect_timeout(Duration::from_secs(3))
             .tcp_keepalive(Duration::from_secs(60))
+            .dns_resolver(crate::adapters::cluster::dns_cache::CachingResolver::shared())
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         let (outbound_tx, outbound_rx) =

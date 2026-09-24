@@ -480,6 +480,11 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         None
     };
 
+    let inflight_writes = crate::config::resolve_max_inflight_writes(
+        config.server.max_inflight_writes,
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+    );
+
     let app_state = AppState {
         ingestion: ingestion_service,
         query: query_service,
@@ -516,6 +521,14 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         } else {
             None
         },
+        write_admission: Some(Arc::new(crate::adapters::http::router::Admission::new(
+            inflight_writes,
+        ))),
+        // KiB of forwarded body in flight: the same number of client-sized
+        // batches, measured in what they actually carry.
+        shard_write_admission: Some(Arc::new(crate::adapters::http::router::Admission::new(
+            inflight_writes * crate::config::SHARD_WRITE_KIB_PER_SLOT,
+        ))),
         wal_batcher_alive,
         disk_read_only: disk_read_only.clone(),
         sharding_enabled: config.sharding.enabled,

@@ -15,12 +15,24 @@ use crate::ports::metadata::MetadataPort;
 use crate::ports::points_sink::PointsSinkPort;
 use crate::ports::wal::WalPort;
 
+pub mod control;
 mod region_write_stats;
 mod shard_heartbeat;
 
 pub use region_write_stats::RegionWriteStats;
 
 pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
+    // The control runtime lives exactly as long as the server: installed
+    // before Raft starts, stopped after everything else has shut down.
+    if config.cluster.enabled {
+        control::install()?;
+    }
+    let result = serve_inner(config).await;
+    control::shutdown();
+    result
+}
+
+async fn serve_inner(config: HyperbytedbConfig) -> anyhow::Result<()> {
     let bootstrapped = build_services(&config).await?;
     let disk_paths = bootstrapped.disk_paths.clone();
     let disk_config = bootstrapped.disk_config.clone();
@@ -355,6 +367,30 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
 
     let app_state = Arc::new(app_state);
     let app = build_router(app_state.clone());
+
+    // Control listener on the control runtime, next to the Raft core: probes
+    // and Raft RPCs are answered even while the write path is saturated.
+    if config.cluster.enabled && config.cluster.control_port > 0 {
+        let control_app = crate::adapters::http::router::build_control_router(app_state.clone());
+        let control_addr = format!(
+            "{}:{}",
+            config.server.bind_address, config.cluster.control_port
+        );
+        let spawn_here = tokio::runtime::Handle::current();
+        control::handle().unwrap_or(&spawn_here).spawn(async move {
+            match tokio::net::TcpListener::bind(&control_addr).await {
+                Ok(listener) => {
+                    tracing::info!(addr = %control_addr, "control listener up");
+                    if let Err(e) = axum::serve(listener, control_app).await {
+                        tracing::error!(error = %e, "control listener stopped");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(addr = %control_addr, error = %e, "control listener failed to bind");
+                }
+            }
+        });
+    }
 
     // ── Raft cluster formation ───────────────────────────────────────────
     // Spawned before the server starts; the task retries with back-off
