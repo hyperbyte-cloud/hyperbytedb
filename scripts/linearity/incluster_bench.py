@@ -16,7 +16,7 @@ This sends concurrently from inside the cluster network, spread across every
 node, which is the only shape in which "does write throughput grow with N?"
 is a meaningful question.
 """
-import argparse, queue, sys, threading, time, urllib.error, urllib.parse, urllib.request
+import argparse, os, queue, sys, threading, time, urllib.error, urllib.parse, urllib.request
 
 
 def parse_args():
@@ -33,6 +33,14 @@ def parse_args():
     # scheduler ticks (tens of seconds); a run that seeds and measures back
     # to back times one region, i.e. one primary, however many nodes exist.
     p.add_argument("--phase", choices=["seed", "measure", "all"], default="all")
+    # One Python process tops out near 900k lines/s (GIL-bound string
+    # building), which is about what N=3 measured -- the client, not the
+    # cluster. The sweep runs several of these as an indexed Job; each takes
+    # every `workers`-th batch. The index defaults to the Job's completion
+    # index.
+    p.add_argument("--workers", type=int, default=1)
+    p.add_argument("--worker-index", type=int,
+                   default=int(os.environ.get("JOB_COMPLETION_INDEX", "0")))
     return p.parse_args()
 
 
@@ -48,20 +56,22 @@ def post(url, body, timeout=60, content_type="text/plain"):
         return 0
 
 
-def run_phase(endpoints, db, meas, start, count, batch, concurrency, ts_base, series=None):
+def run_phase(endpoints, db, meas, start, count, batch, concurrency, ts_base, series=None,
+              workers=1, worker_index=0):
     """Send `count` points as `batch`-sized writes, `concurrency` in flight.
 
     With `series`, point i goes to series `i % series`, so a measure phase
     rewrites the seeded series instead of creating new ones.
     """
     work = queue.Queue()
-    for b in range(0, count, batch):
-        work.put(b)
+    for n, b in enumerate(range(0, count, batch)):
+        if n % workers == worker_index:
+            work.put(b)
     errors = [0]
     lock = threading.Lock()
 
     def worker(idx):
-        ep = endpoints[idx % len(endpoints)]
+        ep = endpoints[(idx + worker_index) % len(endpoints)]
         url = f"{ep}/write?db={db}&rp=autogen&precision=ns"
         local_err = 0
         while True:
@@ -72,7 +82,13 @@ def run_phase(endpoints, db, meas, start, count, batch, concurrency, ts_base, se
             lines = []
             for i in range(base, min(base + batch, count)):
                 sid = start + (i % series if series else i)
-                lines.append(f"{meas},host=s{sid} value=1 {ts_base + i}000000000")
+                # One second per full pass over the series, so the data spans
+                # seconds, like a live workload. `ts_base + i` spread 20M
+                # points over 231 days; every flush block then touched more
+                # than chDB's 100-partition INSERT limit, flushes failed, and
+                # the run measured the resulting backlog instead of ingest.
+                ts = ts_base + (i // series if series else i)
+                lines.append(f"{meas},host=s{sid} value=1 {ts}{sid % 1_000_000_000:09d}")
             code = post(url, ("\n".join(lines)).encode())
             if code != 204:
                 local_err += 1
@@ -95,7 +111,7 @@ def main():
     print(f"[bench] endpoints={len(endpoints)} concurrency={a.concurrency} "
           f"series={a.series} measure_points={a.measure_points}", flush=True)
 
-    if a.phase in ("seed", "all"):
+    if a.phase in ("seed", "all") and a.worker_index == 0:
         # Form-encoded: the /query endpoint expects `q` as a form field, not a
         # raw body. Sending text/plain silently created nothing, so every
         # subsequent write failed and the run still reported a throughput number.
@@ -109,11 +125,17 @@ def main():
             print("[bench] FATAL: could not create database; aborting", flush=True)
             return 2
 
-    # Prove one write lands before timing two million of them.
-    probe = post(
-        f"{endpoints[0]}/write?db={a.db}&rp=autogen&precision=ns",
-        f"{a.measurement},host=probe value=1 1700000000000000000".encode(),
-    )
+    # Prove one write lands before timing millions of them. Retried: with
+    # several workers, only worker 0 creates the database.
+    deadline = time.monotonic() + 60
+    while True:
+        probe = post(
+            f"{endpoints[0]}/write?db={a.db}&rp=autogen&precision=ns",
+            f"{a.measurement},host=probe value=1 1700000000000000000".encode(),
+        )
+        if probe == 204 or time.monotonic() > deadline:
+            break
+        time.sleep(1)
     print(f"[bench] probe write -> HTTP {probe}", flush=True)
     if probe != 204:
         print("[bench] FATAL: probe write rejected; aborting", flush=True)
@@ -122,7 +144,8 @@ def main():
     if a.phase in ("seed", "all"):
         # Seed: establish cardinality. Untimed.
         seed_s, seed_err = run_phase(endpoints, a.db, a.measurement, 0, a.series,
-                                     a.batch, a.concurrency, 1_700_000_000)
+                                     a.batch, a.concurrency, 1_700_000_000,
+                                     workers=a.workers, worker_index=a.worker_index)
         print(f"[bench] seed complete in {seed_s:.1f}s (errors={seed_err})", flush=True)
 
     if a.phase in ("measure", "all"):
@@ -131,9 +154,15 @@ def main():
         # creation. (It used to write series 0..measure_points, i.e. mostly
         # NEW series whenever measure_points > series.)
         dur, errs = run_phase(endpoints, a.db, a.measurement, 0, a.measure_points,
-                              a.batch, a.concurrency, 1_800_000_000, series=a.series)
-        pps = int(a.measure_points / dur) if dur > 0 else 0
-        print(f"[bench] nodes={len(endpoints)} points={a.measure_points} "
+                              a.batch, a.concurrency, 1_800_000_000, series=a.series,
+                              workers=a.workers, worker_index=a.worker_index)
+        mine = len(range(a.worker_index, -(-a.measure_points // a.batch), a.workers)) * a.batch
+        pps = int(mine / dur) if dur > 0 else 0
+        # Per-worker line; the sweep sums points and takes the slowest
+        # duration across workers.
+        print(f"[bench] worker={a.worker_index}/{a.workers} points={mine} "
+              f"duration={dur:.3f}s errors={errs}", flush=True)
+        print(f"[bench] nodes={len(endpoints)} points={mine} "
               f"duration={dur:.1f}s errors={errs}", flush=True)
         print(f"[bench] points_per_sec={pps}", flush=True)
     return 0
