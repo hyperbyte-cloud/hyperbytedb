@@ -14,6 +14,40 @@ use crate::ports::metadata::MetadataPort;
 use crate::ports::points_sink::PointsSinkPort;
 use crate::ports::wal::WalPort;
 
+/// The shard-map op that must accompany a schema drop, if any.
+///
+/// Dropping a database, retention policy or measurement must also drop its
+/// shard spaces. Without Raft the query service proposes that separately; with
+/// Raft the drop arrives here as a `SchemaMutation` and nothing else did it, so
+/// on a real cluster the space outlived its data. The scheduler then kept
+/// moving regions whose data was gone -- every transfer failed with
+/// "measurement not found", every tick, on every node (seen on n3) -- and the
+/// next run of the same database started from the old region count.
+#[must_use]
+pub fn drop_space_for(
+    mutation: &MutationRequest,
+) -> Option<crate::domain::sharding::ops::ShardMapOp> {
+    use crate::domain::sharding::ops::ShardMapOp;
+    match mutation {
+        MutationRequest::DropDatabase(db) => Some(ShardMapOp::DropSpace {
+            db: db.clone(),
+            rp: None,
+            measurement: None,
+        }),
+        MutationRequest::DropRetentionPolicy { db, name } => Some(ShardMapOp::DropSpace {
+            db: db.clone(),
+            rp: Some(name.clone()),
+            measurement: None,
+        }),
+        MutationRequest::DropMeasurement { database, rp, name } => Some(ShardMapOp::DropSpace {
+            db: database.clone(),
+            rp: Some(rp.clone()),
+            measurement: Some(name.clone()),
+        }),
+        _ => None,
+    }
+}
+
 /// Dependencies required to apply schema mutations with full local side effects.
 pub struct SchemaMutationDeps<'a> {
     pub metadata: &'a Arc<dyn MetadataPort>,
@@ -218,5 +252,48 @@ async fn apply_schema_mutation_inner(
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod drop_space_tests {
+    use super::drop_space_for;
+    use crate::domain::cluster::types::MutationRequest;
+    use crate::domain::sharding::ops::ShardMapOp;
+
+    #[test]
+    fn each_schema_drop_carries_its_space_drop() {
+        assert_eq!(
+            drop_space_for(&MutationRequest::DropDatabase("linearity".into())),
+            Some(ShardMapOp::DropSpace {
+                db: "linearity".into(),
+                rp: None,
+                measurement: None,
+            })
+        );
+        assert_eq!(
+            drop_space_for(&MutationRequest::DropRetentionPolicy {
+                db: "d".into(),
+                name: "r".into(),
+            }),
+            Some(ShardMapOp::DropSpace {
+                db: "d".into(),
+                rp: Some("r".into()),
+                measurement: None,
+            })
+        );
+        assert_eq!(
+            drop_space_for(&MutationRequest::DropMeasurement {
+                database: "d".into(),
+                rp: "r".into(),
+                name: "cpu".into(),
+            }),
+            Some(ShardMapOp::DropSpace {
+                db: "d".into(),
+                rp: Some("r".into()),
+                measurement: Some("cpu".into()),
+            })
+        );
+        assert_eq!(drop_space_for(&MutationRequest::DropUser("u".into())), None);
     }
 }
