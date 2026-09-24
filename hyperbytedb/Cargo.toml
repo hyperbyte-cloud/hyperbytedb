@@ -40,6 +40,7 @@ tempfile = "3"
 # WAL + metadata
 rocksdb = { version = "0.24", features = ["multi-threaded-cf"] }
 bincode = "1"
+pprof = { version = "0.14", optional = true, default-features = false }
 libc = "0.2"
 
 # Global allocator. The default glibc malloc holds freed heap in its arenas
@@ -110,6 +111,9 @@ lru = "0.12"
 [features]
 default = ["columnar-ingest"]
 columnar-ingest = []
+# In-process CPU profiler at /debug/pprof/profile on the control listener.
+# Off by default; build with it (and unstripped symbols) to diagnose hot spots.
+profiling = ["dep:pprof"]
 
 [[bench]]
 name = "ingestion_line_protocol"

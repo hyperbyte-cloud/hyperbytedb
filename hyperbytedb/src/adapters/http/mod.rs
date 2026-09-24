@@ -7,6 +7,8 @@ pub mod metrics;
 pub mod middleware;
 pub mod peer_handlers;
 pub mod ping;
+#[cfg(feature = "profiling")]
+pub mod pprof;
 pub mod query;
 pub mod raft_handlers;
 pub mod rate_limit;

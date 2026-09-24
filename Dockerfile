@@ -78,12 +78,18 @@ COPY hyperbytedb/hyperbytedb-cli/tests/ hyperbytedb-cli/tests/
 #   docker build --build-arg CARGO_BUILD_JOBS=4 ...
 ARG CARGO_BUILD_JOBS=default
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+# Diagnostics builds: --build-arg CARGO_FEATURES=profiling
+# --build-arg RELEASE_STRIP=none keeps the symbols the profiler needs.
+ARG CARGO_FEATURES=
+ARG RELEASE_STRIP=symbols
+ENV CARGO_PROFILE_RELEASE_STRIP=${RELEASE_STRIP}
 
 # target/ is a cache mount — artifacts are not in the image layer unless copied out.
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/build/hyperbytedb/target \
     cargo build --release --locked -p hyperbytedb --bin hyperbytedb -p hyperbytedb-cli --bin hyperbytedb-cli \
+        ${CARGO_FEATURES:+--features hyperbytedb/${CARGO_FEATURES}} \
     && mkdir -p /artifacts \
     && cp /build/hyperbytedb/target/release/hyperbytedb /artifacts/ \
     && cp /build/hyperbytedb/target/release/hyperbytedb-cli /artifacts/
