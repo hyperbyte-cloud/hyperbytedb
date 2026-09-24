@@ -88,3 +88,42 @@ async fn build_prepared_wal_slot_keeps_all_measurements_in_telegraf_batch() {
     assert_eq!(cpu_batch.row_count, 2);
     assert_eq!(slot.total_rows(), points.len());
 }
+
+/// The engine's columns are probed (`DESCRIBE TABLE`) only while this
+/// process has not yet materialized the table. Probing on every batch queued
+/// each write behind flush inserts on the shared chDB pool: ~0.5s per Arrow
+/// build at scale.
+#[tokio::test]
+#[serial(chdb)]
+async fn engine_columns_are_probed_once_per_table_not_per_batch() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let meta_path = tmpdir.path().join("meta");
+    let chdb_path = tmpdir.path().join("chdb");
+    std::fs::create_dir_all(&meta_path).unwrap();
+    std::fs::create_dir_all(&chdb_path).unwrap();
+    let metadata = std::sync::Arc::new(RocksDbMetadata::open(&meta_path).unwrap());
+    metadata.create_database("db").await.unwrap();
+    let shared = SharedSession::new_eager(chdb_path.to_str().unwrap(), 1).unwrap();
+
+    let sink = ChdbNativeAdapter::with_metadata(shared.clone(), Some(metadata.clone()));
+    for i in 0..5 {
+        let line = format!("cpu,host=h{i} v=1 {}", 1_780_000_000_000_000_000i64 + i);
+        let points = parse_line_body_to_points(line.as_bytes(), None).unwrap();
+        sink.build_prepared_wal_slot("db", "autogen", 1, &points)
+            .await
+            .unwrap();
+    }
+    assert_eq!(sink.engine_probe_count(), 1, "one probe, then the cache");
+
+    // A new adapter (a restart) starts cold and must probe again, once.
+    let restarted = ChdbNativeAdapter::with_metadata(shared, Some(metadata));
+    for i in 0..3 {
+        let line = format!("cpu,host=h{i} v=2 {}", 1_780_000_000_000_000_100i64 + i);
+        let points = parse_line_body_to_points(line.as_bytes(), None).unwrap();
+        restarted
+            .build_prepared_wal_slot("db", "autogen", 1, &points)
+            .await
+            .unwrap();
+    }
+    assert_eq!(restarted.engine_probe_count(), 1);
+}

@@ -220,6 +220,8 @@ pub struct ChdbNativeAdapter {
     /// [`Self::warm_series_from_metadata`]. A lean `HashSet<u64>` — the
     /// authoritative `series_id → tags` map lives in the metadata layer.
     known_series: Arc<RwLock<LruCache<TableKey, HashSet<u64>>>>,
+    /// `DESCRIBE TABLE` probes issued by `ensure_table`; see there.
+    engine_probes: Arc<std::sync::atomic::AtomicU64>,
     /// Per-table async mutex serialising DDL. Without this two
     /// concurrent flush tasks for the same measurement could each
     /// observe the cache miss, race on `ALTER TABLE`, and one could
@@ -269,6 +271,7 @@ impl ChdbNativeAdapter {
             schemas: Arc::new(RwLock::new(LruCache::new(cache_capacity))),
             series_schemas: Arc::new(RwLock::new(LruCache::new(cache_capacity))),
             known_series: Arc::new(RwLock::new(LruCache::new(cache_capacity))),
+            engine_probes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ddl_locks: Arc::new(tokio::sync::Mutex::new(LruCache::new(cache_capacity))),
             cache_capacity,
             use_arrow,
@@ -457,6 +460,13 @@ impl ChdbNativeAdapter {
 
     /// True if `series_id` is already registered (dimension row inserted +
     /// persisted) for this table.
+    /// How many times `ensure_table` has probed the engine's columns.
+    #[doc(hidden)]
+    pub fn engine_probe_count(&self) -> u64 {
+        self.engine_probes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn series_known(&self, key: &TableKey, sid: u64) -> bool {
         let map = self.known_series.read();
         map.peek(key).is_some_and(|s| s.contains(&sid))
@@ -673,12 +683,24 @@ impl ChdbNativeAdapter {
                 merge_cached_field_column(&mut field_types, phys, *d);
             }
         }
-        // Always probe the engine when the table may already exist (e.g. evolved
-        // Telegraf `netstat` with 75 columns but sparse metadata). Relying only
-        // on `cached.materialized` misses tables not yet in the in-memory cache.
-        if let Ok(engine_cols) = self.engine_field_columns(&table).await {
-            for (phys, d) in engine_cols {
-                merge_cached_field_column(&mut field_types, &phys, d);
+        // Probe the engine when this process has not yet materialized the
+        // table: it may exist on disk with columns the in-memory cache lacks
+        // (e.g. an evolved Telegraf `netstat` with 75 columns but sparse
+        // metadata, after a restart). Once materialized, the cache holds every
+        // column this process created or altered, which is what the probe
+        // would add.
+        //
+        // Probing on EVERY batch was the write-path bottleneck at scale: a
+        // `DESCRIBE TABLE` through the chDB pool, which it shares with flush
+        // inserts that take seconds. Each write's Arrow build queued ~0.5s
+        // behind them, and six saturated nodes delivered 19k points/s.
+        if !cached.materialized {
+            self.engine_probes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Ok(engine_cols) = self.engine_field_columns(&table).await {
+                for (phys, d) in engine_cols {
+                    merge_cached_field_column(&mut field_types, &phys, d);
+                }
             }
         }
 
