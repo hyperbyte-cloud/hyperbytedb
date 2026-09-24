@@ -28,6 +28,11 @@ def parse_args():
     p.add_argument("--measure-points", type=int, default=2_000_000)
     p.add_argument("--batch", type=int, default=1000)
     p.add_argument("--concurrency", type=int, default=32)
+    # Seed and measure run as separate Jobs so the sweep can wait, between
+    # them, for the space to split. Splits are driven by heartbeat and
+    # scheduler ticks (tens of seconds); a run that seeds and measures back
+    # to back times one region, i.e. one primary, however many nodes exist.
+    p.add_argument("--phase", choices=["seed", "measure", "all"], default="all")
     return p.parse_args()
 
 
@@ -43,8 +48,12 @@ def post(url, body, timeout=60, content_type="text/plain"):
         return 0
 
 
-def run_phase(endpoints, db, meas, start, count, batch, concurrency, ts_base):
-    """Send `count` points as `batch`-sized writes, `concurrency` in flight."""
+def run_phase(endpoints, db, meas, start, count, batch, concurrency, ts_base, series=None):
+    """Send `count` points as `batch`-sized writes, `concurrency` in flight.
+
+    With `series`, point i goes to series `i % series`, so a measure phase
+    rewrites the seeded series instead of creating new ones.
+    """
     work = queue.Queue()
     for b in range(0, count, batch):
         work.put(b)
@@ -62,8 +71,8 @@ def run_phase(endpoints, db, meas, start, count, batch, concurrency, ts_base):
                 break
             lines = []
             for i in range(base, min(base + batch, count)):
-                sid = start + i
-                lines.append(f"{meas},host=s{sid} value=1 {ts_base + sid}000000000")
+                sid = start + (i % series if series else i)
+                lines.append(f"{meas},host=s{sid} value=1 {ts_base + i}000000000")
             code = post(url, ("\n".join(lines)).encode())
             if code != 204:
                 local_err += 1
@@ -86,18 +95,19 @@ def main():
     print(f"[bench] endpoints={len(endpoints)} concurrency={a.concurrency} "
           f"series={a.series} measure_points={a.measure_points}", flush=True)
 
-    # Form-encoded: the /query endpoint expects `q` as a form field, not a
-    # raw body. Sending text/plain silently created nothing, so every
-    # subsequent write failed and the run still reported a throughput number.
-    created = post(
-        f"{endpoints[0]}/query",
-        urllib.parse.urlencode({"q": f"CREATE DATABASE {a.db}"}).encode(),
-        content_type="application/x-www-form-urlencoded",
-    )
-    print(f"[bench] create database -> HTTP {created}", flush=True)
-    if created not in (200, 204):
-        print("[bench] FATAL: could not create database; aborting", flush=True)
-        return 2
+    if a.phase in ("seed", "all"):
+        # Form-encoded: the /query endpoint expects `q` as a form field, not a
+        # raw body. Sending text/plain silently created nothing, so every
+        # subsequent write failed and the run still reported a throughput number.
+        created = post(
+            f"{endpoints[0]}/query",
+            urllib.parse.urlencode({"q": f"CREATE DATABASE {a.db}"}).encode(),
+            content_type="application/x-www-form-urlencoded",
+        )
+        print(f"[bench] create database -> HTTP {created}", flush=True)
+        if created not in (200, 204):
+            print("[bench] FATAL: could not create database; aborting", flush=True)
+            return 2
 
     # Prove one write lands before timing two million of them.
     probe = post(
@@ -109,21 +119,23 @@ def main():
         print("[bench] FATAL: probe write rejected; aborting", flush=True)
         return 3
 
-    # Seed: establish cardinality. Untimed -- splitting is driven by heartbeat
-    # and scheduler ticks, so nothing meaningful can be measured until the
-    # regions it creates have settled.
-    seed_s, seed_err = run_phase(endpoints, a.db, a.measurement, 0, a.series,
-                                 a.batch, a.concurrency, 1_700_000_000)
-    print(f"[bench] seed complete in {seed_s:.1f}s (errors={seed_err})", flush=True)
+    if a.phase in ("seed", "all"):
+        # Seed: establish cardinality. Untimed.
+        seed_s, seed_err = run_phase(endpoints, a.db, a.measurement, 0, a.series,
+                                     a.batch, a.concurrency, 1_700_000_000)
+        print(f"[bench] seed complete in {seed_s:.1f}s (errors={seed_err})", flush=True)
 
-    # Measure: rewrite existing series, so this times steady-state ingest
-    # against the converged layout rather than first-touch series creation.
-    dur, errs = run_phase(endpoints, a.db, a.measurement, 0, a.measure_points,
-                          a.batch, a.concurrency, 1_800_000_000)
-    pps = int(a.measure_points / dur) if dur > 0 else 0
-    print(f"[bench] nodes={len(endpoints)} points={a.measure_points} "
-          f"duration={dur:.1f}s errors={errs}", flush=True)
-    print(f"[bench] points_per_sec={pps}", flush=True)
+    if a.phase in ("measure", "all"):
+        # Measure: rewrite the seeded series, so this times steady-state
+        # ingest against the split layout rather than first-touch series
+        # creation. (It used to write series 0..measure_points, i.e. mostly
+        # NEW series whenever measure_points > series.)
+        dur, errs = run_phase(endpoints, a.db, a.measurement, 0, a.measure_points,
+                              a.batch, a.concurrency, 1_800_000_000, series=a.series)
+        pps = int(a.measure_points / dur) if dur > 0 else 0
+        print(f"[bench] nodes={len(endpoints)} points={a.measure_points} "
+              f"duration={dur:.1f}s errors={errs}", flush=True)
+        print(f"[bench] points_per_sec={pps}", flush=True)
     return 0
 
 
