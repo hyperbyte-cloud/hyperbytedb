@@ -20,7 +20,8 @@ use crate::application::wal_append::append_points_with_prepared;
 use crate::domain::sharding::{
     MeasurementKey, RegionHeartbeat, ShardBootstrapRequest, ShardDeleteRequest, ShardEpoch,
     ShardMap, ShardMapJson, ShardMetadataKind, ShardMetadataRequest, ShardMvBackfillRequest,
-    ShardQueryRequest, ShardRegion, ShardRehomeRequest, ShardTransferPayload, ShardWriteRequest,
+    ShardQueryRequest, ShardRegion, ShardRehomeRequest, ShardTransferPayload, ShardWriteBatch,
+    ShardWriteBatchResponse, ShardWritePartResult, ShardWriteRequest,
 };
 use crate::ports::replication::OutboundReplicationBatch;
 use crate::ports::sharding::ShardMapPort;
@@ -293,6 +294,53 @@ pub async fn handle_shard_write(
     };
 
     apply_shard_write(state, req).await
+}
+
+/// POST /internal/shard/write-batch: several regions' forwarded writes for
+/// this node as primary, bincode-encoded [`ShardWriteBatch`].
+///
+/// Each part goes through exactly the single-region path (epoch, ownership,
+/// primary check, WAL append, replication), concurrently, and its status is
+/// reported per part: one stale region must not fail the others.
+pub async fn handle_shard_write_batch(
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> impl IntoResponse {
+    let batch: ShardWriteBatch = match bincode::deserialize(&body) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("bad write batch: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    counter!("hyperbytedb_shard_write_batches_total").increment(1);
+    counter!("hyperbytedb_shard_write_batch_parts_total").increment(batch.parts.len() as u64);
+    let parts = batch.parts.into_iter().map(|part| {
+        let state = state.clone();
+        async move {
+            let region_id = part.region_id;
+            let resp = apply_shard_write(state, part).await;
+            let status = resp.status();
+            let error = if status.is_success() {
+                None
+            } else {
+                axum::body::to_bytes(resp.into_body(), 4096)
+                    .await
+                    .ok()
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+            };
+            ShardWritePartResult {
+                region_id,
+                status: status.as_u16(),
+                error,
+            }
+        }
+    });
+    let results = futures::future::join_all(parts).await;
+    (StatusCode::OK, Json(ShardWriteBatchResponse { results })).into_response()
 }
 
 async fn apply_shard_write(

@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::stream::StreamExt;
 use metrics::{counter, histogram};
 
 #[cfg(feature = "columnar-ingest")]
@@ -15,7 +14,7 @@ use crate::application::line_protocol::{
 use crate::application::msgpack_ingest::parse_msgpack_body_to_points_limited;
 use crate::application::replication_dispatch::dispatch_outbound_replication;
 use crate::application::shard_routing::{
-    ShardRoutingContext, ensure_measurement_bootstrapped, forward_shard_write_to_region,
+    ShardRoutingContext, ensure_measurement_bootstrapped, forward_shard_writes_by_node,
     partition_points, region_replication_targets,
 };
 use crate::application::wal_append::{
@@ -206,15 +205,15 @@ impl PeerIngestionService {
         // non-204. There is no distributed transaction available here, so a
         // partial write is still possible; what changes is that it is as small
         // as we can make it and the error says so.
-        const FORWARD_CONCURRENCY: usize = 32;
+        // One request per primary node, not per region; see
+        // `forward_shard_writes_by_node`.
         let forward_region_count = buckets.forward.len();
-        let forwards = buckets.forward.into_values().map(|fwd_points| async move {
-            forward_shard_write_to_region(ctx, db, rp, precision, &fwd_points).await
-        });
-        let forward_results: Vec<Result<(), HyperbytedbError>> = futures::stream::iter(forwards)
-            .buffer_unordered(FORWARD_CONCURRENCY)
-            .collect()
-            .await;
+        let forward_results: Vec<Result<(), HyperbytedbError>> =
+            forward_shard_writes_by_node(ctx, db, rp, precision, buckets.forward)
+                .await
+                .into_iter()
+                .map(|(_, r)| r)
+                .collect();
         let mut forward_failures = 0usize;
         let mut first_forward_error: Option<HyperbytedbError> = None;
         // Every failure was a primary shedding load: the client should back

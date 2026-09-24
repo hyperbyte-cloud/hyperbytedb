@@ -240,6 +240,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
                         )),
                 )
                 .route(
+                    "/internal/shard/write-batch",
+                    post(shard_handlers::handle_shard_write_batch)
+                        .layer(DefaultBodyLimit::max(replicate_body_limit))
+                        .layer(axum::middleware::from_fn_with_state(
+                            state.clone(),
+                            auth_middleware::shard_write_admission_layer,
+                        )),
+                )
+                .route(
                     "/internal/shard/query",
                     post(shard_handlers::handle_shard_query),
                 )
@@ -429,11 +438,15 @@ pub fn build_control_router(state: Arc<AppState>) -> Router {
             state.clone(),
             auth_middleware::internal_auth_layer,
         ));
-    Router::new()
+    let router = Router::new()
         .route("/ping", get(ping::ping).head(ping::ping))
         .route("/health", get(ping::health).head(ping::health))
-        .merge(raft_routes)
-        .with_state(state)
+        .merge(raft_routes);
+    // On the control listener so it answers even when the node it is
+    // diagnosing is saturated.
+    #[cfg(feature = "profiling")]
+    let router = router.route("/debug/pprof/profile", get(super::pprof::profile));
+    router.with_state(state)
 }
 
 #[cfg(test)]

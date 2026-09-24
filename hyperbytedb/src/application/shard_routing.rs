@@ -394,6 +394,250 @@ pub async fn partition_points(
     Ok(PointBuckets { local, forward })
 }
 
+/// Group forward regions by the node that must accept their writes (the
+/// region primary). Regions with no active serving primary are returned
+/// apart, for the single-region path, which reports why.
+pub(crate) fn group_forwards_by_primary(
+    regions: &[ShardRegion],
+    self_id: u64,
+    membership: &crate::domain::cluster::membership::ClusterMembership,
+) -> (std::collections::BTreeMap<u64, Vec<u64>>, Vec<u64>) {
+    let mut by_node: std::collections::BTreeMap<u64, Vec<u64>> = Default::default();
+    let mut unrouted = Vec::new();
+    for region in regions {
+        match resolve_region_peers(region, self_id, membership, RegionTargetRole::Write)
+            .first()
+            .copied()
+        {
+            Some(node) if node != self_id => {
+                by_node.entry(node).or_default().push(region.region_id)
+            }
+            _ => unrouted.push(region.region_id),
+        }
+    }
+    (by_node, unrouted)
+}
+
+/// Forward a client write's remote buckets with one request per primary
+/// node rather than one per region.
+///
+/// Per-region forwarding made a client batch cost O(regions) requests: at 32
+/// regions, ~30 forwards of ~30 points each, and six saturated nodes managed
+/// 21k points/s. Grouping bounds it at N-1 requests. It adds no delay --
+/// these are the pieces of one client write, sent at once, in parallel.
+///
+/// Each part keeps the single-region semantics: a stale epoch is retried
+/// through [`forward_shard_write_to_region`] (which reloads the region), a
+/// node without the batch endpoint (older build, mid-roll) gets per-region
+/// forwards, and capacity rejections come back as `ClusterUnavailable`.
+pub async fn forward_shard_writes_by_node(
+    ctx: &ShardRoutingContext,
+    db: &str,
+    rp: &str,
+    precision: Option<&str>,
+    forward: HashMap<u64, Vec<Point>>,
+) -> Vec<(u64, Result<(), HyperbytedbError>)> {
+    use crate::application::line_protocol::encode_points_to_line_protocol;
+    use crate::domain::database::Precision;
+    use crate::domain::sharding::{ShardWriteBatch, ShardWriteBatchResponse, ShardWriteRequest};
+
+    let mut results: Vec<(u64, Result<(), HyperbytedbError>)> = Vec::new();
+    // Regions that go through the per-region path instead.
+    let mut single: Vec<u64> = Vec::new();
+
+    let regions: Vec<ShardRegion> = match ctx.shard_map.snapshot().await {
+        Ok(map) => {
+            let mut found = Vec::with_capacity(forward.len());
+            for id in forward.keys() {
+                match region_by_id(&map, *id) {
+                    Some(r) => found.push(r),
+                    None => single.push(*id),
+                }
+            }
+            found
+        }
+        Err(_) => {
+            single.extend(forward.keys().copied());
+            Vec::new()
+        }
+    };
+
+    let (by_node, unrouted, addrs) = {
+        let membership = ctx.peer_client.membership().read().await;
+        let (by_node, unrouted) = group_forwards_by_primary(&regions, ctx.node_id, &membership);
+        let addrs: HashMap<u64, String> = by_node
+            .keys()
+            .filter_map(|n| peer_addr(&membership, *n).map(|a| (*n, a)))
+            .collect();
+        (by_node, unrouted, addrs)
+    };
+    single.extend(unrouted);
+
+    let precision_val = Precision::from_str_opt(precision);
+    let timeout = Duration::from_millis(ctx.config.scatter_peer_timeout_ms.max(1));
+    let region_epochs: HashMap<u64, ShardEpoch> =
+        regions.iter().map(|r| (r.region_id, r.epoch)).collect();
+
+    let mut sends = Vec::new();
+    for (node, region_ids) in by_node {
+        let Some(addr) = addrs.get(&node).cloned() else {
+            single.extend(region_ids);
+            continue;
+        };
+        let mut parts = Vec::with_capacity(region_ids.len());
+        for id in &region_ids {
+            let Some(points) = forward.get(id) else {
+                continue;
+            };
+            match encode_points_to_line_protocol(points, precision_val) {
+                Ok(body) => parts.push(ShardWriteRequest {
+                    db: db.to_string(),
+                    rp: rp.to_string(),
+                    precision: precision.map(str::to_string),
+                    epoch: region_epochs.get(id).copied().unwrap_or_default(),
+                    region_id: *id,
+                    body,
+                }),
+                Err(e) => results.push((*id, Err(e))),
+            }
+        }
+        let body = match bincode::serialize(&ShardWriteBatch { parts }) {
+            Ok(b) => b,
+            Err(e) => {
+                for id in region_ids {
+                    results.push((id, Err(HyperbytedbError::Internal(e.to_string().into()))));
+                }
+                continue;
+            }
+        };
+        let client = ctx.peer_client.http_client();
+        sends.push(async move {
+            let resp = client
+                .post(format!("http://{addr}/internal/shard/write-batch"))
+                .header("Content-Type", "application/octet-stream")
+                .body(body)
+                .timeout(timeout)
+                .send()
+                .await;
+            (node, region_ids, resp)
+        });
+    }
+    counter!("hyperbytedb_shard_forward_batches_total").increment(sends.len() as u64);
+
+    for (node, region_ids, resp) in futures::future::join_all(sends).await {
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                for id in region_ids {
+                    results.push((
+                        id,
+                        Err(HyperbytedbError::PeerUnreachable(format!(
+                            "forward batch to node {node} failed: {e}"
+                        ))),
+                    ));
+                }
+                continue;
+            }
+        };
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND
+            || status == reqwest::StatusCode::METHOD_NOT_ALLOWED
+        {
+            // Older build without the batch endpoint.
+            single.extend(region_ids);
+            continue;
+        }
+        if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        {
+            for id in region_ids {
+                results.push((
+                    id,
+                    Err(HyperbytedbError::ClusterUnavailable(format!(
+                        "node {node} is at write capacity"
+                    ))),
+                ));
+            }
+            continue;
+        }
+        let parsed: Option<ShardWriteBatchResponse> = if status.is_success() {
+            resp.json().await.ok()
+        } else {
+            None
+        };
+        let Some(parsed) = parsed else {
+            for id in region_ids {
+                results.push((
+                    id,
+                    Err(HyperbytedbError::PeerUnreachable(format!(
+                        "forward batch to node {node} failed: {status}"
+                    ))),
+                ));
+            }
+            continue;
+        };
+        for part in parsed.results {
+            match part_outcome(node, &part) {
+                PartOutcome::Done(r) => results.push((part.region_id, r)),
+                PartOutcome::Retry => {
+                    if let Some(points) = forward.get(&part.region_id)
+                        && let Some(p) = points.first()
+                    {
+                        ctx.location_cache
+                            .invalidate_measurement(&MeasurementKey::new(db, rp, &p.measurement));
+                    }
+                    single.push(part.region_id);
+                }
+            }
+        }
+    }
+
+    // Everything the batch path could not take, one region at a time.
+    let singles = single.into_iter().filter_map(|id| {
+        forward.get(&id).map(|points| async move {
+            (
+                id,
+                forward_shard_write_to_region(ctx, db, rp, precision, points).await,
+            )
+        })
+    });
+    use futures::StreamExt;
+    let mut rest: Vec<(u64, Result<(), HyperbytedbError>)> = futures::stream::iter(singles)
+        .buffer_unordered(32)
+        .collect()
+        .await;
+    results.append(&mut rest);
+    results
+}
+
+/// What to do with one part of a batch response.
+#[derive(Debug)]
+pub(crate) enum PartOutcome {
+    Done(Result<(), HyperbytedbError>),
+    /// Stale epoch or not the primary any more: resend through the
+    /// single-region path, which reloads the region first.
+    Retry,
+}
+
+pub(crate) fn part_outcome(
+    node: u64,
+    part: &crate::domain::sharding::ShardWritePartResult,
+) -> PartOutcome {
+    match part.status {
+        200..=299 => PartOutcome::Done(Ok(())),
+        409 => PartOutcome::Retry,
+        429 | 503 => PartOutcome::Done(Err(HyperbytedbError::ClusterUnavailable(format!(
+            "region {} primary {node} is at write capacity",
+            part.region_id
+        )))),
+        s => PartOutcome::Done(Err(HyperbytedbError::PeerUnreachable(format!(
+            "forward write for region {} to node {node} failed: {s} {}",
+            part.region_id,
+            part.error.as_deref().unwrap_or("")
+        )))),
+    }
+}
+
 pub async fn forward_shard_write_to_region(
     ctx: &ShardRoutingContext,
     db: &str,
@@ -831,6 +1075,94 @@ mod scatter_tests {
         }
     }
 
+    /// Wiring: a multi-region write whose regions share a primary reaches it
+    /// as ONE batch request, and the per-region endpoint is never hit. The
+    /// fake primary refuses per-region writes, so a silent fallback fails.
+    #[tokio::test]
+    async fn regions_sharing_a_primary_are_forwarded_as_one_batch() {
+        use crate::domain::point::{FieldValue, Point};
+        use crate::domain::sharding::{
+            ShardWriteBatch, ShardWriteBatchResponse, ShardWritePartResult,
+        };
+
+        let batches = Arc::new(AtomicUsize::new(0));
+        let singles = Arc::new(AtomicUsize::new(0));
+        let (b, s1) = (batches.clone(), singles.clone());
+        let app = Router::new()
+            .route(
+                "/internal/shard/write-batch",
+                post(move |body: axum::body::Bytes| {
+                    let b = b.clone();
+                    async move {
+                        b.fetch_add(1, Ordering::SeqCst);
+                        let batch: ShardWriteBatch = bincode::deserialize(&body).unwrap();
+                        axum::Json(ShardWriteBatchResponse {
+                            results: batch
+                                .parts
+                                .iter()
+                                .map(|p| ShardWritePartResult {
+                                    region_id: p.region_id,
+                                    status: 204,
+                                    error: None,
+                                })
+                                .collect(),
+                        })
+                    }
+                }),
+            )
+            .route(
+                "/internal/shard/write",
+                post(move || {
+                    let s1 = s1.clone();
+                    async move {
+                        s1.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let h = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let membership = membership_with(&[(1, "127.0.0.1:9"), (2, &addr)]);
+        let ctx = test_ctx(membership, ShardingConfig::default(), 1);
+        let mut forward = HashMap::new();
+        for id in 1..=3u64 {
+            let meas = format!("m{id}");
+            let mut region = sample_region();
+            region.region_id = id;
+            region.primary = 2;
+            region.peers = vec![2, 3];
+            ctx.shard_map
+                .apply_op(ShardMapOp::BootstrapMeasurement {
+                    key: MeasurementKey::new("db", "rp", &meas),
+                    region,
+                })
+                .await
+                .unwrap();
+            forward.insert(
+                id,
+                vec![Point {
+                    measurement: meas,
+                    tags: Default::default(),
+                    fields: [("v".to_string(), FieldValue::Float(1.0))].into(),
+                    timestamp: 1,
+                }],
+            );
+        }
+
+        let results = forward_shard_writes_by_node(&ctx, "db", "rp", None, forward).await;
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|(_, r)| r.is_ok()), "{results:?}");
+        assert_eq!(
+            batches.load(Ordering::SeqCst),
+            1,
+            "one request for the node"
+        );
+        assert_eq!(singles.load(Ordering::SeqCst), 0, "no per-region fallback");
+        h.abort();
+    }
+
     fn membership_with(addrs: &[(u64, &str)]) -> SharedMembership {
         let mut m = ClusterMembership::new();
         for (id, addr) in addrs {
@@ -1105,5 +1437,94 @@ mod scatter_tests {
         // bootstrap hashes at all.
         let other = MeasurementKey::new("db", "autogen", "mem");
         assert_ne!(placed, target_placement(&other, 0, &members, 3));
+    }
+}
+
+#[cfg(test)]
+mod forward_batch_tests {
+    use super::{PartOutcome, group_forwards_by_primary, part_outcome};
+    use crate::domain::cluster::membership::{ClusterMembership, NodeInfo, NodeState};
+    use crate::domain::sharding::{ShardEpoch, ShardRegion, ShardWritePartResult};
+    use crate::error::HyperbytedbError;
+
+    fn region(id: u64, primary: u64) -> ShardRegion {
+        ShardRegion {
+            region_id: id,
+            start: id * 10,
+            end: id * 10 + 10,
+            epoch: ShardEpoch::default(),
+            peers: vec![primary, primary % 6 + 1],
+            primary,
+            last_split_at: 0,
+            transfer_verified: None,
+            transfer_first_seen: None,
+            state: Default::default(),
+            staged_from: None,
+            staging_peers: Vec::new(),
+        }
+    }
+
+    fn membership(active: &[u64], down: &[u64]) -> ClusterMembership {
+        let mut m = ClusterMembership::new();
+        for (ids, state) in [(active, NodeState::Active), (down, NodeState::Disconnected)] {
+            for &id in ids {
+                m.add_node(NodeInfo {
+                    node_id: id,
+                    addr: format!("10.0.0.{id}:8086"),
+                    state,
+                    joined_at: 0,
+                    last_heartbeat: 0,
+                    needs_sync: false,
+                    consecutive_misses: 0,
+                });
+            }
+        }
+        m
+    }
+
+    #[test]
+    fn thirty_regions_become_one_request_per_primary_node() {
+        // n3 at N=6: 32 regions meant ~30 forwards per client batch.
+        let regions: Vec<ShardRegion> = (1..=30).map(|i| region(i, i % 5 + 2)).collect();
+        let m = membership(&[1, 2, 3, 4, 5, 6], &[]);
+        let (by_node, unrouted) = group_forwards_by_primary(&regions, 1, &m);
+        assert_eq!(by_node.len(), 5, "one group per other node");
+        assert_eq!(by_node.values().map(Vec::len).sum::<usize>(), 30);
+        assert!(unrouted.is_empty());
+    }
+
+    #[test]
+    fn a_region_whose_primary_is_down_goes_to_the_single_path() {
+        let regions = vec![region(1, 2), region(2, 3)];
+        let m = membership(&[1, 2], &[3]);
+        let (by_node, unrouted) = group_forwards_by_primary(&regions, 1, &m);
+        assert_eq!(by_node.get(&2).map(Vec::as_slice), Some(&[1u64][..]));
+        assert_eq!(unrouted, vec![2]);
+    }
+
+    fn part(status: u16) -> ShardWritePartResult {
+        ShardWritePartResult {
+            region_id: 7,
+            status,
+            error: Some("x".into()),
+        }
+    }
+
+    #[test]
+    fn part_statuses_keep_single_region_semantics() {
+        assert!(matches!(
+            part_outcome(2, &part(204)),
+            PartOutcome::Done(Ok(()))
+        ));
+        // Stale epoch / not primary: resend via the reloading single path.
+        assert!(matches!(part_outcome(2, &part(409)), PartOutcome::Retry));
+        assert!(matches!(
+            part_outcome(2, &part(503)),
+            PartOutcome::Done(Err(HyperbytedbError::ClusterUnavailable(_)))
+        ));
+        assert!(matches!(
+            part_outcome(2, &part(500)),
+            PartOutcome::Done(Err(HyperbytedbError::PeerUnreachable(_)))
+        ));
     }
 }

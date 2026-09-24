@@ -385,6 +385,37 @@ pub struct ShardWriteRequest {
     pub body: Vec<u8>,
 }
 
+/// Several regions' forwarded writes for one primary node, in one request.
+///
+/// Forwarding one request per region made the cost of a client batch grow
+/// with the region count: at 32 regions a 1,000-point batch became ~30
+/// forwards of ~30 points, and six saturated nodes managed 21k points/s. One
+/// request per destination node bounds the fan-out at N-1 whatever the
+/// region count. Nothing waits to fill a batch: it is one client write,
+/// grouped. Sent bincode-encoded to `/internal/shard/write-batch`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShardWriteBatch {
+    pub parts: Vec<ShardWriteRequest>,
+}
+
+/// The outcome of one part of a [`ShardWriteBatch`]: the HTTP status the
+/// single-region endpoint would have returned for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShardWritePartResult {
+    pub region_id: u64,
+    pub status: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShardWriteBatchResponse {
+    pub results: Vec<ShardWritePartResult>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShardBootstrapRequest {
