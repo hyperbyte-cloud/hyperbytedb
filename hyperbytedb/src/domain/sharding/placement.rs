@@ -95,8 +95,14 @@ pub enum PlacementStep {
 ///
 /// 1. **Add** before remove, so replication factor never dips while
 ///    converging. This is what gives drain correct behaviour for free.
-/// 2. **Promote** before remove, so the primary is never the node leaving.
-/// 3. **Remove** last, only once the target set is fully present.
+/// 2. **Remove** a non-primary extra next. It does not wait on a primacy
+///    transfer: that transfer is a rebalance the progress guard may defer
+///    for a long time, and queueing the removal behind it stalled every
+///    decommission on n3 (the departing node sat in two regions whose
+///    primaries were staying put).
+/// 3. **Promote** before removing the primary, so the primary is never the
+///    node leaving.
+/// 4. **Remove** the old primary last, once it no longer is one.
 ///
 /// One step per call: a committed step bumps the region epoch, so the caller
 /// must re-read the region before the next one.
@@ -116,6 +122,13 @@ pub fn next_placement_step(region: &ShardRegion, target: &[u64]) -> Option<Place
     }
     if let Some(&missing) = target.iter().find(|t| !region.peers.contains(t)) {
         return Some(PlacementStep::Add(missing));
+    }
+    if let Some(&extra) = region
+        .peers
+        .iter()
+        .find(|p| !target.contains(p) && **p != region.primary)
+    {
+        return Some(PlacementStep::Remove(extra));
     }
     let want_primary = target[0];
     if region.primary != want_primary {
@@ -276,6 +289,18 @@ mod tests {
         assert_eq!(
             next_placement_step(&region(vec![1, 2, 3], 3), &[3, 2, 4]),
             Some(PlacementStep::Add(4))
+        );
+    }
+
+    #[test]
+    fn a_departing_non_primary_is_removed_before_a_primacy_rebalance() {
+        // n3 region 28: peers [1,3,6,2,4], primary 3, node 6 departing, and
+        // the target also wanted primacy on 2. Promote-first queued the
+        // removal behind a transfer the progress guard kept deferring, so the
+        // decommission never finished.
+        assert_eq!(
+            next_placement_step(&region(vec![1, 3, 6, 2, 4], 3), &[2, 1, 3, 4]),
+            Some(PlacementStep::Remove(6))
         );
     }
 
