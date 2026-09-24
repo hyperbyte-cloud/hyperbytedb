@@ -8,6 +8,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RESULTS="${RESULTS:-$REPO_ROOT/../.scratch/linear-scaling-p1/linearity-results.md}"
 KUBE_CTX="${KUBE_CTX:-kind-hyperbytedb}"
 NS="${NS:-hyperbytedb}"
+CR_NAME="${CR_NAME:-hyperbytedb}"
+POD_PREFIX="${POD_PREFIX:-$CR_NAME}"
 API="${API:-http://localhost:18086}"
 # Series count must grow WITH the cluster, or the sweep measures nothing.
 #
@@ -50,7 +52,7 @@ kubectl_port_forward() {
   while (( i < n )); do
     local port=$(( 18086 + i ))
     fuser -k "${port}/tcp" 2>/dev/null || true
-    kubectl --context "$KUBE_CTX" port-forward -n "$NS" "pod/hyperbytedb-${i}" \
+    kubectl --context "$KUBE_CTX" port-forward -n "$NS" "pod/${POD_PREFIX}-${i}" \
       "${port}:8086" >>/tmp/pf-linearity.log 2>&1 &
     PF_PIDS="$PF_PIDS $!"
     API_LIST="${API_LIST}${API_LIST:+,}http://localhost:${port}"
@@ -67,7 +69,7 @@ kubectl_port_forward_stop() {
 
 for N in $NODES_LIST; do
   echo "[sweep] scaling to N=$N"
-  kubectl --context "$KUBE_CTX" patch hyperbytedbcluster hyperbytedb -n "$NS" \
+  kubectl --context "$KUBE_CTX" patch hyperbytedbcluster "$CR_NAME" -n "$NS" \
     --type merge -p "{\"spec\":{\"replicas\":${N}}}" >/dev/null
   deadline=$((SECONDS + 600))
   while (( SECONDS < deadline )); do
