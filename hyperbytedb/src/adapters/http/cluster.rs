@@ -191,6 +191,62 @@ pub async fn handle_cluster_add_node(
             .into_response();
     }
 
+    // Drop a node from Raft membership before re-adding it if it lost its log.
+    //
+    // The leader keeps each member's replication progress for as long as it
+    // is a member. A node that comes back under the same id with an empty
+    // disk (its PVC was deleted on scale-down) contradicts that progress, and
+    // openraft 0.9 does not support it ("log reversion"): the leader sent it
+    // logs without a snapshot, and the node crashed on its first apply.
+    // Removing it resets its progress; the learner add below then starts it
+    // from a snapshot.
+    //
+    // Only on proof of loss: the node's own log ends before what the leader
+    // already replicated to it. The operator also calls add-node for a node
+    // the leader merely lost sight of during a restart, and removing a
+    // healthy voter then would cost quorum for nothing.
+    let voters_now: std::collections::BTreeSet<u64> = metrics
+        .membership_config
+        .membership()
+        .get_joint_config()
+        .iter()
+        .flat_map(|set| set.iter())
+        .copied()
+        .collect();
+    let in_raft = metrics
+        .membership_config
+        .membership()
+        .nodes()
+        .any(|(id, _)| *id == req.node_id);
+    let leader_matching = metrics
+        .replication
+        .as_ref()
+        .and_then(|r| r.get(&req.node_id).copied().flatten())
+        .map(|l| l.index);
+    let reverted = in_raft && log_reverted(leader_matching, fetch_target_raft(&req.addr).await);
+    let change = if reverted {
+        reset_change(&voters_now, in_raft, req.node_id, state.node_id)
+    } else {
+        None
+    };
+    if let Some(change) = change {
+        if let Err(e) = raft.change_membership(change, false).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("removing node that lost its log before re-add failed: {e}"),
+                    "leader_id": leader_id,
+                })),
+            )
+                .into_response();
+        }
+        tracing::info!(
+            node_id = req.node_id,
+            leader_matching,
+            "add-node: node lost its raft log; removed it so it rejoins from a snapshot"
+        );
+    }
+
     let node = openraft::BasicNode::new(req.addr.clone());
     if let Err(e) = raft.add_learner(req.node_id, node, false).await {
         return (
@@ -240,8 +296,11 @@ pub async fn handle_cluster_add_node(
 
     let mut promoted = false;
     if req.promote {
-        // Build the desired voter set: current voters ∪ {new node}.
-        let mut voters: std::collections::BTreeSet<u64> = metrics
+        // Build the desired voter set: current voters ∪ {new node}. Read it
+        // again: the reset above may have changed it.
+        let mut voters: std::collections::BTreeSet<u64> = raft
+            .metrics()
+            .borrow()
             .membership_config
             .membership()
             .get_joint_config()
@@ -284,9 +343,99 @@ pub(crate) fn readmit_state(
 ) -> Option<crate::domain::cluster::membership::NodeState> {
     use crate::domain::cluster::membership::NodeState;
     match current {
-        Some(NodeState::Decommissioning | NodeState::Leaving) => Some(NodeState::Joining),
+        // `Syncing`, not `Joining`: nothing ever promotes `Joining`, so a
+        // node re-admitted into it stayed there, holding no placement and
+        // serving nothing (seen on n3). `Syncing` is where a new learner
+        // starts, and the heartbeat moves it to `Active` once it reports
+        // ready.
+        Some(NodeState::Decommissioning | NodeState::Leaving) => Some(NodeState::Syncing),
         _ => None,
     }
+}
+
+/// What a member reports about its own Raft log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TargetRaft {
+    /// `None` for an empty log.
+    pub last_log_index: Option<u64>,
+    /// Its Raft core has stopped (openraft state `Shutdown`).
+    pub shutdown: bool,
+}
+
+/// True when a member has provably lost its log.
+///
+/// Either its log ends before what the leader already replicated to it,
+/// which only a lost disk explains, or its Raft core has died -- what a node
+/// that came back empty and was then fed logs without a snapshot looks like
+/// (seen on n3: `LogIndexNotFound`, state `Shutdown`). A dead core is not
+/// participating, so resetting it costs no quorum.
+///
+/// `target` is `None` when the node could not be asked; that is never proof.
+#[must_use]
+pub(crate) fn log_reverted(leader_matching: Option<u64>, target: Option<TargetRaft>) -> bool {
+    let Some(t) = target else {
+        return false;
+    };
+    if t.shutdown {
+        return true;
+    }
+    match leader_matching {
+        Some(matched) => t.last_log_index.is_none_or(|l| l < matched),
+        None => false,
+    }
+}
+
+/// The node's own Raft log position and liveness, or `None` if unreadable.
+async fn fetch_target_raft(addr: &str) -> Option<TargetRaft> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .ok()?;
+    let v: serde_json::Value = client
+        .get(format!("http://{addr}/cluster/raft/metrics"))
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    let last_log_index = match v.get("last_log_index")? {
+        serde_json::Value::Null => None,
+        n => Some(n.as_u64()?),
+    };
+    let shutdown = v.get("state").and_then(serde_json::Value::as_str) == Some("Shutdown");
+    Some(TargetRaft {
+        last_log_index,
+        shutdown,
+    })
+}
+
+/// The membership change that drops a returning node from Raft, or `None`
+/// when no reset is needed.
+///
+/// A voter is removed with `retain = false`, which also drops it as a node; a
+/// learner is removed as a node directly. Nothing to do for a node that is
+/// not in membership (genuinely new), for the leader itself, or for the only
+/// voter.
+#[must_use]
+pub(crate) fn reset_change(
+    voters: &std::collections::BTreeSet<u64>,
+    in_raft: bool,
+    node_id: u64,
+    self_id: u64,
+) -> Option<openraft::ChangeMembers<u64, openraft::BasicNode>> {
+    use openraft::ChangeMembers;
+    if !in_raft || node_id == self_id {
+        return None;
+    }
+    let only = std::collections::BTreeSet::from([node_id]);
+    if voters.contains(&node_id) {
+        if voters.len() == 1 {
+            return None;
+        }
+        return Some(ChangeMembers::RemoveVoters(only));
+    }
+    Some(ChangeMembers::RemoveNodes(only))
 }
 
 #[derive(Debug, Deserialize)]
@@ -387,6 +536,88 @@ pub async fn handle_cluster_remove_node(
 }
 
 #[cfg(test)]
+mod log_reverted_tests {
+    use super::{TargetRaft, log_reverted};
+
+    fn at(last: Option<u64>) -> Option<TargetRaft> {
+        Some(TargetRaft {
+            last_log_index: last,
+            shutdown: false,
+        })
+    }
+
+    #[test]
+    fn an_empty_or_shorter_log_than_the_leader_replicated_is_reverted() {
+        // n3: nodes 4-6 came back with empty disks; the leader had them at ~37k.
+        assert!(log_reverted(Some(37_000), at(None)));
+        assert!(log_reverted(Some(37_000), at(Some(36_000))));
+    }
+
+    #[test]
+    fn a_dead_raft_core_is_reverted_whatever_its_log_says() {
+        // What n3 actually showed by the time add-node ran: the leader had
+        // already fed the empty node logs, so its log was not behind, but
+        // its core had died on apply.
+        let dead = Some(TargetRaft {
+            last_log_index: Some(37_197),
+            shutdown: true,
+        });
+        assert!(log_reverted(Some(37_197), dead));
+        assert!(log_reverted(None, dead));
+    }
+
+    #[test]
+    fn a_node_that_kept_its_log_is_not_reverted() {
+        // The common case: a pod restarted and the leader briefly lost sight
+        // of it. Removing it would cost a voter for nothing.
+        assert!(!log_reverted(Some(37_000), at(Some(37_000))));
+        assert!(!log_reverted(Some(37_000), at(Some(38_000))));
+    }
+
+    #[test]
+    fn no_evidence_is_not_proof() {
+        // Unreachable node, or a leader with no progress for it.
+        assert!(!log_reverted(Some(37_000), None));
+        assert!(!log_reverted(None, at(None)));
+        assert!(!log_reverted(None, None));
+    }
+}
+
+#[cfg(test)]
+mod reset_change_tests {
+    use super::reset_change;
+    use openraft::ChangeMembers;
+    use std::collections::BTreeSet;
+
+    fn set(ids: &[u64]) -> BTreeSet<u64> {
+        ids.iter().copied().collect()
+    }
+
+    #[test]
+    fn a_returning_voter_is_removed_as_a_voter() {
+        // Scale 6 -> 3 -> 6 left node 6 a voter; it came back with an empty
+        // disk under the same id.
+        let got = reset_change(&set(&[1, 2, 3, 4, 5, 6]), true, 6, 2);
+        assert_eq!(got, Some(ChangeMembers::RemoveVoters(set(&[6]))));
+    }
+
+    #[test]
+    fn a_returning_learner_is_removed_as_a_node() {
+        // Not a voter, but the leader holds its progress all the same.
+        // RemoveVoters would leave it in place.
+        let got = reset_change(&set(&[1, 2, 3]), true, 4, 1);
+        assert_eq!(got, Some(ChangeMembers::RemoveNodes(set(&[4]))));
+    }
+
+    #[test]
+    fn a_new_node_the_leader_or_the_last_voter_is_left_alone() {
+        assert_eq!(reset_change(&set(&[1, 2, 3]), false, 4, 1), None);
+        assert_eq!(reset_change(&set(&[1, 2, 3]), true, 1, 1), None);
+        assert_eq!(reset_change(&set(&[2]), true, 2, 1), None);
+    }
+}
+
+#[cfg(test)]
 mod readmit_tests {
     use super::readmit_state;
     use crate::domain::cluster::membership::NodeState;
@@ -397,15 +628,40 @@ mod readmit_tests {
     /// persisted `Leaving` state — terminal by design — and failed readiness
     /// forever. An explicit re-add is the one signal allowed to supersede it.
     #[test]
-    fn a_departed_node_is_readmitted_as_joining() {
+    fn a_departed_node_is_readmitted_as_syncing() {
         assert_eq!(
             readmit_state(Some(NodeState::Leaving)),
-            Some(NodeState::Joining)
+            Some(NodeState::Syncing)
         );
         assert_eq!(
             readmit_state(Some(NodeState::Decommissioning)),
-            Some(NodeState::Joining)
+            Some(NodeState::Syncing)
         );
+    }
+
+    /// The seam that broke on n3: the re-admit state must be one the heartbeat
+    /// actually promotes once the node reports itself active. `Joining` was
+    /// not, and two nodes sat in it indefinitely.
+    #[test]
+    fn a_readmitted_node_reaches_active_through_the_heartbeat() {
+        use crate::application::cluster::heartbeat::{
+            HealthBody, ProbeSignal, decide_transition_with,
+        };
+        for departed in [NodeState::Leaving, NodeState::Decommissioning] {
+            let readmitted = readmit_state(Some(departed)).expect("re-admitted");
+            let signal = ProbeSignal::Response {
+                health_ok: true,
+                body: Some(HealthBody {
+                    state: Some(NodeState::Active),
+                    needs_sync: Some(true),
+                }),
+            };
+            assert_eq!(
+                decide_transition_with(readmitted, &signal, 0, 5, false),
+                Some(NodeState::Active),
+                "{departed:?} -> {readmitted:?} must reach Active"
+            );
+        }
     }
 
     /// Everything else is left exactly as it is. Rewriting a live node's state

@@ -95,6 +95,9 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
         let miss_threshold =
             u32::try_from(config.cluster.heartbeat_miss_threshold).unwrap_or(u32::MAX);
         let rx = service_shutdown_rx.clone();
+        // Under sharding `needs_sync` is not a readiness signal; see
+        // `decide_transition_with`.
+        let sync_gates_readmit = !config.sharding.enabled;
         Some(tokio::spawn(async move {
             heartbeat::run_heartbeat_updater(
                 self_id,
@@ -102,6 +105,7 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
                 miss_threshold,
                 hb_interval,
                 probe_timeout,
+                sync_gates_readmit,
                 rx,
             )
             .await;

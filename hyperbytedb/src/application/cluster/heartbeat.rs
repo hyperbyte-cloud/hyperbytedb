@@ -56,13 +56,37 @@ pub(crate) enum ProbeSignal {
 /// Authority model: for reachable peers the decoded body `state` field is the
 /// sole transition input; overall HTTP status never transitions membership.
 /// `Joining`/`Draining`/`Leaving` are operator-owned and never auto-promoted.
+///
+/// Uses the non-sharded readiness rule, where `needs_sync` blocks readmission.
+/// See [`decide_transition_with`].
+#[cfg(test)]
 pub(crate) fn decide_transition(
     current: NodeState,
     signal: &ProbeSignal,
     consecutive_misses: u32,
     miss_threshold: u32,
 ) -> Option<NodeState> {
+    decide_transition_with(current, signal, consecutive_misses, miss_threshold, true)
+}
+
+/// [`decide_transition`] with the readiness rule made explicit.
+///
+/// `sync_gates_readmit` is true without sharding: every node is a full
+/// replica, and one whose startup sync failed (`needs_sync`) would serve
+/// reads from an incomplete copy, so peers keep it out until it syncs. Under
+/// sharding the flag means nothing -- data lives in regions, and per-region
+/// progress already guards promotion -- and honouring it stranded nodes: a
+/// fresh node reports `needs_sync` forever, so a peer that once saw it
+/// `Disconnected` never readmitted it, and it served no traffic.
+pub(crate) fn decide_transition_with(
+    current: NodeState,
+    signal: &ProbeSignal,
+    consecutive_misses: u32,
+    miss_threshold: u32,
+    sync_gates_readmit: bool,
+) -> Option<NodeState> {
     use NodeState::{Active, Decommissioning, Disconnected, Draining, Joining, Leaving, Syncing};
+    let ready = |b: &HealthBody| b.ready() || (!sync_gates_readmit && b.state == Some(Active));
     match (current, signal) {
         // Transport failure is the sole demotion path to Disconnected;
         // operator states stay untouched.
@@ -82,16 +106,19 @@ pub(crate) fn decide_transition(
         }
         // Reachable with a parseable self-report: mirror self-truth.
         (current, ProbeSignal::Response { body: Some(b), .. }) => match current {
-            Disconnected => {
-                if b.ready() {
-                    Some(Active)
-                } else if b.state == Some(Syncing) {
-                    Some(Syncing)
-                } else {
-                    None
-                }
-            }
-            Syncing => b.ready().then_some(Active),
+            Disconnected => match b.state {
+                // Operator-owned states must reach every peer even if the
+                // node was last seen unreachable. Without this a node
+                // decommissioned while a peer had it `Disconnected` never
+                // counted as departing on that peer -- on the leader, that
+                // meant its regions were never evacuated and the operator
+                // waited on it forever.
+                Some(s @ (Decommissioning | Leaving | Draining)) => Some(s),
+                Some(Syncing) => Some(Syncing),
+                _ if ready(b) => Some(Active),
+                _ => None,
+            },
+            Syncing => ready(b).then_some(Active),
             Active => match b.state {
                 Some(Syncing) => Some(Syncing),
                 Some(Draining) => Some(Draining),
@@ -103,11 +130,15 @@ pub(crate) fn decide_transition(
             // rejoin. Without this it stays `Draining` in its peers' views
             // forever, and since `Draining` keeps its placement seat, the
             // cluster would keep targeting a node it never readmits.
-            Draining => b.ready().then_some(Active),
+            Draining => ready(b).then_some(Active),
             // Terminal and operator-owned. No probe result may resurrect a
             // node that is being removed, or evacuation would be undone.
             Decommissioning | Leaving => None,
-            Joining => None,
+            // Nothing else ever promotes `Joining`, so without this a node
+            // in it stayed there forever, holding no placement and serving
+            // nothing -- what the first add-node re-admit did to two nodes on
+            // n3. Same readiness rule as `Syncing`.
+            Joining => ready(b).then_some(Active),
         },
     }
 }
@@ -157,6 +188,7 @@ pub async fn run_heartbeat_updater(
     miss_threshold: u32,
     interval: Duration,
     probe_timeout: Duration,
+    sync_gates_readmit: bool,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let client = match reqwest::Client::builder().timeout(probe_timeout).build() {
@@ -179,7 +211,7 @@ pub async fn run_heartbeat_updater(
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                probe_peers(self_id, &membership, &client, miss_threshold).await;
+                probe_peers(self_id, &membership, &client, miss_threshold, sync_gates_readmit).await;
             }
             _ = async {
                 while !*shutdown_rx.borrow() {
@@ -198,6 +230,7 @@ async fn probe_peers(
     membership: &SharedMembership,
     client: &reqwest::Client,
     miss_threshold: u32,
+    sync_gates_readmit: bool,
 ) {
     let peers: Vec<(u64, String)> = {
         let m = membership.read().await;
@@ -259,7 +292,13 @@ async fn probe_peers(
                 let Some(current) = m.get_node(pid).map(|n| n.state) else {
                     continue;
                 };
-                let Some(next) = decide_transition(current, &signal, misses, miss_threshold) else {
+                let Some(next) = decide_transition_with(
+                    current,
+                    &signal,
+                    misses,
+                    miss_threshold,
+                    sync_gates_readmit,
+                ) else {
                     continue;
                 };
                 if next != current {
@@ -278,7 +317,9 @@ async fn probe_peers(
                 let Some(current) = m.get_node(pid).map(|n| n.state) else {
                     continue;
                 };
-                let Some(next) = decide_transition(current, &signal, 0, miss_threshold) else {
+                let Some(next) =
+                    decide_transition_with(current, &signal, 0, miss_threshold, sync_gates_readmit)
+                else {
                     continue;
                 };
                 if next != current {
@@ -465,15 +506,80 @@ mod tests {
     }
 
     #[test]
-    fn operator_states_are_never_promoted() {
-        // `Draining` is deliberately absent: a drained node is restarting, not
-        // leaving, and must be able to rejoin. See
-        // `draining_recovers_when_the_node_reports_ready`.
+    fn a_disconnected_peer_that_reports_departing_is_mirrored() {
+        // Seen live on n3: the leader had node 5 `Disconnected` from its
+        // restart, node 5 was then decommissioned, and the leader never
+        // learned it. Its regions were never evacuated and the operator
+        // waited forever. Holds with and without sharding.
+        for gate in [true, false] {
+            for reported in [
+                NodeState::Decommissioning,
+                NodeState::Leaving,
+                NodeState::Draining,
+            ] {
+                assert_eq!(
+                    decide_transition_with(
+                        NodeState::Disconnected,
+                        &body(Some(reported), Some(true)),
+                        0,
+                        THRESHOLD,
+                        gate,
+                    ),
+                    Some(reported),
+                    "reported {reported:?}, gate {gate}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn needs_sync_blocks_readmission_only_without_sharding() {
+        // A fresh node reports `active` with `needs_sync` forever. Under
+        // sharding that stranded it `Disconnected` on every peer that saw it
+        // restart, so it served no traffic.
+        let active_unsynced = body(Some(NodeState::Active), Some(true));
         for current in [
-            NodeState::Joining,
-            NodeState::Decommissioning,
-            NodeState::Leaving,
+            NodeState::Disconnected,
+            NodeState::Syncing,
+            NodeState::Draining,
         ] {
+            assert_eq!(
+                decide_transition_with(current, &active_unsynced, 0, THRESHOLD, true),
+                None,
+                "non-sharded {current:?}"
+            );
+            assert_eq!(
+                decide_transition_with(current, &active_unsynced, 0, THRESHOLD, false),
+                Some(NodeState::Active),
+                "sharded {current:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn joining_is_promoted_once_ready() {
+        let ready = body(Some(NodeState::Active), Some(false));
+        let unsynced = body(Some(NodeState::Active), Some(true));
+        assert_eq!(
+            decide_transition(NodeState::Joining, &ready, 0, THRESHOLD),
+            Some(NodeState::Active)
+        );
+        assert_eq!(
+            decide_transition(NodeState::Joining, &unsynced, 0, THRESHOLD),
+            None
+        );
+        assert_eq!(
+            decide_transition_with(NodeState::Joining, &unsynced, 0, THRESHOLD, false),
+            Some(NodeState::Active)
+        );
+    }
+
+    #[test]
+    fn operator_states_are_never_promoted() {
+        // `Draining` and `Joining` are deliberately absent: both must be able
+        // to reach `Active`. See `draining_recovers_when_the_node_reports_ready`
+        // and `joining_is_promoted_once_ready`.
+        for current in [NodeState::Decommissioning, NodeState::Leaving] {
             assert_eq!(
                 decide_transition(
                     current,
@@ -647,10 +753,46 @@ mod tests {
             .timeout(Duration::from_millis(500))
             .build()
             .unwrap();
-        probe_peers(1, &membership, &client, THRESHOLD).await;
+        probe_peers(1, &membership, &client, THRESHOLD, true).await;
 
         let m = membership.read().await;
         assert_eq!(m.get_node(2).unwrap().state, NodeState::Active);
+    }
+
+    #[tokio::test]
+    async fn prober_readmits_unsynced_peer_and_mirrors_departure_under_sharding() {
+        // The two n3 failures, end to end through the prober: node 4 came
+        // back `active` with `needs_sync` and stayed `Disconnected`; node 5
+        // was decommissioned while `Disconnected` and never counted as
+        // departing on the leader.
+        let unsynced = spawn_health_server(|_| {
+            (
+                axum::http::StatusCode::OK,
+                r#"{"status":"pass","message":"x","state":"active","needs_sync":true}"#,
+            )
+        })
+        .await;
+        let leaving = spawn_health_server(|_| {
+            (
+                axum::http::StatusCode::OK,
+                r#"{"status":"warn","message":"x","state":"decommissioning","needs_sync":true}"#,
+            )
+        })
+        .await;
+        let membership = make_membership(&[
+            (4, unsynced.as_str(), NodeState::Disconnected),
+            (5, leaving.as_str(), NodeState::Disconnected),
+        ]);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(500))
+            .build()
+            .unwrap();
+
+        probe_peers(1, &membership, &client, THRESHOLD, false).await;
+
+        let m = membership.read().await;
+        assert_eq!(m.get_node(4).unwrap().state, NodeState::Active);
+        assert_eq!(m.get_node(5).unwrap().state, NodeState::Decommissioning);
     }
 
     #[tokio::test]
@@ -669,7 +811,7 @@ mod tests {
             .timeout(Duration::from_millis(500))
             .build()
             .unwrap();
-        probe_peers(1, &membership, &client, THRESHOLD).await;
+        probe_peers(1, &membership, &client, THRESHOLD, true).await;
 
         let m = membership.read().await;
         assert_eq!(m.get_node(2).unwrap().state, NodeState::Syncing);
@@ -685,7 +827,7 @@ mod tests {
             .timeout(Duration::from_millis(500))
             .build()
             .unwrap();
-        probe_peers(1, &membership, &client, THRESHOLD).await;
+        probe_peers(1, &membership, &client, THRESHOLD, true).await;
 
         let m = membership.read().await;
         assert_eq!(
@@ -719,7 +861,7 @@ mod tests {
             .build()
             .unwrap();
         for _ in 0..6 {
-            probe_peers(1, &membership, &client, THRESHOLD).await;
+            probe_peers(1, &membership, &client, THRESHOLD, true).await;
         }
 
         let m = membership.read().await;
@@ -744,7 +886,7 @@ mod tests {
             .unwrap();
 
         for probe in 1..THRESHOLD {
-            probe_peers(0, &membership, &client, THRESHOLD).await;
+            probe_peers(0, &membership, &client, THRESHOLD, true).await;
             assert_eq!(
                 membership.read().await.get_node(1).unwrap().state,
                 NodeState::Active,
@@ -752,7 +894,7 @@ mod tests {
             );
         }
 
-        probe_peers(0, &membership, &client, THRESHOLD).await;
+        probe_peers(0, &membership, &client, THRESHOLD, true).await;
         assert_eq!(
             membership.read().await.get_node(1).unwrap().state,
             NodeState::Disconnected,
@@ -797,7 +939,7 @@ mod tests {
             .build()
             .unwrap();
 
-        probe_peers(0, &membership, &client, THRESHOLD).await;
+        probe_peers(0, &membership, &client, THRESHOLD, true).await;
 
         let m = membership.read().await;
         assert_eq!(m.get_node(1).unwrap().state, NodeState::Draining);
@@ -811,6 +953,6 @@ mod tests {
             .build()
             .unwrap();
 
-        probe_peers(0, &membership, &client, THRESHOLD).await;
+        probe_peers(0, &membership, &client, THRESHOLD, true).await;
     }
 }
