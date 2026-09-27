@@ -29,19 +29,26 @@ import sys,json
 try: d=json.load(sys.stdin)
 except Exception: print(0, 0); raise SystemExit
 rs=[r for sp in d.get('spaces',[]) for r in sp.get('regions',[])]
-print(len(rs), len({r.get('primary') for r in rs}))" 2>/dev/null || echo "0 0"
+import collections
+lay=collections.Counter()
+for r in rs:
+  lay[(r.get('primary'),'p')]+=1
+  for p in r.get('peers',[]): lay[(p,'c')]+=1
+sig='-'.join(f'{k[0]}{k[1]}{v}' for k,v in sorted(lay.items()))
+print(len(rs), len({r.get('primary') for r in rs}), sig or 'none')" 2>/dev/null || echo "0 0 none"
 }
 
 # Block until the space has at least N regions and the region and primary
 # counts have held for SPLIT_STABLE_SECS, or SPLIT_TIMEOUT_SECS passes.
 wait_for_split() {
   local n=$1 deadline=$(( SECONDS + ${SPLIT_TIMEOUT_SECS:-900} ))
-  local last="" since=$SECONDS started=$SECONDS regions primaries
+  local last="" since=$SECONDS started=$SECONDS regions primaries layout
   while (( SECONDS < deadline )); do
-    read -r regions primaries < <(map_stats)
-    # Primaries too: placement moves them after the split settles, and
-    # measuring before that timed one primary node at N=6.
-    if [[ "$regions/$primaries" != "$last" ]]; then last="$regions/$primaries"; since=$SECONDS; fi
+    read -r regions primaries layout < <(map_stats)
+    # The whole layout -- every node's copies and primaries -- must hold
+    # still, not just the counts: copy moves continue after primaries have
+    # spread, and measuring mid-move timed one node at 46% of the load.
+    if [[ "$regions/$primaries/$layout" != "$last" ]]; then last="$regions/$primaries/$layout"; since=$SECONDS; fi
     echo "[sweep] N=$n regions=$regions primaries=$primaries stable=$(( SECONDS - since ))s"
     # Primaries must actually be spread: children of a split inherit the
     # parent's primary, and moving primacy (learner, copy, promote) takes
@@ -76,7 +83,7 @@ for s in d['results'][0].get('series',[]):
       kubectl_ctx -n "$NS" exec "${CR_NAME}-0" -c hyperbytedb -- \
         sh -c "curl -sS -m 60 -X POST http://127.0.0.1:8086/query --data-urlencode 'q=DROP DATABASE ${db}'" >/dev/null 2>&1 || true
     done
-    read -r regions _ < <(map_stats)
+    read -r regions _ _ < <(map_stats)
     if [[ -z "$dbs" && "$regions" == 0 ]]; then return 0; fi
     sleep 10
   done
@@ -196,7 +203,7 @@ if len(rows) != $workers or not rows: print('-', '-', '-'); raise SystemExit
 pts=sum(r[0] for r in rows); dur=max(r[1] for r in rows)
 print(int(pts/dur) if dur>0 else '-', int(sum(r[2] for r in rows)), int(sum(r[3] for r in rows)))")
   [[ "$pps" == "-" ]] && pps=""
-  read -r regions primaries < <(map_stats)
+  read -r regions primaries _ < <(map_stats)
   # Layout at measure time: per node, regions it is primary of, regions it
   # holds a replica of, and the share of the hash space it is primary for
   # (series are uniform in hash space, so that is its share of the load).
