@@ -19,7 +19,8 @@ use crate::domain::cluster::membership::{
     NodeInfo, NodeState, SharedMembership, holds_placement, is_departing, is_serving,
 };
 use crate::domain::sharding::placement::{
-    MoveTier, PlacementStep, budget_exhausted, move_tier, next_placement_step, target_placement,
+    MoveTier, PlacementStep, PrimaryCandidate, balance_primaries, budget_exhausted, move_tier,
+    next_placement_step, target_placement, with_primary_first,
 };
 use crate::domain::sharding::{
     MeasurementKey, ShardMap, ShardMapOp, ShardRegion, ShardRehomeRequest,
@@ -104,6 +105,10 @@ type PeerMapVersions = tokio::sync::RwLock<HashMap<u64, ProbeCell<Option<(u64, u
 /// `max_regions_per_measurement`. Splits are metadata-only, so the cost of a
 /// region is a map entry and a heartbeat row, not a copy.
 const REGIONS_PER_CANDIDATE: usize = 32;
+
+/// A region keeps its primary while that node stays within this many percent
+/// of its fair share of primary load; see `balance_primaries`.
+const PRIMARY_BALANCE_TOLERANCE_PCT: u64 = 10;
 
 fn peer_disconnected_past_deadline(node: &NodeInfo, now: i64, timeout_secs: u64) -> bool {
     node.state == NodeState::Disconnected
@@ -229,6 +234,9 @@ pub struct ShardScheduler {
     heartbeats: tokio::sync::RwLock<Vec<RegionHeartbeatRow>>,
     /// (region_id, reporter) -> that peer's median series id for the region.
     split_hints: tokio::sync::RwLock<HashMap<(u64, u64), u64>>,
+    /// region_id -> the primary chosen to balance load; refreshed each tick.
+    /// See `balance_primaries`.
+    primary_plan: tokio::sync::RwLock<HashMap<u64, u64>>,
     /// Regions with an in-flight operator (split/merge/rebalance/failover/transfer).
     region_operators: tokio::sync::RwLock<HashMap<u64, ()>>,
     /// region_id -> the attempt sequence number of its last convergence move.
@@ -326,6 +334,7 @@ impl ShardScheduler {
             max_points_per_request,
             heartbeats: tokio::sync::RwLock::new(Vec::new()),
             split_hints: tokio::sync::RwLock::new(HashMap::new()),
+            primary_plan: tokio::sync::RwLock::new(HashMap::new()),
             region_operators: tokio::sync::RwLock::new(HashMap::new()),
             placement_last_attempted: tokio::sync::RwLock::new(HashMap::new()),
             placement_attempt_seq: std::sync::atomic::AtomicU64::new(0),
@@ -782,6 +791,55 @@ impl ShardScheduler {
         self.region_operators.read().await.contains_key(&region_id)
     }
 
+    /// Recompute which peer should lead each region so primary load is even
+    /// across nodes. Rollup destinations are left out: their placement is not
+    /// driven from here, and counting them would skew everyone else's share.
+    async fn refresh_primary_plan(&self, map: &ShardMap) {
+        let candidates = self.active_candidate_ids().await;
+        if candidates.is_empty() {
+            return;
+        }
+        let rf = effective_replication_factor(self.config.replication_factor, candidates.len());
+        let mut inputs = Vec::new();
+        {
+            let hb = self.heartbeats.read().await;
+            for space in map.spaces.values() {
+                if self.is_rollup_dest(&space.key).await {
+                    continue;
+                }
+                for r in &space.regions {
+                    let (series, _) = max_region_peer_heartbeat_stats(&hb, r);
+                    inputs.push(PrimaryCandidate {
+                        region_id: r.region_id,
+                        current: r.primary,
+                        weight: series.max(1),
+                        peers: target_placement(&space.key, r.start, &candidates, rf),
+                    });
+                }
+            }
+        }
+        let plan = balance_primaries(&inputs, PRIMARY_BALANCE_TOLERANCE_PCT);
+        *self.primary_plan.write().await = plan;
+    }
+
+    /// A region's target placement: HRW picks the peers, the balance plan
+    /// picks which of them leads.
+    async fn balanced_target(
+        &self,
+        key: &MeasurementKey,
+        region: &ShardRegion,
+        candidates: &[u64],
+        rf: usize,
+    ) -> Vec<u64> {
+        let primary = self
+            .primary_plan
+            .read()
+            .await
+            .get(&region.region_id)
+            .copied();
+        with_primary_first(target_placement(key, region.start, candidates, rf), primary)
+    }
+
     async fn tick(&self) -> Result<(), HyperbytedbError> {
         // Peer map versions are only valid for the tick that probed them.
         self.peer_map_versions.write().await.clear();
@@ -789,6 +847,7 @@ impl ShardScheduler {
             .store(0, std::sync::atomic::Ordering::Relaxed);
         let map = self.shard_map.snapshot().await?;
         self.prune_region_counters(&map).await;
+        self.refresh_primary_plan(&map).await;
         // Learners left behind by a failed promote would otherwise never be
         // revisited: once in `peers`, the region looks converged.
         self.try_promote_learners(&map).await;
@@ -986,7 +1045,7 @@ impl ShardScheduler {
             return None;
         }
         let rf = effective_replication_factor(self.config.replication_factor, candidates.len());
-        let target = target_placement(key, region.start, &candidates, rf);
+        let target = self.balanced_target(key, region, &candidates, rf).await;
         next_placement_step(region, &target)?;
         let departing = self.departing_node_ids().await;
         let unhealthy = self.unhealthy_region_peers(region).await;
@@ -1720,7 +1779,7 @@ impl ShardScheduler {
             return Ok(false);
         }
         let rf = effective_replication_factor(self.config.replication_factor, candidates.len());
-        let target = target_placement(key, region.start, &candidates, rf);
+        let target = self.balanced_target(key, region, &candidates, rf).await;
         let Some(step) = next_placement_step(region, &target) else {
             self.clear_placement_stall(region.region_id).await;
             return Ok(false);
@@ -4695,6 +4754,137 @@ mod tests {
                 .await;
         }
         regions
+    }
+
+    /// H5 wiring: the scheduler's plan evens primaries across nodes, each
+    /// region's target leads with its planned primary, and the tick moves
+    /// primacy off the overloaded node. The layout is already at its HRW peer
+    /// sets, so primacy is the only thing to change.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn primaries_are_balanced_across_nodes() {
+        let harness = PlacementTestHarness::new_tuned(true, &[(2, 1_000), (3, 1_000)], 0, |c| {
+            c.replication_factor = 2;
+        })
+        .await;
+        let key = MeasurementKey::new("db", "autogen", "balanced");
+        let nodes = [1u64, 2, 3];
+        let target_for = |start: u64| {
+            let t = target_placement(&key, start, &nodes, 2);
+            // Node 1 leads wherever it is a peer: the skew HRW produced on n3.
+            let primary = if t.contains(&1) { 1 } else { t[0] };
+            (t, primary)
+        };
+        let (t0, p0) = target_for(0);
+        let mut seed = sample_region_peers(t0, p0);
+        seed.region_id = 5_000;
+        seed.last_split_at = 1;
+        harness
+            .scheduler
+            .shard_map
+            .apply_op(ShardMapOp::BootstrapMeasurement {
+                key: key.clone(),
+                region: seed,
+            })
+            .await
+            .unwrap();
+        while harness.space_regions(&key).await.len() < 12 {
+            let parent = harness
+                .space_regions(&key)
+                .await
+                .into_iter()
+                .max_by_key(|r| r.end.saturating_sub(r.start))
+                .unwrap();
+            let split_key = parent.start + (parent.end - parent.start) / 2;
+            let child_epoch = parent.epoch.bump_version();
+            let mut left = parent.clone();
+            left.end = split_key;
+            left.epoch = child_epoch;
+            let mut right = parent.clone();
+            right.start = split_key;
+            right.epoch = child_epoch;
+            for child in [&mut left, &mut right] {
+                let (t, p) = target_for(child.start);
+                child.peers = t;
+                child.primary = p;
+            }
+            harness
+                .scheduler
+                .shard_map
+                .apply_op(ShardMapOp::Split {
+                    key: key.clone(),
+                    region_id: parent.region_id,
+                    split_key,
+                    epoch: parent.epoch,
+                    left,
+                    right,
+                })
+                .await
+                .unwrap();
+        }
+        let regions = harness.space_regions(&key).await;
+        for r in &regions {
+            for p in &r.peers {
+                harness
+                    .scheduler
+                    .record_heartbeat(r.region_id, *p, 50_000, 0, 0)
+                    .await;
+            }
+        }
+        let before = regions.iter().filter(|r| r.primary == 1).count();
+        assert!(
+            before >= 6,
+            "fixture must be skewed onto node 1: {before} of 12"
+        );
+
+        harness.scheduler.tick_once_for_test().await.unwrap();
+
+        let plan = harness.scheduler.primary_plan.read().await.clone();
+        let mut per: HashMap<u64, usize> = HashMap::new();
+        for r in &regions {
+            let chosen = plan[&r.region_id];
+            assert!(r.peers.contains(&chosen), "planned primary must be a peer");
+            *per.entry(chosen).or_default() += 1;
+            let target = harness.scheduler.balanced_target(&key, r, &nodes, 2).await;
+            assert_eq!(target[0], chosen, "target must lead with the plan");
+            let mut a = target.clone();
+            let mut b = r.peers.clone();
+            a.sort_unstable();
+            b.sort_unstable();
+            assert_eq!(a, b, "HRW peer set unchanged");
+        }
+        // As even as the peer sets allow: nobody above the ceiling of a fair
+        // share, and nobody below min(fair floor, regions it is a peer of).
+        for n in nodes {
+            let got = per.get(&n).copied().unwrap_or(0);
+            let reachable = regions.iter().filter(|r| r.peers.contains(&n)).count();
+            assert!(got <= 5, "node {n} leads {got} of 12: {per:?}");
+            assert!(
+                got >= reachable.min(3),
+                "node {n} leads {got}, can lead {reachable}: {per:?}"
+            );
+        }
+
+        let ops = harness.proposals.lock().unwrap();
+        let moves: Vec<u64> = ops
+            .iter()
+            .filter_map(|op| match op {
+                ShardMapOp::TransferPrimary {
+                    key: k,
+                    new_primary,
+                    ..
+                } if *k == key => Some(*new_primary),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !moves.is_empty(),
+            "the tick must start moving primacy: {ops:?}"
+        );
+        assert!(
+            moves.iter().all(|n| *n != 1),
+            "only away from node 1: {moves:?}"
+        );
     }
 
     /// Same shape, but no heartbeats: every region reads as empty, which makes

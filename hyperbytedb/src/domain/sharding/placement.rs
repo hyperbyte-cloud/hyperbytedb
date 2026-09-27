@@ -78,6 +78,132 @@ pub fn target_placement(
 
 use super::types::ShardRegion;
 
+/// One region's input to [`balance_primaries`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrimaryCandidate {
+    pub region_id: u64,
+    /// Its current primary.
+    pub current: u64,
+    /// Its share of the load (series count); regions of equal weight count
+    /// equally.
+    pub weight: u64,
+    /// Its target peer set in HRW order (`target_placement`).
+    pub peers: Vec<u64>,
+}
+
+/// Choose each region's primary among its target peers so that every node
+/// carries about the same primary load.
+///
+/// HRW picks which nodes hold a region, and used its first choice as the
+/// primary too. That choice is effectively random, and with ~5 regions per
+/// node one node ended up primary for 1.7-3x its share: 9 of 16 regions (56%
+/// of the load) at N=3 on n3. Writes all go through the primary, so the
+/// busiest node capped the cluster and N=3 -> N=6 scaled only 1.44x.
+///
+/// Heaviest regions first. A region keeps its current primary while that
+/// node stays within `tolerance_pct` of its fair share, so a balanced layout
+/// is left alone and nothing flaps; otherwise it goes to the least-loaded of
+/// its peers, earlier HRW rank breaking ties. Deterministic for a given input.
+#[must_use]
+pub fn balance_primaries(
+    regions: &[PrimaryCandidate],
+    tolerance_pct: u64,
+) -> std::collections::HashMap<u64, u64> {
+    use std::collections::{BTreeSet, HashMap};
+
+    let nodes: BTreeSet<u64> = regions
+        .iter()
+        .flat_map(|r| r.peers.iter().copied())
+        .collect();
+    let mut out = HashMap::with_capacity(regions.len());
+    if nodes.is_empty() {
+        return out;
+    }
+    let total: u128 = regions.iter().map(|r| u128::from(r.weight.max(1))).sum();
+    // Fair share with tolerance, as (total * (100 + tol)) / (100 * nodes).
+    let cap_num = total * u128::from(100 + tolerance_pct);
+    let cap_den = 100 * nodes.len() as u128;
+
+    let mut order: Vec<&PrimaryCandidate> =
+        regions.iter().filter(|r| !r.peers.is_empty()).collect();
+    order.sort_by(|a, b| b.weight.cmp(&a.weight).then(a.region_id.cmp(&b.region_id)));
+
+    let mut load: HashMap<u64, u128> = HashMap::new();
+    for r in order {
+        let w = u128::from(r.weight.max(1));
+        let within = |node: u64, load: &HashMap<u64, u128>| {
+            (load.get(&node).copied().unwrap_or(0) + w) * cap_den <= cap_num
+        };
+        // A node that leads nothing yet may always keep its region: with
+        // fewer regions than nodes a fair share is under one region, and
+        // moving it would only relocate the imbalance (a lone region hopped
+        // between its two peers).
+        let unloaded =
+            |node: u64, load: &HashMap<u64, u128>| load.get(&node).copied().unwrap_or(0) == 0;
+        let chosen = if r.peers.contains(&r.current)
+            && (within(r.current, &load) || unloaded(r.current, &load))
+        {
+            r.current
+        } else {
+            *r.peers
+                .iter()
+                .enumerate()
+                .min_by_key(|(rank, n)| (load.get(n).copied().unwrap_or(0), *rank))
+                .map(|(_, n)| n)
+                .unwrap_or(&r.peers[0])
+        };
+        *load.entry(chosen).or_default() += w;
+        out.insert(r.region_id, chosen);
+    }
+
+    // Greedy order can strand a node that is a peer of few regions (on a
+    // 12-region layout it gave 5/5/2). Improve locally: move a region's
+    // primary to another of its peers whenever that strictly lowers the
+    // busier of the two. Terminates -- every move lowers the sum of squared
+    // loads -- and a balanced layout has no such move, so nothing flaps.
+    let by_id: HashMap<u64, &PrimaryCandidate> = regions.iter().map(|r| (r.region_id, r)).collect();
+    let mut ids: Vec<u64> = out.keys().copied().collect();
+    ids.sort_unstable();
+    loop {
+        let mut moved = false;
+        for id in &ids {
+            let r = by_id[id];
+            let w = u128::from(r.weight.max(1));
+            let from = out[id];
+            let from_load = load.get(&from).copied().unwrap_or(0);
+            let best = r
+                .peers
+                .iter()
+                .filter(|p| **p != from)
+                .min_by_key(|p| load.get(p).copied().unwrap_or(0))
+                .copied();
+            if let Some(to) = best
+                && load.get(&to).copied().unwrap_or(0) + w < from_load
+            {
+                *load.entry(from).or_default() -= w;
+                *load.entry(to).or_default() += w;
+                out.insert(*id, to);
+                moved = true;
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+    out
+}
+
+/// `target` with `primary` moved to the front, when it is one of the peers.
+#[must_use]
+pub fn with_primary_first(mut target: Vec<u64>, primary: Option<u64>) -> Vec<u64> {
+    if let Some(p) = primary
+        && let Some(i) = target.iter().position(|n| *n == p)
+    {
+        target[..=i].rotate_right(1);
+    }
+    target
+}
+
 /// One mutation moving a region toward its target placement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlacementStep {
@@ -470,5 +596,94 @@ mod tests {
             "0 allowance means unlimited"
         );
         assert!(!budget_exhausted(MoveTier::Convergence, 100, 99));
+    }
+
+    fn cand(id: u64, current: u64, weight: u64, peers: &[u64]) -> super::PrimaryCandidate {
+        super::PrimaryCandidate {
+            region_id: id,
+            current,
+            weight,
+            peers: peers.to_vec(),
+        }
+    }
+
+    fn primaries_per_node(plan: &std::collections::HashMap<u64, u64>) -> Vec<usize> {
+        let mut c: std::collections::BTreeMap<u64, usize> = Default::default();
+        for n in plan.values() {
+            *c.entry(*n).or_default() += 1;
+        }
+        c.into_values().collect()
+    }
+
+    #[test]
+    fn a_skewed_hrw_layout_is_evened_out() {
+        // n3 at N=3: node 3 led 9 of 16 equal regions. Every region has node
+        // 3 as its HRW first choice here, the worst case.
+        let regions: Vec<_> = (1..=16u64)
+            .map(|i| cand(i, 3, 75_000, if i % 2 == 0 { &[3, 1] } else { &[3, 2] }))
+            .collect();
+        let plan = super::balance_primaries(&regions, 10);
+        let per = primaries_per_node(&plan);
+        assert_eq!(per.len(), 3);
+        assert!(per.iter().all(|&n| (5..=6).contains(&n)), "{per:?}");
+        for r in &regions {
+            assert!(
+                r.peers.contains(&plan[&r.region_id]),
+                "primary must be a peer"
+            );
+        }
+    }
+
+    #[test]
+    fn a_balanced_layout_is_left_alone() {
+        let regions: Vec<_> = (1..=6u64)
+            .map(|i| cand(i, (i % 3) + 1, 100, &[(i % 3) + 1, ((i + 1) % 3) + 1]))
+            .collect();
+        let plan = super::balance_primaries(&regions, 10);
+        for r in &regions {
+            assert_eq!(plan[&r.region_id], r.current, "no flapping");
+        }
+    }
+
+    #[test]
+    fn a_lone_region_keeps_its_primary() {
+        // One region, two peers: the fair share is half a region, so a
+        // strict fair-share check would move it for no gain.
+        let plan = super::balance_primaries(&[cand(1, 1, 50, &[2, 1])], 10);
+        assert_eq!(plan[&1], 1);
+    }
+
+    #[test]
+    fn a_primary_outside_its_target_set_is_replaced() {
+        let plan = super::balance_primaries(&[cand(1, 9, 10, &[2, 3])], 10);
+        assert_eq!(plan[&1], 2);
+    }
+
+    #[test]
+    fn heavy_regions_are_spread_before_light_ones() {
+        // Two heavy regions must not share a primary when they need not.
+        let regions = vec![
+            cand(1, 1, 1_000, &[1, 2]),
+            cand(2, 1, 1_000, &[1, 2]),
+            cand(3, 1, 10, &[1, 2]),
+        ];
+        let plan = super::balance_primaries(&regions, 10);
+        assert_ne!(plan[&1], plan[&2]);
+    }
+
+    #[test]
+    fn with_primary_first_rotates_only_a_member() {
+        assert_eq!(
+            super::with_primary_first(vec![1, 2, 3], Some(3)),
+            vec![3, 1, 2]
+        );
+        assert_eq!(
+            super::with_primary_first(vec![1, 2, 3], Some(9)),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            super::with_primary_first(vec![1, 2, 3], None),
+            vec![1, 2, 3]
+        );
     }
 }
