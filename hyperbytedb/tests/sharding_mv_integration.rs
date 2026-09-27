@@ -98,9 +98,30 @@ async fn sharded_mv_incremental_rollup() {
         &format!("cpu,host=b value=20 {t}"),
     )
     .await;
-    flush_node(&nodes[0]).await;
-    flush_node(&nodes[1]).await;
-    flush_node(&nodes[2]).await;
+    // Every replica must hold the pre-create rows before the MV exists. The
+    // MV is a native chDB view: it rolls up whatever each node inserts into
+    // the source table after its creation. Replication is asynchronous, so
+    // a replica whose copy of these rows lands after CREATE rolls them into
+    // the destination and the post-create means come out wrong (seen as
+    // 22/32 for 30/40 once writes got fast enough to win that race).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        for node in &nodes {
+            flush_node(node).await;
+        }
+        let mut all = true;
+        for node in &nodes {
+            all &= chdb_row_count(node.query_port.as_ref(), "sharddb_autogen_cpu").await >= 2;
+        }
+        if all {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pre-create rows never reached every replica"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 
     let src = query_sql(
         &client,

@@ -1073,10 +1073,16 @@ async fn local_wal_points(
 ) -> Vec<hyperbytedb::domain::point::Point> {
     use hyperbytedb::ports::wal::WalPort;
     let wal: std::sync::Arc<dyn WalPort> = node.wal.clone();
+    // Only writes this node applied as its own. A replica also receives the
+    // primary's replicated copy (origin = the primary), which is correct and
+    // is not a local apply; counting it made the replica-only check depend on
+    // replication being slower than the assertion.
+    let me = node.node_id;
     wal.read_from(from_seq)
         .await
         .expect("read wal")
         .into_iter()
+        .filter(|(_, entry)| entry.origin_node_id == 0 || entry.origin_node_id == me)
         .flat_map(|(_, entry)| entry.points)
         .collect()
 }
