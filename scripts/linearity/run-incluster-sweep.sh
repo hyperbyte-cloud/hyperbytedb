@@ -152,7 +152,7 @@ for N in $NODES_LIST; do
   echo "[sweep] scaling to N=$N"
   kubectl_ctx -n "$NS" patch hyperbytedbcluster "$CR_NAME" --type merge \
     -p "{\"spec\":{\"replicas\":${N}}}" >/dev/null
-  deadline=$(( SECONDS + 900 ))
+  deadline=$(( SECONDS + ${READY_TIMEOUT_SECS:-2400} ))
   ready=0; total=0
   while (( SECONDS < deadline )); do
     pods=$(kubectl_ctx -n "$NS" get pods -l app.kubernetes.io/name=hyperbytedb \
