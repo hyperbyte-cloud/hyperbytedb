@@ -193,6 +193,150 @@ pub fn balance_primaries(
     out
 }
 
+/// One region's input to [`plan_placement`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionPlanInput {
+    pub region_id: u64,
+    pub current_peers: Vec<u64>,
+    pub current_primary: u64,
+    /// Its share of the load (series count).
+    pub weight: u64,
+    /// Every candidate node in HRW order for this region
+    /// (`target_placement` with rf = all candidates); breaks ties.
+    pub hrw: Vec<u64>,
+}
+
+/// Choose each region's peer set and primary so that both the copies each
+/// node holds and the regions it leads are even.
+///
+/// Every peer applies every write to its region, so a node's work is its
+/// primaries plus its replicas. Balancing primaries alone (H5) left replica
+/// counts to HRW: on n3 at N=6 one node held no replicas and two held 8-9,
+/// the loaded ones sat at their CPU limit and N=3 -> N=6 scaled 1.15x.
+///
+/// Heaviest regions first: keep current peers that are still candidates,
+/// fill a short set from the least-loaded candidates. Then move a copy from
+/// a region's most-loaded peer to the least-loaded non-peer only when that
+/// closes a gap of at least two copies of the region (`load[to] + 2w <=
+/// load[from]`), so a nearly-even layout never moves data. Finally
+/// [`balance_primaries`] picks the leader within each set. Returns the
+/// target (primary first) per region.
+#[must_use]
+pub fn plan_placement(
+    regions: &[RegionPlanInput],
+    rf: usize,
+    tolerance_pct: u64,
+) -> std::collections::HashMap<u64, Vec<u64>> {
+    use std::collections::HashMap;
+
+    let mut order: Vec<&RegionPlanInput> = regions.iter().filter(|r| !r.hrw.is_empty()).collect();
+    order.sort_by(|a, b| b.weight.cmp(&a.weight).then(a.region_id.cmp(&b.region_id)));
+
+    let rank =
+        |r: &RegionPlanInput, n: u64| r.hrw.iter().position(|x| *x == n).unwrap_or(usize::MAX);
+    let mut load: HashMap<u64, u128> = HashMap::new();
+    for r in &order {
+        for n in &r.hrw {
+            load.entry(*n).or_default();
+        }
+    }
+    let mut sets: HashMap<u64, Vec<u64>> = HashMap::new();
+    for r in &order {
+        let w = u128::from(r.weight.max(1));
+        let want = rf.min(r.hrw.len());
+        // Keep current peers that are still candidates, least loaded first
+        // if there are too many.
+        let mut set: Vec<u64> = r
+            .current_peers
+            .iter()
+            .copied()
+            .filter(|n| r.hrw.contains(n))
+            .collect();
+        set.sort_by_key(|n| (load[n], rank(r, *n)));
+        set.truncate(want);
+        while set.len() < want {
+            let next = r
+                .hrw
+                .iter()
+                .copied()
+                .filter(|n| !set.contains(n))
+                .min_by_key(|n| (load[n], rank(r, *n)));
+            match next {
+                Some(n) => set.push(n),
+                None => break,
+            }
+        }
+        for n in &set {
+            *load.entry(*n).or_default() += w;
+        }
+        sets.insert(r.region_id, set);
+    }
+
+    // Move copies off the busiest nodes, only for a clear gain.
+    loop {
+        let mut moved = false;
+        for r in &order {
+            let w = u128::from(r.weight.max(1));
+            let Some(set) = sets.get_mut(&r.region_id) else {
+                continue;
+            };
+            let Some((i, from)) = set
+                .iter()
+                .copied()
+                .enumerate()
+                .max_by_key(|(_, n)| (load[n], std::cmp::Reverse(rank(r, *n))))
+            else {
+                continue;
+            };
+            let to = r
+                .hrw
+                .iter()
+                .copied()
+                .filter(|n| !set.contains(n))
+                .min_by_key(|n| (load[n], rank(r, *n)));
+            if let Some(to) = to
+                && load[&to] + 2 * w <= load[&from]
+            {
+                *load.entry(from).or_default() -= w;
+                *load.entry(to).or_default() += w;
+                set[i] = to;
+                moved = true;
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+
+    let primaries = balance_primaries(
+        &order
+            .iter()
+            .map(|r| {
+                let mut peers = sets[&r.region_id].clone();
+                peers.sort_by_key(|n| rank(r, *n));
+                PrimaryCandidate {
+                    region_id: r.region_id,
+                    current: r.current_primary,
+                    weight: r.weight,
+                    peers,
+                }
+            })
+            .collect::<Vec<_>>(),
+        tolerance_pct,
+    );
+    order
+        .iter()
+        .map(|r| {
+            let mut set = sets[&r.region_id].clone();
+            set.sort_by_key(|n| rank(r, *n));
+            (
+                r.region_id,
+                with_primary_first(set, primaries.get(&r.region_id).copied()),
+            )
+        })
+        .collect()
+}
+
 /// `target` with `primary` moved to the front, when it is one of the peers.
 #[must_use]
 pub fn with_primary_first(mut target: Vec<u64>, primary: Option<u64>) -> Vec<u64> {
@@ -685,5 +829,86 @@ mod tests {
             super::with_primary_first(vec![1, 2, 3], None),
             vec![1, 2, 3]
         );
+    }
+
+    fn plan_in(id: u64, peers: &[u64], primary: u64, hrw: &[u64]) -> super::RegionPlanInput {
+        super::RegionPlanInput {
+            region_id: id,
+            current_peers: peers.to_vec(),
+            current_primary: primary,
+            weight: 100,
+            hrw: hrw.to_vec(),
+        }
+    }
+
+    fn copies(
+        plan: &std::collections::HashMap<u64, Vec<u64>>,
+    ) -> std::collections::BTreeMap<u64, usize> {
+        let mut c = std::collections::BTreeMap::new();
+        for set in plan.values() {
+            for n in set {
+                *c.entry(*n).or_insert(0) += 1;
+            }
+        }
+        c
+    }
+
+    #[test]
+    fn replica_copies_are_evened_out() {
+        // n3 at N=6: node 6 held no replicas, nodes 3-4 held 8-9. Here every
+        // region sits on nodes 1-3 and nodes 4-6 are empty.
+        let regions: Vec<_> = (1..=30u64)
+            .map(|i| {
+                plan_in(
+                    i,
+                    &[1 + i % 3, 1 + (i + 1) % 3],
+                    1 + i % 3,
+                    &[1, 2, 3, 4, 5, 6],
+                )
+            })
+            .collect();
+        let plan = super::plan_placement(&regions, 2, 10);
+        let c = copies(&plan);
+        assert_eq!(c.values().sum::<usize>(), 60);
+        assert!(c.values().all(|&n| (9..=11).contains(&n)), "{c:?}");
+        for set in plan.values() {
+            assert_eq!(set.len(), 2);
+            assert_ne!(set[0], set[1]);
+        }
+    }
+
+    #[test]
+    fn a_balanced_layout_moves_nothing() {
+        let regions: Vec<_> = (1..=6u64)
+            .map(|i| {
+                let a = 1 + (i % 3);
+                let b = 1 + ((i + 1) % 3);
+                plan_in(i, &[a, b], a, &[1, 2, 3])
+            })
+            .collect();
+        let plan = super::plan_placement(&regions, 2, 10);
+        for r in &regions {
+            let mut got = plan[&r.region_id].clone();
+            got.sort_unstable();
+            let mut had = r.current_peers.clone();
+            had.sort_unstable();
+            assert_eq!(got, had, "region {} moved", r.region_id);
+            assert_eq!(plan[&r.region_id][0], r.current_primary);
+        }
+    }
+
+    #[test]
+    fn a_departed_node_is_replaced_and_a_short_set_filled() {
+        // Node 9 is no longer a candidate; region 2 is under RF.
+        let regions = vec![
+            plan_in(1, &[1, 9], 9, &[1, 2, 3]),
+            plan_in(2, &[3], 3, &[1, 2, 3]),
+        ];
+        let plan = super::plan_placement(&regions, 2, 10);
+        assert!(!plan[&1].contains(&9));
+        assert_eq!(plan[&1].len(), 2);
+        assert!(plan[&1].contains(&1), "kept the surviving peer");
+        assert_eq!(plan[&2].len(), 2);
+        assert!(plan[&2].contains(&3));
     }
 }
