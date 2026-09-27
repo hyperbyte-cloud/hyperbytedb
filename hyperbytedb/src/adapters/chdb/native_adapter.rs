@@ -125,10 +125,12 @@ fn table_schema_from_measurement_meta(
         TableSchema {
             columns: field_cols,
             materialized: false,
+            columns_verified: false,
         },
         TableSchema {
             columns: tag_cols,
             materialized: false,
+            columns_verified: false,
         },
     )
 }
@@ -157,6 +159,17 @@ struct TableSchema {
     /// so the first post-restart flush still issues `CREATE TABLE IF NOT
     /// EXISTS` and tag-type reconciliation `MODIFY`s.
     materialized: bool,
+    /// `true` once an engine probe (`DESCRIBE TABLE`) has been merged into
+    /// `columns`, so the cache holds every column the engine has. Paths that
+    /// mark a table materialized from partial knowledge -- the metadata warm
+    /// and engine sync at startup, MV destination DDL with summing columns --
+    /// leave it `false`, and `ensure_table` probes until it is set.
+    ///
+    /// Probing on every write cost ~0.5s per Arrow build under load; trusting
+    /// `materialized` alone instead broke MV rollups (a missing column shifts
+    /// the positional `INSERT ... SELECT *`, so values land in the wrong
+    /// columns).
+    columns_verified: bool,
 }
 
 impl TableSchema {
@@ -694,13 +707,15 @@ impl ChdbNativeAdapter {
         // `DESCRIBE TABLE` through the chDB pool, which it shares with flush
         // inserts that take seconds. Each write's Arrow build queued ~0.5s
         // behind them, and six saturated nodes delivered 19k points/s.
-        if !cached.materialized {
+        let mut probed = false;
+        if !cached.columns_verified {
             self.engine_probes
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if let Ok(engine_cols) = self.engine_field_columns(&table).await {
                 for (phys, d) in engine_cols {
                     merge_cached_field_column(&mut field_types, &phys, d);
                 }
+                probed = true;
             }
         }
 
@@ -751,6 +766,11 @@ impl ChdbNativeAdapter {
             && !tag_ddl_needed
             && missing_fields.is_empty()
         {
+            if probed {
+                // Nothing missing: the cache already holds every engine column.
+                let mut guard = self.schemas.write();
+                schema_cache_entry(&mut guard, key).columns_verified = true;
+            }
             return Ok(EnsuredTable {
                 table,
                 series_table,
@@ -844,6 +864,10 @@ impl ChdbNativeAdapter {
                     entry.columns.insert(phys.clone(), ColumnKind::Field(*d));
                 }
                 entry.materialized = true;
+                // `field_phys` includes what the probe found, so the cache
+                // now matches the engine. Without a probe it only matches
+                // if it already did.
+                entry.columns_verified |= probed;
             }
             {
                 let mut writers = self.series_schemas.write();
@@ -1130,6 +1154,9 @@ impl ChdbNativeAdapter {
                     entry.columns.insert(phys.clone(), ColumnKind::Field(*d));
                 }
                 entry.materialized = true;
+                // The CREATE also added summing columns that are not in
+                // `field_phys`; make the next write probe for them.
+                entry.columns_verified = false;
             }
             {
                 let mut writers = self.series_schemas.write();
@@ -2707,6 +2734,7 @@ mod tests {
         let cached = TableSchema {
             columns: HashMap::from([("uptime".to_string(), ColumnKind::Field(1))]),
             materialized: true,
+            columns_verified: false,
         };
         let field_phys = vec![("uptime".to_string(), "uptime".to_string(), 2u8)];
         let alters = build_alter_reconcile_field_widening("`t`", &cached, &field_phys);
