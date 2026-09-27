@@ -111,6 +111,11 @@ pub struct ShardingConfig {
     /// Propose `RemovePeer` shard-map ops to shrink a region's replica set.
     #[serde(default = "default_remove_peer_proposals_enabled")]
     pub remove_peer_proposals_enabled: bool,
+    /// Forward and replicate points between nodes as binary frames instead
+    /// of line protocol, so primaries and replicas decode rather than
+    /// re-parse. Every node must run a build that reads them.
+    #[serde(default = "default_binary_points_wire")]
+    pub binary_points_wire: bool,
     /// Cluster-wide cap on region-transfer bytes per second for
     /// convergence-tier moves. 0 = unlimited. RF violations and decommission
     /// evacuation are never throttled.
@@ -146,6 +151,7 @@ impl Default for ShardingConfig {
             transfer_clear_proposals_enabled: default_transfer_clear_proposals_enabled(),
             add_peer_proposals_enabled: default_add_peer_proposals_enabled(),
             remove_peer_proposals_enabled: default_remove_peer_proposals_enabled(),
+            binary_points_wire: default_binary_points_wire(),
             movement_budget_bytes_per_sec: default_movement_budget_bytes_per_sec(),
             dead_node_timeout_secs: default_dead_node_timeout_secs(),
         }
@@ -240,6 +246,10 @@ fn default_add_peer_proposals_enabled() -> bool {
 }
 
 fn default_remove_peer_proposals_enabled() -> bool {
+    true
+}
+
+fn default_binary_points_wire() -> bool {
     true
 }
 

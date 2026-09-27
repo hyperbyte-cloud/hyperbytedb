@@ -489,7 +489,12 @@ pub async fn forward_shard_writes_by_node(
             let Some(points) = forward.get(id) else {
                 continue;
             };
-            match encode_points_to_line_protocol(points, precision_val) {
+            let encoded = if ctx.config.binary_points_wire {
+                crate::application::line_protocol::encode_points_binary(points)
+            } else {
+                encode_points_to_line_protocol(points, precision_val)
+            };
+            match encoded {
                 Ok(body) => parts.push(ShardWriteRequest {
                     db: db.to_string(),
                     rp: rp.to_string(),
@@ -1087,15 +1092,25 @@ mod scatter_tests {
 
         let batches = Arc::new(AtomicUsize::new(0));
         let singles = Arc::new(AtomicUsize::new(0));
-        let (b, s1) = (batches.clone(), singles.clone());
+        let text_parts = Arc::new(AtomicUsize::new(0));
+        let (b, s1, tp) = (batches.clone(), singles.clone(), text_parts.clone());
         let app = Router::new()
             .route(
                 "/internal/shard/write-batch",
                 post(move |body: axum::body::Bytes| {
                     let b = b.clone();
+                    let tp = tp.clone();
                     async move {
                         b.fetch_add(1, Ordering::SeqCst);
                         let batch: ShardWriteBatch = bincode::deserialize(&body).unwrap();
+                        let text = batch
+                            .parts
+                            .iter()
+                            .filter(|p| {
+                                !crate::application::line_protocol::is_binary_points(&p.body)
+                            })
+                            .count();
+                        tp.fetch_add(text, Ordering::SeqCst);
                         axum::Json(ShardWriteBatchResponse {
                             results: batch
                                 .parts
@@ -1160,6 +1175,11 @@ mod scatter_tests {
             "one request for the node"
         );
         assert_eq!(singles.load(Ordering::SeqCst), 0, "no per-region fallback");
+        assert_eq!(
+            text_parts.load(Ordering::SeqCst),
+            0,
+            "parts must travel as binary frames, not line protocol"
+        );
         h.abort();
     }
 

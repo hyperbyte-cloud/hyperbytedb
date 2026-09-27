@@ -36,8 +36,84 @@ pub fn parse_line_body_to_points_limited(
     } else {
         max_points
     };
+    if is_binary_points(body) {
+        return decode_points_frames(body, limit);
+    }
     let cap = estimate_points_capacity(body).min(limit);
     parse_line_body_inner(body, precision, cap, Some(limit))
+}
+
+/// Start of a binary points frame. Line protocol never starts with NUL, so a
+/// body is binary exactly when it starts with this.
+pub const POINTS_FRAME_MAGIC: &[u8; 4] = b"\0HBP";
+
+/// Whether `body` is binary points frames rather than line protocol.
+#[must_use]
+pub fn is_binary_points(body: &[u8]) -> bool {
+    body.starts_with(POINTS_FRAME_MAGIC)
+}
+
+/// Encode points for node-to-node forwarding and replication: one frame,
+/// `magic | u32 LE length | bincode(Vec<Point>)`.
+///
+/// Every point used to cross the cluster as line protocol, re-encoded by the
+/// sender and re-parsed by the primary and again by each replica: about a
+/// quarter of a saturated node's CPU went to parsing. Frames concatenate, and
+/// [`parse_line_body_to_points_limited`] decodes them, so every consumer
+/// (forwards, replication apply, hint replay) accepts either form.
+/// Timestamps are carried as stored (nanoseconds); precision does not apply.
+pub fn encode_points_binary(points: &[Point]) -> Result<Vec<u8>, HyperbytedbError> {
+    let payload = bincode::serialize(points)
+        .map_err(|e| HyperbytedbError::Internal(format!("encode points: {e}").into()))?;
+    let len = u32::try_from(payload.len())
+        .map_err(|_| HyperbytedbError::PayloadTooLarge("points frame over 4 GiB".into()))?;
+    let mut out = Vec::with_capacity(8 + payload.len());
+    out.extend_from_slice(POINTS_FRAME_MAGIC);
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&payload);
+    Ok(out)
+}
+
+/// Decode one or more frames. Whitespace between frames is skipped, so the
+/// newline replication coalescing inserts between bodies is harmless.
+fn decode_points_frames(body: &[u8], limit: usize) -> Result<Vec<Point>, HyperbytedbError> {
+    let bad = |m: &str| HyperbytedbError::LineProtocolParse {
+        line: String::new(),
+        reason: format!("binary points: {m}"),
+    };
+    let mut out: Vec<Point> = Vec::new();
+    let mut rest = body;
+    loop {
+        while let Some((&b, tail)) = rest.split_first() {
+            if b.is_ascii_whitespace() {
+                rest = tail;
+            } else {
+                break;
+            }
+        }
+        if rest.is_empty() {
+            return Ok(out);
+        }
+        if !rest.starts_with(POINTS_FRAME_MAGIC) || rest.len() < 8 {
+            return Err(bad("truncated or mixed body"));
+        }
+        let len = u32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]) as usize;
+        let end = 8usize
+            .checked_add(len)
+            .ok_or_else(|| bad("length overflow"))?;
+        let payload = rest
+            .get(8..end)
+            .ok_or_else(|| bad("frame shorter than its length"))?;
+        let mut points: Vec<Point> =
+            bincode::deserialize(payload).map_err(|e| bad(&e.to_string()))?;
+        if out.len() + points.len() > limit {
+            return Err(HyperbytedbError::PayloadTooLarge(format!(
+                "more than {limit} points in one request"
+            )));
+        }
+        out.append(&mut points);
+        rest = &rest[end..];
+    }
 }
 
 /// Count lines that contain at least one non-whitespace byte. Blank lines are
@@ -349,5 +425,57 @@ mod encode_tests {
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].measurement, "m");
         assert_eq!(back[0].timestamp, p.timestamp);
+    }
+}
+
+#[cfg(test)]
+mod binary_points_tests {
+    use super::{encode_points_binary, is_binary_points, parse_line_body_to_points_limited};
+    use crate::domain::point::{FieldValue, Point};
+
+    fn pt(host: &str, v: f64, ts: i64) -> Point {
+        Point {
+            measurement: "cpu".into(),
+            tags: [("host".to_string(), host.to_string())].into(),
+            fields: [("value".to_string(), FieldValue::Float(v))].into(),
+            timestamp: ts,
+        }
+    }
+
+    #[test]
+    fn frames_round_trip_exactly_including_nanoseconds() {
+        let points = vec![pt("a", 1.5, 1_700_000_000_123_456_789), pt("b", -2.0, 1)];
+        let body = encode_points_binary(&points).unwrap();
+        assert!(is_binary_points(&body));
+        // Precision is ignored for frames: timestamps are already ns.
+        let back = parse_line_body_to_points_limited(&body, Some("s"), 0).unwrap();
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[0].timestamp, 1_700_000_000_123_456_789);
+        assert_eq!(back[1].tags["host"], "b");
+    }
+
+    #[test]
+    fn coalesced_frames_decode_as_one_body() {
+        // Replication coalescing joins bodies with a newline.
+        let mut body = encode_points_binary(&[pt("a", 1.0, 1)]).unwrap();
+        body.push(b'\n');
+        body.extend(encode_points_binary(&[pt("b", 2.0, 2), pt("c", 3.0, 3)]).unwrap());
+        let back = parse_line_body_to_points_limited(&body, None, 0).unwrap();
+        assert_eq!(back.len(), 3);
+    }
+
+    #[test]
+    fn the_point_limit_still_applies() {
+        let body = encode_points_binary(&[pt("a", 1.0, 1), pt("b", 2.0, 2)]).unwrap();
+        assert!(parse_line_body_to_points_limited(&body, None, 1).is_err());
+    }
+
+    #[test]
+    fn a_body_mixing_frames_and_text_is_rejected() {
+        let mut body = encode_points_binary(&[pt("a", 1.0, 1)]).unwrap();
+        body.extend_from_slice(b"\ncpu,host=x value=1 1");
+        assert!(parse_line_body_to_points_limited(&body, None, 0).is_err());
+        // Plain line protocol is untouched.
+        assert!(!is_binary_points(b"cpu value=1 1"));
     }
 }

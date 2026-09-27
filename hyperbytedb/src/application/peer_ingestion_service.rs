@@ -283,7 +283,11 @@ impl PeerIngestionService {
                         format!("no region {region_id}").into(),
                     ));
                 };
-                let local_body = encode_points_to_line_protocol(&region_points, precision_val)?;
+                let local_body = if ctx.config.binary_points_wire {
+                    crate::application::line_protocol::encode_points_binary(&region_points)?
+                } else {
+                    encode_points_to_line_protocol(&region_points, precision_val)?
+                };
                 let targets = region_replication_targets(ctx, &region).await;
                 self.dispatch_replication(OutboundReplicationBatch {
                     database: db.to_string(),

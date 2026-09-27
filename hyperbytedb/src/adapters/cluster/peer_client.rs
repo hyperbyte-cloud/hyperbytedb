@@ -764,6 +764,13 @@ fn coalesce_ok(
     if a.region_id != b.region_id {
         return false;
     }
+    // A merged body is one encoding or the other: frames and line protocol
+    // cannot share a body.
+    if crate::application::line_protocol::is_binary_points(&a.body)
+        != crate::application::line_protocol::is_binary_points(&b.body)
+    {
+        return false;
+    }
     // Targets are part of the identity of a batch, not incidental to it.
     // Under sharding each region gets its own batch with its own peer set, and
     // the merge keeps the FIRST batch's targets — so coalescing two regions'
@@ -950,6 +957,14 @@ mod coalesce_tests {
     /// batch's targets, so region B's rows would be delivered to region A's
     /// peer set and never to B's own. That is an RF hole that surfaces as loss
     /// on failover, not a duplicate.
+    #[test]
+    fn binary_and_text_bodies_do_not_coalesce() {
+        let mut a = batch(10, None);
+        let b = batch(11, None);
+        a.body = crate::application::line_protocol::encode_points_binary(&[]).unwrap();
+        assert!(!coalesce_ok(&a, &b, 1 << 20));
+    }
+
     #[test]
     fn batches_for_different_region_peer_sets_do_not_coalesce() {
         let a = batch(10, Some(vec![2, 3]));
