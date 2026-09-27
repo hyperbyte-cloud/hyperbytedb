@@ -107,6 +107,7 @@ async fn primary_failover_updates_shard_map_after_unhealthy_timeout() {
         .unwrap();
 
     let sharding = hyperbytedb::config::ShardingConfig {
+        bootstrap_regions_per_node: 0,
         enabled: true,
         primary_failover_after_secs: 1,
         ..Default::default()

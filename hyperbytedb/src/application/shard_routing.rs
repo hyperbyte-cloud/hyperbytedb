@@ -247,6 +247,33 @@ pub async fn build_bootstrap_op(
     rp: &str,
     measurement: &str,
 ) -> Result<ShardMapOp, HyperbytedbError> {
+    let candidates = bootstrap_candidates(ctx).await;
+    let regions_wanted = ctx
+        .config
+        .bootstrap_regions_per_node
+        .saturating_mul(candidates.len());
+    // One node gains nothing from splitting: every region would land on it.
+    if regions_wanted > 1 && candidates.len() > 1 {
+        let map = ctx.shard_map.snapshot().await?;
+        let key = MeasurementKey::new(db, rp, measurement);
+        let rf = effective_replication_factor(ctx.config.replication_factor, candidates.len());
+        let last_split_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(1)
+            .max(1);
+        return Ok(ShardMapOp::BootstrapMeasurementPresplit {
+            regions: presplit_regions(
+                &key,
+                map.next_region_id,
+                regions_wanted,
+                &candidates,
+                rf,
+                last_split_at,
+            ),
+            key,
+        });
+    }
     let peers = select_bootstrap_peers(ctx, db, rp, measurement).await?;
     if peers.is_empty() {
         return Err(HyperbytedbError::ClusterUnavailable(
@@ -279,6 +306,82 @@ pub async fn build_bootstrap_op(
         key: MeasurementKey::new(db, rp, measurement),
         region,
     })
+}
+
+/// Every active node (and this one), sorted: the candidates a new
+/// measurement's regions are placed over.
+async fn bootstrap_candidates(ctx: &ShardRoutingContext) -> Vec<u64> {
+    let membership = ctx.peer_client.membership().read().await;
+    let mut ids: Vec<u64> = membership
+        .active_peers(ctx.node_id)
+        .iter()
+        .map(|n| n.node_id)
+        .collect();
+    drop(membership);
+    ids.push(ctx.node_id);
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// `count` empty regions covering the whole hash space in equal ranges,
+/// with peers and primaries balanced across `candidates` by
+/// [`crate::domain::sharding::placement::plan_placement`]. Empty, so placing
+/// them anywhere costs nothing.
+pub(crate) fn presplit_regions(
+    key: &MeasurementKey,
+    first_id: u64,
+    count: usize,
+    candidates: &[u64],
+    rf: usize,
+    last_split_at: u64,
+) -> Vec<ShardRegion> {
+    use crate::domain::sharding::placement::{RegionPlanInput, plan_placement, target_placement};
+
+    let count = count.max(1) as u64;
+    let width = u64::MAX / count;
+    let bounds: Vec<(u64, u64, u64)> = (0..count)
+        .map(|i| {
+            let start = i * width;
+            let end = if i + 1 == count {
+                u64::MAX
+            } else {
+                (i + 1) * width
+            };
+            (first_id + i, start, end)
+        })
+        .collect();
+    let inputs: Vec<RegionPlanInput> = bounds
+        .iter()
+        .map(|&(id, start, _)| RegionPlanInput {
+            region_id: id,
+            current_peers: Vec::new(),
+            current_primary: 0,
+            weight: 1,
+            hrw: target_placement(key, start, candidates, candidates.len()),
+        })
+        .collect();
+    let plan = plan_placement(&inputs, rf, 10);
+    bounds
+        .into_iter()
+        .map(|(id, start, end)| {
+            let peers = plan.get(&id).cloned().unwrap_or_default();
+            ShardRegion {
+                region_id: id,
+                start,
+                end,
+                epoch: ShardEpoch::default(),
+                primary: peers.first().copied().unwrap_or(0),
+                peers,
+                last_split_at,
+                transfer_verified: None,
+                transfer_first_seen: None,
+                state: Default::default(),
+                staged_from: None,
+                staging_peers: Vec::new(),
+            }
+        })
+        .collect()
 }
 
 pub async fn bootstrap_measurement_local(
@@ -1328,9 +1431,37 @@ mod scatter_tests {
     }
 
     #[tokio::test]
+    async fn a_new_measurement_is_bootstrapped_presplit_by_default() {
+        // Default config, three members: the bootstrap op itself carries
+        // every region, already spread, so the first writes never pile onto
+        // one node (n3 at N=12: one node led 17 of 25 regions and OOMed).
+        let membership =
+            membership_with(&[(1, "127.0.0.1:1"), (2, "127.0.0.1:2"), (3, "127.0.0.1:3")]);
+        let ctx = test_ctx(membership, ShardingConfig::default(), 1);
+        let op = build_bootstrap_op(&ctx, "db", "autogen", "cpu")
+            .await
+            .unwrap();
+        let ShardMapOp::BootstrapMeasurementPresplit { regions, .. } = &op else {
+            panic!("expected a presplit bootstrap, got {op:?}");
+        };
+        assert_eq!(regions.len(), 6, "2 regions per node");
+        let primaries: std::collections::HashSet<u64> = regions.iter().map(|r| r.primary).collect();
+        assert_eq!(primaries.len(), 3, "every node leads some");
+        ctx.shard_map.apply_op(op).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn build_bootstrap_op_uses_next_region_id() {
         let membership = membership_with(&[(1, "127.0.0.1:1"), (2, "127.0.0.1:2")]);
-        let ctx = test_ctx(membership, ShardingConfig::default(), 1);
+        let ctx = test_ctx(
+            membership,
+            ShardingConfig {
+                // Exercises the single-region bootstrap path.
+                bootstrap_regions_per_node: 0,
+                ..ShardingConfig::default()
+            },
+            1,
+        );
 
         let op_a = build_bootstrap_op(&ctx, "db", "autogen", "cpu")
             .await
@@ -1375,7 +1506,15 @@ mod scatter_tests {
             (3, "127.0.0.1:3"),
             (4, "127.0.0.1:4"),
         ]);
-        let ctx = test_ctx(membership, ShardingConfig::default(), 99);
+        let ctx = test_ctx(
+            membership,
+            ShardingConfig {
+                // Exercises the single-region bootstrap path.
+                bootstrap_regions_per_node: 0,
+                ..ShardingConfig::default()
+            },
+            99,
+        );
 
         let mut primaries = std::collections::HashSet::new();
         for i in 0..16u32 {
@@ -1546,5 +1685,78 @@ mod forward_batch_tests {
             part_outcome(2, &part(500)),
             PartOutcome::Done(Err(HyperbytedbError::PeerUnreachable(_)))
         ));
+    }
+}
+
+#[cfg(test)]
+mod presplit_tests {
+    use super::presplit_regions;
+    use crate::domain::sharding::{MeasurementKey, ShardMap, ShardMapOp};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn a_new_measurement_starts_split_and_evenly_placed() {
+        let key = MeasurementKey::new("db", "autogen", "cpu");
+        let regions = presplit_regions(&key, 100, 12, &[1, 2, 3, 4, 5, 6], 2, 7);
+        assert_eq!(regions.len(), 12);
+        assert_eq!(regions[0].start, 0);
+        assert_eq!(regions.last().unwrap().end, u64::MAX);
+        for w in regions.windows(2) {
+            assert_eq!(w[0].end, w[1].start, "contiguous");
+        }
+        let mut primaries: BTreeMap<u64, usize> = BTreeMap::new();
+        let mut copies: BTreeMap<u64, usize> = BTreeMap::new();
+        for (i, r) in regions.iter().enumerate() {
+            assert_eq!(r.region_id, 100 + i as u64);
+            assert_eq!(r.peers.len(), 2);
+            assert_eq!(r.primary, r.peers[0]);
+            *primaries.entry(r.primary).or_default() += 1;
+            for p in &r.peers {
+                *copies.entry(*p).or_default() += 1;
+            }
+        }
+        assert!(primaries.values().all(|&n| n == 2), "{primaries:?}");
+        assert!(copies.values().all(|&n| n == 4), "{copies:?}");
+    }
+
+    #[test]
+    fn the_presplit_op_creates_the_space_once() {
+        let key = MeasurementKey::new("db", "autogen", "cpu");
+        let regions = presplit_regions(&key, 1, 6, &[1, 2, 3], 2, 7);
+        let mut map = ShardMap::default();
+        crate::domain::sharding::ops::apply_shard_map_op(
+            &mut map,
+            ShardMapOp::BootstrapMeasurementPresplit {
+                key: key.clone(),
+                regions: regions.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(map.spaces[&key].regions.len(), 6);
+        assert_eq!(map.next_region_id, 7);
+        assert!(
+            crate::domain::sharding::ops::apply_shard_map_op(
+                &mut map,
+                ShardMapOp::BootstrapMeasurementPresplit {
+                    key: key.clone(),
+                    regions,
+                },
+            )
+            .is_err(),
+            "a second bootstrap of the same space must be refused"
+        );
+        let other = MeasurementKey::new("db", "autogen", "mem");
+        let clash = presplit_regions(&other, 3, 2, &[1, 2, 3], 2, 7);
+        assert!(
+            crate::domain::sharding::ops::apply_shard_map_op(
+                &mut map,
+                ShardMapOp::BootstrapMeasurementPresplit {
+                    key: other,
+                    regions: clash,
+                },
+            )
+            .is_err(),
+            "region ids already in use must be refused"
+        );
     }
 }

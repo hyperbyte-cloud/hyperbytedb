@@ -77,6 +77,9 @@ impl Default for ShardedClusterOptions {
                 enabled: true,
                 scatter_peer_timeout_ms: 500,
                 scatter_max_peer_attempts: 3,
+                // Most suites assert on a measurement's single first region.
+                // Pre-split has its own test.
+                bootstrap_regions_per_node: 0,
                 ..Default::default()
             },
             replication: ReplicationConfig::default(),

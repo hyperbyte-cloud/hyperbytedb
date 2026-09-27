@@ -33,6 +33,20 @@ pub enum ShardMapOp {
         key: MeasurementKey,
         region: ShardRegion,
     },
+    /// A new measurement created already split into several regions, each
+    /// with its own peers and primary, in one log entry.
+    ///
+    /// A measurement used to start as one region on one node. High-
+    /// cardinality ingest into a new measurement then hammered that node
+    /// until splits and moves caught up: at N=12 on n3 one node led 17 of
+    /// 25 regions, ran out of memory and the layout never spread. Regions
+    /// created empty can be placed anywhere for free. Atomic on purpose: a
+    /// bootstrap followed by separate splits would let writes land in the
+    /// parent before a child moves to peers that never received them.
+    BootstrapMeasurementPresplit {
+        key: MeasurementKey,
+        regions: Vec<ShardRegion>,
+    },
     Split {
         key: MeasurementKey,
         region_id: u64,
@@ -172,6 +186,7 @@ impl ShardMapOp {
         match self {
             ShardMapOp::DropSpace { .. } => None,
             ShardMapOp::BootstrapMeasurement { key, .. }
+            | ShardMapOp::BootstrapMeasurementPresplit { key, .. }
             | ShardMapOp::Split { key, .. }
             | ShardMapOp::Merge { key, .. }
             | ShardMapOp::MovePeer { key, .. }
@@ -219,6 +234,38 @@ pub fn apply_shard_map_op(
 ) -> Result<(), ShardMapApplyError> {
     map.map_version = map.map_version.saturating_add(1);
     match op {
+        ShardMapOp::BootstrapMeasurementPresplit { key, regions } => {
+            if map.spaces.contains_key(&key) {
+                return Err(ShardMapApplyError::SpaceExists {
+                    db: key.db.clone(),
+                    rp: key.rp.clone(),
+                    measurement: key.measurement.clone(),
+                });
+            }
+            let mut ids = std::collections::HashSet::new();
+            for region in &regions {
+                if !ids.insert(region.region_id)
+                    || map.spaces.values().any(|space| {
+                        space
+                            .regions
+                            .iter()
+                            .any(|r| r.region_id == region.region_id)
+                    })
+                {
+                    return Err(ShardMapApplyError::DuplicateRegionId(region.region_id));
+                }
+            }
+            if let Some(max) = regions.iter().map(|r| r.region_id).max() {
+                map.next_region_id = map.next_region_id.max(max.saturating_add(1));
+            }
+            let mut space = super::types::MeasurementShardSpace {
+                key: key.clone(),
+                regions,
+            };
+            sort_space_regions(&mut space);
+            space.validate().map_err(ShardMapApplyError::Invalid)?;
+            map.spaces.insert(key, space);
+        }
         ShardMapOp::BootstrapMeasurement { key, region } => {
             if map.spaces.contains_key(&key) {
                 return Err(ShardMapApplyError::SpaceExists {

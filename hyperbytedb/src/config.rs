@@ -116,6 +116,11 @@ pub struct ShardingConfig {
     /// re-parse. Every node must run a build that reads them.
     #[serde(default = "default_binary_points_wire")]
     pub binary_points_wire: bool,
+    /// A new measurement starts with this many regions per active node,
+    /// already placed across the cluster (`0` or `1` node: one region, the
+    /// old behaviour). See `ShardMapOp::BootstrapMeasurementPresplit`.
+    #[serde(default = "default_bootstrap_regions_per_node")]
+    pub bootstrap_regions_per_node: usize,
     /// Cluster-wide cap on region-transfer bytes per second for
     /// convergence-tier moves. 0 = unlimited. RF violations and decommission
     /// evacuation are never throttled.
@@ -152,6 +157,7 @@ impl Default for ShardingConfig {
             add_peer_proposals_enabled: default_add_peer_proposals_enabled(),
             remove_peer_proposals_enabled: default_remove_peer_proposals_enabled(),
             binary_points_wire: default_binary_points_wire(),
+            bootstrap_regions_per_node: default_bootstrap_regions_per_node(),
             movement_budget_bytes_per_sec: default_movement_budget_bytes_per_sec(),
             dead_node_timeout_secs: default_dead_node_timeout_secs(),
         }
@@ -251,6 +257,10 @@ fn default_remove_peer_proposals_enabled() -> bool {
 
 fn default_binary_points_wire() -> bool {
     true
+}
+
+fn default_bootstrap_regions_per_node() -> usize {
+    2
 }
 
 fn default_movement_budget_bytes_per_sec() -> u64 {

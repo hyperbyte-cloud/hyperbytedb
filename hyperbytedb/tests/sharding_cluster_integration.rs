@@ -767,6 +767,7 @@ async fn one_member_cluster_owns_region_after_first_write() {
     let dir = tempfile::tempdir().unwrap();
     let opts = ShardedClusterOptions {
         sharding: hyperbytedb::config::ShardingConfig {
+            bootstrap_regions_per_node: 0,
             enabled: true,
             replication_factor: 3,
             scatter_peer_timeout_ms: 500,
@@ -814,6 +815,7 @@ async fn joiner_map_version_matches_before_region_movement() {
     let dir = tempfile::tempdir().unwrap();
     let opts = ShardedClusterOptions {
         sharding: hyperbytedb::config::ShardingConfig {
+            bootstrap_regions_per_node: 0,
             enabled: true,
             replication_factor: 3,
             scatter_peer_timeout_ms: 500,
@@ -867,6 +869,7 @@ async fn joiner_map_version_matches_before_region_movement() {
         node1.membership.clone(),
         &ShardedClusterOptions {
             sharding: hyperbytedb::config::ShardingConfig {
+                bootstrap_regions_per_node: 0,
                 enabled: true,
                 replication_factor: 3,
                 scatter_peer_timeout_ms: 500,
@@ -921,6 +924,7 @@ async fn joiner_receives_existing_region_as_replica() {
     let dir = tempfile::tempdir().unwrap();
     let opts = ShardedClusterOptions {
         sharding: hyperbytedb::config::ShardingConfig {
+            bootstrap_regions_per_node: 0,
             enabled: true,
             replication_factor: 3,
             scatter_peer_timeout_ms: 500,
@@ -961,6 +965,7 @@ async fn joiner_receives_existing_region_as_replica() {
         2,
         &ShardedClusterOptions {
             sharding: hyperbytedb::config::ShardingConfig {
+                bootstrap_regions_per_node: 0,
                 enabled: true,
                 replication_factor: 3,
                 scatter_peer_timeout_ms: 500,
@@ -1106,6 +1111,7 @@ async fn joiner_takes_region_primary_and_applies_writes_locally() {
     let dir = tempfile::tempdir().unwrap();
     let opts = || ShardedClusterOptions {
         sharding: hyperbytedb::config::ShardingConfig {
+            bootstrap_regions_per_node: 0,
             enabled: true,
             replication_factor: 3,
             scatter_peer_timeout_ms: 500,
@@ -1298,6 +1304,7 @@ async fn fourth_node_joining_rf_complete_cluster_takes_a_region() {
     let dir = tempfile::tempdir().unwrap();
     let opts = || ShardedClusterOptions {
         sharding: hyperbytedb::config::ShardingConfig {
+            bootstrap_regions_per_node: 0,
             enabled: true,
             replication_factor: 3,
             scatter_peer_timeout_ms: 500,
