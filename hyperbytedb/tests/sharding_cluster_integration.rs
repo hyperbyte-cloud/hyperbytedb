@@ -1697,3 +1697,79 @@ async fn forwarded_parts_share_one_wal_entry_and_fail_one_by_one() {
     }
     assert_eq!(replicated, 2, "both good parts reached the region peer");
 }
+
+/// The coordinator's own regions land even when a forward fails, now that
+/// the local append runs alongside the forwards instead of after them. The
+/// write still reports the forward failure.
+#[tokio::test]
+#[serial(chdb)]
+async fn the_local_share_lands_when_a_forward_fails() {
+    use hyperbytedb::ports::wal::WalPort;
+
+    let dir = tempfile::tempdir().unwrap();
+    let [n1, mut n2] =
+        start_sharded_pair_cluster(dir.path(), ShardedClusterOptions::default()).await;
+    let client = reqwest::Client::new();
+    for node in [&n1, &n2] {
+        create_db(&client, &node.url, "sharddb").await;
+    }
+    let region = |id: u64, peers: Vec<u64>, primary: u64| ShardRegion {
+        region_id: id,
+        start: 0,
+        end: u64::MAX,
+        epoch: ShardEpoch::default(),
+        peers,
+        primary,
+        last_split_at: 0,
+        transfer_verified: None,
+        transfer_first_seen: None,
+        state: Default::default(),
+        staged_from: None,
+        staging_peers: Vec::new(),
+    };
+    // cpu is node 1's own region; mem lives only on node 2.
+    for (measurement, r) in [
+        ("cpu", region(1, vec![1], 1)),
+        ("mem", region(2, vec![2], 2)),
+    ] {
+        let op = ShardMapOp::BootstrapMeasurement {
+            key: MeasurementKey::new("sharddb", "autogen", measurement),
+            region: r,
+        };
+        for node in [&n1, &n2] {
+            node.shard_map.apply_op(op.clone()).await.unwrap();
+            let snap = node.shard_map.snapshot().await.unwrap();
+            node.location_cache.refresh_from_map(&snap);
+        }
+    }
+    stop_node(&mut n2);
+
+    let before = n1.wal.last_sequence().await.unwrap();
+    let resp = write_line(
+        &client,
+        &n1.url,
+        "sharddb",
+        "cpu,host=a value=1 1000000000\nmem,host=a used=2 1000000000",
+    )
+    .await;
+    assert!(
+        !resp.status().is_success(),
+        "a write whose forward failed must not report success"
+    );
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("partially applied"), "got: {body}");
+
+    let landed: Vec<String> = n1
+        .wal
+        .read_from(before + 1)
+        .await
+        .unwrap()
+        .iter()
+        .flat_map(|(_, e)| e.points.iter().map(|p| p.measurement.clone()))
+        .collect();
+    assert_eq!(
+        landed,
+        vec!["cpu".to_string()],
+        "the local region landed, alone"
+    );
+}

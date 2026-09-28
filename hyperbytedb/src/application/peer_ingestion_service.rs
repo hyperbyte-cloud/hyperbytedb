@@ -211,14 +211,23 @@ impl PeerIngestionService {
         // as we can make it and the error says so.
         // One request per primary node, not per region; see
         // `forward_shard_writes_by_node`.
+        //
+        // The local bucket is appended while the forwards are in flight, not
+        // after them: a write used to pay for its slowest forward and then for
+        // its own WAL append in series (259 ms + 26 ms at N=12 on n3).
         let forward_region_count = buckets.forward.len();
+        let forwards = async {
+            let start = std::time::Instant::now();
+            let results =
+                forward_shard_writes_by_node(ctx, db, rp, precision, buckets.forward).await;
+            metrics::histogram!("hyperbytedb_sharded_write_stage_seconds", "stage" => "forward_fanout")
+                .record(start.elapsed().as_secs_f64());
+            results
+        };
+        let local = self.append_local_buckets(ctx, db, rp, precision, precision_val, buckets.local);
+        let (forward_results, local_result) = tokio::join!(forwards, local);
         let forward_results: Vec<Result<(), HyperbytedbError>> =
-            forward_shard_writes_by_node(ctx, db, rp, precision, buckets.forward)
-                .await
-                .into_iter()
-                .map(|(_, r)| r)
-                .collect();
-        stage.lap("forward_fanout");
+            forward_results.into_iter().map(|(_, r)| r).collect();
         let mut forward_failures = 0usize;
         let mut first_forward_error: Option<HyperbytedbError> = None;
         // Every failure was a primary shedding load: the client should back
@@ -254,9 +263,50 @@ impl PeerIngestionService {
             }
         }
 
-        if !buckets.local.is_empty() {
+        local_result?;
+
+        // Reported after the local append, so a remote region's failure never
+        // costs the local one its write. Still an error: some of the batch did
+        // not land, and the caller has to know that. Naming the counts is what
+        // lets a reader tell a partial write from a total one — the split-write
+        // suite could not, and read the difference as duplication.
+        if let Some(err) = first_forward_error {
+            counter!("hyperbytedb_shard_ingest_partial_total").increment(1);
+            // A capacity-only failure makes the client resend the whole
+            // batch, including every region that did land.
+            if all_capacity {
+                counter!("hyperbytedb_shard_ingest_capacity_retry_total").increment(1);
+                counter!("hyperbytedb_shard_ingest_capacity_retry_regions_landed_total")
+                    .increment((forward_region_count - forward_failures) as u64);
+            }
+            metrics::counter!("hyperbytedb_shard_ingest_forward_region_failures_total")
+                .increment(forward_failures as u64);
+            return Err(partial_write_error(
+                forward_failures,
+                forward_region_count,
+                all_capacity,
+                &err,
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Append this node's own regions of a write to the WAL and replicate
+    /// them. Runs alongside the forwards to other primaries.
+    async fn append_local_buckets(
+        &self,
+        ctx: &ShardRoutingContext,
+        db: &str,
+        rp: &str,
+        precision: Option<&str>,
+        precision_val: Precision,
+        local: std::collections::HashMap<u64, Vec<crate::domain::point::Point>>,
+    ) -> Result<(), HyperbytedbError> {
+        let mut stage = StageTimer::new("hyperbytedb_sharded_write_stage_seconds");
+        if !local.is_empty() {
             let mut all_local: Vec<crate::domain::point::Point> = Vec::new();
-            for pts in buckets.local.values() {
+            for pts in local.values() {
                 all_local.extend(pts.iter().cloned());
             }
 
@@ -283,7 +333,7 @@ impl PeerIngestionService {
             stage.lap("local_wal");
 
             let map = ctx.shard_map.snapshot().await?;
-            for (region_id, region_points) in buckets.local {
+            for (region_id, region_points) in local {
                 let Some(region) = crate::application::shard_routing::region_by_id(&map, region_id)
                 else {
                     return Err(HyperbytedbError::ShardMap(
@@ -308,30 +358,6 @@ impl PeerIngestionService {
                 .await?;
             }
             stage.lap("local_replicate");
-        }
-
-        // Reported after the local append, so a remote region's failure never
-        // costs the local one its write. Still an error: some of the batch did
-        // not land, and the caller has to know that. Naming the counts is what
-        // lets a reader tell a partial write from a total one — the split-write
-        // suite could not, and read the difference as duplication.
-        if let Some(err) = first_forward_error {
-            counter!("hyperbytedb_shard_ingest_partial_total").increment(1);
-            // A capacity-only failure makes the client resend the whole
-            // batch, including every region that did land.
-            if all_capacity {
-                counter!("hyperbytedb_shard_ingest_capacity_retry_total").increment(1);
-                counter!("hyperbytedb_shard_ingest_capacity_retry_regions_landed_total")
-                    .increment((forward_region_count - forward_failures) as u64);
-            }
-            metrics::counter!("hyperbytedb_shard_ingest_forward_region_failures_total")
-                .increment(forward_failures as u64);
-            return Err(partial_write_error(
-                forward_failures,
-                forward_region_count,
-                all_capacity,
-                &err,
-            ));
         }
 
         Ok(())
