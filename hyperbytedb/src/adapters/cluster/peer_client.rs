@@ -7,11 +7,12 @@ use tokio::sync::{Semaphore, oneshot};
 
 use crate::adapters::cluster::hinted_handoff::HintedHandoff;
 use crate::adapters::cluster::replication_log::ReplicationLog;
-use crate::domain::cluster::membership::SharedMembership;
+use crate::domain::cluster::membership::{ClusterMembership, SharedMembership};
 use crate::domain::cluster::replication_wire::{
     HTTP_HEADER_DATABASE, HTTP_HEADER_ORIGIN_NODE, HTTP_HEADER_PRECISION, HTTP_HEADER_REGION,
     HTTP_HEADER_REPLICATED, HTTP_HEADER_RETENTION_POLICY, HTTP_HEADER_SYNC,
-    LINE_PROTOCOL_MEDIA_TYPE_V1, ReplicationHintPayload,
+    LINE_PROTOCOL_MEDIA_TYPE_V1, REPLICATE_BATCH_MEDIA_TYPE_V1, ReplicateBatchPart,
+    ReplicateBatchResponse, ReplicatePartOutcome, ReplicationHintPayload,
 };
 use crate::domain::cluster::types::{
     MutationReplicateRequest, MutationReplicateResponse, MutationRequest,
@@ -100,17 +101,7 @@ impl PeerClient {
         target_node_ids: Option<&[u64]>,
     ) -> Vec<(u64, String)> {
         let m = self.membership.read().await;
-        if let Some(targets) = target_node_ids {
-            targets
-                .iter()
-                .filter_map(|id| m.get_node(*id).map(|n| (n.node_id, n.addr.clone())))
-                .collect()
-        } else {
-            m.replication_peers(self.node_id)
-                .into_iter()
-                .map(|n| (n.node_id, n.addr.clone()))
-                .collect()
-        }
+        resolve_replication_peers(&m, self.node_id, target_node_ids)
     }
 
     pub fn start_outbound_processor(self: &Arc<Self>) {
@@ -139,58 +130,229 @@ impl PeerClient {
         self: Arc<Self>,
         mut rx: tokio::sync::mpsc::Receiver<OutboundReplicationBatch>,
     ) {
-        let mut pending: Option<OutboundReplicationBatch> = None;
-        loop {
-            let mut job = if let Some(j) = pending.take() {
-                j
-            } else {
-                match rx.recv().await {
-                    Some(j) => j,
-                    None => break,
-                }
-            };
-
-            loop {
+        while let Some(first) = rx.recv().await {
+            // Take everything already queued, up to one request's worth.
+            let mut bytes = first.body.len();
+            let mut jobs = vec![first];
+            while bytes < self.max_coalesce_body_bytes && jobs.len() < MAX_PARTS_PER_ROUND {
                 match rx.try_recv() {
-                    Ok(next) if coalesce_ok(&job, &next, self.max_coalesce_body_bytes) => {
-                        if !job.body.is_empty() && !next.body.is_empty() {
-                            job.body.push(b'\n');
-                        }
-                        job.body.extend_from_slice(&next.body);
-                        job.wal_seq = next.wal_seq;
-                    }
                     Ok(next) => {
-                        pending = Some(next);
-                        break;
+                        bytes = bytes.saturating_add(next.body.len());
+                        jobs.push(next);
                     }
-                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                    Err(_) => break,
                 }
             }
+            let jobs = coalesce_jobs(jobs, self.max_coalesce_body_bytes);
 
             let permit = match self.batch_semaphore.clone().acquire_owned().await {
                 Ok(p) => p,
                 Err(_) => return,
             };
             let this = Arc::clone(&self);
-            let j = job;
             tokio::spawn(async move {
-                this.do_replicate_write(&j).await;
+                this.replicate_round(jobs).await;
                 drop(permit);
             });
+        }
+    }
+
+    /// Send one round of queued parts: every part bound for a peer goes to it
+    /// in a single `/internal/replicate-batch` request.
+    async fn replicate_round(&self, jobs: Vec<OutboundReplicationBatch>) {
+        let start = std::time::Instant::now();
+        let mut per_peer: Vec<(u64, String, Vec<ReplicateBatchPart>)> = Vec::new();
+        {
+            let m = self.membership.read().await;
+            for job in &jobs {
+                for (peer_id, addr) in
+                    resolve_replication_peers(&m, self.node_id, job.target_node_ids.as_deref())
+                {
+                    let part = ReplicateBatchPart {
+                        database: job.database.clone(),
+                        retention_policy: job.retention_policy.clone(),
+                        precision: job.precision.clone(),
+                        region_id: job.region_id,
+                        body: job.body.clone(),
+                    };
+                    match per_peer.iter_mut().find(|(id, ..)| *id == peer_id) {
+                        Some((.., parts)) => parts.push(part),
+                        None => per_peer.push((peer_id, addr, vec![part])),
+                    }
+                }
+            }
+        }
+        futures::future::join_all(
+            per_peer
+                .into_iter()
+                .map(|(peer_id, addr, parts)| self.send_parts_to_peer(peer_id, addr, parts)),
+        )
+        .await;
+        histogram!("hyperbytedb_replication_duration_seconds")
+            .record(start.elapsed().as_secs_f64());
+    }
+
+    /// Deliver `parts` to one peer, retrying with backoff the parts it has not
+    /// accepted. Parts still refused after the last attempt go to hinted
+    /// handoff one by one, as a single-part send would.
+    async fn send_parts_to_peer(
+        &self,
+        peer_id: u64,
+        addr: String,
+        mut parts: Vec<ReplicateBatchPart>,
+    ) {
+        let url = format!("http://{addr}/internal/replicate-batch");
+        let mut attempts = 0u32;
+        let mut delay = Duration::from_secs(1);
+        loop {
+            attempts += 1;
+            // Wire-identical to `ReplicateBatchRequest` (bincode writes a
+            // struct as its fields in order) without cloning every body.
+            let body = match bincode::serialize(&(self.node_id, &parts)) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::error!(peer_id, error = %e, "encode replicate batch");
+                    break;
+                }
+            };
+            histogram!("hyperbytedb_replication_batch_bytes").record(body.len() as f64);
+            histogram!("hyperbytedb_replication_batch_parts").record(parts.len() as f64);
+            let http_start = std::time::Instant::now();
+            let result = self
+                .client
+                .post(&url)
+                .header(reqwest::header::CONTENT_TYPE, REPLICATE_BATCH_MEDIA_TYPE_V1)
+                .header(HTTP_HEADER_REPLICATED, "true")
+                .header(HTTP_HEADER_ORIGIN_NODE, self.node_id.to_string())
+                .body(body)
+                .send()
+                .await;
+            histogram!("hyperbytedb_replication_http_seconds", "peer" => url.clone())
+                .record(http_start.elapsed().as_secs_f64());
+
+            match result {
+                Ok(resp)
+                    if resp.status() == reqwest::StatusCode::NOT_FOUND
+                        || resp.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED =>
+                {
+                    // A peer from before this endpoint: one request per part.
+                    self.send_parts_one_by_one(peer_id, addr, parts).await;
+                    return;
+                }
+                Ok(resp) if resp.status().is_success() => {
+                    let decoded = resp
+                        .bytes()
+                        .await
+                        .ok()
+                        .and_then(|b| bincode::deserialize::<ReplicateBatchResponse>(&b).ok());
+                    match decoded {
+                        Some(r) if r.results.len() == parts.len() => {
+                            counter!("hyperbytedb_replication_writes_total", "peer" => url.clone())
+                                .increment(1);
+                            parts = parts
+                                .into_iter()
+                                .zip(r.results)
+                                .filter(|(_, outcome)| *outcome != ReplicatePartOutcome::Accepted)
+                                .map(|(part, _)| part)
+                                .collect();
+                            if parts.is_empty() {
+                                return;
+                            }
+                            counter!("hyperbytedb_replication_parts_refused_total", "peer" => url.clone())
+                                .increment(parts.len() as u64);
+                        }
+                        _ => {
+                            tracing::warn!(peer = %url, attempt = attempts, "bad replicate batch response");
+                            counter!("hyperbytedb_replication_errors_total", "peer" => url.clone())
+                                .increment(1);
+                        }
+                    }
+                }
+                Ok(resp) => {
+                    tracing::warn!(
+                        peer = %url,
+                        status = %resp.status(),
+                        attempt = attempts,
+                        "peer rejected replicate batch"
+                    );
+                    counter!("hyperbytedb_replication_errors_total", "peer" => url.clone())
+                        .increment(1);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        peer = %url,
+                        error = %e,
+                        attempt = attempts,
+                        "failed to send replicate batch"
+                    );
+                    counter!("hyperbytedb_replication_errors_total", "peer" => url.clone())
+                        .increment(1);
+                }
+            }
+            if attempts >= self.max_retries {
+                break;
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_secs(30));
         }
 
-        if let Some(j) = pending {
-            let permit = match self.batch_semaphore.clone().acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => return,
+        let Some(hh) = self.hinted_handoff.as_ref() else {
+            tracing::error!(
+                peer = %url,
+                parts = parts.len(),
+                "giving up replication after {} attempts (no hinted handoff)",
+                self.max_retries
+            );
+            return;
+        };
+        for part in parts {
+            let hint = ReplicationHintPayload {
+                database: part.database,
+                retention_policy: part.retention_policy,
+                precision: part.precision,
+                line_body: part.body,
             };
-            let this = Arc::clone(&self);
-            tokio::spawn(async move {
-                this.do_replicate_write(&j).await;
-                drop(permit);
-            });
+            if let Err(e) = hh.enqueue_hint(peer_id, &hint) {
+                tracing::error!(peer_id, error = %e, "failed to enqueue hinted handoff");
+            }
         }
+    }
+
+    /// The single-part `/internal/replicate` path, for a peer that predates
+    /// `/internal/replicate-batch`.
+    async fn send_parts_one_by_one(
+        &self,
+        peer_id: u64,
+        addr: String,
+        parts: Vec<ReplicateBatchPart>,
+    ) {
+        let sends: Vec<_> = parts
+            .into_iter()
+            .map(|part| {
+                let hint = ReplicationHintPayload {
+                    database: part.database.clone(),
+                    retention_policy: part.retention_policy.clone(),
+                    precision: part.precision.clone(),
+                    line_body: part.body.clone(),
+                };
+                let ctx = self.peer_replicate_ctx(
+                    peer_id,
+                    addr.clone(),
+                    Bytes::from(part.body),
+                    part.database,
+                    part.retention_policy,
+                    part.precision,
+                    0,
+                    hint,
+                    /* sync = */ false,
+                    part.region_id,
+                );
+                async move {
+                    let _ = ctx.run().await;
+                }
+            })
+            .collect();
+        futures::future::join_all(sends).await;
     }
 
     pub fn node_addr(&self) -> &str {
@@ -278,51 +440,6 @@ impl PeerClient {
             hh.enqueue_hint(peer_id, &hint)?;
         }
         Ok(())
-    }
-
-    async fn do_replicate_write(&self, job: &OutboundReplicationBatch) {
-        let start = std::time::Instant::now();
-        let peers = self
-            .resolve_replication_peers_async(job.target_node_ids.as_deref())
-            .await;
-
-        if peers.is_empty() {
-            return;
-        }
-
-        let body = Bytes::copy_from_slice(&job.body);
-        histogram!("hyperbytedb_replication_batch_bytes").record(body.len() as f64);
-        let hint_payload = ReplicationHintPayload {
-            database: job.database.clone(),
-            retention_policy: job.retention_policy.clone(),
-            precision: job.precision.clone(),
-            line_body: job.body.clone(),
-        };
-
-        let futures: Vec<_> = peers
-            .iter()
-            .map(|(peer_id, peer_addr)| {
-                let ctx = self.peer_replicate_ctx(
-                    *peer_id,
-                    peer_addr.clone(),
-                    body.clone(),
-                    job.database.clone(),
-                    job.retention_policy.clone(),
-                    job.precision.clone(),
-                    job.wal_seq,
-                    hint_payload.clone(),
-                    /* sync = */ false,
-                    job.region_id,
-                );
-                async move {
-                    let _ = ctx.run().await;
-                }
-            })
-            .collect();
-
-        futures::future::join_all(futures).await;
-        histogram!("hyperbytedb_replication_duration_seconds")
-            .record(start.elapsed().as_secs_f64());
     }
 
     /// Synchronously fan a single batch out to all active peers and wait for
@@ -746,6 +863,51 @@ impl ReplicationPort for PeerClient {
     }
 }
 
+/// Most queued parts one send round takes.
+const MAX_PARTS_PER_ROUND: usize = 4096;
+
+/// Replication targets as `(node id, addr)`: `targets` when the batch names
+/// them (region peers), otherwise every replication peer but `self_id`.
+fn resolve_replication_peers(
+    m: &ClusterMembership,
+    self_id: u64,
+    targets: Option<&[u64]>,
+) -> Vec<(u64, String)> {
+    match targets {
+        Some(targets) => targets
+            .iter()
+            .filter_map(|id| m.get_node(*id).map(|n| (n.node_id, n.addr.clone())))
+            .collect(),
+        None => m
+            .replication_peers(self_id)
+            .into_iter()
+            .map(|n| (n.node_id, n.addr.clone()))
+            .collect(),
+    }
+}
+
+/// Merge consecutive jobs that [`coalesce_ok`] allows into one body.
+fn coalesce_jobs(
+    jobs: Vec<OutboundReplicationBatch>,
+    max_body: usize,
+) -> Vec<OutboundReplicationBatch> {
+    let mut out: Vec<OutboundReplicationBatch> = Vec::with_capacity(jobs.len());
+    for next in jobs {
+        if let Some(job) = out.last_mut()
+            && coalesce_ok(job, &next, max_body)
+        {
+            if !job.body.is_empty() && !next.body.is_empty() {
+                job.body.push(b'\n');
+            }
+            job.body.extend_from_slice(&next.body);
+            job.wal_seq = next.wal_seq;
+            continue;
+        }
+        out.push(next);
+    }
+    out
+}
+
 fn coalesce_ok(
     a: &OutboundReplicationBatch,
     b: &OutboundReplicationBatch,
@@ -1041,5 +1203,157 @@ mod coalesce_tests {
             &batch(11, None),
             1 << 20
         ));
+    }
+}
+
+#[cfg(test)]
+mod replicate_batch_tests {
+    use super::*;
+    use crate::domain::cluster::membership::{NodeInfo, NodeState};
+    use crate::domain::cluster::replication_wire::ReplicateBatchRequest;
+    use std::sync::atomic::AtomicU64;
+
+    fn part(region: u64) -> ReplicateBatchPart {
+        ReplicateBatchPart {
+            database: "db".into(),
+            retention_policy: "autogen".into(),
+            precision: None,
+            region_id: Some(region),
+            body: format!("cpu,host=r{region} v=1").into_bytes(),
+        }
+    }
+
+    fn job(region: u64, targets: Vec<u64>) -> OutboundReplicationBatch {
+        let p = part(region);
+        OutboundReplicationBatch {
+            database: p.database,
+            retention_policy: p.retention_policy,
+            precision: None,
+            body: p.body,
+            wal_seq: region,
+            target_node_ids: Some(targets),
+            region_id: Some(region),
+        }
+    }
+
+    #[test]
+    fn the_sent_encoding_is_a_replicate_batch_request() {
+        let parts = vec![part(1), part(2)];
+        let sent = bincode::serialize(&(7u64, &parts)).unwrap();
+        let decoded: ReplicateBatchRequest = bincode::deserialize(&sent).unwrap();
+        assert_eq!(
+            decoded,
+            ReplicateBatchRequest {
+                origin_node: 7,
+                parts
+            }
+        );
+    }
+
+    async fn serve(app: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        addr
+    }
+
+    fn node(id: u64, addr: &str) -> NodeInfo {
+        NodeInfo {
+            node_id: id,
+            addr: addr.to_string(),
+            state: NodeState::Active,
+            joined_at: 0,
+            last_heartbeat: 0,
+            needs_sync: false,
+            consecutive_misses: 0,
+        }
+    }
+
+    /// Node 2 speaks replicate-batch and refuses region 99 once (queue
+    /// full); node 3 predates the endpoint. Each gets every part meant for
+    /// it: node 2 in one request plus a retry of the refused part only,
+    /// node 3 one request per part.
+    #[tokio::test]
+    async fn a_round_sends_each_peer_one_request_and_retries_only_refused_parts() {
+        let batch_calls = Arc::new(AtomicU64::new(0));
+        let parts_seen = Arc::new(Mutex::new(Vec::<Vec<Option<u64>>>::new()));
+        let (calls, seen) = (batch_calls.clone(), parts_seen.clone());
+        let batch_peer = serve(axum::Router::new().route(
+            "/internal/replicate-batch",
+            axum::routing::post(move |body: axum::body::Bytes| {
+                let (calls, seen) = (calls.clone(), seen.clone());
+                async move {
+                    let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+                    let req: ReplicateBatchRequest = bincode::deserialize(&body).unwrap();
+                    seen.lock()
+                        .unwrap()
+                        .push(req.parts.iter().map(|p| p.region_id).collect());
+                    let results = req
+                        .parts
+                        .iter()
+                        .map(|p| {
+                            if first && p.region_id == Some(99) {
+                                ReplicatePartOutcome::QueueFull
+                            } else {
+                                ReplicatePartOutcome::Accepted
+                            }
+                        })
+                        .collect();
+                    bincode::serialize(&ReplicateBatchResponse { results }).unwrap()
+                }
+            }),
+        ))
+        .await;
+        let legacy_calls = Arc::new(AtomicU64::new(0));
+        let lc = legacy_calls.clone();
+        let legacy_peer = serve(axum::Router::new().route(
+            "/internal/replicate",
+            axum::routing::post(move || {
+                let lc = lc.clone();
+                async move {
+                    lc.fetch_add(1, Ordering::SeqCst);
+                    axum::http::StatusCode::OK
+                }
+            }),
+        ))
+        .await;
+
+        let mut m = ClusterMembership::new();
+        m.add_node(node(2, &batch_peer));
+        m.add_node(node(3, &legacy_peer));
+        let dir = tempfile::tempdir().unwrap();
+        let pc = PeerClient::new(
+            1,
+            "127.0.0.1:1".into(),
+            crate::domain::cluster::membership::new_shared(m),
+            Arc::new(ReplicationLog::open(dir.path()).unwrap()),
+            3,
+            64,
+            2,
+            1 << 20,
+        );
+
+        pc.replicate_round(vec![
+            job(1, vec![2]),
+            job(2, vec![2, 3]),
+            job(99, vec![2]),
+            job(4, vec![2, 3]),
+            job(5, vec![3]),
+        ])
+        .await;
+
+        let seen = parts_seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![vec![Some(1), Some(2), Some(99), Some(4)], vec![Some(99)],],
+            "one request for node 2's parts, then only the refused part"
+        );
+        assert_eq!(
+            legacy_calls.load(Ordering::SeqCst),
+            3,
+            "node 3: parts 2, 4, 5"
+        );
     }
 }

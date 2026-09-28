@@ -194,3 +194,51 @@ impl ReplicationHintPayload {
         })
     }
 }
+
+/// Content type of `/internal/replicate-batch` bodies: a bincode
+/// [`ReplicateBatchRequest`].
+pub const REPLICATE_BATCH_MEDIA_TYPE_V1: &str = "application/vnd.hyperbytedb.replicate-batch.v1";
+
+/// One region's rows inside a [`ReplicateBatchRequest`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReplicateBatchPart {
+    pub database: String,
+    pub retention_policy: String,
+    pub precision: Option<String>,
+    /// Checked by the receiver exactly as the single-batch region header is.
+    pub region_id: Option<u64>,
+    /// Line protocol or binary points frames.
+    pub body: Vec<u8>,
+}
+
+/// Every queued replication part bound for one peer, in one request.
+///
+/// Replication used to send one request per region part: under sharding a
+/// 1000-point client batch splits into one part per region, so at N=12 on n3
+/// requests carried ~14 points (1.3 KB) each, 8 at a time per node. That
+/// capped a node at ~1,600 requests/s; the rest of the traffic spilled into
+/// hinted handoff (9.9M hints, 3.5M dropped at the hint cap) and the node
+/// spent its CPU on hint writes, compaction and replay.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReplicateBatchRequest {
+    pub origin_node: u64,
+    pub parts: Vec<ReplicateBatchPart>,
+}
+
+/// What the receiver did with one part.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ReplicatePartOutcome {
+    /// Queued for apply (the async replication contract).
+    Accepted,
+    /// The receiver is not a peer of the part's region.
+    NotARegionPeer,
+    /// The receiver's apply queue is full; retry later.
+    QueueFull,
+    Failed(String),
+}
+
+/// One outcome per request part, in order.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReplicateBatchResponse {
+    pub results: Vec<ReplicatePartOutcome>,
+}

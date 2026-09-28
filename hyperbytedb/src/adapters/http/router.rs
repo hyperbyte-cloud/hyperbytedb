@@ -187,6 +187,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
                     .layer(DefaultBodyLimit::max(replicate_body_limit)),
             )
             .route(
+                "/internal/replicate-batch",
+                post(peer_handlers::handle_replicate_batch)
+                    .layer(DefaultBodyLimit::max(replicate_body_limit)),
+            )
+            .route(
                 "/internal/replicate-mutation",
                 post(peer_handlers::handle_replicate_mutation)
                     .layer(DefaultBodyLimit::max(replicate_body_limit)),

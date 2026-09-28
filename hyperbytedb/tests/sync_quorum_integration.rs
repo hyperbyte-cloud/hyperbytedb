@@ -549,3 +549,86 @@ async fn sync_quorum_times_out_when_peer_unreachable() {
         "timeout should fire near ack_timeout_ms (took {elapsed:?})"
     );
 }
+
+/// Async writes reach every peer through the batched replication path, and
+/// the peer's `/internal/replicate-batch` route applies a multi-part request
+/// and answers per part. The direct POST pins the route: a missing route
+/// would still converge (the sender falls back to one request per part) and
+/// hide that the batch path never ran.
+#[tokio::test]
+#[serial(chdb)]
+async fn async_writes_replicate_through_the_batch_endpoint() {
+    use hyperbytedb::domain::cluster::replication_wire::{
+        REPLICATE_BATCH_MEDIA_TYPE_V1, ReplicateBatchPart, ReplicateBatchRequest,
+        ReplicateBatchResponse, ReplicatePartOutcome,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let nodes = start_three_node_cluster(dir.path(), [async_cfg(), async_cfg(), async_cfg()]).await;
+    let client = reqwest::Client::new();
+    create_db(&client, &nodes[0].url, "batchdb").await;
+    for node in &nodes {
+        wait_for_database(&client, &node.url, "batchdb").await;
+    }
+
+    for i in 0..20 {
+        let resp = write_one(
+            &client,
+            &nodes[0].url,
+            "batchdb",
+            &format!("cpu,host=h{i} value={i} {}", 1_000_000_000 + i),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+    let origin_seq = nodes[0].wal.last_sequence().await.unwrap();
+    for node in &nodes[1..] {
+        let mut seq = 0;
+        for _ in 0..200 {
+            seq = node.wal.last_sequence().await.unwrap();
+            if seq >= 20 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(seq >= 20, "peer WAL at {seq}, origin at {origin_seq}");
+    }
+
+    let before = nodes[2].wal.last_sequence().await.unwrap();
+    let part = |line: &str| ReplicateBatchPart {
+        database: "batchdb".into(),
+        retention_policy: "autogen".into(),
+        precision: None,
+        region_id: None,
+        body: line.as_bytes().to_vec(),
+    };
+    let req = ReplicateBatchRequest {
+        origin_node: 1,
+        parts: vec![
+            part("cpu,host=x value=1 2000000000"),
+            part("cpu,host=y value=2 2000000001"),
+        ],
+    };
+    let resp = client
+        .post(format!("{}/internal/replicate-batch", nodes[2].url))
+        .header("Content-Type", REPLICATE_BATCH_MEDIA_TYPE_V1)
+        .body(bincode::serialize(&req).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let out: ReplicateBatchResponse = bincode::deserialize(&resp.bytes().await.unwrap()).unwrap();
+    assert_eq!(out.results, vec![ReplicatePartOutcome::Accepted; 2]);
+    let mut after = before;
+    for _ in 0..200 {
+        after = nodes[2].wal.last_sequence().await.unwrap();
+        if after > before {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        after > before,
+        "the two parts apply as one job: WAL {before} -> {after}"
+    );
+}
