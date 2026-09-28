@@ -19,8 +19,8 @@ use crate::domain::cluster::membership::{
     NodeInfo, NodeState, SharedMembership, holds_placement, is_departing, is_serving,
 };
 use crate::domain::sharding::placement::{
-    MoveTier, PlacementStep, RegionPlanInput, budget_exhausted, move_tier, next_placement_step,
-    plan_placement, target_placement,
+    MoveTier, PlacementStep, RegionPlanInput, budget_exhausted, estimate_region_weights, move_tier,
+    next_placement_step, plan_placement, target_placement,
 };
 use crate::domain::sharding::{
     MeasurementKey, ShardMap, ShardMapOp, ShardRegion, ShardRehomeRequest,
@@ -159,6 +159,24 @@ fn choose_split_key(
         .unwrap_or(start + (end - start) / 2)
         .max(start.saturating_add(1))
         .min(end.saturating_sub(1))
+}
+
+/// Most learners a node may be receiving at once for balance alone.
+///
+/// Balance moves are optional, and each learner costs its destination a full
+/// region copy plus every replicated write from the moment it joins. At N=12
+/// on n3 one node was sent 17 at once; under write load the copies could not
+/// finish, and that node paced the cluster for the whole run. Moves that
+/// restore replication or evacuate a node are not capped.
+const MAX_BALANCE_LEARNERS_PER_NODE: usize = 2;
+
+/// How many regions `node` is currently a learner of.
+fn learners_on(map: &ShardMap, node: u64) -> usize {
+    map.spaces
+        .values()
+        .flat_map(|s| &s.regions)
+        .filter(|r| r.staging_peers.contains(&node))
+        .count()
 }
 
 fn max_region_peer_heartbeat_stats(hb: &[RegionHeartbeatRow], region: &ShardRegion) -> (u64, u64) {
@@ -808,13 +826,31 @@ impl ShardScheduler {
                 if self.is_rollup_dest(&space.key).await {
                     continue;
                 }
-                for r in &space.regions {
-                    let (series, _) = max_region_peer_heartbeat_stats(&hb, r);
+                let reported: Vec<(u64, u64)> = space
+                    .regions
+                    .iter()
+                    .map(|r| {
+                        (
+                            r.end.saturating_sub(r.start),
+                            max_region_peer_heartbeat_stats(&hb, r).0,
+                        )
+                    })
+                    .collect();
+                let weights = estimate_region_weights(&reported);
+                for (r, weight) in space.regions.iter().zip(weights) {
                     inputs.push(RegionPlanInput {
                         region_id: r.region_id,
-                        current_peers: r.peers.clone(),
+                        // Established copies only. A learner whose copy has
+                        // not finished holds nothing yet; counting it made
+                        // the plan keep it and drop a full copy instead.
+                        current_peers: r
+                            .peers
+                            .iter()
+                            .copied()
+                            .filter(|p| !r.staging_peers.contains(p))
+                            .collect(),
                         current_primary: r.primary,
-                        weight: series.max(1),
+                        weight,
                         hrw: target_placement(&space.key, r.start, &candidates, candidates.len()),
                     });
                 }
@@ -1793,12 +1829,13 @@ impl ShardScheduler {
         // regions as stalled under exactly the load stall detection exists for.
         let departing = self.departing_node_ids().await;
         let unhealthy = self.unhealthy_region_peers(region).await;
+        let tier = move_tier(region, rf, &departing, &unhealthy);
         let allowance = self.config.movement_budget_bytes_per_sec.saturating_mul(
             self.tick_interval_secs
                 .load(std::sync::atomic::Ordering::Relaxed),
         );
         if budget_exhausted(
-            move_tier(region, rf, &departing, &unhealthy),
+            tier,
             allowance,
             self.tick_moved_bytes
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -1820,6 +1857,10 @@ impl ShardScheduler {
                     target
                         .iter()
                         .filter(|t| !region.peers.contains(t))
+                        .filter(|t| {
+                            tier != MoveTier::Convergence
+                                || learners_on(&map, **t) < MAX_BALANCE_LEARNERS_PER_NODE
+                        })
                         .filter_map(|t| m.get_node(*t).map(|n| (*t, n.addr.clone())))
                         .collect()
                 };
@@ -4279,6 +4320,58 @@ mod tests {
         fn probe_count(&self, peer: u64) -> u64 {
             self.probes[&peer].load(std::sync::atomic::Ordering::Relaxed)
         }
+    }
+
+    /// Six regions on node 1 at RF 1 with node 2 in the cluster. Moving one
+    /// to node 2 is balance only. `seed_learners` regions already have node 2
+    /// as a learner. Returns the AddPeer-to-2 proposals of one tick.
+    async fn balance_adds_to_node_2(seed_learners: usize) -> usize {
+        // Node 2 reports a map ahead of the seeds below, so it counts as
+        // caught up and only the cap can stop an AddPeer to it.
+        let harness = PlacementTestHarness::new_tuned(true, &[(2, 16)], 6, |c| {
+            c.replication_factor = 1;
+        })
+        .await;
+        for i in 0..seed_learners {
+            let mut seed = sample_region_peers(vec![1, 2], 1);
+            seed.region_id = 9_000 + i as u64;
+            seed.staging_peers = vec![2];
+            harness
+                .scheduler
+                .shard_map
+                .apply_op(ShardMapOp::BootstrapMeasurement {
+                    key: MeasurementKey::new("db", "autogen", format!("learning{i}")),
+                    region: seed,
+                })
+                .await
+                .unwrap();
+        }
+        harness.scheduler.tick_once_for_test().await.unwrap();
+        harness
+            .proposals
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|op| matches!(op, ShardMapOp::AddPeer { to_peer: 2, .. }))
+            .count()
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn balance_moves_a_region_onto_an_empty_node() {
+        assert!(balance_adds_to_node_2(0).await > 0);
+    }
+
+    /// Balance may not pile learners onto one node: at N=12 on n3 one node
+    /// was sent 17 at once and paced the whole cluster.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn balance_moves_stop_at_the_learner_cap_for_a_node() {
+        assert_eq!(
+            balance_adds_to_node_2(MAX_BALANCE_LEARNERS_PER_NODE).await,
+            0,
+            "node 2 is at its learner cap"
+        );
     }
 
     /// Guards the tick wiring. Without this, deleting the three placement calls

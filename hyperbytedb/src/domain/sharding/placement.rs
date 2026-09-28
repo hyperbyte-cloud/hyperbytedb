@@ -193,6 +193,41 @@ pub fn balance_primaries(
     out
 }
 
+/// Planning weight for each region of one space, from its hash-range width
+/// and the series count its peers reported (0 when none has yet).
+///
+/// Series hash uniformly, so a region's expected size is the space's series
+/// density times its width. A region with no report yet -- every region for a
+/// while after a pre-split bootstrap -- is weighted at that expectation, not
+/// at 0. Weighting it 0 made the nodes holding only unreported regions look
+/// idle: at N=12 on n3 the plan started 17 copies onto one node of an already
+/// even layout, the copies could not finish under write load, and that node
+/// set the pace for the whole cluster. A region reporting more than expected
+/// keeps its report. With no reports at all every region weighs 1.
+#[must_use]
+pub fn estimate_region_weights(regions: &[(u64, u64)]) -> Vec<u64> {
+    let (series, width) = regions
+        .iter()
+        .filter(|(_, reported)| *reported > 0)
+        .fold((0u128, 0u128), |(s, w), (width, reported)| {
+            (s + u128::from(*reported), w + u128::from(*width))
+        });
+    regions
+        .iter()
+        .map(|(w, reported)| {
+            let expected = if width == 0 {
+                0
+            } else {
+                u128::from(*w) * series / width
+            };
+            u64::try_from(expected)
+                .unwrap_or(u64::MAX)
+                .max(*reported)
+                .max(1)
+        })
+        .collect()
+}
+
 /// One region's input to [`plan_placement`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegionPlanInput {
@@ -393,6 +428,12 @@ pub fn next_placement_step(region: &ShardRegion, target: &[u64]) -> Option<Place
     if let Some(&missing) = target.iter().find(|t| !region.peers.contains(t)) {
         return Some(PlacementStep::Add(missing));
     }
+    // Every step below removes a copy or hands off primacy. While a target
+    // member is still a learner it holds nothing yet, so removing a full copy
+    // now would leave the region one copy short. Wait for the promotion.
+    if target.iter().any(|t| region.staging_peers.contains(t)) {
+        return None;
+    }
     if let Some(&extra) = region
         .peers
         .iter()
@@ -466,6 +507,83 @@ pub fn budget_exhausted(tier: MoveTier, allowance: u64, moved: u64) -> bool {
 mod tests {
     use super::*;
     use crate::domain::sharding::types::MeasurementKey;
+
+    #[test]
+    fn no_copy_is_removed_while_a_target_member_is_a_learner() {
+        let mut region = ShardRegion {
+            region_id: 1,
+            start: 0,
+            end: u64::MAX,
+            epoch: Default::default(),
+            peers: vec![1, 2, 3],
+            primary: 1,
+            last_split_at: 0,
+            transfer_verified: None,
+            transfer_first_seen: None,
+            state: Default::default(),
+            staged_from: None,
+            staging_peers: vec![3],
+        };
+        assert_eq!(next_placement_step(&region, &[1, 3]), None);
+        region.staging_peers.clear();
+        assert_eq!(
+            next_placement_step(&region, &[1, 3]),
+            Some(PlacementStep::Remove(2))
+        );
+    }
+
+    #[test]
+    fn unreported_regions_are_weighted_at_the_space_density() {
+        let w = u64::MAX / 4;
+        // Two reported at ~100k, two not yet.
+        let got = estimate_region_weights(&[(w, 100_000), (w, 98_000), (w, 0), (w, 0)]);
+        assert_eq!(got[0], 100_000);
+        assert_eq!(got[1], 99_000);
+        assert_eq!(got[2], 99_000);
+        assert_eq!(got[3], 99_000);
+        // A half-width region expects half.
+        let half = estimate_region_weights(&[(w, 100_000), (w / 2, 0)])[1];
+        assert!((49_999..=50_000).contains(&half), "{half}");
+        // Nothing reported: all equal.
+        assert_eq!(estimate_region_weights(&[(w, 0), (w / 2, 0)]), vec![1, 1]);
+    }
+
+    /// The n3 N=12 run: a pre-split layout, already even, with only some
+    /// regions reporting. The plan must leave it alone.
+    #[test]
+    fn a_balanced_presplit_layout_is_kept_while_reports_trickle_in() {
+        let nodes: Vec<u64> = (1..=12).collect();
+        let n = 24u64;
+        let width = u64::MAX / n;
+        let peers = |i: u64| {
+            vec![
+                nodes[(i % 12) as usize],
+                nodes[((i + 1 + i / 12) % 12) as usize],
+            ]
+        };
+        // Regions whose peers include node 4 have not reported yet.
+        let reported: Vec<(u64, u64)> = (0..n)
+            .map(|i| (width, if peers(i).contains(&4) { 0 } else { 100_000 }))
+            .collect();
+        let weights = estimate_region_weights(&reported);
+        let inputs: Vec<RegionPlanInput> = (0..n)
+            .map(|i| RegionPlanInput {
+                region_id: i,
+                current_peers: peers(i),
+                current_primary: peers(i)[0],
+                weight: weights[i as usize],
+                hrw: target_placement(&key(), i * width, &nodes, nodes.len()),
+            })
+            .collect();
+        let plan = plan_placement(&inputs, 2, 10);
+        for r in &inputs {
+            let mut want = r.current_peers.clone();
+            want.sort_unstable();
+            let mut got = plan[&r.region_id].clone();
+            got.sort_unstable();
+            assert_eq!(got, want, "region {} moved a copy", r.region_id);
+        }
+    }
 
     fn key() -> MeasurementKey {
         MeasurementKey::new("db", "autogen", "cpu")
