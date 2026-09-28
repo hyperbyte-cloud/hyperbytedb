@@ -837,6 +837,26 @@ impl ChdbNativeAdapter {
                 series_alters.extend(build_alter_reconcile_tag_strings(&series_table, &tag_phys));
             }
 
+            // A CREATE may be a no-op: another writer can plan its own CREATE
+            // while this one waits, and whichever runs first sets the columns
+            // (`IF NOT EXISTS`). The cache below records THIS plan's columns,
+            // so make sure the table has them. On n3 a series table created
+            // without `host` was cached with it, and every flush on two nodes
+            // failed until their WAL backlog got them OOM-killed.
+            if create_fact.is_some() {
+                fact_alters.extend(build_alter_add_field_columns(
+                    &table,
+                    &TableSchema::default(),
+                    &field_phys,
+                ));
+            }
+            if create_series.is_some() {
+                series_alters.extend(build_alter_add_series_columns(
+                    &series_table,
+                    &TableSchema::default(),
+                    &tag_phys,
+                ));
+            }
             fact_alters.append(&mut series_alters);
             (create_fact, create_series, fact_alters)
         };
@@ -1105,7 +1125,7 @@ impl ChdbNativeAdapter {
         }
 
         let ddl_lock = self.ddl_mutex(&key).await;
-        let (create_fact, create_series) = {
+        let (create_fact, create_series, ensure_columns) = {
             let _guard = ddl_lock.lock().await;
 
             let cached = {
@@ -1133,7 +1153,24 @@ impl ChdbNativeAdapter {
             } else {
                 None
             };
-            (create_fact, create_series)
+            // As in `ensure_table`: a CREATE may be a no-op against a table
+            // another writer created with fewer columns.
+            let mut ensure_columns = Vec::new();
+            if create_fact.is_some() {
+                ensure_columns.extend(build_alter_add_field_columns(
+                    &table,
+                    &TableSchema::default(),
+                    &field_phys,
+                ));
+            }
+            if create_series.is_some() {
+                ensure_columns.extend(build_alter_add_series_columns(
+                    &series_table,
+                    &TableSchema::default(),
+                    &tag_phys,
+                ));
+            }
+            (create_fact, create_series, ensure_columns)
         };
 
         if let Some(sql) = create_fact {
@@ -1143,6 +1180,9 @@ impl ChdbNativeAdapter {
         if let Some(sql) = create_series {
             tracing::debug!(table = %meta.name, "creating chDB native series table for MV destination");
             self.execute(sql).await?;
+        }
+        for stmt in ensure_columns {
+            self.execute(stmt).await?;
         }
 
         {
@@ -1436,86 +1476,11 @@ impl PointsSinkPort for ChdbNativeAdapter {
         ingest_seq_base: u64,
         points: &[Point],
     ) -> Result<WriteAck, HyperbytedbError> {
-        if points.is_empty() {
-            return Ok(WriteAck {
-                min_time: 0,
-                max_time: 0,
-                row_count: 0,
-            });
-        }
-        debug_assert_eq!(
-            origins.len(),
-            points.len(),
-            "origins must be parallel to points"
-        );
-        let key = TableKey {
-            db: db.to_string(),
-            rp: rp.to_string(),
-            measurement: measurement.to_string(),
-        };
-        let ensure_start = std::time::Instant::now();
-        let ensured = self.ensure_table(&key, points).await?;
-        histogram!("hyperbytedb_flush_sink_ensure_table_seconds")
-            .record(ensure_start.elapsed().as_secs_f64());
-
-        // Partial-line coalescing runs in the flush service over the full
-        // measurement batch (before max_points_per_batch splitting).
-        // Deterministic series id per (post-coalesce) point. Register any
-        // brand-new series into the dimension table + metadata before inserting
-        // the fact rows, so tag-resolving queries always find the series row.
-        let sids: Vec<u64> = points.iter().map(series_id_for_point).collect();
-        self.register_new_series(&key, &ensured, points, &sids)
-            .await?;
-
-        let row_count = points.len();
-        let (min_time, max_time) = if self.use_arrow {
-            // Arrow path: build the RecordBatch on this (async) task — it only
-            // reads points by reference, no deep Point clone — then move the
-            // Arc-backed batch into `spawn_blocking` for the FFI insert.
-            let build_start = std::time::Instant::now();
-            let (batch, min_time, max_time) =
-                build_record_batch(&ensured, origins, ingest_seq_base, points, &sids)?;
-            histogram!("hyperbytedb_flush_sink_build_insert_sql_seconds")
-                .record(build_start.elapsed().as_secs_f64());
-
-            let pool = self.session.pool()?;
-            let table = ensured.table.clone();
-            let insert_start = std::time::Instant::now();
-            let insert_options = self.insert_options.clone();
-            tokio::task::spawn_blocking(move || {
-                pool.with_connection(|conn| {
-                    insert_record_batch_direct(conn, &table, batch, insert_options).map_err(|e| {
-                        HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e))
-                    })
-                })
-            })
-            .await
-            .map_err(|e| {
-                HyperbytedbError::Internal(format!("chDB arrow insert join error: {e}").into())
-            })??;
-            histogram!("hyperbytedb_flush_sink_chdb_insert_seconds")
-                .record(insert_start.elapsed().as_secs_f64());
-            (min_time, max_time)
-        } else {
-            // Legacy SQL VALUES path (HYPERBYTEDB_DISABLE_ARROW_INSERT=1).
-            let build_insert_start = std::time::Instant::now();
-            let (sql, min_time, max_time) =
-                build_insert_sql(&ensured, origins, ingest_seq_base, points, &sids)?;
-            histogram!("hyperbytedb_flush_sink_build_insert_sql_seconds")
-                .record(build_insert_start.elapsed().as_secs_f64());
-
-            let insert_start = std::time::Instant::now();
-            self.execute(sql).await?;
-            histogram!("hyperbytedb_flush_sink_chdb_insert_seconds")
-                .record(insert_start.elapsed().as_secs_f64());
-            (min_time, max_time)
-        };
-
-        Ok(WriteAck {
-            min_time,
-            max_time,
-            row_count,
-        })
+        let out = self
+            .write_points_inner(db, rp, measurement, origins, ingest_seq_base, points)
+            .await;
+        self.forget_schema_on_missing_column(db, rp, measurement, &out);
+        out
     }
 
     async fn write_prepared_batch(
@@ -1524,62 +1489,9 @@ impl PointsSinkPort for ChdbNativeAdapter {
         rp: &str,
         batch: &crate::domain::prepared_wal::PreparedMeasurementBatch,
     ) -> Result<WriteAck, HyperbytedbError> {
-        if batch.row_count == 0 {
-            return Ok(WriteAck {
-                min_time: 0,
-                max_time: 0,
-                row_count: 0,
-            });
-        }
-        counter!("hyperbytedb_flush_sink_writes_total", "path" => "prepared").increment(1);
-
-        let key = TableKey {
-            db: db.to_string(),
-            rp: rp.to_string(),
-            measurement: batch.measurement.clone(),
-        };
-
-        // Re-align legacy sparse prepared batches (pre-coalesce WAL entries)
-        // to the current metadata-driven table schema before insert.
-        let ensured = self.ensure_table::<Point>(&key, &[]).await?;
-
-        if let Some(ref series_batch) = batch.new_series_batch {
-            self.insert_prepared_series(&key, &ensured, series_batch)
-                .await?;
-        }
-
-        if !self.use_arrow {
-            return Err(HyperbytedbError::Internal(crate::error::ChainedError::new(
-                "prepared batch path requires Arrow inserts",
-            )));
-        }
-
-        let padded = pad_record_batch_to_ensured(&batch.batch, &ensured)?;
-
-        let pool = self.session.pool()?;
-        let table = batch.table_name.clone();
-        let fact = Arc::new(padded);
-        let insert_start = std::time::Instant::now();
-        let insert_options = self.insert_options.clone();
-        tokio::task::spawn_blocking(move || {
-            let batch = (*fact).clone();
-            pool.with_connection(|conn| {
-                insert_record_batch_direct(conn, &table, batch, insert_options)
-                    .map_err(|e| HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e)))
-            })
-        })
-        .await
-        .map_err(|e| {
-            HyperbytedbError::Internal(format!("chDB prepared insert join: {e}").into())
-        })??;
-        histogram!("hyperbytedb_flush_sink_chdb_insert_seconds", "path" => "prepared")
-            .record(insert_start.elapsed().as_secs_f64());
-
-        Ok(WriteAck {
-            min_time: batch.min_time,
-            max_time: batch.max_time,
-            row_count: batch.row_count,
-        })
+        let out = self.write_prepared_batch_inner(db, rp, batch).await;
+        self.forget_schema_on_missing_column(db, rp, &batch.measurement, &out);
+        out
     }
 
     async fn build_prepared_wal_slot(
@@ -1688,6 +1600,195 @@ impl PointsSinkPort for ChdbNativeAdapter {
         self.known_series.write().pop(&key);
         self.ddl_locks.lock().await.pop(&key);
         Ok(())
+    }
+}
+
+impl ChdbNativeAdapter {
+    async fn write_points_inner(
+        &self,
+        db: &str,
+        rp: &str,
+        measurement: &str,
+        origins: &[u64],
+        ingest_seq_base: u64,
+        points: &[Point],
+    ) -> Result<WriteAck, HyperbytedbError> {
+        if points.is_empty() {
+            return Ok(WriteAck {
+                min_time: 0,
+                max_time: 0,
+                row_count: 0,
+            });
+        }
+        debug_assert_eq!(
+            origins.len(),
+            points.len(),
+            "origins must be parallel to points"
+        );
+        let key = TableKey {
+            db: db.to_string(),
+            rp: rp.to_string(),
+            measurement: measurement.to_string(),
+        };
+        let ensure_start = std::time::Instant::now();
+        let ensured = self.ensure_table(&key, points).await?;
+        histogram!("hyperbytedb_flush_sink_ensure_table_seconds")
+            .record(ensure_start.elapsed().as_secs_f64());
+
+        // Partial-line coalescing runs in the flush service over the full
+        // measurement batch (before max_points_per_batch splitting).
+        // Deterministic series id per (post-coalesce) point. Register any
+        // brand-new series into the dimension table + metadata before inserting
+        // the fact rows, so tag-resolving queries always find the series row.
+        let sids: Vec<u64> = points.iter().map(series_id_for_point).collect();
+        self.register_new_series(&key, &ensured, points, &sids)
+            .await?;
+
+        let row_count = points.len();
+        let (min_time, max_time) = if self.use_arrow {
+            // Arrow path: build the RecordBatch on this (async) task — it only
+            // reads points by reference, no deep Point clone — then move the
+            // Arc-backed batch into `spawn_blocking` for the FFI insert.
+            let build_start = std::time::Instant::now();
+            let (batch, min_time, max_time) =
+                build_record_batch(&ensured, origins, ingest_seq_base, points, &sids)?;
+            histogram!("hyperbytedb_flush_sink_build_insert_sql_seconds")
+                .record(build_start.elapsed().as_secs_f64());
+
+            let pool = self.session.pool()?;
+            let table = ensured.table.clone();
+            let insert_start = std::time::Instant::now();
+            let insert_options = self.insert_options.clone();
+            tokio::task::spawn_blocking(move || {
+                pool.with_connection(|conn| {
+                    insert_record_batch_direct(conn, &table, batch, insert_options).map_err(|e| {
+                        HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e))
+                    })
+                })
+            })
+            .await
+            .map_err(|e| {
+                HyperbytedbError::Internal(format!("chDB arrow insert join error: {e}").into())
+            })??;
+            histogram!("hyperbytedb_flush_sink_chdb_insert_seconds")
+                .record(insert_start.elapsed().as_secs_f64());
+            (min_time, max_time)
+        } else {
+            // Legacy SQL VALUES path (HYPERBYTEDB_DISABLE_ARROW_INSERT=1).
+            let build_insert_start = std::time::Instant::now();
+            let (sql, min_time, max_time) =
+                build_insert_sql(&ensured, origins, ingest_seq_base, points, &sids)?;
+            histogram!("hyperbytedb_flush_sink_build_insert_sql_seconds")
+                .record(build_insert_start.elapsed().as_secs_f64());
+
+            let insert_start = std::time::Instant::now();
+            self.execute(sql).await?;
+            histogram!("hyperbytedb_flush_sink_chdb_insert_seconds")
+                .record(insert_start.elapsed().as_secs_f64());
+            (min_time, max_time)
+        };
+
+        Ok(WriteAck {
+            min_time,
+            max_time,
+            row_count,
+        })
+    }
+
+    async fn write_prepared_batch_inner(
+        &self,
+        db: &str,
+        rp: &str,
+        batch: &crate::domain::prepared_wal::PreparedMeasurementBatch,
+    ) -> Result<WriteAck, HyperbytedbError> {
+        if batch.row_count == 0 {
+            return Ok(WriteAck {
+                min_time: 0,
+                max_time: 0,
+                row_count: 0,
+            });
+        }
+        counter!("hyperbytedb_flush_sink_writes_total", "path" => "prepared").increment(1);
+
+        let key = TableKey {
+            db: db.to_string(),
+            rp: rp.to_string(),
+            measurement: batch.measurement.clone(),
+        };
+
+        // Re-align legacy sparse prepared batches (pre-coalesce WAL entries)
+        // to the current metadata-driven table schema before insert.
+        let ensured = self.ensure_table::<Point>(&key, &[]).await?;
+
+        if let Some(ref series_batch) = batch.new_series_batch {
+            self.insert_prepared_series(&key, &ensured, series_batch)
+                .await?;
+        }
+
+        if !self.use_arrow {
+            return Err(HyperbytedbError::Internal(crate::error::ChainedError::new(
+                "prepared batch path requires Arrow inserts",
+            )));
+        }
+
+        let padded = pad_record_batch_to_ensured(&batch.batch, &ensured)?;
+
+        let pool = self.session.pool()?;
+        let table = batch.table_name.clone();
+        let fact = Arc::new(padded);
+        let insert_start = std::time::Instant::now();
+        let insert_options = self.insert_options.clone();
+        tokio::task::spawn_blocking(move || {
+            let batch = (*fact).clone();
+            pool.with_connection(|conn| {
+                insert_record_batch_direct(conn, &table, batch, insert_options)
+                    .map_err(|e| HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e)))
+            })
+        })
+        .await
+        .map_err(|e| {
+            HyperbytedbError::Internal(format!("chDB prepared insert join: {e}").into())
+        })??;
+        histogram!("hyperbytedb_flush_sink_chdb_insert_seconds", "path" => "prepared")
+            .record(insert_start.elapsed().as_secs_f64());
+
+        Ok(WriteAck {
+            min_time: batch.min_time,
+            max_time: batch.max_time,
+            row_count: batch.row_count,
+        })
+    }
+
+    /// Forget the cached schema of a table whose insert failed on a missing
+    /// column, so the next attempt re-plans it (CREATE IF NOT EXISTS, then
+    /// ADD COLUMN IF NOT EXISTS for every column it needs) instead of
+    /// retrying the same insert against the same wrong cache. A flush retries
+    /// forever, so a stale cache otherwise grows the WAL until the node OOMs.
+    fn forget_schema_on_missing_column<T>(
+        &self,
+        db: &str,
+        rp: &str,
+        measurement: &str,
+        out: &Result<T, HyperbytedbError>,
+    ) {
+        let Err(e) = out else { return };
+        if !e.to_string().contains("NO_SUCH_COLUMN_IN_TABLE") {
+            return;
+        }
+        let key = TableKey {
+            db: db.to_string(),
+            rp: rp.to_string(),
+            measurement: measurement.to_string(),
+        };
+        self.schemas.write().pop(&key);
+        self.series_schemas.write().pop(&key);
+        counter!("hyperbytedb_chdb_schema_cache_resets_total").increment(1);
+        tracing::warn!(
+            db,
+            rp,
+            measurement,
+            "insert hit a missing column; re-planning table schema"
+        );
     }
 }
 
