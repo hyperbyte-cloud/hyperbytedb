@@ -309,15 +309,20 @@ impl RocksDbMetadata {
     ) -> Result<u64, HyperbytedbError> {
         let rdb = self.db.clone();
         let prefix = series_prefix(db, rp, measurement);
+        let first = series_storage_key(db, rp, measurement, start);
         meta_blocking(move || {
             let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
                 HyperbytedbError::Metadata("metadata column family not found".into())
             })?;
             let pbytes = prefix.as_bytes();
+            // Seek to the first id in range: ids are fixed-width hex, so key
+            // order is id order. Starting at the prefix walked every series
+            // below `start`, for every region, on every heartbeat, and a
+            // node's series count grows with the cluster.
             let iter = rdb.iterator_cf_opt(
                 &cf,
                 rocksdb::ReadOptions::default(),
-                IteratorMode::From(pbytes, rocksdb::Direction::Forward),
+                IteratorMode::From(first.as_bytes(), rocksdb::Direction::Forward),
             );
             let mut count = 0u64;
             for item in iter {
@@ -356,15 +361,17 @@ impl RocksDbMetadata {
     ) -> Result<Option<u64>, HyperbytedbError> {
         let rdb = self.db.clone();
         let prefix = series_prefix(db, rp, measurement);
+        let first = series_storage_key(db, rp, measurement, start);
         meta_blocking(move || {
             let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
                 HyperbytedbError::Metadata("metadata column family not found".into())
             })?;
             let pbytes = prefix.as_bytes();
+            // Seek to the first id in range, as in `count_series_ids_blocking`.
             let iter = rdb.iterator_cf_opt(
                 &cf,
                 rocksdb::ReadOptions::default(),
-                IteratorMode::From(pbytes, rocksdb::Direction::Forward),
+                IteratorMode::From(first.as_bytes(), rocksdb::Direction::Forward),
             );
             let mut seen = 0u64;
             for item in iter {
@@ -2386,5 +2393,44 @@ impl MetadataPort for RocksDbMetadata {
         .await?;
         *self.mv_cache.write() = None;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod series_range_tests {
+    use super::*;
+
+    /// Ranges that start mid-space, with series exactly at `start` (in) and
+    /// at `end` (out), and another measurement sorting right after this one.
+    #[tokio::test]
+    async fn range_counts_and_medians_cover_exactly_start_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = RocksDbMetadata::open(dir.path()).unwrap();
+        let ids: Vec<u64> = vec![1, 10, 100, 1_000, 1 << 40, 1 << 62, u64::MAX - 1];
+        let series: Vec<(u64, BTreeMap<String, String>)> =
+            ids.iter().map(|id| (*id, BTreeMap::new())).collect();
+        meta.register_series_batch("db", "autogen", "cpu", &series)
+            .await
+            .unwrap();
+        meta.register_series_batch("db", "autogen", "cpu2", &series)
+            .await
+            .unwrap();
+
+        let count = |start, end| meta.count_series_ids_in_range("db", "autogen", "cpu", start, end);
+        assert_eq!(count(0, u64::MAX).await.unwrap(), 7);
+        assert_eq!(
+            count(10, 1_000).await.unwrap(),
+            2,
+            "10 and 100; 1000 is the end"
+        );
+        assert_eq!(count(11, 1 << 40).await.unwrap(), 2, "100 and 1000");
+        assert_eq!(count(1 << 40, u64::MAX).await.unwrap(), 3);
+        assert_eq!(count(2, 10).await.unwrap(), 0);
+
+        let median =
+            |start, end| meta.median_series_id_in_range("db", "autogen", "cpu", start, end);
+        assert_eq!(median(10, 1 << 62).await.unwrap(), Some(1_000));
+        assert_eq!(median(1 << 40, u64::MAX).await.unwrap(), Some(1 << 62));
+        assert_eq!(median(2, 10).await.unwrap(), None);
     }
 }
