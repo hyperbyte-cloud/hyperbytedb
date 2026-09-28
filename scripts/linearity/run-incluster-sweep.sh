@@ -12,6 +12,8 @@ NODES_LIST="${NODES_LIST:-3 6}"
 SERIES_PER_NODE="${SERIES_PER_NODE:-125000}"
 MEASURE_POINTS="${MEASURE_POINTS:-2000000}"
 CONCURRENCY="${CONCURRENCY:-32}"
+# Points per client write. Telegraf's default metric_batch_size is 1000.
+BATCH="${BATCH:-1000}"
 # Client pods per cluster node. One Python client tops out near 900k
 # lines/s, so a single pod measured the client at N=3, not the cluster.
 CLIENTS_PER_NODE="${CLIENTS_PER_NODE:-2}"
@@ -118,6 +120,7 @@ spec:
             - "--series=${series}"
             - "--measure-points=${MEASURE_POINTS}"
             - "--concurrency=${CONCURRENCY}"
+            - "--batch=${BATCH}"
             - "--phase=${phase}"
             - "--db=${DB}"
             - "--workers=${workers}"
@@ -137,7 +140,7 @@ JOB
   echo "# Linearity sweep (in-cluster client)"
   echo ""
   echo "**Date:** $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  echo "**Series per node:** $SERIES_PER_NODE   **Measure points:** $MEASURE_POINTS   **Concurrency:** $CONCURRENCY per client, $CLIENTS_PER_NODE clients per node"
+  echo "**Series per node:** $SERIES_PER_NODE   **Measure points:** $MEASURE_POINTS   **Concurrency:** $CONCURRENCY per client, $CLIENTS_PER_NODE clients per node   **Batch:** $BATCH points"
   echo ""
   echo "| N | series | regions | primaries | points/sec | errors | retries | vs baseline | valid |"
   echo "|---|--------|---------|-----------|------------|--------|---------|-------------|-------|"
