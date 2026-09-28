@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::application::stage_timer::StageTimer;
 use async_trait::async_trait;
 use metrics::{counter, histogram};
 
@@ -151,6 +152,7 @@ impl PeerIngestionService {
         let ctx = self.shard_routing.as_ref().ok_or_else(|| {
             HyperbytedbError::Internal("sharding context missing on ingest path".into())
         })?;
+        let mut stage = StageTimer::new("hyperbytedb_sharded_write_stage_seconds");
         let mut measurements = std::collections::HashSet::new();
         for p in &points {
             // contains-then-insert avoids a String allocation per point.
@@ -187,8 +189,10 @@ impl PeerIngestionService {
             .await?;
         }
 
+        stage.lap("validate");
         let buckets = partition_points(ctx, db, rp, points).await?;
         let precision_val = Precision::from_str_opt(precision);
+        stage.lap("partition");
 
         // Forward every non-local region bucket concurrently with bounded
         // parallelism: a batch spanning many regions must not pay serial
@@ -214,6 +218,7 @@ impl PeerIngestionService {
                 .into_iter()
                 .map(|(_, r)| r)
                 .collect();
+        stage.lap("forward_fanout");
         let mut forward_failures = 0usize;
         let mut first_forward_error: Option<HyperbytedbError> = None;
         // Every failure was a primary shedding load: the client should back
@@ -264,6 +269,7 @@ impl PeerIngestionService {
                 Some(&self.schema_cache),
             )
             .await?;
+            stage.lap("local_metadata");
             let wal_seq = append_points_with_prepared(
                 self.wal.as_ref(),
                 self.sink.as_ref(),
@@ -274,6 +280,7 @@ impl PeerIngestionService {
                 self.max_points_per_request,
             )
             .await?;
+            stage.lap("local_wal");
 
             let map = ctx.shard_map.snapshot().await?;
             for (region_id, region_points) in buckets.local {
@@ -300,6 +307,7 @@ impl PeerIngestionService {
                 })
                 .await?;
             }
+            stage.lap("local_replicate");
         }
 
         // Reported after the local append, so a remote region's failure never
@@ -309,6 +317,13 @@ impl PeerIngestionService {
         // suite could not, and read the difference as duplication.
         if let Some(err) = first_forward_error {
             counter!("hyperbytedb_shard_ingest_partial_total").increment(1);
+            // A capacity-only failure makes the client resend the whole
+            // batch, including every region that did land.
+            if all_capacity {
+                counter!("hyperbytedb_shard_ingest_capacity_retry_total").increment(1);
+                counter!("hyperbytedb_shard_ingest_capacity_retry_regions_landed_total")
+                    .increment((forward_region_count - forward_failures) as u64);
+            }
             metrics::counter!("hyperbytedb_shard_ingest_forward_region_failures_total")
                 .increment(forward_failures as u64);
             return Err(partial_write_error(

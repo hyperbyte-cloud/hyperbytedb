@@ -30,5 +30,6 @@ pub mod shard_routing;
 pub mod shard_scheduler;
 pub mod shard_transfer;
 pub mod sharded_mv_backfill;
+pub mod stage_timer;
 pub mod statement_summary;
 pub mod wal_append;

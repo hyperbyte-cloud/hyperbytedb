@@ -217,8 +217,11 @@ async fn admit(
     let permits = admission_cost(cost, admission.capacity);
     match admission.sem.clone().try_acquire_many_owned(permits) {
         Ok(permit) => {
+            let start = std::time::Instant::now();
             let resp = next.run(request).await;
             drop(permit);
+            metrics::histogram!("hyperbytedb_admitted_request_seconds", "kind" => kind)
+                .record(start.elapsed().as_secs_f64());
             resp
         }
         Err(_) => {

@@ -391,6 +391,8 @@ async fn apply_shard_write_batch(
         }
     };
 
+    let mut stage =
+        crate::application::stage_timer::StageTimer::new("hyperbytedb_shard_primary_stage_seconds");
     // Check and parse each part; group the good ones by (db, rp).
     let mut groups: Vec<ForwardGroup> = Vec::new();
     for (index, req) in parts.into_iter().enumerate() {
@@ -447,6 +449,7 @@ async fn apply_shard_write_batch(
         }
     }
 
+    stage.lap("check_parse");
     for ForwardGroup {
         db,
         rp,
@@ -455,6 +458,7 @@ async fn apply_shard_write_batch(
     } in groups
     {
         let outcome = append_forwarded_group(state, &db, &rp, points).await;
+        stage.lap("metadata_wal");
         let wal_seq = match outcome {
             Ok(seq) => seq,
             Err((status, msg)) => {
@@ -479,7 +483,9 @@ async fn apply_shard_write_batch(
                 (m.index, region_id, result)
             }
         });
-        for (index, region_id, result) in futures::future::join_all(replicated).await {
+        let replicated = futures::future::join_all(replicated).await;
+        stage.lap("replicate");
+        for (index, region_id, result) in replicated {
             results[index] = Some(match result {
                 Ok(()) => part_result(region_id, StatusCode::NO_CONTENT, None),
                 Err(e) => part_result(

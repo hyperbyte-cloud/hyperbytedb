@@ -620,6 +620,7 @@ pub async fn forward_shard_writes_by_node(
         };
         let client = ctx.peer_client.http_client();
         sends.push(async move {
+            let start = std::time::Instant::now();
             let resp = client
                 .post(format!("http://{addr}/internal/shard/write-batch"))
                 .header("Content-Type", "application/octet-stream")
@@ -627,10 +628,18 @@ pub async fn forward_shard_writes_by_node(
                 .timeout(timeout)
                 .send()
                 .await;
+            let outcome = match &resp {
+                Ok(r) if r.status().is_success() => "ok",
+                Ok(r) if r.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE => "capacity",
+                _ => "error",
+            };
+            metrics::histogram!("hyperbytedb_shard_forward_request_seconds", "outcome" => outcome)
+                .record(start.elapsed().as_secs_f64());
             (node, region_ids, resp)
         });
     }
     counter!("hyperbytedb_shard_forward_batches_total").increment(sends.len() as u64);
+    metrics::histogram!("hyperbytedb_shard_forward_nodes_per_write").record(sends.len() as f64);
 
     for (node, region_ids, resp) in futures::future::join_all(sends).await {
         let resp = match resp {
