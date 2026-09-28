@@ -1577,3 +1577,123 @@ async fn a_partial_multi_region_write_keeps_the_local_bucket_and_reports_partial
          failure; got {rows} rows"
     );
 }
+
+/// A forwarded batch: parts that pass their checks share one WAL entry on
+/// the primary; each failing part still gets its own status; each good
+/// part still replicates to its region's peers.
+#[tokio::test]
+#[serial(chdb)]
+async fn forwarded_parts_share_one_wal_entry_and_fail_one_by_one() {
+    use hyperbytedb::domain::sharding::{
+        ShardWriteBatch, ShardWriteBatchResponse, ShardWriteRequest,
+    };
+    use hyperbytedb::ports::wal::WalPort;
+
+    let dir = tempfile::tempdir().unwrap();
+    let nodes = start_sharded_pair_cluster(dir.path(), ShardedClusterOptions::default()).await;
+    let client = reqwest::Client::new();
+    for node in &nodes {
+        create_db(&client, &node.url, "sharddb").await;
+    }
+    let region = |id: u64, primary: u64| ShardRegion {
+        region_id: id,
+        start: 0,
+        end: u64::MAX,
+        epoch: ShardEpoch::default(),
+        peers: vec![1, 2],
+        primary,
+        last_split_at: 0,
+        transfer_verified: None,
+        transfer_first_seen: None,
+        state: Default::default(),
+        staged_from: None,
+        staging_peers: Vec::new(),
+    };
+    for (measurement, id, primary) in [("cpu", 1, 1), ("mem", 2, 1), ("disk", 3, 2)] {
+        let op = ShardMapOp::BootstrapMeasurement {
+            key: MeasurementKey::new("sharddb", "autogen", measurement),
+            region: region(id, primary),
+        };
+        for node in &nodes {
+            node.shard_map.apply_op(op.clone()).await.unwrap();
+        }
+    }
+
+    let part = |region_id: u64, epoch: ShardEpoch, line: &str| ShardWriteRequest {
+        db: "sharddb".into(),
+        rp: "autogen".into(),
+        precision: None,
+        epoch,
+        region_id,
+        body: line.as_bytes().to_vec(),
+    };
+    let stale = ShardEpoch {
+        conf_ver: 9,
+        ..Default::default()
+    };
+    let batch = ShardWriteBatch {
+        parts: vec![
+            part(1, ShardEpoch::default(), "cpu,host=a value=1 1000000000"),
+            part(2, ShardEpoch::default(), "mem,host=a used=2 1000000000"),
+            part(1, stale, "cpu,host=b value=3 1000000000"),
+            part(7, ShardEpoch::default(), "cpu,host=c value=4 1000000000"),
+            part(3, ShardEpoch::default(), "disk,host=a free=5 1000000000"),
+        ],
+    };
+
+    let primary_before = nodes[0].wal.last_sequence().await.unwrap();
+    let replica_before = nodes[1].wal.last_sequence().await.unwrap();
+    let resp = client
+        .post(format!("{}/internal/shard/write-batch", nodes[0].url))
+        .body(bincode::serialize(&batch).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let out: ShardWriteBatchResponse = resp.json().await.unwrap();
+    let statuses: Vec<(u64, u16)> = out
+        .results
+        .iter()
+        .map(|r| (r.region_id, r.status))
+        .collect();
+    assert_eq!(
+        statuses,
+        vec![(1, 204), (2, 204), (1, 409), (7, 404), (3, 409)],
+        "good parts applied; stale epoch, unknown region and not-primary refused"
+    );
+
+    let appended = nodes[0].wal.read_from(primary_before + 1).await.unwrap();
+    let shape: Vec<(u64, String, Vec<String>)> = appended
+        .iter()
+        .map(|(s, e)| {
+            (
+                *s,
+                e.database.clone(),
+                e.points.iter().map(|p| p.measurement.clone()).collect(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        appended.len(),
+        1,
+        "the two good parts share one WAL entry: {shape:?}"
+    );
+    assert_eq!(appended[0].1.points.len(), 2);
+
+    let mut replicated = 0usize;
+    for _ in 0..200 {
+        replicated = nodes[1]
+            .wal
+            .read_from(replica_before + 1)
+            .await
+            .unwrap()
+            .iter()
+            .map(|(_, e)| e.points.len())
+            .sum();
+        if replicated >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(replicated, 2, "both good parts reached the region peer");
+}

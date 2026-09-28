@@ -17,12 +17,14 @@ use crate::application::shard_routing::{bootstrap_measurement_local, build_boots
 use crate::application::shard_transfer::apply_transfer;
 use crate::application::sharded_mv_backfill::apply_mv_backfill_sql;
 use crate::application::wal_append::append_points_with_prepared;
+use crate::domain::point::Point;
 use crate::domain::sharding::{
     MeasurementKey, RegionHeartbeat, ShardBootstrapRequest, ShardDeleteRequest, ShardEpoch,
     ShardMap, ShardMapJson, ShardMetadataKind, ShardMetadataRequest, ShardMvBackfillRequest,
     ShardQueryRequest, ShardRegion, ShardRehomeRequest, ShardTransferPayload, ShardWriteBatch,
     ShardWriteBatchResponse, ShardWritePartResult, ShardWriteRequest,
 };
+use crate::error::HyperbytedbError;
 use crate::ports::replication::OutboundReplicationBatch;
 use crate::ports::sharding::ShardMapPort;
 
@@ -299,9 +301,18 @@ pub async fn handle_shard_write(
 /// POST /internal/shard/write-batch: several regions' forwarded writes for
 /// this node as primary, bincode-encoded [`ShardWriteBatch`].
 ///
-/// Each part goes through exactly the single-region path (epoch, ownership,
-/// primary check, WAL append, replication), concurrently, and its status is
-/// reported per part: one stale region must not fail the others.
+/// Each part is checked (epoch, ownership, primary) and parsed on its own,
+/// and its status is reported per part: one stale region must not fail the
+/// others. Parts that pass and share a database and retention policy are
+/// then prepared and appended to the WAL together.
+///
+/// Appending each part on its own made a client batch cost one metadata
+/// pass, one Arrow build and one WAL append per region: at N=12 on n3 a
+/// 1,000-point batch split into ~61 parts of ~16 points. The WAL does not
+/// need an entry per region -- catch-up copies the whole WAL, and region
+/// watermarks are the node's last sequence -- so the parts share one entry.
+/// Replication stays per part, because each region has its own peers; the
+/// replication sender merges them per peer.
 pub async fn handle_shard_write_batch(
     State(state): State<Arc<AppState>>,
     body: Bytes,
@@ -318,29 +329,268 @@ pub async fn handle_shard_write_batch(
     };
     counter!("hyperbytedb_shard_write_batches_total").increment(1);
     counter!("hyperbytedb_shard_write_batch_parts_total").increment(batch.parts.len() as u64);
-    let parts = batch.parts.into_iter().map(|part| {
-        let state = state.clone();
-        async move {
-            let region_id = part.region_id;
-            let resp = apply_shard_write(state, part).await;
-            let status = resp.status();
-            let error = if status.is_success() {
-                None
-            } else {
-                axum::body::to_bytes(resp.into_body(), 4096)
-                    .await
-                    .ok()
-                    .map(|b| String::from_utf8_lossy(&b).into_owned())
-            };
-            ShardWritePartResult {
-                region_id,
-                status: status.as_u16(),
-                error,
-            }
-        }
-    });
-    let results = futures::future::join_all(parts).await;
+    let results = apply_shard_write_batch(&state, batch.parts).await;
     (StatusCode::OK, Json(ShardWriteBatchResponse { results })).into_response()
+}
+
+fn part_result(region_id: u64, status: StatusCode, error: Option<String>) -> ShardWritePartResult {
+    ShardWritePartResult {
+        region_id,
+        status: status.as_u16(),
+        error: error.map(|e| serde_json::json!({ "error": e }).to_string()),
+    }
+}
+
+/// A forwarded part that passed its checks, parsed and waiting for its
+/// group's WAL append.
+struct ReadyPart {
+    index: usize,
+    req: ShardWriteRequest,
+    region: ShardRegion,
+    point_count: u64,
+}
+
+/// Forwarded parts for one (db, rp) that will share a WAL append.
+struct ForwardGroup {
+    db: String,
+    rp: String,
+    members: Vec<ReadyPart>,
+    points: Vec<Point>,
+}
+
+async fn apply_shard_write_batch(
+    state: &Arc<AppState>,
+    parts: Vec<ShardWriteRequest>,
+) -> Vec<ShardWritePartResult> {
+    let mut results: Vec<Option<ShardWritePartResult>> = vec![None; parts.len()];
+    let Some(ctx) = state.shard_routing.as_ref() else {
+        return parts
+            .iter()
+            .map(|p| {
+                part_result(
+                    p.region_id,
+                    StatusCode::BAD_REQUEST,
+                    Some("sharding disabled".into()),
+                )
+            })
+            .collect();
+    };
+    let map = match ctx.shard_map.snapshot().await {
+        Ok(m) => m,
+        Err(e) => {
+            return parts
+                .iter()
+                .map(|p| {
+                    part_result(
+                        p.region_id,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Some(e.to_string()),
+                    )
+                })
+                .collect();
+        }
+    };
+
+    // Check and parse each part; group the good ones by (db, rp).
+    let mut groups: Vec<ForwardGroup> = Vec::new();
+    for (index, req) in parts.into_iter().enumerate() {
+        let region = match forwarded_write_region(&map, state.node_id, &req) {
+            Ok(r) => r,
+            Err((status, msg)) => {
+                results[index] = Some(part_result(req.region_id, status, Some(msg.into())));
+                continue;
+            }
+        };
+        let points = match parse_line_body_to_points_limited(
+            &req.body,
+            req.precision.as_deref(),
+            state.max_points_per_request,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                results[index] = Some(part_result(
+                    req.region_id,
+                    StatusCode::BAD_REQUEST,
+                    Some(e.to_string()),
+                ));
+                continue;
+            }
+        };
+        let point_count = points.len() as u64;
+        let ready = ReadyPart {
+            index,
+            req,
+            region,
+            point_count,
+        };
+        // Keep a group within one request's point limit (0 means the
+        // default, as in `validate_point_count`).
+        let limit = match state.max_points_per_request {
+            0 => crate::config::default_max_points_per_request(),
+            n => n,
+        };
+        match groups.iter_mut().find(|g| {
+            g.db == ready.req.db
+                && g.rp == ready.req.rp
+                && g.points.len() + point_count as usize <= limit
+        }) {
+            Some(g) => {
+                g.members.push(ready);
+                g.points.extend(points);
+            }
+            None => groups.push(ForwardGroup {
+                db: ready.req.db.clone(),
+                rp: ready.req.rp.clone(),
+                members: vec![ready],
+                points,
+            }),
+        }
+    }
+
+    for ForwardGroup {
+        db,
+        rp,
+        members,
+        points,
+    } in groups
+    {
+        let outcome = append_forwarded_group(state, &db, &rp, points).await;
+        let wal_seq = match outcome {
+            Ok(seq) => seq,
+            Err((status, msg)) => {
+                for m in members {
+                    results[m.index] =
+                        Some(part_result(m.req.region_id, status, Some(msg.clone())));
+                }
+                continue;
+            }
+        };
+        let replicated = members.into_iter().map(|m| {
+            let state = state.clone();
+            async move {
+                let region_id = m.req.region_id;
+                let result = replicate_forwarded_part(&state, m.req, &m.region, wal_seq).await;
+                if result.is_ok() {
+                    if let Some(ctx) = state.shard_routing.as_ref() {
+                        ctx.region_write_stats.record(region_id, m.point_count);
+                    }
+                    counter!("hyperbytedb_shard_forwarded_writes_applied_total").increment(1);
+                }
+                (m.index, region_id, result)
+            }
+        });
+        for (index, region_id, result) in futures::future::join_all(replicated).await {
+            results[index] = Some(match result {
+                Ok(()) => part_result(region_id, StatusCode::NO_CONTENT, None),
+                Err(e) => part_result(
+                    region_id,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Some(e.to_string()),
+                ),
+            });
+        }
+    }
+
+    results
+        .into_iter()
+        .map(|r| {
+            r.unwrap_or_else(|| {
+                part_result(
+                    0,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Some("part not processed".into()),
+                )
+            })
+        })
+        .collect()
+}
+
+/// Metadata pass and WAL append for one group of forwarded parts.
+async fn append_forwarded_group(
+    state: &AppState,
+    db: &str,
+    rp: &str,
+    points: Vec<Point>,
+) -> Result<u64, (StatusCode, String)> {
+    prepare_batch_metadata(
+        &state.metadata,
+        db,
+        rp,
+        &points,
+        state.ingest_cardinality,
+        Some(&state.ingest_schema_cache),
+    )
+    .await
+    .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    append_points_with_prepared(
+        state.wal.as_ref(),
+        Some(&state.points_sink),
+        db,
+        rp,
+        points,
+        state.node_id,
+        state.max_points_per_request,
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// Replicate one forwarded part to its region's peers.
+async fn replicate_forwarded_part(
+    state: &AppState,
+    req: ShardWriteRequest,
+    region: &ShardRegion,
+    wal_seq: u64,
+) -> Result<(), HyperbytedbError> {
+    let Some(pc) = state.peer_client.as_ref() else {
+        return Ok(());
+    };
+    let membership = pc.membership().read().await;
+    let targets = active_region_peer_targets(region, state.node_id, &membership);
+    drop(membership);
+    dispatch_outbound_replication(
+        pc.clone(),
+        state.node_id,
+        &state.cluster_replication,
+        OutboundReplicationBatch {
+            database: req.db,
+            retention_policy: req.rp,
+            precision: req.precision,
+            body: req.body,
+            wal_seq,
+            target_node_ids: Some(targets),
+            region_id: Some(region.region_id),
+        },
+    )
+    .await
+}
+
+/// The region a forwarded write targets, if this node may accept it: the
+/// region exists at the sender's epoch, this node holds it, and is its
+/// primary.
+fn forwarded_write_region(
+    map: &ShardMap,
+    node_id: u64,
+    req: &ShardWriteRequest,
+) -> Result<ShardRegion, (StatusCode, &'static str)> {
+    let Some(region) = lookup_region_in_db_rp(map, &req.db, &req.rp, req.region_id) else {
+        return Err((StatusCode::NOT_FOUND, "region not found"));
+    };
+    if region.epoch != req.epoch {
+        return Err((StatusCode::CONFLICT, "stale epoch"));
+    }
+    if !region.peers.contains(&node_id) {
+        return Err((StatusCode::FORBIDDEN, "not owner"));
+    }
+    // Single-writer invariant: only the region primary may accept a forwarded
+    // write. A replica accepting one would append to its own WAL concurrently
+    // with the primary, diverging watermarks and replication. 409 (not 403)
+    // so the coordinator's forward path treats it as stale ownership, refreshes
+    // the region from the shard map, and re-routes to the current primary.
+    if region.primary != node_id {
+        return Err((StatusCode::CONFLICT, "not region primary"));
+    }
+    Ok(region)
 }
 
 async fn apply_shard_write(
@@ -366,42 +616,12 @@ async fn apply_shard_write(
         }
     };
 
-    let region = lookup_region_in_db_rp(&map, &req.db, &req.rp, req.region_id);
-
-    let Some(region) = region else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "region not found"})),
-        )
-            .into_response();
+    let region = match forwarded_write_region(&map, state.node_id, &req) {
+        Ok(r) => r,
+        Err((status, msg)) => {
+            return (status, Json(serde_json::json!({"error": msg}))).into_response();
+        }
     };
-
-    if region.epoch != req.epoch {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": "stale epoch"})),
-        )
-            .into_response();
-    }
-    if !region.peers.contains(&state.node_id) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error": "not owner"})),
-        )
-            .into_response();
-    }
-    // Single-writer invariant: only the region primary may accept a forwarded
-    // write. A replica accepting one would append to its own WAL concurrently
-    // with the primary, diverging watermarks and replication. 409 (not 403)
-    // so the coordinator's forward path treats it as stale ownership, refreshes
-    // the region from the shard map, and re-routes to the current primary.
-    if region.primary != state.node_id {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": "not region primary"})),
-        )
-            .into_response();
-    }
 
     let points = match parse_line_body_to_points_limited(
         &req.body,
