@@ -1363,7 +1363,11 @@ impl ChdbNativeAdapter {
 
         use crate::domain::prepared_wal::PreparedMeasurementBatch;
 
+        let mut stage = crate::application::stage_timer::StageTimer::new(
+            "hyperbytedb_prepare_measurement_stage_seconds",
+        );
         let ensured = self.ensure_table(key, points).await?;
+        stage.lap("ensure_table");
         let origins = vec![origin_node_id; points.len()];
         let sids: Vec<u64> = points
             .iter()
@@ -1372,9 +1376,11 @@ impl ChdbNativeAdapter {
         let new_series_batch = self
             .build_new_series_batch(key, &ensured, points, &sids)
             .await?;
+        stage.lap("new_series");
 
         let (batch, min_time, max_time) =
             build_record_batch(&ensured, &origins, ingest_seq_base, points, &sids)?;
+        stage.lap("record_batch");
 
         Ok(PreparedMeasurementBatch {
             measurement: key.measurement.clone(),

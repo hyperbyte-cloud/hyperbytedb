@@ -34,6 +34,7 @@ pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
 
 async fn serve_inner(config: HyperbytedbConfig) -> anyhow::Result<()> {
     let bootstrapped = build_services(&config).await?;
+    crate::application::stage_timer::spawn_scheduling_probe();
     let disk_paths = bootstrapped.disk_paths.clone();
     let disk_config = bootstrapped.disk_config.clone();
     let disk_read_only = bootstrapped.disk_read_only.clone();

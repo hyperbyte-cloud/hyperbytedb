@@ -37,12 +37,16 @@ pub async fn append_points_with_prepared(
                     points,
                     origin_node_id,
                 };
-                return wal
+                let append_start = std::time::Instant::now();
+                let seq = wal
                     .append_bundle(WalAppendBundle {
                         entry,
                         prepared: Some(prepared),
                     })
                     .await;
+                histogram!("hyperbytedb_wal_append_bundle_seconds")
+                    .record(append_start.elapsed().as_secs_f64());
+                return seq;
             }
             Err(e) => {
                 tracing::debug!(error = %e, "prepared WAL build failed; falling back");

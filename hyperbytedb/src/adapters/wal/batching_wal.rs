@@ -174,6 +174,7 @@ impl BatchingWal {
         // time, so this is safe and moves the per-point serialization cost off
         // the writer (the measured ingest bottleneck). ArrowIpc still encodes
         // inline because its payload is patched with the assigned seq.
+        let encode_start = Instant::now();
         let pre_encoded =
             if self.inner.wal_format() == WalFormat::Bincode {
                 Some(bincode::serialize(&bundle.entry).map_err(|e| {
@@ -182,6 +183,8 @@ impl BatchingWal {
             } else {
                 None
             };
+        histogram!("hyperbytedb_wal_batcher_encode_seconds")
+            .record(encode_start.elapsed().as_secs_f64());
         let (tx, rx) = oneshot::channel();
         let req = BatchRequest {
             bundle,

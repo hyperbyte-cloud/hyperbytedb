@@ -27,3 +27,20 @@ impl StageTimer {
         self.last = now;
     }
 }
+
+/// Measure how late the async runtime wakes a task: sleep 10 ms, record how
+/// much longer it took. Starved workers (blocked on a lock, or the whole
+/// pod frozen by its CPU quota) show up here whatever the cause.
+pub fn spawn_scheduling_probe() {
+    tokio::spawn(async {
+        let nominal = std::time::Duration::from_millis(10);
+        loop {
+            let start = Instant::now();
+            tokio::time::sleep(nominal).await;
+            let late = start.elapsed().saturating_sub(nominal);
+            metrics::histogram!("hyperbytedb_runtime_wake_delay_seconds")
+                .record(late.as_secs_f64());
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
+    });
+}
