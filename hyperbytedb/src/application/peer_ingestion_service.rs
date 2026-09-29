@@ -60,16 +60,25 @@ pub struct PeerIngestionService {
 }
 
 /// Queued forward batches delivered at once by the drainer.
-const FORWARD_DRAIN_CONCURRENCY: usize = 4;
+const FORWARD_DRAIN_CONCURRENCY: usize = 8;
 /// Most queue entries (client writes' forwarded shares) per drained batch.
-const FORWARD_DRAIN_MAX_ENTRIES: usize = 256;
-const FORWARD_DRAIN_MAX_BYTES: u64 = 8 * 1024 * 1024;
-/// Delivery attempts before a queued forward is dropped. With backoff capped
-/// at 5 s this is several minutes of a primary refusing it.
+///
+/// Kept small on purpose. A batch goes out as one forward per primary, and
+/// primaries admit forwarded writes by size (64 KiB per write slot). At 256
+/// entries a forward to one node was ~2 MB, costing most of that node's
+/// admission budget, so it was refused unless the node was idle: 822k
+/// regions refused "at capacity" in one run on n3, the queue lagged by tens
+/// of seconds, and most writes fell back to synchronous forwarding.
+const FORWARD_DRAIN_MAX_ENTRIES: usize = 16;
+const FORWARD_DRAIN_MAX_BYTES: u64 = 1024 * 1024;
+/// Delivery attempts before a queued forward is dropped.
 const FORWARD_MAX_ATTEMPTS: u32 = 100;
 
+/// Retry delay. Capped well under the lag limit: a retry keeps its original
+/// timestamp, so a long backoff alone would hold the queue's age over the
+/// limit and push every new write back to synchronous forwarding.
 fn forward_backoff_ms(attempts: u32) -> u64 {
-    (100u64 << attempts.min(6)).min(5_000)
+    (50u64 << attempts.min(5)).min(1_000)
 }
 
 impl PeerIngestionService {
