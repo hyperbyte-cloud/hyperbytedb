@@ -619,15 +619,24 @@ pub async fn forward_shard_writes_by_node(
             }
         };
         let client = ctx.peer_client.http_client();
-        sends.push(async move {
+        let span = tracing::debug_span!(
+            target: crate::telemetry::TARGET,
+            "forward",
+            node,
+            regions = region_ids.len(),
+            bytes = body.len()
+        );
+        sends.push(tracing::Instrument::instrument(async move {
             let start = std::time::Instant::now();
-            let resp = client
-                .post(format!("http://{addr}/internal/shard/write-batch"))
-                .header("Content-Type", "application/octet-stream")
-                .body(body)
-                .timeout(timeout)
-                .send()
-                .await;
+            let resp = crate::telemetry::inject(
+                client
+                    .post(format!("http://{addr}/internal/shard/write-batch"))
+                    .header("Content-Type", "application/octet-stream"),
+            )
+            .body(body)
+            .timeout(timeout)
+            .send()
+            .await;
             let outcome = match &resp {
                 Ok(r) if r.status().is_success() => "ok",
                 Ok(r) if r.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE => "capacity",
@@ -636,7 +645,7 @@ pub async fn forward_shard_writes_by_node(
             metrics::histogram!("hyperbytedb_shard_forward_request_seconds", "outcome" => outcome)
                 .record(start.elapsed().as_secs_f64());
             (node, region_ids, resp)
-        });
+        }, span));
     }
     counter!("hyperbytedb_shard_forward_batches_total").increment(sends.len() as u64);
     metrics::histogram!("hyperbytedb_shard_forward_nodes_per_write").record(sends.len() as f64);

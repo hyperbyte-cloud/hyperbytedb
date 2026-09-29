@@ -225,7 +225,11 @@ impl PeerIngestionService {
         }
 
         stage.lap("validate");
-        let buckets = partition_points(ctx, db, rp, points).await?;
+        let buckets = tracing::Instrument::instrument(
+            partition_points(ctx, db, rp, points),
+            tracing::debug_span!(target: crate::telemetry::TARGET, "partition"),
+        )
+        .await?;
         let precision_val = Precision::from_str_opt(precision);
         stage.lap("partition");
 
@@ -262,13 +266,23 @@ impl PeerIngestionService {
         let forward_region_count = buckets.forward.len();
         let forwards = async {
             let start = std::time::Instant::now();
-            let results =
-                forward_shard_writes_by_node(ctx, db, rp, precision, &buckets.forward).await;
+            let results = tracing::Instrument::instrument(
+                forward_shard_writes_by_node(ctx, db, rp, precision, &buckets.forward),
+                tracing::debug_span!(
+                    target: crate::telemetry::TARGET,
+                    "forward_fanout",
+                    regions = buckets.forward.len()
+                ),
+            )
+            .await;
             metrics::histogram!("hyperbytedb_sharded_write_stage_seconds", "stage" => "forward_fanout")
                 .record(start.elapsed().as_secs_f64());
             results
         };
-        let local = self.append_local_buckets(ctx, db, rp, precision, precision_val, buckets.local);
+        let local = tracing::Instrument::instrument(
+            self.append_local_buckets(ctx, db, rp, precision, precision_val, buckets.local),
+            tracing::debug_span!(target: crate::telemetry::TARGET, "local_append"),
+        );
         let (forward_results, local_result) = tokio::join!(forwards, local);
         let forward_results: Vec<Result<(), HyperbytedbError>> =
             forward_results.into_iter().map(|(_, r)| r).collect();

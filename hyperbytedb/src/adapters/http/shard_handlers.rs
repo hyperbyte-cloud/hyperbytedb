@@ -315,6 +315,7 @@ pub async fn handle_shard_write(
 /// replication sender merges them per peer.
 pub async fn handle_shard_write_batch(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
     let batch: ShardWriteBatch = match bincode::deserialize(&body) {
@@ -329,7 +330,15 @@ pub async fn handle_shard_write_batch(
     };
     counter!("hyperbytedb_shard_write_batches_total").increment(1);
     counter!("hyperbytedb_shard_write_batch_parts_total").increment(batch.parts.len() as u64);
-    let results = apply_shard_write_batch(&state, batch.parts).await;
+    let span = tracing::debug_span!(
+        target: crate::telemetry::TARGET,
+        "shard_write_batch",
+        node = state.node_id,
+        parts = batch.parts.len()
+    );
+    crate::telemetry::set_parent(&span, &headers);
+    let results =
+        tracing::Instrument::instrument(apply_shard_write_batch(&state, batch.parts), span).await;
     (StatusCode::OK, Json(ShardWriteBatchResponse { results })).into_response()
 }
 
@@ -457,7 +466,11 @@ async fn apply_shard_write_batch(
         points,
     } in groups
     {
-        let outcome = append_forwarded_group(state, &db, &rp, points).await;
+        let outcome = tracing::Instrument::instrument(
+            append_forwarded_group(state, &db, &rp, points),
+            tracing::debug_span!(target: crate::telemetry::TARGET, "metadata_wal"),
+        )
+        .await;
         stage.lap("metadata_wal");
         let wal_seq = match outcome {
             Ok(seq) => seq,
@@ -483,7 +496,11 @@ async fn apply_shard_write_batch(
                 (m.index, region_id, result)
             }
         });
-        let replicated = futures::future::join_all(replicated).await;
+        let replicated = tracing::Instrument::instrument(
+            futures::future::join_all(replicated),
+            tracing::debug_span!(target: crate::telemetry::TARGET, "replicate"),
+        )
+        .await;
         stage.lap("replicate");
         for (index, region_id, result) in replicated {
             results[index] = Some(match result {

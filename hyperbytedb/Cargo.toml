@@ -107,6 +107,10 @@ colored = "3.1.1"
 simd-json = { version = "0.17.0", features = ["serde_impl"] }
 humantime = "2"
 lru = "0.12"
+opentelemetry = { version = "0.33.0", optional = true }
+opentelemetry_sdk = { version = "0.33.0", optional = true }
+tracing-opentelemetry = { version = "0.34.0", optional = true }
+opentelemetry-otlp = { version = "0.33.0", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace"], optional = true }
 
 [features]
 default = ["columnar-ingest"]
@@ -114,6 +118,14 @@ columnar-ingest = []
 # In-process CPU profiler at /debug/pprof/profile on the control listener.
 # Off by default; build with it (and unstripped symbols) to diagnose hot spots.
 profiling = ["dep:pprof"]
+# Export request traces over OTLP (set OTEL_EXPORTER_OTLP_ENDPOINT).
+# Off by default; see src/telemetry.rs.
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+]
 
 [[bench]]
 name = "ingestion_line_protocol"

@@ -58,18 +58,7 @@ async fn main() -> anyhow::Result<()> {
         Err(_) => tracing_subscriber::EnvFilter::new(&config.logging.level),
     };
 
-    if config.logging.format == "json" {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .json()
-            .try_init()
-            .map_err(|e| anyhow::anyhow!("failed to set logging subscriber: {e}"))?;
-    } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .try_init()
-            .map_err(|e| anyhow::anyhow!("failed to set logging subscriber: {e}"))?;
-    }
+    let _telemetry = hyperbytedb::telemetry::init_logging(filter, config.logging.format == "json")?;
 
     match cli.command {
         Commands::Serve => serve(config).await,
