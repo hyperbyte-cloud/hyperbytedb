@@ -689,6 +689,10 @@ impl PeerIngestionService {
 
 #[async_trait]
 impl IngestionPort for PeerIngestionService {
+    fn pending_forwards(&self) -> usize {
+        self.forward_queue.as_ref().map_or(0, |q| q.len())
+    }
+
     async fn ingest(
         &self,
         db: &str,

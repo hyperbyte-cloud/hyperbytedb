@@ -122,6 +122,18 @@ async fn maybe_self_retire_after_evacuation(state: &AppState) {
     if still_owns {
         return;
     }
+    // Writes this node acknowledged but has not yet delivered to their
+    // primaries live only in its forward queue; retiring would let the pod
+    // be deleted with them.
+    let owed = state.ingestion.pending_forwards();
+    if owed > 0 {
+        tracing::info!(
+            node_id = state.node_id,
+            owed,
+            "evacuated but still delivering queued forwards; not retiring yet"
+        );
+        return;
+    }
     let mut m = membership.write().await;
     if m.transition(state.node_id, NodeState::Leaving) {
         counter!("hyperbytedb_shard_decommission_completed_total").increment(1);

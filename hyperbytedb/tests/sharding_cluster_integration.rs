@@ -1928,3 +1928,90 @@ async fn a_queued_forward_follows_its_region_to_a_new_primary() {
     assert_eq!(landed, vec!["mem".to_string()]);
     assert!(queue.is_empty());
 }
+
+/// A decommissioning node that has evacuated its regions must not retire
+/// (report Leaving, which lets the operator delete it) while it still owes
+/// queued forwards.
+#[tokio::test]
+#[serial(chdb)]
+async fn a_departing_node_waits_for_its_forward_queue_before_retiring() {
+    use hyperbytedb::domain::cluster::membership::NodeState;
+
+    let dir = tempfile::tempdir().unwrap();
+    let opts = ShardedClusterOptions {
+        forward_queue: true,
+        ..Default::default()
+    };
+    let [n1, mut n2] = start_sharded_pair_cluster(dir.path(), opts).await;
+    let client = reqwest::Client::new();
+    for node in [&n1, &n2] {
+        create_db(&client, &node.url, "sharddb").await;
+    }
+    // Only node 2 holds data; node 1 is a pure coordinator.
+    let op = ShardMapOp::BootstrapMeasurement {
+        key: MeasurementKey::new("sharddb", "autogen", "mem"),
+        region: ShardRegion {
+            region_id: 2,
+            start: 0,
+            end: u64::MAX,
+            epoch: ShardEpoch::default(),
+            peers: vec![2],
+            primary: 2,
+            last_split_at: 0,
+            transfer_verified: None,
+            transfer_first_seen: None,
+            state: Default::default(),
+            staged_from: None,
+            staging_peers: Vec::new(),
+        },
+    };
+    for node in [&n1, &n2] {
+        node.shard_map.apply_op(op.clone()).await.unwrap();
+        let snap = node.shard_map.snapshot().await.unwrap();
+        node.location_cache.refresh_from_map(&snap);
+    }
+    stop_node(&mut n2);
+    let resp = write_line(&client, &n1.url, "sharddb", "mem,host=a used=1 1000000000").await;
+    assert_eq!(resp.status(), 204);
+    let queue = n1.forward_queue.as_ref().unwrap();
+    assert_eq!(queue.len(), 1);
+
+    set_node_state(&n1.membership, 1, NodeState::Decommissioning).await;
+    let health = |url: String| {
+        let client = client.clone();
+        async move {
+            let body: serde_json::Value = client
+                .get(format!("{url}/health"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            body["state"].as_str().unwrap_or_default().to_lowercase()
+        }
+    };
+    assert_eq!(
+        health(n1.url.clone()).await,
+        "decommissioning",
+        "still owes a forward"
+    );
+
+    // Once the queue is empty the node retires.
+    // The drainer may hold the entry for a moment; keep taking until empty.
+    for _ in 0..200 {
+        let owed: Vec<u64> = queue
+            .claim(u64::MAX, 100, u64::MAX)
+            .unwrap()
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        queue.complete(&owed).unwrap();
+        if queue.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(queue.is_empty());
+    assert_eq!(health(n1.url.clone()).await, "leaving");
+}
