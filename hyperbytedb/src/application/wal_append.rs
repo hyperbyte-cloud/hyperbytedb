@@ -45,7 +45,13 @@ pub async fn append_points_with_prepared(
                         entry,
                         prepared: Some(prepared),
                     }),
-                    tracing::debug_span!(target: crate::telemetry::TARGET, "wal_batcher"),
+                    tracing::debug_span!(
+                        target: crate::telemetry::TARGET,
+                        "wal_batcher",
+                        queued_ms = tracing::field::Empty,
+                        write_ms = tracing::field::Empty,
+                        batch_len = tracing::field::Empty
+                    ),
                 )
                 .await;
                 histogram!("hyperbytedb_wal_append_bundle_seconds")
