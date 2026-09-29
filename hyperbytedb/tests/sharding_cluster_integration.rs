@@ -1773,3 +1773,158 @@ async fn the_local_share_lands_when_a_forward_fails() {
         "the local region landed, alone"
     );
 }
+
+/// Pair cluster with the forward queue on: `cpu` lives on node 1, `mem` on
+/// node 2 (`mem_peers` decides who else holds it).
+async fn queued_pair(
+    dir: &std::path::Path,
+    mem_peers: Vec<u64>,
+    max_lag_ms: u64,
+) -> [ShardedTestNode; 2] {
+    let mut opts = ShardedClusterOptions {
+        forward_queue: true,
+        ..Default::default()
+    };
+    opts.sharding.async_forward_max_lag_ms = max_lag_ms;
+    let nodes = start_sharded_pair_cluster(dir, opts).await;
+    let client = reqwest::Client::new();
+    for node in &nodes {
+        create_db(&client, &node.url, "sharddb").await;
+    }
+    let region = |id: u64, peers: Vec<u64>, primary: u64| ShardRegion {
+        region_id: id,
+        start: 0,
+        end: u64::MAX,
+        epoch: ShardEpoch::default(),
+        peers,
+        primary,
+        last_split_at: 0,
+        transfer_verified: None,
+        transfer_first_seen: None,
+        state: Default::default(),
+        staged_from: None,
+        staging_peers: Vec::new(),
+    };
+    for (measurement, r) in [
+        ("cpu", region(1, vec![1], 1)),
+        ("mem", region(2, mem_peers, 2)),
+    ] {
+        let op = ShardMapOp::BootstrapMeasurement {
+            key: MeasurementKey::new("sharddb", "autogen", measurement),
+            region: r,
+        };
+        for node in &nodes {
+            node.shard_map.apply_op(op.clone()).await.unwrap();
+            let snap = node.shard_map.snapshot().await.unwrap();
+            node.location_cache.refresh_from_map(&snap);
+        }
+    }
+    nodes
+}
+
+async fn measurements_in_wal_after(node: &ShardedTestNode, after: u64) -> Vec<String> {
+    use hyperbytedb::ports::wal::WalPort;
+    node.wal
+        .read_from(after + 1)
+        .await
+        .unwrap()
+        .iter()
+        .flat_map(|(_, e)| e.points.iter().map(|p| p.measurement.clone()))
+        .collect()
+}
+
+/// A write is acknowledged once its forwarded share is queued, and the
+/// queue delivers it to the primary well inside the lag budget.
+#[tokio::test]
+#[serial(chdb)]
+async fn a_queued_forward_is_acknowledged_and_reaches_its_primary() {
+    use hyperbytedb::ports::wal::WalPort;
+
+    let dir = tempfile::tempdir().unwrap();
+    let [n1, n2] = queued_pair(dir.path(), vec![2], 1_000).await;
+    let client = reqwest::Client::new();
+    let before = n2.wal.last_sequence().await.unwrap();
+
+    let resp = write_line(
+        &client,
+        &n1.url,
+        "sharddb",
+        "cpu,host=a value=1 1000000000\nmem,host=a used=2 1000000000",
+    )
+    .await;
+    assert_eq!(resp.status(), 204);
+
+    let queue = n1.forward_queue.as_ref().unwrap();
+    let mut landed = Vec::new();
+    for _ in 0..100 {
+        landed = measurements_in_wal_after(&n2, before).await;
+        if !landed.is_empty() && queue.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        landed,
+        vec!["mem".to_string()],
+        "the primary got the forwarded point"
+    );
+    assert!(queue.is_empty(), "delivered entries leave the queue");
+}
+
+/// With the primary down the write is still acknowledged and stays queued;
+/// once the queue is older than the lag limit, new writes forward
+/// synchronously again and report the failure.
+#[tokio::test]
+#[serial(chdb)]
+async fn a_lagging_queue_sends_new_writes_back_to_synchronous_forwarding() {
+    let dir = tempfile::tempdir().unwrap();
+    let [n1, mut n2] = queued_pair(dir.path(), vec![2], 200).await;
+    stop_node(&mut n2);
+    let client = reqwest::Client::new();
+
+    let first = write_line(&client, &n1.url, "sharddb", "mem,host=a used=1 1000000000").await;
+    assert_eq!(first.status(), 204, "queued while the primary is down");
+    let queue = n1.forward_queue.as_ref().unwrap();
+    assert_eq!(queue.len(), 1);
+
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let second = write_line(&client, &n1.url, "sharddb", "mem,host=b used=2 1000000000").await;
+    assert!(
+        !second.status().is_success(),
+        "past the lag limit a write forwards synchronously and sees the failure"
+    );
+    assert!(
+        !queue.is_empty(),
+        "the first write is still owed, not dropped"
+    );
+}
+
+/// A queued forward is routed against the shard map at delivery: when its
+/// region's primary has moved to the coordinator, it lands locally.
+#[tokio::test]
+#[serial(chdb)]
+async fn a_queued_forward_follows_its_region_to_a_new_primary() {
+    use hyperbytedb::ports::wal::WalPort;
+
+    let dir = tempfile::tempdir().unwrap();
+    let [n1, mut n2] = queued_pair(dir.path(), vec![1, 2], 5_000).await;
+    stop_node(&mut n2);
+    let client = reqwest::Client::new();
+    let before = n1.wal.last_sequence().await.unwrap();
+
+    let resp = write_line(&client, &n1.url, "sharddb", "mem,host=a used=1 1000000000").await;
+    assert_eq!(resp.status(), 204);
+    promote_region_primary_on_nodes(&[&n1], "sharddb", "autogen", "mem", 1).await;
+
+    let queue = n1.forward_queue.as_ref().unwrap();
+    let mut landed = Vec::new();
+    for _ in 0..200 {
+        landed = measurements_in_wal_after(&n1, before).await;
+        if !landed.is_empty() && queue.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(landed, vec!["mem".to_string()]);
+    assert!(queue.is_empty());
+}

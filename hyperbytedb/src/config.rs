@@ -130,6 +130,22 @@ pub struct ShardingConfig {
     /// is excluded from placement candidates and may be removed from regions.
     #[serde(default = "default_dead_node_timeout_secs")]
     pub dead_node_timeout_secs: u64,
+    /// Acknowledge a write once the regions it forwards to other primaries
+    /// are durable in this node's forward queue, and forward them in the
+    /// background. Replication is already asynchronous; this bounds how far a
+    /// primary trails its coordinators instead of making every client write
+    /// wait for the slowest of N-1 forwards. Takes effect where the queue is
+    /// wired (a clustered server).
+    #[serde(default = "default_async_forward")]
+    pub async_forward: bool,
+    /// When the oldest queued forward is older than this, new writes forward
+    /// synchronously again until the queue catches up. Keeps primaries well
+    /// inside the few seconds of lag users would notice.
+    #[serde(default = "default_async_forward_max_lag_ms")]
+    pub async_forward_max_lag_ms: u64,
+    /// Queued forward bytes above which new writes forward synchronously.
+    #[serde(default = "default_async_forward_max_bytes")]
+    pub async_forward_max_bytes: u64,
 }
 
 impl Default for ShardingConfig {
@@ -158,6 +174,9 @@ impl Default for ShardingConfig {
             remove_peer_proposals_enabled: default_remove_peer_proposals_enabled(),
             binary_points_wire: default_binary_points_wire(),
             bootstrap_regions_per_node: default_bootstrap_regions_per_node(),
+            async_forward: default_async_forward(),
+            async_forward_max_lag_ms: default_async_forward_max_lag_ms(),
+            async_forward_max_bytes: default_async_forward_max_bytes(),
             movement_budget_bytes_per_sec: default_movement_budget_bytes_per_sec(),
             dead_node_timeout_secs: default_dead_node_timeout_secs(),
         }
@@ -261,6 +280,18 @@ fn default_binary_points_wire() -> bool {
 
 fn default_bootstrap_regions_per_node() -> usize {
     2
+}
+
+fn default_async_forward() -> bool {
+    true
+}
+
+fn default_async_forward_max_lag_ms() -> u64 {
+    1_000
+}
+
+fn default_async_forward_max_bytes() -> u64 {
+    256 * 1024 * 1024
 }
 
 fn default_movement_budget_bytes_per_sec() -> u64 {

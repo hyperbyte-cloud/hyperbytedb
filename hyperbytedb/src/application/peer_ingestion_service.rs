@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::adapters::cluster::forward_queue::{self, ForwardEntry, ForwardQueue};
 use crate::application::stage_timer::StageTimer;
 use async_trait::async_trait;
 use metrics::{counter, histogram};
@@ -53,6 +54,22 @@ pub struct PeerIngestionService {
     shard_routing: Option<Arc<ShardRoutingContext>>,
     is_raft_leader: Arc<dyn Fn() -> bool + Send + Sync>,
     raft_leader_addr: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    /// Durable queue of forwards owed to other primaries; `None` forwards
+    /// every write synchronously. See [`ForwardQueue`].
+    forward_queue: Option<Arc<ForwardQueue>>,
+}
+
+/// Queued forward batches delivered at once by the drainer.
+const FORWARD_DRAIN_CONCURRENCY: usize = 4;
+/// Most queue entries (client writes' forwarded shares) per drained batch.
+const FORWARD_DRAIN_MAX_ENTRIES: usize = 256;
+const FORWARD_DRAIN_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// Delivery attempts before a queued forward is dropped. With backoff capped
+/// at 5 s this is several minutes of a primary refusing it.
+const FORWARD_MAX_ATTEMPTS: u32 = 100;
+
+fn forward_backoff_ms(attempts: u32) -> u64 {
+    (100u64 << attempts.min(6)).min(5_000)
 }
 
 impl PeerIngestionService {
@@ -127,7 +144,16 @@ impl PeerIngestionService {
             shard_routing: None,
             is_raft_leader: Arc::new(|| false),
             raft_leader_addr: Arc::new(|| None),
+            forward_queue: None,
         }
+    }
+
+    /// Acknowledge writes once their forwarded share is in `queue`; see
+    /// `ShardingConfig::async_forward`. Call [`Self::spawn_forward_drainer`]
+    /// to deliver it.
+    pub fn with_forward_queue(mut self, queue: Arc<ForwardQueue>) -> Self {
+        self.forward_queue = Some(queue);
+        self
     }
 
     pub fn with_sharding(
@@ -194,6 +220,15 @@ impl PeerIngestionService {
         let precision_val = Precision::from_str_opt(precision);
         stage.lap("partition");
 
+        if self.queue_forwards(ctx, db, rp, precision, &buckets.forward) {
+            // Acknowledged once the forwarded share is durable here; the
+            // drainer delivers it to the primaries.
+            stage.lap("queue_forwards");
+            return self
+                .append_local_buckets(ctx, db, rp, precision, precision_val, buckets.local)
+                .await;
+        }
+
         // Forward every non-local region bucket concurrently with bounded
         // parallelism: a batch spanning many regions must not pay serial
         // HTTP round-trips.
@@ -219,7 +254,7 @@ impl PeerIngestionService {
         let forwards = async {
             let start = std::time::Instant::now();
             let results =
-                forward_shard_writes_by_node(ctx, db, rp, precision, buckets.forward).await;
+                forward_shard_writes_by_node(ctx, db, rp, precision, &buckets.forward).await;
             metrics::histogram!("hyperbytedb_sharded_write_stage_seconds", "stage" => "forward_fanout")
                 .record(start.elapsed().as_secs_f64());
             results
@@ -290,6 +325,279 @@ impl PeerIngestionService {
         }
 
         Ok(())
+    }
+
+    /// Queue the regions this write forwards to other primaries, when async
+    /// forwarding is on and the queue is keeping up. `false` means the caller
+    /// forwards synchronously, which also slows clients while the queue
+    /// catches up.
+    fn queue_forwards(
+        &self,
+        ctx: &ShardRoutingContext,
+        db: &str,
+        rp: &str,
+        precision: Option<&str>,
+        forward: &std::collections::HashMap<u64, Vec<crate::domain::point::Point>>,
+    ) -> bool {
+        let Some(queue) = self.forward_queue.as_ref() else {
+            return false;
+        };
+        if forward.is_empty() || !ctx.config.async_forward {
+            return false;
+        }
+        let now = forward_queue::now_ms();
+        let behind = if queue.oldest_age_ms(now) > ctx.config.async_forward_max_lag_ms {
+            Some("lag")
+        } else if queue.bytes() > ctx.config.async_forward_max_bytes {
+            Some("bytes")
+        } else {
+            None
+        };
+        if let Some(reason) = behind {
+            counter!("hyperbytedb_forward_queue_sync_fallback_total", "reason" => reason)
+                .increment(1);
+            return false;
+        }
+        // Frames concatenate, so each region's points encode on their own.
+        let mut body = Vec::new();
+        for points in forward.values() {
+            match crate::application::line_protocol::encode_points_binary(points) {
+                Ok(frame) => body.extend_from_slice(&frame),
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not encode forwards for the queue");
+                    return false;
+                }
+            }
+        }
+        let entry = ForwardEntry {
+            db: db.to_string(),
+            rp: rp.to_string(),
+            precision: precision.map(str::to_string),
+            enqueued_ms: now,
+            not_before_ms: 0,
+            attempts: 0,
+            body,
+        };
+        match queue.enqueue(&entry) {
+            Ok(_) => {
+                counter!("hyperbytedb_forward_queue_enqueued_total").increment(1);
+                true
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "forward queue enqueue failed; forwarding synchronously");
+                counter!("hyperbytedb_forward_queue_sync_fallback_total", "reason" => "error")
+                    .increment(1);
+                false
+            }
+        }
+    }
+
+    /// Deliver the forward queue in the background. Does nothing without a
+    /// queue and sharding.
+    pub fn spawn_forward_drainer(self: &Arc<Self>) {
+        let Some(queue) = self.forward_queue.clone() else {
+            return;
+        };
+        if self.shard_routing.is_none() {
+            return;
+        }
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            let permits = Arc::new(tokio::sync::Semaphore::new(FORWARD_DRAIN_CONCURRENCY));
+            loop {
+                let now = forward_queue::now_ms();
+                metrics::gauge!("hyperbytedb_forward_queue_entries").set(queue.len() as f64);
+                metrics::gauge!("hyperbytedb_forward_queue_bytes").set(queue.bytes() as f64);
+                metrics::gauge!("hyperbytedb_forward_queue_oldest_age_seconds")
+                    .set(queue.oldest_age_ms(now) as f64 / 1000.0);
+                let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
+                    return;
+                };
+                let batch =
+                    match queue.claim(now, FORWARD_DRAIN_MAX_ENTRIES, FORWARD_DRAIN_MAX_BYTES) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "forward queue claim failed");
+                            Vec::new()
+                        }
+                    };
+                if batch.is_empty() {
+                    drop(permit);
+                    tokio::select! {
+                        () = queue.notified() => {}
+                        () = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+                    }
+                    continue;
+                }
+                let this = Arc::clone(&this);
+                let queue = Arc::clone(&queue);
+                tokio::spawn(async move {
+                    this.drain_forward_batch(&queue, batch).await;
+                    drop(permit);
+                });
+            }
+        });
+    }
+
+    /// Deliver one claimed batch. Regions that fail go back on the queue with
+    /// their original timestamp; the batch's entries are then removed.
+    async fn drain_forward_batch(&self, queue: &ForwardQueue, batch: Vec<(u64, ForwardEntry)>) {
+        let Some(ctx) = self.shard_routing.as_ref() else {
+            return;
+        };
+        let mut groups: Vec<(ForwardEntry, Vec<u64>, Vec<crate::domain::point::Point>)> =
+            Vec::new();
+        for (seq, entry) in batch {
+            let points = match crate::application::line_protocol::parse_line_body_to_points_limited(
+                &entry.body,
+                None,
+                usize::MAX,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!(seq, error = %e, "undecodable queued forward; dropping");
+                    counter!("hyperbytedb_forward_queue_dropped_total", "reason" => "decode")
+                        .increment(1);
+                    Vec::new()
+                }
+            };
+            match groups.iter_mut().find(|(head, ..)| {
+                head.db == entry.db && head.rp == entry.rp && head.precision == entry.precision
+            }) {
+                Some((head, seqs, pts)) => {
+                    head.enqueued_ms = head.enqueued_ms.min(entry.enqueued_ms);
+                    head.attempts = head.attempts.max(entry.attempts);
+                    seqs.push(seq);
+                    pts.extend(points);
+                }
+                None => groups.push((
+                    ForwardEntry {
+                        body: Vec::new(),
+                        ..entry
+                    },
+                    vec![seq],
+                    points,
+                )),
+            }
+        }
+
+        for (head, seqs, points) in groups {
+            let now = forward_queue::now_ms();
+            match self
+                .deliver_forwards(ctx, &head.db, &head.rp, head.precision.as_deref(), points)
+                .await
+            {
+                Ok(failed) => {
+                    if failed.is_empty() {
+                        metrics::histogram!("hyperbytedb_forward_queue_delivery_lag_seconds")
+                            .record(now.saturating_sub(head.enqueued_ms) as f64 / 1000.0);
+                    } else {
+                        self.requeue_forwards(queue, &head, failed, now);
+                    }
+                    if let Err(e) = queue.complete(&seqs) {
+                        tracing::warn!(error = %e, "forward queue complete failed");
+                    }
+                }
+                Err(e) => {
+                    // Not even partitioned (e.g. the shard map could not be
+                    // read): leave the entries on disk and try again later.
+                    tracing::warn!(error = %e, "could not deliver queued forwards; will retry");
+                    queue.release(&seqs, now + forward_backoff_ms(head.attempts));
+                }
+            }
+        }
+    }
+
+    /// Route `points` against the current shard map and send them: this
+    /// node's own regions (its primaries may have moved here since) are
+    /// appended locally, the rest forwarded. Returns the points that did not
+    /// land.
+    async fn deliver_forwards(
+        &self,
+        ctx: &ShardRoutingContext,
+        db: &str,
+        rp: &str,
+        precision: Option<&str>,
+        points: Vec<crate::domain::point::Point>,
+    ) -> Result<Vec<crate::domain::point::Point>, HyperbytedbError> {
+        if points.is_empty() {
+            return Ok(Vec::new());
+        }
+        let buckets = partition_points(ctx, db, rp, points).await?;
+        let precision_val = Precision::from_str_opt(precision);
+        let local_points: Vec<crate::domain::point::Point> =
+            buckets.local.values().flatten().cloned().collect();
+        let forwards = forward_shard_writes_by_node(ctx, db, rp, precision, &buckets.forward);
+        let local = self.append_local_buckets(ctx, db, rp, precision, precision_val, buckets.local);
+        let (results, local_result) = tokio::join!(forwards, local);
+
+        let mut failed = Vec::new();
+        if let Err(e) = local_result {
+            tracing::warn!(error = %e, "queued forward's local share failed");
+            failed.extend(local_points);
+        }
+        let mut delivered = 0u64;
+        for (region_id, result) in results {
+            match result {
+                Ok(()) => delivered += 1,
+                Err(_) => {
+                    if let Some(p) = buckets.forward.get(&region_id) {
+                        failed.extend(p.iter().cloned());
+                    }
+                }
+            }
+        }
+        counter!("hyperbytedb_forward_queue_delivered_regions_total").increment(delivered);
+        Ok(failed)
+    }
+
+    fn requeue_forwards(
+        &self,
+        queue: &ForwardQueue,
+        head: &ForwardEntry,
+        failed: Vec<crate::domain::point::Point>,
+        now: u64,
+    ) {
+        let attempts = head.attempts + 1;
+        if attempts >= FORWARD_MAX_ATTEMPTS {
+            tracing::error!(
+                points = failed.len(),
+                attempts,
+                db = %head.db,
+                "dropping queued forward after repeated delivery failures"
+            );
+            counter!("hyperbytedb_forward_queue_dropped_total", "reason" => "attempts")
+                .increment(1);
+            metrics::counter!("hyperbytedb_forward_queue_dropped_points_total")
+                .increment(failed.len() as u64);
+            return;
+        }
+        let body = match crate::application::line_protocol::encode_points_binary(&failed) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(error = %e, "could not re-encode failed forwards; dropping");
+                counter!("hyperbytedb_forward_queue_dropped_total", "reason" => "encode")
+                    .increment(1);
+                return;
+            }
+        };
+        let entry = ForwardEntry {
+            db: head.db.clone(),
+            rp: head.rp.clone(),
+            precision: head.precision.clone(),
+            enqueued_ms: head.enqueued_ms,
+            not_before_ms: now + forward_backoff_ms(attempts),
+            attempts,
+            body,
+        };
+        match queue.enqueue(&entry) {
+            Ok(_) => counter!("hyperbytedb_forward_queue_retried_total").increment(1),
+            Err(e) => {
+                tracing::error!(error = %e, "could not requeue failed forwards; dropping");
+                counter!("hyperbytedb_forward_queue_dropped_total", "reason" => "requeue")
+                    .increment(1);
+            }
+        }
     }
 
     /// Append this node's own regions of a write to the WAL and replicate

@@ -1,4 +1,5 @@
 pub mod dns_cache;
+pub mod forward_queue;
 pub mod hinted_handoff;
 pub mod peer_client;
 pub mod raft;

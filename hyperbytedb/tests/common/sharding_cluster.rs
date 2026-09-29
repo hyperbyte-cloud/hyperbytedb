@@ -55,6 +55,8 @@ pub struct ShardedTestNode {
     flush: Arc<FlushServiceImpl>,
     handle: tokio::task::JoinHandle<()>,
     shutdown: Option<watch::Sender<bool>>,
+    /// Set when started with `ShardedClusterOptions::forward_queue`.
+    pub forward_queue: Option<Arc<hyperbytedb::adapters::cluster::forward_queue::ForwardQueue>>,
 }
 
 #[derive(Clone)]
@@ -68,6 +70,9 @@ pub struct ShardedClusterOptions {
     pub replication: ReplicationConfig,
     pub raft: Option<HyperbytedbRaft>,
     pub leader_callbacks: Option<Arc<RaftLeaderCallbacks>>,
+    /// Acknowledge writes once their forwards are queued, as a server does.
+    /// Off by default: most suites assert on synchronous forwarding.
+    pub forward_queue: bool,
 }
 
 impl Default for ShardedClusterOptions {
@@ -85,6 +90,7 @@ impl Default for ShardedClusterOptions {
             replication: ReplicationConfig::default(),
             raft: None,
             leader_callbacks: None,
+            forward_queue: false,
         }
     }
 }
@@ -206,23 +212,35 @@ pub async fn start_sharded_node(
     );
     let base_query: Arc<dyn QueryService> = Arc::new(base_query);
 
-    let ingestion: Arc<dyn hyperbytedb::ports::ingestion::IngestionPort> = Arc::new(
-        PeerIngestionService::with_replication_and_sink(
-            wal.clone(),
-            Some(sink.clone()),
-            metadata.clone(),
-            peer_client.clone(),
-            node_id,
-            IngestCardinalityLimits::default(),
-            0,
-            opts.replication.clone(),
-        )
-        .with_sharding(
-            shard_routing.clone(),
-            is_leader.clone(),
-            leader_addr.clone(),
-        ),
+    let mut ingestion_svc = PeerIngestionService::with_replication_and_sink(
+        wal.clone(),
+        Some(sink.clone()),
+        metadata.clone(),
+        peer_client.clone(),
+        node_id,
+        IngestCardinalityLimits::default(),
+        0,
+        opts.replication.clone(),
+    )
+    .with_sharding(
+        shard_routing.clone(),
+        is_leader.clone(),
+        leader_addr.clone(),
     );
+    let forward_queue = opts.forward_queue.then(|| {
+        Arc::new(
+            hyperbytedb::adapters::cluster::forward_queue::ForwardQueue::new(
+                peer_client.replication_log().db().clone(),
+            )
+            .unwrap(),
+        )
+    });
+    if let Some(q) = forward_queue.clone() {
+        ingestion_svc = ingestion_svc.with_forward_queue(q);
+    }
+    let ingestion_svc = Arc::new(ingestion_svc);
+    ingestion_svc.spawn_forward_drainer();
+    let ingestion: Arc<dyn hyperbytedb::ports::ingestion::IngestionPort> = ingestion_svc;
 
     let query: Arc<dyn QueryService> = Arc::new(PeerQueryService::new(
         base_query,
@@ -321,6 +339,7 @@ pub async fn start_sharded_node(
         flush,
         handle,
         shutdown: Some(shutdown_tx),
+        forward_queue,
     }
 }
 

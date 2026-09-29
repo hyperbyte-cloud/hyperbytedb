@@ -390,8 +390,22 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
                 Arc::new(move || cb_leader.is_leader()),
                 Arc::new(move || cb_addr.leader_addr()),
             );
+            // The queue shares the replication log's RocksDB, next to
+            // hinted handoff.
+            let queue = crate::adapters::cluster::forward_queue::ForwardQueue::new(
+                pc.replication_log().db().clone(),
+            )?;
+            if !queue.is_empty() {
+                tracing::info!(
+                    entries = queue.len(),
+                    "forward queue has writes from a previous run; delivering them"
+                );
+            }
+            svc = svc.with_forward_queue(Arc::new(queue));
         }
-        Arc::new(svc)
+        let svc = Arc::new(svc);
+        svc.spawn_forward_drainer();
+        svc
     } else {
         Arc::new(IngestionServiceImpl::with_sink(
             wal.clone(),

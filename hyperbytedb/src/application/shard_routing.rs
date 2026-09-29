@@ -538,7 +538,7 @@ pub async fn forward_shard_writes_by_node(
     db: &str,
     rp: &str,
     precision: Option<&str>,
-    forward: HashMap<u64, Vec<Point>>,
+    forward: &HashMap<u64, Vec<Point>>,
 ) -> Vec<(u64, Result<(), HyperbytedbError>)> {
     use crate::application::line_protocol::encode_points_to_line_protocol;
     use crate::domain::database::Precision;
@@ -1278,7 +1278,7 @@ mod scatter_tests {
             );
         }
 
-        let results = forward_shard_writes_by_node(&ctx, "db", "rp", None, forward).await;
+        let results = forward_shard_writes_by_node(&ctx, "db", "rp", None, &forward).await;
         assert_eq!(results.len(), 3);
         assert!(results.iter().all(|(_, r)| r.is_ok()), "{results:?}");
         assert_eq!(
