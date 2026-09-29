@@ -283,7 +283,10 @@ fn default_bootstrap_regions_per_node() -> usize {
 }
 
 fn default_async_forward() -> bool {
-    true
+    // Off until it beats synchronous forwarding: on n3 at N=12 it still
+    // lagged up to 5-7 s and raised client errors, because primaries refuse
+    // forwarded writes past their admission budget and the queue falls back.
+    false
 }
 
 fn default_async_forward_max_lag_ms() -> u64 {

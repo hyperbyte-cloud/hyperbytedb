@@ -1785,6 +1785,7 @@ async fn queued_pair(
         forward_queue: true,
         ..Default::default()
     };
+    opts.sharding.async_forward = true;
     opts.sharding.async_forward_max_lag_ms = max_lag_ms;
     let nodes = start_sharded_pair_cluster(dir, opts).await;
     let client = reqwest::Client::new();
@@ -1938,10 +1939,11 @@ async fn a_departing_node_waits_for_its_forward_queue_before_retiring() {
     use hyperbytedb::domain::cluster::membership::NodeState;
 
     let dir = tempfile::tempdir().unwrap();
-    let opts = ShardedClusterOptions {
+    let mut opts = ShardedClusterOptions {
         forward_queue: true,
         ..Default::default()
     };
+    opts.sharding.async_forward = true;
     let [n1, mut n2] = start_sharded_pair_cluster(dir.path(), opts).await;
     let client = reqwest::Client::new();
     for node in [&n1, &n2] {
