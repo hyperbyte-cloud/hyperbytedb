@@ -888,6 +888,44 @@ async fn write_admission_turns_excess_writes_away_at_once() {
     assert!(started.elapsed() < std::time::Duration::from_secs(1));
 }
 
+/// A write refused at capacity has its body read before the 503 goes out.
+/// Admission refuses on headers alone; closing the socket with the body
+/// unread makes the kernel send a reset, which discards the 503 before the
+/// sender reads it. On n3 (N=12, 10k-point batches) that turned 18k forward
+/// refusals into "connection closed before message completed" and 1,143
+/// client writes into non-retryable 500s.
+///
+/// A raw socket shows it on loopback: the whole body can be written, and the
+/// 503 read after it.
+#[tokio::test]
+#[serial(chdb)]
+async fn a_refused_write_is_read_to_the_end_before_the_503() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (_dir, app_state) = admission_app(0).await;
+    let (url, _handle) = start_server(app_state).await;
+    let addr = url.trim_start_matches("http://");
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let body = vec![b'x'; 16 * 1024 * 1024];
+    let head = format!(
+        "POST /write?db=testdb HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    sock.write_all(head.as_bytes()).await.unwrap();
+    for chunk in body.chunks(64 * 1024) {
+        sock.write_all(chunk)
+            .await
+            .expect("the server reads the refused body instead of resetting");
+    }
+    let mut resp = vec![0u8; 1024];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(5), sock.read(&mut resp))
+        .await
+        .unwrap()
+        .expect("the 503 survives");
+    let status = String::from_utf8_lossy(&resp[..n]);
+    assert!(status.starts_with("HTTP/1.1 503"), "got: {status}");
+}
+
 #[tokio::test]
 #[serial(chdb)]
 async fn write_admission_admits_within_capacity() {

@@ -227,6 +227,13 @@ async fn admit(
         Err(_) => {
             metrics::counter!("hyperbytedb_write_admission_rejected_total", "kind" => kind)
                 .increment(1);
+            let drained = drain_refused_body(request).await;
+            metrics::counter!(
+                "hyperbytedb_write_admission_drained_total",
+                "kind" => kind,
+                "drained" => if drained { "yes" } else { "no" }
+            )
+            .increment(1);
             let mut resp = (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "write capacity exhausted, retry shortly",
@@ -236,9 +243,46 @@ async fn admit(
                 axum::http::header::RETRY_AFTER,
                 axum::http::HeaderValue::from_static("1"),
             );
+            if !drained {
+                resp.headers_mut().insert(
+                    axum::http::header::CONNECTION,
+                    axum::http::HeaderValue::from_static("close"),
+                );
+            }
             resp
         }
     }
+}
+
+/// Most bytes and time spent reading a refused request's body.
+const REFUSED_DRAIN_MAX_BYTES: usize = 32 * 1024 * 1024;
+const REFUSED_DRAIN_MAX_TIME: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Read and discard the body of a request refused before its handler ran.
+///
+/// Admission refuses on headers alone. Closing a socket with the body still
+/// unread makes the kernel send a reset, and a reset discards whatever the
+/// peer has not read yet -- including the 503 -- so the sender saw
+/// "connection closed before message completed" instead of a retryable
+/// refusal. Returns false if the body was too large or too slow; the reply
+/// then asks the peer to close.
+async fn drain_refused_body(request: axum::extract::Request) -> bool {
+    use futures::StreamExt;
+    let mut body = request.into_body().into_data_stream();
+    let read = async {
+        let mut total = 0usize;
+        while let Some(chunk) = body.next().await {
+            let Ok(chunk) = chunk else { return false };
+            total += chunk.len();
+            if total > REFUSED_DRAIN_MAX_BYTES {
+                return false;
+            }
+        }
+        true
+    };
+    tokio::time::timeout(REFUSED_DRAIN_MAX_TIME, read)
+        .await
+        .unwrap_or(false)
 }
 
 /// Rate-limiting middleware for `/query`.
