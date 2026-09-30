@@ -1,6 +1,6 @@
 //! Coordinator scatter-gather for SHOW metadata commands under sharding.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use futures::future::try_join_all;
 
@@ -10,9 +10,10 @@ use crate::application::shard_peer_resolution::{RegionTargetRole, ScatterKind};
 use crate::application::shard_routing::{
     ShardRoutingContext, reload_region, scatter_to_region_peers,
 };
+use crate::domain::point::FieldValue;
 use crate::domain::sharding::{ShardMetadataKind, ShardMetadataRequest, ShardRegion};
 use crate::error::HyperbytedbError;
-use crate::ports::metadata::MetadataPort;
+use crate::ports::metadata::{MeasurementMeta, MetadataPort};
 use crate::ports::sharding::ShardMapPort;
 
 async fn fetch_remote_metadata(
@@ -158,6 +159,88 @@ pub async fn scatter_tag_keys(
         }
     }
     Ok(keys.into_iter().collect())
+}
+
+/// `(field, type name)` pairs from local measurement metadata.
+pub fn local_field_keys(meta: Option<&MeasurementMeta>) -> Vec<(String, String)> {
+    let mut fields: Vec<(String, String)> = meta
+        .map(|m| {
+            m.field_types_as_tuples()
+                .into_iter()
+                .map(|(name, disc)| {
+                    (
+                        name,
+                        FieldValue::type_name_from_discriminant(disc).to_string(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    fields.sort();
+    fields
+}
+
+/// Field keys of a measurement across every region. A node records a field
+/// only when it stores the field's rows, so a node holding no copy of the
+/// measurement knows none of them.
+pub async fn scatter_field_keys(
+    ctx: &ShardRoutingContext,
+    metadata: &dyn MetadataPort,
+    db: &str,
+    rp: &str,
+    measurement: &str,
+) -> Result<Vec<(String, String)>, HyperbytedbError> {
+    let local = local_field_keys(
+        metadata
+            .get_measurement(db, rp, measurement)
+            .await?
+            .as_ref(),
+    );
+    let map = ctx.shard_map.snapshot().await?;
+    let serving = ctx
+        .location_cache
+        .serving_regions(&map, db, rp, measurement);
+    if serving.is_empty() {
+        return Ok(local);
+    }
+
+    let mut fields: BTreeMap<String, String> = BTreeMap::new();
+    if serving
+        .iter()
+        .any(|region| region.peers.contains(&ctx.node_id))
+    {
+        fields.extend(local);
+    }
+    let remote_regions: Vec<ShardRegion> = serving
+        .iter()
+        .filter(|region| !region.peers.contains(&ctx.node_id))
+        .cloned()
+        .collect();
+    let remote_parts = fetch_remote_metadata_bounded(
+        ctx,
+        db,
+        rp,
+        measurement,
+        remote_regions,
+        ShardMetadataKind::FieldKeys,
+    )
+    .await?;
+    for part in remote_parts {
+        let Some(arr) = part.get("field_keys").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for pair in arr {
+            if let (Some(name), Some(typ)) = (
+                pair.get(0).and_then(|v| v.as_str()),
+                pair.get(1).and_then(|v| v.as_str()),
+            ) {
+                fields
+                    .entry(name.to_string())
+                    .or_insert_with(|| typ.to_string());
+            }
+        }
+    }
+    Ok(fields.into_iter().collect())
 }
 
 pub async fn scatter_tag_values(

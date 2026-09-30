@@ -1966,6 +1966,64 @@ async fn a_region_refused_at_capacity_is_retried_alone() {
     );
 }
 
+/// SHOW FIELD KEYS on a node that holds no copy of the measurement still
+/// lists its fields. Fields are recorded only where rows are stored, and the
+/// statement used to read local metadata alone, so it came back empty.
+#[tokio::test]
+#[serial(chdb)]
+async fn show_field_keys_includes_fields_held_by_other_nodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let [n1, n2] = start_sharded_pair_cluster(dir.path(), ShardedClusterOptions::default()).await;
+    let client = reqwest::Client::new();
+    for node in [&n1, &n2] {
+        create_db(&client, &node.url, "sharddb").await;
+    }
+    let op = ShardMapOp::BootstrapMeasurement {
+        key: MeasurementKey::new("sharddb", "autogen", "mem"),
+        region: ShardRegion {
+            region_id: 2,
+            start: 0,
+            end: u64::MAX,
+            epoch: ShardEpoch::default(),
+            peers: vec![2],
+            primary: 2,
+            last_split_at: 0,
+            transfer_verified: None,
+            transfer_first_seen: None,
+            state: Default::default(),
+            staged_from: None,
+            staging_peers: Vec::new(),
+        },
+    };
+    for node in [&n1, &n2] {
+        node.shard_map.apply_op(op.clone()).await.unwrap();
+        let snap = node.shard_map.snapshot().await.unwrap();
+        node.location_cache.refresh_from_map(&snap);
+    }
+    let resp = write_line(
+        &client,
+        &n2.url,
+        "sharddb",
+        "mem,host=a used=2,free=3i 1000000000",
+    )
+    .await;
+    assert!(resp.status().is_success(), "write: {}", resp.status());
+
+    for node in [&n1, &n2] {
+        let resp = query_parsed(&client, &node.url, "sharddb", "SHOW FIELD KEYS FROM mem").await;
+        let values = &resp.results[0].series.as_ref().expect("series")[0].values;
+        assert_eq!(
+            values,
+            &vec![
+                vec![serde_json::json!("free"), serde_json::json!("integer")],
+                vec![serde_json::json!("used"), serde_json::json!("float")],
+            ],
+            "{}",
+            node.url
+        );
+    }
+}
+
 /// Pair cluster with the forward queue on: `cpu` lives on node 1, `mem` on
 /// node 2 (`mem_peers` decides who else holds it).
 async fn queued_pair(

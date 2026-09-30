@@ -938,15 +938,26 @@ async fn execute_statement(
                 svc.metadata.list_measurements(db).await?
             };
             for m in &measurements {
-                if let Some(meta) = svc.metadata.get_measurement(db, &rp, m).await? {
-                    for (name, disc) in meta.field_types_as_tuples() {
-                        let typ =
-                            crate::domain::point::FieldValue::type_name_from_discriminant(disc);
-                        field_values.push(vec![
-                            serde_json::Value::String(name),
-                            serde_json::Value::String(typ.to_string()),
-                        ]);
+                let fields = match svc.shard_routing.as_ref() {
+                    Some(ctx) => {
+                        crate::application::shard_metadata_scatter::scatter_field_keys(
+                            ctx,
+                            svc.metadata.as_ref(),
+                            db,
+                            &rp,
+                            m,
+                        )
+                        .await?
                     }
+                    None => crate::application::shard_metadata_scatter::local_field_keys(
+                        svc.metadata.get_measurement(db, &rp, m).await?.as_ref(),
+                    ),
+                };
+                for (name, typ) in fields {
+                    field_values.push(vec![
+                        serde_json::Value::String(name),
+                        serde_json::Value::String(typ),
+                    ]);
                 }
             }
             let columns = vec!["fieldKey".to_string(), "fieldType".to_string()];

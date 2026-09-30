@@ -1309,6 +1309,24 @@ pub async fn handle_shard_metadata(
                     .into_response(),
             }
         }
+        ShardMetadataKind::FieldKeys => {
+            match state
+                .metadata
+                .get_measurement(&req.db, &req.rp, &req.measurement)
+                .await
+            {
+                Ok(meta) => {
+                    let fields =
+                        crate::application::shard_metadata_scatter::local_field_keys(meta.as_ref());
+                    Json(serde_json::json!({"field_keys": fields})).into_response()
+                }
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+                    .into_response(),
+            }
+        }
         ShardMetadataKind::Series => {
             match state
                 .metadata

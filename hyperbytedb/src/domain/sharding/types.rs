@@ -456,6 +456,7 @@ pub enum ShardMetadataKind {
     TagKeys,
     TagValues { tag_key: String },
     Series,
+    FieldKeys,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
