@@ -5,7 +5,7 @@ use chdb_rust::format::OutputFormat;
 
 use crate::adapters::chdb::session::{SharedSession, execute_connection};
 use crate::error::HyperbytedbError;
-use crate::ports::query::QueryPort;
+use crate::ports::query::{ArrowBatchStream, QueryPort};
 
 /// Multi-connection chDB query adapter.
 ///
@@ -102,12 +102,7 @@ impl QueryPort for ChdbQueryAdapter {
                         .map_err(|e| HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e))),
                     Err(e) => {
                         let msg = e.to_string();
-                        if msg.contains("CANNOT_EXTRACT_TABLE_STRUCTURE")
-                            || msg.contains("no files with provided path")
-                            || msg.contains("CANNOT_STAT")
-                            || msg.contains("UNKNOWN_TABLE")
-                            || msg.contains("Code: 60")
-                        {
+                        if is_missing_table_error(&msg) {
                             tracing::warn!(error = %msg, "chDB missing-table error, treating as empty result");
                             Ok(String::new())
                         } else {
@@ -123,4 +118,73 @@ impl QueryPort for ChdbQueryAdapter {
         tracing::debug!(result_len = result.len(), "chDB query completed");
         Ok(result)
     }
+
+    /// Arrow streaming read: no text is formatted or parsed, and only the
+    /// batches in flight are held.
+    async fn execute_sql_arrow(&self, sql: &str) -> Result<ArrowBatchStream, HyperbytedbError> {
+        let permit = match self.concurrency_limit {
+            Some(ref sem) => Some(Arc::clone(sem).acquire_owned().await.map_err(|_| {
+                HyperbytedbError::Internal("chDB concurrency semaphore closed".into())
+            })?),
+            None => None,
+        };
+        tracing::debug!(sql = sql, "executing chDB query (arrow stream)");
+        let pool = self.session.pool()?;
+        let sql_owned = sql.to_string();
+        let (tx, rx) = tokio::sync::mpsc::channel(ARROW_STREAM_DEPTH);
+        // The connection and the concurrency permit are held until the
+        // stream ends or the receiver is dropped, which cancels the query.
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            pool.with_connection_mut(|conn| {
+                let mut stream = match conn.query_stream_arrow(&sql_owned) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        send_stream_error(&tx, &e.to_string());
+                        return;
+                    }
+                };
+                loop {
+                    match stream.next_batch() {
+                        Ok(Some(batch)) => {
+                            if tx.blocking_send(Ok(batch)).is_err() {
+                                stream.cancel();
+                                return;
+                            }
+                        }
+                        Ok(None) => return,
+                        Err(e) => {
+                            send_stream_error(&tx, &e.to_string());
+                            return;
+                        }
+                    }
+                }
+            });
+        });
+        Ok(rx)
+    }
+}
+
+/// Batches buffered between chDB and the consumer.
+const ARROW_STREAM_DEPTH: usize = 2;
+
+/// Errors that mean "the table is not there (yet)": a query on a measurement
+/// that has never been flushed. Treated as an empty result.
+fn is_missing_table_error(msg: &str) -> bool {
+    msg.contains("CANNOT_EXTRACT_TABLE_STRUCTURE")
+        || msg.contains("no files with provided path")
+        || msg.contains("CANNOT_STAT")
+        || msg.contains("UNKNOWN_TABLE")
+        || msg.contains("Code: 60")
+}
+
+fn send_stream_error(
+    tx: &tokio::sync::mpsc::Sender<Result<arrow::record_batch::RecordBatch, HyperbytedbError>>,
+    msg: &str,
+) {
+    if is_missing_table_error(msg) {
+        tracing::warn!(error = %msg, "chDB missing-table error, treating as empty result");
+        return;
+    }
+    let _ = tx.blocking_send(Err(HyperbytedbError::Chdb(msg.to_string().into())));
 }

@@ -15,6 +15,7 @@ pub mod msgpack_limits;
 pub mod peer_ingestion_service;
 pub mod peer_query_service;
 pub mod predicate_sql;
+pub mod query_arrow_series;
 pub mod query_service;
 pub mod raft_leader_callbacks;
 pub mod replication_apply;

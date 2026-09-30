@@ -784,17 +784,72 @@ pub async fn handle_shard_query(
         req.select_sql
     };
 
-    match state.query_port.execute_sql(&sql).await {
-        Ok(raw) => (StatusCode::OK, raw).into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, sql = %sql, "shard query execute_sql failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response()
+    let failed = |e: HyperbytedbError| {
+        tracing::error!(error = %e, sql = %sql, "shard query failed");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response()
+    };
+    let mut batches = match state.query_port.execute_sql_arrow(&sql).await {
+        Ok(b) => b,
+        Err(e) => return failed(e),
+    };
+    // Wait for the first batch so a query error is still a plain 500 and an
+    // empty result an empty 200; after that the body streams.
+    let first = match batches.recv().await {
+        None => return (StatusCode::OK, Body::empty()).into_response(),
+        Some(Err(e)) => return failed(e),
+        Some(Ok(batch)) => batch,
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+    tokio::spawn(async move {
+        if let Err(e) = stream_ipc(first, batches, &tx).await {
+            let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
         }
+    });
+    let body = Body::from_stream(futures::stream::poll_fn(move |cx| rx.poll_recv(cx)));
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, ARROW_STREAM_CONTENT_TYPE)],
+        body,
+    )
+        .into_response()
+}
+
+/// Content type of a `/internal/shard/query` response.
+const ARROW_STREAM_CONTENT_TYPE: &str = "application/vnd.apache.arrow.stream";
+
+/// Write `first` and the rest of `batches` as one Arrow IPC stream, one
+/// chunk per batch, so the result is never held whole on either side.
+async fn stream_ipc(
+    first: arrow::record_batch::RecordBatch,
+    mut batches: crate::ports::query::ArrowBatchStream,
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+) -> Result<(), HyperbytedbError> {
+    let ipc = |e: arrow::error::ArrowError| {
+        HyperbytedbError::Internal(format!("arrow ipc encode: {e}").into())
+    };
+    let mut writer =
+        arrow::ipc::writer::StreamWriter::try_new(Vec::new(), &first.schema()).map_err(ipc)?;
+    let mut batch = Some(first);
+    while let Some(b) = batch.take() {
+        writer.write(&b).map_err(ipc)?;
+        let chunk = std::mem::take(writer.get_mut());
+        if tx.send(Ok(Bytes::from(chunk))).await.is_err() {
+            // The requester went away; dropping `batches` cancels the query.
+            return Ok(());
+        }
+        batch = match batches.recv().await {
+            Some(next) => Some(next?),
+            None => None,
+        };
     }
+    writer.finish().map_err(ipc)?;
+    let tail = std::mem::take(writer.get_mut());
+    let _ = tx.send(Ok(Bytes::from(tail))).await;
+    Ok(())
 }
 
 pub async fn handle_shard_mv_backfill(

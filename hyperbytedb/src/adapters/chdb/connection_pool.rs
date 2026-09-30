@@ -98,6 +98,33 @@ impl ChdbConnectionPool {
     }
 }
 
+impl ChdbConnectionPool {
+    /// [`Self::with_connection`] with mutable access, for calls that borrow
+    /// the connection for longer than one statement (a streamed result).
+    pub fn with_connection_mut<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut Connection) -> R,
+    {
+        let n = self.slots.len();
+        if n == 1 {
+            let mut guard = self.slots[0].lock();
+            return f(&mut guard);
+        }
+
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
+        for offset in 0..n {
+            let idx = (start + offset) % n;
+            if let Some(mut guard) = self.slots[idx].try_lock() {
+                return f(&mut guard);
+            }
+        }
+
+        let idx = start % n;
+        let mut guard = self.slots[idx].lock();
+        f(&mut guard)
+    }
+}
+
 impl std::fmt::Debug for ChdbConnectionPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChdbConnectionPool")

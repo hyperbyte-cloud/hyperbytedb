@@ -1203,3 +1203,124 @@ async fn test_cross_database_on_clause_requires_authorization() {
         allowed.text().await.unwrap_or_default()
     );
 }
+
+/// Wraps the query port and counts Arrow reads.
+struct CountingPort {
+    inner: Arc<dyn hyperbytedb::ports::query::QueryPort>,
+    arrow_calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl hyperbytedb::ports::query::QueryPort for CountingPort {
+    async fn execute_sql(&self, sql: &str) -> Result<String, hyperbytedb::error::HyperbytedbError> {
+        self.inner.execute_sql(sql).await
+    }
+
+    async fn execute_sql_arrow(
+        &self,
+        sql: &str,
+    ) -> Result<hyperbytedb::ports::query::ArrowBatchStream, hyperbytedb::error::HyperbytedbError>
+    {
+        self.arrow_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.execute_sql_arrow(sql).await
+    }
+}
+
+/// InfluxQL queries read their results through the Arrow stream.
+#[tokio::test]
+#[serial(chdb)]
+async fn queries_read_results_through_the_arrow_stream() {
+    use hyperbytedb::ports::query::QueryService as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (state, flush) = setup(&dir);
+    let (url, _handle) = start_server(state.clone()).await;
+    let client = reqwest::Client::new();
+    client
+        .get(format!("{url}/query"))
+        .query(&[("q", "CREATE DATABASE arrowdb")])
+        .send()
+        .await
+        .unwrap();
+    // 600 points, 7 s apart from a minute boundary; usage = i.
+    let base = 1_700_000_040_000_000_000i64;
+    let lines: Vec<String> = (0..600)
+        .map(|i| format!("cpu,host=h{} usage={i} {}", i % 3, base + i * 7_000_000_000))
+        .collect();
+    let resp = client
+        .post(format!("{url}/write"))
+        .query(&[("db", "arrowdb")])
+        .body(lines.join("\n"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    flush.flush().await.unwrap();
+
+    let port = Arc::new(CountingPort {
+        inner: state.query_port.clone(),
+        arrow_calls: Default::default(),
+    });
+    let svc = QueryServiceImpl::new(
+        port.clone(),
+        state.metadata.clone(),
+        state.wal.clone(),
+        30,
+        state.points_sink.clone(),
+    );
+    let query = |q: &'static str, epoch: Option<&'static str>| {
+        let svc = &svc;
+        async move {
+            let r = svc
+                .execute_query("arrowdb", q, epoch, None, None)
+                .await
+                .unwrap();
+            serde_json::to_value(&r).unwrap()["results"][0].clone()
+        }
+    };
+
+    let raw = query("SELECT usage FROM cpu", Some("ns")).await;
+    let rows = raw["series"][0]["values"].as_array().unwrap();
+    assert_eq!(rows.len(), 600);
+    assert_eq!(rows[0], serde_json::json!([base, 0]));
+    assert_eq!(
+        rows[599],
+        serde_json::json!([base + 599 * 7_000_000_000, 599])
+    );
+
+    // 60 s buckets of 7 s points: bucket k holds i in [ceil(60k/7), ceil(60(k+1)/7)).
+    let end = base + 600 * 7_000_000_000;
+    let q = Box::leak(
+        format!("SELECT count(usage), sum(usage) FROM cpu WHERE time >= {base} AND time < {end} GROUP BY time(1m)")
+            .into_boxed_str(),
+    );
+    let buckets = query(q, None).await;
+    let values = buckets["series"][0]["values"].as_array().unwrap();
+    assert_eq!(values[0][0], "2023-11-14T22:14:00Z");
+    assert_eq!(values[0][1], 9, "i = 0..=8 fall in the first minute");
+    assert_eq!(values[0][2], 36);
+
+    let by_host = query("SELECT count(usage) FROM cpu GROUP BY host", None).await;
+    let hosts: Vec<(String, i64)> = by_host["series"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            (
+                s["tags"]["host"].as_str().unwrap().to_string(),
+                s["values"][0][0].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(hosts.len(), 3);
+    assert!(hosts.iter().all(|(_, n)| *n == 200), "{hosts:?}");
+
+    let missing = query("SELECT usage FROM no_such_measurement", None).await;
+    assert!(missing.get("series").is_none() || missing["series"].as_array().unwrap().is_empty());
+
+    assert!(
+        port.arrow_calls.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+        "the query service reads results through the Arrow stream"
+    );
+}

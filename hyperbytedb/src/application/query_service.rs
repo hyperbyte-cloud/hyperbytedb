@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use parking_lot::RwLock;
 use regex::Regex;
@@ -1644,176 +1644,25 @@ async fn execute_statement(
     }
 }
 
-/// ClickHouse/JSONEachRow is strict JSON; chDB/CH may still emit unquoted `nan` / `-inf` in
-/// numeric fields, which simd_json rejects (e.g. `InvalidNumber` at a digit in `0`-like junk).
-static CHDB_NON_JSON_NUMERIC: OnceLock<Regex> = OnceLock::new();
-
-/// Replace `:<ws>NaN` / `:<ws>±inf` (non-JSON) with `:<ws>null` so serde_json can parse.
-fn chdb_sanitize_non_json_number_tokens(line: &str) -> String {
-    let re = CHDB_NON_JSON_NUMERIC.get_or_init(|| {
-        // Literal pattern; invalid regex is a programming error, not user input.
-        #[allow(clippy::expect_used)]
-        Regex::new(r#"(?i)(:\s*)(?:-?inf(?:inity)?|nan)\b"#)
-            .expect("CHDB non-JSON float regex is valid")
-    });
-    re.replace_all(line, |caps: &regex::Captures| format!("{}null", &caps[1]))
-        .to_string()
-}
-
-/// Parse one JSON object line from a JSONEachRow (or similar) chDB/ClickHouse result.
-fn parse_chdb_json_line(line: &str) -> Result<serde_json::Value, HyperbytedbError> {
-    let mut parse_buf: Vec<u8> = line.as_bytes().to_vec();
-    if let Ok(v) = simd_json::from_slice(&mut parse_buf) {
-        return Ok(v);
-    }
-    if let Ok(v) = serde_json::from_str(line) {
-        return Ok(v);
-    }
-    let fixed = chdb_sanitize_non_json_number_tokens(line);
-    if let Ok(v) = serde_json::from_str(&fixed) {
-        return Ok(v);
-    }
-    Err(HyperbytedbError::Internal(
-        format!("chDB JSON line parse (after non-JSON float sanitize): {line:.256}").into(),
-    ))
-}
-
-fn parse_json_each_row_to_series(
-    raw: &str,
+/// Run `sql` on this node and bucket its rows into series, streaming Arrow
+/// record batches (see [`crate::application::query_arrow_series`]).
+async fn run_series_query(
+    svc: &QueryServiceImpl,
+    sql: &str,
     measurement: &str,
     epoch: Option<&str>,
     group_by_tags: &[String],
 ) -> Result<Vec<SeriesResult>, HyperbytedbError> {
-    if raw.trim().is_empty() {
-        return Ok(vec![]);
+    let mut batches = svc.query_port.execute_sql_arrow(sql).await?;
+    let mut builder = crate::application::query_arrow_series::SeriesBuilder::new(
+        measurement,
+        epoch,
+        group_by_tags,
+    );
+    while let Some(batch) = batches.recv().await {
+        builder.push_batch(&batch?)?;
     }
-
-    let line_count = raw
-        .as_bytes()
-        .iter()
-        .filter(|&&b| b == b'\n')
-        .count()
-        .max(1);
-    let mut rows: Vec<serde_json::Value> = Vec::with_capacity(line_count);
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let v: serde_json::Value = parse_chdb_json_line(line)?;
-        rows.push(v);
-    }
-    if rows.is_empty() {
-        return Ok(vec![]);
-    }
-
-    let raw_columns: Vec<String> = rows
-        .first()
-        .and_then(|r| r.as_object())
-        .map(|o| o.keys().cloned().collect())
-        .unwrap_or_default();
-
-    let tag_set: std::collections::HashSet<&str> =
-        group_by_tags.iter().map(|s| s.as_str()).collect();
-
-    let mut col_pairs: Vec<(String, String)> = raw_columns
-        .into_iter()
-        .filter(|raw| !tag_set.contains(raw.as_str()))
-        .map(|raw| {
-            let display = if raw == "__time" {
-                "time".to_string()
-            } else {
-                raw.clone()
-            };
-            (raw, display)
-        })
-        .collect();
-
-    if let Some(pos) = col_pairs.iter().position(|(_, d)| d == "time")
-        && pos != 0
-    {
-        let pair = col_pairs.remove(pos);
-        col_pairs.insert(0, pair);
-    }
-
-    let columns: Vec<String> = col_pairs.iter().map(|(_, d)| d.clone()).collect();
-    let time_idx = columns.iter().position(|c| c == "time");
-
-    if group_by_tags.is_empty() {
-        let values: Vec<Vec<serde_json::Value>> = rows
-            .iter()
-            .map(|r| row_to_values(r, &col_pairs, time_idx, epoch))
-            .collect();
-        let out = vec![SeriesResult {
-            name: measurement.to_string(),
-            tags: None,
-            columns,
-            values,
-            partial: None,
-        }];
-        return Ok(out);
-    }
-
-    // Single-pass: parse rows and bucket into series simultaneously
-    let mut series_map: indexmap::IndexMap<Vec<(String, String)>, Vec<Vec<serde_json::Value>>> =
-        indexmap::IndexMap::new();
-
-    for row in &rows {
-        let obj = row.as_object();
-        let tag_kv: Vec<(String, String)> = group_by_tags
-            .iter()
-            .map(|tag| {
-                let val = obj
-                    .and_then(|o| o.get(tag))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                (tag.clone(), val)
-            })
-            .collect();
-        let row_values = row_to_values(row, &col_pairs, time_idx, epoch);
-        series_map.entry(tag_kv).or_default().push(row_values);
-    }
-
-    let result: Vec<SeriesResult> = series_map
-        .into_iter()
-        .map(|(tag_kv, values)| {
-            let tags: HashMap<String, String> = tag_kv.into_iter().collect();
-            SeriesResult {
-                name: measurement.to_string(),
-                tags: Some(tags),
-                columns: columns.clone(),
-                values,
-                partial: None,
-            }
-        })
-        .collect();
-
-    Ok(result)
-}
-
-fn row_to_values(
-    row: &serde_json::Value,
-    col_pairs: &[(String, String)],
-    time_idx: Option<usize>,
-    epoch: Option<&str>,
-) -> Vec<serde_json::Value> {
-    row.as_object()
-        .map(|o| {
-            col_pairs
-                .iter()
-                .enumerate()
-                .map(|(i, (raw_key, _))| {
-                    let v = o.get(raw_key).cloned().unwrap_or(serde_json::Value::Null);
-                    if Some(i) == time_idx {
-                        normalize_time_value(v, epoch)
-                    } else {
-                        v
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    Ok(builder.finish())
 }
 
 fn series_results_to_json_each_row(series: &[SeriesResult]) -> Result<String, HyperbytedbError> {
@@ -1848,120 +1697,6 @@ fn series_results_to_json_each_row(series: &[SeriesResult]) -> Result<String, Hy
 
 fn escape_clickhouse_string_literal(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "\\'")
-}
-
-/// Parse a chDB DateTime64 string into a Unix nanosecond timestamp.
-/// Handles formats like "2026-03-01 14:30:00.000000000" and "2026-03-01 14:30:00".
-fn parse_chdb_datetime_to_nanos(s: &str) -> Option<i64> {
-    let s = s.trim();
-    if s.len() < 19 || s.as_bytes().get(10) != Some(&b' ') {
-        return None;
-    }
-    let date_part = &s[..10];
-    let time_part = &s[11..];
-
-    let (hms, frac_nanos) = if let Some(dot_pos) = time_part.find('.') {
-        let hms = &time_part[..dot_pos];
-        let frac_str = &time_part[dot_pos + 1..];
-        // Pad or truncate to 9 digits (nanoseconds)
-        let padded = format!("{:0<9}", &frac_str[..frac_str.len().min(9)]);
-        let nanos: i64 = padded.parse().unwrap_or(0);
-        (hms, nanos)
-    } else {
-        (time_part, 0i64)
-    };
-
-    // Parse date: YYYY-MM-DD
-    let parts: Vec<&str> = date_part.split('-').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-    let year: i32 = parts[0].parse().ok()?;
-    let month: u32 = parts[1].parse().ok()?;
-    let day: u32 = parts[2].parse().ok()?;
-
-    // Parse time: HH:MM:SS
-    let tparts: Vec<&str> = hms.split(':').collect();
-    if tparts.len() != 3 {
-        return None;
-    }
-    let hour: u32 = tparts[0].parse().ok()?;
-    let min: u32 = tparts[1].parse().ok()?;
-    let sec: u32 = tparts[2].parse().ok()?;
-
-    let dt = chrono::NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(hour, min, sec)?;
-    let unix_secs = dt.and_utc().timestamp();
-    Some(unix_secs * 1_000_000_000 + frac_nanos)
-}
-
-/// Convert chDB's DateTime64 string to the format requested by the `epoch` param.
-/// - epoch=None  → RFC3339 string ("2026-03-01T14:30:00Z")
-/// - epoch="ns"  → nanosecond integer
-/// - epoch="u"   → microsecond integer
-/// - epoch="ms"  → millisecond integer
-/// - epoch="s"   → second integer
-fn normalize_time_value(v: serde_json::Value, epoch: Option<&str>) -> serde_json::Value {
-    match &v {
-        serde_json::Value::String(s) => {
-            let s = s.trim();
-            if s.len() < 19 || s.as_bytes().get(10) != Some(&b' ') {
-                return v;
-            }
-
-            match epoch {
-                Some("ns") | Some("n") => {
-                    if let Some(nanos) = parse_chdb_datetime_to_nanos(s) {
-                        serde_json::Value::Number(serde_json::Number::from(nanos))
-                    } else {
-                        v
-                    }
-                }
-                Some("u") | Some("us") => {
-                    if let Some(nanos) = parse_chdb_datetime_to_nanos(s) {
-                        serde_json::Value::Number(serde_json::Number::from(nanos / 1_000))
-                    } else {
-                        v
-                    }
-                }
-                Some("ms") => {
-                    if let Some(nanos) = parse_chdb_datetime_to_nanos(s) {
-                        serde_json::Value::Number(serde_json::Number::from(nanos / 1_000_000))
-                    } else {
-                        v
-                    }
-                }
-                Some("s") => {
-                    if let Some(nanos) = parse_chdb_datetime_to_nanos(s) {
-                        serde_json::Value::Number(serde_json::Number::from(nanos / 1_000_000_000))
-                    } else {
-                        v
-                    }
-                }
-                _ => {
-                    // Default: RFC3339 string
-                    let mut rfc = String::with_capacity(s.len() + 2);
-                    rfc.push_str(&s[..10]);
-                    rfc.push('T');
-                    let time_part = &s[11..];
-                    if let Some(dot_pos) = time_part.find('.') {
-                        let frac = &time_part[dot_pos + 1..];
-                        if frac.chars().all(|c| c == '0') {
-                            rfc.push_str(&time_part[..dot_pos]);
-                        } else {
-                            let trimmed = frac.trim_end_matches('0');
-                            rfc.push_str(&time_part[..dot_pos + 1]);
-                            rfc.push_str(trimmed);
-                        }
-                    } else {
-                        rfc.push_str(time_part);
-                    }
-                    rfc.push('Z');
-                    serde_json::Value::String(rfc)
-                }
-            }
-        }
-        _ => v,
-    }
 }
 
 fn inject_tombstone_predicates(sql: String, tombstones: &[(String, String)]) -> String {
@@ -2148,13 +1883,14 @@ async fn execute_select_from_source(
                 let sub_source_sql = format!("(SELECT * FROM format(JSONEachRow, '{escaped}'))");
                 let outer_sql =
                     to_clickhouse::translate_with_source(&select_stmt_expanded, &sub_source_sql)?;
-                let raw = svc.query_port.execute_sql(&outer_sql).await?;
-                return parse_json_each_row_to_series(
-                    &raw,
+                return run_series_query(
+                    svc,
+                    &outer_sql,
                     sub_source,
                     epoch,
                     &resolved_group_by_tags,
-                );
+                )
+                .await;
             }
 
             let sub_sql = to_clickhouse::translate_native_table(
@@ -2172,8 +1908,7 @@ async fn execute_select_from_source(
                 &select_stmt_expanded,
                 &format!("({sub_sql})"),
             )?;
-            let raw = svc.query_port.execute_sql(&outer_sql).await?;
-            parse_json_each_row_to_series(&raw, sub_source, epoch, &resolved_group_by_tags)
+            run_series_query(svc, &outer_sql, sub_source, epoch, &resolved_group_by_tags).await
         }
     }
 }
@@ -2314,8 +2049,7 @@ async fn try_query_sharded_region(
     // scatter to the primary (TiDB-like RYW / cross-coordinator reads), not query
     // their lagging local chDB copy.
     if region.peers.contains(&ctx.node_id) && ctx.node_id == region.primary {
-        let raw = svc.query_port.execute_sql(region_sql).await?;
-        return parse_json_each_row_to_series(&raw, measurement, epoch, resolved_group_by_tags);
+        return run_series_query(svc, region_sql, measurement, epoch, resolved_group_by_tags).await;
     }
 
     let route_to_primary = region.peers.contains(&ctx.node_id) && ctx.node_id != region.primary;
@@ -2342,7 +2076,7 @@ async fn try_query_sharded_region(
     } else {
         RegionTargetRole::Read
     };
-    let raw = scatter_to_region_peers(
+    scatter_to_region_peers(
         ctx,
         region,
         scatter_role,
@@ -2371,15 +2105,17 @@ async fn try_query_sharded_region(
                         "shard query to peer {peer_id} failed: {status} {body}"
                     )));
                 }
-                resp.text()
-                    .await
-                    .map_err(|e| HyperbytedbError::Internal(e.to_string().into()))
+                crate::application::query_arrow_series::series_from_ipc_response(
+                    resp,
+                    measurement,
+                    epoch,
+                    resolved_group_by_tags,
+                )
+                .await
             }
         },
     )
-    .await?;
-
-    parse_json_each_row_to_series(&raw, measurement, epoch, resolved_group_by_tags)
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2420,8 +2156,8 @@ async fn query_materialized_region_all_peers(
     }
 
     let timeout = std::time::Duration::from_millis(ctx.config.scatter_peer_timeout_ms.max(1));
-    let raw = if primary == ctx.node_id {
-        svc.query_port.execute_sql(region_sql).await?
+    let series = if primary == ctx.node_id {
+        run_series_query(svc, region_sql, measurement, epoch, resolved_group_by_tags).await?
     } else {
         let membership = ctx.peer_client.membership().read().await;
         let Some(addr) = peer_addr(&membership, primary) else {
@@ -2449,12 +2185,15 @@ async fn query_materialized_region_all_peers(
                 resp.status()
             )));
         }
-        resp.text()
-            .await
-            .map_err(|e| HyperbytedbError::Internal(e.to_string().into()))?
+        crate::application::query_arrow_series::series_from_ipc_response(
+            resp,
+            measurement,
+            epoch,
+            resolved_group_by_tags,
+        )
+        .await?
     };
 
-    let series = parse_json_each_row_to_series(&raw, measurement, epoch, resolved_group_by_tags)?;
     if series.is_empty() {
         return Ok(Vec::new());
     }
@@ -2768,8 +2507,7 @@ async fn execute_local_measurement_query(
         Some((time_min, time_max)),
     )?;
     sql = inject_tombstone_predicates(sql, &tombstones);
-    let raw = svc.query_port.execute_sql(&sql).await?;
-    parse_json_each_row_to_series(&raw, measurement, epoch, &resolved_group_by_tags)
+    run_series_query(svc, &sql, measurement, epoch, &resolved_group_by_tags).await
 }
 
 fn tag_keys_from_mapping(
