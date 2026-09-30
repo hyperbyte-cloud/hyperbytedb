@@ -320,7 +320,7 @@ fn region_selection_equality_where_hits_single_region() {
         _ => panic!("expected select"),
     };
     let tag_keys = vec!["host".to_string()];
-    let sel = select_regions_for_query(&space, "metrics", &tag_keys, &stmt);
+    let sel = select_regions_for_query(&space, "metrics", Some(&tag_keys), &stmt);
     assert!(matches!(sel, RegionSelection::Single(_)));
     assert_eq!(sel.region_count(space.regions.len()), 1);
 }
@@ -336,7 +336,7 @@ fn region_selection_count_without_where_uses_all_regions() {
         _ => panic!("expected select"),
     };
     let tag_keys = vec!["host".to_string()];
-    let sel = select_regions_for_query(&space, "metrics", &tag_keys, &stmt);
+    let sel = select_regions_for_query(&space, "metrics", Some(&tag_keys), &stmt);
     assert!(matches!(sel, RegionSelection::All));
     assert_eq!(sel.region_count(space.regions.len()), 4);
 }
@@ -357,7 +357,7 @@ fn region_selection_point_lookup_series_id_in_one_region() {
         _ => panic!("expected select"),
     };
     let tag_keys = vec!["host".to_string()];
-    let sel = select_regions_for_query(&space, "metrics", &tag_keys, &stmt);
+    let sel = select_regions_for_query(&space, "metrics", Some(&tag_keys), &stmt);
     match sel {
         RegionSelection::Single(region) => assert_eq!(region.region_id, expected_region.region_id),
         other => panic!("expected single region, got {other:?}"),

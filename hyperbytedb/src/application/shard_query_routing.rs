@@ -41,13 +41,19 @@ impl<'a> RegionSelection<'a> {
 ///
 /// Pruning by `series_id` is only sound when the WHERE clause fixes every tag
 /// key on the measurement (not a subset, and not a field column).
+/// `measurement_tag_keys` is `None` when the coordinator does not know them
+/// (no local metadata or series table); every region is queried then. An
+/// empty list means the measurement truly has no tags.
 #[must_use]
 pub fn select_regions_for_query<'a>(
     space: &'a MeasurementShardSpace,
     measurement: &str,
-    measurement_tag_keys: &[String],
+    measurement_tag_keys: Option<&[String]>,
     stmt: &SelectStatement,
 ) -> RegionSelection<'a> {
+    let Some(measurement_tag_keys) = measurement_tag_keys else {
+        return RegionSelection::All;
+    };
     let Some(series_ids) =
         routable_series_ids(measurement, measurement_tag_keys, stmt.condition.as_ref())
     else {
@@ -319,10 +325,22 @@ mod tests {
     }
 
     #[test]
+    fn unknown_tag_keys_query_every_region() {
+        let space = four_region_space();
+        let stmt = select_stmt("SELECT count(value) FROM metrics WHERE time >= 0");
+        // With no tags a time-only WHERE pins the one tagless series...
+        let sel = select_regions_for_query(&space, "metrics", Some(&[]), &stmt);
+        assert!(matches!(sel, RegionSelection::Single(_)));
+        // ...but unknown tag keys must not be read as "no tags".
+        let sel = select_regions_for_query(&space, "metrics", None, &stmt);
+        assert!(matches!(sel, RegionSelection::All));
+    }
+
+    #[test]
     fn equality_where_selects_single_region() {
         let space = four_region_space();
         let stmt = select_stmt(r#"SELECT value FROM metrics WHERE host = 's50000'"#);
-        let sel = select_regions_for_query(&space, "metrics", &host_only_tags(), &stmt);
+        let sel = select_regions_for_query(&space, "metrics", Some(&host_only_tags()), &stmt);
         assert!(matches!(sel, RegionSelection::Single(_)));
         assert_eq!(sel.region_count(space.regions.len()), 1);
     }
@@ -331,7 +349,7 @@ mod tests {
     fn count_without_where_selects_all_regions() {
         let space = four_region_space();
         let stmt = select_stmt("SELECT count(value) FROM metrics");
-        let sel = select_regions_for_query(&space, "metrics", &host_only_tags(), &stmt);
+        let sel = select_regions_for_query(&space, "metrics", Some(&host_only_tags()), &stmt);
         assert!(matches!(sel, RegionSelection::All));
         assert_eq!(sel.region_count(space.regions.len()), 4);
     }
@@ -340,7 +358,7 @@ mod tests {
     fn regex_where_selects_all_regions() {
         let space = four_region_space();
         let stmt = select_stmt(r#"SELECT value FROM metrics WHERE host =~ /^prod/"#);
-        let sel = select_regions_for_query(&space, "metrics", &host_only_tags(), &stmt);
+        let sel = select_regions_for_query(&space, "metrics", Some(&host_only_tags()), &stmt);
         assert!(matches!(sel, RegionSelection::All));
     }
 
@@ -349,7 +367,7 @@ mod tests {
         let space = four_region_space();
         let stmt =
             select_stmt(r#"SELECT value FROM metrics WHERE host = 's1' AND time > now() - 1h"#);
-        let sel = select_regions_for_query(&space, "metrics", &host_only_tags(), &stmt);
+        let sel = select_regions_for_query(&space, "metrics", Some(&host_only_tags()), &stmt);
         assert!(matches!(sel, RegionSelection::Single(_)));
     }
 
@@ -360,7 +378,7 @@ mod tests {
         let stmt = select_stmt(&format!(
             r#"SELECT value FROM metrics WHERE host = '{h1}' OR host = '{h2}'"#
         ));
-        let sel = select_regions_for_query(&space, "metrics", &host_only_tags(), &stmt);
+        let sel = select_regions_for_query(&space, "metrics", Some(&host_only_tags()), &stmt);
         assert!(matches!(sel, RegionSelection::Subset(_)));
         assert_eq!(sel.region_count(space.regions.len()), 2);
     }
@@ -397,7 +415,7 @@ mod tests {
     fn mixed_tag_or_falls_back_to_all() {
         let space = four_region_space();
         let stmt = select_stmt(r#"SELECT value FROM metrics WHERE host = 'a' OR region = 'b'"#);
-        let sel = select_regions_for_query(&space, "metrics", &host_only_tags(), &stmt);
+        let sel = select_regions_for_query(&space, "metrics", Some(&host_only_tags()), &stmt);
         assert!(matches!(sel, RegionSelection::All));
     }
 
@@ -406,7 +424,7 @@ mod tests {
         let space = four_region_space();
         let stmt = select_stmt(r#"SELECT value FROM metrics WHERE host = 's50000'"#);
         let tags = vec!["host".into(), "region".into()];
-        let sel = select_regions_for_query(&space, "metrics", &tags, &stmt);
+        let sel = select_regions_for_query(&space, "metrics", Some(&tags), &stmt);
         assert!(matches!(sel, RegionSelection::All));
     }
 

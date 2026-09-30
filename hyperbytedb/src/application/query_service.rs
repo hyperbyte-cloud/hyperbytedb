@@ -2293,10 +2293,11 @@ async fn execute_sharded_measurement_query(
     let measurement_meta = svc.metadata.get_measurement(db, rp, measurement).await?;
     let is_materialized_dest = measurement_meta.as_ref().is_some_and(|m| m.materialized);
 
-    let column_mapping = match svc.column_mapping_for(db, rp, measurement).await? {
-        Some(mapping) => Some(mapping),
-        None => Some(inferred_mapping_from_select(stmt)),
-    };
+    let (column_mapping, mapping_inferred) =
+        match svc.column_mapping_for(db, rp, measurement).await? {
+            Some(mapping) => (Some(mapping), false),
+            None => (Some(inferred_mapping_from_select(stmt)), true),
+        };
     let tag_keys = tag_keys_from_mapping(column_mapping.as_ref());
     let (effective_stmt, resolved_group_by_tags) = select_with_expanded_group_by(stmt, &tag_keys);
     let tombstones = svc.metadata.list_tombstones(db, rp, measurement).await?;
@@ -2324,10 +2325,20 @@ async fn execute_sharded_measurement_query(
     let t_min = time_min.unwrap_or(i64::MIN);
     let t_max = time_max.unwrap_or(i64::MAX);
 
+    // Routing to one region by series id needs the measurement's full tag
+    // key set. Inferred from the statement it is only the tags the query
+    // names, often none: a time-only WHERE then "covered" the empty key set
+    // and went to the region holding the tagless series, returning nothing.
+    let tag_keys_known = !mapping_inferred || !table_cols.series.is_empty();
     let region_selection = if is_materialized_dest {
         select_regions_for_materialized_dest(space)
     } else {
-        select_regions_for_query(space, measurement, &series_tag_columns, &effective_stmt)
+        select_regions_for_query(
+            space,
+            measurement,
+            tag_keys_known.then_some(series_tag_columns.as_slice()),
+            &effective_stmt,
+        )
     };
     let is_global_aggregate = !is_materialized_dest && select_has_true_aggregate(&effective_stmt);
     let selected_regions: Vec<ShardRegion> = region_selection
