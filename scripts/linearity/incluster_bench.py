@@ -72,7 +72,7 @@ def post(url, body, timeout=60, content_type="text/plain"):
     except urllib.error.HTTPError as e:
         if e.code not in (429, 503):
             try:
-                detail = e.read(120).decode("utf-8", "replace").replace("\n", " ")
+                detail = e.read(600).decode("utf-8", "replace").replace("\n", " ")
             except Exception:
                 detail = ""
             with ERROR_LOCK:

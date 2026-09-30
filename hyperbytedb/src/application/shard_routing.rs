@@ -658,7 +658,8 @@ pub async fn forward_shard_writes_by_node(
                     results.push((
                         id,
                         Err(HyperbytedbError::PeerUnreachable(format!(
-                            "forward batch to node {node} failed: {e}"
+                            "forward batch to node {node} failed: {}",
+                            error_chain(&e)
                         ))),
                     ));
                 }
@@ -737,6 +738,19 @@ pub async fn forward_shard_writes_by_node(
 }
 
 /// What to do with one part of a batch response.
+/// `e` and its causes, joined: reqwest's own message ("error sending request
+/// for url ...") hides whether the peer refused, reset or timed out.
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut cause = e.source();
+    while let Some(c) = cause {
+        out.push_str(": ");
+        out.push_str(&c.to_string());
+        cause = c.source();
+    }
+    out
+}
+
 #[derive(Debug)]
 pub(crate) enum PartOutcome {
     Done(Result<(), HyperbytedbError>),
