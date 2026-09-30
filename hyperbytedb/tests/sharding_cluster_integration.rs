@@ -1774,6 +1774,135 @@ async fn the_local_share_lands_when_a_forward_fails() {
     );
 }
 
+/// A region its primary refuses at capacity is resent on its own, and the
+/// client write succeeds once it lands. Before, the refusal failed the whole
+/// write and the client resent every point, including those that had landed.
+///
+/// Node 2 is replaced by a mock that refuses the first forward batch with a
+/// 503 and accepts every part after that.
+#[tokio::test]
+#[serial(chdb)]
+async fn a_region_refused_at_capacity_is_retried_alone() {
+    use hyperbytedb::domain::sharding::{
+        ShardWriteBatch, ShardWriteBatchResponse, ShardWritePartResult,
+    };
+    use hyperbytedb::ports::wal::WalPort;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let dir = tempfile::tempdir().unwrap();
+    let [n1, mut n2] =
+        start_sharded_pair_cluster(dir.path(), ShardedClusterOptions::default()).await;
+    let client = reqwest::Client::new();
+    for node in [&n1, &n2] {
+        create_db(&client, &node.url, "sharddb").await;
+    }
+    let region = |id: u64, peers: Vec<u64>, primary: u64| ShardRegion {
+        region_id: id,
+        start: 0,
+        end: u64::MAX,
+        epoch: ShardEpoch::default(),
+        peers,
+        primary,
+        last_split_at: 0,
+        transfer_verified: None,
+        transfer_first_seen: None,
+        state: Default::default(),
+        staged_from: None,
+        staging_peers: Vec::new(),
+    };
+    // cpu is node 1's own region; mem lives only on node 2.
+    for (measurement, r) in [
+        ("cpu", region(1, vec![1], 1)),
+        ("mem", region(2, vec![2], 2)),
+    ] {
+        let op = ShardMapOp::BootstrapMeasurement {
+            key: MeasurementKey::new("sharddb", "autogen", measurement),
+            region: r,
+        };
+        for node in [&n1, &n2] {
+            node.shard_map.apply_op(op.clone()).await.unwrap();
+            let snap = node.shard_map.snapshot().await.unwrap();
+            node.location_cache.refresh_from_map(&snap);
+        }
+    }
+    stop_node(&mut n2);
+
+    let requests = Arc::new(AtomicUsize::new(0));
+    let seen = requests.clone();
+    let app = axum::Router::new().route(
+        "/internal/shard/write-batch",
+        axum::routing::post(move |body: axum::body::Bytes| {
+            let seen = seen.clone();
+            async move {
+                use axum::response::IntoResponse;
+                if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+                let batch: ShardWriteBatch = bincode::deserialize(&body).unwrap();
+                axum::Json(ShardWriteBatchResponse {
+                    results: batch
+                        .parts
+                        .iter()
+                        .map(|p| ShardWritePartResult {
+                            region_id: p.region_id,
+                            status: 204,
+                            error: None,
+                        })
+                        .collect(),
+                })
+                .into_response()
+            }
+        }),
+    );
+    let mut listener = None;
+    for _ in 0..100 {
+        match tokio::net::TcpListener::bind(&n2.addr).await {
+            Ok(l) => {
+                listener = Some(l);
+                break;
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+        }
+    }
+    let listener = listener.expect("node 2's address is free again");
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let before = n1.wal.last_sequence().await.unwrap();
+    let resp = write_line(
+        &client,
+        &n1.url,
+        "sharddb",
+        "cpu,host=a value=1 1000000000\nmem,host=a used=2 1000000000",
+    )
+    .await;
+    let status = resp.status();
+    assert!(
+        status.is_success(),
+        "a region refused once at capacity is retried and the write succeeds: {status} {}",
+        resp.text().await.unwrap_or_default()
+    );
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        2,
+        "node 2 saw the refused batch and one retry"
+    );
+
+    let landed: Vec<String> = n1
+        .wal
+        .read_from(before + 1)
+        .await
+        .unwrap()
+        .iter()
+        .flat_map(|(_, e)| e.points.iter().map(|p| p.measurement.clone()))
+        .collect();
+    assert_eq!(
+        landed,
+        vec!["cpu".to_string()],
+        "the local region landed once; the retry resent only the refused region"
+    );
+}
+
 /// Pair cluster with the forward queue on: `cpu` lives on node 1, `mem` on
 /// node 2 (`mem_peers` decides who else holds it).
 async fn queued_pair(

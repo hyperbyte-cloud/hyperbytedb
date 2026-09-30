@@ -59,6 +59,23 @@ pub struct PeerIngestionService {
     forward_queue: Option<Arc<ForwardQueue>>,
 }
 
+/// Times a coordinator resends regions a primary refused at capacity before
+/// giving up on the client write.
+const CAPACITY_RETRIES: u32 = 4;
+
+/// Wait before capacity retry `attempt` (0-based): 25 ms doubling, with
+/// jitter so coordinators refused together do not come back together.
+fn capacity_backoff(attempt: u32) -> std::time::Duration {
+    let base = 25u64 << attempt.min(4);
+    let jitter = u64::from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0),
+    ) % (base / 2 + 1);
+    std::time::Duration::from_millis(base / 2 + jitter)
+}
+
 /// Queued forward batches delivered at once by the drainer.
 const FORWARD_DRAIN_CONCURRENCY: usize = 8;
 /// Most queue entries (client writes' forwarded shares) per drained batch.
@@ -283,7 +300,16 @@ impl PeerIngestionService {
             self.append_local_buckets(ctx, db, rp, precision, precision_val, buckets.local),
             tracing::debug_span!(target: crate::telemetry::TARGET, "local_append"),
         );
-        let (forward_results, local_result) = tokio::join!(forwards, local);
+        let (mut forward_results, local_result) = tokio::join!(forwards, local);
+        self.retry_refused_regions(
+            ctx,
+            db,
+            rp,
+            precision,
+            &buckets.forward,
+            &mut forward_results,
+        )
+        .await;
         let forward_results: Vec<Result<(), HyperbytedbError>> =
             forward_results.into_iter().map(|(_, r)| r).collect();
         let mut forward_failures = 0usize;
@@ -412,6 +438,45 @@ impl PeerIngestionService {
                     .increment(1);
                 false
             }
+        }
+    }
+
+    /// Resend only the regions a primary refused at capacity, a few times
+    /// with backoff, replacing their results in `results`.
+    ///
+    /// A refused region used to fail the whole client write, and the client
+    /// then resent every point, including the regions that had landed. At
+    /// 1,000-point batches under 1% of writes hit this, but the rework grows
+    /// with batch size and node count: 5,000- and 10,000-point batches at
+    /// N=12 on n3 fell to 387k and 248k points/s with thousands of errors.
+    async fn retry_refused_regions(
+        &self,
+        ctx: &ShardRoutingContext,
+        db: &str,
+        rp: &str,
+        precision: Option<&str>,
+        forward: &std::collections::HashMap<u64, Vec<crate::domain::point::Point>>,
+        results: &mut Vec<(u64, Result<(), HyperbytedbError>)>,
+    ) {
+        for attempt in 0..CAPACITY_RETRIES {
+            let refused: Vec<u64> = results
+                .iter()
+                .filter(|(_, r)| matches!(r, Err(HyperbytedbError::ClusterUnavailable(_))))
+                .map(|(id, _)| *id)
+                .collect();
+            if refused.is_empty() {
+                return;
+            }
+            tokio::time::sleep(capacity_backoff(attempt)).await;
+            let subset: std::collections::HashMap<u64, Vec<crate::domain::point::Point>> = refused
+                .iter()
+                .filter_map(|id| forward.get(id).map(|p| (*id, p.clone())))
+                .collect();
+            counter!("hyperbytedb_shard_forward_capacity_retries_total")
+                .increment(refused.len() as u64);
+            let retried = forward_shard_writes_by_node(ctx, db, rp, precision, &subset).await;
+            results.retain(|(id, _)| !refused.contains(id));
+            results.extend(retried);
         }
     }
 
