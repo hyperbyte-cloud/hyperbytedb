@@ -1971,7 +1971,7 @@ async fn a_region_refused_at_capacity_is_retried_alone() {
 /// statement used to read local metadata alone, so it came back empty.
 #[tokio::test]
 #[serial(chdb)]
-async fn show_field_keys_includes_fields_held_by_other_nodes() {
+async fn a_node_without_a_copy_answers_metadata_and_time_queries() {
     let dir = tempfile::tempdir().unwrap();
     let [n1, n2] = start_sharded_pair_cluster(dir.path(), ShardedClusterOptions::default()).await;
     let client = reqwest::Client::new();
@@ -2008,6 +2008,34 @@ async fn show_field_keys_includes_fields_held_by_other_nodes() {
     )
     .await;
     assert!(resp.status().is_success(), "write: {}", resp.status());
+
+    flush_node(&n2).await;
+
+    // A time-bounded query through the node without a copy. With no local
+    // metadata it infers columns from the statement, and used to take
+    // `time` for a tag.
+    for node in [&n1, &n2] {
+        let resp = query_parsed(
+            &client,
+            &node.url,
+            "sharddb",
+            "SELECT count(used) FROM mem WHERE time >= 0 AND time < 120s GROUP BY time(1m)",
+        )
+        .await;
+        let result = &resp.results[0];
+        assert!(result.error.is_none(), "{}: {:?}", node.url, result.error);
+        let counts: Vec<serde_json::Value> = result.series.as_ref().expect("series")[0]
+            .values
+            .iter()
+            .map(|r| r[1].clone())
+            .collect();
+        assert_eq!(
+            counts,
+            [serde_json::json!(1), serde_json::json!(0)],
+            "{}",
+            node.url
+        );
+    }
 
     for node in [&n1, &n2] {
         let resp = query_parsed(&client, &node.url, "sharddb", "SHOW FIELD KEYS FROM mem").await;

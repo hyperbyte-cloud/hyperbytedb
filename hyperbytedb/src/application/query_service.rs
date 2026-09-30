@@ -2234,7 +2234,11 @@ fn inferred_mapping_from_select(stmt: &SelectStatement) -> ColumnMapping {
     for field in &stmt.fields {
         crate::application::predicate_sql::collect_expr_identifiers(&field.expr, &mut fields);
     }
-    fields.retain(|name| name != "*" && !tags.iter().any(|t| t == name));
+    // `time` is the timestamp column, never a tag or field: taken as a tag it
+    // made the series join ask for `s.time`, failing every time-bounded
+    // query on a node that holds no copy of the measurement.
+    tags.retain(|name| name != "time");
+    fields.retain(|name| name != "*" && name != "time" && !tags.iter().any(|t| t == name));
     tags.retain(|name| !fields.iter().any(|f| f == name));
     if fields.is_empty() {
         fields.push("value".to_string());
@@ -3187,5 +3191,31 @@ mod show_regex_tests {
         let keys = vec!["host".into(), "region".into()];
         let out = filter_strings_by_show_regex(keys, "^ho");
         assert_eq!(out, vec!["host".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod inferred_mapping_tests {
+    use super::inferred_mapping_from_select;
+    use crate::timeseriesql::ast::Statement;
+    use crate::timeseriesql::parser::parse_query;
+
+    #[test]
+    fn time_is_neither_tag_nor_field() {
+        let stmt = match parse_query(
+            "SELECT count(usage) FROM cpu WHERE time >= 0 AND time < 2m AND host = 'a' \
+             GROUP BY time(1m)",
+        )
+        .unwrap()
+        .remove(0)
+        {
+            Statement::Select(s) => s,
+            _ => panic!("expected SELECT"),
+        };
+        let m = inferred_mapping_from_select(&stmt);
+        let mut tags: Vec<_> = m.tag_keys.iter().cloned().collect();
+        tags.sort();
+        assert_eq!(tags, ["host"]);
+        assert!(!m.field_names.iter().any(|f| f == "time"));
     }
 }
