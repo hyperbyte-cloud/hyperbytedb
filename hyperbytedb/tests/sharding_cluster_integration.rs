@@ -569,6 +569,69 @@ async fn multi_region_mean_merges_sum_and_count() {
     );
 }
 
+/// `GROUP BY time(...)` across regions merges per bucket. The region query
+/// used to gain a bare `time` column next to the bucket, which chDB rejects
+/// in an aggregate ("Column 'time' is not under aggregate function").
+#[tokio::test]
+#[serial(chdb)]
+async fn multi_region_group_by_time_merges_buckets() {
+    let dir = tempfile::tempdir().unwrap();
+    let nodes =
+        start_sharded_three_node_cluster(dir.path(), ShardedClusterOptions::default()).await;
+    bootstrap_two_regions(&nodes, "sharddb", "autogen", "cpu").await;
+
+    let client = reqwest::Client::new();
+    for node in &nodes {
+        create_db(&client, &node.url, "sharddb").await;
+    }
+
+    let mid = u64::MAX / 2;
+    let (host_low, host_high) = hosts_for_region_split("cpu", mid);
+    let s = 1_000_000_000u64;
+    let body = format!(
+        "cpu,host={host_low} value=10 {}\n\
+         cpu,host={host_low} value=20 {}\n\
+         cpu,host={host_high} value=30 {}\n\
+         cpu,host={host_high} value=40 {}",
+        0,
+        30 * s,
+        10 * s,
+        70 * s
+    );
+    let resp = write_line(&client, &nodes[0].url, "sharddb", &body).await;
+    assert!(resp.status().is_success(), "write: {}", resp.status());
+    flush_node(&nodes[0]).await;
+    flush_node(&nodes[1]).await;
+
+    for node in &nodes {
+        let resp = query_parsed(
+            &client,
+            &node.url,
+            "sharddb",
+            &format!(
+                "SELECT count(value), mean(value) FROM cpu \
+                 WHERE time >= 0 AND time < {} GROUP BY time(1m)",
+                120 * s
+            ),
+        )
+        .await;
+        let result = &resp.results[0];
+        assert!(result.error.is_none(), "{}: {:?}", node.url, result.error);
+        let series = result.series.as_ref().expect("series");
+        let rows: Vec<(f64, f64)> = series[0]
+            .values
+            .iter()
+            .map(|r| (r[1].as_f64().unwrap(), r[2].as_f64().unwrap()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(3.0, 20.0), (1.0, 40.0)],
+            "{}: per-minute count and mean across both regions",
+            node.url
+        );
+    }
+}
+
 #[tokio::test]
 #[serial(chdb)]
 async fn multi_region_percentile_returns_error() {

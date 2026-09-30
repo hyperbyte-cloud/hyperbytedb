@@ -415,7 +415,8 @@ fn prepare_cq_select_strips_user_time_and_injects_window() {
     assert!(prepared.fill.is_none());
     let (min, max) = extract_time_bounds(prepared.condition.as_ref());
     assert_eq!(min, Some(start));
-    assert_eq!(max, Some(end));
+    // The window is `time < end`; bounds are inclusive.
+    assert_eq!(max, Some(end - 1));
 }
 
 #[tokio::test]
