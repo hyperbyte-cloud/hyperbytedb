@@ -49,6 +49,19 @@ def parse_args():
 ERROR_KINDS = {}
 ERROR_LOCK = threading.Lock()
 
+# A write the server turned away before reading its body. Admission control
+# answers 503 at once and closes the connection; a body larger than the
+# socket buffers is still uploading, so the client sees a broken pipe or a
+# reset instead of the 503. It is the same "not now" and is retried the same
+# way.
+REFUSED_UNREAD = 599
+RETRYABLE = (429, 503, REFUSED_UNREAD)
+
+
+def _refused_unread(e):
+    reason = getattr(e, "reason", e)
+    return isinstance(reason, (BrokenPipeError, ConnectionResetError))
+
 
 def post(url, body, timeout=60, content_type="text/plain"):
     req = urllib.request.Request(url, data=body, method="POST")
@@ -67,6 +80,8 @@ def post(url, body, timeout=60, content_type="text/plain"):
                 ERROR_KINDS[k] = ERROR_KINDS.get(k, 0) + 1
         return e.code
     except Exception as e:
+        if _refused_unread(e):
+            return REFUSED_UNREAD
         with ERROR_LOCK:
             k = f"0 {type(e).__name__}: {str(e)[:100]}"
             ERROR_KINDS[k] = ERROR_KINDS.get(k, 0) + 1
@@ -114,12 +129,12 @@ def run_phase(endpoints, db, meas, start, count, batch, concurrency, ts_base, se
             # retry like a real client. Only a batch that never lands, or a
             # different failure, is an error.
             attempt = 0
-            while code in (429, 503) and attempt < 12:
+            while code in RETRYABLE and attempt < 12:
                 time.sleep(min(0.05 * 2 ** min(attempt, 5), 1.6) * (0.5 + random.random()))
                 attempt += 1
                 local_retry += 1
                 code = post(url, body)
-            if code in (429, 503):
+            if code in RETRYABLE:
                 with ERROR_LOCK:
                     k = f"{code} still rejected after {attempt} retries"
                     ERROR_KINDS[k] = ERROR_KINDS.get(k, 0) + 1
