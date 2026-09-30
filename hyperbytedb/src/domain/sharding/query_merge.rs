@@ -6,8 +6,7 @@ use serde_json::{Value, json};
 use crate::domain::measurement::MeasurementMeta;
 use crate::domain::query_result::{QueryResponse, SeriesResult};
 use crate::domain::rollup::{
-    MeanRollupField, RollupCombine, aggregate_source_field_name, mean_rollup_column_names,
-    rollup_combine_from_field,
+    MeanRollupField, RollupCombine, aggregate_source_field_name, rollup_combine_from_field,
 };
 use crate::error::HyperbytedbError;
 use crate::timeseriesql::ast::{BinaryExpr, BinaryOp, Expr, Field, FunctionCall, SelectStatement};
@@ -84,16 +83,19 @@ pub fn prepare_sharded_region_query(
         plan.saved_offset = stmt.offset;
     }
 
-    if stmt.order_by.is_some()
-        || stmt
-            .group_by
-            .as_ref()
-            .is_some_and(|gb| gb.time_dimension().is_some())
-    {
+    let time_buckets = stmt
+        .group_by
+        .as_ref()
+        .is_some_and(|gb| gb.time_dimension().is_some());
+    if stmt.order_by.is_some() || time_buckets {
         plan.saved_time_desc = stmt.order_by.as_ref().map(|o| o.time_desc);
         plan.needs_global_sort = true;
         plan.region_stmt.order_by = None;
-        ensure_time_field_for_global_sort(&mut plan.region_stmt.fields);
+        // A time-bucketed query already returns each bucket as `time`; a bare
+        // `time` beside the aggregates is an error in chDB.
+        if !time_buckets {
+            ensure_time_field_for_global_sort(&mut plan.region_stmt.fields);
+        }
     }
 
     Ok(plan)
@@ -148,7 +150,9 @@ fn rewrite_field_for_region(
         Expr::Call(func) => match func.name.to_uppercase().as_str() {
             "MEAN" => {
                 let source = aggregate_source_field_name(func)?;
-                let (sum_col, count_col) = mean_rollup_column_names(&source);
+                // Private names, keyed by output: `sum_{field}` would collide
+                // with the user's own `sum(field)` or `count(field)` beside it.
+                let (sum_col, count_col) = partial_names("mean", &output);
                 plan.mean_partials.insert(
                     output,
                     MeanRollupField {
@@ -181,9 +185,8 @@ fn rewrite_field_for_region(
             }
             "STDDEV" => {
                 let source = aggregate_source_field_name(func)?;
-                let sum_col = format!("stddev_sum_{source}");
-                let sumsq_col = format!("stddev_sumsq_{source}");
-                let count_col = format!("stddev_count_{source}");
+                let (sum_col, count_col) = partial_names("stddev", &output);
+                let sumsq_col = format!("__stddev_sumsq_{output}");
                 plan.stddev_partials.insert(
                     output,
                     StddevPartialCols {
@@ -223,6 +226,14 @@ fn rewrite_field_for_region(
         },
         _ => Ok(vec![field.clone()]),
     }
+}
+
+/// Sum and count partial columns for aggregate `kind` producing `output`.
+fn partial_names(kind: &str, output: &str) -> (String, String) {
+    (
+        format!("__{kind}_sum_{output}"),
+        format!("__{kind}_count_{output}"),
+    )
 }
 
 fn field_with_call(name: &str, source: &str, alias: Option<String>) -> Field {
@@ -321,6 +332,23 @@ fn build_merge_rules(
     rules
 }
 
+/// InfluxDB's series order: by name, then by tag set. Without the tag part,
+/// series of one measurement came out in hash order, different on every
+/// coordinator.
+fn series_order(a: &SeriesResult, b: &SeriesResult) -> std::cmp::Ordering {
+    let tags = |s: &SeriesResult| {
+        let mut pairs: Vec<(String, String)> = s
+            .tags
+            .iter()
+            .flatten()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        pairs.sort();
+        pairs
+    };
+    a.name.cmp(&b.name).then_with(|| tags(a).cmp(&tags(b)))
+}
+
 /// Merge multiple partial query responses into one, deduplicating series by name+tags.
 pub fn merge_query_results(
     mut parts: Vec<QueryResponse>,
@@ -374,7 +402,7 @@ pub fn merge_query_results(
             "shard merge would combine more than {SHARD_MERGE_MAX_DISTINCT_SERIES} distinct series; narrow the query"
         )));
     }
-    series.sort_by(|a, b| a.name.cmp(&b.name));
+    series.sort_by(series_order);
 
     Ok(QueryResponse::single(statement_id, series))
 }
@@ -516,7 +544,7 @@ fn merge_rows_with_rules(
     }
 
     let mut series: Vec<SeriesResult> = by_series.into_values().collect();
-    series.sort_by(|a, b| a.name.cmp(&b.name));
+    series.sort_by(series_order);
     Ok(QueryResponse::single(statement_id, series))
 }
 
@@ -1252,6 +1280,38 @@ mod tests {
     }
 
     #[test]
+    fn merged_series_are_ordered_by_name_then_tags() {
+        let part = |hosts: &[&str]| {
+            QueryResponse::single(
+                0,
+                hosts
+                    .iter()
+                    .map(|h| SeriesResult {
+                        name: "cpu".into(),
+                        tags: Some(HashMap::from([("host".to_string(), h.to_string())])),
+                        columns: vec!["time".into(), "value".into()],
+                        values: vec![vec![json!(1), json!(1)]],
+                        partial: None,
+                    })
+                    .collect(),
+            )
+        };
+        let merged = merge_query_results(vec![
+            part(&["h6", "h1", "h4", "h3"]),
+            part(&["h0", "h7", "h2", "h5"]),
+        ])
+        .unwrap();
+        let hosts: Vec<String> = merged.results[0]
+            .series
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|s| s.tags.as_ref().unwrap()["host"].clone())
+            .collect();
+        assert_eq!(hosts, ["h0", "h1", "h2", "h3", "h4", "h5", "h6", "h7"]);
+    }
+
+    #[test]
     fn merges_mean_via_sum_and_count_partials() {
         let stmt = SelectStatement {
             fields: vec![Field {
@@ -1282,6 +1342,7 @@ mod tests {
             timezone: None,
         };
         let plan = prepare_sharded_region_query(&stmt).unwrap();
+        let cols = plan.mean_partials.values().next().unwrap().clone();
 
         let partial = |sum: i64, count: i64| {
             QueryResponse::single(
@@ -1289,7 +1350,7 @@ mod tests {
                 vec![SeriesResult {
                     name: "metrics".into(),
                     tags: None,
-                    columns: vec!["time".into(), "sum_value".into(), "count_value".into()],
+                    columns: vec!["time".into(), cols.sum_col.clone(), cols.count_col.clone()],
                     values: vec![vec![json!(1000), json!(sum), json!(count)]],
                     partial: None,
                 }],
@@ -1459,6 +1520,7 @@ mod tests {
             timezone: None,
         };
         let plan = prepare_sharded_region_query(&stmt).unwrap();
+        let cols = plan.stddev_partials.values().next().unwrap().clone();
 
         // Region A: values 2,4 -> sum=6, sumsq=20, count=2
         // Region B: value 6 -> sum=6, sumsq=36, count=1
@@ -1470,9 +1532,9 @@ mod tests {
                     name: "metrics".into(),
                     tags: None,
                     columns: vec![
-                        "stddev_sum_value".into(),
-                        "stddev_sumsq_value".into(),
-                        "stddev_count_value".into(),
+                        cols.sum_col.clone(),
+                        cols.sumsq_col.clone(),
+                        cols.count_col.clone(),
                     ],
                     values: vec![vec![json!(sum), json!(sumsq), json!(count)]],
                     partial: None,
