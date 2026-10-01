@@ -763,6 +763,82 @@ async fn coalesced_forwards_land_every_point() {
     assert_eq!(count, Some(40.0), "every forwarded point landed once");
 }
 
+/// With peers on HTTP/2, forwards and replication still land every point.
+#[tokio::test]
+#[serial(chdb)]
+async fn forwards_and_replication_work_over_http2() {
+    use hyperbytedb::ports::wal::WalPort;
+
+    let dir = tempfile::tempdir().unwrap();
+    let opts = ShardedClusterOptions {
+        http2: true,
+        ..Default::default()
+    };
+    let nodes = start_sharded_three_node_cluster(dir.path(), opts).await;
+    bootstrap_two_regions(&nodes, "sharddb", "autogen", "cpu").await;
+    let client = reqwest::Client::new();
+    create_db(&client, &nodes[0].url, "sharddb").await;
+    for node in &nodes[1..] {
+        wait_for_database(&client, &node.url, "sharddb").await;
+    }
+    let (low, high) = hosts_for_region_split("cpu", u64::MAX / 2);
+    // One write first: it creates the tables. Twenty concurrent first writes
+    // all run that DDL on the shared chDB session and outlast the 500 ms
+    // forward timeout, over HTTP/1.1 as much as HTTP/2.
+    let warm = format!("cpu,host={low} value=0 999000000\ncpu,host={high} value=0 999000000");
+    let resp = write_line(&client, &nodes[2].url, "sharddb", &warm).await;
+    assert!(
+        resp.status().is_success(),
+        "warm-up write: {}",
+        resp.status()
+    );
+    let replica_before = nodes[2].wal.last_sequence().await.unwrap();
+
+    // Node 3 primaries neither region: both halves forward, then replicate.
+    let writes = (0..20u64).map(|i| {
+        let client = client.clone();
+        let url = nodes[2].url.clone();
+        let body = format!(
+            "cpu,host={low} value={i} {t}\ncpu,host={high} value={i} {t}",
+            t = 1_000_000_000 + i
+        );
+        async move { write_line(&client, &url, "sharddb", &body).await.status() }
+    });
+    for status in futures::future::join_all(writes).await {
+        assert!(status.is_success(), "write: {status}");
+    }
+    flush_node(&nodes[0]).await;
+    flush_node(&nodes[1]).await;
+    let resp = query_parsed(
+        &client,
+        &nodes[2].url,
+        "sharddb",
+        "SELECT count(value) FROM cpu",
+    )
+    .await;
+    let count = resp.results[0].series.as_ref().unwrap()[0].values[0][1].as_f64();
+    assert_eq!(count, Some(42.0), "every forwarded point landed once");
+
+    // Region A's peers are nodes 1 and 2; region B's include node 3, so
+    // replication reaches node 3's WAL.
+    let mut replicated = 0usize;
+    for _ in 0..200 {
+        replicated = nodes[2]
+            .wal
+            .read_from(replica_before + 1)
+            .await
+            .unwrap()
+            .iter()
+            .map(|(_, e)| e.points.len())
+            .sum();
+        if replicated > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(replicated > 0, "replication reached a peer over HTTP/2");
+}
+
 #[tokio::test]
 #[serial(chdb)]
 async fn multi_region_percentile_returns_error() {

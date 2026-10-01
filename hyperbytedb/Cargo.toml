@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 # HTTP
-axum = { version = "0.8", features = ["macros"] }
+axum = { version = "0.8", features = ["macros", "http2"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors", "set-header", "timeout"] }
@@ -77,7 +77,7 @@ metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 
 # HTTP client (peer-to-peer replication)
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
 
 # Compression (gzip decompression for write endpoint)
 flate2 = "1"

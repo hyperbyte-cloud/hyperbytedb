@@ -35,6 +35,30 @@ pub struct PeerClient {
     max_coalesce_body_bytes: usize,
 }
 
+/// The HTTP client for peer traffic.
+///
+/// connect_timeout bounds the worst-case tail for dead/unreachable peers
+/// (black-holed SYNs would otherwise hang until the full per-request
+/// timeout); keepalive keeps long-lived pool sockets from silently expiring
+/// behind NAT/firewalls. Operation timeouts remain the caller's
+/// responsibility via per-request `.timeout(...)`. `builder.build()` only
+/// fails on broken TLS init, and `Client::new()` would also be unusable then.
+fn peer_http_client(http2: bool) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(3))
+        .tcp_keepalive(Duration::from_secs(60))
+        .dns_resolver(crate::adapters::cluster::dns_cache::CachingResolver::shared());
+    if http2 {
+        builder = builder
+            .http2_prior_knowledge()
+            .http2_adaptive_window(true)
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .http2_keep_alive_while_idle(true);
+    }
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
 impl PeerClient {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -48,21 +72,7 @@ impl PeerClient {
         max_coalesce_body_bytes: usize,
     ) -> Self {
         let depth = outbound_queue_depth.max(1);
-        // See raft/network.rs: builder.build() only fails on broken TLS init,
-        // and `Client::new()` would also be unusable in that case.
-        //
-        // connect_timeout bounds the worst-case tail for dead/unreachable
-        // peers (black-holed SYNs would otherwise hang until the full
-        // per-request timeout); keepalive keeps long-lived pool sockets from
-        // silently expiring behind NAT/firewalls. Operation timeouts remain
-        // the caller's responsibility via per-request `.timeout(...)`.
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .connect_timeout(Duration::from_secs(3))
-            .tcp_keepalive(Duration::from_secs(60))
-            .dns_resolver(crate::adapters::cluster::dns_cache::CachingResolver::shared())
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        let client = peer_http_client(false);
         let (outbound_tx, outbound_rx) =
             tokio::sync::mpsc::channel::<OutboundReplicationBatch>(depth);
         let inflight = max_inflight_batches.max(1);
@@ -90,6 +100,17 @@ impl PeerClient {
 
     pub fn membership(&self) -> &SharedMembership {
         &self.membership
+    }
+
+    /// Talk to peers over HTTP/2 (cleartext, prior knowledge): concurrent
+    /// requests to a peer share one connection's streams. See
+    /// `cluster.internal_http2`.
+    #[must_use]
+    pub fn with_http2(mut self, http2: bool) -> Self {
+        if http2 {
+            self.client = peer_http_client(true);
+        }
+        self
     }
 
     pub fn http_client(&self) -> &reqwest::Client {
@@ -1355,5 +1376,34 @@ mod replicate_batch_tests {
             3,
             "node 3: parts 2, 4, 5"
         );
+    }
+}
+
+#[cfg(test)]
+mod http2_tests {
+    use super::peer_http_client;
+
+    async fn version_echo() -> String {
+        let app = axum::Router::new().route(
+            "/v",
+            axum::routing::get(|req: axum::extract::Request| async move {
+                format!("{:?}", req.version())
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}/v")
+    }
+
+    /// With `internal_http2` the peer client speaks HTTP/2 to the axum
+    /// server (cleartext, no upgrade round trip); without it, HTTP/1.1.
+    #[tokio::test]
+    async fn peer_client_speaks_http2_when_enabled() {
+        let url = version_echo().await;
+        let h2 = peer_http_client(true).get(&url).send().await.unwrap();
+        assert_eq!(h2.text().await.unwrap(), "HTTP/2.0");
+        let h1 = peer_http_client(false).get(&url).send().await.unwrap();
+        assert_eq!(h1.text().await.unwrap(), "HTTP/1.1");
     }
 }

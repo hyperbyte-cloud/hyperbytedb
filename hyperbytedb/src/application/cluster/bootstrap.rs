@@ -80,7 +80,8 @@ impl ClusterBootstrap {
                 config.replication_max_inflight_batches,
                 config.replication_max_coalesce_body_bytes,
             )
-            .with_hinted_handoff(hh.clone()),
+            .with_hinted_handoff(hh.clone())
+            .with_http2(config.internal_http2),
         );
 
         Ok(Self {
