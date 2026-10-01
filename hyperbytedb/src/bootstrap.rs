@@ -286,6 +286,7 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
                 node_id: config.cluster.node_id,
                 peer_client: pc.clone(),
                 region_write_stats: Arc::new(RegionWriteStats::new()),
+                forward_coalescer: Default::default(),
             })),
             _ => None,
         }

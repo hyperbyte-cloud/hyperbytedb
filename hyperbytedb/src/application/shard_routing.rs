@@ -33,6 +33,8 @@ pub struct ShardRoutingContext {
     pub node_id: u64,
     pub peer_client: Arc<PeerClient>,
     pub region_write_stats: Arc<RegionWriteStats>,
+    /// Shares one request per destination node among concurrent writes.
+    pub forward_coalescer: Arc<crate::application::forward_coalescer::ForwardCoalescer>,
 }
 
 pub struct PointBuckets {
@@ -542,7 +544,7 @@ pub async fn forward_shard_writes_by_node(
 ) -> Vec<(u64, Result<(), HyperbytedbError>)> {
     use crate::application::line_protocol::encode_points_to_line_protocol;
     use crate::domain::database::Precision;
-    use crate::domain::sharding::{ShardWriteBatch, ShardWriteBatchResponse, ShardWriteRequest};
+    use crate::domain::sharding::ShardWriteRequest;
 
     let mut results: Vec<(u64, Result<(), HyperbytedbError>)> = Vec::new();
     // Regions that go through the per-region path instead.
@@ -609,101 +611,59 @@ pub async fn forward_shard_writes_by_node(
                 Err(e) => results.push((*id, Err(e))),
             }
         }
-        let body = match bincode::serialize(&ShardWriteBatch { parts }) {
-            Ok(b) => b,
-            Err(e) => {
-                for id in region_ids {
-                    results.push((id, Err(HyperbytedbError::Internal(e.to_string().into()))));
-                }
-                continue;
-            }
-        };
-        let client = ctx.peer_client.http_client();
+        let sent: Vec<u64> = parts.iter().map(|p| p.region_id).collect();
+        let client = ctx.peer_client.http_client().clone();
+        let coalescer = ctx.forward_coalescer.clone();
         let span = tracing::debug_span!(
             target: crate::telemetry::TARGET,
             "forward",
             node,
-            regions = region_ids.len(),
-            bytes = body.len()
+            regions = sent.len()
         );
-        sends.push(tracing::Instrument::instrument(async move {
-            let start = std::time::Instant::now();
-            let resp = crate::telemetry::inject(
-                client
-                    .post(format!("http://{addr}/internal/shard/write-batch"))
-                    .header("Content-Type", "application/octet-stream"),
-            )
-            .body(body)
-            .timeout(timeout)
-            .send()
-            .await;
-            let outcome = match &resp {
-                Ok(r) if r.status().is_success() => "ok",
-                Ok(r) if r.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE => "capacity",
-                _ => "error",
-            };
-            metrics::histogram!("hyperbytedb_shard_forward_request_seconds", "outcome" => outcome)
-                .record(start.elapsed().as_secs_f64());
-            (node, region_ids, resp)
-        }, span));
+        sends.push(tracing::Instrument::instrument(
+            async move {
+                let outcome = coalescer.send(&client, &addr, timeout, parts).await;
+                (node, sent, outcome)
+            },
+            span,
+        ));
     }
     counter!("hyperbytedb_shard_forward_batches_total").increment(sends.len() as u64);
     metrics::histogram!("hyperbytedb_shard_forward_nodes_per_write").record(sends.len() as f64);
 
-    for (node, region_ids, resp) in futures::future::join_all(sends).await {
-        let resp = match resp {
-            Ok(r) => r,
-            Err(e) => {
+    for (node, region_ids, outcome) in futures::future::join_all(sends).await {
+        use crate::application::forward_coalescer::NodeSendOutcome;
+        let parsed = match outcome {
+            NodeSendOutcome::Results(results) => results,
+            NodeSendOutcome::Unsupported => {
+                // Older build without the batch endpoint.
+                single.extend(region_ids);
+                continue;
+            }
+            NodeSendOutcome::Capacity => {
+                for id in region_ids {
+                    results.push((
+                        id,
+                        Err(HyperbytedbError::ClusterUnavailable(format!(
+                            "node {node} is at write capacity"
+                        ))),
+                    ));
+                }
+                continue;
+            }
+            NodeSendOutcome::Failed(msg) => {
                 for id in region_ids {
                     results.push((
                         id,
                         Err(HyperbytedbError::PeerUnreachable(format!(
-                            "forward batch to node {node} failed: {}",
-                            error_chain(&e)
+                            "forward batch to node {node} failed: {msg}"
                         ))),
                     ));
                 }
                 continue;
             }
         };
-        let status = resp.status();
-        if status == reqwest::StatusCode::NOT_FOUND
-            || status == reqwest::StatusCode::METHOD_NOT_ALLOWED
-        {
-            // Older build without the batch endpoint.
-            single.extend(region_ids);
-            continue;
-        }
-        if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-        {
-            for id in region_ids {
-                results.push((
-                    id,
-                    Err(HyperbytedbError::ClusterUnavailable(format!(
-                        "node {node} is at write capacity"
-                    ))),
-                ));
-            }
-            continue;
-        }
-        let parsed: Option<ShardWriteBatchResponse> = if status.is_success() {
-            resp.json().await.ok()
-        } else {
-            None
-        };
-        let Some(parsed) = parsed else {
-            for id in region_ids {
-                results.push((
-                    id,
-                    Err(HyperbytedbError::PeerUnreachable(format!(
-                        "forward batch to node {node} failed: {status}"
-                    ))),
-                ));
-            }
-            continue;
-        };
-        for part in parsed.results {
+        for part in parsed {
             match part_outcome(node, &part) {
                 PartOutcome::Done(r) => results.push((part.region_id, r)),
                 PartOutcome::Retry => {
@@ -740,7 +700,7 @@ pub async fn forward_shard_writes_by_node(
 /// What to do with one part of a batch response.
 /// `e` and its causes, joined: reqwest's own message ("error sending request
 /// for url ...") hides whether the peer refused, reset or timed out.
-fn error_chain(e: &dyn std::error::Error) -> String {
+pub(crate) fn error_chain(e: &dyn std::error::Error) -> String {
     let mut out = e.to_string();
     let mut cause = e.source();
     while let Some(c) = cause {
@@ -1195,6 +1155,7 @@ mod scatter_tests {
             node_id,
             peer_client,
             region_write_stats: Arc::new(RegionWriteStats::new()),
+            forward_coalescer: Default::default(),
         }
     }
 

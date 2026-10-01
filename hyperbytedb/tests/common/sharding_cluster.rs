@@ -166,6 +166,7 @@ pub async fn start_sharded_node(
         node_id,
         peer_client: peer_client.clone(),
         region_write_stats: Arc::new(hyperbytedb::application::runtime::RegionWriteStats::new()),
+        forward_coalescer: Default::default(),
     });
 
     let replication_apply = Some(ReplicationApplyQueue::with_sink_and_sharding(

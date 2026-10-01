@@ -6,6 +6,7 @@ pub mod continuous_query_service;
 pub mod database_drop;
 pub mod disk_monitor;
 pub mod flush_service;
+pub mod forward_coalescer;
 pub mod ingest_metadata;
 pub mod ingestion_service;
 pub mod line_protocol;
