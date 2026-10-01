@@ -141,7 +141,7 @@ async fn sharded_mv_incremental_rollup() {
         "source missing written points: {src_body}"
     );
 
-    let create_mv = r#"CREATE MATERIALIZED VIEW "mv_cpu_1m" ON "sharddb" AS SELECT mean("value") INTO "cpu_1m" FROM "cpu" GROUP BY time(1m), *"#;
+    let create_mv = r#"CREATE MATERIALIZED VIEW "mv_cpu_1m" ON "sharddb" AS SELECT mean("value") AS "mean_value" INTO "cpu_1m" FROM "cpu" GROUP BY time(1m), *"#;
     let resp = query_sql(&client, &nodes[0].url, "sharddb", create_mv).await;
     assert!(
         resp.status().is_success(),
@@ -217,7 +217,7 @@ async fn sharded_mv_drop() {
     .await;
     flush_node(&nodes[0]).await;
 
-    let create_mv = r#"CREATE MATERIALIZED VIEW "mv_cpu_1m" ON "sharddb" AS SELECT mean("value") INTO "cpu_1m" FROM "cpu" GROUP BY time(1m), *"#;
+    let create_mv = r#"CREATE MATERIALIZED VIEW "mv_cpu_1m" ON "sharddb" AS SELECT mean("value") AS "mean_value" INTO "cpu_1m" FROM "cpu" GROUP BY time(1m), *"#;
     let resp = query_sql(&client, &nodes[0].url, "sharddb", create_mv).await;
     assert!(resp.status().is_success());
 
@@ -371,7 +371,7 @@ async fn sharded_mv_raft_replicate() {
     flush_node(&nodes[0]).await;
     flush_node(&nodes[1]).await;
 
-    let create_mv = r#"CREATE MATERIALIZED VIEW "mv_cpu_1m" ON "sharddb" AS SELECT mean("value") INTO "cpu_1m" FROM "cpu" GROUP BY time(1m), *"#;
+    let create_mv = r#"CREATE MATERIALIZED VIEW "mv_cpu_1m" ON "sharddb" AS SELECT mean("value") AS "mean_value" INTO "cpu_1m" FROM "cpu" GROUP BY time(1m), *"#;
     let resp = query_sql(&client, &nodes[0].url, "sharddb", create_mv).await;
     assert!(
         resp.status().is_success(),
@@ -478,9 +478,12 @@ async fn sharded_mv_transfer_purge_dest_partials() {
     )
     .await;
     assert!(q_a.status().is_success());
-    let body_a = q_a.text().await.unwrap();
+    let body_a: serde_json::Value = q_a.json().await.unwrap();
+    // Purged: no series, or a sum of null. (Not a substring check: the
+    // time column's own digits include a 4.)
+    let sum_a = &body_a["results"][0]["series"][0]["values"][0][1];
     assert!(
-        !body_a.contains("4"),
+        sum_a.is_null(),
         "host=a dest partials should be purged, got: {body_a}"
     );
 

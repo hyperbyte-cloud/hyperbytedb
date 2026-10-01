@@ -159,6 +159,78 @@ pub(crate) fn is_time_epoch_comparison(be: &BinaryExpr) -> bool {
     matches!(rhs, Expr::DurationLiteral(_) | Expr::IntegerLiteral(_))
 }
 
+/// The start of a query's time range in nanoseconds: the lower bound its
+/// WHERE puts on `time`, as InfluxDB reports for an aggregate without
+/// GROUP BY time(). Understands integer epochs, durations, RFC 3339 strings
+/// and `now() +/- <duration>` (`now` is the caller's). None when unbounded.
+#[must_use]
+pub fn query_start_nanos(condition: Option<&Expr>, now_nanos: i64) -> Option<i64> {
+    condition.and_then(|c| lower_bound(c, now_nanos))
+}
+
+fn lower_bound(expr: &Expr, now: i64) -> Option<i64> {
+    let Expr::BinaryExpr(be) = expr else {
+        return None;
+    };
+    match be.op {
+        BinaryOp::And => match (lower_bound(&be.left, now), lower_bound(&be.right, now)) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        },
+        // Every branch must be bounded below, and the range starts at the
+        // earliest of them.
+        BinaryOp::Or => Some(lower_bound(&be.left, now)?.min(lower_bound(&be.right, now)?)),
+        _ => {
+            let (op, value) = if is_time_identifier(&be.left) {
+                (be.op.clone(), &be.right)
+            } else if is_time_identifier(&be.right) {
+                let flipped = match be.op {
+                    BinaryOp::Gt => BinaryOp::Lt,
+                    BinaryOp::Gte => BinaryOp::Lte,
+                    BinaryOp::Lt => BinaryOp::Gt,
+                    BinaryOp::Lte => BinaryOp::Gte,
+                    ref other => other.clone(),
+                };
+                (flipped, &be.left)
+            } else {
+                return None;
+            };
+            let nanos = time_value_nanos(value, now)?;
+            match op {
+                BinaryOp::Gte | BinaryOp::Eq => Some(nanos),
+                BinaryOp::Gt => Some(nanos.saturating_add(1)),
+                _ => None,
+            }
+        }
+    }
+}
+
+fn time_value_nanos(expr: &Expr, now: i64) -> Option<i64> {
+    match expr {
+        Expr::IntegerLiteral(n) => Some(*n),
+        Expr::DurationLiteral(d) => Some(d.to_nanos()),
+        Expr::Now => Some(now),
+        Expr::TimeLiteral(s) | Expr::StringLiteral(s) => chrono::DateTime::parse_from_rfc3339(s)
+            .ok()
+            .and_then(|t| t.timestamp_nanos_opt())
+            .or_else(|| {
+                chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+                    .ok()
+                    .and_then(|t| t.and_utc().timestamp_nanos_opt())
+            }),
+        Expr::BinaryExpr(be) => {
+            let l = time_value_nanos(&be.left, now)?;
+            let r = time_value_nanos(&be.right, now)?;
+            match be.op {
+                BinaryOp::Add => Some(l.saturating_add(r)),
+                BinaryOp::Sub => Some(l.saturating_sub(r)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +253,34 @@ mod tests {
         );
         assert_eq!(min, Some(3_000_000_000));
         assert_eq!(max, Some(7_000_000_000));
+    }
+
+    fn start(q: &str) -> Option<i64> {
+        let stmt = match parse_query(q).unwrap().remove(0) {
+            Statement::Select(s) => s,
+            _ => panic!("expected SELECT"),
+        };
+        query_start_nanos(stmt.condition.as_ref(), 10_000_000_000_000)
+    }
+
+    #[test]
+    fn query_start_reads_every_form_of_lower_bound() {
+        assert_eq!(start("SELECT count(v) FROM m"), None);
+        assert_eq!(start("SELECT count(v) FROM m WHERE time >= 5"), Some(5));
+        assert_eq!(start("SELECT count(v) FROM m WHERE time > 5"), Some(6));
+        assert_eq!(start("SELECT count(v) FROM m WHERE time < 5"), None);
+        assert_eq!(
+            start("SELECT count(v) FROM m WHERE time >= '2016-08-28T00:00:00Z' AND host = 'a'"),
+            Some(1_472_342_400_000_000_000)
+        );
+        assert_eq!(
+            start("SELECT count(v) FROM m WHERE time >= now() - 1h"),
+            Some(10_000_000_000_000 - 3_600_000_000_000)
+        );
+        assert_eq!(
+            start("SELECT count(v) FROM m WHERE time >= 7 AND time >= 9 AND time < 20"),
+            Some(9)
+        );
     }
 
     #[test]

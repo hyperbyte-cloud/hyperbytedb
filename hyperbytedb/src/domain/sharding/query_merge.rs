@@ -33,6 +33,12 @@ pub struct ShardedQueryPlan {
     saved_offset: Option<u64>,
     saved_time_desc: Option<bool>,
     needs_global_sort: bool,
+    /// For a lone FIRST/LAST/MAX/MIN without GROUP BY time(): the partial
+    /// column carrying the selected point's time, reported as `time`.
+    point_time_col: Option<String>,
+    /// The response's time format (`epoch` query parameter), for times
+    /// promoted from partial columns.
+    pub epoch: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +66,8 @@ pub fn prepare_sharded_region_query(
         saved_offset: None,
         saved_time_desc: None,
         needs_global_sort: false,
+        point_time_col: None,
+        epoch: None,
     };
 
     validate_no_non_mergeable_aggs(stmt)?;
@@ -70,6 +78,22 @@ pub fn prepare_sharded_region_query(
     }
     plan.region_stmt.fields = region_fields;
     plan.merge_rules = build_merge_rules(stmt, &plan);
+    if let Some((output, selector)) = lone_point_selector(stmt) {
+        let col = format!("{output}__sel_time");
+        // FIRST/LAST already carry min/max(time) under this name. A lone
+        // MAX/MIN region query returns its point time as `time`, renamed to
+        // this before merging; the winner's value picks the time.
+        match selector.as_str() {
+            "MAX" => {
+                plan.merge_rules.insert(col.clone(), ColumnMerge::TimeOfMax);
+            }
+            "MIN" => {
+                plan.merge_rules.insert(col.clone(), ColumnMerge::TimeOfMin);
+            }
+            _ => {}
+        }
+        plan.point_time_col = Some(col);
+    }
 
     if stmt.limit.is_some() || stmt.offset.is_some() {
         let offset = stmt.offset.unwrap_or(0);
@@ -91,14 +115,42 @@ pub fn prepare_sharded_region_query(
         plan.saved_time_desc = stmt.order_by.as_ref().map(|o| o.time_desc);
         plan.needs_global_sort = true;
         plan.region_stmt.order_by = None;
-        // A time-bucketed query already returns each bucket as `time`; a bare
-        // `time` beside the aggregates is an error in chDB.
-        if !time_buckets {
+        // A time-bucketed query already returns each bucket as `time`, and an
+        // aggregate without buckets has one row per series; a bare `time`
+        // beside aggregates is an error in chDB.
+        if !time_buckets && !select_has_true_aggregate(stmt) {
             ensure_time_field_for_global_sort(&mut plan.region_stmt.fields);
         }
     }
 
     Ok(plan)
+}
+
+/// `(output, NAME)` when the statement's only call is a bare FIRST, LAST,
+/// MAX or MIN and there is no GROUP BY time().
+fn lone_point_selector(stmt: &SelectStatement) -> Option<(String, String)> {
+    if stmt
+        .group_by
+        .as_ref()
+        .is_some_and(|gb| gb.time_dimension().is_some())
+    {
+        return None;
+    }
+    let mut calls = stmt
+        .fields
+        .iter()
+        .filter(|f| !matches!(f.expr, Expr::Identifier(_) | Expr::FieldRef { .. }));
+    let field = calls.next()?;
+    if calls.next().is_some() {
+        return None;
+    }
+    let Expr::Call(func) = &field.expr else {
+        return None;
+    };
+    let name = func.name.to_uppercase();
+    matches!(name.as_str(), "FIRST" | "LAST" | "MAX" | "MIN")
+        .then(|| select_output_field_name(field).map(|o| (o, name)))
+        .flatten()
 }
 
 fn ensure_time_field_for_global_sort(fields: &mut Vec<Field>) {
@@ -281,11 +333,11 @@ fn build_merge_rules(
     }
     for (output, time_col) in &plan.first_partials {
         rules.insert(output.clone(), ColumnMerge::FirstByTime);
-        rules.insert(time_col.clone(), ColumnMerge::Min);
+        rules.insert(time_col.clone(), ColumnMerge::EarliestTime);
     }
     for (output, time_col) in &plan.last_partials {
         rules.insert(output.clone(), ColumnMerge::LastByTime);
-        rules.insert(time_col.clone(), ColumnMerge::Max);
+        rules.insert(time_col.clone(), ColumnMerge::LatestTime);
     }
     for partial in plan.stddev_partials.values() {
         rules.insert(partial.sum_col.clone(), ColumnMerge::Sum);
@@ -557,6 +609,13 @@ enum ColumnMerge {
     Last,
     FirstByTime,
     LastByTime,
+    /// Timestamps, compared as times and kept as given (an RFC 3339 string
+    /// or an epoch number): numeric Min/Max would turn them into floats.
+    EarliestTime,
+    LatestTime,
+    /// A point time beside a MAX/MIN: the time of the row whose value wins.
+    TimeOfMax,
+    TimeOfMin,
     DistinctKeep,
     Skip,
     Unsupported,
@@ -652,6 +711,26 @@ fn json_as_count(v: &Value) -> i64 {
         .unwrap_or(0)
 }
 
+/// A time cell as nanoseconds (or the epoch unit it was given in), None when
+/// null or unparsable.
+fn json_time_nanos(v: &Value) -> Option<i64> {
+    if v.is_null() {
+        return None;
+    }
+    if let Some(n) = json_as_i64(v) {
+        return Some(n);
+    }
+    let s = v.as_str()?;
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .and_then(|dt| dt.timestamp_nanos_opt())
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+                .ok()
+                .and_then(|t| t.and_utc().timestamp_nanos_opt())
+        })
+}
+
 fn json_sortable_time(v: &Value) -> i64 {
     if let Some(n) = json_as_i64(v) {
         return n;
@@ -734,7 +813,48 @@ fn merge_values(
             let time_col = format!("{col}__sel_time");
             pick_by_time(left, right, left_row, right_row, columns, &time_col, false)
         }
+        ColumnMerge::EarliestTime | ColumnMerge::LatestTime => {
+            let (l, r) = (json_sortable_time(left), json_sortable_time(right));
+            let right_wins = match rule {
+                ColumnMerge::EarliestTime => r < l,
+                _ => r > l,
+            };
+            Ok(if left.is_null() || (right_wins && !right.is_null()) {
+                right.clone()
+            } else {
+                left.clone()
+            })
+        }
+        ColumnMerge::TimeOfMax | ColumnMerge::TimeOfMin => {
+            let col = columns.get(col_idx).ok_or_else(ragged_merge_row)?;
+            let value_col = col
+                .strip_suffix("__sel_time")
+                .ok_or_else(ragged_merge_row)?;
+            let vi = columns
+                .iter()
+                .position(|c| c == value_col)
+                .ok_or_else(ragged_merge_row)?;
+            let l = left_row.get(vi).and_then(json_as_f64);
+            let r = right_row.get(vi).and_then(json_as_f64);
+            let right_wins = match (l, r) {
+                (None, Some(_)) => true,
+                (Some(a), Some(b)) if a == b => {
+                    json_sortable_time(right) < json_sortable_time(left)
+                }
+                (Some(a), Some(b)) => (rule_is_max(rule) && b > a) || (!rule_is_max(rule) && b < a),
+                _ => false,
+            };
+            Ok(if right_wins {
+                right.clone()
+            } else {
+                left.clone()
+            })
+        }
     }
+}
+
+fn rule_is_max(rule: ColumnMerge) -> bool {
+    matches!(rule, ColumnMerge::TimeOfMax)
 }
 
 fn pick_by_time(
@@ -749,8 +869,10 @@ fn pick_by_time(
     let Some(time_idx) = columns.iter().position(|c| c == time_col) else {
         return Ok(left.clone());
     };
-    let lt = json_as_i64(left_row.get(time_idx).ok_or_else(ragged_merge_row)?);
-    let rt = json_as_i64(right_row.get(time_idx).ok_or_else(ragged_merge_row)?);
+    // Selection times arrive as chDB DateTime64 text, not numbers: compared
+    // with json_as_i64 every pick kept the left region's value.
+    let lt = json_time_nanos(left_row.get(time_idx).ok_or_else(ragged_merge_row)?);
+    let rt = json_time_nanos(right_row.get(time_idx).ok_or_else(ragged_merge_row)?);
     Ok(match (lt, rt) {
         (Some(a), Some(b)) if a == b => left.clone(),
         (Some(a), Some(b)) if pick_min && a <= b => left.clone(),
@@ -780,10 +902,33 @@ fn merge_row(
 }
 
 fn merge_aggregate_parts(
-    parts: Vec<QueryResponse>,
+    mut parts: Vec<QueryResponse>,
     stmt: &SelectStatement,
     plan: Option<&ShardedQueryPlan>,
 ) -> Result<QueryResponse, HyperbytedbError> {
+    // A lone MAX/MIN region returns its point's time as `time`. As a row key
+    // it would keep each region's row apart; carry it as the selector's
+    // partial instead, merged by the winning value.
+    if let Some(col) = plan.and_then(|p| {
+        p.point_time_col.as_ref().filter(|c| {
+            matches!(
+                p.merge_rules.get(*c),
+                Some(ColumnMerge::TimeOfMax | ColumnMerge::TimeOfMin)
+            )
+        })
+    }) {
+        for part in &mut parts {
+            for result in &mut part.results {
+                for series in result.series.iter_mut().flatten() {
+                    if !series.columns.iter().any(|c| c == col)
+                        && let Some(t) = series.columns.iter().position(|c| c == "time")
+                    {
+                        series.columns[t] = col.clone();
+                    }
+                }
+            }
+        }
+    }
     if parts.is_empty() {
         return Ok(QueryResponse::empty(0));
     }
@@ -821,7 +966,29 @@ fn finalize_sharded_aggregates(
     };
 
     let mut finalized = Vec::with_capacity(series_list.len());
-    for series in series_list {
+    for mut series in series_list {
+        if let Some(col) = &plan.point_time_col
+            && !series.columns.iter().any(|c| c == "time")
+            && let Some(idx) = series.columns.iter().position(|c| c == col)
+        {
+            // The partial is a plain column (chDB's DateTime64 text, or a
+            // time a region already formatted); report it as a time.
+            series.columns.insert(0, "time".to_string());
+            for row in &mut series.values {
+                // A number is a region's time already in the epoch unit.
+                let t = match row.get(idx) {
+                    Some(Value::String(text)) => {
+                        crate::domain::query_result::time_value_from_nanos(
+                            json_sortable_time(&Value::String(text.clone())),
+                            plan.epoch.as_deref(),
+                        )
+                    }
+                    Some(v) => v.clone(),
+                    None => Value::Null,
+                };
+                row.insert(0, t);
+            }
+        }
         finalized.push(finalize_series_aggregates(series, plan)?);
     }
 
@@ -865,6 +1032,7 @@ fn finalize_series_aggregates(
                 .values()
                 .flat_map(|p| [p.sum_col.clone(), p.sumsq_col.clone(), p.count_col.clone()]),
         )
+        .chain(plan.point_time_col.iter().cloned())
         .collect();
 
     let mut new_columns = Vec::new();
@@ -1212,7 +1380,7 @@ mod tests {
                 vec![SeriesResult {
                     name: "metrics".into(),
                     tags: None,
-                    columns: vec!["count_value".into()],
+                    columns: vec!["count".into()],
                     values: vec![vec![json!(n)]],
                     partial: None,
                 }],
@@ -1264,7 +1432,7 @@ mod tests {
                 vec![SeriesResult {
                     name: "metrics".into(),
                     tags: None,
-                    columns: vec!["time".into(), "count_value".into()],
+                    columns: vec!["time".into(), "count".into()],
                     values: vec![vec![json!(1000), json!(n)]],
                     partial: None,
                 }],
@@ -1403,11 +1571,7 @@ mod tests {
                 vec![SeriesResult {
                     name: "metrics".into(),
                     tags: None,
-                    columns: vec![
-                        "time".into(),
-                        "first_value".into(),
-                        "first_value__sel_time".into(),
-                    ],
+                    columns: vec!["time".into(), "first".into(), "first__sel_time".into()],
                     values: vec![vec![json!(1000), json!(value), json!(sel_time)]],
                     partial: None,
                 }],
@@ -1454,7 +1618,7 @@ mod tests {
                 vec![SeriesResult {
                     name: "metrics".into(),
                     tags: None,
-                    columns: vec!["last_value".into(), "last_value__sel_time".into()],
+                    columns: vec!["last".into(), "last__sel_time".into()],
                     values: vec![vec![json!(value), json!(sel_time)]],
                     partial: None,
                 }],
@@ -1467,8 +1631,10 @@ mod tests {
             Some(&plan),
         )
         .expect("merge");
-        let row = &merged.results[0].series.as_ref().unwrap()[0].values[0];
-        assert_eq!(row[0], json!(99));
+        let series = &merged.results[0].series.as_ref().unwrap()[0];
+        // A lone LAST reports the selected point's time, as InfluxDB does.
+        assert_eq!(series.columns, ["time", "last"]);
+        assert_eq!(series.values[0], [json!(5000), json!(99)]);
     }
 
     #[test]

@@ -354,7 +354,7 @@ fn test_fill_value() {
     // ifNull only reaches existing rows; WITH FILL-generated rows need a
     // constant INTERPOLATE or they surface as column defaults, not the value.
     assert!(
-        sql.contains("INTERPOLATE (\"mean_value\" AS 0)"),
+        sql.contains("INTERPOLATE (\"mean\" AS 0)"),
         "fill(N) must INTERPOLATE generated rows with N, got: {sql}"
     );
 }
@@ -1266,7 +1266,7 @@ fn test_difference_without_group_by_time_projects_time_and_orders() {
         "transform must wrap to filter NULL rows, got: {sql}"
     );
     assert!(
-        sql.contains(") WHERE \"difference_value\" IS NOT NULL"),
+        sql.contains(") WHERE \"difference\" IS NOT NULL"),
         "leading NULL transform rows must be filtered, got: {sql}"
     );
 }

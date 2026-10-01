@@ -709,6 +709,7 @@ async fn show_continuous_queries_after_create() {
                 coverage_interval_secs: 3600,
                 is_advanced: false,
                 last_run_at: None,
+                influxql_names: false,
             },
         )
         .await

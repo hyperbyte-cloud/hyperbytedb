@@ -328,7 +328,16 @@ impl QueryServiceImpl {
 
         let stmts = crate::timeseriesql::parse(&cq.query_text)?;
         let select_stmt = match stmts.into_iter().next() {
-            Some(Statement::Select(s)) => s,
+            Some(Statement::Select(mut s)) => {
+                if !cq.influxql_names {
+                    for field in &mut s.fields {
+                        if field.alias.is_none() {
+                            field.alias = to_clickhouse::legacy_field_alias(&field.expr);
+                        }
+                    }
+                }
+                s
+            }
             _ => {
                 return Err(HyperbytedbError::QueryParse(
                     "continuous query body must be a SELECT statement".to_string(),
@@ -1062,6 +1071,8 @@ async fn execute_statement(
                 all_series.append(&mut series);
             }
 
+            stamp_aggregate_time(select_stmt, &mut all_series, epoch);
+
             // Apply SLIMIT/SOFFSET (series-level pagination)
             if select_stmt.slimit.is_some() || select_stmt.soffset.is_some() {
                 let soffset = select_stmt.soffset.unwrap_or(0) as usize;
@@ -1753,6 +1764,32 @@ fn inject_tombstone_predicates(sql: String, tombstones: &[(String, String)]) -> 
     result
 }
 
+/// Give aggregate results the `time` column InfluxDB always returns. An
+/// aggregate without GROUP BY time() has one row per series, stamped with
+/// the start of the WHERE time range, or epoch 0 when the range is unbounded.
+/// A lone FIRST/LAST/MAX/MIN already carries its point's time.
+fn stamp_aggregate_time(stmt: &SelectStatement, series: &mut [SeriesResult], epoch: Option<&str>) {
+    let buckets = stmt
+        .group_by
+        .as_ref()
+        .is_some_and(|gb| gb.time_dimension().is_some());
+    if buckets || !to_clickhouse::select_has_true_aggregate(stmt) {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let start = to_clickhouse::query_start_nanos(stmt.condition.as_ref(), now).unwrap_or(0);
+    let stamp = crate::application::query_arrow_series::time_value_from_nanos(start, epoch);
+    for s in series {
+        if s.columns.iter().any(|c| c == "time") {
+            continue;
+        }
+        s.columns.insert(0, "time".to_string());
+        for row in &mut s.values {
+            row.insert(0, stamp.clone());
+        }
+    }
+}
+
 /// Execute TimeseriesQL for a single measurement against the backing MergeTree table.
 #[allow(clippy::too_many_arguments)]
 async fn execute_select_from_source(
@@ -2259,6 +2296,9 @@ async fn execute_sharded_measurement_query(
     epoch: Option<&str>,
     group_by_tags: &[String],
 ) -> Result<Vec<SeriesResult>, HyperbytedbError> {
+    // The region SQL names columns this way; the merge must use the same names.
+    let named = to_clickhouse::with_output_names(stmt);
+    let stmt = &named;
     let map = ctx.shard_map.snapshot().await?;
     // Region selection runs over the SERVING view, not the raw snapshot. A
     // staging region is in the map but must not be routed to: scattering to
@@ -2350,7 +2390,9 @@ async fn execute_sharded_measurement_query(
     let sharded_plan = if !is_materialized_dest
         && (selected_regions.len() > 1 || (space.regions.len() > 1 && is_global_aggregate))
     {
-        Some(prepare_sharded_region_query(&effective_stmt)?)
+        let mut plan = prepare_sharded_region_query(&effective_stmt)?;
+        plan.epoch = epoch.map(str::to_string);
+        Some(plan)
     } else {
         None
     };

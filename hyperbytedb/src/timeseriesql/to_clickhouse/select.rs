@@ -32,6 +32,10 @@ pub(super) fn translate_inner(
     series: Option<SeriesJoin<'_>>,
     time_bounds: Option<(Option<i64>, Option<i64>)>,
 ) -> Result<String, HyperbytedbError> {
+    // Every computed column gets its InfluxQL name before anything reads it,
+    // so `mean(a), mean(b)` is `mean`, `mean_1` in the SQL and the merge alike.
+    let named = with_output_names(stmt);
+    let stmt = &named;
     let mut out = String::new();
 
     // InfluxQL treats a GROUP BY time() query without an explicit fill() as
@@ -116,6 +120,11 @@ pub(super) fn translate_inner(
         is_raw_select || (has_raw_transform && !has_group_by_time && !has_star);
     if projects_point_time {
         select_parts.insert(0, quote_phys_identifier("time"));
+    }
+    // A lone selector reports the selected point's own time, like InfluxDB;
+    // other aggregates without GROUP BY time() get theirs from the caller.
+    if !has_group_by_time && let Some(point_time) = lone_selector_time_sql(stmt, mapping)? {
+        select_parts.insert(0, format!("{point_time} AS __time"));
     }
 
     let field_strs: Vec<String> = stmt
@@ -537,23 +546,139 @@ pub fn select_output_field_name(field: &Field) -> Option<String> {
         .or_else(|| default_field_alias(&field.expr))
 }
 
-/// Generate a default column alias matching InfluxDB conventions.
-/// Single-arg aggregates include the field name for uniqueness:
-/// `mean("usage_idle")` → `"mean_usage_idle"`, `count("x")` → `"count_x"`.
-/// No-arg calls use just the function name: `count()` → `"count"`.
-/// Non-call expressions get no alias.
+/// InfluxQL's name for a field without an alias (`Field.Name()` in InfluxDB):
+/// a call is named after its function (`mean("v")` → `mean`), an expression
+/// after the fields and calls in it joined by `_` (`"a" + "b"` → `a_b`,
+/// `mean("v") * 2` → `mean`), a field reference after the field.
+///
+/// A bare field reference gets no alias: its column already has that name.
 pub(super) fn default_field_alias(expr: &Expr) -> Option<String> {
+    if matches!(expr, Expr::Identifier(_) | Expr::FieldRef { .. }) {
+        return None;
+    }
+    influxql_name(expr)
+}
+
+fn influxql_name(expr: &Expr) -> Option<String> {
+    let mut names = Vec::new();
+    expr_name_parts(expr, &mut names);
+    (!names.is_empty()).then(|| names.join("_"))
+}
+
+fn expr_name_parts(expr: &Expr, names: &mut Vec<String>) {
+    match expr {
+        Expr::Call(func) => names.push(func.name.to_lowercase()),
+        Expr::Identifier(name) | Expr::FieldRef { name, .. } => names.push(name.clone()),
+        Expr::BinaryExpr(be) => {
+            expr_name_parts(&be.left, names);
+            expr_name_parts(&be.right, names);
+        }
+        Expr::UnaryExpr(_, inner) => expr_name_parts(inner, names),
+        _ => {}
+    }
+}
+
+/// The pre-InfluxQL default column name: `mean("v")` → `mean_v`. Only for
+/// materialized views stored before aliases were required, whose columns were
+/// created under these names.
+#[must_use]
+pub fn legacy_field_alias(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Call(func) => {
             let base = func.name.to_lowercase();
             if let Some(Expr::Identifier(field_name)) = func.args.first() {
-                Some(format!("{}_{}", base, field_name))
+                Some(format!("{base}_{field_name}"))
             } else {
                 Some(base)
             }
         }
         _ => None,
     }
+}
+
+/// `stmt` with InfluxQL column names on every computed field, as InfluxDB's
+/// `SelectStatement.ColumnNames`: aliases are kept; other fields take their
+/// default name, and a name already taken gets `_1`, `_2`, ...
+///
+/// Plain field references keep no alias (their column is the field itself)
+/// but still take their name. Idempotent.
+#[must_use]
+pub fn with_output_names(stmt: &SelectStatement) -> SelectStatement {
+    let mut out = stmt.clone();
+    let mut taken: std::collections::HashMap<String, usize> = out
+        .fields
+        .iter()
+        .filter_map(|f| f.alias.clone())
+        .map(|a| (a, 1))
+        .collect();
+    for field in &mut out.fields {
+        if field.alias.is_some() {
+            continue;
+        }
+        let Some(name) = influxql_name(&field.expr) else {
+            continue;
+        };
+        let plain = matches!(field.expr, Expr::Identifier(_) | Expr::FieldRef { .. });
+        let resolved = match taken.get(&name).copied() {
+            None => name.clone(),
+            Some(mut n) => loop {
+                let candidate = format!("{name}_{n}");
+                if !taken.contains_key(&candidate) {
+                    taken.insert(name.clone(), n + 1);
+                    break candidate;
+                }
+                n += 1;
+            },
+        };
+        *taken.entry(resolved.clone()).or_insert(0) += 1;
+        if !plain || resolved != name {
+            field.alias = Some(resolved);
+        }
+    }
+    out
+}
+
+/// Selectors whose result is one stored point, so InfluxDB reports its time.
+fn point_selector(name: &str) -> bool {
+    matches!(
+        name.to_uppercase().as_str(),
+        "FIRST" | "LAST" | "MAX" | "MIN"
+    )
+}
+
+/// The selected point's time for a statement whose only call is a bare
+/// FIRST/LAST/MAX/MIN, or None.
+fn lone_selector_time_sql(
+    stmt: &SelectStatement,
+    mapping: Option<&ColumnMapping>,
+) -> Result<Option<String>, HyperbytedbError> {
+    let calls: Vec<&FunctionCall> = stmt
+        .fields
+        .iter()
+        .filter(|f| expr_contains_call(&f.expr))
+        .filter_map(|f| match &f.expr {
+            Expr::Call(c) => Some(c),
+            _ => None,
+        })
+        .collect();
+    let call_fields = stmt
+        .fields
+        .iter()
+        .filter(|f| expr_contains_call(&f.expr))
+        .count();
+    let [func] = calls.as_slice() else {
+        return Ok(None);
+    };
+    if call_fields != 1 || !point_selector(&func.name) || func.args.len() != 1 {
+        return Ok(None);
+    }
+    let arg = super::aggregates::translate_aggregate_arg(&func.args[0], mapping)?;
+    Ok(Some(match func.name.to_uppercase().as_str() {
+        "FIRST" => "min(time)".to_string(),
+        "LAST" => "max(time)".to_string(),
+        "MAX" => format!("argMax(time, {arg})"),
+        _ => format!("argMin(time, {arg})"),
+    }))
 }
 
 /// Whether an expression tree contains a function call (aggregate, selector, or

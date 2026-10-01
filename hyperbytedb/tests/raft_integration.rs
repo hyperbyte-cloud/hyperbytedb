@@ -455,7 +455,7 @@ async fn test_materialized_view_replicates_to_peer() {
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     node_b.flush.flush().await.unwrap();
 
-    let create_mv = r#"CREATE MATERIALIZED VIEW "mv_cpu_5m" ON "mvdb" AS SELECT mean("value") INTO "cpu_5m" FROM "cpu" GROUP BY time(5m), *"#;
+    let create_mv = r#"CREATE MATERIALIZED VIEW "mv_cpu_5m" ON "mvdb" AS SELECT mean("value") AS "mean_value" INTO "cpu_5m" FROM "cpu" GROUP BY time(5m), *"#;
     let resp = client
         .get(format!("{}/query", node_a.url))
         .query(&[("q", create_mv), ("db", "mvdb")])

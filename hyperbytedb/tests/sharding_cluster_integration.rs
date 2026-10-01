@@ -562,7 +562,10 @@ async fn multi_region_mean_merges_sum_and_count() {
     )
     .await;
     let series = resp.results[0].series.as_ref().expect("series");
-    let mean = series[0].values[0][0].as_f64().expect("mean");
+    // InfluxQL: an aggregate over an unbounded range is stamped at epoch 0.
+    assert_eq!(series[0].columns, ["time", "mean"]);
+    assert_eq!(series[0].values[0][0], "1970-01-01T00:00:00Z");
+    let mean = series[0].values[0][1].as_f64().expect("mean");
     assert!(
         (mean - 20.0).abs() < 0.01,
         "expected global mean 20.0, got {mean}"
@@ -629,6 +632,86 @@ async fn multi_region_group_by_time_merges_buckets() {
             "{}: per-minute count and mean across both regions",
             node.url
         );
+    }
+}
+
+/// Across regions, a lone selector reports the winning point's time and a
+/// plain aggregate the range start, as on one node. The winners sit in
+/// different regions: max and last in one, min and first in the other.
+#[tokio::test]
+#[serial(chdb)]
+async fn multi_region_selectors_report_the_selected_points_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let nodes =
+        start_sharded_three_node_cluster(dir.path(), ShardedClusterOptions::default()).await;
+    bootstrap_two_regions(&nodes, "sharddb", "autogen", "cpu").await;
+    let client = reqwest::Client::new();
+    for node in &nodes {
+        create_db(&client, &node.url, "sharddb").await;
+    }
+    let (low, high) = hosts_for_region_split("cpu", u64::MAX / 2);
+    let s = 1_000_000_000u64;
+    let body = format!(
+        "cpu,host={low} value=10 0\n\
+         cpu,host={low} value=20 {}\n\
+         cpu,host={high} value=30 {}\n\
+         cpu,host={high} value=40 {}",
+        30 * s,
+        10 * s,
+        70 * s
+    );
+    let resp = write_line(&client, &nodes[0].url, "sharddb", &body).await;
+    assert!(resp.status().is_success(), "write: {}", resp.status());
+    flush_node(&nodes[0]).await;
+    flush_node(&nodes[1]).await;
+
+    let cases = [
+        (
+            "SELECT max(value) FROM cpu",
+            "max",
+            "1970-01-01T00:01:10Z",
+            40.0,
+        ),
+        (
+            "SELECT last(value) FROM cpu",
+            "last",
+            "1970-01-01T00:01:10Z",
+            40.0,
+        ),
+        (
+            "SELECT min(value) FROM cpu",
+            "min",
+            "1970-01-01T00:00:00Z",
+            10.0,
+        ),
+        (
+            "SELECT first(value) FROM cpu",
+            "first",
+            "1970-01-01T00:00:00Z",
+            10.0,
+        ),
+        (
+            "SELECT count(value) FROM cpu WHERE time >= 5s",
+            "count",
+            "1970-01-01T00:00:05Z",
+            3.0,
+        ),
+    ];
+    for node in &nodes {
+        for (q, col, time, value) in cases {
+            let resp = query_parsed(&client, &node.url, "sharddb", q).await;
+            let series = resp.results[0].series.as_ref().expect("series");
+            assert_eq!(series.len(), 1, "{q} via {}", node.url);
+            assert_eq!(series[0].columns, ["time", col], "{q} via {}", node.url);
+            assert_eq!(series[0].values.len(), 1, "{q} via {}", node.url);
+            assert_eq!(series[0].values[0][0], time, "{q} via {}", node.url);
+            assert_eq!(
+                series[0].values[0][1].as_f64(),
+                Some(value),
+                "{q} via {}",
+                node.url
+            );
+        }
     }
 }
 
@@ -770,7 +853,7 @@ async fn multi_region_count_merges_across_regions() {
         .as_ref()
         .and_then(|s| s.first())
         .and_then(|s| s.values.first())
-        .and_then(|row| row.first())
+        .and_then(|row| row.last())
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
     assert_eq!(count, 6.0, "expected global count across two regions");
@@ -813,7 +896,7 @@ async fn aggregate_read_from_primary_when_replica_lags() {
         .as_ref()
         .and_then(|s| s.first())
         .and_then(|s| s.values.first())
-        .and_then(|row| row.first())
+        .and_then(|row| row.last())
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
     assert_eq!(

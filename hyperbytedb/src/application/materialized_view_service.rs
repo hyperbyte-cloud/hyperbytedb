@@ -72,6 +72,7 @@ impl MaterializedViewService {
         &self,
         mv: &CreateMaterializedViewStatement,
     ) -> Result<MaterializedViewDef, HyperbytedbError> {
+        require_mv_aliases(&mv.query)?;
         if self
             .metadata
             .get_materialized_view(&mv.database, &mv.name)
@@ -784,10 +785,38 @@ fn parse_mv_select(
 ) -> Result<crate::timeseriesql::ast::SelectStatement, HyperbytedbError> {
     let stmts = crate::timeseriesql::parse(query_text)?;
     match stmts.into_iter().next() {
-        Some(crate::timeseriesql::ast::Statement::Select(s)) => Ok(s),
+        Some(crate::timeseriesql::ast::Statement::Select(mut s)) => {
+            fill_legacy_mv_aliases(&mut s);
+            Ok(s)
+        }
         _ => Err(HyperbytedbError::QueryParse(
             "MV body must be a SELECT statement".to_string(),
         )),
+    }
+}
+
+/// A materialized view's columns are stored under their names, so the names
+/// must not depend on defaults that can change: every column needs `AS`.
+fn require_mv_aliases(
+    stmt: &crate::timeseriesql::ast::SelectStatement,
+) -> Result<(), HyperbytedbError> {
+    if let Some(i) = stmt.fields.iter().position(|f| f.alias.is_none()) {
+        return Err(HyperbytedbError::QueryParse(format!(
+            "materialized view columns must be named: column {} has no AS \"<name>\" \
+             (e.g. mean(\"value\") AS \"mean_value\")",
+            i + 1
+        )));
+    }
+    Ok(())
+}
+
+/// Views stored before aliases were required named their columns
+/// `mean_value`-style; keep those names so their stored columns still match.
+fn fill_legacy_mv_aliases(stmt: &mut crate::timeseriesql::ast::SelectStatement) {
+    for field in &mut stmt.fields {
+        if field.alias.is_none() {
+            field.alias = crate::timeseriesql::to_clickhouse::legacy_field_alias(&field.expr);
+        }
     }
 }
 
@@ -869,4 +898,28 @@ fn dest_measurement_meta(
         materialized: true,
         materialized_rp: None,
     })
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::parse_mv_select;
+
+    /// Views stored before AS was required keep the names their columns were
+    /// created under.
+    #[test]
+    fn a_stored_view_without_aliases_keeps_its_legacy_names() {
+        let stmt = parse_mv_select(
+            r#"SELECT mean("value"), sum("v") AS "total", count("x") INTO "d" FROM "cpu" GROUP BY time(1m)"#,
+        )
+        .unwrap();
+        let names: Vec<Option<String>> = stmt.fields.iter().map(|f| f.alias.clone()).collect();
+        assert_eq!(
+            names,
+            [
+                Some("mean_value".to_string()),
+                Some("total".to_string()),
+                Some("count_x".to_string())
+            ]
+        );
+    }
 }

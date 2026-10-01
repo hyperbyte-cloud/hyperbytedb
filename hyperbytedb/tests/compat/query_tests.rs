@@ -1066,3 +1066,76 @@ async fn partial_line_writes_coalesce_before_query() {
         "usage_system should survive partial-line coalesce, got {system}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// InfluxQL column shape: names and the time column
+// ---------------------------------------------------------------------------
+
+/// Columns as InfluxDB names them, with the time InfluxDB reports:
+/// - a call is named after its function, repeats get `_1`, `_2`, an alias wins;
+/// - an aggregate without GROUP BY time() is stamped with the start of the
+///   WHERE range, or epoch 0 when there is none;
+/// - a lone FIRST/LAST/MAX/MIN reports its selected point's time.
+#[tokio::test]
+#[serial(chdb)]
+async fn columns_and_time_follow_influxql() {
+    let ctx = TestContext::new().unwrap();
+    ctx.metadata.create_database("testdb").await.unwrap();
+    ctx.write_and_flush(
+        "testdb",
+        "cpu,host=a v=1,w=10 10000000000\n\
+         cpu,host=a v=5,w=20 20000000000\n\
+         cpu,host=a v=3,w=30 30000000000",
+    )
+    .await
+    .unwrap();
+
+    let shape = |q: &'static str| {
+        let ctx = &ctx;
+        async move {
+            let resp = ctx.query("testdb", q).await.unwrap();
+            assert!(
+                resp.results[0].error.is_none(),
+                "{q}: {:?}",
+                resp.results[0].error
+            );
+            let s = resp.results[0].series.as_ref().unwrap()[0].clone();
+            (s.columns, s.values[0].clone())
+        }
+    };
+    use serde_json::json;
+
+    let (cols, row) = shape("SELECT count(v) FROM cpu").await;
+    assert_eq!(cols, ["time", "count"]);
+    assert_eq!(row, [json!("1970-01-01T00:00:00Z"), json!(3)]);
+
+    let (cols, row) = shape("SELECT count(v) FROM cpu WHERE time >= 15s").await;
+    assert_eq!(cols, ["time", "count"]);
+    assert_eq!(row, [json!("1970-01-01T00:00:15Z"), json!(2)]);
+
+    let (cols, row) = shape("SELECT mean(v), mean(w), sum(v) AS total FROM cpu").await;
+    assert_eq!(cols, ["time", "mean", "mean_1", "total"]);
+    assert_eq!(row[1], json!(3));
+    assert_eq!(row[2], json!(20));
+
+    let (cols, row) = shape("SELECT max(v) FROM cpu").await;
+    assert_eq!(cols, ["time", "max"]);
+    assert_eq!(row, [json!("1970-01-01T00:00:20Z"), json!(5)]);
+
+    let (_, row) = shape("SELECT min(v) FROM cpu").await;
+    assert_eq!(row, [json!("1970-01-01T00:00:10Z"), json!(1)]);
+
+    let (_, row) = shape("SELECT last(v) FROM cpu").await;
+    assert_eq!(row, [json!("1970-01-01T00:00:30Z"), json!(3)]);
+
+    let (_, row) = shape("SELECT first(v) FROM cpu").await;
+    assert_eq!(row, [json!("1970-01-01T00:00:10Z"), json!(1)]);
+
+    // Two selectors: no single point, so the range start.
+    let (cols, row) = shape("SELECT max(v), min(v) FROM cpu").await;
+    assert_eq!(cols, ["time", "max", "min"]);
+    assert_eq!(row[0], json!("1970-01-01T00:00:00Z"));
+
+    let (cols, _) = shape("SELECT v + w FROM cpu").await;
+    assert_eq!(cols, ["time", "v_w"]);
+}

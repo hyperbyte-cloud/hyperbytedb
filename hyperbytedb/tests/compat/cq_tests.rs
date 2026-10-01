@@ -389,6 +389,7 @@ async fn legacy_cq_definition_is_normalized_on_run() {
         coverage_interval_secs: 0,
         is_advanced: false,
         last_run_at: None,
+                influxql_names: false,
     };
     legacy.normalize().unwrap();
     assert_eq!(legacy.group_by_interval_secs, 3600);
@@ -656,8 +657,10 @@ async fn select_qualified_rp_overrides_http_default_rp() {
     );
     let series = resp.results[0].series.as_ref().unwrap();
     assert_eq!(series.len(), 1);
+    // InfluxQL: [time, sum], stamped with the start of the WHERE range.
+    assert_eq!(series[0].columns, ["time", "sum"]);
     assert_eq!(
-        series[0].values[0][0].as_i64(),
+        series[0].values[0][1].as_i64(),
         Some(2),
         "qualified default_high measurement should sum both default_high points"
     );
@@ -674,4 +677,83 @@ async fn select_qualified_rp_overrides_http_default_rp() {
         autogen.is_err(),
         "autogen server_stats has no num_servers column; should not read default_high"
     );
+}
+
+/// A new continuous query writes InfluxQL field names (`mean`); one stored
+/// before that keeps writing the field it always wrote (`mean_passengers`)
+/// rather than starting a second field.
+#[tokio::test]
+#[serial(chdb)]
+async fn cq_field_names_new_vs_stored() {
+    let ctx = TestContext::new().unwrap();
+    ctx.metadata
+        .create_database("transportation")
+        .await
+        .unwrap();
+    ctx.write_and_flush(
+        "transportation",
+        &format!(
+            "bus_data passengers=5i {}\nbus_data passengers=9i {}",
+            ts(7, 0),
+            ts(7, 30)
+        ),
+    )
+    .await
+    .unwrap();
+    let resp = ctx
+        .query(
+            "transportation",
+            r#"CREATE CONTINUOUS QUERY "cq_new" ON "transportation" BEGIN SELECT mean("passengers") INTO "avg_new" FROM "bus_data" GROUP BY time(1h) END"#,
+        )
+        .await
+        .unwrap();
+    assert!(
+        resp.results[0].error.is_none(),
+        "{:?}",
+        resp.results[0].error
+    );
+    let new_cq = ctx
+        .metadata
+        .get_continuous_query("transportation", "cq_new")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(new_cq.influxql_names);
+
+    let mut stored = new_cq.clone();
+    stored.name = "cq_stored".to_string();
+    stored.query_text = stored.query_text.replace("avg_new", "avg_stored");
+    stored.influxql_names = false;
+
+    let run_at = Utc.with_ymd_and_hms(2016, 8, 28, 8, 0, 0).unwrap();
+    for mut cq in [new_cq, stored] {
+        cq.last_run_at = Some(
+            Utc.with_ymd_and_hms(2016, 8, 28, 7, 0, 0)
+                .unwrap()
+                .to_rfc3339(),
+        );
+        let result = ctx
+            .query_service
+            .execute_continuous_query(&mut cq, run_at)
+            .await
+            .unwrap();
+        assert_eq!(result.points_written, 1, "{}", cq.name);
+    }
+    ctx.flush_service.flush().await.unwrap();
+
+    for (measurement, field) in [("avg_new", "mean"), ("avg_stored", "mean_passengers")] {
+        let resp = ctx
+            .query(
+                "transportation",
+                &format!(r#"SHOW FIELD KEYS FROM "{measurement}""#),
+            )
+            .await
+            .unwrap();
+        let keys: Vec<String> = resp.results[0].series.as_ref().unwrap()[0]
+            .values
+            .iter()
+            .map(|r| r[0].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(keys, [field], "{measurement}");
+    }
 }

@@ -364,28 +364,7 @@ fn clickhouse_datetime_text(nanos: i64, digits: usize) -> String {
     format!("{base}.{}", &frac[..digits])
 }
 
-/// The time column's value: an integer in the requested epoch unit, or
-/// RFC3339 with trailing fractional zeros removed.
-pub(crate) fn time_value_from_nanos(nanos: i64, epoch: Option<&str>) -> Value {
-    match epoch {
-        Some("ns") | Some("n") => Value::from(nanos),
-        Some("u") | Some("us") => Value::from(nanos / 1_000),
-        Some("ms") => Value::from(nanos / 1_000_000),
-        Some("s") => Value::from(nanos / 1_000_000_000),
-        _ => {
-            let dt = chrono::DateTime::from_timestamp_nanos(nanos);
-            let mut out = dt.format("%Y-%m-%dT%H:%M:%S").to_string();
-            let frac = format!("{:09}", dt.timestamp_subsec_nanos());
-            let trimmed = frac.trim_end_matches('0');
-            if !trimmed.is_empty() {
-                out.push('.');
-                out.push_str(trimmed);
-            }
-            out.push('Z');
-            Value::String(out)
-        }
-    }
-}
+pub(crate) use crate::domain::query_result::time_value_from_nanos;
 
 #[cfg(test)]
 mod tests {

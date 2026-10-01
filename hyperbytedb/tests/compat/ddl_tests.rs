@@ -404,6 +404,7 @@ async fn drop_continuous_query() {
                 coverage_interval_secs: 60,
                 is_advanced: false,
                 last_run_at: None,
+                influxql_names: false,
             },
         )
         .await
@@ -453,7 +454,7 @@ async fn create_and_query_materialized_view() {
     let create_resp = ctx
         .query(
             "mvdb",
-            r#"CREATE MATERIALIZED VIEW "mv_cpu_5m" ON "mvdb" AS SELECT mean("value") INTO "cpu_5m" FROM "cpu" GROUP BY time(5m), *"#,
+            r#"CREATE MATERIALIZED VIEW "mv_cpu_5m" ON "mvdb" AS SELECT mean("value") AS "mean_value" INTO "cpu_5m" FROM "cpu" GROUP BY time(5m), *"#,
         )
         .await
         .unwrap();
@@ -701,7 +702,7 @@ async fn materialized_view_sum_matches_raw_after_many_single_point_flushes() {
         .unwrap()
         .first()
         .and_then(|s| s.values.first())
-        .and_then(|row| row.first())
+        .and_then(|row| row.last())
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
 
@@ -755,7 +756,7 @@ async fn materialized_view_mean_survives_multiple_flushes() {
     let create_resp = ctx
         .query(
             "mvdb",
-            r#"CREATE MATERIALIZED VIEW "mv_cpu_mean" ON "mvdb" WITH BACKFILL AS SELECT mean("value") INTO "cpu_1m" FROM "cpu" GROUP BY time(1m), "host""#,
+            r#"CREATE MATERIALIZED VIEW "mv_cpu_mean" ON "mvdb" WITH BACKFILL AS SELECT mean("value") AS "mean_value" INTO "cpu_1m" FROM "cpu" GROUP BY time(1m), "host""#,
         )
         .await
         .unwrap();
@@ -884,7 +885,7 @@ async fn materialized_view_sum_dedupes_duplicate_source_rows() {
         .unwrap()
         .first()
         .and_then(|s| s.values.first())
-        .and_then(|row| row.first())
+        .and_then(|row| row.last())
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
 
@@ -902,7 +903,7 @@ async fn materialized_view_sum_dedupes_duplicate_source_rows() {
         .unwrap()
         .first()
         .and_then(|s| s.values.first())
-        .and_then(|row| row.first())
+        .and_then(|row| row.last())
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
 
@@ -946,7 +947,7 @@ async fn materialized_view_dest_in_different_rp_poisons_same_name_in_autogen() {
     let create_resp = ctx
         .query(
             "reprodb",
-            r#"CREATE MATERIALIZED VIEW "mv_bug" ON "reprodb" AS SELECT mean("value") INTO "high"."svstats" FROM "svstats" GROUP BY time(1m), *"#,
+            r#"CREATE MATERIALIZED VIEW "mv_bug" ON "reprodb" AS SELECT mean("value") AS "mean_value" INTO "high"."svstats" FROM "svstats" GROUP BY time(1m), *"#,
         )
         .await
         .unwrap();
@@ -1575,4 +1576,32 @@ async fn drop_materialized_view() {
         .await
         .unwrap();
     assert!(mvs.iter().all(|mv| mv.name != "mv_drop"));
+}
+
+/// A materialized view stores its columns under their names, so every column
+/// must be named with AS: a default name could change under it.
+#[tokio::test]
+#[serial(chdb)]
+async fn materialized_view_columns_must_be_named() {
+    let ctx = TestContext::new().unwrap();
+    ctx.metadata.create_database("mvdb").await.unwrap();
+    let err = match ctx
+        .query(
+            "mvdb",
+            r#"CREATE MATERIALIZED VIEW "mv_unnamed" ON "mvdb" AS SELECT mean("value") INTO "cpu_1m" FROM "cpu" GROUP BY time(1m)"#,
+        )
+        .await
+    {
+        Err(e) => e.to_string(),
+        Ok(resp) => resp.results[0].error.clone().unwrap_or_default(),
+    };
+    assert!(err.contains("must be named"), "got: {err:?}");
+    assert!(
+        ctx.metadata
+            .list_materialized_views("mvdb")
+            .await
+            .unwrap()
+            .is_empty(),
+        "a rejected view is not stored"
+    );
 }

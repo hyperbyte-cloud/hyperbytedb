@@ -1347,7 +1347,7 @@ async fn queries_read_results_through_the_arrow_stream() {
         .map(|s| {
             (
                 s["tags"]["host"].as_str().unwrap().to_string(),
-                s["values"][0][0].as_i64().unwrap(),
+                s["values"][0][1].as_i64().unwrap(),
             )
         })
         .collect();

@@ -58,3 +58,27 @@ impl QueryResponse {
         }
     }
 }
+
+/// The time column's value: an integer in the requested epoch unit, or
+/// RFC3339 with trailing fractional zeros removed.
+pub fn time_value_from_nanos(nanos: i64, epoch: Option<&str>) -> serde_json::Value {
+    use serde_json::Value;
+    match epoch {
+        Some("ns") | Some("n") => Value::from(nanos),
+        Some("u") | Some("us") => Value::from(nanos / 1_000),
+        Some("ms") => Value::from(nanos / 1_000_000),
+        Some("s") => Value::from(nanos / 1_000_000_000),
+        _ => {
+            let dt = chrono::DateTime::from_timestamp_nanos(nanos);
+            let mut out = dt.format("%Y-%m-%dT%H:%M:%S").to_string();
+            let frac = format!("{:09}", dt.timestamp_subsec_nanos());
+            let trimmed = frac.trim_end_matches('0');
+            if !trimmed.is_empty() {
+                out.push('.');
+                out.push_str(trimmed);
+            }
+            out.push('Z');
+            Value::String(out)
+        }
+    }
+}
