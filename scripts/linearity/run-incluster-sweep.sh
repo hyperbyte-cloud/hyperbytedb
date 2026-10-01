@@ -106,7 +106,7 @@ bench_container() {
       '          command: ["python3", "/bench/incluster_bench.py"]'
   else
     printf '%s\n' "          image: ${BENCH_IMAGE}" '          imagePullPolicy: Never' \
-      '          command: ["/hyperbytedb-cli", "bench-write"]'
+      '          command: ["/usr/local/bin/hyperbytedb-cli", "bench-write"]'
   fi
 }
 
