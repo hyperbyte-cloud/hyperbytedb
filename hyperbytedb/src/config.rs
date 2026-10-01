@@ -384,8 +384,10 @@ pub struct ServerConfig {
 /// on forwards to other nodes, so at 8 per CPU a node's slots filled with
 /// waiting requests while its CPU sat idle. On n3 (3-CPU pods), 16 per CPU
 /// raised N=3 from 673k to 733k points/s and N=12 from 1.62M to 1.80M, with
-/// half the client retries and no errors or restarts.
-pub const INFLIGHT_WRITES_PER_CPU: usize = 16;
+/// half the client retries and no errors or restarts. 32 per CPU left
+/// throughput unchanged at N=3/6/8 (757k/1.20M/1.44M vs 742k/1.22M/1.42M)
+/// and cut clients giving up after 12 retries from 286/543/681 to 2/17/26.
+pub const INFLIGHT_WRITES_PER_CPU: usize = 32;
 
 /// KiB of forwarded write body admitted per client write slot on a region
 /// primary. A 1,000-line batch is ~40 KiB of line protocol.
