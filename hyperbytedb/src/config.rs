@@ -605,6 +605,11 @@ pub struct ClusterConfig {
     /// node must run a build that accepts HTTP/2; enable once all do.
     #[serde(default)]
     pub internal_http2: bool,
+    /// HTTP/2 connections kept to each peer when `internal_http2` is on;
+    /// requests take them in turn. One connection put a peer's whole load on
+    /// one TCP stream.
+    #[serde(default = "default_internal_http2_connections")]
+    pub internal_http2_connections: usize,
     /// Max HTTP body size for `/internal/replicate` and `/internal/replicate-mutation`.
     /// `0` resolves at startup to `max(4 × replication_max_coalesce_body_bytes,
     /// server.max_body_size_bytes)`.
@@ -760,6 +765,10 @@ fn default_anti_entropy_interval_secs() -> u64 {
 
 fn default_replication_max_inflight_batches() -> usize {
     8
+}
+
+fn default_internal_http2_connections() -> usize {
+    16
 }
 
 fn default_replication_max_coalesce_body_bytes() -> usize {
@@ -1011,6 +1020,7 @@ impl HyperbytedbConfig {
                 replication_max_inflight_batches: default_replication_max_inflight_batches(),
                 replication_max_coalesce_body_bytes: default_replication_max_coalesce_body_bytes(),
                 internal_http2: false,
+                internal_http2_connections: default_internal_http2_connections(),
                 replicate_body_limit_bytes: 0,
                 replicate_receiver_queue_depth: default_replicate_receiver_queue_depth(),
                 replicate_receiver_workers: default_replicate_receiver_workers(),
@@ -1403,6 +1413,7 @@ mod replicate_body_limit_tests {
             replication_max_inflight_batches: 8,
             replication_max_coalesce_body_bytes: 8 * 1024 * 1024,
             internal_http2: false,
+            internal_http2_connections: super::default_internal_http2_connections(),
             replicate_body_limit_bytes: 0,
             replicate_receiver_queue_depth: 1024,
             replicate_receiver_workers: 1,

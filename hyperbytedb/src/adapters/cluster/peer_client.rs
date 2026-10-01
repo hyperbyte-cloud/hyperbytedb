@@ -24,7 +24,10 @@ pub struct PeerClient {
     membership: SharedMembership,
     replication_log: Arc<ReplicationLog>,
     hinted_handoff: Option<Arc<HintedHandoff>>,
-    client: reqwest::Client,
+    /// One client per connection to keep to each peer: each has its own
+    /// pool, so over HTTP/2 each holds its own connection. One for HTTP/1.1.
+    clients: Vec<reqwest::Client>,
+    next_client: std::sync::atomic::AtomicUsize,
     node_id: u64,
     node_addr: String,
     max_retries: u32,
@@ -81,7 +84,8 @@ impl PeerClient {
             membership,
             replication_log,
             hinted_handoff: None,
-            client,
+            clients: vec![client],
+            next_client: std::sync::atomic::AtomicUsize::new(0),
             node_id,
             node_addr,
             max_retries: if max_retries == 0 { 5 } else { max_retries },
@@ -102,19 +106,27 @@ impl PeerClient {
         &self.membership
     }
 
-    /// Talk to peers over HTTP/2 (cleartext, prior knowledge): concurrent
-    /// requests to a peer share one connection's streams. See
-    /// `cluster.internal_http2`.
+    /// Talk to peers over HTTP/2 (cleartext, prior knowledge), on
+    /// `connections` connections per peer that requests take in turn:
+    /// concurrent requests share their streams. One connection carried a
+    /// peer's whole load on one TCP stream; TiKV keeps 4 per store. See
+    /// `cluster.internal_http2` / `internal_http2_connections`.
     #[must_use]
-    pub fn with_http2(mut self, http2: bool) -> Self {
+    pub fn with_http2(mut self, http2: bool, connections: usize) -> Self {
         if http2 {
-            self.client = peer_http_client(true);
+            self.clients = (0..connections.max(1))
+                .map(|_| peer_http_client(true))
+                .collect();
         }
         self
     }
 
+    /// The client for the next peer request (round-robin over connections).
     pub fn http_client(&self) -> &reqwest::Client {
-        &self.client
+        let i = self
+            .next_client
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        &self.clients[i % self.clients.len()]
     }
 
     async fn resolve_replication_peers_async(
@@ -240,7 +252,7 @@ impl PeerClient {
             histogram!("hyperbytedb_replication_batch_parts").record(parts.len() as f64);
             let http_start = std::time::Instant::now();
             let result = self
-                .client
+                .http_client()
                 .post(&url)
                 .header(reqwest::header::CONTENT_TYPE, REPLICATE_BATCH_MEDIA_TYPE_V1)
                 .header(HTTP_HEADER_REPLICATED, "true")
@@ -624,7 +636,7 @@ impl PeerClient {
     ) -> PeerReplicateCtx {
         PeerReplicateCtx {
             url: format!("http://{}/internal/replicate", peer_addr),
-            client: self.client.clone(),
+            client: self.http_client().clone(),
             replication_log: self.replication_log.clone(),
             hinted_handoff: self.hinted_handoff.clone(),
             origin_node: self.node_id,
@@ -675,7 +687,7 @@ impl PeerClient {
                 let p = &batch[i];
                 let body = Bytes::copy_from_slice(&p.line_body);
                 let mut req = self
-                    .client
+                    .http_client()
                     .post(&url)
                     .header("Content-Type", LINE_PROTOCOL_MEDIA_TYPE_V1)
                     .header(HTTP_HEADER_REPLICATED, "true")
@@ -745,7 +757,7 @@ impl PeerClient {
             .iter()
             .map(|(peer_id, peer_addr)| {
                 let url = format!("http://{}/internal/replicate-mutation", peer_addr);
-                let client = self.client.clone();
+                let client = self.http_client().clone();
                 // `MutationWireRequest` is a plain owned struct (no maps with
                 // non-string keys, no NaN floats), so serialization is
                 // infallible in practice. Keep an explicit panic rather than
@@ -1394,6 +1406,64 @@ mod http2_tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         format!("http://{addr}/v")
+    }
+
+    /// `internal_http2_connections` spreads a peer's requests over that many
+    /// HTTP/2 connections, each request taking the next in turn.
+    #[tokio::test]
+    async fn requests_spread_over_the_configured_connections() {
+        use std::collections::HashSet;
+        use std::net::SocketAddr;
+        use std::sync::{Arc, Mutex};
+
+        let seen: Arc<Mutex<HashSet<SocketAddr>>> = Arc::default();
+        let record = seen.clone();
+        let app = axum::Router::new().route(
+            "/v",
+            axum::routing::get(
+                move |axum::extract::ConnectInfo(from): axum::extract::ConnectInfo<SocketAddr>| {
+                    let record = record.clone();
+                    async move {
+                        record.lock().unwrap().insert(from);
+                        "ok"
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap()
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            crate::adapters::cluster::replication_log::ReplicationLog::open(dir.path()).unwrap(),
+        );
+        let membership = crate::domain::cluster::membership::new_shared(
+            crate::domain::cluster::membership::ClusterMembership::new(),
+        );
+        let pc = super::PeerClient::new(1, "127.0.0.1:9".into(), membership, log, 1, 16, 1, 1024)
+            .with_http2(true, 4);
+        for _ in 0..32 {
+            let r = pc
+                .http_client()
+                .get(format!("http://{addr}/v"))
+                .send()
+                .await
+                .unwrap();
+            assert!(r.status().is_success());
+        }
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            4,
+            "one connection per configured slot"
+        );
     }
 
     /// With `internal_http2` the peer client speaks HTTP/2 to the axum

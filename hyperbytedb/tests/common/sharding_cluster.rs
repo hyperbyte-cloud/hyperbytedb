@@ -161,7 +161,7 @@ pub async fn start_sharded_node(
             8,
             8 * 1024 * 1024,
         )
-        .with_http2(opts.http2),
+        .with_http2(opts.http2, 4),
     );
 
     let shard_map = Arc::new(RocksDbShardMap::open(&meta_dir, true).unwrap());
