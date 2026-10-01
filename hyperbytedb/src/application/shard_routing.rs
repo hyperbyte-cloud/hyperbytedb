@@ -614,6 +614,7 @@ pub async fn forward_shard_writes_by_node(
         let sent: Vec<u64> = parts.iter().map(|p| p.region_id).collect();
         let client = ctx.peer_client.http_client().clone();
         let coalescer = ctx.forward_coalescer.clone();
+        let coalesce = ctx.config.forward_coalesce;
         let span = tracing::debug_span!(
             target: crate::telemetry::TARGET,
             "forward",
@@ -622,7 +623,14 @@ pub async fn forward_shard_writes_by_node(
         );
         sends.push(tracing::Instrument::instrument(
             async move {
-                let outcome = coalescer.send(&client, &addr, timeout, parts).await;
+                let outcome = if coalesce {
+                    coalescer.send(&client, &addr, timeout, parts).await
+                } else {
+                    crate::application::forward_coalescer::send_direct(
+                        &client, &addr, timeout, parts,
+                    )
+                    .await
+                };
                 (node, sent, outcome)
             },
             span,

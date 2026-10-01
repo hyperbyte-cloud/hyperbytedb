@@ -55,6 +55,7 @@ pub struct ShardedTestNode {
     flush: Arc<FlushServiceImpl>,
     handle: tokio::task::JoinHandle<()>,
     shutdown: Option<watch::Sender<bool>>,
+    pub shard_routing: Arc<ShardRoutingContext>,
     /// Set when started with `ShardedClusterOptions::forward_queue`.
     pub forward_queue: Option<Arc<hyperbytedb::adapters::cluster::forward_queue::ForwardQueue>>,
 }
@@ -311,7 +312,7 @@ pub async fn start_sharded_node(
         sharding_enabled: true,
         shard_map: Some(shard_map.clone() as Arc<dyn ShardMapPort>),
         shard_location_cache: location_cache.clone(),
-        shard_routing: Some(shard_routing),
+        shard_routing: Some(shard_routing.clone()),
         shard_scheduler: scheduler.clone().map(|s| s as Arc<_>),
         ingest_cardinality: IngestCardinalityLimits::default(),
         ingest_schema_cache: Default::default(),
@@ -340,6 +341,7 @@ pub async fn start_sharded_node(
         flush,
         handle,
         shutdown: Some(shutdown_tx),
+        shard_routing,
         forward_queue,
     }
 }

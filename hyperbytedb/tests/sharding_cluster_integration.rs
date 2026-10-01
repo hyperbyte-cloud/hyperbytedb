@@ -715,6 +715,54 @@ async fn multi_region_selectors_report_the_selected_points_time() {
     }
 }
 
+/// With `forward_coalesce` on, concurrent writes forward through the
+/// per-node lanes and every point lands once.
+#[tokio::test]
+#[serial(chdb)]
+async fn coalesced_forwards_land_every_point() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = ShardedClusterOptions::default();
+    opts.sharding.forward_coalesce = true;
+    let nodes = start_sharded_three_node_cluster(dir.path(), opts).await;
+    bootstrap_two_regions(&nodes, "sharddb", "autogen", "cpu").await;
+    let client = reqwest::Client::new();
+    create_db(&client, &nodes[0].url, "sharddb").await;
+    for node in &nodes[1..] {
+        wait_for_database(&client, &node.url, "sharddb").await;
+    }
+    let (low, high) = hosts_for_region_split("cpu", u64::MAX / 2);
+
+    // Node 3 primaries neither region, so every write forwards both halves.
+    let writes = (0..20u64).map(|i| {
+        let client = client.clone();
+        let url = nodes[2].url.clone();
+        let body = format!(
+            "cpu,host={low} value={i} {t}\ncpu,host={high} value={i} {t}",
+            t = 1_000_000_000 + i
+        );
+        async move { write_line(&client, &url, "sharddb", &body).await.status() }
+    });
+    for status in futures::future::join_all(writes).await {
+        assert!(status.is_success(), "write: {status}");
+    }
+    assert!(
+        nodes[2].shard_routing.forward_coalescer.lane_count() > 0,
+        "forwards went through the coalescer"
+    );
+    flush_node(&nodes[0]).await;
+    flush_node(&nodes[1]).await;
+
+    let resp = query_parsed(
+        &client,
+        &nodes[2].url,
+        "sharddb",
+        "SELECT count(value) FROM cpu",
+    )
+    .await;
+    let count = resp.results[0].series.as_ref().unwrap()[0].values[0][1].as_f64();
+    assert_eq!(count, Some(40.0), "every forwarded point landed once");
+}
+
 #[tokio::test]
 #[serial(chdb)]
 async fn multi_region_percentile_returns_error() {

@@ -116,6 +116,12 @@ pub struct ShardingConfig {
     /// re-parse. Every node must run a build that reads them.
     #[serde(default = "default_binary_points_wire")]
     pub binary_points_wire: bool,
+    /// Share one forward request per destination node among concurrent
+    /// writes (TiKV client-go style). Off: on n3 it merged ~2.8 writes per
+    /// request, did not lower CPU per point at N=8, and the queueing raised
+    /// write latency and client 503s.
+    #[serde(default)]
+    pub forward_coalesce: bool,
     /// A new measurement starts with this many regions per active node,
     /// already placed across the cluster (`0` or `1` node: one region, the
     /// old behaviour). See `ShardMapOp::BootstrapMeasurementPresplit`.
@@ -173,6 +179,7 @@ impl Default for ShardingConfig {
             add_peer_proposals_enabled: default_add_peer_proposals_enabled(),
             remove_peer_proposals_enabled: default_remove_peer_proposals_enabled(),
             binary_points_wire: default_binary_points_wire(),
+            forward_coalesce: false,
             bootstrap_regions_per_node: default_bootstrap_regions_per_node(),
             async_forward: default_async_forward(),
             async_forward_max_lag_ms: default_async_forward_max_lag_ms(),

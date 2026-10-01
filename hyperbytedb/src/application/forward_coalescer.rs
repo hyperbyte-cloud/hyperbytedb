@@ -75,6 +75,12 @@ impl ForwardCoalescer {
         }
     }
 
+    /// Destinations with a lane (one per node forwarded to so far).
+    #[must_use]
+    pub fn lane_count(&self) -> usize {
+        self.lanes.lock().len()
+    }
+
     /// Send `parts` to the node at `addr`, in a request shared with other
     /// writes' parts for that node.
     pub async fn send(
@@ -210,6 +216,26 @@ async fn send_jobs(client: &reqwest::Client, addr: &str, timeout: Duration, jobs
                 let _ = reply.send(other.clone());
             }
         }
+    }
+}
+
+/// Send `parts` to the node at `addr` in a request of their own: the path
+/// when `sharding.forward_coalesce` is off.
+pub async fn send_direct(
+    client: &reqwest::Client,
+    addr: &str,
+    timeout: Duration,
+    parts: Vec<ShardWriteRequest>,
+) -> NodeSendOutcome {
+    let n = parts.len();
+    match post_batch(client, addr, timeout, parts).await {
+        NodeSendOutcome::Results(results) if results.len() != n => {
+            NodeSendOutcome::Failed(format!(
+                "forward batch to {addr}: {} results for {n} parts",
+                results.len()
+            ))
+        }
+        other => other,
     }
 }
 
