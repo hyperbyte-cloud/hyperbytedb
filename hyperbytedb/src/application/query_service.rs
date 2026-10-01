@@ -1766,7 +1766,8 @@ fn inject_tombstone_predicates(sql: String, tombstones: &[(String, String)]) -> 
 
 /// Give aggregate results the `time` column InfluxDB always returns. An
 /// aggregate without GROUP BY time() has one row per series, stamped with
-/// the start of the WHERE time range, or epoch 0 when the range is unbounded.
+/// epoch 0 whatever the WHERE range (InfluxQL docs: `SELECT INTEGRAL(..)
+/// WHERE time >= '2015-08-18T00:00:00Z' ..` returns 1970-01-01T00:00:00Z).
 /// A lone FIRST/LAST/MAX/MIN already carries its point's time.
 fn stamp_aggregate_time(stmt: &SelectStatement, series: &mut [SeriesResult], epoch: Option<&str>) {
     let buckets = stmt
@@ -1776,9 +1777,7 @@ fn stamp_aggregate_time(stmt: &SelectStatement, series: &mut [SeriesResult], epo
     if buckets || !to_clickhouse::select_has_true_aggregate(stmt) {
         return;
     }
-    let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-    let start = to_clickhouse::query_start_nanos(stmt.condition.as_ref(), now).unwrap_or(0);
-    let stamp = crate::application::query_arrow_series::time_value_from_nanos(start, epoch);
+    let stamp = crate::application::query_arrow_series::time_value_from_nanos(0, epoch);
     for s in series {
         if s.columns.iter().any(|c| c == "time") {
             continue;

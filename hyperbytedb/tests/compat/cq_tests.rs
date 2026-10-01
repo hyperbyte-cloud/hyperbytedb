@@ -657,7 +657,7 @@ async fn select_qualified_rp_overrides_http_default_rp() {
     );
     let series = resp.results[0].series.as_ref().unwrap();
     assert_eq!(series.len(), 1);
-    // InfluxQL: [time, sum], stamped with the start of the WHERE range.
+    // InfluxQL: [time, sum], stamped with epoch 0.
     assert_eq!(series[0].columns, ["time", "sum"]);
     assert_eq!(
         series[0].values[0][1].as_i64(),

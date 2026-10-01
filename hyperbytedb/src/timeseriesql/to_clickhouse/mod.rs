@@ -28,7 +28,6 @@ pub use select::{
     legacy_field_alias, select_has_true_aggregate, select_output_field_name,
     translate_native_table, translate_with_source, with_output_names,
 };
-pub use time_bounds::query_start_nanos;
 
 /// `SELECT ... INTO` requires `GROUP BY time(<interval>)` so results are bucketed
 /// before writing to the destination measurement.

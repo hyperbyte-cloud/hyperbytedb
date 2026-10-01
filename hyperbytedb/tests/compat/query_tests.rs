@@ -1073,8 +1073,8 @@ async fn partial_line_writes_coalesce_before_query() {
 
 /// Columns as InfluxDB names them, with the time InfluxDB reports:
 /// - a call is named after its function, repeats get `_1`, `_2`, an alias wins;
-/// - an aggregate without GROUP BY time() is stamped with the start of the
-///   WHERE range, or epoch 0 when there is none;
+/// - an aggregate without GROUP BY time() is stamped with epoch 0, whatever
+///   the WHERE range;
 /// - a lone FIRST/LAST/MAX/MIN reports its selected point's time.
 #[tokio::test]
 #[serial(chdb)]
@@ -1109,9 +1109,10 @@ async fn columns_and_time_follow_influxql() {
     assert_eq!(cols, ["time", "count"]);
     assert_eq!(row, [json!("1970-01-01T00:00:00Z"), json!(3)]);
 
+    // A time range does not move the stamp: still epoch 0.
     let (cols, row) = shape("SELECT count(v) FROM cpu WHERE time >= 15s").await;
     assert_eq!(cols, ["time", "count"]);
-    assert_eq!(row, [json!("1970-01-01T00:00:15Z"), json!(2)]);
+    assert_eq!(row, [json!("1970-01-01T00:00:00Z"), json!(2)]);
 
     let (cols, row) = shape("SELECT mean(v), mean(w), sum(v) AS total FROM cpu").await;
     assert_eq!(cols, ["time", "mean", "mean_1", "total"]);
@@ -1131,7 +1132,7 @@ async fn columns_and_time_follow_influxql() {
     let (_, row) = shape("SELECT first(v) FROM cpu").await;
     assert_eq!(row, [json!("1970-01-01T00:00:10Z"), json!(1)]);
 
-    // Two selectors: no single point, so the range start.
+    // Two selectors: no single point, so epoch 0.
     let (cols, row) = shape("SELECT max(v), min(v) FROM cpu").await;
     assert_eq!(cols, ["time", "max", "min"]);
     assert_eq!(row[0], json!("1970-01-01T00:00:00Z"));

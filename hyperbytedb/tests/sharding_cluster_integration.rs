@@ -636,7 +636,7 @@ async fn multi_region_group_by_time_merges_buckets() {
 }
 
 /// Across regions, a lone selector reports the winning point's time and a
-/// plain aggregate the range start, as on one node. The winners sit in
+/// plain aggregate epoch 0, as on one node. The winners sit in
 /// different regions: max and last in one, min and first in the other.
 #[tokio::test]
 #[serial(chdb)]
@@ -693,7 +693,7 @@ async fn multi_region_selectors_report_the_selected_points_time() {
         (
             "SELECT count(value) FROM cpu WHERE time >= 5s",
             "count",
-            "1970-01-01T00:00:05Z",
+            "1970-01-01T00:00:00Z",
             3.0,
         ),
     ];

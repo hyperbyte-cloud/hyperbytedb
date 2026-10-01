@@ -189,7 +189,7 @@ SELECT <field_expression>[, ...] FROM <measurement>
 
 **Column names** follow InfluxQL: an alias wins; otherwise a function call is named after the function (`mean("value")` → `mean`), an expression after the fields and functions in it (`"a" + "b"` → `a_b`), and a repeated name gets `_1`, `_2` (`mean("a"), mean("b")` → `mean`, `mean_1`).
 
-**The `time` column** is always first. Raw selects return each point's time and `GROUP BY time()` returns each bucket's start. An aggregate without `GROUP BY time()` returns the start of the `WHERE` time range, or `1970-01-01T00:00:00Z` when there is no lower bound; a lone `first()`, `last()`, `max()` or `min()` returns the selected point's own time.
+**The `time` column** is always first. Raw selects return each point's time and `GROUP BY time()` returns each bucket's start. An aggregate without `GROUP BY time()` returns one row stamped `1970-01-01T00:00:00Z`, whatever the `WHERE` time range; a lone `first()`, `last()`, `max()` or `min()` returns the selected point's own time.
 
 **FROM clause:**
 - Single: `FROM "cpu"`
