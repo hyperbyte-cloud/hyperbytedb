@@ -17,6 +17,13 @@ BATCH="${BATCH:-1000}"
 # Client pods per cluster node. One Python client tops out near 900k
 # lines/s, so a single pod measured the client at N=3, not the cluster.
 CLIENTS_PER_NODE="${CLIENTS_PER_NODE:-2}"
+# rust: `hyperbytedb-cli bench-write` from the DB image (a quarter of the
+# Python client's CPU per point, keep-alive connections). python: the
+# original incluster_bench.py.
+BENCH_CLIENT="${BENCH_CLIENT:-rust}"
+BENCH_IMAGE="${BENCH_IMAGE:-docker.io/library/hyperbytedb:e2e}"
+# CPU limit per client pod, so clients cannot crowd the DB on a shared host.
+BENCH_CPU="${BENCH_CPU:-1}"
 RESULTS="${RESULTS:-/tmp/linearity-incluster.md}"
 BASELINE=""
 
@@ -92,6 +99,17 @@ for s in d['results'][0].get('series',[]):
   echo "[sweep] WARNING: spaces still present after drop (regions=$regions)"
 }
 
+# Image and command lines of the bench container, per BENCH_CLIENT.
+bench_container() {
+  if [[ "$BENCH_CLIENT" == "python" ]]; then
+    printf '%s\n' '          image: python:3.12-slim' \
+      '          command: ["python3", "/bench/incluster_bench.py"]'
+  else
+    printf '%s\n' "          image: ${BENCH_IMAGE}" '          imagePullPolicy: Never' \
+      '          command: ["/hyperbytedb-cli", "bench-write"]'
+  fi
+}
+
 # Run one bench phase as a Job and print its log.
 run_phase() {
   local phase=$1 eps=$2 series=$3 workers=$4
@@ -113,8 +131,10 @@ spec:
       restartPolicy: Never
       containers:
         - name: bench
-          image: python:3.12-slim
-          command: ["python3", "/bench/incluster_bench.py"]
+$(bench_container)
+          resources:
+            limits:
+              cpu: "${BENCH_CPU}"
           args:
             - "--endpoints=${eps}"
             - "--series=${series}"
