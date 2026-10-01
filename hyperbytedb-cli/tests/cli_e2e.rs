@@ -347,7 +347,7 @@ async fn materialized_view_via_execute() {
         repl::execute_query(
             &session,
             &client,
-            r#"CREATE MATERIALIZED VIEW "mv_5m" ON "mvcli" AS SELECT mean("value") INTO "cpu_5m" FROM "cpu" GROUP BY time(5m), *"#,
+            r#"CREATE MATERIALIZED VIEW "mv_5m" ON "mvcli" AS SELECT mean("value") AS "mean_value" INTO "cpu_5m" FROM "cpu" GROUP BY time(5m), *"#,
         )
         .await
         .expect("create mv");
@@ -359,7 +359,7 @@ async fn materialized_view_via_execute() {
         let err = repl::execute_query(
             &session,
             &client,
-            r#"CREATE MATERIALIZED VIEW "mv_5m" ON "mvcli" AS SELECT mean("value") INTO "cpu_5m" FROM "cpu" GROUP BY time(5m), *"#,
+            r#"CREATE MATERIALIZED VIEW "mv_5m" ON "mvcli" AS SELECT mean("value") AS "mean_value" INTO "cpu_5m" FROM "cpu" GROUP BY time(5m), *"#,
         )
         .await
         .expect_err("duplicate mv should fail");
