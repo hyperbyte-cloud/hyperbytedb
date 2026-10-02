@@ -770,10 +770,7 @@ async fn forwards_and_replication_work_over_http2() {
     use hyperbytedb::ports::wal::WalPort;
 
     let dir = tempfile::tempdir().unwrap();
-    let opts = ShardedClusterOptions {
-        http2: true,
-        ..Default::default()
-    };
+    let opts = ShardedClusterOptions::default();
     let nodes = start_sharded_three_node_cluster(dir.path(), opts).await;
     bootstrap_two_regions(&nodes, "sharddb", "autogen", "cpu").await;
     let client = reqwest::Client::new();
@@ -2257,6 +2254,72 @@ async fn a_node_without_a_copy_answers_metadata_and_time_queries() {
             node.url
         );
     }
+}
+
+/// A write for a database that no longer exists must not leave series
+/// metadata behind. After DROP DATABASE, forwards, replication and catch-up
+/// still in flight kept registering the dropped database's series: on n3,
+/// nodes with no databases warmed 35-38 million series at startup.
+#[tokio::test]
+#[serial(chdb)]
+async fn a_late_write_for_a_dropped_database_leaves_no_series() {
+    use hyperbytedb::domain::sharding::{ShardWriteBatch, ShardWriteRequest};
+    use hyperbytedb::ports::metadata::MetadataPort;
+
+    let dir = tempfile::tempdir().unwrap();
+    let [n1, n2] = start_sharded_pair_cluster(dir.path(), ShardedClusterOptions::default()).await;
+    let client = reqwest::Client::new();
+    for node in [&n1, &n2] {
+        create_db(&client, &node.url, "latedb").await;
+    }
+    let op = ShardMapOp::BootstrapMeasurement {
+        key: MeasurementKey::new("latedb", "autogen", "cpu"),
+        region: ShardRegion {
+            region_id: 1,
+            start: 0,
+            end: u64::MAX,
+            epoch: ShardEpoch::default(),
+            peers: vec![1],
+            primary: 1,
+            last_split_at: 0,
+            transfer_verified: None,
+            transfer_first_seen: None,
+            state: Default::default(),
+            staged_from: None,
+            staging_peers: Vec::new(),
+        },
+    };
+    for node in [&n1, &n2] {
+        node.shard_map.apply_op(op.clone()).await.unwrap();
+    }
+    for node in [&n1, &n2] {
+        let resp = query_sql(&client, &node.url, "latedb", "DROP DATABASE latedb").await;
+        assert!(resp.status().is_success());
+    }
+    assert_eq!(n1.metadata.warm_series().await.unwrap(), 0);
+
+    // A forward that was in flight when the database went away.
+    let batch = ShardWriteBatch {
+        parts: vec![ShardWriteRequest {
+            db: "latedb".into(),
+            rp: "autogen".into(),
+            precision: None,
+            epoch: ShardEpoch::default(),
+            region_id: 1,
+            body: b"cpu,host=a value=1 1000000000\ncpu,host=b value=2 1000000000".to_vec(),
+        }],
+    };
+    let _ = client
+        .post(format!("{}/internal/shard/write-batch", n1.url))
+        .body(bincode::serialize(&batch).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        n1.metadata.warm_series().await.unwrap(),
+        0,
+        "a late write re-registered the dropped database's series"
+    );
 }
 
 /// Pair cluster with the forward queue on: `cpu` lives on node 1, `mem` on

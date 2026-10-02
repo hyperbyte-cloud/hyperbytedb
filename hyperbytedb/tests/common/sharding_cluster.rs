@@ -74,8 +74,6 @@ pub struct ShardedClusterOptions {
     /// Acknowledge writes once their forwards are queued, as a server does.
     /// Off by default: most suites assert on synchronous forwarding.
     pub forward_queue: bool,
-    /// Peers talk HTTP/2 (`cluster.internal_http2`).
-    pub http2: bool,
 }
 
 impl Default for ShardedClusterOptions {
@@ -94,7 +92,6 @@ impl Default for ShardedClusterOptions {
             raft: None,
             leader_callbacks: None,
             forward_queue: false,
-            http2: false,
         }
     }
 }
@@ -161,7 +158,7 @@ pub async fn start_sharded_node(
             8,
             8 * 1024 * 1024,
         )
-        .with_http2(opts.http2, 4),
+        .with_http2_connections(4),
     );
 
     let shard_map = Arc::new(RocksDbShardMap::open(&meta_dir, true).unwrap());

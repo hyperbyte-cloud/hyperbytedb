@@ -24,8 +24,8 @@ pub struct PeerClient {
     membership: SharedMembership,
     replication_log: Arc<ReplicationLog>,
     hinted_handoff: Option<Arc<HintedHandoff>>,
-    /// One client per connection to keep to each peer: each has its own
-    /// pool, so over HTTP/2 each holds its own connection. One for HTTP/1.1.
+    /// One client per HTTP/2 connection to keep to each peer: each has its
+    /// own pool, so each holds its own connection.
     clients: Vec<reqwest::Client>,
     next_client: std::sync::atomic::AtomicUsize,
     node_id: u64,
@@ -46,20 +46,18 @@ pub struct PeerClient {
 /// behind NAT/firewalls. Operation timeouts remain the caller's
 /// responsibility via per-request `.timeout(...)`. `builder.build()` only
 /// fails on broken TLS init, and `Client::new()` would also be unusable then.
-fn peer_http_client(http2: bool) -> reqwest::Client {
-    let mut builder = reqwest::Client::builder()
+fn peer_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .connect_timeout(Duration::from_secs(3))
         .tcp_keepalive(Duration::from_secs(60))
-        .dns_resolver(crate::adapters::cluster::dns_cache::CachingResolver::shared());
-    if http2 {
-        builder = builder
-            .http2_prior_knowledge()
-            .http2_adaptive_window(true)
-            .http2_keep_alive_interval(Duration::from_secs(30))
-            .http2_keep_alive_while_idle(true);
-    }
-    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+        .dns_resolver(crate::adapters::cluster::dns_cache::CachingResolver::shared())
+        .http2_prior_knowledge()
+        .http2_adaptive_window(true)
+        .http2_keep_alive_interval(Duration::from_secs(30))
+        .http2_keep_alive_while_idle(true)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 impl PeerClient {
@@ -75,7 +73,7 @@ impl PeerClient {
         max_coalesce_body_bytes: usize,
     ) -> Self {
         let depth = outbound_queue_depth.max(1);
-        let client = peer_http_client(false);
+        let client = peer_http_client();
         let (outbound_tx, outbound_rx) =
             tokio::sync::mpsc::channel::<OutboundReplicationBatch>(depth);
         let inflight = max_inflight_batches.max(1);
@@ -106,18 +104,14 @@ impl PeerClient {
         &self.membership
     }
 
-    /// Talk to peers over HTTP/2 (cleartext, prior knowledge), on
-    /// `connections` connections per peer that requests take in turn:
-    /// concurrent requests share their streams. One connection carried a
-    /// peer's whole load on one TCP stream; TiKV keeps 4 per store. See
-    /// `cluster.internal_http2` / `internal_http2_connections`.
+    /// Keep `connections` HTTP/2 connections to each peer; requests take
+    /// them in turn. One connection carried a peer's whole load on one TCP
+    /// stream; TiKV keeps 4 per store. See `cluster.internal_http2_connections`.
     #[must_use]
-    pub fn with_http2(mut self, http2: bool, connections: usize) -> Self {
-        if http2 {
-            self.clients = (0..connections.max(1))
-                .map(|_| peer_http_client(true))
-                .collect();
-        }
+    pub fn with_http2_connections(mut self, connections: usize) -> Self {
+        self.clients = (0..connections.max(1))
+            .map(|_| peer_http_client())
+            .collect();
         self
     }
 
@@ -1449,7 +1443,7 @@ mod http2_tests {
             crate::domain::cluster::membership::ClusterMembership::new(),
         );
         let pc = super::PeerClient::new(1, "127.0.0.1:9".into(), membership, log, 1, 16, 1, 1024)
-            .with_http2(true, 4);
+            .with_http2_connections(4);
         for _ in 0..32 {
             let r = pc
                 .http_client()
@@ -1466,14 +1460,12 @@ mod http2_tests {
         );
     }
 
-    /// With `internal_http2` the peer client speaks HTTP/2 to the axum
-    /// server (cleartext, no upgrade round trip); without it, HTTP/1.1.
+    /// The peer client speaks HTTP/2 to the axum server (cleartext, no
+    /// upgrade round trip).
     #[tokio::test]
-    async fn peer_client_speaks_http2_when_enabled() {
+    async fn peer_client_speaks_http2() {
         let url = version_echo().await;
-        let h2 = peer_http_client(true).get(&url).send().await.unwrap();
-        assert_eq!(h2.text().await.unwrap(), "HTTP/2.0");
-        let h1 = peer_http_client(false).get(&url).send().await.unwrap();
-        assert_eq!(h1.text().await.unwrap(), "HTTP/1.1");
+        let resp = peer_http_client().get(&url).send().await.unwrap();
+        assert_eq!(resp.text().await.unwrap(), "HTTP/2.0");
     }
 }

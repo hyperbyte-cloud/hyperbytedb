@@ -81,7 +81,7 @@ impl ClusterBootstrap {
                 config.replication_max_coalesce_body_bytes,
             )
             .with_hinted_handoff(hh.clone())
-            .with_http2(config.internal_http2, config.internal_http2_connections),
+            .with_http2_connections(config.internal_http2_connections),
         );
 
         Ok(Self {

@@ -601,15 +601,11 @@ pub struct ClusterConfig {
     /// Max bytes for coalescing consecutive WAL batches (same db/rp/precision).
     #[serde(default = "default_replication_max_coalesce_body_bytes")]
     pub replication_max_coalesce_body_bytes: usize,
-    /// Speak HTTP/2 (cleartext, prior knowledge) to peers for forwards and
-    /// replication: requests to a peer share multiplexed streams on one
-    /// connection instead of holding one HTTP/1.1 connection each. Every
-    /// node must run a build that accepts HTTP/2; enable once all do.
-    #[serde(default)]
-    pub internal_http2: bool,
-    /// HTTP/2 connections kept to each peer when `internal_http2` is on;
-    /// requests take them in turn. One connection put a peer's whole load on
-    /// one TCP stream.
+    /// HTTP/2 connections kept to each peer for forwards and replication;
+    /// requests take them in turn. Peers always talk cleartext HTTP/2 (prior
+    /// knowledge): requests share multiplexed streams instead of holding one
+    /// HTTP/1.1 connection each (on n3, 834 -> 162 established connections
+    /// per pod). One connection put a peer's whole load on one TCP stream.
     #[serde(default = "default_internal_http2_connections")]
     pub internal_http2_connections: usize,
     /// Max HTTP body size for `/internal/replicate` and `/internal/replicate-mutation`.
@@ -1021,7 +1017,6 @@ impl HyperbytedbConfig {
                 replication_queue_depth: default_replication_queue_depth(),
                 replication_max_inflight_batches: default_replication_max_inflight_batches(),
                 replication_max_coalesce_body_bytes: default_replication_max_coalesce_body_bytes(),
-                internal_http2: false,
                 internal_http2_connections: default_internal_http2_connections(),
                 replicate_body_limit_bytes: 0,
                 replicate_receiver_queue_depth: default_replicate_receiver_queue_depth(),
@@ -1414,7 +1409,6 @@ mod replicate_body_limit_tests {
             replication_queue_depth: 8192,
             replication_max_inflight_batches: 8,
             replication_max_coalesce_body_bytes: 8 * 1024 * 1024,
-            internal_http2: false,
             internal_http2_connections: super::default_internal_http2_connections(),
             replicate_body_limit_bytes: 0,
             replicate_receiver_queue_depth: 1024,
