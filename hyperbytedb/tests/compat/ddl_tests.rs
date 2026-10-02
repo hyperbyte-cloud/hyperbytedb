@@ -1605,3 +1605,32 @@ async fn materialized_view_columns_must_be_named() {
         "a rejected view is not stored"
     );
 }
+
+/// DROP DATABASE removes the database's series from metadata. A node warms
+/// its series cache from every stored series key at startup; on n3, nodes
+/// with no databases left warmed 35-38 million, and OOM-crashed at 16 GiB.
+#[tokio::test]
+#[serial(chdb)]
+async fn drop_database_removes_its_series_metadata() {
+    let ctx = TestContext::new().unwrap();
+    ctx.metadata.create_database("leakdb").await.unwrap();
+    let lines: Vec<String> = (0..50)
+        .map(|i| format!("cpu,host=h{i} value=1 {}", 1_000_000_000 + i))
+        .collect();
+    ctx.write_and_flush("leakdb", &lines.join("\n"))
+        .await
+        .unwrap();
+    assert!(ctx.metadata.warm_series().await.unwrap() >= 50);
+
+    let resp = ctx.query("leakdb", "DROP DATABASE leakdb").await.unwrap();
+    assert!(
+        resp.results[0].error.is_none(),
+        "{:?}",
+        resp.results[0].error
+    );
+    assert_eq!(
+        ctx.metadata.warm_series().await.unwrap(),
+        0,
+        "series keys of a dropped database"
+    );
+}
