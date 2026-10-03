@@ -654,6 +654,13 @@ fn new_transfer_id() -> u64 {
         .unwrap_or(1)
 }
 
+/// Most points one transfer push carries. Callers pass the client
+/// `max_points_per_request` (500,000 by default): one chunk then was hundreds
+/// of MB of JSON parsed row by row, far past the receiver's body limit (413,
+/// retried forever), and with 4 concurrent moves the donor was OOM-killed at
+/// 16 GiB on every scale-up on n3.
+const TRANSFER_CHUNK_POINTS: usize = 50_000;
+
 #[allow(clippy::too_many_arguments)]
 async fn transfer_region_data(
     peer_client: &Arc<crate::adapters::cluster::peer_client::PeerClient>,
@@ -675,7 +682,7 @@ async fn transfer_region_data(
             bytes: 0,
         });
     }
-    let max_points = max_points.max(1);
+    let max_points = max_points.clamp(1, TRANSFER_CHUNK_POINTS);
     let transfer_id = new_transfer_id();
     let mut seq = 0u64;
     let mut exported = 0u64;
