@@ -25,6 +25,13 @@ BENCH_IMAGE="${BENCH_IMAGE:-docker.io/library/hyperbytedb:e2e}"
 # CPU limit per client pod, so clients cannot crowd the DB on a shared host.
 BENCH_CPU="${BENCH_CPU:-1}"
 RESULTS="${RESULTS:-/tmp/linearity-incluster.md}"
+# 1: drop every database before the sweep and after each N (the old
+# behaviour). 0 (default): keep them. Dropping right after a measure applied
+# DROP DATABASE under load: on n3 a node applying it OOM-crashed and replayed
+# the drop on every restart. Each N writes its own database, and the region
+# and layout checks look only at that database's spaces.
+SWEEP_DROP="${SWEEP_DROP:-0}"
+export SPACE_DB=""
 BASELINE=""
 
 kubectl_ctx() { kubectl --context "$KUBE_CTX" "$@"; }
@@ -37,7 +44,9 @@ map_stats() {
 import sys,json
 try: d=json.load(sys.stdin)
 except Exception: print(0, 0); raise SystemExit
-rs=[r for sp in d.get('spaces',[]) for r in sp.get('regions',[])]
+import os
+want=os.environ.get('SPACE_DB','')
+rs=[r for sp in d.get('spaces',[]) if not want or sp.get('key',{}).get('db')==want for r in sp.get('regions',[])]
 import collections
 lay=collections.Counter()
 for r in rs:
@@ -170,7 +179,7 @@ kubectl_ctx -n "$NS" create configmap linearity-bench \
   --from-file=incluster_bench.py="$SCRIPT_DIR/incluster_bench.py" \
   --dry-run=client -o yaml | kubectl_ctx apply -f - >/dev/null
 
-drop_all_spaces
+[[ "$SWEEP_DROP" == 1 ]] && drop_all_spaces
 for N in $NODES_LIST; do
   echo "[sweep] scaling to N=$N"
   kubectl_ctx -n "$NS" patch hyperbytedbcluster "$CR_NAME" --type merge \
@@ -210,6 +219,7 @@ for N in $NODES_LIST; do
   # of step; the flush then fails forever ("No such column host"), the WAL
   # backs up, and the nodes starve until liveness kills them. Plan item B1.
   DB="linearity_${N}_$(date +%s)"
+  export SPACE_DB="$DB"
   run_phase "seed" "$eps" "$series" "$workers" | grep -E 'FATAL|seed complete' | sort | uniq -c
   # Wait for the space to split before timing anything. With DROP DATABASE
   # now really dropping the shard space, every point starts from ONE region;
@@ -233,9 +243,11 @@ print(int(pts/dur) if dur>0 else '-', int(sum(r[2] for r in rows)), int(sum(r[3]
   kubectl_ctx -n "$NS" exec "${CR_NAME}-0" -c hyperbytedb -- \
     sh -c 'curl -sS -m 20 http://127.0.0.1:8086/internal/shard/map' 2>/dev/null \
     | python3 -c "
-import sys,json,collections
+import sys,json,collections,os
+want=os.environ.get('SPACE_DB','')
 d=json.load(sys.stdin); P=collections.Counter(); R=collections.Counter(); W=collections.Counter()
 for sp in d.get('spaces',[]):
+  if want and sp.get('key',{}).get('db')!=want: continue
   for r in sp['regions']:
     P[r['primary']]+=1; W[r['primary']]+=(r['end']-r['start'])/2**64
     for p in r['peers']:
@@ -254,8 +266,10 @@ for n in sorted(set(P)|set(R)): print(f'[layout] node={n} primary={P[n]} replica
     ratio=$(python3 -c "print(f'{$pps/$BASELINE:.2f}x')")
   else ratio="—"; fi
   echo "| $N | $series | ${regions:-?} | ${primaries:-?} | ${pps:-?} | ${errs:-?} | ${retries:-?} | $ratio | $valid |" >>"$RESULTS"
-  # Drop the dataset so the next N starts clean.
-  drop_all_spaces
-  sleep 20
+  # Drop the dataset so the next N starts clean (SWEEP_DROP=1 only).
+  if [[ "$SWEEP_DROP" == 1 ]]; then
+    drop_all_spaces
+    sleep 20
+  fi
 done
 echo "[sweep] results: $RESULTS"
