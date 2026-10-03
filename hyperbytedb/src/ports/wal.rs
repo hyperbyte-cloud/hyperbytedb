@@ -39,7 +39,11 @@ pub trait WalPort: Send + Sync {
         self.append(bundle.entry).await
     }
 
+    /// Like `read_range` with no entry limit; still one bounded page.
     async fn read_from(&self, sequence: u64) -> Result<Vec<(u64, WalEntry)>, HyperbytedbError>;
+    /// Read up to `max_entries` entries starting at `from`. A read may stop
+    /// early to bound memory, so a short page does not mean the end of the
+    /// log: only an empty result does.
     async fn read_range(
         &self,
         from: u64,

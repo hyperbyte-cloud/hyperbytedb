@@ -200,10 +200,11 @@ pub async fn export_region_points_from_wal_chunked(
         let page = wal
             .read_range(next.from_seq, WAL_EXPORT_PAGE_ENTRIES)
             .await?;
+        // Only an empty page is the log tail; reads stop early to bound memory.
         if page.is_empty() {
             return Ok((encode_wal_chunk(&points)?, points.len(), next));
         }
-        let page_full = page.len() == WAL_EXPORT_PAGE_ENTRIES;
+        let page_start = next;
 
         // Entries are owned (freshly decoded from the page read): consume by
         // value so exported points MOVE into the chunk buffer instead of
@@ -263,15 +264,10 @@ pub async fn export_region_points_from_wal_chunked(
             };
         }
 
-        // A non-full page means we reached the log tail without splitting:
-        // whatever is buffered is the final chunk.
-        if !page_full {
-            return Ok((encode_wal_chunk(&points)?, points.len(), next));
-        }
-        // Full page and no split: keep paging from the advanced cursor. Bail
-        // defensively if a pass made no progress (should be impossible: any
-        // consumed entry either advances `next` or triggers the split return).
-        if next == cursor {
+        // No split: keep paging from the advanced cursor. Bail defensively if
+        // a pass made no progress (should be impossible: any consumed entry
+        // either advances `next` or triggers the split return).
+        if next == page_start {
             return Err(HyperbytedbError::ShardMap(
                 "wal export made no progress".into(),
             ));

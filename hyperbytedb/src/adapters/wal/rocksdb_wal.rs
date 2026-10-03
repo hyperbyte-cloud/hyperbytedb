@@ -17,6 +17,10 @@ use crate::ports::wal::{WalAppendBundle, WalEntry, WalFormat, WalPort};
 const WAL_CF: &str = "wal";
 const WAL_META_CF: &str = "wal_meta";
 const LAST_SEQ_KEY: &[u8] = b"last_seq";
+/// Encoded bytes one `read_range` call may decode. Entries expand several-fold
+/// once decoded, so an entry-count limit alone let a restart's first flush
+/// decode thousands of large write batches at once and OOM the pod.
+const READ_MAX_BYTES: usize = 32 << 20;
 
 fn u64_to_be_bytes(n: u64) -> [u8; 8] {
     n.to_be_bytes()
@@ -502,13 +506,14 @@ impl WalPort for RocksDbWal {
                 .ok_or_else(|| HyperbytedbError::Wal("wal column family not found".into()))?;
 
             let mut results = Vec::new();
+            let mut read_bytes = 0usize;
             let start_key = u64_to_be_bytes(from);
             let mode = IteratorMode::From(&start_key, Direction::Forward);
 
             let iter = db.iterator_cf_opt(&wal_cf, rocksdb::ReadOptions::default(), mode);
 
             for item in iter {
-                if results.len() >= max_entries {
+                if results.len() >= max_entries || read_bytes >= READ_MAX_BYTES {
                     break;
                 }
                 let (key, value) = item.map_err(|e| {
@@ -519,6 +524,7 @@ impl WalPort for RocksDbWal {
                         format!("invalid WAL key length: expected 8, got {}", key.len()).into(),
                     ));
                 }
+                read_bytes += value.len();
                 let seq = be_bytes_to_u64(&key);
                 let (prepared, entry) = wal_ipc::decode_wal_value(wal_format, &value)?;
                 if arrow_wal_enabled && let Some(slot) = prepared {
@@ -764,6 +770,39 @@ mod tests {
         )
         .unwrap();
         assert_absolute_seqs(&append_and_take(&wal).await);
+    }
+
+    #[tokio::test]
+    async fn a_large_backlog_is_read_a_bounded_page_at_a_time() {
+        let tmp = TempDir::new().unwrap();
+        let wal = RocksDbWal::open(tmp.path()).unwrap();
+        // 1 MiB per entry, so the backlog is twice the per-read budget.
+        let entries = 2 * READ_MAX_BYTES / (1 << 20);
+        for _ in 0..entries {
+            let mut entry = test_entry();
+            entry.points[0]
+                .fields
+                .insert("blob".into(), FieldValue::String("x".repeat(1 << 20)));
+            wal.append(entry).await.unwrap();
+        }
+
+        let first = wal.read_range(1, usize::MAX).await.unwrap();
+        assert!(
+            !first.is_empty() && first.len() < entries,
+            "got {}",
+            first.len()
+        );
+
+        // Paging until an empty read still returns every entry exactly once.
+        let mut seen = first.len();
+        let mut next = first.last().unwrap().0 + 1;
+        loop {
+            let page = wal.read_range(next, usize::MAX).await.unwrap();
+            let Some((last, _)) = page.last() else { break };
+            next = last + 1;
+            seen += page.len();
+        }
+        assert_eq!(seen, entries);
     }
 
     #[tokio::test]
