@@ -18,6 +18,16 @@ use crate::ports::sharding::ShardMapPort;
 use crate::ports::wal::WalPort;
 
 const WAL_READ_CHUNK: usize = 5_000;
+/// chDB inserts one flush chunk runs at once. The node has one chDB write
+/// connection, so more only queue, each holding its decoded rows: with a
+/// backlog every 50k-point slice of a 5,000-entry chunk was spawned at once,
+/// and nodes restarting after a crash were OOM-killed at 16-24 GiB within
+/// seconds, every restart.
+const FLUSH_INSERT_CONCURRENCY: usize = 4;
+/// A native chunk stops taking WAL entries at this many batches' worth of
+/// points: an entry is a whole client write (thousands of points), so 5,000
+/// entries could decode tens of millions of points at once.
+const NATIVE_CHUNK_BATCHES: usize = 4;
 const DEFAULT_MAX_POINTS_PER_BATCH: usize = 50_000;
 const MIN_BATCH_POINTS: usize = 10_000;
 const MAX_BATCH_POINTS: usize = 500_000;
@@ -405,9 +415,12 @@ impl FlushServiceImpl {
 
         let sink = self.sink.clone();
         let mut handles = Vec::with_capacity(work_items.len());
+        let inserts = Arc::new(tokio::sync::Semaphore::new(FLUSH_INSERT_CONCURRENCY));
         for work in work_items {
             let sink = sink.clone();
+            let inserts = inserts.clone();
             handles.push(tokio::spawn(async move {
+                let _slot = inserts.acquire_owned().await;
                 let count = work.batch.row_count;
                 let _ack = sink
                     .write_prepared_batch(&work.db, &work.rp, &work.batch)
@@ -550,9 +563,17 @@ impl FlushServiceImpl {
                 break;
             }
 
+            let budget = self.max_points_per_batch * NATIVE_CHUNK_BATCHES;
+            let mut taken_points = 0usize;
             let entries: Vec<_> = entries
                 .into_iter()
                 .filter(|(seq, _)| *seq <= snapshot_seq)
+                .take_while(|(_, e)| {
+                    // Always take one entry, then stop at the budget.
+                    let take = taken_points == 0 || taken_points < budget;
+                    taken_points += e.points.len();
+                    take
+                })
                 .collect();
             if entries.is_empty() {
                 break;
@@ -640,10 +661,13 @@ impl FlushServiceImpl {
             let sink = self.sink.clone();
             let mut handles = Vec::with_capacity(work_items.len());
             let chunk_min_seq = from_seq;
+            let inserts = Arc::new(tokio::sync::Semaphore::new(FLUSH_INSERT_CONCURRENCY));
             for (idx, work) in work_items.into_iter().enumerate() {
                 let sink = sink.clone();
                 let ingest_seq_base = chunk_min_seq.saturating_add(idx as u64);
+                let inserts = inserts.clone();
                 handles.push(tokio::spawn(async move {
+                    let _slot = inserts.acquire_owned().await;
                     let count = work.points.len();
                     tracing::debug!(
                         db = %work.db,
@@ -853,6 +877,126 @@ mod tests {
             remaining.len(),
             1,
             "failed chunk must stay in the WAL for retry, not be truncated"
+        );
+    }
+
+    /// Sink that records how many writes run at once and how many points are
+    /// in flight, slowly enough for concurrent writes to overlap.
+    #[derive(Default)]
+    struct CountingSink {
+        active: std::sync::atomic::AtomicUsize,
+        peak_active: std::sync::atomic::AtomicUsize,
+        points: std::sync::atomic::AtomicUsize,
+        written: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl PointsSinkPort for CountingSink {
+        async fn write_points(
+            &self,
+            _db: &str,
+            _rp: &str,
+            _measurement: &str,
+            _origins: &[u64],
+            _ingest_seq_base: u64,
+            points: &[Point],
+        ) -> Result<WriteAck, HyperbytedbError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let now = self.active.fetch_add(1, SeqCst) + 1;
+            self.peak_active.fetch_max(now, SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            self.active.fetch_sub(1, SeqCst);
+            self.points.fetch_add(points.len(), SeqCst);
+            self.written.fetch_add(1, SeqCst);
+            Ok(WriteAck {
+                min_time: 0,
+                max_time: 0,
+                row_count: points.len(),
+            })
+        }
+    }
+
+    fn big_entry(n: usize, offset: usize) -> WalEntry {
+        let mut e = entry();
+        e.points = (0..n)
+            .map(|i| {
+                let mut p = e.points[0].clone();
+                p.tags.insert("host".into(), format!("h{}", offset + i));
+                p
+            })
+            .collect();
+        e
+    }
+
+    /// A backlog flushes in bounded steps: chunks of a few batches' points and
+    /// at most FLUSH_INSERT_CONCURRENCY inserts at once. Unbounded, a node
+    /// restarting with a backlog spawned every slice of a 5,000-entry chunk at
+    /// once and was OOM-killed within seconds, on every restart.
+    #[tokio::test]
+    async fn a_backlog_flushes_in_bounded_steps() {
+        let tmp = TempDir::new().unwrap();
+        let wal: Arc<dyn WalPort> = Arc::new(
+            RocksDbWal::open_with_options(
+                tmp.path(),
+                RocksDbWalOptions {
+                    wal_format: WalFormat::Bincode,
+                    arrow_wal_enabled: false,
+                },
+            )
+            .unwrap(),
+        );
+        for i in 0..40 {
+            wal.append(big_entry(10_000, i * 10_000)).await.unwrap();
+        }
+        let sink = Arc::new(CountingSink::default());
+        let flush = FlushServiceImpl::new(wal.clone(), 10_000, sink.clone());
+        flush.flush().await.unwrap();
+
+        use std::sync::atomic::Ordering::SeqCst;
+        assert_eq!(sink.points.load(SeqCst), 400_000, "every point flushed");
+        assert!(
+            sink.peak_active.load(SeqCst) <= super::FLUSH_INSERT_CONCURRENCY,
+            "peak concurrent inserts {}",
+            sink.peak_active.load(SeqCst)
+        );
+        assert!(
+            wal.read_range(1, 16).await.unwrap().is_empty(),
+            "WAL truncated"
+        );
+    }
+
+    /// Many measurements in one chunk still insert at most
+    /// FLUSH_INSERT_CONCURRENCY at a time.
+    #[tokio::test]
+    async fn many_measurements_insert_a_few_at_a_time() {
+        let tmp = TempDir::new().unwrap();
+        let wal: Arc<dyn WalPort> = Arc::new(
+            RocksDbWal::open_with_options(
+                tmp.path(),
+                RocksDbWalOptions {
+                    wal_format: WalFormat::Bincode,
+                    arrow_wal_enabled: false,
+                },
+            )
+            .unwrap(),
+        );
+        for i in 0..20 {
+            let mut e = big_entry(500, i * 500);
+            for p in &mut e.points {
+                p.measurement = format!("m{i}");
+            }
+            wal.append(e).await.unwrap();
+        }
+        let sink = Arc::new(CountingSink::default());
+        let flush = FlushServiceImpl::new(wal.clone(), 10_000, sink.clone());
+        flush.flush().await.unwrap();
+
+        use std::sync::atomic::Ordering::SeqCst;
+        assert_eq!(sink.written.load(SeqCst), 20, "one insert per measurement");
+        assert!(
+            sink.peak_active.load(SeqCst) <= super::FLUSH_INSERT_CONCURRENCY,
+            "peak concurrent inserts {}",
+            sink.peak_active.load(SeqCst)
         );
     }
 }
