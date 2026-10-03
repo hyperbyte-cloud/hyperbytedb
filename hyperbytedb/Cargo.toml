@@ -118,6 +118,9 @@ columnar-ingest = []
 # In-process CPU profiler at /debug/pprof/profile on the control listener.
 # Off by default; build with it (and unstripped symbols) to diagnose hot spots.
 profiling = ["dep:pprof"]
+# jemalloc heap profiling: run with _RJEM_MALLOC_CONF="prof:true,..." and
+# read the dumps with jeprof against an unstripped binary.
+heap-profiling = ["tikv-jemallocator/profiling"]
 # Export request traces over OTLP (set OTEL_EXPORTER_OTLP_ENDPOINT).
 # Off by default; see src/telemetry.rs.
 otel = [
