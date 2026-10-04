@@ -181,6 +181,10 @@ pub struct ShardRehomeRequest {
     /// staging). Uses the stage transfer that skips dest ownership checks.
     #[serde(default)]
     pub stage: bool,
+    /// Pace the push to this many bytes per second (0 = unpaced). Set by the
+    /// leader for balance moves, which share `movement_budget_bytes_per_sec`.
+    #[serde(default)]
+    pub max_bytes_per_sec: u64,
     /// Accepted and ignored. Retained only so a new binary can still decode a
     /// payload from an older one: `ShardRehomeRequest` is
     /// `deny_unknown_fields`, so removing the name would make the whole

@@ -655,8 +655,20 @@ fn new_transfer_id() -> u64 {
 /// of MB of JSON parsed row by row, far past the receiver's body limit (413,
 /// retried forever), and with 4 concurrent moves the donor was OOM-killed at
 /// 16 GiB on every scale-up on n3.
-const TRANSFER_CHUNK_POINTS: usize = 50_000;
+pub(crate) const TRANSFER_CHUNK_POINTS: usize = 50_000;
 
+/// How long to wait so `sent` bytes over `elapsed` stay at or under `rate`
+/// bytes per second. A rate of 0 is unpaced.
+fn pacing_delay(rate: u64, sent: u64, elapsed: std::time::Duration) -> std::time::Duration {
+    if rate == 0 {
+        return std::time::Duration::ZERO;
+    }
+    std::time::Duration::from_secs_f64(sent as f64 / rate as f64).saturating_sub(elapsed)
+}
+
+/// `max_bytes_per_sec` paces the push chunk by chunk (0 = unpaced). The
+/// sender is the only place a rate can be enforced: the leader that starts a
+/// move only sees the whole remote stage, after it is done.
 #[allow(clippy::too_many_arguments)]
 async fn transfer_region_data(
     peer_client: &Arc<crate::adapters::cluster::peer_client::PeerClient>,
@@ -669,6 +681,7 @@ async fn transfer_region_data(
     dest_primary: u64,
     max_points: usize,
     stage: bool,
+    max_bytes_per_sec: u64,
 ) -> Result<RegionTransferOutcome, HyperbytedbError> {
     if dest_primary == source_node_id {
         return Ok(RegionTransferOutcome {
@@ -684,6 +697,7 @@ async fn transfer_region_data(
     let mut exported = 0u64;
     let mut bytes = 0u64;
     let mut applied = 0u64;
+    let started = std::time::Instant::now();
 
     // Unflushed WAL rows: chunked and resumable so regions with more pending
     // points than one chunk transfers never fail permanently (H4).
@@ -709,6 +723,10 @@ async fn transfer_region_data(
             applied += chunk_applied;
             bytes += chunk_bytes;
             seq = seq.saturating_add(1);
+            let wait = pacing_delay(max_bytes_per_sec, bytes, started.elapsed());
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
+            }
         }
         if next_cursor == cursor {
             break;
@@ -760,6 +778,10 @@ async fn transfer_region_data(
             applied += chunk_applied;
             bytes += chunk_bytes;
             seq = seq.saturating_add(1);
+            let wait = pacing_delay(max_bytes_per_sec, bytes, started.elapsed());
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
+            }
             if done {
                 break;
             }
@@ -827,6 +849,7 @@ pub async fn push_region_transfer_data(
         dest_primary,
         max_points,
         false,
+        0,
     )
     .await
 }
@@ -845,6 +868,7 @@ pub async fn stage_region_transfer_data(
     region: &ShardRegion,
     dest_primary: u64,
     max_points: usize,
+    max_bytes_per_sec: u64,
 ) -> Result<RegionTransferOutcome, HyperbytedbError> {
     let outcome = transfer_region_data(
         peer_client,
@@ -857,6 +881,7 @@ pub async fn stage_region_transfer_data(
         dest_primary,
         max_points,
         true,
+        max_bytes_per_sec,
     )
     .await;
     match outcome {
@@ -1186,6 +1211,26 @@ mod tests {
             ..ok
         };
         assert!(same_points_more_bytes.verified());
+    }
+
+    #[test]
+    fn pacing_holds_the_sender_to_its_rate() {
+        use std::time::Duration;
+        // 1 MiB sent at 1 MiB/s is due at 1 s: after 0.25 s, wait 0.75 s.
+        assert_eq!(
+            super::pacing_delay(1 << 20, 1 << 20, Duration::from_millis(250)),
+            Duration::from_millis(750)
+        );
+        // Already slower than the rate: no wait.
+        assert_eq!(
+            super::pacing_delay(1 << 20, 1 << 20, Duration::from_secs(2)),
+            Duration::ZERO
+        );
+        // Rate 0 is unpaced.
+        assert_eq!(
+            super::pacing_delay(0, u64::MAX, Duration::ZERO),
+            Duration::ZERO
+        );
     }
 
     /// The movement budget is a bandwidth throttle, so two regions with equal

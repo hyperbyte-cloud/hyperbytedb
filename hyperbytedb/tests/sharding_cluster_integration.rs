@@ -1287,6 +1287,7 @@ async fn joiner_receives_existing_region_as_replica() {
         &region,
         2,
         10_000,
+        0,
     )
     .await
     .expect("stage onto joiner");
@@ -1449,6 +1450,7 @@ async fn joiner_takes_region_primary_and_applies_writes_locally() {
         &region,
         2,
         10_000,
+        0,
     )
     .await
     .expect("stage onto joiner");
@@ -1689,6 +1691,7 @@ async fn fourth_node_joining_rf_complete_cluster_takes_a_region() {
         &region,
         4,
         10_000,
+        0,
     )
     .await
     .expect("stage onto the newcomer");

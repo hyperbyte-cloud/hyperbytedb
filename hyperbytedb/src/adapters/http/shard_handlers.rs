@@ -1159,6 +1159,7 @@ pub async fn handle_shard_rehome(
             region,
             req.dest_primary,
             state.max_points_per_request,
+            req.max_bytes_per_sec,
         )
         .await
     } else {

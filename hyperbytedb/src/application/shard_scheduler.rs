@@ -11,16 +11,16 @@ use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
 use crate::application::shard_peer_resolution::is_active_peer;
 use crate::application::shard_routing::effective_replication_factor;
 use crate::application::shard_transfer::{
-    complete_region_transfer, push_region_transfer_data, run_region_transfer,
-    stage_region_transfer_data,
+    TRANSFER_CHUNK_POINTS, complete_region_transfer, push_region_transfer_data,
+    run_region_transfer, stage_region_transfer_data,
 };
 use crate::config::ShardingConfig;
 use crate::domain::cluster::membership::{
     NodeInfo, NodeState, SharedMembership, holds_placement, is_departing, is_serving,
 };
 use crate::domain::sharding::placement::{
-    MoveTier, PlacementStep, RegionPlanInput, budget_exhausted, estimate_region_weights, move_tier,
-    next_placement_step, plan_placement, target_placement,
+    MoveTier, PlacementStep, RegionPlanInput, estimate_region_weights, move_rate_bytes_per_sec,
+    move_tier, next_placement_step, plan_placement, target_placement,
 };
 use crate::domain::sharding::{
     MeasurementKey, ShardMap, ShardMapOp, ShardRegion, ShardRehomeRequest,
@@ -307,16 +307,10 @@ pub struct ShardScheduler {
     /// re-copies regions that are merely mid-flight, and that competes with
     /// evacuation for the same movement budget.
     learners_seen: tokio::sync::RwLock<HashSet<(u64, u64)>>,
-    /// Bytes staged by convergence-tier moves during the current tick.
-    ///
-    /// A bare `AtomicU64`: the scheduler is already shared behind an `Arc`, so
-    /// wrapping again buys nothing. `Relaxed` is correct — the counter is
-    /// written and read only by the single scheduler task and orders no other
-    /// memory.
-    tick_moved_bytes: std::sync::atomic::AtomicU64,
-    /// The scheduler's own tick cadence, for sizing the movement budget.
-    /// Set from the interval passed to [`ShardScheduler::run`].
-    tick_interval_secs: std::sync::atomic::AtomicU64,
+    /// True while [`ShardScheduler::run`]'s background mover pool is working.
+    /// Ticks that find it busy plan (splits, heals, failover) but leave their
+    /// placements for a later tick.
+    movers_busy: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     test_force_leader: bool,
     #[cfg(test)]
@@ -363,8 +357,7 @@ impl ShardScheduler {
             placement_stalls: tokio::sync::RwLock::new(HashMap::new()),
             placement_errors: tokio::sync::RwLock::new(HashMap::new()),
             learners_seen: tokio::sync::RwLock::new(HashSet::new()),
-            tick_moved_bytes: std::sync::atomic::AtomicU64::new(0),
-            tick_interval_secs: std::sync::atomic::AtomicU64::new(1),
+            movers_busy: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             test_force_leader: false,
             #[cfg(test)]
@@ -566,8 +559,13 @@ impl ShardScheduler {
                     if !stale.contains(&(region.region_id, peer)) {
                         continue;
                     }
+                    // A mover still copying onto it: ticks no longer wait for
+                    // moves, so a learner seen twice is not necessarily stale.
+                    if self.region_has_operator(region.region_id).await {
+                        continue;
+                    }
                     if self
-                        .stage_region_onto(&space.key, region, peer)
+                        .stage_region_onto(&space.key, region, peer, 0)
                         .await
                         .is_err()
                     {
@@ -761,15 +759,12 @@ impl ShardScheduler {
         metrics.current_leader == Some(self.node_id)
     }
 
-    pub async fn run(&self, interval: Duration, mut shutdown_rx: watch::Receiver<bool>) {
-        // The budget is bytes-per-second, so it needs the real cadence. Sizing
-        // it from `split_merge_interval_secs` (default 3600) while ticking on
-        // `heartbeat_interval_secs` (default 10) would hand every tick an
-        // hour's allowance.
-        self.tick_interval_secs.store(
-            interval.as_secs().max(1),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+    /// Tick on `interval` while leader. Placement moves run in a background
+    /// pool, so a tick never waits on a data copy: splits, heals and failover
+    /// keep their cadence while regions move. A tick used to await every move
+    /// it queued, and on n3 a new database's second split round waited 3.5
+    /// minutes behind moves of an older database's regions.
+    pub async fn run(self: Arc<Self>, interval: Duration, mut shutdown_rx: watch::Receiver<bool>) {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -778,8 +773,12 @@ impl ShardScheduler {
                     if !self.is_leader() {
                         continue;
                     }
-                    if let Err(e) = self.tick().await {
-                        tracing::warn!(error = %e, "shard scheduler tick error");
+                    match self.plan_tick().await {
+                        Ok(pending) => {
+                            self.retire_evacuated_nodes().await;
+                            self.start_background_placements(pending);
+                        }
+                        Err(e) => tracing::warn!(error = %e, "shard scheduler tick error"),
                     }
                 }
                 _ = shutdown_rx.changed() => {
@@ -791,10 +790,27 @@ impl ShardScheduler {
         }
     }
 
+    /// Run `pending` in a background mover pool, unless the previous pool is
+    /// still working: those regions are planned again on a later tick.
+    fn start_background_placements(self: &Arc<Self>, pending: Vec<PendingPlacement>) {
+        use std::sync::atomic::Ordering;
+        if pending.is_empty() || self.movers_busy.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            this.run_pending_placements(pending).await;
+            this.movers_busy.store(false, Ordering::Release);
+        });
+    }
+
+    /// Claim `region_id` for one operator (split, merge, heal, move). Only
+    /// exclusivity: how many moves run at once is the mover pool's
+    /// `schedule_limit`. Capping this table at `schedule_limit` as well let
+    /// four background movers lock the planning pass out of every region.
     async fn acquire_operator(&self, region_id: u64) -> bool {
-        let limit = self.config.schedule_limit.max(1);
         let mut ops = self.region_operators.write().await;
-        if ops.len() >= limit || ops.contains_key(&region_id) {
+        if ops.contains_key(&region_id) {
             return false;
         }
         ops.insert(region_id, ());
@@ -879,11 +895,23 @@ impl ShardScheduler {
         target_placement(key, region.start, candidates, rf)
     }
 
+    /// One full scheduler pass with its placements run inline. [`Self::run`]
+    /// plans the same way but moves data in the background.
+    #[cfg(test)]
     async fn tick(&self) -> Result<(), HyperbytedbError> {
+        let pending = self.plan_tick().await?;
+        self.run_pending_placements(pending).await;
+        // After the movers, so a node that finished evacuating this tick is
+        // retired in the same tick rather than waiting for the next.
+        self.retire_evacuated_nodes().await;
+        Ok(())
+    }
+
+    /// Splits, merges, heals and failover for every region, plus the
+    /// placement moves it wants, returned instead of run.
+    async fn plan_tick(&self) -> Result<Vec<PendingPlacement>, HyperbytedbError> {
         // Peer map versions are only valid for the tick that probed them.
         self.peer_map_versions.write().await.clear();
-        self.tick_moved_bytes
-            .store(0, std::sync::atomic::Ordering::Relaxed);
         let map = self.shard_map.snapshot().await?;
         self.prune_region_counters(&map).await;
         self.refresh_placement_plan(&map).await;
@@ -1060,12 +1088,7 @@ impl ShardScheduler {
             }
         }
 
-        self.run_pending_placements(pending_placements).await;
-
-        // After the region pass, so a node that finished evacuating this tick
-        // is retired in the same tick rather than waiting for the next.
-        self.retire_evacuated_nodes().await;
-        Ok(())
+        Ok(pending_placements)
     }
 
     /// Whether this region has a placement step pending (cheap; no data movement).
@@ -1124,16 +1147,14 @@ impl ShardScheduler {
 
         // Bound the bytes in flight, not just the number of movers.
         //
-        // `schedule_limit` alone counts jobs, so N concurrent movers of a large
-        // region hold N staged bodies at once. On the kind cluster that was the
-        // difference between a leader that survived N=6 and one OOM-killed
-        // seven times at a 4Gi limit: the pool ran 4 wide regardless of how big
-        // each region was. Concurrency of 4 over small regions is fine; over
-        // large ones it is not, and only a byte budget can tell those apart.
+        // When a move staged a whole region in memory, four concurrent movers
+        // of large regions OOM-killed a 4Gi leader on the kind cluster. Moves
+        // now stream one chunk at a time, so each is charged a chunk (see
+        // `mover_inflight_permits`); charging the whole region serialised
+        // every move of a region over the budget, on n3 one at a time.
         //
-        // Permits are MiB so the counts stay small. A region larger than the
-        // whole budget still runs, alone — never refuse a move outright, or a
-        // big region could never be placed at all.
+        // Permits are MiB so the counts stay small. A move larger than the
+        // whole budget still runs, alone — never refuse a move outright.
         let budget_mib = (self.config.movement_max_inflight_bytes / (1024 * 1024)).max(1) as usize;
         let byte_budget = Arc::new(tokio::sync::Semaphore::new(budget_mib));
 
@@ -1141,7 +1162,7 @@ impl ShardScheduler {
             .for_each_concurrent(limit, |job| {
                 let byte_budget = Arc::clone(&byte_budget);
                 async move {
-                    let want = ((job.approx_bytes / (1024 * 1024)).max(1) as usize).min(budget_mib);
+                    let want = mover_inflight_permits(job.approx_bytes, budget_mib);
                     let _permit = match byte_budget.acquire_many_owned(want as u32).await {
                         Ok(p) => p,
                         Err(_) => return,
@@ -1830,18 +1851,15 @@ impl ShardScheduler {
         let departing = self.departing_node_ids().await;
         let unhealthy = self.unhealthy_region_peers(region).await;
         let tier = move_tier(region, rf, &departing, &unhealthy);
-        let allowance = self.config.movement_budget_bytes_per_sec.saturating_mul(
-            self.tick_interval_secs
-                .load(std::sync::atomic::Ordering::Relaxed),
-        );
-        if budget_exhausted(
+        // Paced on the sender, chunk by chunk, at an even share of the
+        // cluster-wide cap. This was a per-tick allowance checked only before
+        // a move started; one region larger than the allowance spent it, so
+        // balance moves ran one per tick however long the tick took.
+        let rate = move_rate_bytes_per_sec(
             tier,
-            allowance,
-            self.tick_moved_bytes
-                .load(std::sync::atomic::Ordering::Relaxed),
-        ) {
-            return Ok(false);
-        }
+            self.config.movement_budget_bytes_per_sec,
+            self.config.schedule_limit,
+        );
         match step {
             PlacementStep::Add(_) => {
                 if !self.config.add_peer_proposals_enabled {
@@ -1904,9 +1922,8 @@ impl ShardScheduler {
                 let Some(after_region) = current_region(&after_add, key, region.region_id) else {
                     return Ok(true);
                 };
-                let staged = self.stage_region_onto(key, after_region, to_peer).await?;
-                self.tick_moved_bytes
-                    .fetch_add(staged, std::sync::atomic::Ordering::Relaxed);
+                self.stage_region_onto(key, after_region, to_peer, rate)
+                    .await?;
 
                 let promoted = self.shard_map.snapshot().await?;
                 let Some(current) = current_region(&promoted, key, region.region_id) else {
@@ -2011,11 +2028,13 @@ impl ShardScheduler {
     /// Returns the number of points staged, for movement-budget accounting.
     /// The remote branch reports 0: the source node accounts for those bytes,
     /// not the leader that asked for the transfer.
+    /// Copy `region` onto `to_peer`, paced at `max_bytes_per_sec` (0 = unpaced).
     async fn stage_region_onto(
         &self,
         key: &MeasurementKey,
         region: &ShardRegion,
         to_peer: u64,
+        max_bytes_per_sec: u64,
     ) -> Result<u64, HyperbytedbError> {
         let Some(pc) = self.peer_client.as_ref() else {
             return Err(HyperbytedbError::ShardMap("no peer client".into()));
@@ -2031,6 +2050,7 @@ impl ShardScheduler {
                 region,
                 to_peer,
                 self.max_points_per_request,
+                max_bytes_per_sec,
             )
             .await?;
             if !outcome.verified() {
@@ -2054,6 +2074,7 @@ impl ShardScheduler {
                 key,
                 region,
                 to_peer,
+                max_bytes_per_sec,
             )
             .await
             {
@@ -2217,6 +2238,17 @@ impl ShardScheduler {
 
 /// Re-home timeout: transfers are bulk data movement, not scatter queries.
 const REHOME_TIMEOUT_SECS: u64 = 300;
+
+/// What one move holds in memory at once: a transfer chunk, never the whole
+/// region. An estimate, costed like the heartbeat's region size (128 B a row)
+/// times the four copies a chunk exists as: export text and decoded points on
+/// the sender, the line-protocol body, and the receiver's parse.
+const MOVE_INFLIGHT_BYTES: u64 = TRANSFER_CHUNK_POINTS as u64 * 128 * 4;
+
+/// MiB permits one move takes from the mover pool's in-flight budget.
+fn mover_inflight_permits(approx_bytes: u64, budget_mib: usize) -> usize {
+    ((approx_bytes.min(MOVE_INFLIGHT_BYTES) / (1024 * 1024)).max(1) as usize).min(budget_mib)
+}
 
 /// Data-aware failover guard: the candidate must hold a caught-up copy.
 ///
@@ -2404,6 +2436,7 @@ async fn request_region_rehome(
         dest_primary,
         drop_source,
         stage: false,
+        max_bytes_per_sec: 0,
         dest_skip_wal_through: 0,
     };
     let url = format!("http://{addr}/internal/shard/rehome");
@@ -2434,6 +2467,7 @@ async fn request_region_stage(
     key: &MeasurementKey,
     range: &ShardRegion,
     dest: u64,
+    max_bytes_per_sec: u64,
 ) -> Result<u64, HyperbytedbError> {
     let addr = {
         let m = membership.read().await;
@@ -2453,6 +2487,7 @@ async fn request_region_stage(
         dest_primary: dest,
         drop_source: false,
         stage: true,
+        max_bytes_per_sec,
         // Accepted and ignored by the receiver; retained only for wire compat.
         dest_skip_wal_through: 0,
     };
@@ -4102,7 +4137,7 @@ mod tests {
     /// so `tick()` runs the placement steps end to end.
     struct PlacementTestHarness {
         _dir: tempfile::TempDir,
-        scheduler: ShardScheduler,
+        scheduler: Arc<ShardScheduler>,
         proposals: Arc<std::sync::Mutex<Vec<ShardMapOp>>>,
         /// `/internal/shard/map` hit counts, keyed by mock peer node id.
         probes: HashMap<u64, Arc<std::sync::atomic::AtomicU64>>,
@@ -4262,10 +4297,34 @@ mod tests {
 
             Self {
                 _dir: dir,
-                scheduler,
+                scheduler: Arc::new(scheduler),
                 proposals,
                 probes,
             }
+        }
+
+        /// Unflushed rows for measurement `cpu{measurement}`, one series each,
+        /// so a move of its region has `points` lines to push.
+        async fn write_points(&self, measurement: usize, points: usize) {
+            use crate::domain::point::{FieldValue, Point};
+            let points = (0..points)
+                .map(|i| Point {
+                    measurement: format!("cpu{measurement}"),
+                    tags: [("host".to_string(), format!("h{i}"))].into(),
+                    fields: [("v".to_string(), FieldValue::Float(1.0))].into(),
+                    timestamp: 1_000_000_000 + i as i64,
+                })
+                .collect();
+            self.scheduler
+                .wal
+                .append(crate::ports::wal::WalEntry {
+                    database: "db".into(),
+                    retention_policy: "autogen".into(),
+                    points,
+                    origin_node_id: 0,
+                })
+                .await
+                .unwrap();
         }
 
         /// The measurement `new(.., regions: 1)` bootstraps: `cpu0`.
@@ -4698,36 +4757,6 @@ mod tests {
                 proposals,
             }
         }
-    }
-
-    #[test]
-    fn budget_sizing_uses_the_tick_cadence_not_the_split_cooldown() {
-        use crate::domain::sharding::placement::MoveTier;
-        // The scheduler ticks on sharding.heartbeat_interval_secs (default 10);
-        // split_merge_interval_secs (default 3600) is an unrelated cooldown.
-        // Sizing the allowance from the latter hands every tick an hour's worth
-        // of budget -- a 360x hole in the throttle.
-        let per_sec: u64 = 1_000;
-        let tick_secs: u64 = 10;
-        let allowance = per_sec.saturating_mul(tick_secs);
-        assert_eq!(allowance, 10_000);
-
-        let converging = sample_region_peers(vec![1, 2, 3], 1);
-        assert_eq!(move_tier(&converging, 3, &[], &[]), MoveTier::Convergence);
-        assert!(budget_exhausted(
-            move_tier(&converging, 3, &[], &[]),
-            allowance,
-            allowance
-        ));
-
-        // Safety tiers ignore it entirely.
-        let under_rf = sample_region_peers(vec![1, 2], 1);
-        assert_eq!(move_tier(&under_rf, 3, &[], &[]), MoveTier::RfViolation);
-        assert!(!budget_exhausted(
-            move_tier(&under_rf, 3, &[], &[]),
-            allowance,
-            u64::MAX
-        ));
     }
 
     #[tokio::test]
@@ -5436,39 +5465,237 @@ mod tests {
         );
         assert!(promote_progress_safe(Some(95_500), Some(100_000), 50));
     }
-    /// The mover pool's byte budget must bound concurrency by SIZE, and must
-    /// never refuse a move outright.
-    ///
-    /// `schedule_limit` counts jobs, so four concurrent movers hold four staged
-    /// bodies whatever their size — which OOM-killed the leader at a 4Gi limit
-    /// while the same workload survived at a limit of one. The budget makes
-    /// "four small regions" and "four large ones" different, which a job count
-    /// cannot express.
+    /// A move is charged what it holds at once, one transfer chunk, so the
+    /// default budget runs four moves of large regions together. Charging the
+    /// whole region ran every move over 256 MiB alone: on n3, 45 moves of a
+    /// kept database took over 30 minutes.
     #[test]
-    fn the_mover_byte_budget_scales_with_region_size() {
+    fn a_move_is_charged_one_chunk_not_its_region() {
         let budget_mib = 256usize;
-        let permits =
-            |approx_bytes: u64| ((approx_bytes / (1024 * 1024)).max(1) as usize).min(budget_mib);
+        let chunk_mib = (MOVE_INFLIGHT_BYTES / (1024 * 1024)) as usize;
 
-        // Small regions barely draw on the budget, so concurrency is unaffected.
-        assert_eq!(permits(4 * 1024 * 1024), 4);
+        // Small regions barely draw on the budget.
+        assert_eq!(mover_inflight_permits(4 * 1024 * 1024, budget_mib), 4);
+
+        // A large region costs one chunk, so four of them fit.
+        let large = mover_inflight_permits(650 * 1024 * 1024, budget_mib);
+        assert_eq!(large, chunk_mib);
         assert!(
-            budget_mib / permits(4 * 1024 * 1024) >= 4,
-            "4 small moves fit"
+            budget_mib / large >= 4,
+            "four large moves fit: {large} MiB each"
         );
 
-        // A large region takes a real share, so fewer run together.
-        assert_eq!(permits(128 * 1024 * 1024), 128);
-        assert_eq!(budget_mib / permits(128 * 1024 * 1024), 2, "only two fit");
+        // A region with no heartbeat yet still costs something.
+        assert_eq!(mover_inflight_permits(0, budget_mib), 1);
 
-        // A region with no heartbeat yet still costs something, so an unknown
-        // size cannot smuggle unlimited concurrency past the budget.
-        assert_eq!(permits(0), 1);
+        // A budget smaller than a chunk is clamped, NOT refused: the move runs
+        // alone. Asking for more permits than the semaphore holds would block
+        // that region forever.
+        assert_eq!(mover_inflight_permits(u64::MAX, 4), 4);
+    }
 
-        // A region bigger than the entire budget is clamped, NOT refused: it
-        // runs alone. Requesting more permits than the semaphore holds would
-        // otherwise block that region forever and it could never be placed.
-        assert_eq!(permits(4 * 1024 * 1024 * 1024), budget_mib);
-        assert!(permits(u64::MAX) <= budget_mib);
+    /// Large regions move together, each at its share of the cap.
+    ///
+    /// Charging a move its whole region ran every move of a region over the
+    /// in-flight budget alone, and the per-tick allowance stopped balance
+    /// moves after the first big one. Every region here reports 1 GiB, so
+    /// the old charge would run these moves strictly one after another.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn large_moves_run_together_each_paced_to_its_share() {
+        const REGIONS: usize = 8;
+        const MOVERS: usize = 8;
+        const POINTS: usize = 2_000;
+        let harness = PlacementTestHarness::new_tuned(true, &[(2, 0)], REGIONS, |c| {
+            c.schedule_limit = MOVERS;
+            c.replication_factor = 1;
+            // Each mover's share is sized below so one move takes >= 1 s.
+            c.movement_budget_bytes_per_sec = (MOVERS * 20 * 1024) as u64;
+        })
+        .await;
+        for i in 0..REGIONS {
+            harness.write_points(i, POINTS).await;
+            harness
+                .scheduler
+                .record_heartbeat((i + 1) as u64, 1, POINTS as u64, 1 << 30, 0)
+                .await;
+        }
+
+        let started = std::time::Instant::now();
+        harness.scheduler.tick_once_for_test().await.unwrap();
+        let elapsed = started.elapsed();
+
+        let staged: Vec<u64> = harness
+            .proposals
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|op| match op {
+                ShardMapOp::PromotePeer { region_id, .. } => Some(*region_id),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            (2..=MOVERS).contains(&staged.len()),
+            "the fixture needs 2..={MOVERS} moves in one wave, got {staged:?}"
+        );
+        // Each move pushes > 20 KiB at a 20 KiB/s share: paced to >= 1 s.
+        assert!(
+            elapsed >= std::time::Duration::from_secs(1),
+            "moves were not paced: {elapsed:?}"
+        );
+        // Together, not one after another (serial would be >= moves seconds).
+        assert!(
+            elapsed < std::time::Duration::from_millis(1_000 * staged.len() as u64 - 300),
+            "{} moves ran one at a time: {elapsed:?}",
+            staged.len()
+        );
+    }
+
+    /// A move in flight must not lock the planning pass out of other regions.
+    ///
+    /// The operator table was capped at `schedule_limit`. With movers running
+    /// in the background holding their regions, that cap would stop every
+    /// split, merge and heal until the moves finished.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn a_split_is_planned_while_movers_hold_other_regions() {
+        let harness = PlacementTestHarness::new_tuned(true, &[(2, 0)], 2, |c| {
+            c.schedule_limit = 1;
+            c.replication_factor = 1;
+        })
+        .await;
+        // Region 2 is mid-move: its mover holds the only schedule_limit slot.
+        assert!(harness.scheduler.acquire_operator(2).await);
+        harness
+            .scheduler
+            .record_heartbeat(1, 1, 1_000_000, 0, 0)
+            .await;
+
+        harness.scheduler.plan_tick().await.unwrap();
+
+        let proposals = harness.proposals.lock().unwrap();
+        assert!(
+            proposals
+                .iter()
+                .any(|op| matches!(op, ShardMapOp::Split { region_id: 1, .. })),
+            "region 1 is over region_max_series and must split while region 2 \
+             moves: {proposals:?}"
+        );
+    }
+
+    /// `run` must keep planning while its movers copy data.
+    ///
+    /// Ticks used to await every move they queued, so on n3 a new database's
+    /// second split round waited 3.5 minutes behind moves of another
+    /// database's regions.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn run_keeps_splitting_while_a_move_is_in_flight() {
+        const REGIONS: usize = 8;
+        let harness = PlacementTestHarness::new_tuned(true, &[(2, 0)], REGIONS, |c| {
+            c.schedule_limit = 1;
+            c.replication_factor = 1;
+            // One mover at 4 KiB/s: a move of ~50 KiB takes many seconds.
+            c.movement_budget_bytes_per_sec = 4 * 1024;
+        })
+        .await;
+        for i in 0..REGIONS {
+            harness.write_points(i, 2_000).await;
+        }
+
+        let (tx, rx) = watch::channel(false);
+        let sched = harness.scheduler.clone();
+        let run = tokio::spawn(async move {
+            sched.run(Duration::from_millis(100), rx).await;
+        });
+        // Let the first move start, then make another region need a split.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            harness
+                .scheduler
+                .movers_busy
+                .load(std::sync::atomic::Ordering::Acquire),
+            "a move should be in flight"
+        );
+        // Any region but the one the single mover holds.
+        let held: Vec<u64> = harness
+            .scheduler
+            .region_operators
+            .read()
+            .await
+            .keys()
+            .copied()
+            .collect();
+        let split_region = (1..=REGIONS as u64).find(|r| !held.contains(r)).unwrap();
+        harness
+            .scheduler
+            .record_heartbeat(split_region, 1, 1_000_000, 0, 0)
+            .await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        let split = harness.proposals.lock().unwrap().iter().any(
+            |op| matches!(op, ShardMapOp::Split { region_id, .. } if *region_id == split_region),
+        );
+        let still_moving = harness
+            .scheduler
+            .movers_busy
+            .load(std::sync::atomic::Ordering::Acquire);
+        let _ = tx.send(true);
+        run.abort();
+        assert!(
+            still_moving,
+            "the move finished too early to prove anything"
+        );
+        assert!(split, "no split proposed while a move was in flight");
+    }
+
+    /// A learner whose copy is still running is not stale.
+    ///
+    /// Learners seen on two ticks in a row were re-staged as failed promotes.
+    /// Once ticks stopped waiting for moves, that re-copied regions whose
+    /// mover was still copying.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn a_learner_mid_move_is_not_restaged() {
+        let harness = PlacementTestHarness::new(true, &[(2, 0)], 1).await;
+        let region = harness.region().await;
+        harness
+            .scheduler
+            .shard_map
+            .apply_op(ShardMapOp::AddPeer {
+                key: PlacementTestHarness::key(),
+                region_id: region.region_id,
+                to_peer: 2,
+                epoch: region.epoch,
+                staging: true,
+            })
+            .await
+            .unwrap();
+        let promoted = |h: &PlacementTestHarness| {
+            h.proposals
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|op| matches!(op, ShardMapOp::PromotePeer { peer: 2, .. }))
+        };
+
+        assert!(harness.scheduler.acquire_operator(region.region_id).await);
+        for _ in 0..2 {
+            let map = harness.scheduler.shard_map.snapshot().await.unwrap();
+            harness.scheduler.try_promote_learners(&map).await;
+        }
+        assert!(
+            !promoted(&harness),
+            "re-staged a learner its mover still holds"
+        );
+
+        harness.scheduler.release_operator(region.region_id).await;
+        let map = harness.scheduler.shard_map.snapshot().await.unwrap();
+        harness.scheduler.try_promote_learners(&map).await;
+        assert!(
+            promoted(&harness),
+            "a learner left over once its mover is gone must still be promoted"
+        );
     }
 }

@@ -76,12 +76,11 @@ pub struct ShardingConfig {
     /// `failover_watermark_safe`.
     #[serde(default = "default_promote_min_progress_pct")]
     pub promote_min_progress_pct: u64,
-    /// Ceiling on region bytes being staged concurrently by the mover pool.
+    /// Ceiling on bytes the mover pool holds in flight between its moves.
     ///
     /// `schedule_limit` bounds how many moves run at once; this bounds how much
-    /// data they may hold between them. Without it a leader running four
-    /// concurrent movers over large regions was OOM-killed, because the limit
-    /// counted jobs and said nothing about their size.
+    /// data they may hold between them. A move streams one transfer chunk at a
+    /// time and is charged that, not its region's size.
     #[serde(default = "default_movement_max_inflight_bytes")]
     pub movement_max_inflight_bytes: u64,
     /// Seconds a region primary may stay non-Active before Raft leader proposes TransferPrimary.
@@ -128,8 +127,9 @@ pub struct ShardingConfig {
     #[serde(default = "default_bootstrap_regions_per_node")]
     pub bootstrap_regions_per_node: usize,
     /// Cluster-wide cap on region-transfer bytes per second for
-    /// convergence-tier moves. 0 = unlimited. RF violations and decommission
-    /// evacuation are never throttled.
+    /// convergence-tier moves, split evenly across `schedule_limit` movers and
+    /// enforced chunk by chunk on the sending node. 0 = unlimited. RF
+    /// violations and decommission evacuation are never throttled.
     #[serde(default = "default_movement_budget_bytes_per_sec")]
     pub movement_budget_bytes_per_sec: u64,
     /// After this many seconds without a heartbeat while `Disconnected`, a node
@@ -305,7 +305,7 @@ fn default_async_forward_max_bytes() -> u64 {
 }
 
 fn default_movement_budget_bytes_per_sec() -> u64 {
-    10 * 1024 * 1024
+    50 * 1024 * 1024
 }
 
 impl HyperbytedbConfig {
@@ -1462,8 +1462,8 @@ mod replicate_body_limit_tests {
         assert!(s.remove_peer_proposals_enabled);
         assert_eq!(
             s.movement_budget_bytes_per_sec,
-            10 * 1024 * 1024,
-            "convergence-tier moves share a per-tick byte budget"
+            50 * 1024 * 1024,
+            "convergence-tier moves share a 50 MiB/s cluster-wide cap"
         );
         assert!(s.transfer_clear_proposals_enabled);
     }

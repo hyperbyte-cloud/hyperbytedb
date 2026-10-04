@@ -493,14 +493,19 @@ pub fn move_tier(
     }
 }
 
-/// True when a move must yield to the movement budget.
+/// Bytes per second one move of `tier` may send: the cluster-wide `cap`
+/// shared evenly by `movers` concurrent movers, so together they stay under
+/// it. 0 means unpaced.
 ///
-/// Only `Convergence` is throttled; RF violations and evacuation are exempt,
-/// because safety must never queue behind balance. An allowance of 0 means
+/// Only `Convergence` is paced; RF violations and evacuation are exempt,
+/// because safety must never queue behind balance. A cap of 0 means
 /// unlimited.
 #[must_use]
-pub fn budget_exhausted(tier: MoveTier, allowance: u64, moved: u64) -> bool {
-    tier == MoveTier::Convergence && allowance > 0 && moved >= allowance
+pub fn move_rate_bytes_per_sec(tier: MoveTier, cap: u64, movers: usize) -> u64 {
+    if tier != MoveTier::Convergence || cap == 0 {
+        return 0;
+    }
+    (cap / movers.max(1) as u64).max(1)
 }
 
 #[cfg(test)]
@@ -849,15 +854,18 @@ mod tests {
     }
 
     #[test]
-    fn budget_gates_only_the_convergence_tier() {
-        assert!(budget_exhausted(MoveTier::Convergence, 100, 100));
-        assert!(!budget_exhausted(MoveTier::RfViolation, 100, 100));
-        assert!(!budget_exhausted(MoveTier::Evacuation, 100, 100));
-        assert!(
-            !budget_exhausted(MoveTier::Convergence, 0, u64::MAX),
-            "0 allowance means unlimited"
+    fn pacing_applies_only_to_the_convergence_tier() {
+        assert_eq!(move_rate_bytes_per_sec(MoveTier::Convergence, 100, 4), 25);
+        assert_eq!(move_rate_bytes_per_sec(MoveTier::RfViolation, 100, 4), 0);
+        assert_eq!(move_rate_bytes_per_sec(MoveTier::Evacuation, 100, 4), 0);
+        assert_eq!(
+            move_rate_bytes_per_sec(MoveTier::Convergence, 0, 4),
+            0,
+            "a cap of 0 means unlimited"
         );
-        assert!(!budget_exhausted(MoveTier::Convergence, 100, 99));
+        // A cap smaller than the mover count must still pace, not unpace.
+        assert_eq!(move_rate_bytes_per_sec(MoveTier::Convergence, 3, 4), 1);
+        assert_eq!(move_rate_bytes_per_sec(MoveTier::Convergence, 100, 0), 100);
     }
 
     fn cand(id: u64, current: u64, weight: u64, peers: &[u64]) -> super::PrimaryCandidate {
