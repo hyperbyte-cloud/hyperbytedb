@@ -448,13 +448,16 @@ impl PeerClient {
             })?
             .clone();
 
-        let peers = {
-            let m = self.membership.read().await;
-            m.replication_peers(self.node_id)
-                .into_iter()
-                .map(|n| n.node_id)
-                .collect::<Vec<_>>()
-        };
+        // The batch's own targets: a region's replicas, not every member.
+        // Hinting every member made each spilled batch replay onto N-1 nodes
+        // (573k hints from 115k spills at N=6 on n3), most of which do not
+        // hold the region and parsed, indexed and logged it for nothing.
+        let peers: Vec<u64> = self
+            .resolve_replication_peers_async(batch.target_node_ids.as_deref())
+            .await
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
 
         let hint = ReplicationHintPayload {
             database: batch.database.clone(),
@@ -1382,6 +1385,46 @@ mod replicate_batch_tests {
             3,
             "node 3: parts 2, 4, 5"
         );
+    }
+
+    /// A batch that spills to hinted handoff because the outbound queue is
+    /// full is hinted to its region's replicas only, not to every member.
+    #[tokio::test]
+    async fn a_spilled_batch_is_hinted_to_its_targets_only() {
+        let mut m = ClusterMembership::new();
+        for id in 2..=4 {
+            m.add_node(node(id, "127.0.0.1:1"));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(ReplicationLog::open(dir.path()).unwrap());
+        let hh = Arc::new(HintedHandoff::new(log.db().clone(), 100).unwrap());
+        let pc = Arc::new(
+            PeerClient::new(
+                1,
+                "127.0.0.1:1".into(),
+                crate::domain::cluster::membership::new_shared(m),
+                log,
+                3,
+                1,
+                2,
+                1 << 20,
+            )
+            .with_hinted_handoff(hh.clone()),
+        );
+        // No consumer: the one-slot queue fills and the next batch spills.
+        pc.outbound_started.store(true, Ordering::SeqCst);
+        PeerClient::replicate_write(&pc, job(1, vec![3])).unwrap();
+        PeerClient::replicate_write(&pc, job(2, vec![3])).unwrap();
+
+        for _ in 0..100 {
+            if hh.total_pending().unwrap() > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(hh.pending_count(3).unwrap(), 1, "the region's replica");
+        assert_eq!(hh.pending_count(2).unwrap(), 0, "not a replica of region 2");
+        assert_eq!(hh.pending_count(4).unwrap(), 0, "not a replica of region 2");
     }
 }
 
