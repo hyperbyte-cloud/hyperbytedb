@@ -56,24 +56,58 @@ sig='-'.join(f'{k[0]}{k[1]}{v}' for k,v in sorted(lay.items()))
 print(len(rs), len({r.get('primary') for r in rs}), sig or 'none')" 2>/dev/null || echo "0 0 none"
 }
 
-# Block until the space has at least N regions and the region and primary
-# counts have held for SPLIT_STABLE_SECS, or SPLIT_TIMEOUT_SECS passes.
+# Over this many series a region must split (the CR's regionMaxSeries).
+REGION_MAX_SERIES="${REGION_MAX_SERIES:-150000}"
+
+# "known over" for the linearity space, from the raft leader's scheduler:
+# regions whose heartbeat series count has reached the leader, and regions
+# still over REGION_MAX_SERIES. A new database's counts take ~100 s to reach
+# the leader when another database's regions are reported ahead of it; until
+# then its regions look stable at the pre-split count and r8 measured N=6 and
+# N=8 on 12 and 16 unsplit regions.
+region_series_stats() {
+  local lid
+  lid=$(kubectl_ctx -n "$NS" exec "${CR_NAME}-0" -c hyperbytedb -- \
+    sh -c 'curl -sS -m 5 http://127.0.0.1:8086/cluster/leader' 2>/dev/null \
+    | python3 -c "import sys,json; print(json.load(sys.stdin).get('leader_id') or '')" 2>/dev/null) || true
+  [[ -n "$lid" ]] || { echo "0 0"; return; }
+  kubectl_ctx -n "$NS" exec "${CR_NAME}-$(( lid - 1 ))" -c hyperbytedb -- \
+    sh -c 'curl -sS -m 20 http://127.0.0.1:8086/internal/shard/map; echo; curl -sS -m 20 http://127.0.0.1:8086/metrics' 2>/dev/null \
+    | python3 -c "
+import sys,json,os,re
+lines=sys.stdin.read().split(chr(10),1)
+try: d=json.loads(lines[0])
+except Exception: print(0, 0); raise SystemExit
+sc={int(m.group(1)): float(m.group(2)) for m in re.finditer(r'^hyperbytedb_shard_heartbeat_series_count\{region_id=\"(\d+)\"\} (\S+)', lines[1] if len(lines)>1 else '', re.M)}
+want=os.environ.get('SPACE_DB','')
+ids=[r['region_id'] for sp in d.get('spaces',[]) if not want or sp.get('key',{}).get('db')==want for r in sp.get('regions',[])]
+known=sum(1 for i in ids if sc.get(i,0)>0)
+over=sum(1 for i in ids if sc.get(i,0)>$REGION_MAX_SERIES)
+print(known, over)" 2>/dev/null || echo "0 0"
+}
+
+# Block until the space has at least N regions, every region's series count
+# has reached the leader and none is over REGION_MAX_SERIES, and the region
+# and primary counts have held for SPLIT_STABLE_SECS, or SPLIT_TIMEOUT_SECS
+# passes.
 wait_for_split() {
   local n=$1 deadline=$(( SECONDS + ${SPLIT_TIMEOUT_SECS:-900} ))
-  local last="" since=$SECONDS started=$SECONDS regions primaries layout
+  local last="" since=$SECONDS started=$SECONDS regions primaries layout known over
   while (( SECONDS < deadline )); do
     read -r regions primaries layout < <(map_stats)
+    read -r known over < <(region_series_stats)
     # The whole layout -- every node's copies and primaries -- must hold
     # still, not just the counts: copy moves continue after primaries have
     # spread, and measuring mid-move timed one node at 46% of the load.
     if [[ "$regions/$primaries/$layout" != "$last" ]]; then last="$regions/$primaries/$layout"; since=$SECONDS; fi
-    echo "[sweep] N=$n regions=$regions primaries=$primaries stable=$(( SECONDS - since ))s"
+    echo "[sweep] N=$n regions=$regions primaries=$primaries series_known=$known over_max=$over stable=$(( SECONDS - since ))s"
     # Primaries must actually be spread: children of a split inherit the
     # parent's primary, and moving primacy (learner, copy, promote) takes
     # several scheduler ticks per region. A count that merely held still
     # measured one node holding 7 of 8 primaries.
     local want=$(( regions < n ? regions : n ))
-    if (( regions >= n && primaries >= want && SECONDS - since >= ${SPLIT_STABLE_SECS:-60} )); then
+    if (( regions >= n && primaries >= want && known == regions && over == 0 \
+          && SECONDS - since >= ${SPLIT_STABLE_SECS:-60} )); then
       echo "[sweep] N=$n converged in $(( SECONDS - started ))s"
       return 0
     fi
