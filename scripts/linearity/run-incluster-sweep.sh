@@ -254,13 +254,14 @@ for N in $NODES_LIST; do
   # backs up, and the nodes starve until liveness kills them. Plan item B1.
   DB="linearity_${N}_$(date +%s)"
   export SPACE_DB="$DB"
+  echo "[sweep] db=$DB"
   run_phase "seed" "$eps" "$series" "$workers" | grep -E 'FATAL|seed complete' | sort | uniq -c
   # Wait for the space to split before timing anything. With DROP DATABASE
   # now really dropping the shard space, every point starts from ONE region;
   # measuring straight after the seed timed one primary at every N.
   wait_for_split "$N"
   out=$(run_phase "measure" "$eps" "$series" "$workers")
-  echo "$out" | grep -E '^\[bench\] (worker=|error x)'
+  echo "$out" | grep -E '^\[bench\] (worker=|error x|replay )'
   # Total points over the slowest worker's time: the cluster absorbed all of
   # it within that window. Blank unless every worker reported.
   read -r pps errs retries < <(echo "$out" | python3 -c "

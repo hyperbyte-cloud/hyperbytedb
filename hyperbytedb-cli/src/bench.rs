@@ -60,6 +60,8 @@ impl BenchArgs {
 /// Not an HTTP status: the request failed in transport (refused, reset).
 const TRANSPORT_ERROR: u16 = 599;
 const MAX_RETRIES: u32 = 12;
+/// How long the untimed replay of failed batches may take.
+const REPLAY_DEADLINE: Duration = Duration::from_secs(600);
 
 struct Bench {
     http: reqwest::Client,
@@ -142,6 +144,52 @@ struct PhaseResult {
     duration: Duration,
     errors: u64,
     retries: u64,
+    /// First point index of each batch that never got a 204.
+    failed: Vec<u64>,
+}
+
+/// Rewrite each failed batch until it is accepted or `deadline` passes, and
+/// return how many were not. Run after the timed phase, so a read-back can
+/// expect every point: rewriting a batch is idempotent, because a point is
+/// its (series, time) and duplicates collapse on read.
+#[allow(clippy::too_many_arguments)]
+async fn replay_failed(
+    bench: &Bench,
+    url: &str,
+    measurement: &str,
+    failed: &[u64],
+    batch: u64,
+    count: u64,
+    ts_base: u64,
+    series: Option<u64>,
+    deadline: Instant,
+) -> usize {
+    let mut seed = 0x2545_F491_4F6C_DD1Du64;
+    let mut unrecovered = 0;
+    for &base in failed {
+        let body = bytes::Bytes::from(build_body(
+            measurement,
+            0,
+            base,
+            (base + batch).min(count),
+            ts_base,
+            series,
+        ));
+        let mut attempt = 0u32;
+        loop {
+            if bench.post(url, body.clone(), "text/plain").await == 204 {
+                break;
+            }
+            if Instant::now() >= deadline {
+                unrecovered += 1;
+                break;
+            }
+            let wait = (0.05 * 2f64.powi(attempt.min(5) as i32)).min(1.6) * jitter(&mut seed);
+            tokio::time::sleep(Duration::from_secs_f64(wait)).await;
+            attempt += 1;
+        }
+    }
+    unrecovered
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -174,6 +222,7 @@ async fn run_phase(
         let mut seed = 0x9E37_79B9_7F4A_7C15u64 ^ ((idx as u64 + 1) << 17) ^ a.worker_index();
         tasks.push(tokio::spawn(async move {
             let (mut errors, mut retries) = (0u64, 0u64);
+            let mut failed = Vec::new();
             loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 let Some(&base) = batches.get(i) else { break };
@@ -200,22 +249,25 @@ async fn run_phase(
                 }
                 if code != 204 {
                     errors += 1;
+                    failed.push(base);
                 }
             }
-            (errors, retries)
+            (errors, retries, failed)
         }));
     }
-    let (mut errors, mut retries) = (0, 0);
+    let (mut errors, mut retries, mut failed) = (0, 0, Vec::new());
     for t in tasks {
-        if let Ok((e, r)) = t.await {
+        if let Ok((e, r, f)) = t.await {
             errors += e;
             retries += r;
+            failed.extend(f);
         }
     }
     PhaseResult {
         duration: started.elapsed(),
         errors,
         retries,
+        failed,
     }
 }
 
@@ -346,6 +398,25 @@ pub async fn run(mut a: BenchArgs) -> u8 {
         for (k, n) in kinds.into_iter().take(3) {
             println!("[bench] error x{n}: {k}");
         }
+        // Untimed: make the written set complete for a read-back check.
+        let url = format!("{}/write?db={}&rp=autogen&precision=ns", endpoints[0], a.db);
+        let unrecovered = replay_failed(
+            &bench,
+            &url,
+            &a.measurement,
+            &r.failed,
+            a.batch,
+            a.measure_points,
+            1_800_000_000,
+            Some(a.series),
+            Instant::now() + REPLAY_DEADLINE,
+        )
+        .await;
+        println!(
+            "[bench] replay worker={} failed={} unrecovered={unrecovered}",
+            a.worker_index(),
+            r.failed.len()
+        );
     }
     0
 }
@@ -353,6 +424,52 @@ pub async fn run(mut a: BenchArgs) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::build_body;
+
+    /// A batch that failed during the timed phase is rewritten until accepted,
+    /// so the read-back can expect every point.
+    #[tokio::test]
+    async fn failed_batches_are_replayed_until_accepted() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let posts = Arc::new(AtomicUsize::new(0));
+        let seen = posts.clone();
+        // Refuse the first two writes, then accept.
+        let app = axum::Router::new().route(
+            "/write",
+            axum::routing::post(move || {
+                let n = seen.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n < 2 {
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                    } else {
+                        axum::http::StatusCode::NO_CONTENT
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let bench = super::Bench {
+            http: reqwest::Client::new(),
+            error_kinds: parking_lot::Mutex::new(Default::default()),
+        };
+        let unrecovered = super::replay_failed(
+            &bench,
+            &format!("http://{addr}/write"),
+            "cpu",
+            &[0, 5],
+            5,
+            10,
+            1_800_000_000,
+            Some(4),
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .await;
+        assert_eq!(unrecovered, 0);
+        assert_eq!(posts.load(Ordering::SeqCst), 4, "2 refusals + 2 batches");
+    }
 
     /// Byte-for-byte the lines the Python client sent.
     #[test]
