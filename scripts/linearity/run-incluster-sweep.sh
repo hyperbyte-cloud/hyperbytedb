@@ -221,7 +221,7 @@ for N in $NODES_LIST; do
   deadline=$(( SECONDS + ${READY_TIMEOUT_SECS:-2400} ))
   ready=0; total=0
   while (( SECONDS < deadline )); do
-    pods=$(kubectl_ctx -n "$NS" get pods -l app.kubernetes.io/name=hyperbytedb \
+    pods=$(kubectl_ctx -n "$NS" get pods -l "app.kubernetes.io/name=hyperbytedb,app.kubernetes.io/instance=${CR_NAME}" \
       --no-headers 2>/dev/null || true)
     total=$(grep -c . <<<"$pods" || true)
     ready=$(grep -c '1/1 *Running' <<<"$pods" || true)

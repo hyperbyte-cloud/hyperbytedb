@@ -5,19 +5,27 @@
 # 3 replicas), scales to N and measures one sweep point. Each N in NODES_LIST
 # runs RUNS times; the median is the result and min-max is the noise band.
 #
+# Equal host load (MATCH_LOAD=1, the default): every N below the largest is
+# measured while a twin cluster of (largest - N) nodes runs its own write load
+# on the same host, so each size keeps the host equally busy. On one host a
+# busier machine costs every point more CPU (n3: >=13% at N=3 with 9 more
+# cores busy), which would otherwise be charged to the larger N.
+#
 # PASS when, at every N:
 #   - median(N) / median(first N) >= PASS_RATIO * N / first N
 #   - every measured point reads back (count == MEASURE_POINTS)
 #   - no DB pod restarted
 #
-# DESTRUCTIVE: deletes the HyperbytedbCluster and all its data before every
-# run. Refuses unless CONFIRM_RESET=<namespace>/<cluster name>.
+# DESTRUCTIVE: deletes the HyperbytedbCluster (and the twin) and all their
+# data before every run. Refuses unless CONFIRM_RESET=<namespace>/<cluster name>.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KUBE_CTX="${KUBE_CTX:-n3}"
 NS="${NS:-hyperbytedb-e2e}"
 CR_NAME="${CR_NAME:-hyperbytedb-e2e}"
 RUNS="${RUNS:-3}"
+MATCH_LOAD="${MATCH_LOAD:-1}"
+TWIN_CR="${TWIN_CR:-${CR_NAME}-twin}"
 NODES_LIST="${NODES_LIST:-3 6}"
 # 0.9: N=6 must reach 1.8x N=3.
 PASS_RATIO="${PASS_RATIO:-0.9}"
@@ -28,6 +36,7 @@ export CLIENTS_PER_NODE="${CLIENTS_PER_NODE:-2}"
 export BENCH_CPU="${BENCH_CPU:-1}"
 export BATCH="${BATCH:-5000}"
 export SPLIT_TIMEOUT_SECS="${SPLIT_TIMEOUT_SECS:-2400}"
+BENCH_IMAGE="${BENCH_IMAGE:-docker.io/library/hyperbytedb:e2e}"
 OUT_DIR="${OUT_DIR:-/tmp/linearity-acceptance-$(date +%Y%m%d-%H%M%S)}"
 # Counters summed over DB pods after each run, for the per-run diagnosis.
 COUNTERS='hinted_handoff_enqueued_total|replication_queue_full_total|write_admission_rejected_total|shard_forward_capacity_retries_total|shard_forward_failed_total|write_requests_total'
@@ -41,6 +50,9 @@ if [[ "${CONFIRM_RESET:-}" != "$NS/$CR_NAME" ]]; then
 fi
 mkdir -p "$OUT_DIR"
 k() { kubectl --context "$KUBE_CTX" -n "$NS" "$@"; }
+# DB pods of one cluster; both clusters share app.kubernetes.io/name.
+sel() { echo "app.kubernetes.io/name=hyperbytedb,app.kubernetes.io/instance=$1"; }
+NMAX=$(tr ' ' '\n' <<<"$NODES_LIST" | sort -n | tail -1)
 log() { echo "[acceptance] $(date -u +%H:%M:%S) $*"; }
 
 # The spec every run starts from, captured once.
@@ -53,31 +65,88 @@ cr.pop("status",None)
 cr["spec"]["replicas"]=3
 json.dump(cr,sys.stdout)' >"$OUT_DIR/cr.json"
 
+# $1 = cluster name, $2 = replicas: the captured spec under another name/size.
+cr_for() {
+  python3 -c '
+import json,sys
+cr=json.load(open(sys.argv[1])); cr["metadata"]["name"]=sys.argv[2]; cr["spec"]["replicas"]=int(sys.argv[3])
+json.dump(cr,sys.stdout)' "$OUT_DIR/cr.json" "$1" "$2"
+}
+
 leader() {
-  k exec "${CR_NAME}-0" -c hyperbytedb -- sh -c \
+  k exec "${1:-$CR_NAME}-0" -c hyperbytedb -- sh -c \
     'curl -sS -m 5 http://127.0.0.1:8086/cluster/leader' 2>/dev/null \
     | python3 -c "import sys,json; print(json.load(sys.stdin).get('leader_id') or '')" 2>/dev/null || true
 }
 
-reset_cluster() {
-  k delete job linearity-bench --ignore-not-found >/dev/null
-  k delete hyperbytedbcluster "$CR_NAME" --ignore-not-found --wait=true --timeout=300s >/dev/null
+# Delete cluster $1 and its data.
+delete_cluster() {
+  local name=$1 pvcs
+  k delete hyperbytedbcluster "$name" --ignore-not-found --wait=true --timeout=300s >/dev/null
   for _ in $(seq 1 60); do
-    [[ -z "$(k get pods -l app.kubernetes.io/name=hyperbytedb -o name 2>/dev/null)" ]] && break
+    [[ -z "$(k get pods -l "$(sel "$name")" -o name 2>/dev/null)" ]] && break
     sleep 5
   done
-  local pvcs
-  pvcs=$(k get pvc -o name | grep "/data-${CR_NAME}-" || true)
+  pvcs=$(k get pvc -o name | grep "/data-${name}-[0-9]" || true)
   [[ -n "$pvcs" ]] && k delete $pvcs --wait=true --timeout=300s >/dev/null
-  k apply -f "$OUT_DIR/cr.json" >/dev/null
+  return 0
+}
+
+# Recreate cluster $1 empty at $2 replicas and wait for a leader.
+reset_cluster() {
+  local name=$1 replicas=$2 ready
+  delete_cluster "$name"
+  cr_for "$name" "$replicas" | k apply -f - >/dev/null
   for _ in $(seq 1 90); do
-    local ready
-    ready=$(k get pods -l app.kubernetes.io/name=hyperbytedb --no-headers 2>/dev/null | grep -c '1/1 *Running' || true)
-    (( ready == 3 )) && [[ -n "$(leader)" ]] && return 0
+    ready=$(k get pods -l "$(sel "$name")" --no-headers 2>/dev/null | grep -c '1/1 *Running' || true)
+    (( ready == replicas )) && [[ -n "$(leader "$name")" ]] && return 0
     sleep 10
   done
-  log "cluster did not come back"; return 1
+  log "$name did not come back"; return 1
 }
+
+# Constant write load on the twin ($1 nodes) until stop_twin_load.
+start_twin_load() {
+  local n=$1 eps="" workers
+  workers=$(( CLIENTS_PER_NODE * n ))
+  for ((i = 0; i < n; i++)); do
+    eps="${eps}${eps:+,}http://${TWIN_CR}-${i}.${TWIN_CR}-headless.${NS}.svc.cluster.local:8086"
+  done
+  k delete job linearity-twin-load --ignore-not-found >/dev/null
+  cat <<JOB | k apply -f - >/dev/null
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: linearity-twin-load
+  namespace: ${NS}
+spec:
+  backoffLimit: 0
+  completionMode: Indexed
+  completions: ${workers}
+  parallelism: ${workers}
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: bench
+          image: ${BENCH_IMAGE}
+          imagePullPolicy: Never
+          command: ["/usr/local/bin/hyperbytedb-cli", "bench-write"]
+          resources:
+            limits:
+              cpu: "${BENCH_CPU}"
+          args:
+            - "--endpoints=${eps}"
+            - "--series=$(( SERIES_PER_NODE * n ))"
+            - "--measure-points=4000000000"
+            - "--concurrency=${CONCURRENCY}"
+            - "--batch=${BATCH}"
+            - "--phase=all"
+            - "--db=twin_load"
+            - "--workers=${workers}"
+JOB
+}
+stop_twin_load() { k delete job linearity-twin-load --ignore-not-found --wait=false >/dev/null; }
 
 # Count of measured points in $1, polled until it reaches MEASURE_POINTS or
 # stops changing for three polls. Under-reading mid-flush is not loss.
@@ -101,26 +170,42 @@ except Exception: print('')" 2>/dev/null || true)
   echo "${n:-0}"
 }
 
-# DB-pod CPU in millicores summed over pods, and the pod count, every 10 s.
+# Every 10 s: DB-pod millicores and pod count, for the cluster and its twin.
 sample_cpu() {
   while true; do
     echo "$(date +%s) $(k top pods -l app.kubernetes.io/name=hyperbytedb --no-headers 2>/dev/null \
-      | awk '{gsub(/m/,"",$2); s+=$2; n++} END{print s+0, n+0}')"
+      | awk -v twin="$TWIN_CR-" '{gsub(/m/,"",$2); if (index($1, twin) == 1) {t+=$2; tn++} else {s+=$2; n++}}
+             END{print s+0, n+0, t+0, tn+0}')"
     sleep 10
   done
 }
 
 echo "N run points_per_sec errors unrecovered read_back restarts db_cores us_per_point" >"$OUT_DIR/runs.txt"
 for N in $NODES_LIST; do
+  twin=0
+  [[ "$MATCH_LOAD" == 1 ]] && twin=$(( NMAX - N ))
   for r in $(seq 1 "$RUNS"); do
-    log "N=$N run $r/$RUNS: reset"
-    reset_cluster
+    log "N=$N run $r/$RUNS: reset (twin=$twin)"
+    k delete job linearity-bench --ignore-not-found >/dev/null
+    stop_twin_load
+    reset_cluster "$CR_NAME" 3 &
+    primary=$!
+    if (( twin > 0 )); then
+      reset_cluster "$TWIN_CR" "$twin" &
+      twin_reset=$!
+      wait "$twin_reset"
+      start_twin_load "$twin"
+    else
+      delete_cluster "$TWIN_CR"
+    fi
+    wait "$primary"
     log "N=$N run $r/$RUNS: sweep"
     sample_cpu >"$OUT_DIR/cpu-$N-$r.txt" 2>/dev/null &
     sampler=$!
     NODES_LIST="$N" RESULTS="$OUT_DIR/sweep-$N-$r.md" KUBE_CTX="$KUBE_CTX" NS="$NS" CR_NAME="$CR_NAME" \
       "$SCRIPT_DIR/run-incluster-sweep.sh" >"$OUT_DIR/sweep-$N-$r.log" 2>&1 || true
     kill "$sampler" 2>/dev/null || true
+    stop_twin_load
     for ((i = 0; i < N; i++)); do
       k exec "${CR_NAME}-$i" -c hyperbytedb -- sh -c 'curl -sS -m 10 http://127.0.0.1:8086/metrics' 2>/dev/null || true
     done | grep -E "^hyperbytedb_($COUNTERS)" \
@@ -136,11 +221,14 @@ for N in $NODES_LIST; do
     unrec=$(grep -oE 'replay worker=[0-9]+ failed=[0-9]+ unrecovered=[0-9]+' "$OUT_DIR/sweep-$N-$r.log" \
       | awk -F'unrecovered=' '{s+=$2} END{print s+0}')
     got=$(readback "${db:-missing}")
-    restarts=$(k get pods -l app.kubernetes.io/name=hyperbytedb \
+    restarts=$(k get pods -l "$(sel "$CR_NAME")" \
       -o jsonpath='{range .items[*]}{.status.containerStatuses[0].restartCount}{"\n"}{end}' | awk '{s+=$1} END{print s+0}')
     upp=$(python3 -c "print(f'{$cores/$pps*1e6:.2f}')" 2>/dev/null || echo -)
     echo "$N $r ${pps:--} ${errs:--} $unrec $got $restarts $cores $upp" >>"$OUT_DIR/runs.txt"
-    log "N=$N run $r: pps=${pps:--} errors=${errs:--} unrecovered=$unrec read_back=$got/$MEASURE_POINTS restarts=$restarts db_cores=$cores us_per_point=$upp"
+    # Twin cores over the same busiest quartile of the cluster's own samples.
+    twin_cores=$(awk -v n="$N" '$3==n {print $2, $4}' "$OUT_DIR/cpu-$N-$r.txt" | sort -n \
+      | awk '{v[NR]=$2} END{if(!NR){print "-"; exit} s=0; c=0; for(i=int(NR*0.75)+1;i<=NR;i++){s+=v[i]; c++} printf "%.1f", s/c/1000}')
+    log "N=$N run $r: pps=${pps:--} errors=${errs:--} unrecovered=$unrec read_back=$got/$MEASURE_POINTS restarts=$restarts db_cores=$cores us_per_point=$upp twin_cores=$twin_cores"
   done
 done
 
@@ -170,4 +258,6 @@ for n in sorted(by):
 print()
 print("PASS" if ok else "FAIL")
 PY
+stop_twin_load
+delete_cluster "$TWIN_CR"
 log "results in $OUT_DIR"
