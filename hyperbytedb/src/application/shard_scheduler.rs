@@ -4313,6 +4313,7 @@ mod tests {
                     tags: [("host".to_string(), format!("h{i}"))].into(),
                     fields: [("v".to_string(), FieldValue::Float(1.0))].into(),
                     timestamp: 1_000_000_000 + i as i64,
+                    series_id_cache: Default::default(),
                 })
                 .collect();
             self.scheduler

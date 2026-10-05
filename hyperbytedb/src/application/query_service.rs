@@ -2903,6 +2903,7 @@ async fn write_series_as_points(
                     tags: tags.clone(),
                     fields,
                     timestamp,
+                    series_id_cache: Default::default(),
                 });
                 total_count += 1;
             }

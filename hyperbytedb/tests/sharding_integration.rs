@@ -73,6 +73,7 @@ async fn location_cache_locates_after_bootstrap() {
         )]
         .into(),
         timestamp: 1,
+        series_id_cache: Default::default(),
     };
     let sid = series_id_for_point(&p);
     let located = cache

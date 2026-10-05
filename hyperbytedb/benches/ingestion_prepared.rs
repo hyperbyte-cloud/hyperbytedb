@@ -229,6 +229,7 @@ fn synthetic_points(n: usize) -> Vec<Point> {
                 tags,
                 fields,
                 timestamp: BASE_NS + i as i64 * 1_000_000,
+                series_id_cache: Default::default(),
             }
         })
         .collect()

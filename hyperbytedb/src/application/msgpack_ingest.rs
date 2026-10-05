@@ -67,6 +67,7 @@ pub fn parse_msgpack_body_to_points_limited(
             tags: w.tags,
             fields: w.fields,
             timestamp: timestamp_ns,
+            series_id_cache: Default::default(),
         });
     }
     Ok(points)

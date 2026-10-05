@@ -96,16 +96,61 @@ pub fn series_id_ch_sql_for_tags(
     series_id_ch_sql(measurement, &cols)
 }
 
-/// Convenience wrapper computing [`series_id`] straight from a [`Point`]. `Point::tags`
-/// is already a sorted `BTreeMap`, so this is allocation-free.
+/// [`series_id`] of a [`Point`], computed once and cached on the point.
+/// `Point::tags` is already a sorted `BTreeMap`, so this is allocation-free.
 #[must_use]
 pub fn series_id_for_point(p: &Point) -> u64 {
-    series_id(&p.measurement, &p.tags)
+    *p.series_id_cache
+        .get_or_init(|| series_id(&p.measurement, &p.tags))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn point() -> Point {
+        Point {
+            measurement: "cpu".into(),
+            tags: tags(&[("host", "a"), ("dc", "x")]),
+            fields: [(
+                "v".to_string(),
+                crate::domain::point::FieldValue::Float(1.0),
+            )]
+            .into(),
+            timestamp: 7,
+            series_id_cache: Default::default(),
+        }
+    }
+
+    /// The id is computed once per point and then read from the point.
+    #[test]
+    fn a_points_series_id_is_computed_once_and_cached() {
+        let p = point();
+        assert!(p.series_id_cache.get().is_none());
+        let id = series_id_for_point(&p);
+        assert_eq!(id, series_id(&p.measurement, &p.tags));
+        assert_eq!(p.series_id_cache.get(), Some(&id), "cached after first use");
+        // A cached value is what later calls return.
+        let marked = point();
+        marked.series_id_cache.set(42).unwrap();
+        assert_eq!(series_id_for_point(&marked), 42);
+    }
+
+    /// The cache is not serialized: WAL and wire bytes are the same whether
+    /// or not the id was read.
+    #[test]
+    fn the_cached_series_id_does_not_change_the_encoding() {
+        let fresh = point();
+        let read = point();
+        let _ = series_id_for_point(&read);
+        assert_eq!(
+            bincode::serialize(&fresh).unwrap(),
+            bincode::serialize(&read).unwrap()
+        );
+        let back: Point = bincode::deserialize(&bincode::serialize(&read).unwrap()).unwrap();
+        assert!(back.series_id_cache.get().is_none());
+        assert_eq!(series_id_for_point(&back), series_id_for_point(&read));
+    }
 
     fn tags(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs

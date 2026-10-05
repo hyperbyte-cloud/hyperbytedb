@@ -2252,6 +2252,7 @@ fn columnar_representative_point(
         tags: wire.tags.clone(),
         fields,
         timestamp: ts.first().copied().unwrap_or(0),
+        series_id_cache: Default::default(),
     })
 }
 
@@ -2614,6 +2615,7 @@ mod tests {
             tags: tag_map,
             fields: field_map,
             timestamp: ts,
+            series_id_cache: Default::default(),
         }
     }
 

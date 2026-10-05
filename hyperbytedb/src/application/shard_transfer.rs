@@ -439,6 +439,7 @@ pub async fn export_region_points_from_chdb(
             tags,
             fields,
             timestamp,
+            series_id_cache: Default::default(),
         });
     }
 

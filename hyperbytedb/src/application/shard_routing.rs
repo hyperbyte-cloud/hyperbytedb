@@ -1266,6 +1266,7 @@ mod scatter_tests {
                     tags: Default::default(),
                     fields: [("v".to_string(), FieldValue::Float(1.0))].into(),
                     timestamp: 1,
+                    series_id_cache: Default::default(),
                 }],
             );
         }

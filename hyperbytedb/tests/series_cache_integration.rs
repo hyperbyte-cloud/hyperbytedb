@@ -32,6 +32,7 @@ fn point(host: &str, ts: i64) -> Point {
         tags,
         fields,
         timestamp: ts,
+        series_id_cache: Default::default(),
     }
 }
 

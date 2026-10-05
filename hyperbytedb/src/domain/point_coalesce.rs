@@ -148,6 +148,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.clone()))
                 .collect(),
             timestamp: ts,
+            series_id_cache: Default::default(),
         }
     }
 

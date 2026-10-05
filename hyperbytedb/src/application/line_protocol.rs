@@ -223,6 +223,7 @@ fn parsed_line_to_point(
         tags,
         fields,
         timestamp: timestamp_ns,
+        series_id_cache: Default::default(),
     })
 }
 
@@ -376,6 +377,7 @@ mod encode_tests {
             tags,
             fields,
             timestamp: 1_700_000_000_000_000_000,
+            series_id_cache: Default::default(),
         };
 
         let encoded = encode_points_to_line_protocol(&[p], Precision::Nanosecond).unwrap();
@@ -418,6 +420,7 @@ mod encode_tests {
             tags,
             fields,
             timestamp: 1_234_567_890_123_456_789,
+            series_id_cache: Default::default(),
         };
         let bytes = encode_points_to_line_protocol(std::slice::from_ref(&p), Precision::Nanosecond)
             .unwrap();
@@ -439,6 +442,7 @@ mod binary_points_tests {
             tags: [("host".to_string(), host.to_string())].into(),
             fields: [("value".to_string(), FieldValue::Float(v))].into(),
             timestamp: ts,
+            series_id_cache: Default::default(),
         }
     }
 
