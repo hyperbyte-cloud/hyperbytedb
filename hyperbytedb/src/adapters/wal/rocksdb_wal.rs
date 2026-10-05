@@ -94,14 +94,13 @@ impl RocksDbWal {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-        // Bottommost level is rewritten by leveled compaction once L0/L1
-        // pressure clears; using zstd there gives us ~2x the compression
-        // ratio of LZ4 at the cost of CPU we have available off the hot
-        // write path. WAL data is short-lived, so this only matters
-        // during sustained backlog scenarios where compaction has time
-        // to rewrite SSTs into the bottommost level.
-        opts.set_bottommost_compression_type(rocksdb::DBCompressionType::Zstd);
+        // No compression anywhere in this DB. WAL entries live until the next
+        // flush (~10 s) and are then range-deleted, so compressing them saves
+        // no lasting space. Dynamic level sizing sends flushed SSTs straight
+        // to the bottommost level, which was ZSTD: on n3 that compaction
+        // was 9.4% of a node's CPU under write load.
+        opts.set_compression_type(rocksdb::DBCompressionType::None);
+        opts.set_bottommost_compression_type(rocksdb::DBCompressionType::None);
         opts.set_block_based_table_factory(&block_opts);
         // 64 MiB memtable × 4 = 256 MiB worst-case footprint. The bigger
         // memtable lets concurrent appenders accumulate writes for longer
@@ -149,8 +148,8 @@ impl RocksDbWal {
         opts.set_max_open_files(1024);
 
         let mut wal_cf_opts = Options::default();
-        wal_cf_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-        wal_cf_opts.set_bottommost_compression_type(rocksdb::DBCompressionType::Zstd);
+        wal_cf_opts.set_compression_type(rocksdb::DBCompressionType::None);
+        wal_cf_opts.set_bottommost_compression_type(rocksdb::DBCompressionType::None);
         wal_cf_opts.set_block_based_table_factory(&block_opts);
         wal_cf_opts.set_write_buffer_size(64 * 1024 * 1024);
         wal_cf_opts.set_max_write_buffer_number(4);
@@ -770,6 +769,30 @@ mod tests {
         )
         .unwrap();
         assert_absolute_seqs(&append_and_take(&wal).await);
+    }
+
+    /// WAL data is range-deleted at the next flush, so compressing it buys
+    /// nothing; ZSTD compaction of it cost 9.4% of a node's CPU on n3.
+    #[test]
+    fn the_wal_column_family_is_not_compressed() {
+        let tmp = TempDir::new().unwrap();
+        drop(RocksDbWal::open(tmp.path()).unwrap());
+        let options = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("OPTIONS-"))
+            .max_by_key(|e| e.file_name())
+            .map(|e| std::fs::read_to_string(e.path()).unwrap())
+            .expect("RocksDB writes an OPTIONS file");
+        let wal = options
+            .split("[CFOptions \"")
+            .find(|section| section.starts_with("wal\""))
+            .expect("wal column family section");
+        // Whole lines: "compression=..." is a substring of
+        // "bottommost_compression=...".
+        let set = |line: &str| wal.lines().any(|l| l.trim() == line);
+        assert!(set("compression=kNoCompression"), "{wal}");
+        assert!(set("bottommost_compression=kNoCompression"), "{wal}");
     }
 
     #[tokio::test]
