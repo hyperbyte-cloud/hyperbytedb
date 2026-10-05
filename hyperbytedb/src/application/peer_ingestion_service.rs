@@ -701,10 +701,31 @@ impl PeerIngestionService {
     ) -> Result<(), HyperbytedbError> {
         let mut stage = StageTimer::new("hyperbytedb_sharded_write_stage_seconds");
         if !local.is_empty() {
-            let mut all_local: Vec<crate::domain::point::Point> = Vec::new();
-            for pts in local.values() {
-                all_local.extend(pts.iter().cloned());
+            // Encode each region's replication body first, so the points can
+            // then MOVE into the WAL append. Cloning them for the append (to
+            // keep the originals for encoding) copied every tag and field map
+            // of every local point.
+            let map = ctx.shard_map.snapshot().await?;
+            let mut replicas = Vec::with_capacity(local.len());
+            for (region_id, region_points) in &local {
+                let Some(region) =
+                    crate::application::shard_routing::region_by_id(&map, *region_id)
+                else {
+                    return Err(HyperbytedbError::ShardMap(
+                        format!("no region {region_id}").into(),
+                    ));
+                };
+                let body = if ctx.config.binary_points_wire {
+                    crate::application::line_protocol::encode_points_binary(region_points)?
+                } else {
+                    encode_points_to_line_protocol(region_points, precision_val)?
+                };
+                let targets = region_replication_targets(ctx, &region).await;
+                replicas.push((*region_id, body, targets));
             }
+            stage.lap("local_encode");
+            let all_local: Vec<crate::domain::point::Point> =
+                local.into_values().flatten().collect();
 
             prepare_batch_metadata(
                 &self.metadata,
@@ -728,25 +749,12 @@ impl PeerIngestionService {
             .await?;
             stage.lap("local_wal");
 
-            let map = ctx.shard_map.snapshot().await?;
-            for (region_id, region_points) in local {
-                let Some(region) = crate::application::shard_routing::region_by_id(&map, region_id)
-                else {
-                    return Err(HyperbytedbError::ShardMap(
-                        format!("no region {region_id}").into(),
-                    ));
-                };
-                let local_body = if ctx.config.binary_points_wire {
-                    crate::application::line_protocol::encode_points_binary(&region_points)?
-                } else {
-                    encode_points_to_line_protocol(&region_points, precision_val)?
-                };
-                let targets = region_replication_targets(ctx, &region).await;
+            for (region_id, body, targets) in replicas {
                 self.dispatch_replication(OutboundReplicationBatch {
                     database: db.to_string(),
                     retention_policy: rp.to_string(),
                     precision: precision.map(|s| s.to_string()),
-                    body: local_body,
+                    body,
                     wal_seq,
                     target_node_ids: Some(targets),
                     region_id: Some(region_id),
