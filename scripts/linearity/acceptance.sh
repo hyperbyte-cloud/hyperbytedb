@@ -203,6 +203,7 @@ for N in $NODES_LIST; do
     sample_cpu >"$OUT_DIR/cpu-$N-$r.txt" 2>/dev/null &
     sampler=$!
     NODES_LIST="$N" RESULTS="$OUT_DIR/sweep-$N-$r.md" KUBE_CTX="$KUBE_CTX" NS="$NS" CR_NAME="$CR_NAME" \
+      CPU_STAT_FILE="$OUT_DIR/cpustat-$N-$r.txt" \
       "$SCRIPT_DIR/run-incluster-sweep.sh" >"$OUT_DIR/sweep-$N-$r.log" 2>&1 || true
     kill "$sampler" 2>/dev/null || true
     stop_twin_load
@@ -211,10 +212,12 @@ for N in $NODES_LIST; do
     done | grep -E "^hyperbytedb_($COUNTERS)" \
       | awk '{sub(/\{peer_id="[0-9]+"\}/,"",$1); s[$1]+=$2} END{for(m in s) printf "%14.0f %s\n", s[m], m}' \
       | sort -k2 >"$OUT_DIR/counters-$N-$r.txt" || true
-    # Mean DB cores over samples taken while every pod was up and the cluster
-    # was busy (the top quartile), i.e. the measure phase.
-    cores=$(awk -v n="$N" '$3==n {print $2}' "$OUT_DIR/cpu-$N-$r.txt" | sort -n \
-      | awk '{v[NR]=$1} END{if(!NR){print "-"; exit} s=0; c=0; for(i=int(NR*0.75)+1;i<=NR;i++){s+=v[i]; c++} printf "%.1f", s/c/1000}')
+    # Exact DB CPU over the measure phase, from cgroup usage before and after:
+    # mean cores, and CPU microseconds per measured point.
+    read -r cores upp < <(awk -v pts="$MEASURE_POINTS" '
+      $1=="start"{t0=$2; u0=$3} $1=="end"{t1=$2; u1=$3}
+      END{ if (t1>t0 && u1>u0) printf "%.1f %.2f\n", (u1-u0)/((t1-t0)*1000), (u1-u0)/pts; else print "- -" }' \
+      "$OUT_DIR/cpustat-$N-$r.txt" 2>/dev/null || echo "- -")
     db=$(grep -oE '^\[sweep\] db=\S+' "$OUT_DIR/sweep-$N-$r.log" | tail -1 | cut -d= -f2)
     read -r pps errs < <(grep -E "^\| $N \|" "$OUT_DIR/sweep-$N-$r.md" | tail -1 \
       | awk -F'|' '{gsub(/ /,"",$6); gsub(/ /,"",$7); print ($6==""?"-":$6), ($7==""?"-":$7)}')
@@ -223,7 +226,6 @@ for N in $NODES_LIST; do
     got=$(readback "${db:-missing}")
     restarts=$(k get pods -l "$(sel "$CR_NAME")" \
       -o jsonpath='{range .items[*]}{.status.containerStatuses[0].restartCount}{"\n"}{end}' | awk '{s+=$1} END{print s+0}')
-    upp=$(python3 -c "print(f'{$cores/$pps*1e6:.2f}')" 2>/dev/null || echo -)
     echo "$N $r ${pps:--} ${errs:--} $unrec $got $restarts $cores $upp" >>"$OUT_DIR/runs.txt"
     # Twin cores over the same busiest quartile of the cluster's own samples.
     twin_cores=$(awk -v n="$N" '$3==n {print $2, $4}' "$OUT_DIR/cpu-$N-$r.txt" | sort -n \

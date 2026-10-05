@@ -153,6 +153,18 @@ bench_container() {
   fi
 }
 
+# "<epoch ms> <usage_usec summed over the cluster's DB pods>" from each pod's
+# cgroup cpu.stat: exact CPU, unlike kubectl top's lagging samples.
+cpu_usage_snapshot() {
+  local n=$1 sum=0 u
+  for ((i = 0; i < n; i++)); do
+    u=$(kubectl_ctx -n "$NS" exec "${CR_NAME}-$i" -c hyperbytedb -- \
+      sh -c "awk '/^usage_usec/{print \$2}' /sys/fs/cgroup/cpu.stat" 2>/dev/null || echo 0)
+    sum=$(( sum + ${u:-0} ))
+  done
+  echo "$(date +%s%3N) $sum"
+}
+
 # Run one bench phase as a Job and print its log.
 run_phase() {
   local phase=$1 eps=$2 series=$3 workers=$4
@@ -260,7 +272,9 @@ for N in $NODES_LIST; do
   # now really dropping the shard space, every point starts from ONE region;
   # measuring straight after the seed timed one primary at every N.
   wait_for_split "$N"
+  [[ -n "${CPU_STAT_FILE:-}" ]] && echo "start $(cpu_usage_snapshot "$N")" >>"$CPU_STAT_FILE"
   out=$(run_phase "measure" "$eps" "$series" "$workers")
+  [[ -n "${CPU_STAT_FILE:-}" ]] && echo "end $(cpu_usage_snapshot "$N")" >>"$CPU_STAT_FILE"
   echo "$out" | grep -E '^\[bench\] (worker=|error x|replay )'
   # Total points over the slowest worker's time: the cluster absorbed all of
   # it within that window. Blank unless every worker reported.
