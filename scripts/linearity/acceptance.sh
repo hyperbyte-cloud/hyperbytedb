@@ -29,6 +29,8 @@ export BENCH_CPU="${BENCH_CPU:-1}"
 export BATCH="${BATCH:-5000}"
 export SPLIT_TIMEOUT_SECS="${SPLIT_TIMEOUT_SECS:-2400}"
 OUT_DIR="${OUT_DIR:-/tmp/linearity-acceptance-$(date +%Y%m%d-%H%M%S)}"
+# Counters summed over DB pods after each run, for the per-run diagnosis.
+COUNTERS='hinted_handoff_enqueued_total|replication_queue_full_total|write_admission_rejected_total|shard_forward_capacity_retries_total|shard_forward_failed_total|write_requests_total'
 # How long the read-back may wait for flushes and hints to land.
 READBACK_TIMEOUT_SECS="${READBACK_TIMEOUT_SECS:-900}"
 
@@ -99,14 +101,35 @@ except Exception: print('')" 2>/dev/null || true)
   echo "${n:-0}"
 }
 
-echo "N run points_per_sec errors unrecovered read_back restarts" >"$OUT_DIR/runs.txt"
+# DB-pod CPU in millicores summed over pods, and the pod count, every 10 s.
+sample_cpu() {
+  while true; do
+    echo "$(date +%s) $(k top pods -l app.kubernetes.io/name=hyperbytedb --no-headers 2>/dev/null \
+      | awk '{gsub(/m/,"",$2); s+=$2; n++} END{print s+0, n+0}')"
+    sleep 10
+  done
+}
+
+echo "N run points_per_sec errors unrecovered read_back restarts db_cores us_per_point" >"$OUT_DIR/runs.txt"
 for N in $NODES_LIST; do
   for r in $(seq 1 "$RUNS"); do
     log "N=$N run $r/$RUNS: reset"
     reset_cluster
     log "N=$N run $r/$RUNS: sweep"
+    sample_cpu >"$OUT_DIR/cpu-$N-$r.txt" 2>/dev/null &
+    sampler=$!
     NODES_LIST="$N" RESULTS="$OUT_DIR/sweep-$N-$r.md" KUBE_CTX="$KUBE_CTX" NS="$NS" CR_NAME="$CR_NAME" \
       "$SCRIPT_DIR/run-incluster-sweep.sh" >"$OUT_DIR/sweep-$N-$r.log" 2>&1 || true
+    kill "$sampler" 2>/dev/null || true
+    for ((i = 0; i < N; i++)); do
+      k exec "${CR_NAME}-$i" -c hyperbytedb -- sh -c 'curl -sS -m 10 http://127.0.0.1:8086/metrics' 2>/dev/null || true
+    done | grep -E "^hyperbytedb_($COUNTERS)" \
+      | awk '{sub(/\{peer_id="[0-9]+"\}/,"",$1); s[$1]+=$2} END{for(m in s) printf "%14.0f %s\n", s[m], m}' \
+      | sort -k2 >"$OUT_DIR/counters-$N-$r.txt" || true
+    # Mean DB cores over samples taken while every pod was up and the cluster
+    # was busy (the top quartile), i.e. the measure phase.
+    cores=$(awk -v n="$N" '$3==n {print $2}' "$OUT_DIR/cpu-$N-$r.txt" | sort -n \
+      | awk '{v[NR]=$1} END{if(!NR){print "-"; exit} s=0; c=0; for(i=int(NR*0.75)+1;i<=NR;i++){s+=v[i]; c++} printf "%.1f", s/c/1000}')
     db=$(grep -oE '^\[sweep\] db=\S+' "$OUT_DIR/sweep-$N-$r.log" | tail -1 | cut -d= -f2)
     read -r pps errs < <(grep -E "^\| $N \|" "$OUT_DIR/sweep-$N-$r.md" | tail -1 \
       | awk -F'|' '{gsub(/ /,"",$6); gsub(/ /,"",$7); print ($6==""?"-":$6), ($7==""?"-":$7)}')
@@ -115,8 +138,9 @@ for N in $NODES_LIST; do
     got=$(readback "${db:-missing}")
     restarts=$(k get pods -l app.kubernetes.io/name=hyperbytedb \
       -o jsonpath='{range .items[*]}{.status.containerStatuses[0].restartCount}{"\n"}{end}' | awk '{s+=$1} END{print s+0}')
-    echo "$N $r ${pps:--} ${errs:--} $unrec $got $restarts" >>"$OUT_DIR/runs.txt"
-    log "N=$N run $r: pps=${pps:--} errors=${errs:--} unrecovered=$unrec read_back=$got/$MEASURE_POINTS restarts=$restarts"
+    upp=$(python3 -c "print(f'{$cores/$pps*1e6:.2f}')" 2>/dev/null || echo -)
+    echo "$N $r ${pps:--} ${errs:--} $unrec $got $restarts $cores $upp" >>"$OUT_DIR/runs.txt"
+    log "N=$N run $r: pps=${pps:--} errors=${errs:--} unrecovered=$unrec read_back=$got/$MEASURE_POINTS restarts=$restarts db_cores=$cores us_per_point=$upp"
   done
 done
 
@@ -125,21 +149,24 @@ import os,statistics,sys
 rows=[l.split() for l in open(sys.argv[1]).read().splitlines()[1:] if l.strip()]
 want=int(os.environ["MEASURE_POINTS"]); bar=float(os.environ["PASS_RATIO"])
 by={}
-for n,r,pps,errs,unrec,got,rst in rows: by.setdefault(int(n),[]).append((pps,errs,int(unrec),int(got),int(rst)))
+for n,r,pps,errs,unrec,got,rst,cores,upp in rows: by.setdefault(int(n),[]).append((pps,errs,int(unrec),int(got),int(rst),cores,upp))
 ok=True; base=None
-print("| N | median pts/s | min-max | vs first N | needed | lost points | restarts | pass |")
-print("|---|---|---|---|---|---|---|---|")
+print("| N | median pts/s | min-max | vs first N | needed | lost points | restarts | DB cores | CPU us/point | pass |")
+print("|---|---|---|---|---|---|---|---|---|---|")
 for n in sorted(by):
     runs=by[n]; vals=[int(p) for p,*_ in runs if p not in ("-","")]
-    lost=sum(max(0,want-g) for _,_,_,g,_ in runs); rst=sum(x[4] for x in runs)
+    lost=sum(max(0,want-x[3]) for x in runs); rst=sum(x[4] for x in runs)
+    med_of=lambda i: (f"{statistics.median([float(x[i]) for x in runs if x[i] not in ('-','')]):.{1 if i==5 else 2}f}"
+                      if any(x[i] not in ('-','') for x in runs) else "-")
+    cores, upp = med_of(5), med_of(6)
     if not vals:
-        print(f"| {n} | - | - | - | - | {lost} | {rst} | NO (no numbers) |"); ok=False; continue
+        print(f"| {n} | - | - | - | - | {lost} | {rst} | {cores} | {upp} | NO (no numbers) |"); ok=False; continue
     med=statistics.median(vals)
     if base is None: base=(n,med)
     ratio=med/base[1]; need=bar*n/base[0] if n!=base[0] else 1.0
     good=len(vals)==len(runs) and ratio>=need-1e-9 and lost==0 and rst==0
     ok&=good
-    print(f"| {n} | {med:,.0f} | {min(vals):,}-{max(vals):,} | {ratio:.2f}x | {need:.2f}x | {lost} | {rst} | {'yes' if good else 'NO'} |")
+    print(f"| {n} | {med:,.0f} | {min(vals):,}-{max(vals):,} | {ratio:.2f}x | {need:.2f}x | {lost} | {rst} | {cores} | {upp} | {'yes' if good else 'NO'} |")
 print()
 print("PASS" if ok else "FAIL")
 PY
