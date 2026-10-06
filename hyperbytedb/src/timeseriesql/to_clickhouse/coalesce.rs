@@ -5,7 +5,20 @@ use crate::domain::rollup::RollupCombine;
 use super::conditions::quote_phys_identifier;
 
 pub fn build_coalesced_fact_view(fact_table: &QuotedTableName, mapping: &ColumnMapping) -> String {
-    build_coalesced_fact_view_impl(fact_table, mapping, false)
+    build_coalesced_fact_view_impl(fact_table, mapping, false, None)
+}
+
+/// Like [`build_coalesced_fact_view`], with `filter` applied to the fact rows
+/// before they are grouped. Only predicates on `series_id` and `time` (the
+/// grouping keys) belong here: a group is kept or dropped as a whole either
+/// way, so filtering early returns the same rows and lets the
+/// `(series_id, time)` sort key skip the rest of the table.
+pub(super) fn build_coalesced_fact_view_filtered(
+    fact_table: &QuotedTableName,
+    mapping: &ColumnMapping,
+    filter: Option<&str>,
+) -> String {
+    build_coalesced_fact_view_impl(fact_table, mapping, false, filter)
 }
 
 /// Like [`build_coalesced_fact_view`], but preserves `ingest_seq` / `origin_node_id` for
@@ -14,13 +27,14 @@ pub fn build_coalesced_fact_view_with_row_meta(
     fact_table: &QuotedTableName,
     mapping: &ColumnMapping,
 ) -> String {
-    build_coalesced_fact_view_impl(fact_table, mapping, true)
+    build_coalesced_fact_view_impl(fact_table, mapping, true, None)
 }
 
 pub(super) fn build_coalesced_fact_view_impl(
     fact_table: &QuotedTableName,
     mapping: &ColumnMapping,
     include_row_metadata: bool,
+    filter: Option<&str>,
 ) -> String {
     let mut field_cols: Vec<&String> = mapping.field_names.iter().collect();
     field_cols.sort();
@@ -48,7 +62,8 @@ pub(super) fn build_coalesced_fact_view_impl(
     } else {
         ""
     };
+    let filter = filter.map(|f| format!(" WHERE {f}")).unwrap_or_default();
     format!(
-        "(SELECT `series_id`, `time`{row_meta}{select_fields} FROM {fact_table} GROUP BY `series_id`, `time`)"
+        "(SELECT `series_id`, `time`{row_meta}{select_fields} FROM {fact_table}{filter} GROUP BY `series_id`, `time`)"
     )
 }

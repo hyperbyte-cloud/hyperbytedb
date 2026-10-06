@@ -1059,6 +1059,64 @@ fn series_where_tag_filter_joins_dimension() {
     assert!(sql.contains("\"host\" = 'h1'"), "got: {sql}");
 }
 
+/// The part of the coalesced fact view before `GROUP BY`.
+fn inner_fact_where(sql: &str) -> Option<&str> {
+    let start =
+        sql.find("FROM `mydb_autogen_cpu` WHERE ")? + "FROM `mydb_autogen_cpu` WHERE ".len();
+    let end = sql[start..].find(" GROUP BY `series_id`, `time`")?;
+    Some(&sql[start..start + end])
+}
+
+/// Time bounds and tag equalities filter fact rows before they are coalesced,
+/// so a one-series lookup reads that series, not the whole table.
+#[test]
+fn time_and_tag_equality_filter_fact_rows_before_coalescing() {
+    let stmt = parse_select(
+        r#"SELECT last(usage_idle) FROM cpu WHERE "host" = 'h1' AND time >= 1800000000s"#,
+    );
+    let sql = translate_series(&stmt, &cpu_mapping());
+    let inner = inner_fact_where(&sql).unwrap_or_else(|| panic!("no inner filter: {sql}"));
+    assert!(
+        inner.contains("time >= fromUnixTimestamp(1800000000)"),
+        "{inner}"
+    );
+    assert!(
+        inner.contains(
+            "`series_id` IN (SELECT `series_id` FROM `mydb_autogen_cpu_series` WHERE (\"host\" = 'h1'))"
+        ),
+        "{inner}"
+    );
+    // The full WHERE still applies after the join.
+    assert!(sql.ends_with("WHERE ((\"host\" = 'h1') AND (time >= fromUnixTimestamp(1800000000)))"));
+}
+
+/// Only terms that cannot change the result are pushed: OR, negation, an
+/// empty tag value (which a missing series row also matches through the LEFT
+/// JOIN) and field predicates stay outside.
+#[test]
+fn predicates_that_could_change_the_result_are_not_pushed() {
+    for q in [
+        r#"SELECT mean(usage_idle) FROM cpu WHERE "host" = 'a' OR "host" = 'b'"#,
+        r#"SELECT mean(usage_idle) FROM cpu WHERE "host" != 'a'"#,
+        r#"SELECT mean(usage_idle) FROM cpu WHERE "host" = ''"#,
+        r#"SELECT mean(usage_idle) FROM cpu WHERE usage_idle > 5"#,
+        r#"SELECT mean(usage_idle) FROM cpu WHERE "host" =~ /a/"#,
+    ] {
+        let sql = translate_series(&parse_select(q), &cpu_mapping());
+        assert!(inner_fact_where(&sql).is_none(), "{q} pushed: {sql}");
+    }
+    // A pushable term alongside an unpushable one: only the time bound moves.
+    let sql = translate_series(
+        &parse_select(r#"SELECT mean(usage_idle) FROM cpu WHERE time > 5s AND usage_idle > 5"#),
+        &cpu_mapping(),
+    );
+    let inner = inner_fact_where(&sql).unwrap_or_else(|| panic!("no inner filter: {sql}"));
+    assert!(
+        inner.contains("time >") && !inner.contains("usage_idle"),
+        "{inner}"
+    );
+}
+
 #[test]
 fn series_group_by_all_tags_expands_to_measurement_tags() {
     let mut stmt = parse_select(r#"SELECT mean("usage_idle") FROM cpu GROUP BY time(5m), *"#);

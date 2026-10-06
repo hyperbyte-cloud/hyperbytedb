@@ -9,7 +9,7 @@ use super::aggregates::{
     expr_contains_aggregate, expr_contains_raw_transform, translate_aggregate_call,
     translate_binary_expr,
 };
-use super::coalesce::build_coalesced_fact_view;
+use super::coalesce::build_coalesced_fact_view_filtered;
 use super::conditions::{
     format_float, nanos_to_ch_timestamp, quote_identifier, quote_phys_identifier, quote_string,
     translate_expr,
@@ -421,7 +421,12 @@ pub(super) fn build_from_source(
 ) -> String {
     let fact = match mapping {
         Some(m) => {
-            build_coalesced_fact_view(&QuotedTableName::new_quoted(fact_table.to_string()), m)
+            let filter = pushdown_filter(stmt, m, series.as_ref());
+            build_coalesced_fact_view_filtered(
+                &QuotedTableName::new_quoted(fact_table.to_string()),
+                m,
+                filter.as_deref(),
+            )
         }
         None => fact_table.to_string(),
     };
@@ -458,6 +463,127 @@ pub(super) fn build_from_source(
         series = sj.table,
     )
 }
+/// The part of the WHERE clause that can run on fact rows before they are
+/// coalesced: top-level AND terms on `time` alone, and `tag = '<value>'`
+/// equalities, turned into a `series_id` lookup in the series table.
+///
+/// Without this every query coalesced the whole fact table and joined every
+/// series before applying its WHERE: one series' `last` took as long as a
+/// count over 90M points (~1.2 s on n3). The outer WHERE still applies in
+/// full, so pushing a subset of terms never changes the result. Only
+/// equalities with a non-empty value are pushed: a fact row whose series row
+/// is missing reads its tags as '' through the LEFT JOIN, which `host = ''`
+/// or `host != 'x'` would match but a series-table lookup would not.
+fn pushdown_filter(
+    stmt: &SelectStatement,
+    m: &ColumnMapping,
+    series: Option<&SeriesJoin<'_>>,
+) -> Option<String> {
+    let cond = stmt.condition.as_ref()?;
+    let mut terms = Vec::new();
+    and_terms(cond, &mut terms);
+    let mut time_parts = Vec::new();
+    let mut tag_parts = Vec::new();
+    for term in terms {
+        let mut sql = String::new();
+        if is_time_only_comparison(term) {
+            if translate_expr(term, &mut sql, true, Some(m)).is_ok() {
+                time_parts.push(sql);
+            }
+        } else if series.is_some()
+            && let Some(tag) = tag_equality(term, m)
+            && series.is_some_and(|sj| {
+                sj.tag_columns.is_empty()
+                    || sj.tag_columns.contains(&m.physical_tag_column_name(tag))
+            })
+            && translate_expr(term, &mut sql, true, Some(m)).is_ok()
+        {
+            tag_parts.push(sql);
+        }
+    }
+    if let (Some(sj), false) = (series, tag_parts.is_empty()) {
+        time_parts.push(format!(
+            "`series_id` IN (SELECT `series_id` FROM {} WHERE {})",
+            sj.table,
+            tag_parts.join(" AND ")
+        ));
+    }
+    (!time_parts.is_empty()).then(|| time_parts.join(" AND "))
+}
+
+/// Flatten top-level `AND`s into their terms.
+fn and_terms<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
+    match e {
+        Expr::BinaryExpr(be) if be.op == BinaryOp::And => {
+            and_terms(&be.left, out);
+            and_terms(&be.right, out);
+        }
+        other => out.push(other),
+    }
+}
+
+/// A comparison whose only column is `time`, e.g. `time >= now() - 1h`.
+fn is_time_only_comparison(e: &Expr) -> bool {
+    fn constant_or_time(e: &Expr, saw_time: &mut bool) -> bool {
+        match e {
+            Expr::Identifier(n) | Expr::FieldRef { name: n, .. } => {
+                let is_time = n.eq_ignore_ascii_case("time");
+                *saw_time |= is_time;
+                is_time
+            }
+            Expr::StringLiteral(_)
+            | Expr::IntegerLiteral(_)
+            | Expr::FloatLiteral(_)
+            | Expr::DurationLiteral(_)
+            | Expr::TimeLiteral(_)
+            | Expr::Now => true,
+            Expr::UnaryExpr(UnaryOp::Neg, inner) => constant_or_time(inner, saw_time),
+            Expr::BinaryExpr(be) if matches!(be.op, BinaryOp::Add | BinaryOp::Sub) => {
+                constant_or_time(&be.left, saw_time) && constant_or_time(&be.right, saw_time)
+            }
+            _ => false,
+        }
+    }
+    let Expr::BinaryExpr(be) = e else {
+        return false;
+    };
+    if !matches!(
+        be.op,
+        BinaryOp::Eq | BinaryOp::Lt | BinaryOp::Lte | BinaryOp::Gt | BinaryOp::Gte
+    ) {
+        return false;
+    }
+    let mut saw_time = false;
+    constant_or_time(&be.left, &mut saw_time)
+        && constant_or_time(&be.right, &mut saw_time)
+        && saw_time
+}
+
+/// `tag = '<non-empty>'` (either side) for a name that is a tag and not also
+/// a field. Returns the tag name.
+fn tag_equality<'e>(e: &'e Expr, m: &ColumnMapping) -> Option<&'e str> {
+    let Expr::BinaryExpr(be) = e else {
+        return None;
+    };
+    if be.op != BinaryOp::Eq {
+        return None;
+    }
+    let tag_name = |x: &'e Expr| match x {
+        Expr::Identifier(n)
+        | Expr::FieldRef {
+            name: n,
+            typ: None | Some(FieldType::Tag),
+        } if m.tag_keys.contains(n) && !m.field_names.contains(n) => Some(n.as_str()),
+        _ => None,
+    };
+    let non_empty = |x: &Expr| matches!(x, Expr::StringLiteral(v) if !v.is_empty());
+    match (tag_name(&be.left), tag_name(&be.right)) {
+        (Some(t), None) if non_empty(&be.right) => Some(t),
+        (None, Some(t)) if non_empty(&be.left) => Some(t),
+        _ => None,
+    }
+}
+
 pub(super) fn group_by_tag_sql(
     tag: &str,
     mapping: Option<&ColumnMapping>,
