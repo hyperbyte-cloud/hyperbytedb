@@ -2,6 +2,7 @@
 
 pub mod args;
 pub mod bench;
+pub mod bench_read;
 pub mod client;
 pub mod config;
 pub mod error;

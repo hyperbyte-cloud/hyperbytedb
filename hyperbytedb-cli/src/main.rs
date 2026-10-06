@@ -147,6 +147,9 @@ enum Commands {
     /// Ingest benchmark for the in-cluster linearity sweep.
     #[command(hide = true)]
     BenchWrite(hyperbytedb_cli::bench::BenchArgs),
+    /// Query benchmark over the dataset bench-write leaves.
+    #[command(hide = true)]
+    BenchRead(hyperbytedb_cli::bench_read::BenchReadArgs),
     /// Write line protocol from stdin, a file, or --data-binary
     Write {
         #[arg(long = "file")]
@@ -286,6 +289,14 @@ async fn run() -> hyperbytedb_cli::error::Result<()> {
         return Ok(());
     }
 
+    if let Some(Commands::BenchRead(args)) = cli.command.clone() {
+        let code = hyperbytedb_cli::bench_read::run(args).await;
+        if code != 0 {
+            std::process::exit(i32::from(code));
+        }
+        return Ok(());
+    }
+
     if cli.query_type.eq_ignore_ascii_case("flux") {
         return Err(CliError::Other(
             "Flux is not supported; use -type influxql (default)".to_string(),
@@ -398,7 +409,7 @@ async fn run_subcommand(
 
     match cmd {
         // Dispatched in `run` before a connection is built.
-        Commands::BenchWrite(_) => Ok(()),
+        Commands::BenchWrite(_) | Commands::BenchRead(_) => Ok(()),
         Commands::Write {
             file,
             data_binary,
