@@ -1689,6 +1689,8 @@ async fn run_series_query(
     epoch: Option<&str>,
     group_by_tags: &[String],
 ) -> Result<Vec<SeriesResult>, HyperbytedbError> {
+    let mut stage =
+        crate::application::stage_timer::StageTimer::new("hyperbytedb_query_local_stage_seconds");
     let sql = with_execution_time_limit(sql, svc.query_timeout_secs);
     let mut batches = svc.query_port.execute_sql_arrow(&sql).await?;
     let mut builder = crate::application::query_arrow_series::SeriesBuilder::new(
@@ -1699,7 +1701,10 @@ async fn run_series_query(
     while let Some(batch) = batches.recv().await {
         builder.push_batch(&batch?)?;
     }
-    Ok(builder.finish())
+    stage.lap("chdb");
+    let series = builder.finish();
+    stage.lap("build");
+    Ok(series)
 }
 
 fn series_results_to_json_each_row(series: &[SeriesResult]) -> Result<String, HyperbytedbError> {
@@ -2313,6 +2318,8 @@ async fn execute_sharded_measurement_query(
     epoch: Option<&str>,
     group_by_tags: &[String],
 ) -> Result<Vec<SeriesResult>, HyperbytedbError> {
+    let mut stage =
+        crate::application::stage_timer::StageTimer::new("hyperbytedb_query_stage_seconds");
     // The region SQL names columns this way; the merge must use the same names.
     let named = to_clickhouse::with_output_names(stmt);
     let stmt = &named;
@@ -2387,6 +2394,7 @@ async fn execute_sharded_measurement_query(
     // names, often none: a time-only WHERE then "covered" the empty key set
     // and went to the region holding the tagless series, returning nothing.
     let tag_keys_known = !mapping_inferred || !table_cols.series.is_empty();
+    stage.lap("prepare");
     let region_selection = if is_materialized_dest {
         select_regions_for_materialized_dest(space)
     } else {
@@ -2404,6 +2412,8 @@ async fn execute_sharded_measurement_query(
         .cloned()
         .collect();
 
+    metrics::histogram!("hyperbytedb_query_regions").record(selected_regions.len() as f64);
+    stage.lap("route");
     let sharded_plan = if !is_materialized_dest
         && (selected_regions.len() > 1 || (space.regions.len() > 1 && is_global_aggregate))
     {
@@ -2450,6 +2460,7 @@ async fn execute_sharded_measurement_query(
     .set(selected_regions.len() as f64);
 
     let materialized_meta_ref = measurement_meta.as_ref().filter(|_| is_materialized_dest);
+    stage.lap("translate");
 
     const SHARD_QUERY_REGION_CONCURRENCY: usize = 32;
     let resolved_tags_owned = resolved_group_by_tags.to_vec();
@@ -2491,6 +2502,7 @@ async fn execute_sharded_measurement_query(
             .collect();
         region_results.extend(futures::future::try_join_all(chunk_futures).await?);
     }
+    stage.lap("regions");
     let mut parts = Vec::with_capacity(region_results.len());
     for series in region_results {
         if !series.is_empty() {
@@ -2520,6 +2532,7 @@ async fn execute_sharded_measurement_query(
     } else {
         merge_sharded_query_results(parts, &effective_stmt, sharded_plan.as_ref())?
     };
+    stage.lap("merge");
     Ok(first_statement_series(merged))
 }
 

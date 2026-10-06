@@ -798,6 +798,8 @@ pub async fn handle_shard_query(
         )
             .into_response()
     };
+    let mut stage =
+        crate::application::stage_timer::StageTimer::new("hyperbytedb_shard_query_stage_seconds");
     let mut batches = match state.query_port.execute_sql_arrow(&sql).await {
         Ok(b) => b,
         Err(e) => return failed(e),
@@ -809,6 +811,7 @@ pub async fn handle_shard_query(
         Some(Err(e)) => return failed(e),
         Some(Ok(batch)) => batch,
     };
+    stage.lap("first_batch");
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
     tokio::spawn(async move {
         if let Err(e) = stream_ipc(first, batches, &tx).await {
