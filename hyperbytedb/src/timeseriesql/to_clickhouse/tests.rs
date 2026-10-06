@@ -1090,17 +1090,43 @@ fn time_and_tag_equality_filter_fact_rows_before_coalescing() {
     assert!(sql.ends_with("WHERE ((\"host\" = 'h1') AND (time >= fromUnixTimestamp(1800000000)))"));
 }
 
+/// Grafana multi-value selections (`=~ /^(a|b)$/`) and ORs of tag
+/// equalities select series by tag alone, so they become the series lookup.
+#[test]
+fn tag_regex_and_or_selections_filter_fact_rows_before_coalescing() {
+    for (q, pushed) in [
+        (
+            r#"SELECT mean(usage_idle) FROM cpu WHERE "host" =~ /^(a|b)$/ AND time > 5s"#,
+            "match(\"host\", '^(a|b)$')",
+        ),
+        (
+            r#"SELECT mean(usage_idle) FROM cpu WHERE "host" = 'a' OR "region" = 'eu'"#,
+            "(\"host\" = 'a') OR (\"region\" = 'eu')",
+        ),
+    ] {
+        let sql = translate_series(&parse_select(q), &cpu_mapping());
+        let inner = inner_fact_where(&sql).unwrap_or_else(|| panic!("{q} not pushed: {sql}"));
+        assert!(
+            inner.contains("`series_id` IN (SELECT `series_id` FROM"),
+            "{inner}"
+        );
+        assert!(inner.contains(pushed), "{q}: {inner}");
+    }
+}
+
 /// Only terms that cannot change the result are pushed: OR, negation, an
 /// empty tag value (which a missing series row also matches through the LEFT
 /// JOIN) and field predicates stay outside.
 #[test]
 fn predicates_that_could_change_the_result_are_not_pushed() {
     for q in [
-        r#"SELECT mean(usage_idle) FROM cpu WHERE "host" = 'a' OR "host" = 'b'"#,
+        r#"SELECT mean(usage_idle) FROM cpu WHERE "host" = 'a' OR usage_idle > 5"#,
         r#"SELECT mean(usage_idle) FROM cpu WHERE "host" != 'a'"#,
         r#"SELECT mean(usage_idle) FROM cpu WHERE "host" = ''"#,
         r#"SELECT mean(usage_idle) FROM cpu WHERE usage_idle > 5"#,
-        r#"SELECT mean(usage_idle) FROM cpu WHERE "host" =~ /a/"#,
+        r#"SELECT mean(usage_idle) FROM cpu WHERE "host" =~ /a*/"#,
+        r#"SELECT mean(usage_idle) FROM cpu WHERE "host" =~ /^(a|)$/"#,
+        r#"SELECT mean(usage_idle) FROM cpu WHERE "host" !~ /a/"#,
     ] {
         let sql = translate_series(&parse_select(q), &cpu_mapping());
         assert!(inner_fact_where(&sql).is_none(), "{q} pushed: {sql}");

@@ -464,16 +464,16 @@ pub(super) fn build_from_source(
     )
 }
 /// The part of the WHERE clause that can run on fact rows before they are
-/// coalesced: top-level AND terms on `time` alone, and `tag = '<value>'`
-/// equalities, turned into a `series_id` lookup in the series table.
+/// coalesced: top-level AND terms on `time` alone, and tag selectors (see
+/// [`tag_selector`]), turned into a `series_id` lookup in the series table.
 ///
 /// Without this every query coalesced the whole fact table and joined every
 /// series before applying its WHERE: one series' `last` took as long as a
 /// count over 90M points (~1.2 s on n3). The outer WHERE still applies in
 /// full, so pushing a subset of terms never changes the result. Only
-/// equalities with a non-empty value are pushed: a fact row whose series row
-/// is missing reads its tags as '' through the LEFT JOIN, which `host = ''`
-/// or `host != 'x'` would match but a series-table lookup would not.
+/// selectors that cannot match '' are pushed: a fact row whose series row is
+/// missing reads its tags as '' through the LEFT JOIN, which `host = ''` or
+/// `host != 'x'` would match but a series-table lookup would not.
 fn pushdown_filter(
     stmt: &SelectStatement,
     m: &ColumnMapping,
@@ -490,15 +490,17 @@ fn pushdown_filter(
             if translate_expr(term, &mut sql, true, Some(m)).is_ok() {
                 time_parts.push(sql);
             }
-        } else if series.is_some()
-            && let Some(tag) = tag_equality(term, m)
-            && series.is_some_and(|sj| {
-                sj.tag_columns.is_empty()
-                    || sj.tag_columns.contains(&m.physical_tag_column_name(tag))
-            })
-            && translate_expr(term, &mut sql, true, Some(m)).is_ok()
-        {
-            tag_parts.push(sql);
+        } else if let Some(sj) = series {
+            let mut tags = Vec::new();
+            if tag_selector(term, m, &mut tags)
+                && tags.iter().all(|t| {
+                    sj.tag_columns.is_empty()
+                        || sj.tag_columns.contains(&m.physical_tag_column_name(t))
+                })
+                && translate_expr(term, &mut sql, true, Some(m)).is_ok()
+            {
+                tag_parts.push(sql);
+            }
         }
     }
     if let (Some(sj), false) = (series, tag_parts.is_empty()) {
@@ -559,15 +561,15 @@ fn is_time_only_comparison(e: &Expr) -> bool {
         && saw_time
 }
 
-/// `tag = '<non-empty>'` (either side) for a name that is a tag and not also
-/// a field. Returns the tag name.
-fn tag_equality<'e>(e: &'e Expr, m: &ColumnMapping) -> Option<&'e str> {
+/// Whether `e` selects series by tag values alone, matching no series whose
+/// tags are all '' (how a fact row with a missing series row reads through
+/// the LEFT JOIN): `tag = '<non-empty>'`, `tag =~ /re/` for a regex that
+/// cannot match '', or an OR of those. Grafana's multi-value variables send
+/// `host =~ /^(a|b|c)$/`. Pushes the names of the tags involved onto `tags`.
+fn tag_selector<'e>(e: &'e Expr, m: &ColumnMapping, tags: &mut Vec<&'e str>) -> bool {
     let Expr::BinaryExpr(be) = e else {
-        return None;
+        return false;
     };
-    if be.op != BinaryOp::Eq {
-        return None;
-    }
     let tag_name = |x: &'e Expr| match x {
         Expr::Identifier(n)
         | Expr::FieldRef {
@@ -576,11 +578,30 @@ fn tag_equality<'e>(e: &'e Expr, m: &ColumnMapping) -> Option<&'e str> {
         } if m.tag_keys.contains(n) && !m.field_names.contains(n) => Some(n.as_str()),
         _ => None,
     };
-    let non_empty = |x: &Expr| matches!(x, Expr::StringLiteral(v) if !v.is_empty());
-    match (tag_name(&be.left), tag_name(&be.right)) {
-        (Some(t), None) if non_empty(&be.right) => Some(t),
-        (None, Some(t)) if non_empty(&be.left) => Some(t),
-        _ => None,
+    match be.op {
+        BinaryOp::Or => tag_selector(&be.left, m, tags) && tag_selector(&be.right, m, tags),
+        BinaryOp::Eq => {
+            let non_empty = |x: &Expr| matches!(x, Expr::StringLiteral(v) if !v.is_empty());
+            let tag = match (tag_name(&be.left), tag_name(&be.right)) {
+                (Some(t), None) if non_empty(&be.right) => t,
+                (None, Some(t)) if non_empty(&be.left) => t,
+                _ => return false,
+            };
+            tags.push(tag);
+            true
+        }
+        BinaryOp::RegexMatch => {
+            let (Some(tag), Expr::Regex(pattern)) = (tag_name(&be.left), &be.right) else {
+                return false;
+            };
+            // Unparseable here: do not risk it.
+            if !regex::Regex::new(pattern).is_ok_and(|r| !r.is_match("")) {
+                return false;
+            }
+            tags.push(tag);
+            true
+        }
+        _ => false,
     }
 }
 
