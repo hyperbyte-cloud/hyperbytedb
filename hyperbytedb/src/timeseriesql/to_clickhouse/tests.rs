@@ -1033,7 +1033,7 @@ fn telegraf_cpu_multi_field_query_coalesces_partial_rows() {
         "expected coalesced fact view, got: {sql}"
     );
     assert!(
-        sql.contains("ANY LEFT JOIN `mydb_autogen_cpu_series` AS s"),
+        sql.contains("ANY LEFT JOIN (SELECT * FROM `mydb_autogen_cpu_series` WHERE"),
         "tag filter should join series table, got: {sql}"
     );
     assert!(sql.contains("avg(\"usage_idle\")"), "got: {sql}");
@@ -1048,7 +1048,7 @@ fn series_where_tag_filter_joins_dimension() {
     let stmt = parse_select(r#"SELECT mean("usage_idle") FROM cpu WHERE "host" = 'h1'"#);
     let sql = translate_series(&stmt, &cpu_mapping());
     assert!(
-        sql.contains("ANY LEFT JOIN `mydb_autogen_cpu_series` AS s"),
+        sql.contains("ANY LEFT JOIN (SELECT * FROM `mydb_autogen_cpu_series` WHERE"),
         "tag filter should join the series table, got: {sql}"
     );
     assert!(
@@ -1088,6 +1088,13 @@ fn time_and_tag_equality_filter_fact_rows_before_coalescing() {
     );
     // The full WHERE still applies after the join.
     assert!(sql.ends_with("WHERE ((\"host\" = 'h1') AND (time >= fromUnixTimestamp(1800000000)))"));
+    // And the join reads only the selected series, not the whole table.
+    assert!(
+        sql.contains(
+            "ANY LEFT JOIN (SELECT * FROM `mydb_autogen_cpu_series` WHERE (\"host\" = 'h1')) AS s"
+        ),
+        "{sql}"
+    );
 }
 
 /// Grafana multi-value selections (`=~ /^(a|b)$/`) and ORs of tag

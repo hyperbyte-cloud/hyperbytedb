@@ -419,15 +419,13 @@ pub(super) fn build_from_source(
     mapping: Option<&ColumnMapping>,
     stmt: &SelectStatement,
 ) -> String {
+    let pushed = mapping.map(|m| pushdown_filter(stmt, m, series.as_ref()));
     let fact = match mapping {
-        Some(m) => {
-            let filter = pushdown_filter(stmt, m, series.as_ref());
-            build_coalesced_fact_view_filtered(
-                &QuotedTableName::new_quoted(fact_table.to_string()),
-                m,
-                filter.as_deref(),
-            )
-        }
+        Some(m) => build_coalesced_fact_view_filtered(
+            &QuotedTableName::new_quoted(fact_table.to_string()),
+            m,
+            pushed.as_ref().and_then(|p| p.fact.as_deref()),
+        ),
         None => fact_table.to_string(),
     };
     let (Some(sj), Some(m)) = (series, mapping) else {
@@ -458,10 +456,25 @@ pub(super) fn build_from_source(
         .map(|c| format!("s.{}", quote_phys_identifier(c)))
         .collect::<Vec<_>>()
         .join(", ");
+    // With a tag selector pushed, every result row satisfies it, so the join
+    // needs only the selected series. Joining the whole series table built a
+    // hash of every series on the node for each region query: ~110 ms of CPU
+    // for a one-series last() on n3.
+    let series_side = match pushed.as_ref().and_then(|p| p.series.as_deref()) {
+        Some(selector) => format!("(SELECT * FROM {} WHERE {selector})", sj.table),
+        None => sj.table.to_string(),
+    };
     format!(
-        "(SELECT t.*, {projected} FROM {fact} AS t ANY LEFT JOIN {series} AS s ON t.`series_id` = s.`series_id`)",
-        series = sj.table,
+        "(SELECT t.*, {projected} FROM {fact} AS t ANY LEFT JOIN {series_side} AS s ON t.`series_id` = s.`series_id`)",
     )
+}
+
+/// Filters [`pushdown_filter`] moves ahead of the coalesce and the join.
+struct Pushdown {
+    /// For the fact rows, before they are grouped.
+    fact: Option<String>,
+    /// The pushed tag selectors, for the series table.
+    series: Option<String>,
 }
 /// The part of the WHERE clause that can run on fact rows before they are
 /// coalesced: top-level AND terms on `time` alone, and tag selectors (see
@@ -478,8 +491,13 @@ fn pushdown_filter(
     stmt: &SelectStatement,
     m: &ColumnMapping,
     series: Option<&SeriesJoin<'_>>,
-) -> Option<String> {
-    let cond = stmt.condition.as_ref()?;
+) -> Pushdown {
+    let Some(cond) = stmt.condition.as_ref() else {
+        return Pushdown {
+            fact: None,
+            series: None,
+        };
+    };
     let mut terms = Vec::new();
     and_terms(cond, &mut terms);
     let mut time_parts = Vec::new();
@@ -503,14 +521,17 @@ fn pushdown_filter(
             }
         }
     }
-    if let (Some(sj), false) = (series, tag_parts.is_empty()) {
+    let selector = (!tag_parts.is_empty()).then(|| tag_parts.join(" AND "));
+    if let (Some(sj), Some(sel)) = (series, &selector) {
         time_parts.push(format!(
-            "`series_id` IN (SELECT `series_id` FROM {} WHERE {})",
-            sj.table,
-            tag_parts.join(" AND ")
+            "`series_id` IN (SELECT `series_id` FROM {} WHERE {sel})",
+            sj.table
         ));
     }
-    (!time_parts.is_empty()).then(|| time_parts.join(" AND "))
+    Pushdown {
+        fact: (!time_parts.is_empty()).then(|| time_parts.join(" AND ")),
+        series: selector,
+    }
 }
 
 /// Flatten top-level `AND`s into their terms.
