@@ -783,6 +783,12 @@ pub async fn handle_shard_query(
     } else {
         req.select_sql
     };
+    // The coordinator gives up after the query timeout; stop the scan then too.
+    let limit_secs = state
+        .shard_routing
+        .as_ref()
+        .map_or(30, |c| c.config.scatter_query_timeout_ms.div_ceil(1000));
+    let sql = crate::application::query_service::with_execution_time_limit(&sql, limit_secs);
 
     let failed = |e: HyperbytedbError| {
         tracing::error!(error = %e, sql = %sql, "shard query failed");

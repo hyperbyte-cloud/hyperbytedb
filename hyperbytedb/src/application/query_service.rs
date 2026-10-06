@@ -1666,6 +1666,20 @@ async fn execute_statement(
     }
 }
 
+/// `sql` with ClickHouse's own time limit attached, so the engine stops a
+/// query nobody waits for any more at the query timeout. Dropping the caller
+/// cancels a stream only between batches, and an aggregate yields its first
+/// batch only after scanning everything: abandoned scans on n3 kept every node
+/// pinned for minutes after the clients had gone.
+#[must_use]
+pub fn with_execution_time_limit(sql: &str, secs: u64) -> String {
+    format!(
+        "{}\nSETTINGS max_execution_time = {}, timeout_overflow_mode = 'throw'",
+        sql.trim_end().trim_end_matches(';'),
+        secs.max(1)
+    )
+}
+
 /// Run `sql` on this node and bucket its rows into series, streaming Arrow
 /// record batches (see [`crate::application::query_arrow_series`]).
 async fn run_series_query(
@@ -1675,7 +1689,8 @@ async fn run_series_query(
     epoch: Option<&str>,
     group_by_tags: &[String],
 ) -> Result<Vec<SeriesResult>, HyperbytedbError> {
-    let mut batches = svc.query_port.execute_sql_arrow(sql).await?;
+    let sql = with_execution_time_limit(sql, svc.query_timeout_secs);
+    let mut batches = svc.query_port.execute_sql_arrow(&sql).await?;
     let mut builder = crate::application::query_arrow_series::SeriesBuilder::new(
         measurement,
         epoch,
@@ -3273,5 +3288,21 @@ mod inferred_mapping_tests {
         tags.sort();
         assert_eq!(tags, ["host"]);
         assert!(!m.field_names.iter().any(|f| f == "time"));
+    }
+}
+
+#[cfg(test)]
+mod execution_limit_tests {
+    use super::with_execution_time_limit;
+
+    /// ClickHouse stops the query itself at the limit; the clause goes last,
+    /// after any trailing semicolon is dropped.
+    #[test]
+    fn queries_carry_an_engine_time_limit() {
+        assert_eq!(
+            with_execution_time_limit("SELECT 1 FROM t ORDER BY time;  ", 30),
+            "SELECT 1 FROM t ORDER BY time\nSETTINGS max_execution_time = 30, timeout_overflow_mode = 'throw'"
+        );
+        assert!(with_execution_time_limit("SELECT 1", 0).contains("max_execution_time = 1,"));
     }
 }
