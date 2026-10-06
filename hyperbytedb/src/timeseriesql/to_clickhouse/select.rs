@@ -144,11 +144,11 @@ pub(super) fn translate_inner(
     write!(out, "{}", select_parts.join(", "))?;
 
     // FROM <source> — wrapped in the tag-rejoin inline view when needed.
-    let from = build_from_source(from_source, series, mapping, stmt);
-    write!(out, "\nFROM {}", from)?;
+    let source = build_from_source(from_source, series, mapping, stmt);
+    write!(out, "\nFROM {}", source.from)?;
 
     // WHERE
-    if let Some(ref cond) = stmt.condition {
+    if let Some(ref cond) = source.outer_condition {
         write!(out, "\nWHERE ")?;
         translate_expr(cond, &mut out, true, mapping)?;
     }
@@ -418,8 +418,12 @@ pub(super) fn build_from_source(
     series: Option<SeriesJoin<'_>>,
     mapping: Option<&ColumnMapping>,
     stmt: &SelectStatement,
-) -> String {
+) -> FromSource {
     let pushed = mapping.map(|m| pushdown_filter(stmt, m, series.as_ref()));
+    let unchanged = |from: String| FromSource {
+        from,
+        outer_condition: stmt.condition.clone(),
+    };
     let fact = match mapping {
         Some(m) => build_coalesced_fact_view_filtered(
             &QuotedTableName::new_quoted(fact_table.to_string()),
@@ -429,10 +433,30 @@ pub(super) fn build_from_source(
         None => fact_table.to_string(),
     };
     let (Some(sj), Some(m)) = (series, mapping) else {
-        return fact;
+        return unchanged(fact);
     };
     if !sj.force && !query_references_tag(stmt, m) {
-        return fact;
+        return unchanged(fact);
+    }
+    // Every tag the query uses was pushed into the fact filter as a series
+    // lookup, and none is output or grouped by: the join would only add
+    // columns nobody reads. On n3 data it was 20 of a one-series last()'s
+    // 33 ms. The pushed terms leave the outer WHERE with it, since their
+    // columns are not there; the series lookup already applied them exactly.
+    if let Some(p) = pushed.as_ref().filter(|p| !p.tag_terms.is_empty())
+        && !sj.force
+        && !output_references_tag(stmt, m)
+    {
+        let remaining = condition_without_terms(stmt.condition.as_ref(), &p.tag_terms);
+        if !remaining
+            .as_ref()
+            .is_some_and(|c| expr_references_tag(c, m))
+        {
+            return FromSource {
+                from: fact,
+                outer_condition: remaining,
+            };
+        }
     }
     let mut tag_cols: Vec<String> = m
         .tag_keys
@@ -440,7 +464,7 @@ pub(super) fn build_from_source(
         .map(|t| m.physical_tag_column_name(t))
         .collect();
     if tag_cols.is_empty() {
-        return fact;
+        return unchanged(fact);
     }
     // Only project tag columns that actually exist in the series table.
     // MV destinations may have a subset of source tags (GROUP BY columns only).
@@ -448,7 +472,7 @@ pub(super) fn build_from_source(
         tag_cols.retain(|c| sj.tag_columns.contains(c));
     }
     if tag_cols.is_empty() {
-        return fact;
+        return unchanged(fact);
     }
     tag_cols.sort();
     let projected = tag_cols
@@ -464,9 +488,44 @@ pub(super) fn build_from_source(
         Some(selector) => format!("(SELECT * FROM {} WHERE {selector})", sj.table),
         None => sj.table.to_string(),
     };
-    format!(
+    unchanged(format!(
         "(SELECT t.*, {projected} FROM {fact} AS t ANY LEFT JOIN {series_side} AS s ON t.`series_id` = s.`series_id`)",
-    )
+    ))
+}
+
+/// The FROM source and the condition the outer WHERE should apply to it.
+pub(super) struct FromSource {
+    pub from: String,
+    pub outer_condition: Option<Expr>,
+}
+
+/// Whether the query outputs or groups by a tag (`SELECT *` includes tags).
+fn output_references_tag(stmt: &SelectStatement, m: &ColumnMapping) -> bool {
+    stmt.group_by
+        .as_ref()
+        .is_some_and(|gb| gb.references_tags())
+        || stmt.fields.iter().any(|f| {
+            matches!(f.expr, Expr::Star | Expr::Wildcard) || expr_references_tag(&f.expr, m)
+        })
+}
+
+/// `cond` without its top-level AND terms at `drop` (indices in
+/// [`and_terms`] order), or None when nothing is left.
+fn condition_without_terms(cond: Option<&Expr>, drop: &[usize]) -> Option<Expr> {
+    let mut terms = Vec::new();
+    and_terms(cond?, &mut terms);
+    terms
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !drop.contains(i))
+        .map(|(_, t)| t.clone())
+        .reduce(|left, right| {
+            Expr::BinaryExpr(Box::new(BinaryExpr {
+                left,
+                op: BinaryOp::And,
+                right,
+            }))
+        })
 }
 
 /// Filters [`pushdown_filter`] moves ahead of the coalesce and the join.
@@ -475,6 +534,9 @@ struct Pushdown {
     fact: Option<String>,
     /// The pushed tag selectors, for the series table.
     series: Option<String>,
+    /// Indices (in [`and_terms`] order) of the condition terms the series
+    /// lookup applies exactly.
+    tag_terms: Vec<usize>,
 }
 /// The part of the WHERE clause that can run on fact rows before they are
 /// coalesced: top-level AND terms on `time` alone, and tag selectors (see
@@ -496,13 +558,15 @@ fn pushdown_filter(
         return Pushdown {
             fact: None,
             series: None,
+            tag_terms: Vec::new(),
         };
     };
     let mut terms = Vec::new();
     and_terms(cond, &mut terms);
     let mut time_parts = Vec::new();
     let mut tag_parts = Vec::new();
-    for term in terms {
+    let mut tag_terms = Vec::new();
+    for (index, term) in terms.into_iter().enumerate() {
         let mut sql = String::new();
         if is_time_only_comparison(term) {
             if translate_expr(term, &mut sql, true, Some(m)).is_ok() {
@@ -518,6 +582,7 @@ fn pushdown_filter(
                 && translate_expr(term, &mut sql, true, Some(m)).is_ok()
             {
                 tag_parts.push(sql);
+                tag_terms.push(index);
             }
         }
     }
@@ -531,6 +596,7 @@ fn pushdown_filter(
     Pushdown {
         fact: (!time_parts.is_empty()).then(|| time_parts.join(" AND ")),
         series: selector,
+        tag_terms,
     }
 }
 

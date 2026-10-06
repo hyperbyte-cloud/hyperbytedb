@@ -1045,7 +1045,9 @@ fn telegraf_cpu_multi_field_query_coalesces_partial_rows() {
 
 #[test]
 fn series_where_tag_filter_joins_dimension() {
-    let stmt = parse_select(r#"SELECT mean("usage_idle") FROM cpu WHERE "host" = 'h1'"#);
+    // Grouping by a tag needs its column, so the series table is joined.
+    let stmt =
+        parse_select(r#"SELECT mean("usage_idle") FROM cpu WHERE "host" = 'h1' GROUP BY "host""#);
     let sql = translate_series(&stmt, &cpu_mapping());
     assert!(
         sql.contains("ANY LEFT JOIN (SELECT * FROM `mydb_autogen_cpu_series` WHERE"),
@@ -1086,14 +1088,44 @@ fn time_and_tag_equality_filter_fact_rows_before_coalescing() {
         ),
         "{inner}"
     );
-    // The full WHERE still applies after the join.
-    assert!(sql.ends_with("WHERE ((\"host\" = 'h1') AND (time >= fromUnixTimestamp(1800000000)))"));
-    // And the join reads only the selected series, not the whole table.
+    // No tag is output or grouped by, so there is no join, and the pushed
+    // tag term leaves the outer WHERE with it.
+    assert!(!sql.contains("JOIN"), "{sql}");
     assert!(
-        sql.contains(
+        sql.ends_with("WHERE (time >= fromUnixTimestamp(1800000000))"),
+        "{sql}"
+    );
+
+    // Grouped by the tag: joined, against only the selected series, and the
+    // full WHERE applies after the join.
+    let grouped = translate_series(
+        &parse_select(
+            r#"SELECT last(usage_idle) FROM cpu WHERE "host" = 'h1' AND time >= 1800000000s GROUP BY "host""#,
+        ),
+        &cpu_mapping(),
+    );
+    assert!(
+        grouped.contains(
             "ANY LEFT JOIN (SELECT * FROM `mydb_autogen_cpu_series` WHERE (\"host\" = 'h1')) AS s"
         ),
-        "{sql}"
+        "{grouped}"
+    );
+    assert!(
+        grouped.contains("WHERE ((\"host\" = 'h1') AND (time >= fromUnixTimestamp(1800000000)))"),
+        "{grouped}"
+    );
+
+    // A tag condition that is not pushed keeps the join, and all of WHERE.
+    let mixed = translate_series(
+        &parse_select(
+            r#"SELECT mean(usage_idle) FROM cpu WHERE "host" = 'h1' AND "region" != 'x'"#,
+        ),
+        &cpu_mapping(),
+    );
+    assert!(mixed.contains("ANY LEFT JOIN"), "{mixed}");
+    assert!(
+        mixed.contains("(\"region\" != 'x')") && mixed.contains("(\"host\" = 'h1')"),
+        "{mixed}"
     );
 }
 
