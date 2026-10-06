@@ -1858,12 +1858,7 @@ fn build_create_table_sql(
         sql.push_str("\n) ENGINE = ReplacingMergeTree(`ingest_seq`)\n");
     }
     sql.push_str("PARTITION BY toDate(`time`)\n");
-    sql.push_str("ORDER BY (`series_id`, `time`)\n");
-    // Queries read one or a few series from every part, decompressing at
-    // least one granule per part to find them: 1024-row granules made a
-    // one-series read 26% cheaper than the 8192 default (45 parts, 30M rows)
-    // with no change to a full scan.
-    sql.push_str("SETTINGS index_granularity = 1024");
+    sql.push_str("ORDER BY (`series_id`, `time`)");
     sql
 }
 
@@ -2758,7 +2753,6 @@ mod tests {
             None,
         );
         assert!(sql.contains("ORDER BY (`series_id`, `time`)"));
-        assert!(sql.ends_with("SETTINGS index_granularity = 1024"), "{sql}");
     }
 
     #[test]
