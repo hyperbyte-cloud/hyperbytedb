@@ -86,9 +86,15 @@ pub struct ShardingConfig {
     /// Seconds a region primary may stay non-Active before Raft leader proposes TransferPrimary.
     #[serde(default = "default_primary_failover_after_secs")]
     pub primary_failover_after_secs: u64,
-    /// Per-candidate HTTP timeout for sharded scatter (queries, metadata, forwards).
+    /// Per-candidate HTTP timeout for sharded scatter of metadata and forwards.
     #[serde(default = "default_scatter_peer_timeout_ms")]
     pub scatter_peer_timeout_ms: u64,
+    /// Per-candidate HTTP timeout for a region query sent to a peer. A region
+    /// query scans data and may take as long as the query itself, so it gets
+    /// the query budget: under the 5 s forward timeout, a 90M-point scan on
+    /// n3 answered 502 while the peer was still working.
+    #[serde(default = "default_scatter_query_timeout_ms")]
+    pub scatter_query_timeout_ms: u64,
     /// Max Active peers tried per region per scatter request.
     #[serde(default = "default_scatter_max_peer_attempts")]
     pub scatter_max_peer_attempts: usize,
@@ -173,6 +179,7 @@ impl Default for ShardingConfig {
             movement_max_inflight_bytes: default_movement_max_inflight_bytes(),
             primary_failover_after_secs: default_primary_failover_after_secs(),
             scatter_peer_timeout_ms: default_scatter_peer_timeout_ms(),
+            scatter_query_timeout_ms: default_scatter_query_timeout_ms(),
             scatter_max_peer_attempts: default_scatter_max_peer_attempts(),
             peer_heal_enabled: default_peer_heal_enabled(),
             transfer_clear_proposals_enabled: default_transfer_clear_proposals_enabled(),
@@ -248,6 +255,11 @@ fn default_primary_failover_after_secs() -> u64 {
 
 fn default_scatter_peer_timeout_ms() -> u64 {
     5000
+}
+
+/// The server's default query timeout (`server.query_timeout_secs`, 30 s).
+fn default_scatter_query_timeout_ms() -> u64 {
+    30_000
 }
 
 fn default_scatter_max_peer_attempts() -> usize {

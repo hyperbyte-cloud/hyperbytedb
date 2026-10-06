@@ -2202,7 +2202,10 @@ async fn query_materialized_region_all_peers(
         return Ok(Vec::new());
     }
 
-    let timeout = std::time::Duration::from_millis(ctx.config.scatter_peer_timeout_ms.max(1));
+    let timeout = crate::application::shard_routing::scatter_timeout(
+        &ctx.config,
+        crate::application::shard_peer_resolution::ScatterKind::Query,
+    );
     let series = if primary == ctx.node_id {
         run_series_query(svc, region_sql, measurement, epoch, resolved_group_by_tags).await?
     } else {

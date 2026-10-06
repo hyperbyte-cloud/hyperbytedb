@@ -54,6 +54,17 @@ pub fn region_by_id(map: &ShardMap, region_id: u64) -> Option<ShardRegion> {
         .cloned()
 }
 
+/// How long one peer may take to answer a scatter of `kind`: a region query
+/// gets the query budget, metadata and forwards the short peer timeout.
+#[must_use]
+pub fn scatter_timeout(config: &ShardingConfig, kind: ScatterKind) -> Duration {
+    let ms = match kind {
+        ScatterKind::Query => config.scatter_query_timeout_ms,
+        ScatterKind::Metadata | ScatterKind::Write => config.scatter_peer_timeout_ms,
+    };
+    Duration::from_millis(ms.max(1))
+}
+
 /// Try remote peers in Active-only order until one succeeds.
 pub async fn scatter_to_region_peers<T, F, Fut>(
     ctx: &ShardRoutingContext,
@@ -93,7 +104,7 @@ where
         )));
     }
 
-    let timeout = Duration::from_millis(ctx.config.scatter_peer_timeout_ms.max(1));
+    let timeout = scatter_timeout(&ctx.config, scatter_kind);
     let mut last_err: Option<HyperbytedbError> = None;
 
     for (attempts, (peer_id, addr)) in peer_addrs.into_iter().enumerate() {
@@ -1333,6 +1344,37 @@ mod scatter_tests {
         assert_eq!(attempts[1].0, 2);
         h1.abort();
         h2.abort();
+    }
+
+    /// A region query gets the query budget; metadata and forwards keep the
+    /// short peer timeout.
+    #[tokio::test]
+    async fn region_queries_get_the_query_timeout() {
+        let (addr, h) = spawn_mock_peer(StatusCode::OK, "ok").await;
+        let config = ShardingConfig {
+            scatter_peer_timeout_ms: 5_000,
+            scatter_query_timeout_ms: 30_000,
+            ..Default::default()
+        };
+        let ctx = test_ctx(membership_with(&[(1, &addr)]), config, 99);
+        let region = sample_region();
+        for (kind, want) in [
+            (ScatterKind::Query, 30_000),
+            (ScatterKind::Metadata, 5_000),
+            (ScatterKind::Write, 5_000),
+        ] {
+            let got = scatter_to_region_peers(
+                &ctx,
+                &region,
+                RegionTargetRole::Read,
+                kind,
+                |_, _, t| async move { Ok::<_, HyperbytedbError>(t) },
+            )
+            .await
+            .unwrap();
+            assert_eq!(got, Duration::from_millis(want), "{kind:?}");
+        }
+        h.abort();
     }
 
     #[tokio::test]
