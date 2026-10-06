@@ -4,6 +4,7 @@ version = "0.8.5"
 edition = "2024"
 
 [dependencies]
+foldhash = "0.2"
 # HTTP
 axum = { version = "0.8", features = ["macros", "http2"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }

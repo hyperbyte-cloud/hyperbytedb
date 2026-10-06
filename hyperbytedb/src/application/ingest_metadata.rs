@@ -47,12 +47,23 @@ const MAX_CACHED_TAG_HASHES: usize = 1_048_576;
 /// nothing has changed (the common steady-state case).
 pub struct IngestSchemaCache {
     /// (db, rp, measurement) → hash of (field_types, tag_keys) for schema identity.
-    schema: RwLock<HashMap<u64, u64>>,
+    schema: RwLock<HashMap<u64, u64, FastHash>>,
     /// Set of hashed (db, measurement, tag_key, tag_value) tuples already persisted.
-    tags: RwLock<HashSet<u64>>,
+    tags: RwLock<HashSet<u64, FastHash>>,
     /// Set of hashed (db, rp, measurement, series_id) tuples already registered,
     /// letting steady-state batches skip `register_series_batch` entirely.
-    series: RwLock<HashSet<u64>>,
+    series: RwLock<HashSet<u64, FastHash>>,
+}
+
+/// The cache's keys and sets live only in memory, so they use foldhash rather
+/// than std's SipHash: every tag of every point is hashed on each write, and
+/// SipHash was 4.1% of a node's CPU on n3.
+type FastHash = foldhash::fast::FixedState;
+
+fn fast_hasher() -> foldhash::fast::FoldHasher<'static> {
+    use std::hash::BuildHasher;
+    static STATE: FastHash = FastHash::with_seed(0x5ca1_ab1e_d00d_f00d);
+    STATE.build_hasher()
 }
 
 impl Default for IngestSchemaCache {
@@ -64,14 +75,14 @@ impl Default for IngestSchemaCache {
 impl IngestSchemaCache {
     pub fn new() -> Self {
         Self {
-            schema: RwLock::new(HashMap::with_capacity(256)),
-            tags: RwLock::new(HashSet::with_capacity(4096)),
-            series: RwLock::new(HashSet::with_capacity(8192)),
+            schema: RwLock::new(HashMap::with_capacity_and_hasher(256, FastHash::default())),
+            tags: RwLock::new(HashSet::with_capacity_and_hasher(4096, FastHash::default())),
+            series: RwLock::new(HashSet::with_capacity_and_hasher(8192, FastHash::default())),
         }
     }
 
     fn hash_key(db: &str, rp: &str, meas: &str) -> u64 {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let mut h = fast_hasher();
         db.hash(&mut h);
         rp.hash(&mut h);
         meas.hash(&mut h);
@@ -79,7 +90,7 @@ impl IngestSchemaCache {
     }
 
     fn hash_schema(field_types: &HashMap<String, u8>, tag_keys: &BTreeSet<String>) -> u64 {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let mut h = fast_hasher();
         let mut fields: Vec<(&String, &u8)> = field_types.iter().collect();
         fields.sort_by_key(|(k, _)| *k);
         for (k, v) in &fields {
@@ -93,7 +104,7 @@ impl IngestSchemaCache {
     }
 
     pub fn hash_tag(db: &str, rp: &str, meas: &str, tag_key: &str, tag_value: &str) -> u64 {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let mut h = fast_hasher();
         db.hash(&mut h);
         rp.hash(&mut h);
         meas.hash(&mut h);
@@ -135,6 +146,17 @@ impl IngestSchemaCache {
         self.is_tag_known_by_hash(h)
     }
 
+    /// Whether every tag value of every point is already persisted, under one
+    /// read lock rather than one per tag.
+    fn all_tags_known(&self, db: &str, rp: &str, points: &[Point]) -> bool {
+        let cache = self.tags.read();
+        points.iter().all(|p| {
+            p.tags
+                .iter()
+                .all(|(k, v)| cache.contains(&Self::hash_tag(db, rp, &p.measurement, k, v)))
+        })
+    }
+
     fn is_tag_known_by_hash(&self, h: u64) -> bool {
         let cache = self.tags.read();
         cache.contains(&h)
@@ -152,7 +174,7 @@ impl IngestSchemaCache {
     }
 
     fn hash_series(db: &str, rp: &str, meas: &str, sid: u64) -> u64 {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let mut h = fast_hasher();
         db.hash(&mut h);
         rp.hash(&mut h);
         meas.hash(&mut h);
@@ -561,9 +583,15 @@ pub async fn prepare_batch_metadata(
     let mut measurements: HashMap<String, (HashMap<String, u8>, BTreeSet<String>)> = HashMap::new();
 
     for point in points {
-        let entry = measurements
-            .entry(point.measurement.clone())
-            .or_insert_with(|| (HashMap::new(), BTreeSet::new()));
+        // Clone a name only the first time it is seen: this loop runs per
+        // point, and cloning the measurement and every tag key on every
+        // point was most of prepare_batch_metadata's own time.
+        if !measurements.contains_key(&point.measurement) {
+            measurements.insert(point.measurement.clone(), (HashMap::new(), BTreeSet::new()));
+        }
+        let Some(entry) = measurements.get_mut(&point.measurement) else {
+            continue;
+        };
         for (k, v) in &point.fields {
             let disc = v.type_discriminant();
             match entry.0.get_mut(k) {
@@ -578,7 +606,9 @@ pub async fn prepare_batch_metadata(
             }
         }
         for k in point.tags.keys() {
-            entry.1.insert(k.clone());
+            if !entry.1.contains(k) {
+                entry.1.insert(k.clone());
+            }
         }
     }
 
@@ -589,11 +619,7 @@ pub async fn prepare_batch_metadata(
 
         if all_schemas_known {
             // Schema is known → field types are unchanged, check_field_types is redundant.
-            let all_tags_known = points.iter().all(|p| {
-                p.tags
-                    .iter()
-                    .all(|(k, v)| sc.is_tag_known(db, rp, &p.measurement, k, v))
-            });
+            let all_tags_known = sc.all_tags_known(db, rp, points);
             if all_tags_known {
                 // Full cache hit: zero I/O.
                 metrics::counter!("hyperbytedb_ingest_schema_cache_hits_total").increment(1);
@@ -777,6 +803,21 @@ mod tests {
             timestamp: ts,
             series_id_cache: Default::default(),
         }
+    }
+
+    /// The batch tag check passes only when every tag value of every point is
+    /// cached.
+    #[test]
+    fn all_tags_known_needs_every_tag_value() {
+        let cache = IngestSchemaCache::new();
+        let known = point("cpu", &[("v", FieldValue::Float(1.0))], 1);
+        cache.mark_tags(&[(IngestSchemaCache::hash_tag("db", "rp", "cpu", "host", "h"),)]);
+        assert!(cache.all_tags_known("db", "rp", std::slice::from_ref(&known)));
+
+        let mut other = point("cpu", &[("v", FieldValue::Float(1.0))], 2);
+        other.tags.insert("host".into(), "new".into());
+        assert!(!cache.all_tags_known("db", "rp", &[known.clone(), other]));
+        assert!(!cache.all_tags_known("other_db", "rp", &[known]));
     }
 
     /// Simulates two cluster nodes that seeded `uptime` differently in local

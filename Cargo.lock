@@ -1965,6 +1965,7 @@ dependencies = [
  "criterion",
  "figment",
  "flate2",
+ "foldhash 0.2.0",
  "futures",
  "humantime",
  "indexmap",

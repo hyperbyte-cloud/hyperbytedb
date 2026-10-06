@@ -62,6 +62,10 @@ use crate::domain::field_type::{merge_field_type_map, widen_field_disc};
 use crate::domain::measurement::MeasurementMeta;
 use crate::domain::point::{FieldValue, Point};
 use crate::domain::series::series_id_for_point;
+
+/// Series ids are already well-mixed hashes; foldhash is far cheaper than
+/// std's SipHash for these per-point membership checks.
+type IdSet = HashSet<u64, foldhash::fast::FixedState>;
 use crate::error::HyperbytedbError;
 use crate::ports::metadata::MetadataPort;
 use crate::ports::points_sink::{PointsSinkPort, WriteAck};
@@ -232,7 +236,7 @@ pub struct ChdbNativeAdapter {
     /// the dimension insert + metadata write. Loaded on startup by
     /// [`Self::warm_series_from_metadata`]. A lean `HashSet<u64>` — the
     /// authoritative `series_id → tags` map lives in the metadata layer.
-    known_series: Arc<RwLock<LruCache<TableKey, HashSet<u64>>>>,
+    known_series: Arc<RwLock<LruCache<TableKey, IdSet>>>,
     /// `DESCRIBE TABLE` probes issued by `ensure_table`; see there.
     engine_probes: Arc<std::sync::atomic::AtomicU64>,
     /// Per-table async mutex serialising DDL. Without this two
@@ -462,7 +466,7 @@ impl ChdbNativeAdapter {
                         rp: rp.name.clone(),
                         measurement: meas_name.clone(),
                     };
-                    let ids: HashSet<u64> = series.into_iter().collect();
+                    let ids: IdSet = series.into_iter().collect();
                     warmed += ids.len();
                     self.known_series.write().put(key, ids);
                 }
@@ -485,11 +489,34 @@ impl ChdbNativeAdapter {
         map.peek(key).is_some_and(|s| s.contains(&sid))
     }
 
+    /// The first point of each series in `sids` not yet registered for this
+    /// table. One lock and one table lookup for the batch: looking each point
+    /// up separately re-hashed the table key's three strings per point
+    /// (`series_known` was 6% of a node's CPU on n3).
+    fn unregistered_series<'p, P: Borrow<Point>>(
+        &self,
+        key: &TableKey,
+        points: &'p [P],
+        sids: &[u64],
+    ) -> Vec<(u64, &'p Point)> {
+        let map = self.known_series.read();
+        let known = map.peek(key);
+        let mut seen = IdSet::default();
+        let mut out = Vec::new();
+        for (i, &sid) in sids.iter().enumerate() {
+            if known.is_some_and(|s| s.contains(&sid)) || !seen.insert(sid) {
+                continue;
+            }
+            out.push((sid, points[i].borrow()));
+        }
+        out
+    }
+
     /// Record `series_id`s as registered for this table.
     fn mark_series(&self, key: &TableKey, ids: impl IntoIterator<Item = u64>) {
         let mut map = self.known_series.write();
         if !map.contains(key) {
-            map.put(key.clone(), HashSet::new());
+            map.put(key.clone(), IdSet::default());
         }
         if let Some(set) = map.get_mut(key) {
             set.extend(ids);
@@ -926,14 +953,7 @@ impl ChdbNativeAdapter {
         points: &[Point],
         sids: &[u64],
     ) -> Result<(), HyperbytedbError> {
-        let mut seen: HashSet<u64> = HashSet::new();
-        let mut new_series: Vec<(u64, &Point)> = Vec::new();
-        for (i, &sid) in sids.iter().enumerate() {
-            if self.series_known(key, sid) || !seen.insert(sid) {
-                continue;
-            }
-            new_series.push((sid, &points[i]));
-        }
+        let new_series = self.unregistered_series(key, points, sids);
         if new_series.is_empty() {
             return Ok(());
         }
@@ -1401,14 +1421,7 @@ impl ChdbNativeAdapter {
         points: &[P],
         sids: &[u64],
     ) -> Result<Option<Arc<RecordBatch>>, HyperbytedbError> {
-        let mut seen: HashSet<u64> = HashSet::new();
-        let mut new_series: Vec<(u64, &Point)> = Vec::new();
-        for (i, &sid) in sids.iter().enumerate() {
-            if self.series_known(key, sid) || !seen.insert(sid) {
-                continue;
-            }
-            new_series.push((sid, points[i].borrow()));
-        }
+        let new_series = self.unregistered_series(key, points, sids);
         if new_series.is_empty() {
             return Ok(None);
         }
@@ -2956,6 +2969,34 @@ mod tests {
         assert_eq!(idle_col.value(0), 95.0);
         assert_eq!(user_col.value(0), 4.0);
         assert_eq!(system_col.value(0), 1.0);
+    }
+
+    /// One lookup per batch: each series not yet registered comes back once,
+    /// with its first point, and registered series are skipped.
+    #[test]
+    fn unregistered_series_lists_each_new_series_once() {
+        // Lazy session: this check never touches chDB, so no engine opens.
+        let session = crate::adapters::chdb::session::SharedSession::new("/nonexistent");
+        let adapter = ChdbNativeAdapter::new(session);
+        let key = TableKey {
+            db: "db".into(),
+            rp: "rp".into(),
+            measurement: "m".into(),
+        };
+        let a1 = make_point(1, &[("host", "a")], &[("v", FieldValue::Float(1.0))]);
+        let a2 = make_point(2, &[("host", "a")], &[("v", FieldValue::Float(2.0))]);
+        let b = make_point(3, &[("host", "b")], &[("v", FieldValue::Float(3.0))]);
+        let c = make_point(4, &[("host", "c")], &[("v", FieldValue::Float(4.0))]);
+        let points = [a1, a2, b, c];
+        let sids: Vec<u64> = points.iter().map(series_id_for_point).collect();
+        adapter.mark_series(&key, [sids[2]]);
+
+        let new: Vec<(u64, i64)> = adapter
+            .unregistered_series(&key, &points, &sids)
+            .into_iter()
+            .map(|(sid, p)| (sid, p.timestamp))
+            .collect();
+        assert_eq!(new, vec![(sids[0], 1), (sids[3], 4)]);
     }
 
     #[test]
