@@ -26,6 +26,13 @@ pub enum QueryKind {
     LastHost,
     /// Every measured value of one random series.
     RawHost,
+    /// `mean` per host over 10 random hosts picked Grafana-style
+    /// (`host =~ /^(sA|sB|...)$/`), grouped by host.
+    RegexHosts,
+    /// `last` per host over 10 random hosts, grouped by host.
+    LastHosts,
+    /// `mean` per 10 s window of one random series.
+    WindowHost,
 }
 
 impl QueryKind {
@@ -35,12 +42,23 @@ impl QueryKind {
             Self::Mean10s => "mean_10s",
             Self::LastHost => "last_host",
             Self::RawHost => "raw_host",
+            Self::RegexHosts => "regex_hosts",
+            Self::LastHosts => "last_hosts",
+            Self::WindowHost => "window_host",
         }
     }
 
-    /// The InfluxQL for this kind; `host` picks the series for per-host kinds.
-    pub fn sql(self, measurement: &str, host: u64) -> String {
+    /// The InfluxQL for this kind; `host` picks the series for per-host kinds
+    /// (and the first of ten, 7919 apart modulo `series`, for the multi-host
+    /// kinds).
+    pub fn sql(self, measurement: &str, host: u64, series: u64) -> String {
         let from = format!("time >= {MEASURE_START_SECS}s");
+        let ten = || {
+            (0..10u64)
+                .map(|i| format!("s{}", (host + i * 7919) % series.max(1)))
+                .collect::<Vec<_>>()
+                .join("|")
+        };
         match self {
             Self::CountAll => format!("SELECT count(value) FROM \"{measurement}\" WHERE {from}"),
             Self::Mean10s => format!(
@@ -53,6 +71,18 @@ impl QueryKind {
             Self::RawHost => {
                 format!("SELECT value FROM \"{measurement}\" WHERE host = 's{host}' AND {from}")
             }
+            Self::RegexHosts => format!(
+                "SELECT mean(value) FROM \"{measurement}\" WHERE host =~ /^({})$/ AND {from} GROUP BY host",
+                ten()
+            ),
+            Self::LastHosts => format!(
+                "SELECT last(value) FROM \"{measurement}\" WHERE host =~ /^({})$/ AND {from} GROUP BY host",
+                ten()
+            ),
+            Self::WindowHost => format!(
+                "SELECT mean(value) FROM \"{measurement}\" WHERE host = 's{host}' AND {from} AND time < {}s GROUP BY time(10s)",
+                MEASURE_START_SECS + 100
+            ),
         }
     }
 }
@@ -166,7 +196,7 @@ pub async fn run(a: BenchReadArgs) -> u8 {
                     seed ^= seed << 13;
                     seed ^= seed >> 7;
                     seed ^= seed << 17;
-                    let q = kind.sql(&measurement, seed % series);
+                    let q = kind.sql(&measurement, seed % series, series);
                     let ep = &endpoints[(idx + n) % endpoints.len()];
                     n += 1;
                     match run_query(&http, ep, &db, &q).await {
@@ -212,14 +242,17 @@ mod tests {
     #[test]
     fn queries_target_the_bench_write_dataset() {
         assert_eq!(
-            QueryKind::LastHost.sql("cpu", 42),
+            QueryKind::LastHost.sql("cpu", 42, 100),
             "SELECT last(value) FROM \"cpu\" WHERE host = 's42' AND time >= 1800000000s"
         );
         assert!(
             QueryKind::Mean10s
-                .sql("cpu", 0)
+                .sql("cpu", 0, 100)
                 .ends_with("GROUP BY time(10s)")
         );
+        let multi = QueryKind::RegexHosts.sql("cpu", 1, 100);
+        assert!(multi.contains("host =~ /^(s1|s20|s39|"), "{multi}");
+        assert!(multi.ends_with("GROUP BY host"));
     }
 
     #[test]
