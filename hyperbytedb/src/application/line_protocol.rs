@@ -63,15 +63,31 @@ pub fn is_binary_points(body: &[u8]) -> bool {
 /// (forwards, replication apply, hint replay) accepts either form.
 /// Timestamps are carried as stored (nanoseconds); precision does not apply.
 pub fn encode_points_binary(points: &[Point]) -> Result<Vec<u8>, HyperbytedbError> {
-    let payload = bincode::serialize(points)
-        .map_err(|e| HyperbytedbError::Internal(format!("encode points: {e}").into()))?;
-    let len = u32::try_from(payload.len())
-        .map_err(|_| HyperbytedbError::PayloadTooLarge("points frame over 4 GiB".into()))?;
-    let mut out = Vec::with_capacity(8 + payload.len());
+    // One pass straight into the frame. `bincode::serialize` walks every point
+    // twice (once to size the buffer) and the payload was then copied into
+    // the frame; on n3 the sizing pass alone was ~3% of a node's CPU.
+    let mut out = Vec::with_capacity(8 + points.len() * POINT_ENCODED_SIZE_HINT);
     out.extend_from_slice(POINTS_FRAME_MAGIC);
-    out.extend_from_slice(&len.to_le_bytes());
-    out.extend_from_slice(&payload);
+    out.extend_from_slice(&[0; 4]);
+    encode_bincode_into(&mut out, points)
+        .map_err(|e| HyperbytedbError::Internal(format!("encode points: {e}").into()))?;
+    let len = u32::try_from(out.len() - 8)
+        .map_err(|_| HyperbytedbError::PayloadTooLarge("points frame over 4 GiB".into()))?;
+    out[4..8].copy_from_slice(&len.to_le_bytes());
     Ok(out)
+}
+
+/// Starting buffer size per point for one-pass bincode encoding: a point with
+/// a few short tags and one field. Only a hint; the buffer grows as needed.
+pub const POINT_ENCODED_SIZE_HINT: usize = 96;
+
+/// Append `value`'s bincode encoding to `out` in one pass. Same bytes as
+/// `bincode::serialize`, without its separate sizing pass.
+pub fn encode_bincode_into<T: serde::Serialize + ?Sized>(
+    out: &mut Vec<u8>,
+    value: &T,
+) -> Result<(), bincode::Error> {
+    bincode::serialize_into(out, value)
 }
 
 /// Decode one or more frames. Whitespace between frames is skipped, so the
@@ -434,6 +450,27 @@ mod encode_tests {
 #[cfg(test)]
 mod binary_points_tests {
     use super::{encode_points_binary, is_binary_points, parse_line_body_to_points_limited};
+
+    /// The one-pass encoder must produce exactly the old two-pass frame, or
+    /// nodes on either side of an upgrade would misread each other.
+    #[test]
+    fn one_pass_frame_matches_the_two_pass_encoding() {
+        let points = super::parse_line_body_to_points(
+            b"cpu,host=a,dc=x v=1,w=2i 1\nmem,host=b used=3u,ok=true,s=\"t\" 2",
+            None,
+        )
+        .unwrap();
+        let payload = bincode::serialize(&points).unwrap();
+        let mut old = Vec::new();
+        old.extend_from_slice(super::POINTS_FRAME_MAGIC);
+        old.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        old.extend_from_slice(&payload);
+        assert_eq!(encode_points_binary(&points).unwrap(), old);
+
+        let mut one = Vec::new();
+        super::encode_bincode_into(&mut one, &points).unwrap();
+        assert_eq!(one, payload);
+    }
     use crate::domain::point::{FieldValue, Point};
 
     fn pt(host: &str, v: f64, ts: i64) -> Point {
