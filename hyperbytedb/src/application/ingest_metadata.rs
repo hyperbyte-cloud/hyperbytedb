@@ -41,6 +41,9 @@ pub fn validate_point_count(count: usize, max_points: usize) -> Result<(), Hyper
 /// Cache misses are harmless (fall back to a RocksDB lookup).
 const MAX_CACHED_TAG_HASHES: usize = 1_048_576;
 
+/// Unregistered series per measurement: series id → its tags.
+type SeriesByMeasurement = HashMap<String, BTreeMap<u64, BTreeMap<String, String>>>;
+
 /// Fast in-memory cache for the ingest hot path.  Tracks which measurement
 /// schemas and tag values have already been persisted so that
 /// `prepare_batch_metadata` can return immediately with zero I/O when
@@ -148,7 +151,7 @@ impl IngestSchemaCache {
 
     /// Whether every tag value of every point is already persisted, under one
     /// read lock rather than one per tag.
-    fn all_tags_known(&self, db: &str, rp: &str, points: &[Point]) -> bool {
+    fn all_tags_known(&self, db: &str, rp: &str, points: &[&Point]) -> bool {
         let cache = self.tags.read();
         points.iter().all(|p| {
             p.tags
@@ -183,15 +186,17 @@ impl IngestSchemaCache {
     }
 
     /// Split `points` into per-measurement subsets containing only series this
-    /// cache has never seen registered. Empty map ⇒ every series is already
-    /// known and `register_series_batch` can be skipped entirely.
-    fn unknown_series_by_measurement(
+    /// cache has never seen registered, plus the points of those series. Empty
+    /// map ⇒ every series is already known and `register_series_batch` can be
+    /// skipped entirely.
+    fn unknown_series_by_measurement<'p>(
         &self,
         db: &str,
         rp: &str,
-        points: &[Point],
-    ) -> HashMap<String, BTreeMap<u64, BTreeMap<String, String>>> {
+        points: &'p [Point],
+    ) -> (SeriesByMeasurement, Vec<&'p Point>) {
         let mut out: HashMap<String, BTreeMap<u64, BTreeMap<String, String>>> = HashMap::new();
+        let mut fresh = Vec::new();
         let series = self.series.read();
         for p in points {
             let sid = crate::domain::series::series_id_for_point(p);
@@ -199,15 +204,22 @@ impl IngestSchemaCache {
             if series.contains(&h) {
                 continue;
             }
+            fresh.push(p);
             out.entry(p.measurement.clone())
                 .or_default()
                 .entry(sid)
                 .or_insert_with(|| p.tags.clone());
         }
-        out
+        (out, fresh)
     }
 
-    fn mark_series_seen(&self, db: &str, rp: &str, points: &[Point]) {
+    /// Mark these points' series as registered. Called only once their tag
+    /// values are persisted too, which is what lets later batches skip the
+    /// tag check for every point of a known series.
+    fn mark_series_seen(&self, db: &str, rp: &str, points: &[&Point]) {
+        if points.is_empty() {
+            return;
+        }
         let mut cache = self.series.write();
         if cache.len() > MAX_CACHED_TAG_HASHES {
             cache.clear();
@@ -569,13 +581,20 @@ pub async fn prepare_batch_metadata(
     // all already known skip the RocksDB registration round-trip entirely.
     // Unknown subsets register per measurement; registration is an idempotent
     // upsert, so a racing batch duplicating one new series is harmless.
+    //
+    // `fresh` is the points of series not seen before. A seen series had all
+    // its tag values persisted when it was first written (series are marked
+    // seen only after that), so only fresh points can carry an unseen tag
+    // value. Checking every tag of every point instead was ~5% of a node's
+    // CPU on n3, nearly all of it on series that were long known.
+    let mut fresh: Vec<&Point> = Vec::new();
     match schema_cache {
         Some(sc) => {
-            let unknown = sc.unknown_series_by_measurement(db, rp, points);
+            let (unknown, new_points) = sc.unknown_series_by_measurement(db, rp, points);
             if !unknown.is_empty() {
                 register_series_entries(metadata, db, rp, unknown).await?;
-                sc.mark_series_seen(db, rp, points);
             }
+            fresh = new_points;
         }
         None => register_series_from_points(metadata, db, rp, points).await?,
     }
@@ -619,9 +638,10 @@ pub async fn prepare_batch_metadata(
 
         if all_schemas_known {
             // Schema is known → field types are unchanged, check_field_types is redundant.
-            let all_tags_known = sc.all_tags_known(db, rp, points);
+            let all_tags_known = sc.all_tags_known(db, rp, &fresh);
             if all_tags_known {
                 // Full cache hit: zero I/O.
+                sc.mark_series_seen(db, rp, &fresh);
                 metrics::counter!("hyperbytedb_ingest_schema_cache_hits_total").increment(1);
                 return Ok(());
             }
@@ -630,7 +650,7 @@ pub async fn prepare_batch_metadata(
             // Tag values are only needed for SHOW TAG VALUES queries, not write
             // correctness, but import-style bulk loads query metadata immediately
             // after the write returns.
-            let novel_hashes: Vec<(u64,)> = points
+            let novel_hashes: Vec<(u64,)> = fresh
                 .iter()
                 .flat_map(|p| {
                     p.tags.iter().filter_map(move |(k, v)| {
@@ -650,7 +670,7 @@ pub async fn prepare_batch_metadata(
             for meas_name in measurements.keys() {
                 let mut seen: HashSet<(String, String)> = HashSet::new();
                 let mut batch: Vec<(String, String)> = Vec::new();
-                for point in points.iter().filter(|pt| pt.measurement == *meas_name) {
+                for point in fresh.iter().filter(|pt| pt.measurement == *meas_name) {
                     for (k, v) in &point.tags {
                         let h = IngestSchemaCache::hash_tag(db, rp, &point.measurement, k, v);
                         if novel_set.contains(&h) && seen.insert((k.clone(), v.clone())) {
@@ -668,6 +688,7 @@ pub async fn prepare_batch_metadata(
                     .await?;
                 sc.mark_tags(&novel_hashes);
             }
+            sc.mark_series_seen(db, rp, &fresh);
             metrics::counter!("hyperbytedb_ingest_schema_cache_hits_total").increment(1);
             return Ok(());
         }
@@ -779,6 +800,7 @@ pub async fn prepare_batch_metadata(
             })
             .collect();
         sc.mark_tags(&novel_hashes);
+        sc.mark_series_seen(db, rp, &fresh);
     }
 
     Ok(())
@@ -805,6 +827,72 @@ mod tests {
         }
     }
 
+    /// Tag checks run only for points of series not seen before. A new tag
+    /// value always means a new series id, so a new host under a schema that
+    /// is already known must still have its tag value persisted, and a batch
+    /// of known series must not re-check any tag.
+    #[tokio::test]
+    async fn only_new_series_have_their_tag_values_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta: Arc<dyn MetadataPort> =
+            Arc::new(RocksDbMetadata::open(dir.path().join("meta")).unwrap());
+        meta.create_database("db").await.unwrap();
+        let cache = IngestSchemaCache::new();
+        let host = |h: &str, ts: i64| {
+            let mut p = point("cpu", &[("v", FieldValue::Float(1.0))], ts);
+            p.tags.insert("host".into(), h.into());
+            p
+        };
+        let limits = IngestCardinalityLimits::default();
+
+        // First write: schema unknown, slow path registers host=a.
+        prepare_batch_metadata(
+            &meta,
+            "db",
+            "autogen",
+            &[host("a", 1)],
+            limits,
+            Some(&cache),
+        )
+        .await
+        .unwrap();
+        // Known schema, new series: host=b must still be persisted.
+        prepare_batch_metadata(
+            &meta,
+            "db",
+            "autogen",
+            &[host("a", 2), host("b", 3)],
+            limits,
+            Some(&cache),
+        )
+        .await
+        .unwrap();
+        for h in ["a", "b"] {
+            assert!(
+                meta.tag_value_is_known("db", "autogen", "cpu", "host", h)
+                    .await
+                    .unwrap(),
+                "host={h} must be persisted"
+            );
+        }
+        let tag_hash = |h: &str| IngestSchemaCache::hash_tag("db", "autogen", "cpu", "host", h);
+        assert!(cache.is_tag_known_by_hash(tag_hash("b")));
+
+        // Known series only: no point is fresh, so no tag is looked at. Drop
+        // the tag cache to prove it: a re-check would now see "unknown".
+        cache.tags.write().clear();
+        let again = [host("a", 4), host("b", 5)];
+        let (unknown, fresh) = cache.unknown_series_by_measurement("db", "autogen", &again);
+        assert!(unknown.is_empty() && fresh.is_empty());
+        prepare_batch_metadata(&meta, "db", "autogen", &again, limits, Some(&cache))
+            .await
+            .unwrap();
+        assert!(
+            !cache.is_tag_known_by_hash(tag_hash("a")),
+            "known series must not trigger tag work"
+        );
+    }
+
     /// The batch tag check passes only when every tag value of every point is
     /// cached.
     #[test]
@@ -812,12 +900,12 @@ mod tests {
         let cache = IngestSchemaCache::new();
         let known = point("cpu", &[("v", FieldValue::Float(1.0))], 1);
         cache.mark_tags(&[(IngestSchemaCache::hash_tag("db", "rp", "cpu", "host", "h"),)]);
-        assert!(cache.all_tags_known("db", "rp", std::slice::from_ref(&known)));
+        assert!(cache.all_tags_known("db", "rp", &[&known]));
 
         let mut other = point("cpu", &[("v", FieldValue::Float(1.0))], 2);
         other.tags.insert("host".into(), "new".into());
-        assert!(!cache.all_tags_known("db", "rp", &[known.clone(), other]));
-        assert!(!cache.all_tags_known("other_db", "rp", &[known]));
+        assert!(!cache.all_tags_known("db", "rp", &[&known, &other]));
+        assert!(!cache.all_tags_known("other_db", "rp", &[&known]));
     }
 
     /// Simulates two cluster nodes that seeded `uptime` differently in local
