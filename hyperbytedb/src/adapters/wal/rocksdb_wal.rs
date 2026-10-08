@@ -35,6 +35,7 @@ fn be_bytes_to_u64(bytes: &[u8]) -> u64 {
 pub struct RocksDbWal {
     db: Arc<DB>,
     seq: Arc<AtomicU64>,
+    flushed_through: AtomicU64,
     arrow_cache: Arc<WalArrowCache>,
     wal_format: WalFormat,
     arrow_wal_enabled: bool,
@@ -208,6 +209,7 @@ impl RocksDbWal {
         Ok(Self {
             db,
             seq: Arc::new(AtomicU64::new(seq)),
+            flushed_through: AtomicU64::new(0),
             arrow_cache: Arc::new(WalArrowCache::new()),
             wal_format: options.wal_format,
             arrow_wal_enabled: options.arrow_wal_enabled,
@@ -579,6 +581,14 @@ impl WalPort for RocksDbWal {
 
     async fn last_sequence(&self) -> Result<u64, HyperbytedbError> {
         Ok(self.seq.load(Ordering::Relaxed))
+    }
+
+    fn flushed_through(&self) -> u64 {
+        self.flushed_through.load(Ordering::Acquire)
+    }
+
+    fn set_flushed_through(&self, sequence: u64) {
+        self.flushed_through.store(sequence, Ordering::Release);
     }
 
     async fn flush_wal(&self) -> Result<(), HyperbytedbError> {

@@ -702,7 +702,21 @@ async fn transfer_region_data(
 
     // Unflushed WAL rows: chunked and resumable so regions with more pending
     // points than one chunk transfers never fail permanently (H4).
-    let mut cursor = WalExportCursor::default();
+    //
+    // Only unflushed: rows the flush has written are exported from chDB below.
+    // Starting at 0 decoded the node's whole retained WAL for every copy, 18 GB
+    // on n3, to keep the ~1/18 in this region and send it all again from chDB;
+    // a copy then pushed nothing for minutes. Without a chDB pass there is no
+    // other source, so the WAL is read from the start.
+    let flushed = wal.flushed_through();
+    let mut cursor = WalExportCursor {
+        from_seq: if query_port.is_some() && flushed > 0 {
+            flushed + 1
+        } else {
+            0
+        },
+        skip_points_in_head_entry: 0,
+    };
     loop {
         let (body, count, next_cursor) =
             export_region_points_from_wal_chunked(wal, key, region, cursor, max_points, 0).await?;
@@ -1077,6 +1091,160 @@ mod tests {
 
     fn host_tag(v: &str) -> BTreeMap<String, String> {
         [("host".into(), v.into())].into()
+    }
+
+    /// A copy sends each row once: flushed rows from chDB, the rest from the
+    /// WAL. The WAL pass started at 0 and re-read every flushed entry, so it
+    /// sent flushed rows twice and, on a node with an 18 GB WAL, pushed
+    /// nothing for minutes while it decoded the lot.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn a_copy_reads_only_unflushed_wal_entries() {
+        use crate::adapters::chdb::native_adapter::ChdbNativeAdapter;
+        use crate::adapters::chdb::query_adapter::ChdbQueryAdapter;
+        use crate::adapters::chdb::session::SharedSession;
+        use crate::adapters::cluster::peer_client::PeerClient;
+        use crate::adapters::cluster::replication_log::ReplicationLog;
+        use crate::adapters::wal::rocksdb_wal::RocksDbWal;
+        use crate::application::ingest_metadata::{
+            IngestCardinalityLimits, prepare_batch_metadata,
+        };
+        use crate::domain::cluster::membership::{
+            ClusterMembership, NodeInfo, NodeState, new_shared,
+        };
+        use crate::domain::point::{FieldValue, Point};
+        use crate::ports::wal::WalEntry;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let received = Arc::new(AtomicU64::new(0));
+        let seen = received.clone();
+        let app = axum::Router::new().route(
+            "/internal/shard/transfer",
+            axum::routing::post(move |body: axum::body::Bytes| {
+                let seen = seen.clone();
+                async move {
+                    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let raw: Vec<u8> = payload["body"]
+                        .as_array()
+                        .map(|b| {
+                            b.iter()
+                                .filter_map(|v| v.as_u64())
+                                .map(|n| n as u8)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let lines = String::from_utf8_lossy(&raw)
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .count() as u64;
+                    seen.fetch_add(lines, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({ "applied": lines }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = ClusterMembership::new();
+        m.add_node(NodeInfo {
+            node_id: 2,
+            addr,
+            state: NodeState::Active,
+            joined_at: 0,
+            last_heartbeat: 0,
+            needs_sync: false,
+            consecutive_misses: 0,
+        });
+        let pc = Arc::new(PeerClient::new(
+            1,
+            "127.0.0.1:1".into(),
+            new_shared(m),
+            Arc::new(ReplicationLog::open(dir.path().join("repl")).unwrap()),
+            3,
+            64,
+            2,
+            1 << 20,
+        ));
+        let chdb = SharedSession::new_eager(dir.path().join("chdb").to_str().unwrap(), 1).unwrap();
+        let query: Arc<dyn QueryPort> = Arc::new(ChdbQueryAdapter::from_shared(chdb.clone(), 0));
+        let sink = ChdbNativeAdapter::new(chdb);
+        let metadata: Arc<dyn MetadataPort> =
+            Arc::new(RocksDbMetadata::open(dir.path().join("meta")).unwrap());
+        let wal: Arc<dyn WalPort> = Arc::new(RocksDbWal::open(dir.path().join("wal")).unwrap());
+
+        let points = |from: usize, n: usize| -> Vec<Point> {
+            (from..from + n)
+                .map(|i| Point {
+                    measurement: "cpu".into(),
+                    tags: host_tag(&format!("h{i}")),
+                    fields: [("v".to_string(), FieldValue::Float(1.0))].into(),
+                    timestamp: 1_000_000_000,
+                    series_id_cache: Default::default(),
+                })
+                .collect()
+        };
+        let entry = |points: Vec<Point>| WalEntry {
+            database: "db".into(),
+            retention_policy: "autogen".into(),
+            points,
+            origin_node_id: 0,
+        };
+        let (flushed, unflushed) = (points(0, 100), points(100, 50));
+        let all: Vec<Point> = flushed.iter().chain(&unflushed).cloned().collect();
+        let limits = IngestCardinalityLimits {
+            max_tag_values_per_measurement: 0,
+            max_measurements_per_database: 0,
+        };
+        prepare_batch_metadata(&metadata, "db", "autogen", &all, limits, None)
+            .await
+            .unwrap();
+
+        // What a flush does: the entry reaches chDB, then its watermark is set.
+        let seq = wal.append(entry(flushed.clone())).await.unwrap();
+        sink.write_points("db", "autogen", "cpu", &[0; 100], seq, &flushed)
+            .await
+            .unwrap();
+        wal.set_flushed_through(seq);
+        wal.append(entry(unflushed)).await.unwrap();
+
+        let region = ShardRegion {
+            region_id: 1,
+            start: 0,
+            end: u64::MAX,
+            epoch: Default::default(),
+            peers: vec![1],
+            primary: 1,
+            last_split_at: 0,
+            transfer_verified: None,
+            transfer_first_seen: None,
+            state: Default::default(),
+            staged_from: None,
+            staging_peers: Vec::new(),
+        };
+        let outcome = transfer_region_data(
+            &pc,
+            &metadata,
+            &wal,
+            Some(&query),
+            1,
+            &MeasurementKey::new("db", "autogen", "cpu"),
+            &region,
+            2,
+            10_000,
+            true,
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            received.load(Ordering::SeqCst),
+            150,
+            "each of the 150 rows once: 100 from chDB, 50 from the WAL"
+        );
+        assert_eq!(outcome.exported, 150);
     }
 
     #[tokio::test]

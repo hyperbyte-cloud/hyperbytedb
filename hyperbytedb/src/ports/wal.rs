@@ -78,6 +78,16 @@ pub trait WalPort: Send + Sync {
     async fn truncate_before(&self, sequence: u64) -> Result<(), HyperbytedbError>;
     async fn last_sequence(&self) -> Result<u64, HyperbytedbError>;
 
+    /// Highest sequence whose entries are all in the local store, as the flush
+    /// last recorded it. 0 means unknown (nothing flushed since start), and a
+    /// reader must then treat every entry as possibly unflushed.
+    fn flushed_through(&self) -> u64 {
+        0
+    }
+
+    /// Record that every entry up to `sequence` is in the local store.
+    fn set_flushed_through(&self, _sequence: u64) {}
+
     /// Remove all durable and in-memory WAL entries for `database`.
     async fn purge_database(&self, database: &str) -> Result<(), HyperbytedbError> {
         let _ = database;

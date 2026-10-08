@@ -297,6 +297,14 @@ impl WalPort for BatchingWal {
         self.inner.last_sequence().await
     }
 
+    fn flushed_through(&self) -> u64 {
+        self.inner.flushed_through()
+    }
+
+    fn set_flushed_through(&self, sequence: u64) {
+        self.inner.set_flushed_through(sequence);
+    }
+
     async fn flush_wal(&self) -> Result<(), HyperbytedbError> {
         self.inner.flush_wal().await
     }

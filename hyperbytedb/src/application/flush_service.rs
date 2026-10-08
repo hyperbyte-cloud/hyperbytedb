@@ -472,6 +472,7 @@ impl FlushServiceImpl {
         }
 
         *self.last_flushed.lock().await = flushed_through;
+        self.wal.set_flushed_through(flushed_through);
         *cursor = flushed_through;
         *total_entries_processed += chunk_entry_count as u64;
 
@@ -732,6 +733,7 @@ impl FlushServiceImpl {
             }
 
             *self.last_flushed.lock().await = flushed_through;
+            self.wal.set_flushed_through(flushed_through);
             cursor = flushed_through;
             total_entries_processed += chunk_entry_count as u64;
 
@@ -879,6 +881,34 @@ mod tests {
             1,
             "failed chunk must stay in the WAL for retry, not be truncated"
         );
+        assert!(
+            wal.flushed_through() < seq,
+            "a failed chunk must not be recorded as flushed"
+        );
+    }
+
+    /// A region copy reads only WAL entries past this watermark and takes the
+    /// rest from chDB, so a flush must record it.
+    #[tokio::test]
+    async fn a_flush_records_how_far_the_wal_is_flushed() {
+        let tmp = TempDir::new().unwrap();
+        let wal: Arc<dyn WalPort> = Arc::new(
+            RocksDbWal::open_with_options(
+                tmp.path(),
+                RocksDbWalOptions {
+                    wal_format: WalFormat::Bincode,
+                    arrow_wal_enabled: false,
+                },
+            )
+            .unwrap(),
+        );
+        wal.append(entry()).await.unwrap();
+        let seq = wal.append(entry()).await.unwrap();
+
+        let flush = FlushServiceImpl::new(wal.clone(), 0, Arc::new(CountingSink::default()));
+        flush.flush().await.unwrap();
+
+        assert_eq!(wal.flushed_through(), seq);
     }
 
     /// Sink that records how many writes run at once and how many points are
