@@ -80,6 +80,13 @@ struct PendingPlacement {
     approx_bytes: u64,
 }
 
+/// Whether two regions live on exactly the same peers, none of them a
+/// learner: the only pairs a merge may join without moving data.
+fn same_peers(a: &ShardRegion, b: &ShardRegion) -> bool {
+    let set = |r: &ShardRegion| r.peers.iter().copied().collect::<HashSet<u64>>();
+    a.staging_peers.is_empty() && b.staging_peers.is_empty() && set(a) == set(b)
+}
+
 /// Two adjacent regions a tick chose to merge.
 struct PendingMerge {
     key: MeasurementKey,
@@ -1207,11 +1214,13 @@ impl ShardScheduler {
                             >= self.config.split_merge_interval_secs
                         && now.saturating_sub(right.last_split_at)
                             >= self.config.split_merge_interval_secs
+                        && same_peers(region, right)
                         && !self.region_has_operator(right.region_id).await
                     {
-                        // Run in the background: staging the right half is a
-                        // region copy, and inside the tick two merges of
-                        // 1.6 GB regions held up a 3 -> 6 scale-up for 20 min.
+                        // Run in the background, holding both regions: a
+                        // merge used to copy data, and inside the tick two
+                        // merges of 1.6 GB regions held up a 3 -> 6 scale-up
+                        // for 20 min.
                         merges.push(PendingMerge {
                             key: space.key.clone(),
                             left_id: region.region_id,
@@ -1784,6 +1793,20 @@ impl ShardScheduler {
             );
             return Ok(());
         }
+        // A merge moves no data: only regions on the same peers merge, so
+        // every merged peer already holds both halves and keeps receiving
+        // their writes. Copying the right half onto peers that lacked it was
+        // a snapshot, and the right's writes during the copy never reached
+        // them: on n3 one merge lost 2.02M acked points, 1.1% of the writes
+        // of a 3 -> 6 scale-up.
+        if !same_peers(left, &right) {
+            tracing::debug!(
+                left_region_id = left.region_id,
+                right_region_id = right.region_id,
+                "shard merge deferred: regions on different peers"
+            );
+            return Ok(());
+        }
         let mut merged = left.clone();
         merged.end = right.end;
         merged.epoch = left.epoch.bump_version();
@@ -1791,29 +1814,6 @@ impl ShardScheduler {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-
-        // Stage the right half onto every merged peer that lacks it BEFORE
-        // committing: after a split, the right child's rows may live solely on
-        // its own peers, and merging ownership without moving data strands
-        // them. The merged region keeps the left's peers, so each of them
-        // needs the rows, not only the merged primary. Staged, because none
-        // of them owns `right` yet: a plain push is refused with 403 "not
-        // owner", and on n3 one merge was retried every tick, ~50 s a time.
-        // The source copy stays, so a rejected Merge proposal strands nothing.
-        // Balance work: paced like a convergence move.
-        let rate = move_rate_bytes_per_sec(
-            MoveTier::Convergence,
-            self.config.movement_budget_bytes_per_sec,
-            self.config.schedule_limit,
-        );
-        for dest in merged
-            .peers
-            .iter()
-            .copied()
-            .filter(|p| !right.peers.contains(p))
-        {
-            self.stage_region_onto(key, &right, dest, rate).await?;
-        }
 
         let op = ShardMapOp::Merge {
             key: key.clone(),
@@ -5991,46 +5991,49 @@ mod tests {
         );
     }
 
-    /// A merge copies the right half onto every merged peer that lacks it.
+    /// A merge joins only regions on the same peers, and moves no data.
     ///
-    /// The merged region keeps the left's peers. The right's rows went only to
-    /// the merged primary, only when it was not already the right's primary,
-    /// and as a plain push that a node not yet owning the right refuses.
+    /// It used to copy the right half onto the left's peers that lacked it.
+    /// That copy was a snapshot: the right's writes during it never reached
+    /// them, and on n3 one merge lost 2.02M acked points.
     #[tokio::test]
     #[serial_test::serial(chdb)]
-    async fn a_merge_stages_the_right_half_onto_left_peers_that_lack_it() {
+    async fn a_merge_needs_both_regions_on_the_same_peers() {
         let harness = PlacementTestHarness::new(true, &[(2, 0)], 1).await;
         harness.write_points(0, 200).await;
+        let key = PlacementTestHarness::key();
         let mid = u64::MAX / 2;
         let mut left = sample_region_peers(vec![1, 2], 1);
         left.end = mid;
         let mut right = sample_region_peers(vec![1], 1);
         right.region_id = 2;
         right.start = mid;
-
-        harness
-            .scheduler
-            .try_merge(&PlacementTestHarness::key(), &left, right)
-            .await
-            .unwrap();
-
-        let pushes = harness.pushes[&2].lock().unwrap().clone();
-        assert!(
-            !pushes.is_empty(),
-            "node 2 holds the left only and got none of the right's rows"
-        );
-        assert!(
-            pushes.iter().all(|stage| *stage),
-            "node 2 does not own the right yet, so every push must be staged: {pushes:?}"
-        );
-        assert!(
-            harness
-                .proposals
+        let merges = |h: &PlacementTestHarness| {
+            h.proposals
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|op| matches!(op, ShardMapOp::Merge { .. })),
-            "the merge was not proposed"
+                .filter(|op| matches!(op, ShardMapOp::Merge { .. }))
+                .count()
+        };
+
+        harness
+            .scheduler
+            .try_merge(&key, &left, right.clone())
+            .await
+            .unwrap();
+        assert_eq!(merges(&harness), 0, "node 2 lacks the right half");
+
+        right.peers = vec![2, 1];
+        harness
+            .scheduler
+            .try_merge(&key, &left, right)
+            .await
+            .unwrap();
+        assert_eq!(merges(&harness), 1, "same peers in any order may merge");
+        assert!(
+            harness.pushes[&2].lock().unwrap().is_empty(),
+            "a merge moves no data"
         );
     }
 
@@ -6077,119 +6080,30 @@ mod tests {
         let run = tokio::spawn(async move {
             sched.run(Duration::from_millis(100), rx).await;
         });
-        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        // Measure from the moment the slow move holds its region.
+        for _ in 0..50 {
+            if harness.scheduler.region_has_operator(slow).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let before = adds(&harness, fast);
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
         // Proposals go to a sink, so the map never changes and the fast
         // region wants its move again on every tick it can get a slot.
-        let fast_moves = adds(&harness, fast);
+        let fast_moves = adds(&harness, fast) - before;
         let still_slow = harness.scheduler.region_has_operator(slow).await;
         let _ = tx.send(true);
         run.abort();
         assert!(
             still_slow,
-            "the slow move finished too early to prove anything"
+            "the slow move was not running throughout, so this proves nothing"
         );
         assert!(
             fast_moves >= 3,
-            "region {fast} was moved {fast_moves} time(s) in 15 ticks while region {slow} \
+            "region {fast} was moved {fast_moves} time(s) in ~10 ticks while region {slow} \
              copied: ticks waited for the slow move"
         );
-    }
-
-    /// `run` must keep splitting while a merge copies the right half.
-    ///
-    /// Merges ran inside the tick. On n3 two merges of 1.6 GB regions held
-    /// up a 3 -> 6 scale-up for 20 minutes, with node 6 still empty.
-    #[tokio::test]
-    #[serial_test::serial(chdb)]
-    async fn run_keeps_splitting_while_a_merge_copies() {
-        let harness = PlacementTestHarness::new_tuned(false, &[(2, 0)], 2, |c| {
-            c.schedule_limit = 1;
-            c.replication_factor = 1;
-            c.split_merge_interval_secs = 0;
-            // A merge copy of ~25 KiB at 4 KiB/s takes several seconds.
-            c.movement_budget_bytes_per_sec = 4 * 1024;
-        })
-        .await;
-        harness.write_points(0, 2_000).await;
-        // cpu0 becomes two adjacent regions; only the left one is on node 2,
-        // so merging them copies the right half there.
-        let key = PlacementTestHarness::key();
-        let parent = harness.region().await;
-        let split_key = u64::MAX / 2;
-        let mut left = parent.clone();
-        left.end = split_key;
-        left.epoch = parent.epoch.bump_version();
-        let mut right = parent.clone();
-        right.start = split_key;
-        right.epoch = left.epoch;
-        harness
-            .scheduler
-            .shard_map
-            .apply_op(ShardMapOp::Split {
-                key: key.clone(),
-                region_id: parent.region_id,
-                split_key,
-                epoch: parent.epoch,
-                left,
-                right,
-            })
-            .await
-            .unwrap();
-        let halves = harness.space_regions(&key).await;
-        assert_eq!(halves.len(), 2);
-        harness
-            .scheduler
-            .shard_map
-            .apply_op(ShardMapOp::AddPeer {
-                key: key.clone(),
-                region_id: halves[0].region_id,
-                to_peer: 2,
-                epoch: halves[0].epoch,
-                staging: false,
-            })
-            .await
-            .unwrap();
-        let other = harness
-            .space_regions(&MeasurementKey::new("db", "autogen", "cpu1"))
-            .await[0]
-            .region_id;
-
-        let (tx, rx) = watch::channel(false);
-        let sched = harness.scheduler.clone();
-        let run = tokio::spawn(async move {
-            sched.run(Duration::from_millis(100), rx).await;
-        });
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        assert!(
-            harness
-                .scheduler
-                .region_has_operator(halves[0].region_id)
-                .await,
-            "the merge should be copying"
-        );
-        harness
-            .scheduler
-            .record_heartbeat(other, 1, 1_000_000, 0, 0)
-            .await;
-        tokio::time::sleep(Duration::from_millis(800)).await;
-
-        let split = harness
-            .proposals
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|op| matches!(op, ShardMapOp::Split { region_id, .. } if *region_id == other));
-        let still_merging = harness
-            .scheduler
-            .region_has_operator(halves[0].region_id)
-            .await;
-        let _ = tx.send(true);
-        run.abort();
-        assert!(
-            still_merging,
-            "the merge finished too early to prove anything"
-        );
-        assert!(split, "no split proposed while a merge was copying");
     }
 
     /// `run` must keep splitting while it re-stages a leftover learner.
