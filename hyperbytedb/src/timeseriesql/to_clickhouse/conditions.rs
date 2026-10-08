@@ -235,6 +235,8 @@ pub(super) fn translate_expr(
                     translate_expr(&be.right, out, in_where, mapping)?;
                 } else if in_where && is_time_epoch_comparison(be) {
                     translate_time_epoch_comparison(be, out)?;
+                } else if in_where && is_time_string_comparison(be) {
+                    translate_time_string_comparison(be, out)?;
                 } else {
                     let handled = if let Some(m) = mapping {
                         if in_where {
@@ -302,6 +304,44 @@ pub(super) fn translate_time_epoch_comparison(
         write!(out, "time {} {}", binary_op_to_clickhouse(&be.op), ts_sql)?;
     } else {
         write!(out, "{} {} time", ts_sql, binary_op_to_clickhouse(&be.op))?;
+    }
+    Ok(())
+}
+
+/// `time <cmp> '2027-01-15T08:06:00Z'`: InfluxQL takes RFC3339 or
+/// `YYYY-MM-DD HH:MM:SS` strings for time. Written as a bare string, chDB
+/// cannot compare it with a `DateTime64` column and fails the query.
+fn is_time_string_comparison(be: &BinaryExpr) -> bool {
+    let comparison = matches!(
+        be.op,
+        BinaryOp::Eq | BinaryOp::Neq | BinaryOp::Lt | BinaryOp::Lte | BinaryOp::Gt | BinaryOp::Gte
+    );
+    let string = |e: &Expr| matches!(e, Expr::StringLiteral(_) | Expr::TimeLiteral(_));
+    comparison
+        && ((is_time_identifier(&be.left) && string(&be.right))
+            || (is_time_identifier(&be.right) && string(&be.left)))
+}
+
+fn translate_time_string_comparison(
+    be: &BinaryExpr,
+    out: &mut String,
+) -> Result<(), HyperbytedbError> {
+    let ts = |e: &Expr| match e {
+        Expr::StringLiteral(s) | Expr::TimeLiteral(s) => Some(format!(
+            "parseDateTime64BestEffort({}, 9, 'UTC')",
+            quote_string(s)
+        )),
+        _ => None,
+    };
+    let op = binary_op_to_clickhouse(&be.op);
+    match (ts(&be.left), ts(&be.right)) {
+        (None, Some(right)) => write!(out, "time {op} {right}")?,
+        (Some(left), None) => write!(out, "{left} {op} time")?,
+        _ => {
+            return Err(HyperbytedbError::QueryParse(
+                "expected a time string beside time in comparison".to_string(),
+            ));
+        }
     }
     Ok(())
 }

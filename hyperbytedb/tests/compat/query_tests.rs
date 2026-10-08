@@ -525,6 +525,37 @@ async fn where_time_range() {
     );
 }
 
+/// InfluxQL takes time as RFC3339 or `YYYY-MM-DD HH:MM:SS` strings. Passed
+/// through as bare strings, chDB refused to compare them with the time column
+/// and the whole query failed.
+#[tokio::test]
+#[serial(chdb)]
+async fn where_time_accepts_date_time_strings() {
+    let ctx = TestContext::new().unwrap();
+    ctx.metadata.create_database("testdb").await.unwrap();
+    ctx.write_and_flush(
+        "testdb",
+        "cpu value=1.0 1000000000\ncpu value=2.0 2000000000\ncpu value=3.0 3000000000",
+    )
+    .await
+    .unwrap();
+
+    for q in [
+        "SELECT count(value) FROM cpu WHERE time >= '1970-01-01T00:00:02Z'",
+        "SELECT count(value) FROM cpu WHERE time >= '1970-01-01 00:00:02'",
+        "SELECT count(value) FROM cpu WHERE '1970-01-01T00:00:02Z' <= time",
+    ] {
+        let resp = ctx.query("testdb", q).await.unwrap();
+        assert!(
+            resp.results[0].error.is_none(),
+            "{q}: {:?}",
+            resp.results[0].error
+        );
+        let series = resp.results[0].series.as_ref().unwrap();
+        assert_eq!(series[0].values[0][1], serde_json::json!(2), "{q}");
+    }
+}
+
 #[tokio::test]
 #[serial(chdb)]
 async fn where_tag_condition() {
