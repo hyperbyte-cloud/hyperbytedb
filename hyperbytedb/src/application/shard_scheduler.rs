@@ -12,7 +12,7 @@ use crate::application::shard_peer_resolution::is_active_peer;
 use crate::application::shard_routing::effective_replication_factor;
 use crate::application::shard_transfer::{
     TRANSFER_CHUNK_POINTS, complete_region_transfer, push_region_transfer_data,
-    run_region_transfer, stage_region_transfer_data,
+    stage_region_transfer_data,
 };
 use crate::config::ShardingConfig;
 use crate::domain::cluster::membership::{
@@ -311,6 +311,8 @@ pub struct ShardScheduler {
     /// Ticks that find it busy plan (splits, heals, failover) but leave their
     /// placements for a later tick.
     movers_busy: std::sync::atomic::AtomicBool,
+    /// True while [`ShardScheduler::run`] is re-staging leftover learners.
+    learners_busy: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     test_force_leader: bool,
     #[cfg(test)]
@@ -358,6 +360,7 @@ impl ShardScheduler {
             placement_errors: tokio::sync::RwLock::new(HashMap::new()),
             learners_seen: tokio::sync::RwLock::new(HashSet::new()),
             movers_busy: std::sync::atomic::AtomicBool::new(false),
+            learners_busy: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             test_force_leader: false,
             #[cfg(test)]
@@ -527,13 +530,21 @@ impl ShardScheduler {
     /// receiving replicated writes since it joined, so this only has to close
     /// whatever the first copy missed, and staging is idempotent at the
     /// destination.
+    #[cfg(test)]
     async fn try_promote_learners(&self, map: &ShardMap) {
-        // Only act on a learner that was ALSO outstanding last tick. The
-        // convergence path stages and promotes inline, so a learner seen once
-        // is usually just mid-flight; re-staging it immediately re-copies the
-        // region for nothing and competes with evacuation for the movement
-        // budget. One left over on two consecutive ticks is one whose inline
-        // promote actually failed.
+        for (key, region_id, peer) in self.stale_learners(map).await {
+            self.promote_learner(&key, region_id, peer).await;
+        }
+    }
+
+    /// Learners outstanding on this tick and the last that no operator holds.
+    ///
+    /// Only a learner ALSO outstanding last tick counts. The convergence path
+    /// stages and promotes inline, so a learner seen once is usually just
+    /// mid-flight; re-staging it immediately re-copies the region for nothing
+    /// and competes with evacuation for the movement budget. One left over on
+    /// two consecutive ticks is one whose inline promote actually failed.
+    async fn stale_learners(&self, map: &ShardMap) -> Vec<(MeasurementKey, u64, u64)> {
         let current: HashSet<(u64, u64)> = map
             .spaces
             .values()
@@ -550,12 +561,13 @@ impl ShardScheduler {
         };
         *self.learners_seen.write().await = current;
         if stale.is_empty() {
-            return;
+            return Vec::new();
         }
 
+        let mut out = Vec::new();
         for space in map.spaces.values() {
             for region in &space.regions {
-                for peer in region.staging_peers.clone() {
+                for &peer in &region.staging_peers {
                     if !stale.contains(&(region.region_id, peer)) {
                         continue;
                     }
@@ -564,34 +576,68 @@ impl ShardScheduler {
                     if self.region_has_operator(region.region_id).await {
                         continue;
                     }
-                    if self
-                        .stage_region_onto(&space.key, region, peer, 0)
-                        .await
-                        .is_err()
-                    {
-                        continue;
-                    }
-                    let fresh = match self.shard_map.snapshot().await {
-                        Ok(m) => m,
-                        Err(_) => continue,
-                    };
-                    let Some(current) = current_region(&fresh, &space.key, region.region_id) else {
-                        continue;
-                    };
-                    if self
-                        .propose(ShardMapOp::PromotePeer {
-                            key: space.key.clone(),
-                            region_id: region.region_id,
-                            peer,
-                            epoch: current.epoch,
-                        })
-                        .await
-                        .is_ok()
-                    {
-                        counter!("hyperbytedb_shard_learners_promoted_total").increment(1);
-                    }
+                    out.push((space.key.clone(), region.region_id, peer));
                 }
             }
+        }
+        out
+    }
+
+    /// Re-stage one leftover learner and promote it, holding the region's
+    /// operator throughout so no mover or split touches it mid-copy.
+    async fn promote_learner(&self, key: &MeasurementKey, region_id: u64, peer: u64) {
+        if !self.acquire_operator(region_id).await {
+            return;
+        }
+        self.restage_and_promote(key, region_id, peer).await;
+        self.release_operator(region_id).await;
+    }
+
+    async fn restage_and_promote(&self, key: &MeasurementKey, region_id: u64, peer: u64) {
+        let Ok(map) = self.shard_map.snapshot().await else {
+            return;
+        };
+        let Some(region) = current_region(&map, key, region_id) else {
+            return;
+        };
+        if !region.staging_peers.contains(&peer) {
+            return;
+        }
+        // Paced like a move of the same tier: a re-stage is a full region
+        // copy and shares the movement budget with the movers.
+        let candidates = self.active_candidate_ids().await;
+        let rf = effective_replication_factor(self.config.replication_factor, candidates.len());
+        let departing = self.departing_node_ids().await;
+        let unhealthy = self.unhealthy_region_peers(region).await;
+        let rate = move_rate_bytes_per_sec(
+            move_tier(region, rf, &departing, &unhealthy),
+            self.config.movement_budget_bytes_per_sec,
+            self.config.schedule_limit,
+        );
+        if self
+            .stage_region_onto(key, region, peer, rate)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let Ok(fresh) = self.shard_map.snapshot().await else {
+            return;
+        };
+        let Some(current) = current_region(&fresh, key, region_id) else {
+            return;
+        };
+        if self
+            .propose(ShardMapOp::PromotePeer {
+                key: key.clone(),
+                region_id,
+                peer,
+                epoch: current.epoch,
+            })
+            .await
+            .is_ok()
+        {
+            counter!("hyperbytedb_shard_learners_promoted_total").increment(1);
         }
     }
 
@@ -773,6 +819,10 @@ impl ShardScheduler {
                     if !self.is_leader() {
                         continue;
                     }
+                    if let Ok(map) = self.shard_map.snapshot().await {
+                        let learners = self.stale_learners(&map).await;
+                        self.start_background_learners(learners);
+                    }
                     match self.plan_tick().await {
                         Ok(pending) => {
                             self.retire_evacuated_nodes().await;
@@ -801,6 +851,24 @@ impl ShardScheduler {
         tokio::spawn(async move {
             this.run_pending_placements(pending).await;
             this.movers_busy.store(false, Ordering::Release);
+        });
+    }
+
+    /// Re-stage and promote `learners` in the background, unless the previous
+    /// batch is still working. Each is a full region copy; run inside the
+    /// tick, a remote stage timing out after five minutes per learner froze
+    /// splits for a new database on n3 for over 30 minutes.
+    fn start_background_learners(self: &Arc<Self>, learners: Vec<(MeasurementKey, u64, u64)>) {
+        use std::sync::atomic::Ordering;
+        if learners.is_empty() || self.learners_busy.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            for (key, region_id, peer) in learners {
+                this.promote_learner(&key, region_id, peer).await;
+            }
+            this.learners_busy.store(false, Ordering::Release);
         });
     }
 
@@ -899,6 +967,10 @@ impl ShardScheduler {
     /// plans the same way but moves data in the background.
     #[cfg(test)]
     async fn tick(&self) -> Result<(), HyperbytedbError> {
+        // Learners left behind by a failed promote would otherwise never be
+        // revisited: once in `peers`, the region looks converged.
+        let map = self.shard_map.snapshot().await?;
+        self.try_promote_learners(&map).await;
         let pending = self.plan_tick().await?;
         self.run_pending_placements(pending).await;
         // After the movers, so a node that finished evacuating this tick is
@@ -915,9 +987,6 @@ impl ShardScheduler {
         let map = self.shard_map.snapshot().await?;
         self.prune_region_counters(&map).await;
         self.refresh_placement_plan(&map).await;
-        // Learners left behind by a failed promote would otherwise never be
-        // revisited: once in `peers`, the region looks converged.
-        self.try_promote_learners(&map).await;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -1640,49 +1709,21 @@ impl ShardScheduler {
             .unwrap_or_default()
             .as_secs();
 
-        // Stage the right half onto the merged owner BEFORE committing: after
-        // a split, the right child's rows may live solely on its own primary,
-        // and merging ownership without moving data strands them (reads go to
-        // `merged.primary` only). The transfer must not depend on who the
-        // leader is — only on where the data lives.
-        if right.primary != merged.primary {
-            if right.primary == self.node_id {
-                let Some(pc) = self.peer_client.as_ref() else {
-                    return Ok(());
-                };
-                run_region_transfer(
-                    pc,
-                    &self.metadata,
-                    &self.wal,
-                    self.query_port.as_ref(),
-                    self.points_sink.as_ref(),
-                    self.node_id,
-                    key,
-                    &right,
-                    merged.primary,
-                    self.max_points_per_request,
-                    // Merged range keeps a single owner; retain the source copy
-                    // as a stale replica rather than dropping before
-                    // ownership is committed.
-                    false,
-                )
-                .await?;
-            } else if let Some(pc) = self.peer_client.as_ref() {
-                // Leader is neither holder nor destination: have the current
-                // holder stage its copy onto the future owner. Keep the source
-                // copy (drop_source=false) so a rejected Merge proposal cannot
-                // strand the data.
-                request_region_rehome(
-                    pc,
-                    &self.membership,
-                    right.primary,
-                    key,
-                    &right,
-                    merged.primary,
-                    false,
-                )
-                .await?;
-            }
+        // Stage the right half onto every merged peer that lacks it BEFORE
+        // committing: after a split, the right child's rows may live solely on
+        // its own peers, and merging ownership without moving data strands
+        // them. The merged region keeps the left's peers, so each of them
+        // needs the rows, not only the merged primary. Staged, because none
+        // of them owns `right` yet: a plain push is refused with 403 "not
+        // owner", and on n3 one merge was retried every tick, ~50 s a time.
+        // The source copy stays, so a rejected Merge proposal strands nothing.
+        for dest in merged
+            .peers
+            .iter()
+            .copied()
+            .filter(|p| !right.peers.contains(p))
+        {
+            self.stage_region_onto(key, &right, dest, 0).await?;
         }
 
         let op = ShardMapOp::Merge {
@@ -2237,7 +2278,68 @@ impl ShardScheduler {
 }
 
 /// Re-home timeout: transfers are bulk data movement, not scatter queries.
-const REHOME_TIMEOUT_SECS: u64 = 300;
+/// Longest a rehome may go without a byte from its sender. A node that
+/// streams progress sends one every 10 s; an older one answers only when the
+/// copy is done, so this stays at the old total timeout.
+const REHOME_IDLE_SECS: u64 = 300;
+/// Upper bound on a whole rehome, progress or not.
+const REHOME_MAX_SECS: u64 = 6 * 3600;
+
+/// POST a rehome and wait for its result, timing out on silence rather than
+/// on total time: a large region under write load took longer than any fixed
+/// total, and each timeout threw the copy away to start again from nothing.
+async fn post_rehome(
+    http: &reqwest::Client,
+    url: &str,
+    req: &ShardRehomeRequest,
+    idle: Duration,
+) -> Result<serde_json::Value, HyperbytedbError> {
+    use crate::adapters::http::shard_handlers::REHOME_PROGRESS_HEADER;
+    let unreachable = |e: String| HyperbytedbError::PeerUnreachable(format!("{url}: {e}"));
+    let mut resp = http
+        .post(url)
+        .header(REHOME_PROGRESS_HEADER, "1")
+        .json(req)
+        .timeout(Duration::from_secs(REHOME_MAX_SECS))
+        .send()
+        .await
+        .map_err(|e| unreachable(e.to_string()))?;
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        return Err(HyperbytedbError::TransferRejected {
+            status,
+            reason: crate::application::shard_transfer::rejection_reason(resp).await,
+        });
+    }
+    let mut raw = Vec::new();
+    loop {
+        match tokio::time::timeout(idle, resp.chunk()).await {
+            Err(_) => return Err(unreachable(format!("rehome silent for {idle:?}"))),
+            Ok(Err(e)) => return Err(unreachable(e.to_string())),
+            Ok(Ok(None)) => break,
+            Ok(Ok(Some(chunk))) => raw.extend_from_slice(&chunk),
+        }
+    }
+    let body: serde_json::Value =
+        serde_json::from_slice(&raw).map_err(|e| unreachable(format!("rehome result: {e}")))?;
+    // Streamed results carry their status in the body: the 200 went out
+    // before the copy finished.
+    let status = body
+        .get("status")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(200);
+    if status != 200 {
+        let reason = body
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("no reason");
+        return Err(HyperbytedbError::TransferRejected {
+            status: status as u16,
+            reason: reason.into(),
+        });
+    }
+    Ok(body)
+}
 
 /// What one move holds in memory at once: a transfer chunk, never the whole
 /// region. An estimate, costed like the heartbeat's region size (128 B a row)
@@ -2439,22 +2541,13 @@ async fn request_region_rehome(
         max_bytes_per_sec: 0,
         dest_skip_wal_through: 0,
     };
-    let url = format!("http://{addr}/internal/shard/rehome");
-    let resp = peer_client
-        .http_client()
-        .post(&url)
-        .json(&req)
-        .timeout(Duration::from_secs(REHOME_TIMEOUT_SECS))
-        .send()
-        .await
-        .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        return Err(HyperbytedbError::TransferRejected {
-            status,
-            reason: crate::application::shard_transfer::rejection_reason(resp).await,
-        });
-    }
+    post_rehome(
+        peer_client.http_client(),
+        &format!("http://{addr}/internal/shard/rehome"),
+        &req,
+        Duration::from_secs(REHOME_IDLE_SECS),
+    )
+    .await?;
     Ok(())
 }
 
@@ -2491,26 +2584,13 @@ async fn request_region_stage(
         // Accepted and ignored by the receiver; retained only for wire compat.
         dest_skip_wal_through: 0,
     };
-    let url = format!("http://{addr}/internal/shard/rehome");
-    let resp = peer_client
-        .http_client()
-        .post(&url)
-        .json(&req)
-        .timeout(Duration::from_secs(REHOME_TIMEOUT_SECS))
-        .send()
-        .await
-        .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        return Err(HyperbytedbError::TransferRejected {
-            status,
-            reason: crate::application::shard_transfer::rejection_reason(resp).await,
-        });
-    }
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
+    let body = post_rehome(
+        peer_client.http_client(),
+        &format!("http://{addr}/internal/shard/rehome"),
+        &req,
+        Duration::from_secs(REHOME_IDLE_SECS),
+    )
+    .await?;
     // Bytes, not points: the budget is a bandwidth throttle. An older peer that
     // does not report `bytes` contributes 0 rather than a point count —
     // under-charging is a convergence-rate cost, while charging points as if
@@ -4001,11 +4081,20 @@ mod tests {
     /// map + scheduler internals without a full raft bootstrap where possible.
     /// Minimal stand-in for a joiner: answers the map-version probe with
     /// `map_version`, and accepts a staging push by echoing the line count it
-    /// received. Returns the address it bound to.
-    async fn spawn_mock_peer(map_version: u64) -> (String, Arc<std::sync::atomic::AtomicU64>) {
+    /// received, recording each push's `stage` flag. Returns the address it
+    /// bound to, its probe count and the push log.
+    async fn spawn_recording_mock_peer(
+        map_version: u64,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicU64>,
+        Arc<std::sync::Mutex<Vec<bool>>>,
+    ) {
         use axum::routing::{get, post};
         let probes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let probe_counter = probes.clone();
+        let pushes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let push_log = pushes.clone();
         let app = axum::Router::new()
             .route(
                 "/internal/shard/map",
@@ -4023,9 +4112,15 @@ mod tests {
             )
             .route(
                 "/internal/shard/transfer",
-                post(|body: axum::body::Bytes| async move {
+                post(move |body: axum::body::Bytes| async move {
                     let payload: serde_json::Value =
                         serde_json::from_slice(&body).unwrap_or_default();
+                    push_log.lock().unwrap().push(
+                        payload
+                            .get("stage")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false),
+                    );
                     let applied = payload
                         .get("body")
                         .and_then(|b| b.as_array())
@@ -4048,10 +4143,10 @@ mod tests {
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        (addr, probes)
+        (addr, probes, pushes)
     }
 
-    /// Like [`spawn_mock_peer`], but answers every probe from `version` as it
+    /// Like [`spawn_recording_mock_peer`], but answers every probe from `version` as it
     /// stands at that moment — a peer that keeps up with the cluster rather
     /// than one frozen at a fixed number.
     async fn spawn_tracking_mock_peer(
@@ -4141,6 +4236,8 @@ mod tests {
         proposals: Arc<std::sync::Mutex<Vec<ShardMapOp>>>,
         /// `/internal/shard/map` hit counts, keyed by mock peer node id.
         probes: HashMap<u64, Arc<std::sync::atomic::AtomicU64>>,
+        /// The `stage` flag of every push each mock peer received.
+        pushes: HashMap<u64, Arc<std::sync::Mutex<Vec<bool>>>>,
     }
 
     impl PlacementTestHarness {
@@ -4234,6 +4331,7 @@ mod tests {
             let map_version = shard_map.snapshot().await.unwrap().map_version;
 
             let mut probes = HashMap::new();
+            let mut pushes = HashMap::new();
             {
                 let mut m = bootstrap.membership.write().await;
                 m.add_node(NodeInfo {
@@ -4247,8 +4345,9 @@ mod tests {
                 });
                 for (id, delta) in peers {
                     let reported = map_version.saturating_add_signed(*delta);
-                    let (addr, counter) = spawn_mock_peer(reported).await;
+                    let (addr, counter, push_log) = spawn_recording_mock_peer(reported).await;
                     probes.insert(*id, counter);
+                    pushes.insert(*id, push_log);
                     m.add_node(NodeInfo {
                         node_id: *id,
                         addr,
@@ -4300,6 +4399,7 @@ mod tests {
                 scheduler: Arc::new(scheduler),
                 proposals,
                 probes,
+                pushes,
             }
         }
 
@@ -5698,5 +5798,214 @@ mod tests {
             promoted(&harness),
             "a learner left over once its mover is gone must still be promoted"
         );
+    }
+
+    /// Serve one rehome reply: `beats` newlines `gap` apart, then `result`.
+    async fn spawn_rehome_peer(beats: usize, gap: Duration, result: &'static str) -> String {
+        use axum::routing::post;
+        let app = axum::Router::new().route(
+            "/internal/shard/rehome",
+            post(move || async move {
+                let stream = futures::stream::unfold(0usize, move |i| async move {
+                    if i > beats {
+                        return None;
+                    }
+                    tokio::time::sleep(gap).await;
+                    let chunk = if i == beats { result } else { "\n" };
+                    Some((
+                        Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(chunk)),
+                        i + 1,
+                    ))
+                });
+                axum::body::Body::from_stream(stream)
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}/internal/shard/rehome")
+    }
+
+    fn sample_rehome_request() -> ShardRehomeRequest {
+        ShardRehomeRequest {
+            db: "db".into(),
+            rp: "autogen".into(),
+            measurement: "cpu".into(),
+            start: 0,
+            end: u64::MAX,
+            region_id: 1,
+            epoch: ShardEpoch::default(),
+            dest_primary: 2,
+            drop_source: false,
+            stage: true,
+            max_bytes_per_sec: 0,
+            dest_skip_wal_through: 0,
+        }
+    }
+
+    /// A copy that keeps reporting progress is waited for however long it
+    /// runs; one that goes silent is given up on.
+    ///
+    /// The caller used a fixed 300 s total. Under write load on n3 every
+    /// remote copy of a scale-up ran past it and was restarted from nothing.
+    #[tokio::test]
+    async fn a_rehome_times_out_on_silence_not_on_total_time() {
+        let http = reqwest::Client::new();
+        let idle = Duration::from_millis(300);
+        let req = sample_rehome_request();
+
+        // ~1 s in all, never silent for longer than 100 ms.
+        let url =
+            spawn_rehome_peer(10, Duration::from_millis(100), r#"{"ok":true,"bytes":7}"#).await;
+        let body = post_rehome(&http, &url, &req, idle).await.unwrap();
+        assert_eq!(body["bytes"], 7);
+
+        let url = spawn_rehome_peer(1, Duration::from_millis(800), r#"{"ok":true}"#).await;
+        let err = post_rehome(&http, &url, &req, idle).await.unwrap_err();
+        assert!(
+            matches!(err, HyperbytedbError::PeerUnreachable(ref m) if m.contains("silent")),
+            "{err}"
+        );
+    }
+
+    /// A streamed failure is a failure, although its HTTP status was 200.
+    #[tokio::test]
+    async fn a_streamed_rehome_error_is_returned_as_a_rejection() {
+        let url = spawn_rehome_peer(
+            2,
+            Duration::from_millis(10),
+            r#"{"error":"not owner","status":403}"#,
+        )
+        .await;
+        let err = post_rehome(
+            &reqwest::Client::new(),
+            &url,
+            &sample_rehome_request(),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HyperbytedbError::TransferRejected { status: 403, ref reason } if &**reason == "not owner"
+            ),
+            "{err}"
+        );
+    }
+
+    /// A merge copies the right half onto every merged peer that lacks it.
+    ///
+    /// The merged region keeps the left's peers. The right's rows went only to
+    /// the merged primary, only when it was not already the right's primary,
+    /// and as a plain push that a node not yet owning the right refuses.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn a_merge_stages_the_right_half_onto_left_peers_that_lack_it() {
+        let harness = PlacementTestHarness::new(true, &[(2, 0)], 1).await;
+        harness.write_points(0, 200).await;
+        let mid = u64::MAX / 2;
+        let mut left = sample_region_peers(vec![1, 2], 1);
+        left.end = mid;
+        let mut right = sample_region_peers(vec![1], 1);
+        right.region_id = 2;
+        right.start = mid;
+
+        harness
+            .scheduler
+            .try_merge(&PlacementTestHarness::key(), &left, right)
+            .await
+            .unwrap();
+
+        let pushes = harness.pushes[&2].lock().unwrap().clone();
+        assert!(
+            !pushes.is_empty(),
+            "node 2 holds the left only and got none of the right's rows"
+        );
+        assert!(
+            pushes.iter().all(|stage| *stage),
+            "node 2 does not own the right yet, so every push must be staged: {pushes:?}"
+        );
+        assert!(
+            harness
+                .proposals
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|op| matches!(op, ShardMapOp::Merge { .. })),
+            "the merge was not proposed"
+        );
+    }
+
+    /// `run` must keep splitting while it re-stages a leftover learner.
+    ///
+    /// The re-stage ran inside the tick. On n3 remote stages under write load
+    /// timed out after five minutes each, three learners were left over, and
+    /// a new database waited over 30 minutes for its first split.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn run_keeps_splitting_while_a_learner_is_restaged() {
+        const REGIONS: usize = 4;
+        let harness = PlacementTestHarness::new_tuned(true, &[(2, 0)], REGIONS, |c| {
+            c.schedule_limit = 1;
+            c.replication_factor = 1;
+            // A re-stage of ~50 KiB at 4 KiB/s takes many seconds.
+            c.movement_budget_bytes_per_sec = 4 * 1024;
+        })
+        .await;
+        harness.write_points(0, 2_000).await;
+        let region = harness.region().await;
+        harness
+            .scheduler
+            .shard_map
+            .apply_op(ShardMapOp::AddPeer {
+                key: PlacementTestHarness::key(),
+                region_id: region.region_id,
+                to_peer: 2,
+                epoch: region.epoch,
+                staging: true,
+            })
+            .await
+            .unwrap();
+
+        let (tx, rx) = watch::channel(false);
+        let sched = harness.scheduler.clone();
+        let run = tokio::spawn(async move {
+            sched.run(Duration::from_millis(100), rx).await;
+        });
+        // Two ticks to call the learner stale, then its re-stage starts.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            harness
+                .scheduler
+                .region_has_operator(region.region_id)
+                .await,
+            "the learner should be re-staging"
+        );
+        let split_region = (1..=REGIONS as u64)
+            .find(|r| *r != region.region_id)
+            .unwrap();
+        harness
+            .scheduler
+            .record_heartbeat(split_region, 1, 1_000_000, 0, 0)
+            .await;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        let split = harness.proposals.lock().unwrap().iter().any(
+            |op| matches!(op, ShardMapOp::Split { region_id, .. } if *region_id == split_region),
+        );
+        let still_restaging = harness
+            .scheduler
+            .region_has_operator(region.region_id)
+            .await;
+        let _ = tx.send(true);
+        run.abort();
+        assert!(
+            still_restaging,
+            "the re-stage finished too early to prove anything"
+        );
+        assert!(split, "no split proposed while a learner was re-staged");
     }
 }

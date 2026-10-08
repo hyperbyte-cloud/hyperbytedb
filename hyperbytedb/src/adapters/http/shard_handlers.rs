@@ -1089,10 +1089,9 @@ pub async fn handle_shard_transfer(
 /// node that can export historical rows) nor the new child primary.
 pub async fn handle_shard_rehome(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<ShardRehomeRequest>,
-) -> impl IntoResponse {
-    use crate::application::shard_transfer::{complete_region_transfer, push_region_transfer_data};
-
+) -> axum::response::Response {
     let Some(ctx) = state.shard_routing.as_ref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1100,13 +1099,13 @@ pub async fn handle_shard_rehome(
         )
             .into_response();
     };
-    let Some(peer_client) = state.peer_client.as_ref() else {
+    if state.peer_client.is_none() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"error": "no peer client"})),
         )
             .into_response();
-    };
+    }
     if req.dest_primary == state.node_id {
         return (
             StatusCode::BAD_REQUEST,
@@ -1115,21 +1114,34 @@ pub async fn handle_shard_rehome(
             .into_response();
     }
 
-    let map = match ctx.shard_map.snapshot().await {
-        Ok(m) => m,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response();
+    // The leader stages right after it commits AddPeer, and this node may
+    // not have applied that op yet. Refusing at once as a stale epoch failed
+    // two of three moves in one n3 round; wait briefly for the map instead.
+    let deadline = std::time::Instant::now() + REHOME_EPOCH_WAIT;
+    let region = loop {
+        let map = match ctx.shard_map.snapshot().await {
+            Ok(m) => m,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+                    .into_response();
+            }
+        };
+        // Validate against the committed map: exact child range + epoch. This
+        // also pins the real apply-allocated region_id into the transfer
+        // payloads.
+        let region = map
+            .space(&req.db, &req.rp, &req.measurement)
+            .and_then(|space| resolve_rehome_region(space, req.region_id, req.start, req.end))
+            .cloned();
+        match region {
+            Some(r) if r.epoch.is_behind(req.epoch) && std::time::Instant::now() < deadline => {}
+            other => break other,
         }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     };
-    // Validate against the committed map: exact child range + epoch. This also
-    // pins the real apply-allocated region_id into the transfer payloads.
-    let region = map
-        .space(&req.db, &req.rp, &req.measurement)
-        .and_then(|space| resolve_rehome_region(space, req.region_id, req.start, req.end));
     let Some(region) = region else {
         return (
             StatusCode::NOT_FOUND,
@@ -1157,6 +1169,74 @@ pub async fn handle_shard_rehome(
             .into_response();
     }
 
+    if !headers.contains_key(REHOME_PROGRESS_HEADER) {
+        let (status, body) = run_rehome(state, req, region).await;
+        return (status, Json(body)).into_response();
+    }
+    // The copy runs for minutes. A newline every few seconds tells the caller
+    // it is still alive, so the caller times out on silence rather than on a
+    // fixed total that a large region under write load always exceeded: on
+    // n3 every remote copy of a 3 -> 6 scale-up was dropped at 300 s and
+    // started again from nothing. Dropping the body (the caller went away)
+    // aborts the copy instead of leaving it running unobserved.
+    let task = AbortOnDrop(tokio::spawn(run_rehome(state, req, region)));
+    let mut ticker = tokio::time::interval(REHOME_PROGRESS_INTERVAL);
+    ticker.tick().await;
+    let stream = futures::stream::unfold(Some((task, ticker)), |st| async move {
+        let (mut task, mut ticker) = st?;
+        tokio::select! {
+            done = &mut task.0 => {
+                let body = match done {
+                    Ok((status, mut body)) => {
+                        body["status"] = status.as_u16().into();
+                        body
+                    }
+                    Err(e) => serde_json::json!({
+                        "error": format!("rehome task failed: {e}"),
+                        "status": 500,
+                    }),
+                };
+                Some((Ok::<_, std::convert::Infallible>(Bytes::from(body.to_string())), None))
+            }
+            _ = ticker.tick() => Some((Ok(Bytes::from_static(b"\n")), Some((task, ticker)))),
+        }
+    });
+    (StatusCode::OK, Body::from_stream(stream)).into_response()
+}
+
+/// Request header asking `/internal/shard/rehome` to stream progress: a
+/// newline every [`REHOME_PROGRESS_INTERVAL`] while copying, then the result
+/// JSON with its status in `"status"`. A header, not a body field, because
+/// the request is `deny_unknown_fields` and an older node would refuse the
+/// whole request; an older node ignores the header and answers as before.
+pub const REHOME_PROGRESS_HEADER: &str = "x-hyperbytedb-rehome-progress";
+const REHOME_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long a rehome waits for this node's map to reach the request's epoch.
+const REHOME_EPOCH_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Copy `region` to `req.dest_primary`: the part of a rehome after the
+/// request has been validated against the committed map.
+async fn run_rehome(
+    state: Arc<AppState>,
+    req: ShardRehomeRequest,
+    region: ShardRegion,
+) -> (StatusCode, serde_json::Value) {
+    use crate::application::shard_transfer::{complete_region_transfer, push_region_transfer_data};
+    let Some(peer_client) = state.peer_client.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"error": "no peer client"}),
+        );
+    };
+    let region = &region;
     let outcome = match if req.stage {
         crate::application::shard_transfer::stage_region_transfer_data(
             peer_client,
@@ -1199,9 +1279,8 @@ pub async fn handle_shard_rehome(
             );
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response();
+                serde_json::json!({"error": e.to_string()}),
+            );
         }
     };
 
@@ -1228,22 +1307,20 @@ pub async fn handle_shard_rehome(
         );
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response();
+            serde_json::json!({"error": e.to_string()}),
+        );
     }
 
     counter!("hyperbytedb_shard_rehome_total").increment(1);
     (
         StatusCode::OK,
-        Json(serde_json::json!({
+        serde_json::json!({
             "ok": true,
             "exported": outcome.exported,
             "applied": outcome.applied,
             "bytes": outcome.bytes,
-        })),
+        }),
     )
-        .into_response()
 }
 
 fn ctx_key(req: &ShardRehomeRequest) -> MeasurementKey {

@@ -90,23 +90,30 @@ wait_ready() {
 
 # Every region of every space: id, primary, peers. Changes on any split,
 # merge or move.
+# "<regions> <hash> <ok>". ok=1 once no learner is staging and exactly $1
+# nodes hold region copies: before moves start the layout is just as stable,
+# and calling that settled timed a 3 -> 6 scale-up at 46 s.
 layout() {
   k exec "${CR_NAME}-0" -c hyperbytedb -- sh -c 'curl -sS -m 20 http://127.0.0.1:8086/internal/shard/map' 2>/dev/null \
     | python3 -c "
 import sys,json
+want=int(sys.argv[1])
 try: d=json.load(sys.stdin)
 except Exception: print('unavailable'); raise SystemExit
-rs=sorted((r['region_id'],r['primary'],tuple(sorted(r['peers'])),tuple(sorted(r.get('staging_peers',[])))) for sp in d.get('spaces',[]) for r in sp['regions'])
-print(len(rs), hash(tuple(rs)))" 2>/dev/null || echo unavailable
+regs=[r for sp in d.get('spaces',[]) for r in sp['regions']]
+rs=sorted((r['region_id'],r['primary'],tuple(sorted(r['peers'])),tuple(sorted(r.get('staging_peers',[])))) for r in regs)
+nodes={p for r in regs for p in r['peers']}
+ok=int(not any(r.get('staging_peers') for r in regs) and len(nodes)==want)
+print(len(rs), hash(tuple(rs)), ok)" "$1" 2>/dev/null || echo unavailable
 }
 # Seconds from $1 (SECONDS at the change) until the layout last changed, once
-# it has then held for SETTLE_SECS.
+# it is complete for $2 nodes and has then held for SETTLE_SECS.
 wait_settled() {
-  local since=$1 last="" changed=$SECONDS deadline=$(( SECONDS + 3600 ))
+  local since=$1 nodes=$2 last="" changed=$SECONDS deadline=$(( SECONDS + 3600 ))
   while (( SECONDS < deadline )); do
-    local now; now=$(layout)
+    local now; now=$(layout "$nodes")
     if [[ "$now" != "$last" ]]; then last=$now; changed=$SECONDS; fi
-    if (( SECONDS - changed >= SETTLE_SECS )) && [[ "$now" != unavailable ]]; then
+    if (( SECONDS - changed >= SETTLE_SECS )) && [[ "$now" == *" 1" ]]; then
       echo $(( changed - since )); return 0
     fi
     sleep 10
@@ -292,7 +299,7 @@ scale_to() {
   log "$step: scaling to $n"
   k patch hyperbytedbcluster "$CR_NAME" --type merge -p "{\"spec\":{\"replicas\":${n}}}" >/dev/null
   local ready; ready=$(wait_ready "$n")
-  local settled; settled=$(wait_settled "$t0")
+  local settled; settled=$(wait_settled "$t0" "$n")
   record "$step" scale.pods_ready_secs "$ready"
   record "$step" scale.layout_settled_secs "$settled"
   record "$step" scale.region_moves "$(( $(placements) - p0 ))"
@@ -304,7 +311,7 @@ log "reset to $FIRST_N"
 t0=$SECONDS
 reset_cluster
 record "reset" "pods_ready_secs" "$(wait_ready "$FIRST_N")"
-record "reset" "layout_settled_secs" "$(wait_settled "$t0")"
+record "reset" "layout_settled_secs" "$(wait_settled "$t0" "$FIRST_N")"
 
 write_bench "$FIRST_N"
 read_bench "$FIRST_N" "$WRITE_DB"

@@ -23,6 +23,29 @@ impl ShardEpoch {
             ..self
         }
     }
+
+    /// True when `self` is an earlier state of the region that `other`
+    /// describes: no counter ahead and at least one behind. A node whose map
+    /// has not applied the latest op yet holds such an epoch.
+    #[must_use]
+    pub fn is_behind(self, other: Self) -> bool {
+        self != other && self.conf_ver <= other.conf_ver && self.version <= other.version
+    }
+}
+
+#[cfg(test)]
+mod epoch_tests {
+    use super::ShardEpoch;
+
+    #[test]
+    fn an_epoch_is_behind_only_a_strictly_later_one() {
+        let e = |conf_ver, version| ShardEpoch { conf_ver, version };
+        assert!(e(1, 0).is_behind(e(2, 0)));
+        assert!(e(1, 0).is_behind(e(1, 1)));
+        assert!(!e(1, 0).is_behind(e(1, 0)), "equal is not behind");
+        assert!(!e(2, 0).is_behind(e(1, 0)), "ahead is not behind");
+        assert!(!e(2, 0).is_behind(e(1, 1)), "diverged is not behind");
+    }
 }
 
 /// Whether a region may serve reads and writes.
