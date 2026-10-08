@@ -49,6 +49,10 @@ pub struct BenchArgs {
     /// Defaults to the Job's completion index (`JOB_COMPLETION_INDEX`).
     #[arg(long)]
     pub worker_index: Option<u64>,
+    /// Stop the measure phase taking new batches after this many seconds
+    /// (0: write every point). For a steady writer during scaling.
+    #[arg(long, default_value_t = 0)]
+    pub max_secs: u64,
 }
 
 impl BenchArgs {
@@ -146,6 +150,46 @@ struct PhaseResult {
     retries: u64,
     /// First point index of each batch that never got a 204.
     failed: Vec<u64>,
+    /// Points in the batches this worker took (all of its share, unless
+    /// `--max-secs` stopped it early).
+    points: u64,
+    latency: Arc<LatencyHist>,
+}
+
+/// Upper bounds (ms) of the write-latency buckets; one more counts the rest.
+const LATENCY_BUCKETS_MS: [u64; 24] = [
+    1, 2, 3, 5, 7, 10, 15, 20, 30, 50, 70, 100, 150, 200, 300, 500, 700, 1_000, 1_500, 2_000,
+    3_000, 5_000, 10_000, 30_000,
+];
+
+/// Batch write latency as a client sees it, retries included, in fixed
+/// buckets so workers' histograms merge by adding counts.
+#[derive(Default)]
+struct LatencyHist {
+    counts: [std::sync::atomic::AtomicU64; LATENCY_BUCKETS_MS.len() + 1],
+}
+
+impl LatencyHist {
+    fn record(&self, d: Duration) {
+        let ms = d.as_secs_f64() * 1000.0;
+        let i = LATENCY_BUCKETS_MS
+            .iter()
+            .position(|&b| ms <= b as f64)
+            .unwrap_or(LATENCY_BUCKETS_MS.len());
+        self.counts[i].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `1:<n>,2:<n>,...,30000:<n>,inf:<n>`.
+    fn render(&self) -> String {
+        LATENCY_BUCKETS_MS
+            .iter()
+            .map(|b| b.to_string())
+            .chain(std::iter::once("inf".to_string()))
+            .zip(self.counts.iter())
+            .map(|(b, c)| format!("{b}:{}", c.load(Ordering::Relaxed)))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
 }
 
 /// Rewrite each failed batch until it is accepted or `deadline` passes, and
@@ -200,7 +244,9 @@ async fn run_phase(
     count: u64,
     ts_base: u64,
     series: Option<u64>,
+    deadline: Option<Instant>,
 ) -> PhaseResult {
+    let latency = Arc::new(LatencyHist::default());
     let batches: Vec<u64> = (0..count)
         .step_by(a.batch as usize)
         .enumerate()
@@ -219,13 +265,19 @@ async fn run_phase(
         let url = format!("{ep}/write?db={}&rp=autogen&precision=ns", a.db);
         let measurement = a.measurement.clone();
         let batch = a.batch;
+        let latency = latency.clone();
         let mut seed = 0x9E37_79B9_7F4A_7C15u64 ^ ((idx as u64 + 1) << 17) ^ a.worker_index();
         tasks.push(tokio::spawn(async move {
-            let (mut errors, mut retries) = (0u64, 0u64);
+            let (mut errors, mut retries, mut points) = (0u64, 0u64, 0u64);
             let mut failed = Vec::new();
             loop {
+                if deadline.is_some_and(|d| Instant::now() >= d) {
+                    break;
+                }
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 let Some(&base) = batches.get(i) else { break };
+                let started = Instant::now();
+                points += (base + batch).min(count) - base;
                 let body = bytes::Bytes::from(build_body(
                     &measurement,
                     0,
@@ -244,6 +296,7 @@ async fn run_phase(
                     retries += 1;
                     code = bench.post(&url, body.clone(), "text/plain").await;
                 }
+                latency.record(started.elapsed());
                 if retryable(code) {
                     bench.note_error(format!("{code} still rejected after {attempt} retries"));
                 }
@@ -252,15 +305,16 @@ async fn run_phase(
                     failed.push(base);
                 }
             }
-            (errors, retries, failed)
+            (errors, retries, failed, points)
         }));
     }
-    let (mut errors, mut retries, mut failed) = (0, 0, Vec::new());
+    let (mut errors, mut retries, mut failed, mut points) = (0, 0, Vec::new(), 0);
     for t in tasks {
-        if let Ok((e, r, f)) = t.await {
+        if let Ok((e, r, f, p)) = t.await {
             errors += e;
             retries += r;
             failed.extend(f);
+            points += p;
         }
     }
     PhaseResult {
@@ -268,6 +322,8 @@ async fn run_phase(
         errors,
         retries,
         failed,
+        points,
+        latency,
     }
 }
 
@@ -351,7 +407,16 @@ pub async fn run(mut a: BenchArgs) -> u8 {
     }
 
     if matches!(a.phase, Phase::Seed | Phase::All) {
-        let r = run_phase(bench.clone(), &a, &endpoints, a.series, 1_700_000_000, None).await;
+        let r = run_phase(
+            bench.clone(),
+            &a,
+            &endpoints,
+            a.series,
+            1_700_000_000,
+            None,
+            None,
+        )
+        .await;
         println!(
             "[bench] seed complete in {:.1}s (errors={})",
             r.duration.as_secs_f64(),
@@ -367,13 +432,10 @@ pub async fn run(mut a: BenchArgs) -> u8 {
             a.measure_points,
             1_800_000_000,
             Some(a.series),
+            (a.max_secs > 0).then(|| Instant::now() + Duration::from_secs(a.max_secs)),
         )
         .await;
-        let total_batches = a.measure_points.div_ceil(a.batch);
-        let mine = (a.worker_index()..total_batches)
-            .step_by(a.workers as usize)
-            .count() as u64
-            * a.batch;
+        let mine = r.points;
         let secs = r.duration.as_secs_f64();
         let pps = if secs > 0.0 {
             (mine as f64 / secs) as u64
@@ -416,6 +478,14 @@ pub async fn run(mut a: BenchArgs) -> u8 {
             "[bench] replay worker={} failed={} unrecovered={unrecovered}",
             a.worker_index(),
             r.failed.len()
+        );
+        println!("[bench] latency_ms_hist={}", r.latency.render());
+        // Every point of every batch taken, less any still failing: what a
+        // read-back of this database must find.
+        println!(
+            "[bench] acked worker={} points={}",
+            a.worker_index(),
+            mine.saturating_sub(unrecovered as u64 * a.batch)
         );
     }
     0
@@ -472,6 +542,19 @@ mod tests {
     }
 
     /// Byte-for-byte the lines the Python client sent.
+    #[test]
+    fn latency_lands_in_the_first_bucket_that_holds_it() {
+        use std::time::Duration;
+        let h = super::LatencyHist::default();
+        h.record(Duration::from_micros(500));
+        h.record(Duration::from_millis(5));
+        h.record(Duration::from_millis(6));
+        h.record(Duration::from_secs(60));
+        let r = h.render();
+        assert!(r.starts_with("1:1,2:0,3:0,5:1,7:1,"), "{r}");
+        assert!(r.ends_with(",30000:0,inf:1"), "{r}");
+    }
+
     #[test]
     fn lines_match_the_python_client() {
         let seed = String::from_utf8(build_body("cpu", 0, 0, 2, 1_700_000_000, None)).unwrap();

@@ -275,7 +275,7 @@ for N in $NODES_LIST; do
   [[ -n "${CPU_STAT_FILE:-}" ]] && echo "start $(cpu_usage_snapshot "$N")" >>"$CPU_STAT_FILE"
   out=$(run_phase "measure" "$eps" "$series" "$workers")
   [[ -n "${CPU_STAT_FILE:-}" ]] && echo "end $(cpu_usage_snapshot "$N")" >>"$CPU_STAT_FILE"
-  echo "$out" | grep -E '^\[bench\] (worker=|error x|replay )'
+  echo "$out" | grep -E '^\[bench\] (worker=|error x|replay |latency_ms_hist=|acked )'
   # Total points over the slowest worker's time: the cluster absorbed all of
   # it within that window. Blank unless every worker reported.
   read -r pps errs retries < <(echo "$out" | python3 -c "
