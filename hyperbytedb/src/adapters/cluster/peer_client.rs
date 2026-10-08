@@ -650,6 +650,15 @@ impl PeerClient {
         }
     }
 
+    /// Hinted-handoff writes queued for `peer_id` (0 without a queue).
+    #[must_use]
+    pub fn pending_hints(&self, peer_id: u64) -> u64 {
+        self.hinted_handoff
+            .as_ref()
+            .and_then(|hh| hh.pending_count(peer_id).ok())
+            .unwrap_or(0)
+    }
+
     /// Drain all queued hinted-handoff writes for `peer_id`, replaying
     /// them in FIFO order. Writes that still fail are re-enqueued.
     pub async fn drain_hints_for_peer(&self, peer_id: u64) {
