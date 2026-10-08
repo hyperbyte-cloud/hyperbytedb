@@ -92,7 +92,8 @@ wait_ready() {
 # merge or move.
 # "<regions> <hash> <ok>". ok=1 once no learner is staging and exactly $1
 # nodes hold region copies: before moves start the layout is just as stable,
-# and calling that settled timed a 3 -> 6 scale-up at 46 s.
+# and calling that settled timed a 3 -> 6 scale-up at 46 s. An empty map (a
+# fresh cluster) is settled.
 layout() {
   k exec "${CR_NAME}-0" -c hyperbytedb -- sh -c 'curl -sS -m 20 http://127.0.0.1:8086/internal/shard/map' 2>/dev/null \
     | python3 -c "
@@ -103,7 +104,7 @@ except Exception: print('unavailable'); raise SystemExit
 regs=[r for sp in d.get('spaces',[]) for r in sp['regions']]
 rs=sorted((r['region_id'],r['primary'],tuple(sorted(r['peers'])),tuple(sorted(r.get('staging_peers',[])))) for r in regs)
 nodes={p for r in regs for p in r['peers']}
-ok=int(not any(r.get('staging_peers') for r in regs) and len(nodes)==want)
+ok=int(not regs or (not any(r.get('staging_peers') for r in regs) and len(nodes)==want))
 print(len(rs), hash(tuple(rs)), ok)" "$1" 2>/dev/null || echo unavailable
 }
 # Seconds from $1 (SECONDS at the change) until the layout last changed, once
