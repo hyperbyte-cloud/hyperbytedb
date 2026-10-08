@@ -80,6 +80,19 @@ struct PendingPlacement {
     approx_bytes: u64,
 }
 
+/// Two adjacent regions a tick chose to merge.
+struct PendingMerge {
+    key: MeasurementKey,
+    left_id: u64,
+    right_id: u64,
+}
+
+/// What one planning pass wants done outside the tick.
+struct TickPlan {
+    placements: Vec<PendingPlacement>,
+    merges: Vec<PendingMerge>,
+}
+
 /// Entries older than this multiple of the report interval are ignored for
 /// scheduling decisions — otherwise stats from permanently-dead nodes would
 /// drive splits/rebalances forever.
@@ -313,6 +326,8 @@ pub struct ShardScheduler {
     movers_busy: std::sync::atomic::AtomicBool,
     /// True while [`ShardScheduler::run`] is re-staging leftover learners.
     learners_busy: std::sync::atomic::AtomicBool,
+    /// True while [`ShardScheduler::run`] is merging regions.
+    merges_busy: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     test_force_leader: bool,
     #[cfg(test)]
@@ -361,6 +376,7 @@ impl ShardScheduler {
             learners_seen: tokio::sync::RwLock::new(HashSet::new()),
             movers_busy: std::sync::atomic::AtomicBool::new(false),
             learners_busy: std::sync::atomic::AtomicBool::new(false),
+            merges_busy: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             test_force_leader: false,
             #[cfg(test)]
@@ -824,9 +840,10 @@ impl ShardScheduler {
                         self.start_background_learners(learners);
                     }
                     match self.plan_tick().await {
-                        Ok(pending) => {
+                        Ok(plan) => {
                             self.retire_evacuated_nodes().await;
-                            self.start_background_placements(pending);
+                            self.start_background_placements(plan.placements);
+                            self.start_background_merges(plan.merges);
                         }
                         Err(e) => tracing::warn!(error = %e, "shard scheduler tick error"),
                     }
@@ -870,6 +887,52 @@ impl ShardScheduler {
             }
             this.learners_busy.store(false, Ordering::Release);
         });
+    }
+
+    /// Run `merges` in the background, unless the previous batch is still
+    /// working: those pairs are chosen again on a later tick.
+    fn start_background_merges(self: &Arc<Self>, merges: Vec<PendingMerge>) {
+        use std::sync::atomic::Ordering;
+        if merges.is_empty() || self.merges_busy.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            for merge in merges {
+                this.run_merge(merge).await;
+            }
+            this.merges_busy.store(false, Ordering::Release);
+        });
+    }
+
+    /// Merge one pair, holding both regions' operators so no mover or split
+    /// touches either while the right half is copied.
+    async fn run_merge(&self, merge: PendingMerge) {
+        if !self.acquire_operator(merge.left_id).await {
+            return;
+        }
+        if !self.acquire_operator(merge.right_id).await {
+            self.release_operator(merge.left_id).await;
+            return;
+        }
+        // The regions as they are now, not as the tick saw them: a move may
+        // have committed in between, and the proposal carries the epoch.
+        if let Ok(map) = self.shard_map.snapshot().await
+            && let (Some(left), Some(right)) = (
+                current_region(&map, &merge.key, merge.left_id),
+                current_region(&map, &merge.key, merge.right_id),
+            )
+            && let Err(e) = self.try_merge(&merge.key, left, right.clone()).await
+        {
+            tracing::warn!(
+                left_region_id = merge.left_id,
+                right_region_id = merge.right_id,
+                error = %e,
+                "shard merge failed"
+            );
+        }
+        self.release_operator(merge.right_id).await;
+        self.release_operator(merge.left_id).await;
     }
 
     /// Claim `region_id` for one operator (split, merge, heal, move). Only
@@ -971,17 +1034,20 @@ impl ShardScheduler {
         // revisited: once in `peers`, the region looks converged.
         let map = self.shard_map.snapshot().await?;
         self.try_promote_learners(&map).await;
-        let pending = self.plan_tick().await?;
-        self.run_pending_placements(pending).await;
+        let plan = self.plan_tick().await?;
+        for merge in plan.merges {
+            self.run_merge(merge).await;
+        }
+        self.run_pending_placements(plan.placements).await;
         // After the movers, so a node that finished evacuating this tick is
         // retired in the same tick rather than waiting for the next.
         self.retire_evacuated_nodes().await;
         Ok(())
     }
 
-    /// Splits, merges, heals and failover for every region, plus the
-    /// placement moves it wants, returned instead of run.
-    async fn plan_tick(&self) -> Result<Vec<PendingPlacement>, HyperbytedbError> {
+    /// Splits, heals and failover for every region, plus the placement moves
+    /// and merges it wants, returned instead of run.
+    async fn plan_tick(&self) -> Result<TickPlan, HyperbytedbError> {
         // Peer map versions are only valid for the tick that probed them.
         self.peer_map_versions.write().await.clear();
         let map = self.shard_map.snapshot().await?;
@@ -1007,6 +1073,7 @@ impl ShardScheduler {
             .collect();
 
         let mut pending_placements: Vec<PendingPlacement> = Vec::new();
+        let mut merges: Vec<PendingMerge> = Vec::new();
 
         for (key, space) in &map.spaces {
             metrics::gauge!(
@@ -1019,6 +1086,8 @@ impl ShardScheduler {
 
             let mut cap_refused = 0usize;
 
+            // The right half of a merge queued this tick: leave it alone.
+            let mut merging_right: Option<u64> = None;
             for (idx, region) in space.regions.iter().enumerate() {
                 let (series_count, write_qps) = max_region_peer_heartbeat_stats(&hb, region);
                 metrics::gauge!(
@@ -1026,6 +1095,10 @@ impl ShardScheduler {
                     "region_id" => region.region_id.to_string(),
                 )
                 .set(series_count as f64);
+
+                if merging_right == Some(region.region_id) {
+                    continue;
+                }
 
                 if self.region_has_operator(region.region_id).await {
                     continue;
@@ -1095,12 +1168,19 @@ impl ShardScheduler {
                             >= self.config.split_merge_interval_secs
                         && now.saturating_sub(right.last_split_at)
                             >= self.config.split_merge_interval_secs
+                        && !self.region_has_operator(right.region_id).await
                     {
-                        let key = space.key.clone();
-                        if self.try_merge(&key, region, right.clone()).await.is_ok() {
-                            self.release_operator(region.region_id).await;
-                            continue;
-                        }
+                        // Run in the background: staging the right half is a
+                        // region copy, and inside the tick two merges of
+                        // 1.6 GB regions held up a 3 -> 6 scale-up for 20 min.
+                        merges.push(PendingMerge {
+                            key: space.key.clone(),
+                            left_id: region.region_id,
+                            right_id: right.region_id,
+                        });
+                        merging_right = Some(right.region_id);
+                        self.release_operator(region.region_id).await;
+                        continue;
                     }
                 }
 
@@ -1157,7 +1237,10 @@ impl ShardScheduler {
             }
         }
 
-        Ok(pending_placements)
+        Ok(TickPlan {
+            placements: pending_placements,
+            merges,
+        })
     }
 
     /// Whether this region has a placement step pending (cheap; no data movement).
@@ -1717,13 +1800,19 @@ impl ShardScheduler {
         // of them owns `right` yet: a plain push is refused with 403 "not
         // owner", and on n3 one merge was retried every tick, ~50 s a time.
         // The source copy stays, so a rejected Merge proposal strands nothing.
+        // Balance work: paced like a convergence move.
+        let rate = move_rate_bytes_per_sec(
+            MoveTier::Convergence,
+            self.config.movement_budget_bytes_per_sec,
+            self.config.schedule_limit,
+        );
         for dest in merged
             .peers
             .iter()
             .copied()
             .filter(|p| !right.peers.contains(p))
         {
-            self.stage_region_onto(key, &right, dest, 0).await?;
+            self.stage_region_onto(key, &right, dest, rate).await?;
         }
 
         let op = ShardMapOp::Merge {
@@ -5937,6 +6026,103 @@ mod tests {
                 .any(|op| matches!(op, ShardMapOp::Merge { .. })),
             "the merge was not proposed"
         );
+    }
+
+    /// `run` must keep splitting while a merge copies the right half.
+    ///
+    /// Merges ran inside the tick. On n3 two merges of 1.6 GB regions held
+    /// up a 3 -> 6 scale-up for 20 minutes, with node 6 still empty.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn run_keeps_splitting_while_a_merge_copies() {
+        let harness = PlacementTestHarness::new_tuned(false, &[(2, 0)], 2, |c| {
+            c.schedule_limit = 1;
+            c.replication_factor = 1;
+            c.split_merge_interval_secs = 0;
+            // A merge copy of ~25 KiB at 4 KiB/s takes several seconds.
+            c.movement_budget_bytes_per_sec = 4 * 1024;
+        })
+        .await;
+        harness.write_points(0, 2_000).await;
+        // cpu0 becomes two adjacent regions; only the left one is on node 2,
+        // so merging them copies the right half there.
+        let key = PlacementTestHarness::key();
+        let parent = harness.region().await;
+        let split_key = u64::MAX / 2;
+        let mut left = parent.clone();
+        left.end = split_key;
+        left.epoch = parent.epoch.bump_version();
+        let mut right = parent.clone();
+        right.start = split_key;
+        right.epoch = left.epoch;
+        harness
+            .scheduler
+            .shard_map
+            .apply_op(ShardMapOp::Split {
+                key: key.clone(),
+                region_id: parent.region_id,
+                split_key,
+                epoch: parent.epoch,
+                left,
+                right,
+            })
+            .await
+            .unwrap();
+        let halves = harness.space_regions(&key).await;
+        assert_eq!(halves.len(), 2);
+        harness
+            .scheduler
+            .shard_map
+            .apply_op(ShardMapOp::AddPeer {
+                key: key.clone(),
+                region_id: halves[0].region_id,
+                to_peer: 2,
+                epoch: halves[0].epoch,
+                staging: false,
+            })
+            .await
+            .unwrap();
+        let other = harness
+            .space_regions(&MeasurementKey::new("db", "autogen", "cpu1"))
+            .await[0]
+            .region_id;
+
+        let (tx, rx) = watch::channel(false);
+        let sched = harness.scheduler.clone();
+        let run = tokio::spawn(async move {
+            sched.run(Duration::from_millis(100), rx).await;
+        });
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            harness
+                .scheduler
+                .region_has_operator(halves[0].region_id)
+                .await,
+            "the merge should be copying"
+        );
+        harness
+            .scheduler
+            .record_heartbeat(other, 1, 1_000_000, 0, 0)
+            .await;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        let split = harness
+            .proposals
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|op| matches!(op, ShardMapOp::Split { region_id, .. } if *region_id == other));
+        let still_merging = harness
+            .scheduler
+            .region_has_operator(halves[0].region_id)
+            .await;
+        let _ = tx.send(true);
+        run.abort();
+        assert!(
+            still_merging,
+            "the merge finished too early to prove anything"
+        );
+        assert!(split, "no split proposed while a merge was copying");
     }
 
     /// `run` must keep splitting while it re-stages a leftover learner.
