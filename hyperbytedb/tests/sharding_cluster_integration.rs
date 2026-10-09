@@ -740,10 +740,13 @@ async fn coalesced_forwards_land_every_point() {
             "cpu,host={low} value={i} {t}\ncpu,host={high} value={i} {t}",
             t = 1_000_000_000 + i
         );
-        async move { write_line(&client, &url, "sharddb", &body).await.status() }
+        async move {
+            let resp = write_line(&client, &url, "sharddb", &body).await;
+            (resp.status(), resp.text().await.unwrap_or_default())
+        }
     });
-    for status in futures::future::join_all(writes).await {
-        assert!(status.is_success(), "write: {status}");
+    for (status, body) in futures::future::join_all(writes).await {
+        assert!(status.is_success(), "write: {status} {body}");
     }
     assert!(
         nodes[2].shard_routing.forward_coalescer.lane_count() > 0,
