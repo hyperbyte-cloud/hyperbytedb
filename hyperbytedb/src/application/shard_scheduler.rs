@@ -80,11 +80,18 @@ struct PendingPlacement {
     approx_bytes: u64,
 }
 
-/// Whether two regions live on exactly the same peers, none of them a
-/// learner: the only pairs a merge may join without moving data.
-fn same_peers(a: &ShardRegion, b: &ShardRegion) -> bool {
+/// Whether two regions may merge: on exactly the same peers, none of them a
+/// learner, so no data moves; and at the same epoch, because the `Merge` op
+/// carries one epoch and its apply checks both regions against it. Pairs whose
+/// epochs had drifted apart were proposed, refused, and proposed again every
+/// tick, and their regions were never placed: on n3 that kept a decommission
+/// from finishing for 20 hours.
+fn mergeable(a: &ShardRegion, b: &ShardRegion) -> bool {
     let set = |r: &ShardRegion| r.peers.iter().copied().collect::<HashSet<u64>>();
-    a.staging_peers.is_empty() && b.staging_peers.is_empty() && set(a) == set(b)
+    a.staging_peers.is_empty()
+        && b.staging_peers.is_empty()
+        && set(a) == set(b)
+        && a.epoch == b.epoch
 }
 
 /// Two adjacent regions a tick chose to merge.
@@ -339,6 +346,9 @@ pub struct ShardScheduler {
     test_force_leader: bool,
     #[cfg(test)]
     test_propose_sink: Option<Arc<std::sync::Mutex<Vec<ShardMapOp>>>>,
+    /// Send proposals through raft even with a sink set.
+    #[cfg(test)]
+    test_propose_via_raft: std::sync::atomic::AtomicBool,
 }
 
 impl ShardScheduler {
@@ -391,6 +401,8 @@ impl ShardScheduler {
             test_force_leader: false,
             #[cfg(test)]
             test_propose_sink: None,
+            #[cfg(test)]
+            test_propose_via_raft: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1214,7 +1226,7 @@ impl ShardScheduler {
                             >= self.config.split_merge_interval_secs
                         && now.saturating_sub(right.last_split_at)
                             >= self.config.split_merge_interval_secs
-                        && same_peers(region, right)
+                        && mergeable(region, right)
                         && !self.region_has_operator(right.region_id).await
                     {
                         // Run in the background, holding both regions: a
@@ -1799,11 +1811,11 @@ impl ShardScheduler {
         // a snapshot, and the right's writes during the copy never reached
         // them: on n3 one merge lost 2.02M acked points, 1.1% of the writes
         // of a 3 -> 6 scale-up.
-        if !same_peers(left, &right) {
+        if !mergeable(left, &right) {
             tracing::debug!(
                 left_region_id = left.region_id,
                 right_region_id = right.region_id,
-                "shard merge deferred: regions on different peers"
+                "shard merge deferred: regions on different peers or epochs"
             );
             return Ok(());
         }
@@ -2352,16 +2364,32 @@ impl ShardScheduler {
 
     async fn propose(&self, op: ShardMapOp) -> Result<(), HyperbytedbError> {
         #[cfg(test)]
-        if let Some(sink) = &self.test_propose_sink {
+        if let Some(sink) = &self.test_propose_sink
+            && !self
+                .test_propose_via_raft
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
             sink.lock().unwrap().push(op);
             return Ok(());
         }
         use crate::adapters::cluster::raft::types::ClusterRequest;
         let req = ClusterRequest::ShardMapMutation(Box::new(op));
-        self.raft
+        let resp = self
+            .raft
             .client_write(req)
             .await
             .map_err(|e| HyperbytedbError::ShardMap(e.to_string().into()))?;
+        // Committed is not applied: the apply can refuse the op (a stale
+        // epoch, say), and that was read as success. A refused Merge was
+        // counted and retried every tick for 20 hours on n3, 72,541 times.
+        if !resp.data.ok {
+            return Err(HyperbytedbError::ShardMap(
+                resp.data
+                    .message
+                    .unwrap_or_else(|| "shard map op refused".into())
+                    .into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -5991,6 +6019,37 @@ mod tests {
         );
     }
 
+    /// An op the apply refuses is an error, not a success.
+    ///
+    /// `propose` returned Ok once raft committed the op, whatever the apply
+    /// said, so a refused Merge was counted and retried every tick: 72,541
+    /// times in 20 hours on n3.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn a_refused_op_is_an_error() {
+        let harness = PlacementTestHarness::new(true, &[(2, 0)], 1).await;
+        harness
+            .scheduler
+            .test_propose_via_raft
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let region = harness.region().await;
+        let add = |epoch| ShardMapOp::AddPeer {
+            key: PlacementTestHarness::key(),
+            region_id: region.region_id,
+            to_peer: 2,
+            epoch,
+            staging: true,
+        };
+
+        let stale = region.epoch.bump_conf_ver().bump_version();
+        assert!(
+            harness.scheduler.propose(add(stale)).await.is_err(),
+            "the apply refuses a stale epoch"
+        );
+        harness.scheduler.propose(add(region.epoch)).await.unwrap();
+        assert!(harness.region().await.staging_peers.contains(&2));
+    }
+
     /// A merge joins only regions on the same peers, and moves no data.
     ///
     /// It used to copy the right half onto the left's peers that lacked it.
@@ -6025,6 +6084,19 @@ mod tests {
         assert_eq!(merges(&harness), 0, "node 2 lacks the right half");
 
         right.peers = vec![2, 1];
+        right.epoch = left.epoch.bump_conf_ver();
+        harness
+            .scheduler
+            .try_merge(&key, &left, right.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            merges(&harness),
+            0,
+            "the apply checks both regions against one epoch, so it would refuse"
+        );
+
+        right.epoch = left.epoch;
         harness
             .scheduler
             .try_merge(&key, &left, right)
