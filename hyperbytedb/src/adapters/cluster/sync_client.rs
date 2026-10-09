@@ -87,6 +87,13 @@ impl SyncClient {
 
     /// Reconnect after a disconnect: detect WAL gap and do WAL catch-up or
     /// a full metadata re-sync when the gap is large.
+    ///
+    /// Sharded: metadata and the shard map only. A node's WAL holds the writes
+    /// it took, numbered by its own sequence, so "the gap" compared unrelated
+    /// numbers, and the catch-up copied another node's regions into this
+    /// one's store. On n3 that took ~20 minutes per reconnect with the node
+    /// Syncing (not ready). A sharded replica gets missed writes from hinted
+    /// handoff, and a new copy of a region from a learner stage.
     pub async fn reconnect_sync(&self) -> Result<bool, HyperbytedbError> {
         let peer_addr = self.pick_sync_peer().await;
         let peer_addr = match peer_addr {
@@ -98,6 +105,13 @@ impl SyncClient {
         };
 
         tracing::debug!(peer = %peer_addr, "starting reconnect sync");
+
+        if self.shard_map.is_some() {
+            self.sync_metadata(&peer_addr).await?;
+            self.sync_shard_map(&peer_addr).await?;
+            tracing::info!("reconnect sync complete (metadata and shard map), node is Active");
+            return Ok(true);
+        }
 
         let manifest = self.get_manifest(&peer_addr).await?;
         let local_wal_seq = self.wal.last_sequence().await?;
@@ -198,27 +212,13 @@ impl SyncClient {
             );
         }
 
-        let mut applied = 0u64;
-        if let Some(ref shard_map) = self.shard_map {
-            let map = shard_map.snapshot().await?;
-            for space in map.spaces.values() {
-                for region in &space.regions {
-                    if !region.peers.contains(&self.node_id) || region.primary == self.node_id {
-                        continue;
-                    }
-                    let primary_addr = {
-                        let m = self.membership.read().await;
-                        m.get_node(region.primary).map(|n| n.addr.clone())
-                    };
-                    if let Some(addr) = primary_addr {
-                        applied += self.wal_catchup(&addr, local_wal_seq).await?;
-                    }
-                }
-            }
+        // Sharded: no WAL catch-up (see `reconnect_sync`). A joiner gets a
+        // region's rows when it is added as a learner and staged.
+        if self.shard_map.is_none() {
+            let applied = self.wal_catchup(&peer_addr, local_wal_seq).await?;
+            let local_after = self.wal.last_sequence().await?;
+            verify_catchup_progress(local_wal_seq, manifest.wal_last_seq, applied, local_after)?;
         }
-        applied += self.wal_catchup(&peer_addr, local_wal_seq).await?;
-        let local_after = self.wal.last_sequence().await?;
-        verify_catchup_progress(local_wal_seq, manifest.wal_last_seq, applied, local_after)?;
 
         let mut m = self.membership.write().await;
         m.complete_sync_to_active(self.node_id);
@@ -599,6 +599,99 @@ fn verify_catchup_progress(
 mod tests {
     use super::{remote_map_is_newer, verify_catchup_progress};
     use crate::error::HyperbytedbError;
+
+    /// A peer that answers sync calls and counts WAL catch-up requests.
+    async fn spawn_sync_peer(wal_requests: std::sync::Arc<std::sync::atomic::AtomicU64>) -> String {
+        use axum::routing::{get, post};
+        let app = axum::Router::new()
+            .route(
+                "/internal/sync/manifest",
+                get(|| async {
+                    axum::Json(serde_json::json!({
+                        "node_id": 2, "wal_last_seq": 500_000, "databases": [],
+                        "shard_map_version": 0,
+                    }))
+                }),
+            )
+            .route(
+                "/internal/sync/metadata",
+                get(|| async { axum::Json(serde_json::json!({ "entries": [] })) }),
+            )
+            .route(
+                "/internal/shard/map",
+                get(|| async {
+                    axum::Json(serde_json::json!({
+                        "map_version": 0, "next_region_id": 1, "spaces": [],
+                    }))
+                }),
+            )
+            .route(
+                "/internal/sync/wal",
+                get(move || {
+                    let n = wal_requests.clone();
+                    async move {
+                        n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                }),
+            )
+            .route(
+                "/internal/membership/join",
+                post(|| async { axum::http::StatusCode::OK }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        addr
+    }
+
+    /// A sharded node never pulls a peer's WAL to sync: not on reconnect and
+    /// not on join. Comparing its own WAL sequence with a peer's compared
+    /// unrelated numbers, and copied the peer's regions into this node (~20
+    /// minutes per reconnect on n3, with the node not ready meanwhile).
+    #[tokio::test]
+    async fn a_sharded_node_syncs_without_pulling_a_peer_wal() {
+        use crate::adapters::metadata::rocksdb_meta::RocksDbMetadata;
+        use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
+        use crate::adapters::wal::rocksdb_wal::RocksDbWal;
+        use crate::domain::cluster::membership::{
+            ClusterMembership, NodeInfo, NodeState, new_shared,
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let wal_requests = Arc::new(AtomicU64::new(0));
+        let peer = spawn_sync_peer(wal_requests.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = ClusterMembership::new();
+        m.add_node(NodeInfo {
+            node_id: 2,
+            addr: peer,
+            state: NodeState::Active,
+            joined_at: 0,
+            last_heartbeat: 0,
+            needs_sync: false,
+            consecutive_misses: 0,
+        });
+        std::fs::create_dir_all(dir.path().join("meta")).unwrap();
+        let client = super::SyncClient::new(
+            1,
+            "127.0.0.1:1".into(),
+            new_shared(m),
+            Arc::new(RocksDbMetadata::open(dir.path().join("meta2")).unwrap()),
+            Arc::new(RocksDbWal::open(dir.path().join("wal")).unwrap()),
+            Vec::new(),
+        )
+        .with_shard_map(Arc::new(
+            RocksDbShardMap::open(&dir.path().join("meta"), true).unwrap(),
+        ));
+
+        assert!(client.reconnect_sync().await.unwrap());
+        client.join_and_sync().await.unwrap();
+        assert_eq!(wal_requests.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn remote_map_installs_only_when_strictly_newer() {
