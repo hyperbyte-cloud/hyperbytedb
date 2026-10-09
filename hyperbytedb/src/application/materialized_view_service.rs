@@ -437,12 +437,19 @@ impl MaterializedViewService {
         let fact_mv_quoted = quoted_fact_mv_name(&mv.database, &dest_rp, &mv.name);
         let series_mv_quoted = quoted_series_mv_name(&mv.database, &dest_rp, &mv.name);
 
-        let select_sql = to_clickhouse::translate_materialized_view_select(
+        // Sharded: roll up only rows ingested on this node, so a row that
+        // every replica inserts is counted once across the cluster.
+        let source_filter = self
+            .shard_routing
+            .as_ref()
+            .map(|ctx| crate::application::shard_query::ingested_here_filter(ctx.node_id));
+        let select_sql = to_clickhouse::translate_materialized_view_select_with_source_filter(
             &effective_query,
             &source_fact,
             &source_series,
             &dest_measurement,
             &source_mapping,
+            source_filter.as_deref(),
         )?;
 
         let create_fact_mv =

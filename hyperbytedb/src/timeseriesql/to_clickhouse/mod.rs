@@ -22,6 +22,7 @@ pub use materialized_view::{
     build_create_fact_materialized_view, build_create_series_materialized_view,
     cq_time_window_condition, prepare_cq_select, strip_time_predicates, translate_bounded_cq_into,
     translate_materialized_view_backfill, translate_materialized_view_select,
+    translate_materialized_view_select_with_source_filter,
     translate_materialized_view_series_select, translate_select_into, translate_select_into_native,
 };
 pub use select::{

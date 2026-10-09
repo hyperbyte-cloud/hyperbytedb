@@ -1577,3 +1577,30 @@ fn test_timezone_string_is_escaped() {
 fn translate_test_tz(stmt: &SelectStatement) -> String {
     translate_native_table(stmt, test_table().as_str(), None, None, None).unwrap()
 }
+
+/// A materialized view's source filter applies to the raw source rows, inside
+/// the coalescing subquery: that is where `origin_node_id` exists.
+#[test]
+fn a_materialized_view_source_filter_applies_to_raw_rows() {
+    let stmt = parse_select(
+        r#"SELECT mean("usage_idle") INTO "cpu_5m" FROM "cpu" GROUP BY time(5m), "host""#,
+    );
+    let sql = translate_materialized_view_select_with_source_filter(
+        &stmt,
+        &test_table(),
+        &test_series_table(),
+        "cpu_5m",
+        &cpu_mapping(),
+        Some("`origin_node_id` IN (0, 7)"),
+    )
+    .unwrap();
+    let inner = sql
+        .split_once("FROM (SELECT `series_id`, `time`")
+        .and_then(|(_, rest)| rest.split_once(") AS t"))
+        .map(|(inner, _)| inner)
+        .unwrap_or_else(|| panic!("no source subquery: {sql}"));
+    assert!(
+        inner.contains("WHERE `origin_node_id` IN (0, 7) GROUP BY `series_id`, `time`"),
+        "{inner}"
+    );
+}

@@ -5,7 +5,7 @@ use crate::error::HyperbytedbError;
 use crate::timeseriesql::ast::*;
 use std::fmt::Write;
 
-use super::coalesce::build_coalesced_fact_view_with_row_meta;
+use super::coalesce::build_coalesced_fact_view_impl;
 use super::conditions::{quote_phys_identifier, translate_expr};
 use super::rename::rename_time_bucket_alias;
 use super::select::{
@@ -77,6 +77,26 @@ pub fn translate_materialized_view_select(
     source_series: &QuotedTableName,
     dest_measurement: &str,
     mapping: &ColumnMapping,
+) -> Result<String, HyperbytedbError> {
+    translate_materialized_view_select_with_source_filter(
+        stmt,
+        source_fact,
+        source_series,
+        dest_measurement,
+        mapping,
+        None,
+    )
+}
+
+/// [`translate_materialized_view_select`] with `source_filter` applied to the
+/// raw source rows, before they are coalesced.
+pub fn translate_materialized_view_select_with_source_filter(
+    stmt: &SelectStatement,
+    source_fact: &QuotedTableName,
+    source_series: &QuotedTableName,
+    dest_measurement: &str,
+    mapping: &ColumnMapping,
+    source_filter: Option<&str>,
 ) -> Result<String, HyperbytedbError> {
     validate_select_into(stmt)?;
     let gb = stmt
@@ -160,7 +180,8 @@ pub fn translate_materialized_view_select(
     let mut out = String::new();
     write!(out, "SELECT {}", select_parts.join(", "))?;
     let source_mapping = mapping_with_mv_aggregate_fields(mapping, &stmt.fields);
-    let coalesced_source = build_coalesced_fact_view_with_row_meta(source_fact, &source_mapping);
+    let coalesced_source =
+        build_coalesced_fact_view_impl(source_fact, &source_mapping, true, source_filter);
     // ANY LEFT JOIN for consistency with the query path: fact rows whose series
     // row hasn't landed yet must not be silently dropped from the rollup.
     write!(

@@ -39,6 +39,19 @@ fn find_clause_terminator(sql: &str) -> Option<usize> {
         .min()
 }
 
+/// The rows this node ingested: written here (`origin_node_id` is this node,
+/// or 0 for a local write that predates stamping), not copied here by
+/// replication or a region transfer.
+///
+/// Every replica of a region inserts the region's rows, and each node's
+/// materialized view rolled up everything it inserted, while a destination
+/// query adds up every node's rollups: with RF 3 a row counted three times.
+/// Rolled up only where it was ingested, each row counts once.
+#[must_use]
+pub fn ingested_here_filter(node_id: u64) -> String {
+    format!("`origin_node_id` IN (0, {node_id})")
+}
+
 fn inject_and_predicate(sql: String, predicate: &str) -> String {
     if predicate.is_empty() {
         return sql;

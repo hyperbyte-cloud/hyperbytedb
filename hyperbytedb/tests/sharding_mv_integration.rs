@@ -70,8 +70,14 @@ fn host_tag(host: &str) -> BTreeMap<String, String> {
     BTreeMap::from([("host".into(), host.into())])
 }
 
+/// Ignored: these in-process nodes share one chDB (one data path per
+/// process), so they share one source table, which takes every replica's
+/// insert of a row, and one view, created with whichever node's filter
+/// applied first. A real cluster has a view per node that rolls up only the
+/// rows that node ingested (`ingested_here_filter`); that is checked on n3.
 #[tokio::test]
 #[serial(chdb)]
+#[ignore = "shared chDB cannot model per-node views; see doc comment"]
 async fn sharded_mv_incremental_rollup() {
     let dir = tempfile::tempdir().unwrap();
     let nodes =
