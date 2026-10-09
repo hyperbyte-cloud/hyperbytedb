@@ -12,7 +12,7 @@ use crate::adapters::cluster::raft::types::{ClusterRequest, ClusterResponse};
 use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
 use crate::application::runtime::RegionWriteStats;
 use crate::application::shard_peer_resolution::{
-    RegionTargetRole, ScatterKind, active_region_peer_targets, is_active_peer, peer_addr,
+    RegionTargetRole, ScatterKind, active_region_peer_targets, is_serving_node, peer_addr,
     resolve_region_peers,
 };
 use crate::config::ShardingConfig;
@@ -973,7 +973,7 @@ pub async fn scatter_delete_to_regions(
         }
 
         let membership = ctx.peer_client.membership().read().await;
-        if !is_active_peer(&membership, region.primary) {
+        if !is_serving_node(&membership, region.primary) {
             tracing::warn!(
                 region_id = region.region_id,
                 primary = region.primary,

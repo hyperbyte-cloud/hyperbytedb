@@ -12,7 +12,7 @@ use crate::application::shard_metadata_scatter::{
     scatter_series_keys, scatter_tag_keys, scatter_tag_values,
 };
 use crate::application::shard_peer_resolution::{
-    RegionTargetRole, ScatterKind, is_active_peer, peer_addr,
+    RegionTargetRole, ScatterKind, is_serving_node, peer_addr,
 };
 use crate::application::shard_query::inject_region_series_id_predicate;
 use crate::application::shard_query_routing::{
@@ -2215,7 +2215,7 @@ async fn query_materialized_region_all_peers(
 
     let membership = ctx.peer_client.membership().read().await;
     let primary = region.primary;
-    let primary_active = is_active_peer(&membership, primary) && region.is_serving_peer(primary);
+    let primary_active = is_serving_node(&membership, primary) && region.is_serving_peer(primary);
     drop(membership);
 
     if !primary_active {
