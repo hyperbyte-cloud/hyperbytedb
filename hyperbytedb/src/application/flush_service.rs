@@ -34,6 +34,9 @@ const MAX_BATCH_POINTS: usize = 500_000;
 /// Maximum number of unflushed WAL entries to retain when peers are lagging.
 /// Beyond this limit we truncate anyway to prevent unbounded WAL growth.
 const MAX_WAL_RETENTION_ENTRIES: u64 = 500_000;
+/// WAL entries kept behind the flush in a sharded cluster: tens of seconds of
+/// peak ingest, re-flushed (idempotently) after a crash.
+const SHARDED_WAL_RETENTION_ENTRIES: u64 = 10_000;
 
 type MeasurementBatchKey = (String, String, String);
 type MeasurementBatch = (Vec<Point>, Vec<u64>);
@@ -62,6 +65,8 @@ pub struct FlushServiceImpl {
     coalesce: bool,
     sharding_enabled: bool,
     shard_map: Option<Arc<dyn ShardMapPort>>,
+    /// WAL entries kept behind the flush in a sharded cluster.
+    sharded_wal_retention_entries: u64,
 }
 
 struct FlushWork {
@@ -111,6 +116,7 @@ impl FlushServiceImpl {
             coalesce: std::env::var("HYPERBYTEDB_DISABLE_COALESCE").is_err(),
             sharding_enabled: false,
             shard_map: None,
+            sharded_wal_retention_entries: SHARDED_WAL_RETENTION_ENTRIES,
         }
     }
 
@@ -134,6 +140,11 @@ impl FlushServiceImpl {
         self.heartbeat_interval_secs = heartbeat_interval_secs;
         self.heartbeat_miss_threshold = heartbeat_miss_threshold;
         self.truncate_stale_peer_multiplier = truncate_stale_peer_multiplier;
+        self
+    }
+
+    pub fn with_sharded_wal_retention(mut self, entries: u64) -> Self {
+        self.sharded_wal_retention_entries = entries;
         self
     }
 
@@ -190,6 +201,15 @@ impl FlushServiceImpl {
     /// are omitted (they need full sync / ops intervention); truncation then follows the
     /// remaining peers only. Multiplier `0` disables this (strict legacy behavior).
     async fn compute_safe_truncate_seq(&self, chunk_max_seq: u64) -> u64 {
+        // Sharded: nothing reads a flushed entry back. Replicas get writes
+        // from the replication queue and hinted handoff, and a moving region
+        // from chDB plus the unflushed WAL; no peer ever acks the WAL, so the
+        // barrier below kept 500k entries, 18-72 GB a pod on n3, and every
+        // restart re-flushed all of it. A margin stays behind the flush for
+        // the chDB parts the OS has not written back yet.
+        if self.sharding_enabled {
+            return chunk_max_seq.saturating_sub(self.sharded_wal_retention_entries);
+        }
         let rl = match self.replication_log {
             Some(ref rl) => rl,
             None => return chunk_max_seq,
@@ -885,6 +905,75 @@ mod tests {
             wal.flushed_through() < seq,
             "a failed chunk must not be recorded as flushed"
         );
+    }
+
+    /// In a sharded cluster the WAL keeps only a margin behind the flush.
+    ///
+    /// It waited for peer acks that nothing sends, so it kept 500k entries:
+    /// 18 GB on most n3 pods and 72 GB on one, which then decoded on open for
+    /// longer than its startup probe allowed.
+    #[tokio::test]
+    async fn a_sharded_wal_keeps_only_a_margin_behind_the_flush() {
+        use crate::adapters::cluster::replication_log::ReplicationLog;
+        use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
+        use crate::domain::cluster::membership::{ClusterMembership, new_shared};
+        use crate::domain::sharding::{MeasurementKey, ShardMapOp, ShardRegion};
+        use crate::ports::sharding::ShardMapPort;
+
+        let tmp = TempDir::new().unwrap();
+        let wal: Arc<dyn WalPort> = Arc::new(
+            RocksDbWal::open_with_options(
+                tmp.path().join("wal"),
+                RocksDbWalOptions {
+                    wal_format: WalFormat::Bincode,
+                    arrow_wal_enabled: false,
+                },
+            )
+            .unwrap(),
+        );
+        std::fs::create_dir_all(tmp.path().join("meta")).unwrap();
+        let map = Arc::new(RocksDbShardMap::open(&tmp.path().join("meta"), true).unwrap());
+        map.apply_op(ShardMapOp::BootstrapMeasurement {
+            key: MeasurementKey::new("db", "autogen", "cpu"),
+            region: ShardRegion {
+                region_id: 1,
+                start: 0,
+                end: u64::MAX,
+                epoch: Default::default(),
+                peers: vec![1, 2],
+                primary: 1,
+                last_split_at: 0,
+                transfer_verified: None,
+                transfer_first_seen: None,
+                state: Default::default(),
+                staged_from: None,
+                staging_peers: Vec::new(),
+            },
+        })
+        .await
+        .unwrap();
+        // Node 2 shares a region with this node and has never acked.
+        let flush = FlushServiceImpl::new(wal.clone(), 0, Arc::new(CountingSink::default()))
+            .with_replication_log(Arc::new(
+                ReplicationLog::open(tmp.path().join("repl")).unwrap(),
+            ))
+            .with_membership(1, new_shared(ClusterMembership::new()))
+            .with_sharding(true, Some(map as Arc<dyn ShardMapPort>), 1)
+            .with_sharded_wal_retention(2);
+        for _ in 0..5 {
+            wal.append(entry()).await.unwrap();
+        }
+
+        flush.flush().await.unwrap();
+
+        let kept: Vec<u64> = wal
+            .read_range(1, 16)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(seq, _)| seq)
+            .collect();
+        assert_eq!(kept, vec![4, 5]);
     }
 
     /// A region copy reads only WAL entries past this watermark and takes the
