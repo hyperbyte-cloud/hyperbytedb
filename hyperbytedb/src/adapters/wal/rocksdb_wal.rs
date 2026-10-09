@@ -235,10 +235,29 @@ impl RocksDbWal {
     /// layout first; on failure we decode the legacy 3-field shape, append
     /// `origin_node_id: 0`, re-serialize, and overwrite the key in-place.
     /// After this runs every entry matches the current schema.
+    ///
+    /// Only the oldest entry is checked before scanning: the format only moves
+    /// forward, so if it is current, so is everything after it. Scanning and
+    /// decoding every entry on every open took longer than the 10-minute
+    /// startup probe on n3 (a 72 GB WAL), and the pod restarted forever.
     fn migrate_legacy_entries(db: &DB) -> Result<(), HyperbytedbError> {
         let wal_cf = db
             .cf_handle(WAL_CF)
             .ok_or_else(|| HyperbytedbError::Wal("wal column family not found".into()))?;
+        let current = |value: &[u8]| {
+            (value.len() >= 4 && &value[..4] == b"HBWA")
+                || bincode::deserialize::<WalEntry>(value).is_ok()
+        };
+        match db.iterator_cf(&wal_cf, IteratorMode::Start).next() {
+            None => return Ok(()),
+            Some(Ok((_, value))) if current(&value) => return Ok(()),
+            Some(Err(e)) => {
+                return Err(HyperbytedbError::Wal(
+                    crate::error::ChainedError::from_error(e),
+                ));
+            }
+            Some(Ok(_)) => {}
+        }
 
         #[derive(serde::Deserialize)]
         struct LegacyWalEntry {
@@ -260,10 +279,7 @@ impl RocksDbWal {
             let (key, value) =
                 item.map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
 
-            if bincode::deserialize::<WalEntry>(&value).is_ok() {
-                continue;
-            }
-            if value.len() >= 4 && &value[..4] == b"HBWA" {
+            if current(&value) {
                 continue;
             }
 
@@ -663,6 +679,70 @@ mod tests {
 
     use super::*;
     use crate::domain::point::{FieldValue, Point};
+
+    fn cpu_entry(points: usize) -> WalEntry {
+        WalEntry {
+            database: "db".into(),
+            retention_policy: "autogen".into(),
+            points: (0..points)
+                .map(|i| Point {
+                    measurement: "cpu".into(),
+                    tags: [("host".to_string(), format!("h{i}"))].into(),
+                    fields: [("v".to_string(), FieldValue::Float(1.0))].into(),
+                    timestamp: i as i64,
+                    series_id_cache: Default::default(),
+                })
+                .collect(),
+            origin_node_id: 0,
+        }
+    }
+
+    /// Opening a WAL looks at its oldest entry, not at every entry: decoding a
+    /// 72 GB WAL on open outran a pod's startup probe, so it never started.
+    /// An undecodable entry behind a current oldest one proves it: a full
+    /// scan reports it as corrupt.
+    #[tokio::test]
+    async fn opening_a_wal_does_not_decode_every_entry() {
+        let dir = TempDir::new().unwrap();
+        {
+            let wal = RocksDbWal::open(dir.path()).unwrap();
+            wal.append(cpu_entry(3)).await.unwrap();
+            let cf = wal.db.cf_handle(WAL_CF).unwrap();
+            wal.db
+                .put_cf(&cf, u64_to_be_bytes(1_000), b"not a wal entry")
+                .unwrap();
+        }
+        RocksDbWal::open(dir.path()).expect("open must not decode every entry");
+    }
+
+    /// A WAL whose oldest entry predates `origin_node_id` is still migrated.
+    #[tokio::test]
+    async fn a_legacy_wal_is_still_migrated() {
+        #[derive(serde::Serialize)]
+        struct LegacyWalEntry {
+            database: String,
+            retention_policy: String,
+            points: Vec<Point>,
+        }
+        let dir = TempDir::new().unwrap();
+        {
+            let wal = RocksDbWal::open(dir.path()).unwrap();
+            let entry = cpu_entry(2);
+            let legacy = bincode::serialize(&LegacyWalEntry {
+                database: entry.database,
+                retention_policy: entry.retention_policy,
+                points: entry.points,
+            })
+            .unwrap();
+            let cf = wal.db.cf_handle(WAL_CF).unwrap();
+            wal.db.put_cf(&cf, u64_to_be_bytes(1), legacy).unwrap();
+        }
+        let wal = RocksDbWal::open(dir.path()).unwrap();
+        let entries = wal.read_range(1, 8).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1.points.len(), 2);
+        assert_eq!(entries[0].1.origin_node_id, 0);
+    }
 
     fn seq_only_batch(n: usize) -> Arc<RecordBatch> {
         let schema = Arc::new(Schema::new(vec![Field::new(
