@@ -723,30 +723,30 @@ impl MetadataPort for RocksDbMetadata {
             let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
                 HyperbytedbError::Metadata("metadata column family not found".into())
             })?;
-            let db_prefix = format!("db:{}", name_owned);
-            let meas_prefix = format!("meas:{}:", name_owned);
-            let tag_prefix = format!("tag_val:{}:", name_owned);
-            let series_db_prefix = format!("series:{}:", name_owned);
-
-            let iter =
-                rdb.iterator_cf_opt(&cf, rocksdb::ReadOptions::default(), IteratorMode::Start);
-            let mut to_delete = Vec::new();
-            for item in iter {
-                if let Ok((key, _)) = item
-                    && let Ok(k) = std::str::from_utf8(&key)
-                    && (k.starts_with(&db_prefix)
-                        || k.starts_with(&meas_prefix)
-                        || k.starts_with(&tag_prefix)
-                        || k.starts_with(&series_db_prefix))
-                {
-                    to_delete.push(key.to_vec());
+            // The database's own key exactly, and everything under its
+            // prefixes as ranges. Collecting every matching key from a scan
+            // of the whole column family held millions of series keys in
+            // memory at once and deleted them one by one; and "db:{name}"
+            // as a prefix also matched "db:{name}_other", so dropping one
+            // database could delete another's record.
+            let mut batch = rocksdb::WriteBatch::default();
+            batch.delete_cf(&cf, db_key(&name_owned));
+            for prefix in [
+                format!("meas:{name_owned}:"),
+                format!("tag_val:{name_owned}:"),
+                format!("series:{name_owned}:"),
+            ] {
+                let start = prefix.into_bytes();
+                let mut end = start.clone();
+                // Every prefix ends in ':', so bumping it bounds the range.
+                if let Some(last) = end.last_mut() {
+                    *last += 1;
                 }
+                batch.delete_range_cf(&cf, start, end);
             }
-            for k in to_delete {
-                rdb.delete_cf(&cf, k).map_err(|e| {
-                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
-                })?;
-            }
+            rdb.write(batch).map_err(|e| {
+                HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+            })?;
             Ok(())
         })
         .await?;
@@ -2399,6 +2399,60 @@ impl MetadataPort for RocksDbMetadata {
 #[cfg(test)]
 mod series_range_tests {
     use super::*;
+
+    /// Dropping a database removes its own metadata and nothing of a database
+    /// whose name it prefixes. "db:{name}" was matched as a prefix, so
+    /// dropping "foo" also deleted "foobar"'s record.
+    #[tokio::test]
+    async fn dropping_a_database_leaves_one_it_prefixes_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = RocksDbMetadata::open(dir.path()).unwrap();
+        for db in ["foo", "foobar"] {
+            meta.create_database(db).await.unwrap();
+            meta.register_measurement(
+                db,
+                "autogen",
+                &MeasurementMeta {
+                    name: "cpu".into(),
+                    tag_keys: vec!["host".into()],
+                    field_types: [("value".into(), 0_u8)].into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let series: Vec<(u64, BTreeMap<String, String>)> = (1..=50u64)
+                .map(|id| (id, [("host".to_string(), format!("h{id}"))].into()))
+                .collect();
+            meta.register_series_batch(db, "autogen", "cpu", &series)
+                .await
+                .unwrap();
+        }
+
+        meta.drop_database("foo").await.unwrap();
+        // Read back from disk, not from the in-memory caches.
+        drop(meta);
+        let meta = RocksDbMetadata::open(dir.path()).unwrap();
+
+        assert!(meta.get_database("foo").await.unwrap().is_none());
+        assert!(
+            meta.list_series_ids("foo", "autogen", "cpu")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            meta.get_database("foobar").await.unwrap().is_some(),
+            "dropping foo deleted foobar"
+        );
+        assert_eq!(
+            meta.list_series_ids("foobar", "autogen", "cpu")
+                .await
+                .unwrap()
+                .len(),
+            50
+        );
+    }
 
     /// Ranges that start mid-space, with series exactly at `start` (in) and
     /// at `end` (out), and another measurement sorting right after this one.
