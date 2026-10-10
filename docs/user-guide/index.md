@@ -18,6 +18,7 @@ This guide covers deploying, configuring, and operating HyperbyteDB. You do not 
 | 8 | [Troubleshooting](troubleshooting.md) | Fix startup, query, and cluster issues |
 | 9 | [API reference](reference.md) | HTTP endpoints and TimeseriesQL compatibility |
 | 10 | [Resource sizing](resource-sizing.md) | CPU, memory, disk, and cluster sizing guidelines |
+| 10b | [Operating a sharded cluster](operating-sharded-clusters.md) | What scaling, restarts, reads and materialized views do in practice, with measured times |
 | 11 | [V1 stable scope](v1-stable-scope.md) | Supported topologies, guarantees, and breaking-change policy |
 
 ## Prerequisites
