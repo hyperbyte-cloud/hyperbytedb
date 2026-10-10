@@ -1,6 +1,6 @@
 [package]
 name = "hyperbytedb"
-version = "0.8.5"
+version = "0.9.0-beta"
 edition = "2024"
 
 [dependencies]
