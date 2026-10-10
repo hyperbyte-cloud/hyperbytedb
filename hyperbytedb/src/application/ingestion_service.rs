@@ -147,10 +147,9 @@ impl IngestionPort for IngestionServiceImpl {
                     .as_deref()
                     .is_none_or(|mr| mr == retention_policy)
             {
-                return Err(HyperbytedbError::QueryParse(format!(
-                    "cannot write directly to materialized view destination \"{0}\"",
-                    wire.measurement,
-                )));
+                return Err(HyperbytedbError::WriteToMaterializedDestination(
+                    wire.measurement.clone(),
+                ));
             }
 
             let t3 = std::time::Instant::now();
@@ -231,10 +230,9 @@ impl IngestionPort for IngestionServiceImpl {
                     .as_deref()
                     .is_none_or(|mr| mr == retention_policy)
             {
-                return Err(HyperbytedbError::QueryParse(format!(
-                    "cannot write directly to materialized view destination \"{0}\"",
-                    point.measurement,
-                )));
+                return Err(HyperbytedbError::WriteToMaterializedDestination(
+                    point.measurement.clone(),
+                ));
             }
         }
 

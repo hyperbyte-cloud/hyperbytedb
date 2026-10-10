@@ -92,6 +92,12 @@ pub enum HyperbytedbError {
     #[error("error parsing query: {0}")]
     QueryParse(String),
 
+    /// A write to a materialized view destination, which only its view may
+    /// fill. Kept apart from `QueryParse` because no retry can succeed: the
+    /// flush drops such rows instead of holding the WAL for them.
+    #[error("error parsing query: cannot write directly to materialized view destination \"{0}\"")]
+    WriteToMaterializedDestination(String),
+
     #[error("authorization failed")]
     AuthFailed,
 

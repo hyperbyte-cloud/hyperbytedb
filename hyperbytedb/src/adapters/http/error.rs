@@ -29,7 +29,8 @@ fn error_to_status_and_message(err: &HyperbytedbError) -> (StatusCode, String) {
         HyperbytedbError::Forbidden(_) => StatusCode::FORBIDDEN,
         HyperbytedbError::DatabaseRequired
         | HyperbytedbError::MissingParameter(_)
-        | HyperbytedbError::QueryParse(_) => StatusCode::BAD_REQUEST,
+        | HyperbytedbError::QueryParse(_)
+        | HyperbytedbError::WriteToMaterializedDestination(_) => StatusCode::BAD_REQUEST,
         HyperbytedbError::CardinalityExceeded { .. } => StatusCode::UNPROCESSABLE_ENTITY,
         HyperbytedbError::RequestPointLimitExceeded { .. }
         | HyperbytedbError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,

@@ -446,9 +446,13 @@ impl FlushServiceImpl {
             handles.push(tokio::spawn(async move {
                 let _slot = inserts.acquire_owned().await;
                 let count = work.batch.row_count;
-                let _ack = sink
+                let written = sink
                     .write_prepared_batch(&work.db, &work.rp, &work.batch)
-                    .await?;
+                    .await;
+                if unwritable_rows(&written, count) {
+                    return Ok(0);
+                }
+                written?;
                 counter!("hyperbytedb_native_rows_written_total", "path" => "prepared")
                     .increment(count as u64);
                 Ok::<usize, HyperbytedbError>(count)
@@ -701,7 +705,7 @@ impl FlushServiceImpl {
                         points = count,
                         "writing native chDB rows"
                     );
-                    let _ack = sink
+                    let written = sink
                         .write_points(
                             &work.db,
                             &work.rp,
@@ -710,7 +714,11 @@ impl FlushServiceImpl {
                             ingest_seq_base,
                             &work.points,
                         )
-                        .await?;
+                        .await;
+                    if unwritable_rows(&written, count) {
+                        return Ok(0);
+                    }
+                    written?;
                     counter!("hyperbytedb_native_rows_written_total", "path" => "native")
                         .increment(count as u64);
                     Ok::<usize, HyperbytedbError>(count)
@@ -819,6 +827,24 @@ impl FlushPort for FlushServiceImpl {
     }
 }
 
+/// Rows the sink refuses for good: writes to a materialized view
+/// destination. Held for retry they would hold the WAL forever, so no later
+/// write on the node would flush either (n3: moved destination regions put
+/// such rows in the WAL). Logged, counted and dropped instead.
+fn unwritable_rows<T>(written: &Result<T, HyperbytedbError>, rows: usize) -> bool {
+    let Err(HyperbytedbError::WriteToMaterializedDestination(measurement)) = written else {
+        return false;
+    };
+    tracing::error!(
+        %measurement,
+        rows,
+        "dropping rows a materialized view destination refuses; retrying cannot succeed"
+    );
+    counter!("hyperbytedb_flush_rows_dropped_total", "reason" => "materialized_destination")
+        .increment(rows as u64);
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -908,6 +934,75 @@ mod tests {
         assert!(
             wal.flushed_through() < seq,
             "a failed chunk must not be recorded as flushed"
+        );
+    }
+
+    /// Native sink that refuses `cpu_1m` as a materialized view destination
+    /// and counts the points it writes for anything else.
+    #[derive(Default)]
+    struct DestinationRefusingSink {
+        written: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl PointsSinkPort for DestinationRefusingSink {
+        async fn write_points(
+            &self,
+            _db: &str,
+            _rp: &str,
+            measurement: &str,
+            _origins: &[u64],
+            _ingest_seq_base: u64,
+            points: &[Point],
+        ) -> Result<WriteAck, HyperbytedbError> {
+            if measurement == "cpu_1m" {
+                return Err(HyperbytedbError::WriteToMaterializedDestination(
+                    measurement.into(),
+                ));
+            }
+            self.written
+                .fetch_add(points.len(), std::sync::atomic::Ordering::SeqCst);
+            Ok(WriteAck {
+                min_time: 0,
+                max_time: 0,
+                row_count: points.len(),
+            })
+        }
+    }
+
+    /// Rows a materialized view destination refuses can never be written, so
+    /// they must not hold the WAL: on n3 they stopped every later write on
+    /// the node from flushing.
+    #[tokio::test]
+    async fn rows_a_view_destination_refuses_do_not_hold_the_wal() {
+        let tmp = TempDir::new().unwrap();
+        let wal: Arc<dyn WalPort> = Arc::new(
+            RocksDbWal::open_with_options(
+                tmp.path(),
+                RocksDbWalOptions {
+                    wal_format: WalFormat::Bincode,
+                    arrow_wal_enabled: false,
+                },
+            )
+            .unwrap(),
+        );
+        let mut refused = entry();
+        refused.points[0].measurement = "cpu_1m".into();
+        wal.append(refused).await.unwrap();
+        let last = wal.append(entry()).await.unwrap();
+
+        let sink = Arc::new(DestinationRefusingSink::default());
+        let flush = FlushServiceImpl::new(wal.clone(), 0, sink.clone());
+        flush.flush().await.unwrap();
+
+        assert_eq!(
+            sink.written.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the row after the refused one must be written"
+        );
+        assert!(
+            wal.flushed_through() >= last,
+            "the WAL must move past the refused row"
         );
     }
 

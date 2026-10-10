@@ -689,12 +689,9 @@ impl ChdbNativeAdapter {
                     .as_deref()
                     .is_none_or(|mr| mr == key.rp)
             {
-                return Err(HyperbytedbError::QueryParse(format!(
-                    "cannot write directly to materialized view destination \"{0}\". \
-                     Data must be ingested into the source measurement and the \
-                     materialized view will propagate it automatically.",
-                    key.measurement,
-                )));
+                return Err(HyperbytedbError::WriteToMaterializedDestination(
+                    key.measurement.clone(),
+                ));
             }
             field_types = merge_field_type_map(&meas_meta.field_types, &field_types);
             for k in &meas_meta.tag_keys {
