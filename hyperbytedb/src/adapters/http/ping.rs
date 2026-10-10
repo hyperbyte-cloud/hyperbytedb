@@ -114,13 +114,41 @@ async fn maybe_self_retire_after_evacuation(state: &AppState) {
     let Ok(map) = shard_map.snapshot().await else {
         return;
     };
-    let still_owns = map
-        .spaces
-        .values()
-        .flat_map(|s| s.regions.iter())
-        .any(|r| r.peers.contains(&state.node_id));
-    if still_owns {
+    // View destination regions never move, so counting them kept a node
+    // that held one from ever retiring (n3, 6 -> 3: three pods left
+    // `decommissioning` for good). Their rows leave by the rollup handoff;
+    // retire once it has emptied them here.
+    let Ok(dests) = crate::application::mv_handoff::destination_set(state.metadata.as_ref()).await
+    else {
         return;
+    };
+    if crate::application::mv_handoff::holds_regions_to_evacuate(&map, state.node_id, &dests) {
+        return;
+    }
+    match crate::application::mv_handoff::local_rollups_empty(
+        state.metadata.as_ref(),
+        state.query_port.as_ref(),
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) if !rollup_wait_expired() => {
+            tracing::info!(
+                node_id = state.node_id,
+                "evacuated but view rollups not handed off yet; not retiring yet"
+            );
+            return;
+        }
+        Ok(false) => {
+            tracing::error!(
+                node_id = state.node_id,
+                "view rollups never handed off; retiring without them"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "could not check view rollups; not retiring yet");
+            return;
+        }
     }
     // Writes this node acknowledged but has not yet delivered to their
     // primaries live only in its forward queue; retiring would let the pod
@@ -142,6 +170,18 @@ async fn maybe_self_retire_after_evacuation(state: &AppState) {
             "evacuation complete; node self-marked Leaving"
         );
     }
+}
+
+/// How long an evacuated node waits for its view rollups to be handed off
+/// before it retires anyway, matching the leader's give-up: a leader too old
+/// to ask for the handoff must not keep the node forever.
+const ROLLUP_HANDOFF_WAIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// True once this node has waited [`ROLLUP_HANDOFF_WAIT`] since it first
+/// found itself evacuated with rollups still here.
+fn rollup_wait_expired() -> bool {
+    static SINCE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    SINCE.get_or_init(std::time::Instant::now).elapsed() >= ROLLUP_HANDOFF_WAIT
 }
 
 /// GET /health - readiness check.

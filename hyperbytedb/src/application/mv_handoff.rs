@@ -196,6 +196,43 @@ async fn destinations(
         .collect())
 }
 
+/// Whether every view destination on this node is empty: nothing left to
+/// hand off (it was handed off, or nothing was ever rolled up here).
+pub async fn local_rollups_empty(
+    metadata: &dyn MetadataPort,
+    query: &dyn QueryPort,
+) -> Result<bool, HyperbytedbError> {
+    for key in destinations(metadata).await? {
+        if row_count(query, &table_for(&key, false)).await? > 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Whether `node_id` is still a peer of a region it must give up before it
+/// may leave. View destinations do not count: their regions never move, and
+/// their rows leave by the rollup handoff instead.
+#[must_use]
+pub fn holds_regions_to_evacuate(
+    map: &crate::domain::sharding::ShardMap,
+    node_id: u64,
+    dests: &HashSet<MeasurementKey>,
+) -> bool {
+    map.spaces
+        .values()
+        .filter(|s| !dests.contains(&s.key))
+        .flat_map(|s| s.regions.iter())
+        .any(|r| r.peers.contains(&node_id))
+}
+
+/// The destinations of every view this node knows, as a set.
+pub async fn destination_set(
+    metadata: &dyn MetadataPort,
+) -> Result<HashSet<MeasurementKey>, HyperbytedbError> {
+    Ok(destinations(metadata).await?.into_iter().collect())
+}
+
 /// Send every destination row on this node to `send`, one range at a time,
 /// then empty the destination tables here. Returns the rows sent.
 ///
@@ -316,6 +353,48 @@ mod tests {
             a.chars()
                 .all(|c| c.is_ascii_alphanumeric() || "-._".contains(c))
         );
+    }
+
+    /// Destination regions never move, so they must not count as regions a
+    /// departing node still has to give up.
+    #[test]
+    fn destination_regions_do_not_hold_a_node() {
+        use crate::domain::sharding::{MeasurementShardSpace, ShardMap, ShardRegion};
+        let region = |peers: Vec<u64>| ShardRegion {
+            region_id: 1,
+            start: 0,
+            end: u64::MAX,
+            epoch: Default::default(),
+            peers,
+            primary: 1,
+            last_split_at: 0,
+            transfer_verified: None,
+            transfer_first_seen: None,
+            state: Default::default(),
+            staged_from: None,
+            staging_peers: Vec::new(),
+        };
+        let raw = MeasurementKey::new("db", "autogen", "cpu");
+        let dest = MeasurementKey::new("db", "autogen", "cpu_1m");
+        let mut map = ShardMap::default();
+        map.spaces.insert(
+            dest.clone(),
+            MeasurementShardSpace {
+                key: dest.clone(),
+                regions: vec![region(vec![1, 4])],
+            },
+        );
+        map.spaces.insert(
+            raw.clone(),
+            MeasurementShardSpace {
+                key: raw.clone(),
+                regions: vec![region(vec![1, 2])],
+            },
+        );
+        let dests = HashSet::from([dest]);
+        assert!(!holds_regions_to_evacuate(&map, 4, &dests));
+        assert!(holds_regions_to_evacuate(&map, 4, &HashSet::new()));
+        assert!(holds_regions_to_evacuate(&map, 2, &dests));
     }
 
     /// Two tables in one chDB stand for the departing node's destination and
