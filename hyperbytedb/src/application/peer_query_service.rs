@@ -13,6 +13,8 @@ use crate::application::query_service::check_authorization;
 use crate::domain::cluster::membership::ClusterMembership;
 use crate::domain::cluster::types::MutationRequest;
 use crate::domain::database::{RetentionPolicy, retention_policy_from_create};
+use crate::domain::materialized_view::MaterializedViewDef;
+use crate::domain::measurement::MeasurementMeta;
 use crate::domain::query_result::{QueryResponse, StatementResult};
 use crate::error::HyperbytedbError;
 use crate::ports::metadata::ContinuousQueryDef;
@@ -325,6 +327,18 @@ fn extract_mv_dest_rp(mv: &CreateMaterializedViewStatement) -> Option<String> {
         .and_then(|m| m.retention_policy.clone())
 }
 
+/// The source measurement's schema here, sent with the CREATE so a node that
+/// has no rows for it yet can still create the view.
+async fn mv_source_meta(
+    metadata: &Arc<dyn MetadataPort>,
+    def: &MaterializedViewDef,
+) -> Result<Option<Box<MeasurementMeta>>, HyperbytedbError> {
+    Ok(metadata
+        .get_measurement(&def.source_db, &def.source_rp, &def.source_measurement)
+        .await?
+        .map(Box::new))
+}
+
 async fn resolve_mv_source_rp(
     metadata: &Arc<dyn MetadataPort>,
     mv: &CreateMaterializedViewStatement,
@@ -412,10 +426,12 @@ async fn mutation_request_from_statement(
             let source_rp = resolve_mv_source_rp(metadata, mv).await?;
             let dest_rp = resolve_mv_dest_rp(metadata, mv).await?;
             let definition = def_from_statement(mv, &source_rp, &dest_rp)?;
+            let source_meta = mv_source_meta(metadata, &definition).await?;
             Ok(MutationRequest::CreateMaterializedView {
                 database: mv.database.clone(),
                 name: mv.name.clone(),
                 definition,
+                source_meta,
             })
         }
         Statement::DropMaterializedView { name, db: mv_db } => {
@@ -758,10 +774,12 @@ impl QueryService for PeerQueryService {
                             }
                         };
                         if let Ok(def) = def_from_statement(mv, &source_rp, &dest_rp) {
+                            let source_meta = mv_source_meta(&self.metadata, &def).await?;
                             self.replicate_mutation(MutationRequest::CreateMaterializedView {
                                 database: mv.database.clone(),
                                 name: mv.name.clone(),
                                 definition: def,
+                                source_meta,
                             })
                             .await?;
                         }

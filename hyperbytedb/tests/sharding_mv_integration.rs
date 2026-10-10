@@ -5,6 +5,7 @@ use hyperbytedb::domain::series::series_id;
 use hyperbytedb::domain::sharding::{
     MeasurementKey, ShardEpoch, ShardMapOp, ShardRegion, ShardTransferPayload, TransferPhase,
 };
+use hyperbytedb::ports::metadata::MetadataPort;
 use hyperbytedb::ports::sharding::ShardMapPort;
 use serial_test::serial;
 use std::collections::BTreeMap;
@@ -392,6 +393,55 @@ async fn sharded_mv_raft_replicate() {
     assert!(
         wait_for_chdb_mv_object(&client, &nodes[1].url, "mv_cpu_1m").await,
         "follower missing ClickHouse MV objects after replication"
+    );
+}
+
+/// A node with no rows for the source yet has no measurement record for it.
+/// It must still create the view from the replicated CREATE, or it never
+/// rolls up the rows that land on it later. On n3 such a node failed the
+/// apply with "source measurement not found" and a third of the buckets
+/// were missing.
+#[tokio::test]
+#[serial(chdb)]
+async fn sharded_mv_replicates_to_node_without_source_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let nodes = start_sharded_pair_cluster(dir.path(), ShardedClusterOptions::default()).await;
+    // Only node 1 holds the region, so node 2 never sees a cpu row.
+    bootstrap_region_on_all_nodes(&nodes, "sharddb", "autogen", "cpu", vec![1], 1).await;
+
+    let client = reqwest::Client::new();
+    for node in &nodes {
+        create_db(&client, &node.url, "sharddb").await;
+    }
+    let t = MV_MINUTE_ALIGNED_NS;
+    write_line(
+        &client,
+        &nodes[0].url,
+        "sharddb",
+        &format!("cpu,host=a value=10 {t}"),
+    )
+    .await;
+    flush_node(&nodes[0]).await;
+    assert!(
+        nodes[1]
+            .metadata
+            .get_measurement("sharddb", "autogen", "cpu")
+            .await
+            .unwrap()
+            .is_none(),
+        "precondition: node 2 has no cpu measurement"
+    );
+
+    let create_mv = r#"CREATE MATERIALIZED VIEW "mv_cpu_1m" ON "sharddb" AS SELECT mean("value") AS "mean_value" INTO "cpu_1m" FROM "cpu" GROUP BY time(1m), *"#;
+    let resp = query_sql(&client, &nodes[0].url, "sharddb", create_mv).await;
+    assert!(
+        resp.status().is_success(),
+        "CREATE MV on leader failed: {}",
+        resp.text().await.unwrap_or_default()
+    );
+    assert!(
+        wait_for_show_materialized_view(&client, &nodes[1].url, "sharddb", "mv_cpu_1m").await,
+        "node 2 has no view: its apply failed without the source measurement"
     );
 }
 

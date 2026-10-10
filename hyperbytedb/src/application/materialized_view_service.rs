@@ -288,7 +288,11 @@ impl MaterializedViewService {
     pub async fn apply_replicated_definition(
         &self,
         definition: &MaterializedViewDef,
+        source_meta: Option<&MeasurementMeta>,
     ) -> Result<(), HyperbytedbError> {
+        if let Some(meta) = source_meta {
+            self.ensure_source_measurement(definition, meta).await?;
+        }
         if self
             .metadata
             .get_materialized_view(&definition.database, &definition.name)
@@ -315,6 +319,29 @@ impl MaterializedViewService {
         let def = self.create_with(&stmt, false).await?;
         self.spawn_bootstrap_after_apply(&def);
         Ok(())
+    }
+
+    /// With sharding a node has the source measurement only once rows for it
+    /// land there. Register it from the proposer's schema so the view exists
+    /// before this node's first row, which it would otherwise never roll up.
+    async fn ensure_source_measurement(
+        &self,
+        def: &MaterializedViewDef,
+        meta: &MeasurementMeta,
+    ) -> Result<(), HyperbytedbError> {
+        let (db, rp) = (&def.source_db, &def.source_rp);
+        if self
+            .metadata
+            .get_measurement(db, rp, &def.source_measurement)
+            .await?
+            .is_some()
+        {
+            return Ok(());
+        }
+        self.metadata.register_measurement(db, rp, meta).await?;
+        self.points_sink
+            .ensure_measurement_schema(db, rp, meta)
+            .await
     }
 
     fn spawn_bootstrap_after_apply(&self, def: &MaterializedViewDef) {

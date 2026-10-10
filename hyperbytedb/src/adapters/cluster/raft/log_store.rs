@@ -919,6 +919,7 @@ impl RaftStore {
             }
             ClusterRequest::SchemaMutation(mutation) => {
                 let space_drop = schema_mutation_apply::drop_space_for(&mutation);
+                let op = schema_mutation_apply::schema_mutation_op_label(&mutation);
                 if let Some(ref metadata) = self.metadata {
                     let resp = match schema_mutation_apply::apply_schema_mutation(
                         SchemaMutationDeps {
@@ -933,7 +934,12 @@ impl RaftStore {
                     .await
                     {
                         Ok(()) => ClusterResponse::success(),
-                        Err(e) => ClusterResponse::error(e.to_string()),
+                        Err(e) => {
+                            // Only the proposer sees the response; on every
+                            // other node this is the one trace of the failure.
+                            tracing::warn!(op, error = %e, "schema mutation apply failed");
+                            ClusterResponse::error(e.to_string())
+                        }
                     };
                     // Drop the shard space in the same log entry, so every
                     // node drops it at the same point. Only when sharding is

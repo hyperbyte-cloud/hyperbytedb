@@ -74,7 +74,7 @@ pub async fn apply_schema_mutation(
     result
 }
 
-fn schema_mutation_op_label(mutation: &MutationRequest) -> &'static str {
+pub fn schema_mutation_op_label(mutation: &MutationRequest) -> &'static str {
     match mutation {
         MutationRequest::CreateDatabase { .. } => "create_database",
         MutationRequest::DropDatabase(_) => "drop_database",
@@ -183,9 +183,11 @@ async fn apply_schema_mutation_inner(
             database,
             name,
             definition,
+            source_meta,
         } => {
             if let Some(mv) = mv_service {
-                mv.apply_replicated_definition(&definition).await
+                mv.apply_replicated_definition(&definition, source_meta.as_deref())
+                    .await
             } else {
                 metadata
                     .store_materialized_view(&database, &name, &definition)
