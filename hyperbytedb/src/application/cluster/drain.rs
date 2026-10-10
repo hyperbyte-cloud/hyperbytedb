@@ -9,7 +9,7 @@ use crate::adapters::cluster::replication_log::ReplicationLog;
 use crate::application::shard_routing::ShardRoutingContext;
 use crate::application::shard_transfer::run_region_transfer;
 use crate::domain::cluster::membership::{NodeState, SharedMembership};
-use crate::domain::sharding::ShardMapOp;
+use crate::domain::sharding::{MeasurementKey, ShardMapOp};
 use crate::error::HyperbytedbError;
 use crate::ports::flush::FlushPort;
 use crate::ports::metadata::MetadataPort;
@@ -212,20 +212,18 @@ impl DrainService {
             .ok_or_else(|| HyperbytedbError::ClusterUnavailable("no raft".into()))?;
 
         let map = ctx.shard_map.snapshot().await?;
-        for space in map.spaces.values() {
-            for region in &space.regions {
-                if region.primary != self.node_id {
-                    continue;
-                }
-                let new_primary = region
-                    .peers
-                    .iter()
-                    .copied()
-                    .find(|id| *id != self.node_id)
-                    .ok_or_else(|| {
-                        HyperbytedbError::ShardMap("no alternate primary for handoff".into())
-                    })?;
+        let dests = view_destinations(metadata.as_ref()).await?;
+        for (key, region, copy) in primaries_to_hand_off(&map, self.node_id, &dests) {
+            let new_primary = region
+                .peers
+                .iter()
+                .copied()
+                .find(|id| *id != self.node_id)
+                .ok_or_else(|| {
+                    HyperbytedbError::ShardMap("no alternate primary for handoff".into())
+                })?;
 
+            if copy {
                 run_region_transfer(
                     pc,
                     metadata,
@@ -233,7 +231,7 @@ impl DrainService {
                     self.query_port.as_ref(),
                     self.points_sink.as_ref(),
                     self.node_id,
-                    &space.key,
+                    key,
                     region,
                     new_primary,
                     self.max_points_per_request.max(1),
@@ -242,18 +240,18 @@ impl DrainService {
                     false,
                 )
                 .await?;
-
-                use crate::adapters::cluster::raft::types::ClusterRequest;
-                let tp = ShardMapOp::TransferPrimary {
-                    key: space.key.clone(),
-                    region_id: region.region_id,
-                    new_primary,
-                    epoch: region.epoch,
-                };
-                raft.client_write(ClusterRequest::ShardMapMutation(Box::new(tp)))
-                    .await
-                    .map_err(|e| HyperbytedbError::ShardMap(e.to_string().into()))?;
             }
+
+            use crate::adapters::cluster::raft::types::ClusterRequest;
+            let tp = ShardMapOp::TransferPrimary {
+                key: key.clone(),
+                region_id: region.region_id,
+                new_primary,
+                epoch: region.epoch,
+            };
+            raft.client_write(ClusterRequest::ShardMapMutation(Box::new(tp)))
+                .await
+                .map_err(|e| HyperbytedbError::ShardMap(e.to_string().into()))?;
         }
         Ok(())
     }
@@ -298,6 +296,47 @@ impl DrainService {
     }
 }
 
+/// The measurements materialized views write into.
+async fn view_destinations(
+    metadata: &dyn MetadataPort,
+) -> Result<std::collections::HashSet<MeasurementKey>, HyperbytedbError> {
+    Ok(metadata
+        .list_all_materialized_views()
+        .await?
+        .into_iter()
+        .map(|d| MeasurementKey::new(d.dest_db, d.dest_rp, d.dest_measurement))
+        .collect())
+}
+
+/// The regions `node_id` leads, each with whether handing it off copies
+/// its rows.
+///
+/// A view destination's rows are this node's own rollups, not the region's
+/// data: copied, they reached the new primary's flush, which refuses writes
+/// to a destination (on n3 that held the WAL until c09390b, and dropped them
+/// after). Only primacy moves for those.
+fn primaries_to_hand_off<'a>(
+    map: &'a crate::domain::sharding::ShardMap,
+    node_id: u64,
+    dests: &std::collections::HashSet<MeasurementKey>,
+) -> Vec<(
+    &'a MeasurementKey,
+    &'a crate::domain::sharding::ShardRegion,
+    bool,
+)> {
+    map.spaces
+        .values()
+        .flat_map(|space| {
+            let copy = !dests.contains(&space.key);
+            space
+                .regions
+                .iter()
+                .filter(move |r| r.primary == node_id)
+                .map(move |r| (&space.key, r, copy))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,6 +351,55 @@ mod tests {
         async fn drain(&self) -> Result<(), HyperbytedbError> {
             Ok(())
         }
+    }
+
+    /// A departing primary hands off its regions; a view destination's
+    /// region moves primacy only, never its rows.
+    #[test]
+    fn a_view_destination_hands_off_primacy_without_copying() {
+        use crate::domain::sharding::{MeasurementShardSpace, ShardMap, ShardRegion};
+        let region = |id: u64, primary: u64| ShardRegion {
+            region_id: id,
+            start: 0,
+            end: u64::MAX,
+            epoch: Default::default(),
+            peers: vec![1, 2],
+            primary,
+            last_split_at: 0,
+            transfer_verified: None,
+            transfer_first_seen: None,
+            state: Default::default(),
+            staged_from: None,
+            staging_peers: Vec::new(),
+        };
+        let raw = MeasurementKey::new("db", "autogen", "cpu");
+        let dest = MeasurementKey::new("db", "autogen", "cpu_1m");
+        let mut map = ShardMap::default();
+        for (key, regions) in [
+            (&raw, vec![region(1, 1), region(2, 2)]),
+            (&dest, vec![region(3, 1)]),
+        ] {
+            map.spaces.insert(
+                key.clone(),
+                MeasurementShardSpace {
+                    key: key.clone(),
+                    regions,
+                },
+            );
+        }
+        let dests = std::collections::HashSet::from([dest.clone()]);
+        let mut got: Vec<(String, u64, bool)> = primaries_to_hand_off(&map, 1, &dests)
+            .into_iter()
+            .map(|(k, r, copy)| (k.measurement.clone(), r.region_id, copy))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                ("cpu".to_string(), 1, true),
+                ("cpu_1m".to_string(), 3, false)
+            ]
+        );
     }
 
     fn make_node(id: u64, state: NodeState) -> NodeInfo {

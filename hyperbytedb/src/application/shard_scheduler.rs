@@ -610,6 +610,10 @@ impl ShardScheduler {
 
         let mut out = Vec::new();
         for space in map.spaces.values() {
+            // A destination's rows are per-node rollups: never copied.
+            if self.is_rollup_dest(&space.key).await {
+                continue;
+            }
             for region in &space.regions {
                 for &peer in &region.staging_peers {
                     if !stale.contains(&(region.region_id, peer)) {
