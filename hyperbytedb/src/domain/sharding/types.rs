@@ -460,6 +460,11 @@ pub struct ShardQueryRequest {
     pub series_id_start: u64,
     pub series_id_end: u64,
     pub select_sql: String,
+    /// Run on this node's local tables without the region checks: a
+    /// materialized view destination's partials are per node, not per
+    /// region. Omitted when false, so older nodes still accept the rest.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub node_local: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

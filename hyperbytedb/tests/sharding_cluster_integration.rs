@@ -225,6 +225,7 @@ async fn internal_shard_query_handler_serves_region_sql() {
         series_id_start: 0,
         series_id_end: u64::MAX,
         select_sql: "SELECT \"value\" FROM `sharddb_autogen_cpu`".into(),
+        node_local: false,
     };
 
     let resp = client

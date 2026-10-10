@@ -11,9 +11,7 @@ use crate::application::replication_dispatch::dispatch_outbound_replication;
 use crate::application::shard_metadata_scatter::{
     scatter_series_keys, scatter_tag_keys, scatter_tag_values,
 };
-use crate::application::shard_peer_resolution::{
-    RegionTargetRole, ScatterKind, is_serving_node, peer_addr,
-};
+use crate::application::shard_peer_resolution::{RegionTargetRole, ScatterKind};
 use crate::application::shard_query::inject_region_series_id_predicate;
 use crate::application::shard_query_routing::{
     select_regions_for_materialized_dest, select_regions_for_query,
@@ -2035,7 +2033,6 @@ async fn query_sharded_region(
     t_max: i64,
     epoch: Option<&str>,
     resolved_group_by_tags: &[String],
-    materialized_meta: Option<&MeasurementMeta>,
     aggregate_authoritative: bool,
 ) -> Result<Vec<SeriesResult>, HyperbytedbError> {
     match try_query_sharded_region(
@@ -2050,7 +2047,6 @@ async fn query_sharded_region(
         t_max,
         epoch,
         resolved_group_by_tags,
-        materialized_meta,
         aggregate_authoritative,
     )
     .await
@@ -2069,7 +2065,6 @@ async fn query_sharded_region(
                 t_max,
                 epoch,
                 resolved_group_by_tags,
-                materialized_meta,
                 aggregate_authoritative,
             )
             .await
@@ -2091,27 +2086,8 @@ async fn try_query_sharded_region(
     t_max: i64,
     epoch: Option<&str>,
     resolved_group_by_tags: &[String],
-    materialized_meta: Option<&MeasurementMeta>,
     aggregate_authoritative: bool,
 ) -> Result<Vec<SeriesResult>, HyperbytedbError> {
-    if let Some(meta) = materialized_meta {
-        return query_materialized_region_all_peers(
-            svc,
-            ctx,
-            db,
-            rp,
-            measurement,
-            region,
-            region_sql,
-            t_min,
-            t_max,
-            epoch,
-            resolved_group_by_tags,
-            meta,
-        )
-        .await;
-    }
-
     // Only the region primary holds authoritative flushed data. Replica peers must
     // scatter to the primary (TiDB-like RYW / cross-coordinator reads), not query
     // their lagging local chDB copy.
@@ -2135,6 +2111,7 @@ async fn try_query_sharded_region(
         series_id_start: region.start,
         series_id_end: region.end,
         select_sql: region_sql.to_string(),
+        node_local: false,
     };
 
     let region_id = region.region_id;
@@ -2185,73 +2162,62 @@ async fn try_query_sharded_region(
     .await
 }
 
+/// One node's partial rollups for a materialized view destination.
+///
+/// A view rolls up the rows ingested on its node into that node's own
+/// destination table, so the partials live wherever writes arrived, not with
+/// the destination's regions. Each node that can hold them is asked once for
+/// its whole table. Asking each region's primary instead read a node once
+/// per region it led and skipped nodes that led none: on n3 a rollup counted
+/// 40,800 of 60,000 points.
 #[allow(clippy::too_many_arguments)]
-async fn query_materialized_region_all_peers(
+async fn query_materialized_dest_node(
     svc: &QueryServiceImpl,
     ctx: &ShardRoutingContext,
     db: &str,
     rp: &str,
     measurement: &str,
-    region: &ShardRegion,
-    region_sql: &str,
+    node_id: u64,
+    addr: &str,
+    sql: &str,
     t_min: i64,
     t_max: i64,
     epoch: Option<&str>,
     resolved_group_by_tags: &[String],
     meta: &MeasurementMeta,
 ) -> Result<Vec<SeriesResult>, HyperbytedbError> {
-    let req = ShardQueryRequest {
-        db: db.to_string(),
-        rp: rp.to_string(),
-        measurement: measurement.to_string(),
-        epoch: region.epoch,
-        region_id: region.region_id,
-        time_min: t_min,
-        time_max: t_max,
-        series_id_start: 0,
-        series_id_end: 0,
-        select_sql: region_sql.to_string(),
-    };
-
-    let membership = ctx.peer_client.membership().read().await;
-    let primary = region.primary;
-    let primary_active = is_serving_node(&membership, primary) && region.is_serving_peer(primary);
-    drop(membership);
-
-    if !primary_active {
-        return Ok(Vec::new());
-    }
-
-    let timeout = crate::application::shard_routing::scatter_timeout(
-        &ctx.config,
-        crate::application::shard_peer_resolution::ScatterKind::Query,
-    );
-    let series = if primary == ctx.node_id {
-        run_series_query(svc, region_sql, measurement, epoch, resolved_group_by_tags).await?
+    let series = if node_id == ctx.node_id {
+        run_series_query(svc, sql, measurement, epoch, resolved_group_by_tags).await?
     } else {
-        let membership = ctx.peer_client.membership().read().await;
-        let Some(addr) = peer_addr(&membership, primary) else {
-            return Ok(Vec::new());
+        let req = ShardQueryRequest {
+            db: db.to_string(),
+            rp: rp.to_string(),
+            measurement: measurement.to_string(),
+            epoch: Default::default(),
+            region_id: 0,
+            time_min: t_min,
+            time_max: t_max,
+            series_id_start: 0,
+            series_id_end: 0,
+            select_sql: sql.to_string(),
+            node_local: true,
         };
-        drop(membership);
-        let url = format!("http://{addr}/internal/shard/query");
+        let timeout = crate::application::shard_routing::scatter_timeout(
+            &ctx.config,
+            crate::application::shard_peer_resolution::ScatterKind::Query,
+        );
         let resp = ctx
             .peer_client
             .http_client()
-            .post(&url)
+            .post(format!("http://{addr}/internal/shard/query"))
             .json(&req)
             .timeout(timeout)
             .send()
             .await
             .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
-        if resp.status() == reqwest::StatusCode::CONFLICT {
-            return Err(HyperbytedbError::StaleShardEpoch {
-                region_id: region.region_id,
-            });
-        }
         if !resp.status().is_success() {
             return Err(HyperbytedbError::PeerUnreachable(format!(
-                "materialized shard query to primary {primary} failed: {}",
+                "materialized query to node {node_id} failed: {}",
                 resp.status()
             )));
         }
@@ -2263,12 +2229,33 @@ async fn query_materialized_region_all_peers(
         )
         .await?
     };
-
     if series.is_empty() {
         return Ok(Vec::new());
     }
     let merged = merge_materialized_rollup_results(vec![QueryResponse::single(0, series)], meta)?;
     Ok(first_statement_series(merged))
+}
+
+/// Nodes that may hold materialized view partials: every node that may have
+/// ingested writes and has not left.
+fn materialized_partial_holders(
+    ctx_node: u64,
+    membership: &crate::domain::cluster::membership::ClusterMembership,
+) -> Vec<(u64, String)> {
+    let mut nodes: Vec<(u64, String)> = membership
+        .all_peers(u64::MAX)
+        .into_iter()
+        .filter(|n| {
+            crate::domain::cluster::membership::holds_placement(n)
+                || n.state == crate::domain::cluster::membership::NodeState::Decommissioning
+        })
+        .map(|n| (n.node_id, n.addr.clone()))
+        .collect();
+    if !nodes.iter().any(|(id, _)| *id == ctx_node) {
+        nodes.push((ctx_node, String::new()));
+    }
+    nodes.sort();
+    nodes
 }
 
 fn first_statement_series(resp: QueryResponse) -> Vec<SeriesResult> {
@@ -2467,18 +2454,46 @@ async fn execute_sharded_measurement_query(
     let materialized_meta_owned = materialized_meta_ref.cloned();
     let epoch_owned = epoch.map(str::to_string);
     let mut region_results = Vec::with_capacity(selected_regions.len());
+    if let Some(meta) = materialized_meta_owned.as_ref() {
+        let holders = {
+            let m = ctx.peer_client.membership().read().await;
+            materialized_partial_holders(ctx.node_id, &m)
+        };
+        let futures: Vec<_> = holders
+            .iter()
+            .map(|(node_id, addr)| {
+                query_materialized_dest_node(
+                    svc,
+                    ctx,
+                    db,
+                    rp,
+                    measurement,
+                    *node_id,
+                    addr,
+                    &sql,
+                    t_min,
+                    t_max,
+                    epoch,
+                    &resolved_tags_owned,
+                    meta,
+                )
+            })
+            .collect();
+        region_results.extend(futures::future::try_join_all(futures).await?);
+    }
+    let selected_regions = if is_materialized_dest {
+        Vec::new()
+    } else {
+        selected_regions
+    };
     for chunk in selected_regions.chunks(SHARD_QUERY_REGION_CONCURRENCY) {
         let chunk_futures: Vec<_> = chunk
             .iter()
             .map(|region| {
                 let region = region.clone();
-                let region_sql = if is_materialized_dest {
-                    sql.clone()
-                } else {
-                    inject_region_series_id_predicate(sql.clone(), region.start, region.end)
-                };
+                let region_sql =
+                    inject_region_series_id_predicate(sql.clone(), region.start, region.end);
                 let tags = resolved_tags_owned.clone();
-                let meta = materialized_meta_owned.clone();
                 let epoch = epoch_owned.as_deref();
                 async move {
                     query_sharded_region(
@@ -2493,7 +2508,6 @@ async fn execute_sharded_measurement_query(
                         t_max,
                         epoch,
                         &tags,
-                        meta.as_ref(),
                         is_global_aggregate,
                     )
                     .await
@@ -3317,5 +3331,48 @@ mod execution_limit_tests {
             "SELECT 1 FROM t ORDER BY time\nSETTINGS max_execution_time = 30, timeout_overflow_mode = 'throw'"
         );
         assert!(with_execution_time_limit("SELECT 1", 0).contains("max_execution_time = 1,"));
+    }
+}
+
+#[cfg(test)]
+mod materialized_holder_tests {
+    use super::materialized_partial_holders;
+    use crate::domain::cluster::membership::{ClusterMembership, NodeInfo, NodeState};
+
+    /// Every node that may have ingested and has not left holds partials,
+    /// including this one; joining and leaving nodes do not.
+    #[test]
+    fn partial_holders_are_every_node_that_may_have_ingested() {
+        let mut m = ClusterMembership::new();
+        for (id, state) in [
+            (1, NodeState::Active),
+            (2, NodeState::Draining),
+            (3, NodeState::Disconnected),
+            (4, NodeState::Decommissioning),
+            (5, NodeState::Joining),
+            (6, NodeState::Syncing),
+            (7, NodeState::Leaving),
+        ] {
+            m.add_node(NodeInfo {
+                node_id: id,
+                addr: format!("n{id}"),
+                state,
+                joined_at: 0,
+                last_heartbeat: 0,
+                needs_sync: false,
+                consecutive_misses: 0,
+            });
+        }
+        let ids: Vec<u64> = materialized_partial_holders(1, &m)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, [1, 2, 3, 4]);
+        // This node is asked even before membership lists it.
+        let ids: Vec<u64> = materialized_partial_holders(9, &m)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, [1, 2, 3, 4, 9]);
     }
 }

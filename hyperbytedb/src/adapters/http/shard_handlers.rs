@@ -745,37 +745,41 @@ pub async fn handle_shard_query(
     let Some(ctx) = state.shard_routing.as_ref() else {
         return sharding_disabled();
     };
-    let map = match ctx.shard_map.snapshot().await {
-        Ok(m) => m,
-        Err(e) => {
+    // A materialized view destination's partials are per node: there is no
+    // region to check.
+    if !req.node_local {
+        let map = match ctx.shard_map.snapshot().await {
+            Ok(m) => m,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+                    .into_response();
+            }
+        };
+        let region = lookup_region(&map, &req.db, &req.rp, &req.measurement, req.region_id);
+        let Some(region) = region else {
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "region not found"})),
+            )
+                .into_response();
+        };
+        if region.epoch != req.epoch {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "stale epoch"})),
             )
                 .into_response();
         }
-    };
-    let region = lookup_region(&map, &req.db, &req.rp, &req.measurement, req.region_id);
-    let Some(region) = region else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "region not found"})),
-        )
-            .into_response();
-    };
-    if region.epoch != req.epoch {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": "stale epoch"})),
-        )
-            .into_response();
-    }
-    if !region.peers.contains(&state.node_id) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error": "not owner"})),
-        )
-            .into_response();
+        if !region.peers.contains(&state.node_id) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "not owner"})),
+            )
+                .into_response();
+        }
     }
 
     let sql = if req.series_id_end > req.series_id_start {

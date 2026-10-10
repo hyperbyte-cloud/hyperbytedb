@@ -741,6 +741,30 @@ impl ShardScheduler {
     /// rollup destination sums it twice and is corrupted permanently. Contended
     /// lock counts as "yes" — skipping a placement costs a tick, guessing wrong
     /// costs the data.
+    /// Reload the materialized view destinations [`Self::is_rollup_dest`]
+    /// answers from. Until this ran every tick the set stayed empty in
+    /// production (its only caller was the dead reconciliation drain), and
+    /// placement moved destination regions: on n3 a moved destination's rows
+    /// reached the flush, which refuses writes to a destination, and held
+    /// the WAL on every retry.
+    async fn refresh_rollup_dests(&self) {
+        match self.metadata.list_all_materialized_views().await {
+            Ok(defs) => {
+                let mut set = self.rollup_dests.write().await;
+                set.clear();
+                for def in defs {
+                    set.insert(
+                        MeasurementKey::new(def.dest_db, def.dest_rp, def.dest_measurement),
+                        (),
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "rollup-dest refresh failed; using cached set");
+            }
+        }
+    }
+
     async fn is_rollup_dest(&self, key: &MeasurementKey) -> bool {
         match self.rollup_dests.try_read() {
             Ok(set) => set.contains_key(key),
@@ -1108,6 +1132,7 @@ impl ShardScheduler {
     async fn plan_tick(&self) -> Result<TickPlan, HyperbytedbError> {
         // Peer map versions are only valid for the tick that probed them.
         self.peer_map_versions.write().await.clear();
+        self.refresh_rollup_dests().await;
         let map = self.shard_map.snapshot().await?;
         self.prune_region_counters(&map).await;
         self.refresh_placement_plan(&map).await;
@@ -1905,8 +1930,13 @@ impl ShardScheduler {
         let Ok(map) = self.shard_map.snapshot().await else {
             return false;
         };
+        // Destination regions never move (see `is_rollup_dest`), and their
+        // peers do not say where the rows are: each node keeps the partials
+        // it rolled up. They must not hold the node forever.
+        let dests = self.rollup_dests.read().await;
         !map.spaces
             .values()
+            .filter(|s| !dests.contains_key(&s.key))
             .flat_map(|s| s.regions.iter())
             .any(|r| r.peers.contains(&node_id))
     }
@@ -2939,23 +2969,7 @@ impl ShardScheduler {
     /// leader tick, before scheduling heuristics.
     #[allow(dead_code)]
     async fn drain_reconciliation(&self, map: &super::super::domain::sharding::types::ShardMap) {
-        // Refresh rollup-destination knowledge for the exclusion check.
-        match self.metadata.list_all_materialized_views().await {
-            Ok(defs) => {
-                let mut set = self.rollup_dests.write().await;
-                set.clear();
-                for def in defs {
-                    set.insert(
-                        MeasurementKey::new(def.dest_db, def.dest_rp, def.dest_measurement),
-                        (),
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "rollup-dest refresh failed; using cached set");
-            }
-        }
-
+        self.refresh_rollup_dests().await;
         self.rebuild_queue_from_map(map);
 
         let pending = self.pending_transfers();
@@ -5001,6 +5015,48 @@ mod tests {
         assert!(
             h.scheduler.decommission_complete(9999).await,
             "a node holding nothing must read as evacuated"
+        );
+    }
+
+    /// The tick itself must learn the destinations from metadata: tests that
+    /// seeded the set hid that production never filled it.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn a_tick_learns_view_destinations_and_they_do_not_block_decommission() {
+        let h = PlacementTestHarness::new(true, &[(2, 0)], 1).await;
+        let key = PlacementTestHarness::key();
+        let owner = h.scheduler.node_id;
+        assert!(!h.scheduler.decommission_complete(owner).await);
+
+        let def = crate::domain::materialized_view::MaterializedViewDef {
+            name: "mv".into(),
+            database: key.db.clone(),
+            query_text: String::new(),
+            source_db: key.db.clone(),
+            source_rp: key.rp.clone(),
+            source_measurement: "src".into(),
+            dest_db: key.db.clone(),
+            dest_rp: key.rp.clone(),
+            dest_measurement: key.measurement.clone(),
+            ch_fact_mv_name: String::new(),
+            ch_series_mv_name: String::new(),
+            created_at: String::new(),
+            backfill_on_create: false,
+        };
+        h.scheduler
+            .metadata
+            .store_materialized_view(&key.db, "mv", &def)
+            .await
+            .unwrap();
+        h.scheduler.plan_tick().await.unwrap();
+
+        assert!(
+            h.scheduler.is_rollup_dest(&key).await,
+            "the tick did not load view destinations from metadata"
+        );
+        assert!(
+            h.scheduler.decommission_complete(owner).await,
+            "a destination region, which never moves, held the node"
         );
     }
 
