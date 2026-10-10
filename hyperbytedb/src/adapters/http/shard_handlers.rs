@@ -908,6 +908,11 @@ pub async fn handle_shard_mv_backfill(
     match apply_mv_backfill_sql(&state.points_sink, &state.metadata, &state.query_port, &req).await
     {
         Ok(()) => (StatusCode::NO_CONTENT, ()).into_response(),
+        Err(e @ crate::error::HyperbytedbError::ClusterUnavailable(_)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),

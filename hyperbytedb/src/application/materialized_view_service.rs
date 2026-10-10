@@ -23,6 +23,7 @@ use crate::timeseriesql::to_clickhouse::{
     self, build_create_fact_materialized_view, build_create_series_materialized_view,
 };
 
+#[derive(Clone)]
 pub struct MaterializedViewService {
     metadata: Arc<dyn MetadataPort>,
     query_port: Arc<dyn QueryPort>,
@@ -143,7 +144,13 @@ impl MaterializedViewService {
             .await?;
         }
 
-        if mv.backfill_on_create && self.shard_routing.is_some() {
+        // Sharded history is rolled up once for the whole cluster: here on
+        // the statement's own node, or by the leader after a Raft apply (see
+        // `spawn_bootstrap_after_apply`). Every node applies the replicated
+        // CREATE, and each one backfilling counted the history once per node.
+        let sharded_backfill =
+            bootstrap_now && mv.backfill_on_create && self.shard_routing.is_some();
+        if sharded_backfill {
             self.run_sharded_backfill(
                 mv,
                 MeasurementShardRef {
@@ -161,9 +168,10 @@ impl MaterializedViewService {
         }
 
         let run_local_backfill = mv.backfill_on_create && self.shard_routing.is_none();
-        let sharded_backfill_done = mv.backfill_on_create && self.shard_routing.is_some();
-        // Sharded scatter backfill runs before DDL; do not drop the destination it just filled.
-        let reset_destination = !sharded_backfill_done;
+        // Sharded scatter backfill runs before DDL; do not drop the destination
+        // it just filled. Nor on a replicated apply: another node's backfill
+        // may already have written this node's share.
+        let reset_destination = bootstrap_now && !sharded_backfill;
         self.materialize_ddl(mv, reset_destination, run_local_backfill)
             .await?;
 
@@ -360,6 +368,34 @@ impl MaterializedViewService {
             .await
     }
 
+    /// The history of a view created through Raft, rolled up once, by the
+    /// leader, after its own apply.
+    async fn backfill_replicated(&self, def: &MaterializedViewDef) -> Result<(), HyperbytedbError> {
+        let stmt = CreateMaterializedViewStatement {
+            name: def.name.clone(),
+            database: def.database.clone(),
+            query: parse_mv_select(&def.query_text)?,
+            raw_query: def.query_text.clone(),
+            backfill_on_create: true,
+        };
+        self.run_sharded_backfill(
+            &stmt,
+            MeasurementShardRef {
+                db: &def.source_db,
+                rp: &def.source_rp,
+                measurement: &def.source_measurement,
+            },
+            MeasurementShardRef {
+                db: &def.dest_db,
+                rp: &def.dest_rp,
+                measurement: &def.dest_measurement,
+            },
+        )
+        .await?;
+        tracing::info!(mv = %def.name, db = %def.database, "materialized view backfilled");
+        Ok(())
+    }
+
     fn spawn_bootstrap_after_apply(&self, def: &MaterializedViewDef) {
         let Some(ctx) = self.shard_routing.clone() else {
             return;
@@ -368,6 +404,7 @@ impl MaterializedViewService {
             return;
         }
         let leader_addr = self.raft_leader_addr.as_ref().and_then(|f| f());
+        let backfill = def.backfill_on_create.then(|| (self.clone(), def.clone()));
         let spaces = [
             (
                 def.source_db.clone(),
@@ -400,6 +437,16 @@ impl MaterializedViewService {
                         "materialized view shard space bootstrap failed"
                     );
                 }
+            }
+            if let Some((svc, def)) = backfill
+                && let Err(e) = svc.backfill_replicated(&def).await
+            {
+                tracing::error!(
+                    mv = %def.name,
+                    db = %def.database,
+                    error = %e,
+                    "materialized view backfill failed"
+                );
             }
         });
     }

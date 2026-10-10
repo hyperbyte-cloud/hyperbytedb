@@ -6,6 +6,7 @@ use hyperbytedb::domain::sharding::{
     MeasurementKey, ShardEpoch, ShardMapOp, ShardRegion, ShardTransferPayload, TransferPhase,
 };
 use hyperbytedb::ports::metadata::MetadataPort;
+use hyperbytedb::ports::query::QueryPort;
 use hyperbytedb::ports::sharding::ShardMapPort;
 use serial_test::serial;
 use std::collections::BTreeMap;
@@ -282,6 +283,29 @@ async fn sharded_mv_with_backfill() {
     assert!(
         dest_rows >= 2,
         "backfill should populate dest rows, got {dest_rows}"
+    );
+    // The in-process nodes share one chDB, so one destination table holds
+    // every backfill: the history must be rolled up exactly once. Every
+    // node's apply of the replicated CREATE used to backfill it again.
+    for node in &nodes {
+        assert!(
+            wait_for_show_materialized_view(&client, &node.url, "sharddb", "mv_metrics").await,
+            "node {} has no view",
+            node.node_id
+        );
+    }
+    let total = nodes[0]
+        .query_port
+        .execute_sql(&format!(
+            "SELECT sum(`value`) AS s FROM `{dest_table}` FORMAT JSONEachRow"
+        ))
+        .await
+        .unwrap();
+    let total: serde_json::Value = serde_json::from_str(total.lines().next().unwrap()).unwrap();
+    assert_eq!(
+        total["s"].as_f64(),
+        Some(12.0),
+        "5 + 7 rolled up once; got {total}"
     );
 
     let q = query_sql(
