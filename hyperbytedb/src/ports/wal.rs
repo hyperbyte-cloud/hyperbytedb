@@ -88,6 +88,14 @@ pub trait WalPort: Send + Sync {
     /// Record that every entry up to `sequence` is in the local store.
     fn set_flushed_through(&self, _sequence: u64) {}
 
+    /// Where to truncate so that at most `max_bytes` of the entries up to
+    /// `through` stay: the highest sequence that may go. Entries whose size
+    /// is not known (written before this process started) count as over the
+    /// budget. Default: keep nothing.
+    fn flushed_margin_start(&self, through: u64, _max_bytes: u64) -> u64 {
+        through
+    }
+
     /// Remove all durable and in-memory WAL entries for `database`.
     async fn purge_database(&self, database: &str) -> Result<(), HyperbytedbError> {
         let _ = database;

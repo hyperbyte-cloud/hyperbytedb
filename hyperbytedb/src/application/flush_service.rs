@@ -34,9 +34,9 @@ const MAX_BATCH_POINTS: usize = 500_000;
 /// Maximum number of unflushed WAL entries to retain when peers are lagging.
 /// Beyond this limit we truncate anyway to prevent unbounded WAL growth.
 const MAX_WAL_RETENTION_ENTRIES: u64 = 500_000;
-/// WAL entries kept behind the flush in a sharded cluster: tens of seconds of
-/// peak ingest, re-flushed (idempotently) after a crash.
-const SHARDED_WAL_RETENTION_ENTRIES: u64 = 10_000;
+/// Bytes of WAL kept behind the flush in a sharded cluster: tens of seconds
+/// of peak ingest, re-flushed (idempotently) after a crash.
+const SHARDED_WAL_RETENTION_BYTES: u64 = 1 << 30;
 
 type MeasurementBatchKey = (String, String, String);
 type MeasurementBatch = (Vec<Point>, Vec<u64>);
@@ -65,8 +65,8 @@ pub struct FlushServiceImpl {
     coalesce: bool,
     sharding_enabled: bool,
     shard_map: Option<Arc<dyn ShardMapPort>>,
-    /// WAL entries kept behind the flush in a sharded cluster.
-    sharded_wal_retention_entries: u64,
+    /// Bytes of WAL kept behind the flush in a sharded cluster.
+    sharded_wal_retention_bytes: u64,
 }
 
 struct FlushWork {
@@ -116,7 +116,7 @@ impl FlushServiceImpl {
             coalesce: std::env::var("HYPERBYTEDB_DISABLE_COALESCE").is_err(),
             sharding_enabled: false,
             shard_map: None,
-            sharded_wal_retention_entries: SHARDED_WAL_RETENTION_ENTRIES,
+            sharded_wal_retention_bytes: SHARDED_WAL_RETENTION_BYTES,
         }
     }
 
@@ -143,8 +143,8 @@ impl FlushServiceImpl {
         self
     }
 
-    pub fn with_sharded_wal_retention(mut self, entries: u64) -> Self {
-        self.sharded_wal_retention_entries = entries;
+    pub fn with_sharded_wal_retention_bytes(mut self, bytes: u64) -> Self {
+        self.sharded_wal_retention_bytes = bytes;
         self
     }
 
@@ -206,9 +206,13 @@ impl FlushServiceImpl {
         // from chDB plus the unflushed WAL; no peer ever acks the WAL, so the
         // barrier below kept 500k entries, 18-72 GB a pod on n3, and every
         // restart re-flushed all of it. A margin stays behind the flush for
-        // the chDB parts the OS has not written back yet.
+        // the chDB parts the OS has not written back yet, bounded in bytes:
+        // a received region chunk is one ~4.5 MB entry, so a margin of 10k
+        // entries still held up to 45 GB.
         if self.sharding_enabled {
-            return chunk_max_seq.saturating_sub(self.sharded_wal_retention_entries);
+            return self
+                .wal
+                .flushed_margin_start(chunk_max_seq, self.sharded_wal_retention_bytes);
         }
         let rl = match self.replication_log {
             Some(ref rl) => rl,
@@ -907,11 +911,12 @@ mod tests {
         );
     }
 
-    /// In a sharded cluster the WAL keeps only a margin behind the flush.
+    /// In a sharded cluster the WAL keeps only a margin behind the flush,
+    /// bounded in bytes.
     ///
     /// It waited for peer acks that nothing sends, so it kept 500k entries:
-    /// 18 GB on most n3 pods and 72 GB on one, which then decoded on open for
-    /// longer than its startup probe allowed.
+    /// 18 GB on most n3 pods and 72 GB on one. A margin of 10k entries then
+    /// still held 32-45 GB, since a received region chunk is one big entry.
     #[tokio::test]
     async fn a_sharded_wal_keeps_only_a_margin_behind_the_flush() {
         use crate::adapters::cluster::replication_log::ReplicationLog;
@@ -958,8 +963,13 @@ mod tests {
                 ReplicationLog::open(tmp.path().join("repl")).unwrap(),
             ))
             .with_membership(1, new_shared(ClusterMembership::new()))
-            .with_sharding(true, Some(map as Arc<dyn ShardMapPort>), 1)
-            .with_sharded_wal_retention(2);
+            .with_sharding(true, Some(map as Arc<dyn ShardMapPort>), 1);
+        // A budget of two and a half entries keeps the newest two.
+        let one =
+            crate::adapters::wal::wal_ipc::encode_wal_value(WalFormat::Bincode, None, &entry())
+                .unwrap()
+                .len() as u64;
+        let flush = flush.with_sharded_wal_retention_bytes(one * 5 / 2);
         for _ in 0..5 {
             wal.append(entry()).await.unwrap();
         }

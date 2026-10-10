@@ -36,6 +36,9 @@ pub struct RocksDbWal {
     db: Arc<DB>,
     seq: Arc<AtomicU64>,
     flushed_through: AtomicU64,
+    /// `(seq, encoded bytes)` of entries written by this process and not yet
+    /// truncated, oldest first: what a byte-bounded margin is measured in.
+    sizes: Arc<std::sync::Mutex<std::collections::VecDeque<(u64, u64)>>>,
     arrow_cache: Arc<WalArrowCache>,
     wal_format: WalFormat,
     arrow_wal_enabled: bool,
@@ -210,6 +213,7 @@ impl RocksDbWal {
             db,
             seq: Arc::new(AtomicU64::new(seq)),
             flushed_through: AtomicU64::new(0),
+            sizes: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             arrow_cache: Arc::new(WalArrowCache::new()),
             wal_format: options.wal_format,
             arrow_wal_enabled: options.arrow_wal_enabled,
@@ -353,6 +357,7 @@ impl RocksDbWal {
         write_bundle_batch(
             &self.db,
             &self.seq,
+            &self.sizes,
             &self.arrow_cache,
             self.wal_format,
             self.arrow_wal_enabled,
@@ -362,9 +367,13 @@ impl RocksDbWal {
     }
 }
 
+type EntrySizes = std::sync::Mutex<std::collections::VecDeque<(u64, u64)>>;
+
+#[allow(clippy::too_many_arguments)]
 fn write_bundle_batch(
     db: &DB,
     seq: &Arc<AtomicU64>,
+    sizes: &EntrySizes,
     arrow_cache: &WalArrowCache,
     wal_format: WalFormat,
     arrow_wal_enabled: bool,
@@ -383,6 +392,7 @@ fn write_bundle_batch(
 
     let mut wb = WriteBatch::default();
     let mut seqs = Vec::with_capacity(bundles.len());
+    let mut lens = Vec::with_capacity(bundles.len());
     let mut prepared_slots = Vec::with_capacity(bundles.len());
 
     for (i, bundle) in bundles.iter_mut().enumerate() {
@@ -405,6 +415,7 @@ fn write_bundle_batch(
             Some(bytes) => bytes,
             None => wal_ipc::encode_wal_value(wal_format, bundle.prepared.as_ref(), &bundle.entry)?,
         };
+        lens.push(value.len() as u64);
         wb.put_cf(&wal_cf, u64_to_be_bytes(wal_seq), value);
         seqs.push(wal_seq);
         prepared_slots.push(bundle.prepared.take());
@@ -412,6 +423,9 @@ fn write_bundle_batch(
 
     db.write(wb)
         .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
+    if let Ok(mut sizes) = sizes.lock() {
+        sizes.extend(seqs.iter().copied().zip(lens));
+    }
 
     if arrow_wal_enabled {
         for (wal_seq, slot) in seqs.iter().zip(prepared_slots) {
@@ -437,6 +451,7 @@ impl WalPort for RocksDbWal {
     async fn append_bundle(&self, bundle: WalAppendBundle) -> Result<u64, HyperbytedbError> {
         let db = Arc::clone(&self.db);
         let seq = Arc::clone(&self.seq);
+        let sizes = Arc::clone(&self.sizes);
         let arrow_cache = Arc::clone(&self.arrow_cache);
         let wal_format = self.wal_format;
         let arrow_wal_enabled = self.arrow_wal_enabled;
@@ -445,6 +460,7 @@ impl WalPort for RocksDbWal {
             write_bundle_batch(
                 &db,
                 &seq,
+                &sizes,
                 &arrow_cache,
                 wal_format,
                 arrow_wal_enabled,
@@ -563,6 +579,11 @@ impl WalPort for RocksDbWal {
 
     async fn truncate_before(&self, sequence: u64) -> Result<(), HyperbytedbError> {
         self.arrow_cache.truncate_before(sequence);
+        if let Ok(mut sizes) = self.sizes.lock() {
+            while sizes.front().is_some_and(|(s, _)| *s < sequence) {
+                sizes.pop_front();
+            }
+        }
         let db = self.db.clone();
         // Snapshot the high-water-mark *before* the delete so a fully-
         // truncated WAL CF can still recover the last assigned seq from
@@ -605,6 +626,23 @@ impl WalPort for RocksDbWal {
 
     fn set_flushed_through(&self, sequence: u64) {
         self.flushed_through.store(sequence, Ordering::Release);
+    }
+
+    fn flushed_margin_start(&self, through: u64, max_bytes: u64) -> u64 {
+        let Ok(sizes) = self.sizes.lock() else {
+            return through;
+        };
+        let mut kept = 0u64;
+        let mut start = through;
+        for &(seq, len) in sizes.iter().rev().skip_while(|(s, _)| *s > through) {
+            if kept + len > max_bytes {
+                return seq;
+            }
+            kept += len;
+            start = seq.saturating_sub(1);
+        }
+        // Every entry this process wrote fits; older ones, of unknown size, go.
+        start
     }
 
     async fn flush_wal(&self) -> Result<(), HyperbytedbError> {
