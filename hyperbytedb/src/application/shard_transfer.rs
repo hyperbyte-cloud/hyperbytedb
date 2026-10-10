@@ -305,18 +305,18 @@ pub async fn export_region_points_from_chdb(
         field_column_name, quote_backticks, quoted_series_table_name, quoted_table_name,
     };
 
-    let meta = metadata
+    // No metadata here means no rows here: a node registers a measurement
+    // before any of its points reach the WAL. That is nothing to copy, not an
+    // error. Failing it made every move of such a region fail forever: on n3
+    // a materialized view whose CREATE failed left its destination's shard
+    // space behind with no measurement, its learners never promoted, and they
+    // used up the new nodes' learner slots, so no other region moved there.
+    let Some(meta) = metadata
         .get_measurement(&key.db, &key.rp, &key.measurement)
         .await?
-        .ok_or_else(|| {
-            HyperbytedbError::ShardMap(
-                format!(
-                    "measurement {} not found for transfer export",
-                    key.measurement
-                )
-                .into(),
-            )
-        })?;
+    else {
+        return Ok((Vec::new(), 0, None));
+    };
 
     let mapping = ColumnMapping::from_measurement_meta(&meta);
     let fact = quoted_table_name(&key.db, &key.rp, &key.measurement);
@@ -1091,6 +1091,49 @@ mod tests {
 
     fn host_tag(v: &str) -> BTreeMap<String, String> {
         [("host".into(), v.into())].into()
+    }
+
+    /// A region of a measurement this node has no metadata for holds no rows
+    /// here: exporting it is empty, not an error. The error failed every move
+    /// of an empty space forever, and its learners blocked other moves.
+    #[tokio::test]
+    async fn a_measurement_unknown_here_exports_nothing() {
+        use crate::adapters::chdb::query_adapter::ChdbQueryAdapter;
+        use crate::adapters::chdb::session::SharedSession;
+
+        let dir = tempfile::tempdir().unwrap();
+        let metadata: Arc<dyn MetadataPort> = Arc::new(RocksDbMetadata::open(dir.path()).unwrap());
+        let query: Arc<dyn QueryPort> = Arc::new(ChdbQueryAdapter::from_shared(
+            SharedSession::new("/nonexistent"),
+            0,
+        ));
+        let region = ShardRegion {
+            region_id: 1,
+            start: 0,
+            end: u64::MAX,
+            epoch: Default::default(),
+            peers: vec![1],
+            primary: 1,
+            last_split_at: 0,
+            transfer_verified: None,
+            transfer_first_seen: None,
+            state: Default::default(),
+            staged_from: None,
+            staging_peers: Vec::new(),
+        };
+        let (body, count, last) = export_region_points_from_chdb(
+            query.as_ref(),
+            metadata.as_ref(),
+            &MeasurementKey::new("db", "autogen", "cpu_1m"),
+            &region,
+            None,
+            100,
+        )
+        .await
+        .unwrap();
+        assert!(body.is_empty());
+        assert_eq!(count, 0);
+        assert_eq!(last, None);
     }
 
     /// A copy sends each row once: flushed rows from chDB, the rest from the
