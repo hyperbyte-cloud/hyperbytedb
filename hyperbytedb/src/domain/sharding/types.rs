@@ -477,9 +477,13 @@ pub struct ShardMetadataRequest {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ShardMetadataKind {
     TagKeys,
-    TagValues { tag_key: String },
+    TagValues {
+        tag_key: String,
+    },
     Series,
     FieldKeys,
+    /// The whole `MeasurementMeta`, or null when the node has none.
+    Measurement,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

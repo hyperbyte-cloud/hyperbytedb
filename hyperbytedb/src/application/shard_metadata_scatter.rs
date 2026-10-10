@@ -107,6 +107,77 @@ async fn fetch_remote_metadata_bounded(
     Ok(parts)
 }
 
+/// This node's schema for the measurement or, when it has none, the schemas
+/// of the serving regions' owners merged. With sharding a node has a
+/// measurement only once rows for it land there, and CREATE MATERIALIZED
+/// VIEW needs the schema on the node that takes the statement.
+pub async fn scatter_measurement_meta(
+    ctx: &ShardRoutingContext,
+    metadata: &dyn MetadataPort,
+    db: &str,
+    rp: &str,
+    measurement: &str,
+) -> Result<Option<MeasurementMeta>, HyperbytedbError> {
+    if let Some(local) = metadata.get_measurement(db, rp, measurement).await? {
+        return Ok(Some(local));
+    }
+    let map = ctx.shard_map.snapshot().await?;
+    let remote_regions: Vec<ShardRegion> = ctx
+        .location_cache
+        .serving_regions(&map, db, rp, measurement)
+        .iter()
+        .filter(|region| !region.peers.contains(&ctx.node_id))
+        .cloned()
+        .collect();
+    let parts = fetch_remote_metadata_bounded(
+        ctx,
+        db,
+        rp,
+        measurement,
+        remote_regions,
+        ShardMetadataKind::Measurement,
+    )
+    .await?;
+    let mut merged: Option<MeasurementMeta> = None;
+    for part in parts {
+        let Some(meta) = part
+            .get("measurement")
+            .cloned()
+            .and_then(|v| serde_json::from_value::<Option<MeasurementMeta>>(v).ok())
+            .flatten()
+        else {
+            continue;
+        };
+        match merged.as_mut() {
+            None => merged = Some(meta),
+            Some(acc) => merge_measurement_meta(acc, meta),
+        }
+    }
+    Ok(merged)
+}
+
+/// Union of two nodes' schemas for one measurement; `acc` wins on conflicts.
+fn merge_measurement_meta(acc: &mut MeasurementMeta, other: MeasurementMeta) {
+    for (k, v) in other.field_types {
+        acc.field_types.entry(k).or_insert(v);
+    }
+    for k in other.tag_keys {
+        if !acc.tag_keys.contains(&k) {
+            acc.tag_keys.push(k);
+        }
+    }
+    for (k, v) in other.field_rollups {
+        acc.field_rollups.entry(k).or_insert(v);
+    }
+    for (k, v) in other.mean_fields {
+        acc.mean_fields.entry(k).or_insert(v);
+    }
+    acc.materialized |= other.materialized;
+    if acc.materialized_rp.is_none() {
+        acc.materialized_rp = other.materialized_rp;
+    }
+}
+
 pub async fn scatter_tag_keys(
     ctx: &ShardRoutingContext,
     metadata: &dyn MetadataPort,

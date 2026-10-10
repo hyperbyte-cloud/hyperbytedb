@@ -169,6 +169,9 @@ async fn serve_inner(config: HyperbytedbConfig) -> anyhow::Result<()> {
         if let Some(m) = &membership {
             pqs.set_membership(m.clone());
         }
+        if let Some(ctx) = &app_state.shard_routing {
+            pqs.set_shard_routing(ctx.clone());
+        }
         tracing::info!("schema mutations will be routed through raft consensus");
     }
 

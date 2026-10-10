@@ -247,11 +247,9 @@ pub async fn start_sharded_node(
     ingestion_svc.spawn_forward_drainer();
     let ingestion: Arc<dyn hyperbytedb::ports::ingestion::IngestionPort> = ingestion_svc;
 
-    let query: Arc<dyn QueryService> = Arc::new(PeerQueryService::new(
-        base_query,
-        metadata.clone(),
-        peer_client.clone(),
-    ));
+    let peer_query = PeerQueryService::new(base_query, metadata.clone(), peer_client.clone());
+    peer_query.set_shard_routing(shard_routing.clone());
+    let query: Arc<dyn QueryService> = Arc::new(peer_query);
 
     // Only with a Raft handle: the scheduler owns proposals, and there is
     // nothing to propose through without one. Its presence is what makes the

@@ -445,6 +445,56 @@ async fn sharded_mv_replicates_to_node_without_source_rows() {
     );
 }
 
+/// The node that takes the CREATE may have no rows for the source either: it
+/// asks the region owners for the schema. On n3 the leader rejected such a
+/// CREATE after the other nodes had already applied it.
+#[tokio::test]
+#[serial(chdb)]
+async fn sharded_mv_create_on_node_without_source_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let nodes = start_sharded_pair_cluster(dir.path(), ShardedClusterOptions::default()).await;
+    // Only node 2 holds the region, so node 1 never sees a cpu row.
+    bootstrap_region_on_all_nodes(&nodes, "sharddb", "autogen", "cpu", vec![2], 2).await;
+
+    let client = reqwest::Client::new();
+    for node in &nodes {
+        create_db(&client, &node.url, "sharddb").await;
+    }
+    let t = MV_MINUTE_ALIGNED_NS;
+    write_line(
+        &client,
+        &nodes[1].url,
+        "sharddb",
+        &format!("cpu,host=a value=10 {t}"),
+    )
+    .await;
+    flush_node(&nodes[1]).await;
+    assert!(
+        nodes[0]
+            .metadata
+            .get_measurement("sharddb", "autogen", "cpu")
+            .await
+            .unwrap()
+            .is_none(),
+        "precondition: node 1 has no cpu measurement"
+    );
+
+    let create_mv = r#"CREATE MATERIALIZED VIEW "mv_cpu_1m" ON "sharddb" AS SELECT mean("value") AS "mean_value" INTO "cpu_1m" FROM "cpu" GROUP BY time(1m), *"#;
+    let resp = query_sql(&client, &nodes[0].url, "sharddb", create_mv).await;
+    let body = resp.text().await.unwrap_or_default();
+    assert!(
+        !body.contains("error"),
+        "CREATE MV on node 1 failed: {body}"
+    );
+    for node in &nodes {
+        assert!(
+            wait_for_show_materialized_view(&client, &node.url, "sharddb", "mv_cpu_1m").await,
+            "node {} has no view",
+            node.node_id
+        );
+    }
+}
+
 #[tokio::test]
 #[serial(chdb)]
 async fn sharded_mv_transfer_purge_dest_partials() {

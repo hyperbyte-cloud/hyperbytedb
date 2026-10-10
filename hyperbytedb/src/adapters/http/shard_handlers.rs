@@ -1414,6 +1414,20 @@ pub async fn handle_shard_metadata(
                     .into_response(),
             }
         }
+        ShardMetadataKind::Measurement => {
+            match state
+                .metadata
+                .get_measurement(&req.db, &req.rp, &req.measurement)
+                .await
+            {
+                Ok(meta) => Json(serde_json::json!({"measurement": meta})).into_response(),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+                    .into_response(),
+            }
+        }
         ShardMetadataKind::Series => {
             match state
                 .metadata

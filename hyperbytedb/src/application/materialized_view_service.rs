@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::application::ingest_metadata::register_series_from_series_table;
+use crate::application::shard_metadata_scatter::scatter_measurement_meta;
 use crate::application::shard_routing::{ShardRoutingContext, ensure_measurement_bootstrapped};
 use crate::application::sharded_mv_backfill::{
     MeasurementShardRef, ShardedMvBackfillPlan, ShardedMvBackfillPorts, scatter_mv_backfill,
@@ -117,6 +118,20 @@ impl MaterializedViewService {
         };
 
         if bootstrap_now {
+            // The statement's own node, not a Raft apply: it may ask peers.
+            if let Some(ctx) = self.shard_routing.as_ref()
+                && let Some(meta) = scatter_measurement_meta(
+                    ctx,
+                    self.metadata.as_ref(),
+                    &source_db,
+                    &source_rp,
+                    &source_measurement,
+                )
+                .await?
+            {
+                self.ensure_source_measurement(&source_db, &source_rp, &meta)
+                    .await?;
+            }
             self.bootstrap_sharded_measurements(
                 &source_db,
                 &source_rp,
@@ -291,7 +306,8 @@ impl MaterializedViewService {
         source_meta: Option<&MeasurementMeta>,
     ) -> Result<(), HyperbytedbError> {
         if let Some(meta) = source_meta {
-            self.ensure_source_measurement(definition, meta).await?;
+            self.ensure_source_measurement(&definition.source_db, &definition.source_rp, meta)
+                .await?;
         }
         if self
             .metadata
@@ -326,13 +342,13 @@ impl MaterializedViewService {
     /// before this node's first row, which it would otherwise never roll up.
     async fn ensure_source_measurement(
         &self,
-        def: &MaterializedViewDef,
+        db: &str,
+        rp: &str,
         meta: &MeasurementMeta,
     ) -> Result<(), HyperbytedbError> {
-        let (db, rp) = (&def.source_db, &def.source_rp);
         if self
             .metadata
-            .get_measurement(db, rp, &def.source_measurement)
+            .get_measurement(db, rp, &meta.name)
             .await?
             .is_some()
         {
