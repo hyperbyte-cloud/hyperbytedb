@@ -325,13 +325,30 @@ pub async fn build_bootstrap_op(
 /// measurement's regions are placed over.
 async fn bootstrap_candidates(ctx: &ShardRoutingContext) -> Vec<u64> {
     let membership = ctx.peer_client.membership().read().await;
+    placeable_members(&membership, ctx.node_id)
+}
+
+/// Active peers plus this node, unless this node is leaving the cluster.
+///
+/// This node was added unconditionally. The bootstrap op is built where the
+/// measurement is first written or on the Raft leader, and on n3 the leader
+/// was itself decommissioning: a new measurement's regions were placed on
+/// it, its rows were rolled up there, and those rollups left with it.
+fn placeable_members(
+    membership: &crate::domain::cluster::membership::ClusterMembership,
+    self_id: u64,
+) -> Vec<u64> {
     let mut ids: Vec<u64> = membership
-        .active_peers(ctx.node_id)
+        .active_peers(self_id)
         .iter()
         .map(|n| n.node_id)
         .collect();
-    drop(membership);
-    ids.push(ctx.node_id);
+    let self_departing = membership
+        .get_node(self_id)
+        .is_some_and(crate::domain::cluster::membership::is_departing);
+    if !self_departing {
+        ids.push(self_id);
+    }
     ids.sort_unstable();
     ids.dedup();
     ids
@@ -445,15 +462,8 @@ async fn select_bootstrap_peers(
     measurement: &str,
 ) -> Result<Vec<u64>, HyperbytedbError> {
     let membership = ctx.peer_client.membership().read().await;
-    let mut peers: Vec<u64> = membership
-        .active_peers(ctx.node_id)
-        .iter()
-        .map(|n| n.node_id)
-        .collect();
-    peers.push(ctx.node_id);
+    let peers = placeable_members(&membership, ctx.node_id);
     drop(membership);
-    peers.sort_unstable();
-    peers.dedup();
     let member_count = peers.len();
     let rf = effective_replication_factor(ctx.config.replication_factor, member_count);
     let key = crate::domain::sharding::types::MeasurementKey::new(db, rp, measurement);
@@ -1492,6 +1502,40 @@ mod scatter_tests {
         let primaries: std::collections::HashSet<u64> = regions.iter().map(|r| r.primary).collect();
         assert_eq!(primaries.len(), 3, "every node leads some");
         ctx.shard_map.apply_op(op).await.unwrap();
+    }
+
+    /// A node leaving the cluster gets no regions of a new measurement, even
+    /// when it is the node building the bootstrap (on n3, the Raft leader).
+    #[tokio::test]
+    async fn a_departing_node_gets_no_regions_of_a_new_measurement() {
+        let membership =
+            membership_with(&[(1, "127.0.0.1:1"), (2, "127.0.0.1:2"), (3, "127.0.0.1:3")]);
+        membership
+            .write()
+            .await
+            .set_state(1, NodeState::Decommissioning);
+        for regions_per_node in [2, 0] {
+            let ctx = test_ctx(
+                membership.clone(),
+                ShardingConfig {
+                    bootstrap_regions_per_node: regions_per_node,
+                    ..ShardingConfig::default()
+                },
+                1,
+            );
+            let op = build_bootstrap_op(&ctx, "db", "autogen", "cpu")
+                .await
+                .unwrap();
+            let regions = match &op {
+                ShardMapOp::BootstrapMeasurementPresplit { regions, .. } => regions.clone(),
+                ShardMapOp::BootstrapMeasurement { region, .. } => vec![region.clone()],
+                other => panic!("expected a bootstrap op, got {other:?}"),
+            };
+            assert!(
+                regions.iter().all(|r| !r.peers.contains(&1)),
+                "regions_per_node={regions_per_node}: departing node 1 placed: {regions:?}"
+            );
+        }
     }
 
     #[tokio::test]
