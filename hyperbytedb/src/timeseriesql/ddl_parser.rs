@@ -22,7 +22,7 @@ pub fn parse_ddl_statement(input: &str) -> Result<Statement, HyperbytedbError> {
             "DROP" => parse_drop(&mut cur),
             "ALTER" => parse_alter(&mut cur),
             "DELETE" => parse_delete(&mut cur),
-            "SET" => parse_set_password(&mut cur),
+            "SET" => parse_set(&mut cur),
             "GRANT" => parse_grant(&mut cur),
             "REVOKE" => parse_revoke(&mut cur),
             other => Err(HyperbytedbError::QueryParse(format!(
@@ -176,8 +176,55 @@ fn parse_show(cur: &mut TokenCursor<'_>) -> Result<Statement, HyperbytedbError> 
                 "unsupported SHOW: {k}"
             ))),
         },
+        // Not a keyword, so a measurement or database may still be named
+        // `settings`.
+        TokenKind::Ident(word) if word.eq_ignore_ascii_case("SETTINGS") => {
+            cur.bump();
+            Ok(Statement::ShowSettings)
+        }
         _ => Err(HyperbytedbError::QueryParse("incomplete SHOW".to_string())),
     }
+}
+
+/// `SET PASSWORD ...` or `SET <setting> = <integer> | DEFAULT`.
+fn parse_set(cur: &mut TokenCursor<'_>) -> Result<Statement, HyperbytedbError> {
+    if matches!(
+        cur.tokens.get(cur.pos + 1).map(|t| &t.kind),
+        Some(TokenKind::Keyword(k)) if k == "PASSWORD"
+    ) {
+        return parse_set_password(cur);
+    }
+    cur.expect_keyword("SET")?;
+    let name = cur.take_ident()?.to_ascii_lowercase();
+    match cur.bump() {
+        Some(Token {
+            kind: TokenKind::Eq,
+            ..
+        }) => {}
+        other => {
+            return Err(HyperbytedbError::QueryParse(format!(
+                "expected '=' after SET {name}, found {:?}",
+                other.map(|t| t.kind)
+            )));
+        }
+    }
+    let value = match cur.bump() {
+        Some(Token {
+            kind: TokenKind::Number(n),
+            ..
+        }) => Some(n),
+        Some(Token {
+            kind: TokenKind::Keyword(k),
+            ..
+        }) if k == "DEFAULT" => None,
+        other => {
+            return Err(HyperbytedbError::QueryParse(format!(
+                "expected an integer or DEFAULT for {name}, found {:?}",
+                other.map(|t| t.kind)
+            )));
+        }
+    };
+    Ok(Statement::SetSetting { name, value })
 }
 
 fn parse_show_tail(
@@ -1064,6 +1111,39 @@ fn slice_remaining_clause(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_and_show_settings_parse() {
+        for (q, value) in [
+            ("SET query_pool_size = 8", Some(8)),
+            ("set QUERY_POOL_SIZE = 4", Some(4)),
+            ("SET query_pool_size = DEFAULT", None),
+        ] {
+            match parse_ddl_statement(q).unwrap() {
+                Statement::SetSetting { name, value: v } => {
+                    assert_eq!(name, "query_pool_size", "{q}");
+                    assert_eq!(v, value, "{q}");
+                }
+                other => panic!("{q}: expected SetSetting, got {other:?}"),
+            }
+        }
+        assert!(matches!(
+            parse_ddl_statement("SHOW SETTINGS").unwrap(),
+            Statement::ShowSettings
+        ));
+        for bad in [
+            "SET query_pool_size",
+            "SET query_pool_size = 'eight'",
+            "SET query_pool_size = 8 9",
+        ] {
+            assert!(parse_ddl_statement(bad).is_err(), "{bad}");
+        }
+        // SET PASSWORD still parses as before.
+        assert!(matches!(
+            parse_ddl_statement("SET PASSWORD FOR bob = 'pw'").unwrap(),
+            Statement::SetPassword { .. }
+        ));
+    }
 
     #[test]
     fn set_password_for_with_eq() {

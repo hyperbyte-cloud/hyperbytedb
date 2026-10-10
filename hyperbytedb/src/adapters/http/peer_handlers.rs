@@ -833,6 +833,19 @@ async fn build_metadata_snapshot(
         }
     }
 
+    for name in crate::application::runtime_settings::SETTINGS {
+        if let Some(value) = metadata.get_setting(name).await? {
+            entries.push(MetadataEntry {
+                key: format!("setting:{name}"),
+                value: serde_json::to_vec(&value).map_err(|e| {
+                    crate::error::HyperbytedbError::Metadata(
+                        crate::error::ChainedError::from_error(e),
+                    )
+                })?,
+            });
+        }
+    }
+
     Ok(MetadataSnapshot { entries })
 }
 

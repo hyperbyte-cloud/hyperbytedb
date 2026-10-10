@@ -445,6 +445,11 @@ impl SyncClient {
                     .store_continuous_query(db, &cq.name, &cq)
                     .await?;
             }
+        } else if let Some(name) = entry.key.strip_prefix("setting:") {
+            let value: u64 = serde_json::from_slice(&entry.value)
+                .map_err(|e| HyperbytedbError::Metadata(format!("parse setting: {e}").into()))?;
+            crate::application::runtime_settings::apply(self.metadata.as_ref(), name, Some(value))
+                .await?;
         } else if entry.key.starts_with("mv:") {
             let parts: Vec<&str> = entry.key.splitn(3, ':').collect();
             if parts.len() == 3 {

@@ -16,6 +16,8 @@ pub fn stmt_type(stmt: &Statement) -> &'static str {
         Statement::ShowUsers => "SHOW",
         Statement::ShowContinuousQueries => "SHOW",
         Statement::ShowMaterializedViews => "SHOW",
+        Statement::ShowSettings => "SHOW",
+        Statement::SetSetting { .. } => "SET",
         Statement::CreateDatabase(_) => "CREATE",
         Statement::CreateRetentionPolicyStmt { .. } => "CREATE",
         Statement::CreateUser { .. } => "CREATE",
@@ -133,6 +135,10 @@ fn normalize_statement(stmt: &Statement) -> String {
         Statement::ShowUsers => out.push_str("show users"),
         Statement::ShowContinuousQueries => out.push_str("show continuous queries"),
         Statement::ShowMaterializedViews => out.push_str("show materialized views"),
+        Statement::ShowSettings => out.push_str("show settings"),
+        Statement::SetSetting { name, .. } => {
+            write!(out, "set {name} = ?").ok();
+        }
         Statement::CreateDatabase(_) => out.push_str("create database ?"),
         Statement::DropDatabase(_) => out.push_str("drop database ?"),
         Statement::DropMeasurement { .. } => out.push_str("drop measurement ?"),

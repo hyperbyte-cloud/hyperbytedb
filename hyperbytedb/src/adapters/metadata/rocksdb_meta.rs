@@ -2105,6 +2105,47 @@ impl MetadataPort for RocksDbMetadata {
         Ok(())
     }
 
+    async fn get_setting(&self, name: &str) -> Result<Option<u64>, HyperbytedbError> {
+        let rdb = self.db.clone();
+        let key = format!("setting:{name}");
+        meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            match rdb.get_cf(&cf, key.as_bytes()) {
+                Ok(Some(v)) => serde_json::from_slice(&v).map(Some).map_err(|e| {
+                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                }),
+                Ok(None) => Ok(None),
+                Err(e) => Err(HyperbytedbError::Metadata(
+                    crate::error::ChainedError::from_error(e),
+                )),
+            }
+        })
+        .await
+    }
+
+    async fn set_setting(&self, name: &str, value: Option<u64>) -> Result<(), HyperbytedbError> {
+        let rdb = self.db.clone();
+        let key = format!("setting:{name}");
+        meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            let result = match value {
+                Some(v) => rdb.put_cf(
+                    &cf,
+                    key.as_bytes(),
+                    serde_json::to_vec(&v).unwrap_or_default(),
+                ),
+                None => rdb.delete_cf(&cf, key.as_bytes()),
+            };
+            result
+                .map_err(|e| HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e)))
+        })
+        .await
+    }
+
     async fn store_continuous_query(
         &self,
         db: &str,

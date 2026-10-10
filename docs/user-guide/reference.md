@@ -302,7 +302,21 @@ CREATE MATERIALIZED VIEW "<name>" ON "<db>"
   AS <select_into_statement>          -- every column needs AS "<name>"
 DROP MATERIALIZED VIEW "<name>" ON "<db>"
 SHOW MATERIALIZED VIEWS
+
+SET <setting> = <integer> | DEFAULT   -- admin; applied on every node at once
+SHOW SETTINGS                         -- name, value, source (set | config | auto)
 ```
+
+### Runtime settings
+
+| Setting | Range | Without `SET` |
+|---|---|---|
+| `query_pool_size` | 1-128 | `chdb.query_pool_size` (or legacy `chdb.pool_size`) from the config file, else one connection per CPU plus one |
+
+`SET` is replicated through Raft and stored, so it survives a restart and
+reaches nodes that join later. `SET <setting> = DEFAULT` removes the
+override. Do not run `SET` while a rolling upgrade from a version without it
+is in progress: nodes on the older build cannot decode it.
 
 ### DELETE
 

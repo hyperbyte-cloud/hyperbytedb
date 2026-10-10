@@ -1362,3 +1362,75 @@ async fn queries_read_results_through_the_arrow_stream() {
         "the query service reads results through the Arrow stream"
     );
 }
+
+/// `SET query_pool_size` resizes the live query pool and is stored, `SHOW
+/// SETTINGS` reports it, and `DEFAULT` returns to the size without an
+/// override. Bad names and values are refused.
+#[tokio::test]
+#[serial(chdb)]
+async fn set_query_pool_size_resizes_the_pool() {
+    use hyperbytedb::application::runtime_settings::{Source, register_query_pool};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _flush) = setup(&dir);
+    let pool = SharedSession::new_eager(dir.path().join("chdb").to_str().unwrap(), 2)
+        .unwrap()
+        .pool()
+        .unwrap();
+    register_query_pool(&pool, 2, Source::Auto);
+    let (url, _handle) = start_server(state.clone()).await;
+    let client = reqwest::Client::new();
+    let query = |q: &'static str| {
+        let client = client.clone();
+        let url = url.clone();
+        async move {
+            let resp = client
+                .post(format!("{url}/query"))
+                .form(&[("q", q)])
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{q}");
+            resp.json::<serde_json::Value>().await.unwrap()
+        }
+    };
+    let settings = |body: serde_json::Value| body["results"][0]["series"][0]["values"].clone();
+
+    let body = query("SET query_pool_size = 5").await;
+    assert!(body["results"][0]["error"].is_null(), "{body}");
+    assert_eq!(pool.pool_size(), 5);
+    assert_eq!(
+        state.metadata.get_setting("query_pool_size").await.unwrap(),
+        Some(5)
+    );
+    assert_eq!(
+        settings(query("SHOW SETTINGS").await),
+        serde_json::json!([["query_pool_size", 5, "set"]])
+    );
+
+    query("SET query_pool_size = DEFAULT").await;
+    assert_eq!(pool.pool_size(), 2);
+    assert_eq!(
+        state.metadata.get_setting("query_pool_size").await.unwrap(),
+        None
+    );
+    assert_eq!(
+        settings(query("SHOW SETTINGS").await),
+        serde_json::json!([["query_pool_size", 2, "auto"]])
+    );
+
+    for bad in [
+        "SET query_pool_size = 0",
+        "SET query_pool_size = 500",
+        "SET nope = 3",
+    ] {
+        let resp = client
+            .post(format!("{url}/query"))
+            .form(&[("q", bad)])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad}");
+    }
+    assert_eq!(pool.pool_size(), 2, "a refused SET changes nothing");
+}

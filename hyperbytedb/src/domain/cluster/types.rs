@@ -84,6 +84,12 @@ pub enum MutationRequest {
         username: String,
         database: Option<String>,
     },
+    /// `SET <setting> = <value> | DEFAULT`. A node on a build without it
+    /// cannot decode it: do not run `SET` during a rolling upgrade.
+    SetSetting {
+        name: String,
+        value: Option<u64>,
+    },
 }
 
 /// Wrapper sent over the wire -- carries the sender's seq for ack tracking.

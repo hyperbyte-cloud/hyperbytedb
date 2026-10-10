@@ -631,3 +631,33 @@ async fn sharded_mv_transfer_purge_dest_partials() {
         "host=b dest partials should remain after ranged purge, got: {body_b}"
     );
 }
+
+/// A `SET` on one node reaches every node's stored settings.
+#[tokio::test]
+#[serial(chdb)]
+async fn a_setting_replicates_to_every_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let nodes = start_sharded_pair_cluster(dir.path(), ShardedClusterOptions::default()).await;
+    let client = reqwest::Client::new();
+    let resp = query_sql(&client, &nodes[0].url, "", "SET query_pool_size = 3").await;
+    assert!(
+        resp.status().is_success(),
+        "{}",
+        resp.text().await.unwrap_or_default()
+    );
+    let mut seen = false;
+    for _ in 0..50 {
+        if nodes[1]
+            .metadata
+            .get_setting("query_pool_size")
+            .await
+            .unwrap()
+            == Some(3)
+        {
+            seen = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(seen, "node 2 never stored the SET");
+}

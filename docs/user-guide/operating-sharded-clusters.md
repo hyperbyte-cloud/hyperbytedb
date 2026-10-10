@@ -63,10 +63,10 @@ All are opt-in, per cluster, and set on the `HyperbytedbCluster` object.
   regions that hold those series. Anything else goes to every region.
 - Each region a query touches is one chDB query on the node that holds it,
   so concurrent multi-region queries compete for that node's **query pool**.
-  The database default is 12 connections (`chdb.query_pool_size`). Operator
-  `25812f2` and later writes 12 when the spec sets no pool field; older
-  operators write `pool_size = 1`, so set `spec.chdb.queryPoolSize`
-  explicitly there. With 4 concurrent
+  The default is one connection per CPU the pod may use, plus one (4 at
+  3 CPU). Change it on a running cluster with `SET query_pool_size = <n>`
+  (every node resizes at once; `SHOW SETTINGS` shows the value and where it
+  comes from; `SET query_pool_size = DEFAULT` goes back). With 4 concurrent
   10-host `GROUP BY host` queries over 6 regions, p50 was 250-450 ms with a
   pool of 1 and 90-130 ms with a pool of 4; a single such query alone takes
   about 55 ms, the same as one host.

@@ -499,7 +499,8 @@ pub struct ChdbConfig {
     #[serde(default)]
     pub pool_size: usize,
     /// chDB connections for queries (`ChdbQueryAdapter`). When unset, uses
-    /// `pool_size` if non-zero, else 12. Clamped to 1..=128.
+    /// `pool_size` if non-zero, else one per CPU plus one. Clamped to 1..=128.
+    /// `SET query_pool_size = n` overrides it at run time.
     #[serde(default)]
     pub query_pool_size: Option<usize>,
     /// chDB connections for ingest/flush (`ChdbNativeAdapter`). When unset, uses
@@ -541,7 +542,7 @@ impl ChdbConfig {
     pub fn resolved_query_pool_size(&self) -> usize {
         self.query_pool_size
             .or((self.pool_size > 0).then_some(self.pool_size))
-            .unwrap_or(crate::adapters::chdb::connection_pool::DEFAULT_QUERY_POOL_SIZE)
+            .unwrap_or_else(crate::adapters::chdb::connection_pool::default_query_pool_size)
     }
 
     pub fn resolved_write_pool_size(&self) -> usize {
@@ -1236,7 +1237,10 @@ mod chdb_pool_config_tests {
             insert_max_insert_block_size: 0,
             tag_low_cardinality_max: None,
         };
-        assert_eq!(c.resolved_query_pool_size(), 12);
+        assert_eq!(
+            c.resolved_query_pool_size(),
+            crate::adapters::chdb::connection_pool::default_query_pool_size()
+        );
         assert_eq!(c.resolved_write_pool_size(), 4);
     }
 

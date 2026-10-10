@@ -24,6 +24,7 @@ pub mod replication_apply;
 pub mod replication_dispatch;
 pub mod retention_service;
 pub mod runtime;
+pub mod runtime_settings;
 pub mod schema_mutation_apply;
 pub mod shard_metadata_scatter;
 pub mod shard_peer_resolution;

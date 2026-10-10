@@ -93,6 +93,7 @@ pub fn schema_mutation_op_label(mutation: &MutationRequest) -> &'static str {
         MutationRequest::DropMeasurement { .. } => "drop_measurement",
         MutationRequest::Grant { .. } => "grant",
         MutationRequest::Revoke { .. } => "revoke",
+        MutationRequest::SetSetting { .. } => "set_setting",
     }
 }
 
@@ -241,6 +242,9 @@ async fn apply_schema_mutation_inner(
                 }
             }
             Ok(())
+        }
+        MutationRequest::SetSetting { name, value } => {
+            crate::application::runtime_settings::apply(metadata.as_ref(), &name, value).await
         }
         MutationRequest::Revoke { username, database } => {
             if let Some(db) = &database {

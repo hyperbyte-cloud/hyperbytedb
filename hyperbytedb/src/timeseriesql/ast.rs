@@ -65,6 +65,14 @@ pub enum Statement {
     },
     CreateMaterializedView(CreateMaterializedViewStatement),
     ShowMaterializedViews,
+    /// `SET <setting> = <value> | DEFAULT`: a runtime setting, replicated to
+    /// every node. `None` clears the override.
+    SetSetting {
+        name: String,
+        value: Option<i64>,
+    },
+    /// `SHOW SETTINGS`.
+    ShowSettings,
     DropMaterializedView {
         name: String,
         db: String,

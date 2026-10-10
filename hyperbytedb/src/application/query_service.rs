@@ -408,7 +408,8 @@ fn statement_auth_targets(stmt: &Statement, request_db: &str) -> StatementAuthTa
         | Statement::DropUser(_)
         | Statement::SetPassword { .. }
         | Statement::Grant { .. }
-        | Statement::Revoke { .. } => {
+        | Statement::Revoke { .. }
+        | Statement::SetSetting { .. } => {
             targets.requires_admin = true;
         }
         Statement::Select(s) => {
@@ -461,7 +462,8 @@ fn statement_auth_targets(stmt: &Statement, request_db: &str) -> StatementAuthTa
         Statement::ShowDatabases
         | Statement::ShowUsers
         | Statement::ShowContinuousQueries
-        | Statement::ShowMaterializedViews => {
+        | Statement::ShowMaterializedViews
+        | Statement::ShowSettings => {
             push_db_unique(&mut targets.read, request_db);
         }
         Statement::CreateRetentionPolicyStmt { db, .. }
@@ -542,7 +544,9 @@ fn is_mutating_statement(stmt: &Statement) -> bool {
         | Statement::ShowRetentionPolicies(_)
         | Statement::ShowUsers
         | Statement::ShowContinuousQueries
-        | Statement::ShowMaterializedViews => false,
+        | Statement::ShowMaterializedViews
+        | Statement::ShowSettings => false,
+        Statement::SetSetting { .. } => true,
         Statement::CreateDatabase(_)
         | Statement::DropDatabase(_)
         | Statement::DropMeasurement { .. }
@@ -675,7 +679,9 @@ async fn execute_statement(
             | Statement::SetPassword { .. }
             | Statement::ShowUsers
             | Statement::ShowContinuousQueries
-            | Statement::ShowMaterializedViews => {}
+            | Statement::ShowMaterializedViews
+            | Statement::SetSetting { .. }
+            | Statement::ShowSettings => {}
             _ => {
                 svc.metadata
                     .get_database(db)
@@ -1351,6 +1357,40 @@ async fn execute_statement(
                     tags: None,
                     columns,
                     values,
+                    partial: None,
+                }]),
+                error: None,
+            })
+        }
+        Statement::SetSetting { name, value } => {
+            // A single node; a cluster replicates the SET through Raft and
+            // every node applies it the same way.
+            let value = crate::application::runtime_settings::validate(name, *value)?;
+            crate::application::runtime_settings::apply(svc.metadata.as_ref(), name, value).await?;
+            Ok(StatementResult {
+                statement_id,
+                series: Some(vec![]),
+                error: None,
+            })
+        }
+        Statement::ShowSettings => {
+            let rows = crate::application::runtime_settings::show(svc.metadata.as_ref()).await?;
+            Ok(StatementResult {
+                statement_id,
+                series: Some(vec![SeriesResult {
+                    name: "settings".to_string(),
+                    tags: None,
+                    columns: vec!["name".into(), "value".into(), "source".into()],
+                    values: rows
+                        .into_iter()
+                        .map(|(name, value, source)| {
+                            vec![
+                                serde_json::Value::String(name),
+                                serde_json::Value::from(value),
+                                serde_json::Value::String(source.as_str().to_string()),
+                            ]
+                        })
+                        .collect(),
                     partial: None,
                 }]),
                 error: None,

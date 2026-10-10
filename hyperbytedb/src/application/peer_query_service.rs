@@ -573,6 +573,10 @@ async fn mutation_request_from_statement(
             username: username.clone(),
             database: database.clone(),
         }),
+        Statement::SetSetting { name, value } => Ok(MutationRequest::SetSetting {
+            name: name.clone(),
+            value: crate::application::runtime_settings::validate(name, *value)?,
+        }),
         _ => Err(HyperbytedbError::Internal(crate::error::ChainedError::new(
             "not a cluster mutation statement",
         ))),
@@ -599,6 +603,7 @@ fn is_cluster_mutation(stmt: &Statement) -> bool {
             | Statement::DropMeasurement { .. }
             | Statement::Grant { .. }
             | Statement::Revoke { .. }
+            | Statement::SetSetting { .. }
     )
 }
 
@@ -1116,6 +1121,29 @@ impl QueryService for PeerQueryService {
                         self.replicate_mutation(MutationRequest::Revoke {
                             username: username.clone(),
                             database: database.clone(),
+                        })
+                        .await?;
+                    }
+                    result
+                }
+                Statement::SetSetting {
+                    ref name,
+                    ref value,
+                } => {
+                    let result = self
+                        .execute_inner_statement(
+                            db,
+                            stmt_query,
+                            epoch,
+                            retention_policy,
+                            caller,
+                            statement_id,
+                        )
+                        .await;
+                    if result.error.is_none() {
+                        self.replicate_mutation(MutationRequest::SetSetting {
+                            name: name.clone(),
+                            value: crate::application::runtime_settings::validate(name, *value)?,
                         })
                         .await?;
                     }

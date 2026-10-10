@@ -355,6 +355,18 @@ pub trait MetadataPort: Send + Sync {
     async fn remove_tombstone(&self, db: &str, tombstone_id: &str) -> Result<(), HyperbytedbError>;
 
     // Continuous query management
+    /// A runtime setting override (`SET name = value`), if one is stored.
+    async fn get_setting(&self, name: &str) -> Result<Option<u64>, HyperbytedbError> {
+        let _ = name;
+        Ok(None)
+    }
+
+    /// Store (`Some`) or remove (`None`) a runtime setting override.
+    async fn set_setting(&self, name: &str, value: Option<u64>) -> Result<(), HyperbytedbError> {
+        let _ = (name, value);
+        Ok(())
+    }
+
     async fn store_continuous_query(
         &self,
         db: &str,

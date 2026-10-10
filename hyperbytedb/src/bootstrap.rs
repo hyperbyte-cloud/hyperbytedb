@@ -188,8 +188,21 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
     let write_pool_size = config.chdb.resolved_write_pool_size();
     let query_chdb = SharedSession::new_eager(&config.chdb.session_data_path, query_pool_size)?;
     let write_chdb = SharedSession::new_eager(&config.chdb.session_data_path, write_pool_size)?;
+    {
+        use crate::application::runtime_settings::{Source, register_query_pool, restore};
+        let source = if config.chdb.query_pool_size.is_some() || config.chdb.pool_size > 0 {
+            Source::Config
+        } else {
+            Source::Auto
+        };
+        register_query_pool(&query_chdb.pool()?, query_pool_size, source);
+        // A `SET query_pool_size` made before this restart.
+        if let Err(e) = restore(metadata.as_ref()).await {
+            tracing::warn!(error = %e, "failed to apply stored settings");
+        }
+    }
     tracing::info!(
-        query_pool_size = query_chdb.configured_pool_size(),
+        query_pool_size = query_chdb.pool()?.pool_size(),
         write_pool_size = write_chdb.configured_pool_size(),
         path = %config.chdb.session_data_path,
         "chDB query and write connection pools ready"

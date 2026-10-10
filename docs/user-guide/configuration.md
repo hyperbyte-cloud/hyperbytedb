@@ -75,7 +75,7 @@ Embedded ClickHouse (chDB) query engine settings.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `session_data_path` | string | `"./chdb_data"` | chDB session state directory |
-| `query_pool_size` | integer | `12` | chDB connections reserved for queries (`ChdbQueryAdapter`). Each connection has its own client mutex, so concurrent `spawn_blocking` query tasks overlap when > 1. Clamped to 1–128. For best overlap, set `server.max_concurrent_queries` ≥ `query_pool_size`. |
+| `query_pool_size` | integer | CPUs + 1 | chDB connections reserved for queries (`ChdbQueryAdapter`). Each connection has its own client mutex, so concurrent `spawn_blocking` query tasks overlap when > 1. Clamped to 1–128. For best overlap, set `server.max_concurrent_queries` ≥ `query_pool_size`. Change it at run time with `SET query_pool_size = <n>`. |
 | `write_pool_size` | integer | `4` | chDB connections reserved for ingest/flush (`ChdbNativeAdapter`), isolated from the query pool so heavy queries do not block inserts. Clamped to 1–128. |
 | `pool_size` | integer | `0` (unused) | **Legacy.** When non-zero and `query_pool_size` / `write_pool_size` are unset, applies the same size to both pools. Prefer explicit `query_pool_size` and `write_pool_size`. |
 | `schema_cache_max_entries` | integer | `10000` | Max `(db, rp, measurement)` entries in the chDB native adapter schema and series caches. Oldest entries are evicted (LRU). |
