@@ -115,11 +115,22 @@ live copies to 80 regions but dropped almost no departing peers, so no node
 could leave. After the fix the departing nodes dropped about 63 peers in the
 first minute.
 
+6 → 3 (no restarts, `8d7086e`) finished in 35 minutes.
+
 **Avoid scaling up while a scale-down is in progress.** On n3, raising
-replicas from 3 to 6 mid-scale-down brought two departing nodes back to
-`active`, but the node that was also the Raft leader stayed
-`decommissioning` inside a 6-replica cluster. No data was lost; wait for the
-scale-down to finish first.
+replicas from 3 to 6 mid-scale-down re-admitted two departing nodes (they
+went `leaving` → `syncing` → `active`), but the node that was also the Raft
+leader stayed departing inside a 6-replica cluster until the next scale-down
+removed it. No data was lost; wait for the scale-down to finish first.
+
+**A departing node can stay Raft leader** until its pod is deleted, which
+then triggers an election. **Membership state can differ between nodes for a
+while**: on n3 the leader showed a node as `leaving` while a follower's
+`GET /cluster/nodes` still showed `decommissioning`. Ask the leader
+(`GET /cluster/leader` names it) when the state matters.
+
+Before `25803d7` a new measurement created during a scale-down could have
+its regions placed on a departing node (see Materialized views).
 
 Watch: `GET /cluster/nodes` (each node's state),
 `hyperbytedb_shard_decommission_completed_total`, and the per-node peer
@@ -137,11 +148,12 @@ counts in `GET /internal/shard/map`.
 
 ## Materialized views
 
-- **Each node rolls up the rows written through it** into its own copy of
-  the destination. A query on the destination asks every node that may hold
-  rollups (active, draining, disconnected or decommissioning) and adds the
-  results. If one of those nodes cannot answer, the query fails instead of
-  returning a short count.
+- **Each row is rolled up on the node that first stored it**: the primary of
+  its region at the time it was written. That node keeps the rollup in its
+  own copy of the destination, even after the region moves elsewhere. A query
+  on the destination asks every node that may hold rollups (active, draining,
+  disconnected or decommissioning) and adds the results. If one of those nodes
+  cannot answer, the query fails instead of returning a short count.
 - `CREATE MATERIALIZED VIEW` goes through Raft and returns in about 30 ms.
   A node that has not seen the source measurement yet gets its schema with
   the statement. `hyperbytedb_schema_mutations_applied_total{op="create_materialized_view"}`
@@ -152,8 +164,13 @@ counts in `GET /internal/shard/map`.
   for up to 30 s (`b570f03` and later; before that every node backfilled,
   counting the history once per node). Verification on n3 is pending.
 - Destination regions are never moved by the scheduler.
-- **Known limit:** a node that leaves the cluster takes its rollups with it.
-  Rebuild the view `WITH BACKFILL` after a scale-down if you need them.
+- **Known limit: a scale-down loses the departing nodes' rollups.** Any row
+  that was first stored on a node that later leaves is missing from the view
+  afterwards, though the source rows are all still there. On n3, a view
+  checked exactly at 3 and at 6 nodes had 44,700 of 60,000 points after
+  scaling back to 3 (partly from the bug fixed in `25803d7`, which placed a
+  new measurement's regions on a departing node). Rebuild the view
+  `WITH BACKFILL` after a scale-down if you need exact rollups.
 - Rows that reach a destination any other way are dropped at flush with an
   error log and counted in
   `hyperbytedb_flush_rows_dropped_total{reason="materialized_destination"}`.
@@ -163,11 +180,15 @@ Verified on n3 (`6d354fb`): 60,000 points written through three pods rolled
 up to exactly 60,000 (counts and means match per host per minute), both right
 away and five minutes later.
 
+## Dropping a database
+
+`DROP DATABASE` on a 90-million-point database returned in 7 s on 3 nodes,
+with peak memory up about 0.2 GiB per pod and no restarts (`8d7086e`).
+
 ## Pending measurements
 
 These are being measured on the beta candidate and will be added here:
 
-- Memory and time for `DROP DATABASE` on a large database.
-- Materialized view counts after scaling 3 → 6 → 3.
 - Query pool 4 vs 12 under the read bench.
+- `WITH BACKFILL` counted once (old vs new build).
 - Where the rest of a region copy's time goes.
