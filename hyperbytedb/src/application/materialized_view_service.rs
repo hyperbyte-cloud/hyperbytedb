@@ -72,6 +72,17 @@ impl MaterializedViewService {
         &self,
         mv: &CreateMaterializedViewStatement,
     ) -> Result<MaterializedViewDef, HyperbytedbError> {
+        self.create_with(mv, true).await
+    }
+
+    /// `bootstrap_now: false` leaves the shard spaces to the caller: from a
+    /// Raft apply, proposing the bootstrap waits on an entry that cannot apply
+    /// until this one returns (see [`Self::apply_replicated_definition`]).
+    async fn create_with(
+        &self,
+        mv: &CreateMaterializedViewStatement,
+        bootstrap_now: bool,
+    ) -> Result<MaterializedViewDef, HyperbytedbError> {
         require_mv_aliases(&mv.query)?;
         if self
             .metadata
@@ -105,15 +116,17 @@ impl MaterializedViewService {
                 .unwrap_or_else(|_| "autogen".to_string()),
         };
 
-        self.bootstrap_sharded_measurements(
-            &source_db,
-            &source_rp,
-            &source_measurement,
-            &dest_db,
-            &dest_rp,
-            &dest_measurement,
-        )
-        .await?;
+        if bootstrap_now {
+            self.bootstrap_sharded_measurements(
+                &source_db,
+                &source_rp,
+                &source_measurement,
+                &dest_db,
+                &dest_rp,
+                &dest_measurement,
+            )
+            .await?;
+        }
 
         if mv.backfill_on_create && self.shard_routing.is_some() {
             self.run_sharded_backfill(
@@ -292,8 +305,60 @@ impl MaterializedViewService {
             raw_query: definition.query_text.clone(),
             backfill_on_create: definition.backfill_on_create,
         };
-        self.create(&stmt).await?;
+        // Raft applies one entry at a time, and bootstrapping the shard spaces
+        // proposes new entries and waits for them: from inside this apply that
+        // waited on an entry this apply was holding up. On n3 every CREATE
+        // MATERIALIZED VIEW stalled the leader for the 5 s proposal timeout,
+        // lost the leadership, failed, and left the destination's space
+        // bootstrapped with no view. Bootstrap after the apply instead, once,
+        // from the leader; the view's local objects do not need the spaces.
+        let def = self.create_with(&stmt, false).await?;
+        self.spawn_bootstrap_after_apply(&def);
         Ok(())
+    }
+
+    fn spawn_bootstrap_after_apply(&self, def: &MaterializedViewDef) {
+        let Some(ctx) = self.shard_routing.clone() else {
+            return;
+        };
+        if !self.is_raft_leader.as_ref().map(|f| f()).unwrap_or(true) {
+            return;
+        }
+        let leader_addr = self.raft_leader_addr.as_ref().and_then(|f| f());
+        let spaces = [
+            (
+                def.source_db.clone(),
+                def.source_rp.clone(),
+                def.source_measurement.clone(),
+            ),
+            (
+                def.dest_db.clone(),
+                def.dest_rp.clone(),
+                def.dest_measurement.clone(),
+            ),
+        ];
+        tokio::spawn(async move {
+            for (db, rp, measurement) in spaces {
+                if let Err(e) = ensure_measurement_bootstrapped(
+                    &ctx,
+                    &db,
+                    &rp,
+                    &measurement,
+                    true,
+                    leader_addr.as_deref(),
+                )
+                .await
+                {
+                    tracing::warn!(
+                        db = %db,
+                        rp = %rp,
+                        measurement = %measurement,
+                        error = %e,
+                        "materialized view shard space bootstrap failed"
+                    );
+                }
+            }
+        });
     }
 
     /// Idempotent drop of a replicated materialized view (metadata + chDB objects).
