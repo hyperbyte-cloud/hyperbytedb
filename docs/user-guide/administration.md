@@ -162,6 +162,21 @@ The drain procedure:
 4. Notifies peers of departure.
 5. Sets state to `Leaving`.
 
+### Runtime settings
+
+Some settings change on a running cluster, applied on every node at once
+and kept across restarts (admin only):
+
+```sql
+SHOW SETTINGS                      -- name, value, source: set | config | auto
+SET query_pool_size = 8            -- chDB query connections per node
+SET query_pool_size = DEFAULT      -- back to the config file, else CPUs + 1
+```
+
+See [API reference](reference.md#runtime-settings). For what scaling,
+restarts and scale-downs look like in practice, see
+[Operating a sharded cluster](operating-sharded-clusters.md).
+
 ### Cluster sync
 
 In cluster mode, the Raft leader periodically compares `/internal/sync/manifest` responses from peers and may mark peers as needing sync. New nodes pull metadata and WAL deltas via the sync APIs. See [Deep Dive: Clustering](../deep-dive/deep-dive-clustering.md).

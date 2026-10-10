@@ -102,8 +102,11 @@ nav:
       - Advanced features: user-guide/advanced-features.md
       - Common workflows: user-guide/common-workflows.md
       - Administration: user-guide/administration.md
+      - Operating a sharded cluster: user-guide/operating-sharded-clusters.md
       - Troubleshooting: user-guide/troubleshooting.md
       - API & TimeseriesQL Reference: user-guide/reference.md
+      - Release notes:
+          - 0.9.0-beta: user-guide/release-notes-0.9.0-beta.md
   - Developer Guide:
       - developer-guide/index.md
       - Architecture: developer-guide/architecture.md

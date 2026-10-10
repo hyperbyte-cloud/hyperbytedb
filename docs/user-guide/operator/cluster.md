@@ -38,7 +38,7 @@ metadata:
 spec:
   replicas: 5
   image: hyperbytedb:latest
-  version: "0.8.3"
+  version: "0.9.0-beta"
   server:
     port: 8086
     requestTimeoutSecs: 60
@@ -132,7 +132,7 @@ metadata:
 spec:
   replicas: 3
   image: hyperbytedb:latest
-  version: "0.8.3"
+  version: "0.9.0-beta"
   server:
     port: 8086
     tls:
@@ -233,7 +233,13 @@ HyperbyteDB stores WAL, metadata, Raft state, and chDB session data on the per-r
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `sessionDataPath` | string | | chDB session data directory (embedded MergeTree storage) |
-| `poolSize` | int32 | `1` | Number of chDB connections to the same session data path. Clamped to 1–32. Set `server.maxConcurrentQueries` ≥ `poolSize` for best overlap. |
+| `queryPoolSize` | int32 | | chDB connections for queries. Unset on HyperbyteDB 0.9.0-beta and later: the database uses one per CPU of the pod's limit, plus one, and `SET query_pool_size = <n>` changes it at run time. |
+| `writePoolSize` | int32 | `1` when no pool field is set | chDB connections for ingest and flush. |
+| `poolSize` | int32 | | Legacy: one size for both pools, when the other two are unset. HyperbyteDB 0.8.x has only this one (the operator writes `poolSize`, else `queryPoolSize`, else 1). |
+
+Set `server.maxConcurrentQueries` ≥ the query pool for best overlap. A
+larger query pool is not always faster: each query also runs threads of its
+own, and on 3-CPU pods 12 connections were 10-40% slower than 4.
 
 ### `auth`
 
@@ -408,6 +414,33 @@ kubectl get hyperbytedbcluster hyperbytedb-cluster -o jsonpath='{.status}' | jq
 ```
 
 ---
+
+## Annotations and versions
+
+Opt-in behaviour is set with annotations on the `HyperbytedbCluster`:
+
+| Annotation | Effect | HyperbyteDB |
+|---|---|---|
+| `hyperbytedb.hyperbyte.cloud/parallel-pods: "true"` | `Parallel` pod management: pods start and restart together (the operator recreates the StatefulSet once, keeping the pods). Recommended for clusters; under `OrderedReady` a scale-down can leave a deleted pod uncreated. | any |
+| `hyperbytedb.hyperbyte.cloud/evacuate-together: "true"` | A scale-down decommissions every departing node at once instead of one at a time. | 0.9.0-beta+ |
+| `hyperbytedb.hyperbyte.cloud/control-listener: "true"` | Liveness and Raft on a separate listener (server port + 1), so a write-saturated node still answers. | 0.9.0-beta+ |
+| `hyperbytedb.hyperbyte.cloud/database-version: "<version>"` | The HyperbyteDB version to render for, when neither `version` nor the image tag is one (a locally built image, say). | any |
+
+**Versions.** The operator (v0.2.0 and later) works out which HyperbyteDB
+version each cluster runs (the `database-version` annotation, else `version`,
+else the image tag; if none is a version, the newest it knows) and renders
+only what that version accepts: HyperbyteDB 0.9 rejects config keys it does
+not know, and 0.8 silently ignores them. On 0.8.x it writes `pool_size`
+only, no `[sharding]` section, and ignores the `evacuate-together` and
+`control-listener` annotations. The `DatabaseVersion` status condition says
+which version was used, where it came from, and what was left out:
+
+```bash
+kubectl get hyperbytedbcluster my-cluster \
+  -o jsonpath='{.status.conditions[?(@.type=="DatabaseVersion")].message}'
+```
+
+The full matrix is in the operator repository's `docs/compatibility.md`.
 
 ## Operations
 
