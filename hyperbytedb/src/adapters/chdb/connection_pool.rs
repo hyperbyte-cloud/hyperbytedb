@@ -15,7 +15,11 @@ use crate::error::HyperbytedbError;
 pub const MIN_POOL_SIZE: usize = 1;
 pub const MAX_POOL_SIZE: usize = 128;
 pub const DEFAULT_POOL_SIZE: usize = 4;
-pub const DEFAULT_QUERY_POOL_SIZE: usize = 4;
+/// Every sharded query runs one chDB query per region it touches, so a few
+/// concurrent multi-region queries queue on a small pool. On n3 (3 CPU per
+/// pod, 4 concurrent 10-host GROUP BY queries over 6 regions) a pool of 1 ran
+/// them at 250-450 ms p50, a pool of 4 at 90-130 ms.
+pub const DEFAULT_QUERY_POOL_SIZE: usize = 12;
 pub const DEFAULT_WRITE_POOL_SIZE: usize = 4;
 
 /// Clamp configured pool size to a safe range.

@@ -417,7 +417,7 @@ HyperbyteDB uses **chDB** (embedded ClickHouse) as its query engine and storage 
 
 Each chDB `Connection` is `Send` but not `Sync`. HyperbyteDB opens **two** connection pools to the same `session_data_path` (see `ChdbConnectionPool` in `adapters/chdb/connection_pool.rs`):
 
-- **Query pool** (`chdb.query_pool_size`, default 4) — used by `ChdbQueryAdapter` for reads.
+- **Query pool** (`chdb.query_pool_size`, default 12) — used by `ChdbQueryAdapter` for reads.
 - **Write pool** (`chdb.write_pool_size`, default 4) — used by `ChdbNativeAdapter` for ingest/flush.
 
 Legacy `chdb.pool_size` (when non-zero) sets both pools to the same size when the explicit keys are unset. Each pool is clamped to 1–128 connections.

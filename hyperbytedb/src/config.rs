@@ -499,7 +499,7 @@ pub struct ChdbConfig {
     #[serde(default)]
     pub pool_size: usize,
     /// chDB connections for queries (`ChdbQueryAdapter`). When unset, uses
-    /// `pool_size` if non-zero, else 4. Clamped to 1..=128.
+    /// `pool_size` if non-zero, else 12. Clamped to 1..=128.
     #[serde(default)]
     pub query_pool_size: Option<usize>,
     /// chDB connections for ingest/flush (`ChdbNativeAdapter`). When unset, uses
@@ -1236,7 +1236,7 @@ mod chdb_pool_config_tests {
             insert_max_insert_block_size: 0,
             tag_low_cardinality_max: None,
         };
-        assert_eq!(c.resolved_query_pool_size(), 4);
+        assert_eq!(c.resolved_query_pool_size(), 12);
         assert_eq!(c.resolved_write_pool_size(), 4);
     }
 
