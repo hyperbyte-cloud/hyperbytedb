@@ -322,14 +322,18 @@ pub async fn export_region_points_from_chdb(
     let fact = quoted_table_name(&key.db, &key.rp, &key.measurement);
     let series = quoted_series_table_name(&key.db, &key.rp, &key.measurement);
 
+    let mut fact_cols = vec!["`time`".to_string(), "`series_id`".to_string()];
     let mut select_cols = vec!["f.`time`".to_string(), "f.`series_id`".to_string()];
     for field in mapping.field_names.iter() {
-        let phys = field_column_name(field);
-        select_cols.push(format!("f.{}", quote_backticks(&phys)));
+        let phys = quote_backticks(&field_column_name(field));
+        select_cols.push(format!("f.{phys}"));
+        fact_cols.push(phys);
     }
+    let mut series_cols = vec!["`series_id`".to_string()];
     for tag in mapping.tag_keys.iter() {
-        let phys = mapping.physical_tag_column_name(tag);
-        select_cols.push(format!("s.{}", quote_backticks(&phys)));
+        let phys = quote_backticks(&mapping.physical_tag_column_name(tag));
+        select_cols.push(format!("s.{phys}"));
+        series_cols.push(phys);
     }
     // Witness for the ANY LEFT JOIN below. A LEFT JOIN that finds no series row
     // does not fail -- it substitutes column defaults, so every tag comes back
@@ -342,22 +346,29 @@ pub async fn export_region_points_from_chdb(
     match after_series_id {
         // Inclusive re-read of the boundary series keeps tie-grouped rows
         // (same series, split across chunk boundaries) from being skipped.
-        Some(sid) => predicates.push(format!("f.`series_id` >= {sid}")),
-        None => predicates.push(format!("f.`series_id` >= {}", region.start)),
+        Some(sid) => predicates.push(format!("`series_id` >= {sid}")),
+        None => predicates.push(format!("`series_id` >= {}", region.start)),
     }
     if region.end != u64::MAX {
-        predicates.push(format!("f.`series_id` < {}", region.end));
+        predicates.push(format!("`series_id` < {}", region.end));
     }
+    let range = predicates.join(" AND ");
 
+    // The chunk is cut from the fact table before the join, in its sort
+    // order, so it reads about one chunk; and only the range's series are
+    // joined. Joining first sorted every remaining row of the region and
+    // hashed every series on the node for each chunk: on n3 0.24 s a chunk
+    // against 0.06 s, for the same 50,000 rows.
     let sql = format!(
-        "SELECT {} FROM {fact} AS f \
-         ANY LEFT JOIN {series} AS s ON f.`series_id` = s.`series_id` \
-         WHERE {} \
+        "SELECT {} FROM (SELECT {} FROM {fact} WHERE {range} \
+         ORDER BY `series_id`, `time` LIMIT {max_points}) AS f \
+         ANY LEFT JOIN (SELECT {} FROM {series} WHERE {range}) AS s \
+         ON f.`series_id` = s.`series_id` \
          ORDER BY f.`series_id`, f.`time` \
-         LIMIT {max_points} \
          FORMAT JSONEachRow",
         select_cols.join(", "),
-        predicates.join(" AND ")
+        fact_cols.join(", "),
+        series_cols.join(", "),
     );
 
     let raw = query.execute_sql(&sql).await?;
