@@ -78,7 +78,13 @@ struct PendingPlacement {
     tier: MoveTier,
     /// Best known size of the region, for the in-flight byte budget.
     approx_bytes: u64,
+    /// The step stages a copy of the region. Only those take a mover slot.
+    copies: bool,
 }
+
+/// Placement steps that copy nothing (remove a peer, hand off primacy) started
+/// per tick, so a large evacuation does not flood Raft in one tick.
+const MAX_PROPOSAL_STEPS_PER_TICK: usize = 64;
 
 /// Whether two regions may merge: on exactly the same peers, none of them a
 /// learner, so no data moves; and at the same epoch, because the `Merge` op
@@ -909,16 +915,37 @@ impl ShardScheduler {
     /// Was one pool per tick, and a tick that found the last pool still busy
     /// started nothing: on n3 one region's 12-minute copy held back every
     /// move the following ticks wanted, and a scale-up plateaued behind it.
+    ///
+    /// Only a copy takes a slot. Removing a peer or handing off primacy is one
+    /// Raft proposal; queued behind copies, it waited for a free slot like a
+    /// copy does. On n3 an 8 -> 3 scale-down added live copies to 80 regions
+    /// but dropped almost no departing peers, so no node could retire.
     async fn start_background_placements(self: &Arc<Self>, mut pending: Vec<PendingPlacement>) {
         self.sort_placements(&mut pending).await;
         let budget_mib = move_budget_mib(&self.config);
+        let mut copies_full = false;
+        let mut proposals = 0usize;
         for job in pending {
-            let Ok(mover) = Arc::clone(&self.movers).try_acquire_owned() else {
-                break;
-            };
-            let want = mover_inflight_permits(job.approx_bytes, budget_mib) as u32;
-            let Ok(bytes) = Arc::clone(&self.move_bytes).try_acquire_many_owned(want) else {
-                break;
+            let slots = if job.copies {
+                if copies_full {
+                    continue;
+                }
+                let Ok(mover) = Arc::clone(&self.movers).try_acquire_owned() else {
+                    copies_full = true;
+                    continue;
+                };
+                let want = mover_inflight_permits(job.approx_bytes, budget_mib) as u32;
+                let Ok(bytes) = Arc::clone(&self.move_bytes).try_acquire_many_owned(want) else {
+                    copies_full = true;
+                    continue;
+                };
+                Some((mover, bytes))
+            } else {
+                if proposals >= MAX_PROPOSAL_STEPS_PER_TICK {
+                    continue;
+                }
+                proposals += 1;
+                None
             };
             // One mover per region. A region the planning pass or another
             // mover holds is left for a later tick.
@@ -927,7 +954,7 @@ impl ShardScheduler {
             }
             let this = Arc::clone(self);
             tokio::spawn(async move {
-                let _slots = (mover, bytes);
+                let _slots = slots;
                 this.note_placement_attempt(job.region_id).await;
                 this.run_one_placement(&job).await;
                 this.release_operator(job.region_id).await;
@@ -1295,13 +1322,14 @@ impl ShardScheduler {
                     }
                 }
 
-                if let Some(tier) = self.preview_placement_tier(&space.key, region).await {
+                if let Some((tier, step)) = self.preview_placement_tier(&space.key, region).await {
                     let approx_bytes = max_region_peer_heartbeat_bytes(&hb, region);
                     pending_placements.push(PendingPlacement {
                         key: space.key.clone(),
                         region_id: region.region_id,
                         tier,
                         approx_bytes,
+                        copies: matches!(step, PlacementStep::Add(_)),
                     });
                 }
 
@@ -1333,7 +1361,7 @@ impl ShardScheduler {
         &self,
         key: &MeasurementKey,
         region: &ShardRegion,
-    ) -> Option<MoveTier> {
+    ) -> Option<(MoveTier, PlacementStep)> {
         if self.is_rollup_dest(key).await || self.peer_client.is_none() {
             return None;
         }
@@ -1345,10 +1373,10 @@ impl ShardScheduler {
         }
         let rf = effective_replication_factor(self.config.replication_factor, candidates.len());
         let target = self.balanced_target(key, region, &candidates, rf).await;
-        next_placement_step(region, &target)?;
+        let step = next_placement_step(region, &target)?;
         let departing = self.departing_node_ids().await;
         let unhealthy = self.unhealthy_region_peers(region).await;
-        Some(move_tier(region, rf, &departing, &unhealthy))
+        Some((move_tier(region, rf, &departing, &unhealthy), step))
     }
 
     /// [`Self::start_background_placements`] for one tick, waiting for every
@@ -1385,7 +1413,10 @@ impl ShardScheduler {
         let Some(region) = current_region(&map, &job.key, job.region_id) else {
             return;
         };
-        match self.try_converge_placement(&job.key, region).await {
+        match self
+            .try_converge_placement(&job.key, region, job.copies)
+            .await
+        {
             Ok(true) => {
                 self.clear_placement_error(job.region_id).await;
             }
@@ -1981,6 +2012,9 @@ impl ShardScheduler {
         &self,
         key: &MeasurementKey,
         region: &ShardRegion,
+        // Holds a mover slot: may stage a copy. A job planned as a proposal
+        // that finds a copy is due leaves it to a later tick.
+        may_copy: bool,
     ) -> Result<bool, HyperbytedbError> {
         // `apply_transfer_push` is not idempotent, so a re-staged
         // SummingMergeTree destination sums twice, permanently and silently.
@@ -2034,7 +2068,7 @@ impl ShardScheduler {
         );
         match step {
             PlacementStep::Add(_) => {
-                if !self.config.add_peer_proposals_enabled {
+                if !self.config.add_peer_proposals_enabled || !may_copy {
                     return Ok(false);
                 }
                 // Every target member the region is missing, in target order —
@@ -5057,6 +5091,49 @@ mod tests {
         assert!(
             h.scheduler.decommission_complete(owner).await,
             "a destination region, which never moves, held the node"
+        );
+    }
+
+    /// Dropping a departing peer is one proposal: it must not wait for a
+    /// mover slot that copies hold for minutes. On n3 an 8 -> 3 scale-down
+    /// added live copies to 80 regions but dropped almost no departing peers.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn removing_a_departing_peer_does_not_wait_for_a_mover_slot() {
+        let h = PlacementTestHarness::new(true, &[(2, 0)], 1).await;
+        h.add_peer_to_region(2).await;
+        h.set_node_state(2, NodeState::Decommissioning).await;
+        // Every mover slot is busy copying some other region.
+        let _busy = Arc::clone(&h.scheduler.movers)
+            .acquire_many_owned(h.scheduler.config.schedule_limit.max(1) as u32)
+            .await
+            .unwrap();
+
+        let plan = h.scheduler.plan_tick().await.unwrap();
+        assert!(
+            plan.placements.iter().any(|p| !p.copies),
+            "the plan must hold the removal"
+        );
+        h.scheduler
+            .start_background_placements(plan.placements)
+            .await;
+
+        let mut removed = false;
+        for _ in 0..50 {
+            removed = h
+                .proposals
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|op| matches!(op, ShardMapOp::RemovePeer { from_peer: 2, .. }));
+            if removed {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            removed,
+            "the departing peer was not removed while every slot was busy"
         );
     }
 
