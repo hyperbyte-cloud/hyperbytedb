@@ -82,6 +82,20 @@ struct PendingPlacement {
     copies: bool,
 }
 
+/// Where a departing node's view-rollup handoff stands.
+#[derive(Debug, Default, Clone)]
+struct RollupHandoff {
+    done: bool,
+    running: bool,
+    /// The first failed attempt, to give up after [`ROLLUP_HANDOFF_GIVE_UP`].
+    failing_since: Option<std::time::Instant>,
+}
+
+/// How long a failing rollup handoff holds a departing node. Past this the
+/// node leaves without it (logged): a node that cannot answer must not keep
+/// a scale-down open forever.
+const ROLLUP_HANDOFF_GIVE_UP: Duration = Duration::from_secs(30 * 60);
+
 /// Placement steps that copy nothing (remove a peer, hand off primacy) started
 /// per tick, so a large evacuation does not flood Raft in one tick.
 const MAX_PROPOSAL_STEPS_PER_TICK: usize = 64;
@@ -307,6 +321,9 @@ pub struct ShardScheduler {
     /// enqueued — their primary changes are provisioned by the MV backfill
     /// path.
     rollup_dests: tokio::sync::RwLock<HashMap<MeasurementKey, ()>>,
+    /// Departing nodes' view-rollup handoffs, by node id (see
+    /// [`Self::rollups_handed_off`]).
+    rollup_handoffs: Arc<tokio::sync::Mutex<HashMap<u64, RollupHandoff>>>,
     /// Peer `map_version` probes for the tick in progress, keyed by node id,
     /// cleared when each tick starts. `/internal/shard/map` serializes every
     /// space and region in the cluster to answer one `u64`, so probing per
@@ -395,6 +412,7 @@ impl ShardScheduler {
             unhealthy_primaries: tokio::sync::RwLock::new(HashMap::new()),
             reconciliation_queue: std::sync::Mutex::new(Vec::new()),
             rollup_dests: tokio::sync::RwLock::new(HashMap::new()),
+            rollup_handoffs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             peer_map_versions: tokio::sync::RwLock::new(HashMap::new()),
             placement_stalls: tokio::sync::RwLock::new(HashMap::new()),
             placement_errors: tokio::sync::RwLock::new(HashMap::new()),
@@ -1976,6 +1994,92 @@ impl ShardScheduler {
             .any(|r| r.peers.contains(&node_id))
     }
 
+    /// Whether `node_id`'s view rollups are on a node that stays, starting the
+    /// handoff in the background if not. A view rolls up each row on the node
+    /// that first stored it, so a node that left took its share with it: on
+    /// n3 a view held 44,700 of 60,000 points after 3 -> 6 -> 3.
+    async fn rollups_handed_off(&self, node_id: u64) -> bool {
+        if self.rollup_dests.read().await.is_empty() {
+            return true;
+        }
+        let Some(pc) = self.peer_client.clone() else {
+            return true;
+        };
+        let mut handoffs = self.rollup_handoffs.lock().await;
+        let state = handoffs.entry(node_id).or_default();
+        if state.done {
+            return true;
+        }
+        if state.running {
+            return false;
+        }
+        let (from, to) = {
+            let m = self.membership.read().await;
+            let from = m.get_node(node_id).map(|n| n.addr.clone());
+            let to = m
+                .nodes
+                .values()
+                .filter(|n| n.node_id != node_id && is_serving(n))
+                .min_by_key(|n| n.node_id)
+                .map(|n| n.addr.clone());
+            (from, to)
+        };
+        let (Some(from), Some(to)) = (from, to) else {
+            return false;
+        };
+        state.running = true;
+        let handoffs = Arc::clone(&self.rollup_handoffs);
+        tokio::spawn(async move {
+            let req = crate::application::mv_handoff::MvHandoffRequest {
+                to_addr: to.clone(),
+            };
+            let result = pc
+                .http_client()
+                .post(format!("http://{from}/internal/mv/handoff"))
+                .json(&req)
+                .timeout(Duration::from_secs(30 * 60))
+                .send()
+                .await;
+            let mut handoffs = handoffs.lock().await;
+            let state = handoffs.entry(node_id).or_default();
+            state.running = false;
+            match result {
+                Ok(resp) if resp.status().is_success() => {
+                    state.done = true;
+                    tracing::info!(node_id, to = %to, "view rollups handed off");
+                }
+                // A node too old to hand off: it leaves as before.
+                Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
+                    state.done = true;
+                    tracing::warn!(
+                        node_id,
+                        "node cannot hand off view rollups; its share leaves with it"
+                    );
+                }
+                other => {
+                    let why = match other {
+                        Ok(resp) => format!("status {}", resp.status()),
+                        Err(e) => e.to_string(),
+                    };
+                    let since = *state
+                        .failing_since
+                        .get_or_insert_with(std::time::Instant::now);
+                    if since.elapsed() >= ROLLUP_HANDOFF_GIVE_UP {
+                        state.done = true;
+                        tracing::error!(
+                            node_id,
+                            error = %why,
+                            "view rollup handoff kept failing; the node leaves without it"
+                        );
+                    } else {
+                        tracing::warn!(node_id, error = %why, "view rollup handoff failed; retrying");
+                    }
+                }
+            }
+        });
+        false
+    }
+
     /// Move a fully evacuated `Decommissioning` node to `Leaving`.
     async fn retire_evacuated_nodes(&self) {
         for node_id in self.departing_node_ids().await {
@@ -1990,7 +2094,7 @@ impl ShardScheduler {
             if !still_decommissioning {
                 continue;
             }
-            if self.decommission_complete(node_id).await {
+            if self.decommission_complete(node_id).await && self.rollups_handed_off(node_id).await {
                 let mut m = self.membership.write().await;
                 let moved = m.transition(node_id, NodeState::Leaving);
                 drop(m);
@@ -4278,6 +4382,10 @@ mod tests {
         let push_log = pushes.clone();
         let app = axum::Router::new()
             .route(
+                "/internal/mv/handoff",
+                post(|| async { axum::Json(serde_json::json!({"ok": true, "rows": 0})) }),
+            )
+            .route(
                 "/internal/shard/map",
                 get(move || {
                     let probes = probe_counter.clone();
@@ -5096,6 +5204,61 @@ mod tests {
             h.scheduler.decommission_complete(owner).await,
             "a destination region, which never moves, held the node"
         );
+    }
+
+    /// A departing node holding only view-destination regions leaves only
+    /// after its rollups are handed off: the first pass starts the handoff
+    /// and keeps it departing, a later one retires it.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn a_departing_node_leaves_only_after_its_rollups_are_handed_off() {
+        let h = PlacementTestHarness::new(true, &[(2, 0)], 1).await;
+        let key = PlacementTestHarness::key();
+        h.add_peer_to_region(2).await;
+        h.set_node_state(2, NodeState::Decommissioning).await;
+        let def = crate::domain::materialized_view::MaterializedViewDef {
+            name: "mv".into(),
+            database: key.db.clone(),
+            query_text: String::new(),
+            source_db: key.db.clone(),
+            source_rp: key.rp.clone(),
+            source_measurement: "src".into(),
+            dest_db: key.db.clone(),
+            dest_rp: key.rp.clone(),
+            dest_measurement: key.measurement.clone(),
+            ch_fact_mv_name: String::new(),
+            ch_series_mv_name: String::new(),
+            created_at: String::new(),
+            backfill_on_create: false,
+        };
+        h.scheduler
+            .metadata
+            .store_materialized_view(&key.db, "mv", &def)
+            .await
+            .unwrap();
+        h.scheduler.refresh_rollup_dests().await;
+        assert!(h.scheduler.decommission_complete(2).await);
+
+        let state = |h: &PlacementTestHarness| {
+            let m = h.scheduler.membership.clone();
+            async move { m.read().await.get_node(2).map(|n| n.state) }
+        };
+        h.scheduler.retire_evacuated_nodes().await;
+        assert_eq!(
+            state(&h).await,
+            Some(NodeState::Decommissioning),
+            "retired before its rollups were handed off"
+        );
+        let mut left = false;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            h.scheduler.retire_evacuated_nodes().await;
+            if state(&h).await == Some(NodeState::Leaving) {
+                left = true;
+                break;
+            }
+        }
+        assert!(left, "never retired after the handoff answered");
     }
 
     /// Dropping a departing peer is one proposal: it must not wait for a

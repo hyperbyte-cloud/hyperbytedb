@@ -347,6 +347,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
                 "/internal/shard/rehome",
                 post(shard_handlers::handle_shard_rehome),
             )
+            // A departing node's view rollups, sent to a node that stays
+            // before it leaves; as long as copying its destination tables.
+            .route(
+                "/internal/mv/handoff",
+                post(shard_handlers::handle_mv_handoff),
+            )
+            .route(
+                "/internal/mv/handoff-chunk",
+                post(shard_handlers::handle_mv_handoff_chunk)
+                    .layer(DefaultBodyLimit::max(replicate_body_limit)),
+            )
             .route_layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 auth_middleware::internal_auth_layer,

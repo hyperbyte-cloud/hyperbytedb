@@ -921,6 +921,82 @@ pub async fn handle_shard_mv_backfill(
     }
 }
 
+/// Hand this node's materialized view rollups to `to_addr`, then empty its
+/// destination tables. Called by the leader before this node may leave.
+pub async fn handle_mv_handoff(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<crate::application::mv_handoff::MvHandoffRequest>,
+) -> impl IntoResponse {
+    let Some(ctx) = state.shard_routing.as_ref() else {
+        return sharding_disabled();
+    };
+    let client = ctx.peer_client.http_client().clone();
+    let url = format!("http://{}/internal/mv/handoff-chunk", req.to_addr);
+    let result = crate::application::mv_handoff::hand_off_rollups(
+        state.node_id,
+        state.metadata.as_ref(),
+        state.query_port.as_ref(),
+        |chunk| {
+            let client = client.clone();
+            let url = url.clone();
+            async move {
+                let resp = client
+                    .post(&url)
+                    .json(&chunk)
+                    .timeout(std::time::Duration::from_secs(120))
+                    .send()
+                    .await
+                    .map_err(|e| crate::error::HyperbytedbError::PeerUnreachable(e.to_string()))?;
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(crate::error::HyperbytedbError::PeerUnreachable(format!(
+                        "view rollup handoff chunk refused: {status} {body}"
+                    )));
+                }
+                Ok(())
+            }
+        },
+    )
+    .await;
+    match result {
+        Ok(rows) => Json(serde_json::json!({"ok": true, "rows": rows})).into_response(),
+        Err(e) => {
+            tracing::warn!(error = %e, to = %req.to_addr, "view rollup handoff failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Insert one range of a departing node's view rollups.
+pub async fn handle_mv_handoff_chunk(
+    State(state): State<Arc<AppState>>,
+    Json(chunk): Json<crate::application::mv_handoff::MvHandoffChunk>,
+) -> impl IntoResponse {
+    if state.shard_routing.is_none() {
+        return sharding_disabled();
+    }
+    match crate::application::mv_handoff::receive_chunk(
+        state.metadata.as_ref(),
+        state.query_port.as_ref(),
+        state.points_sink.as_ref(),
+        &chunk,
+    )
+    .await
+    {
+        Ok(()) => (StatusCode::NO_CONTENT, ()).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 pub async fn handle_shard_heartbeat(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RegionHeartbeat>,

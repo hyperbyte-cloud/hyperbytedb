@@ -13,6 +13,7 @@ pub mod line_protocol;
 pub mod materialized_view_service;
 pub mod msgpack_ingest;
 pub mod msgpack_limits;
+pub mod mv_handoff;
 pub mod peer_ingestion_service;
 pub mod peer_query_service;
 pub mod predicate_sql;
