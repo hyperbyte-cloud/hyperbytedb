@@ -72,6 +72,13 @@ All are opt-in, per cluster, and set on the `HyperbytedbCluster` object.
   about 55 ms, the same as one host.
 - A point lookup (`last(value)` for one host) is 30-60 ms p50 under the same
   load.
+- **A larger pool is not always faster.** Each chDB query uses several
+  threads, so on 3-CPU pods a pool of 12 was 10-40% slower than 4 for
+  10-host queries (p50 `GROUP BY host` 2.0-2.2 s vs 1.5-1.6 s, 2 interleaved
+  rounds, `8d7086e`). Size the pool to the CPU limit.
+- **Cost grows with the regions a node holds.** The same 10-host query took
+  ~120 ms on a 6-region measurement and ~1.5 s on one with 48 regions over
+  3 nodes: each node runs one chDB query per region it holds.
 - During a restart, a query that needs a node that is not up yet fails with
   `peer unreachable` (HTTP 502) rather than returning partial results.
 
@@ -162,15 +169,19 @@ counts in `GET /internal/shard/map`.
 - `WITH BACKFILL` rolls up the existing history once, run by the Raft leader
   after its own apply; a node that has not created the view yet is retried
   for up to 30 s (`b570f03` and later; before that every node backfilled,
-  counting the history once per node). Verification on n3 is pending.
+  counting the history once per node). n3, 60,000 points: 60,000 rolled up
+  on `8d7086e`, 90,900 on `792c94b`.
 - Destination regions are never moved by the scheduler.
-- **Known limit: a scale-down loses the departing nodes' rollups.** Any row
-  that was first stored on a node that later leaves is missing from the view
-  afterwards, though the source rows are all still there. On n3, a view
-  checked exactly at 3 and at 6 nodes had 44,700 of 60,000 points after
-  scaling back to 3 (partly from the bug fixed in `25803d7`, which placed a
-  new measurement's regions on a departing node). Rebuild the view
-  `WITH BACKFILL` after a scale-down if you need exact rollups.
+- **A departing node hands its rollups to a node that stays** before it
+  leaves (`6dac99e`): the leader asks it to send its destination rows to the
+  lowest-id active node, each range inserted once even if retried, then it
+  empties its own tables. Logs: `view rollups handed off` on the leader,
+  `materialized view rollups handed off` on the departing node. A node that
+  cannot hand off within 30 minutes leaves without it (`view rollup handoff
+  kept failing` at error level); its share of the rollups is then lost.
+  Before `6dac99e` every scale-down lost the departing nodes' rollups: on n3
+  a view held 44,700 of 60,000 points after 3 -> 6 -> 3. Verification of the
+  handoff on n3 is pending.
 - Rows that reach a destination any other way are dropped at flush with an
   error log and counted in
   `hyperbytedb_flush_rows_dropped_total{reason="materialized_destination"}`.
@@ -189,6 +200,5 @@ with peak memory up about 0.2 GiB per pod and no restarts (`8d7086e`).
 
 These are being measured on the beta candidate and will be added here:
 
-- Query pool 4 vs 12 under the read bench.
-- `WITH BACKFILL` counted once (old vs new build).
+- View rollups through 3 -> 6 -> 3 with the handoff (`6dac99e`).
 - Where the rest of a region copy's time goes.
