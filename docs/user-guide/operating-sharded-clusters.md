@@ -110,8 +110,11 @@ Watch: `hyperbytedb_shard_transfer_bytes` (rate per pod),
 2. **Departing pods report unready** (`/health` returns 503). This is
    expected; they keep serving the copies of their data.
 3. Each region on a departing node gets a copy on a remaining node, then the
-   departing peer is removed. When a node holds no region it becomes
-   `leaving`, and the operator deletes its pod and PVC.
+   departing peer is removed. Its materialized view rollups are handed to a
+   remaining node (see Materialized views). When it holds no region other
+   than view destinations and its rollups are handed off, the node marks
+   itself `leaving` (its `/health` reports it), and the operator deletes its
+   pod and PVC.
 
 Expect it to take as long as copying the departing nodes' data at the copy
 speed above.
@@ -180,8 +183,14 @@ counts in `GET /internal/shard/map`.
   cannot hand off within 30 minutes leaves without it (`view rollup handoff
   kept failing` at error level); its share of the rollups is then lost.
   Before `6dac99e` every scale-down lost the departing nodes' rollups: on n3
-  a view held 44,700 of 60,000 points after 3 -> 6 -> 3. Verification of the
-  handoff on n3 is pending.
+  a view held 44,700 of 60,000 points after 3 -> 6 -> 3. On `0082e44`, a view
+  created and written at 6 nodes (through all 6 pods) still held exactly
+  60,000 of 60,000 after scaling to 3; all three departing nodes handed off
+  within a minute and the scale-down finished in 59 s.
+- **Destination regions keep naming departed nodes.** They never move, so
+  after a scale-down `GET /internal/shard/map` can show a destination region
+  whose only peer is a node that has left. This has no effect on data or
+  queries (destination queries ask every member node, not region peers).
 - Rows that reach a destination any other way are dropped at flush with an
   error log and counted in
   `hyperbytedb_flush_rows_dropped_total{reason="materialized_destination"}`.
@@ -200,5 +209,4 @@ with peak memory up about 0.2 GiB per pod and no restarts (`8d7086e`).
 
 These are being measured on the beta candidate and will be added here:
 
-- View rollups through 3 -> 6 -> 3 with the handoff (`6dac99e`).
 - Where the rest of a region copy's time goes.
