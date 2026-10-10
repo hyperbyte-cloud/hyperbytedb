@@ -94,129 +94,126 @@ pub fn select_regions_for_materialized_dest<'a>(
 }
 
 /// Extract routable series_id values from a WHERE clause, if the predicate is exact enough.
+///
+/// The clause must be an AND of time bounds and, for every tag key, one set
+/// of exact values: `tag = 'v'`, an OR of those, or an anchored literal
+/// regex `tag =~ /^(a|b|c)$/` (how Grafana sends a multi-value variable).
+/// Before regexes and ORs next to a time bound were routed, a 10-host
+/// `GROUP BY host` went to every region and took seconds on n3, against
+/// ~70 ms for one host.
 fn routable_series_ids(
     measurement: &str,
     measurement_tag_keys: &[String],
     condition: Option<&Expr>,
 ) -> Option<Vec<u64>> {
-    let expr = condition?;
-    if let Some(tags) = tag_equalities_from_and(expr) {
-        if !tag_equalities_cover_all_keys(measurement_tag_keys, &tags) {
+    let mut sets = BTreeMap::new();
+    if !collect_tag_value_sets(condition?, &mut sets) {
+        return None;
+    }
+    let mut want: Vec<&String> = measurement_tag_keys.iter().collect();
+    want.sort();
+    if !want.iter().copied().eq(sets.keys()) {
+        return None;
+    }
+    let mut combos = vec![BTreeMap::new()];
+    for (tag, values) in &sets {
+        if combos.len().saturating_mul(values.len()) > MAX_SERIES_IDS_FOR_ROUTING {
             return None;
         }
-        return Some(vec![series_id(measurement, &tags)]);
+        combos = combos
+            .iter()
+            .flat_map(|c| {
+                values.iter().map(move |v| {
+                    let mut c = c.clone();
+                    c.insert(tag.clone(), v.clone());
+                    c
+                })
+            })
+            .collect();
     }
-    same_tag_or_series_ids(measurement, measurement_tag_keys, expr)
+    Some(combos.iter().map(|t| series_id(measurement, t)).collect())
 }
 
-fn tag_equalities_cover_all_keys(
-    measurement_tag_keys: &[String],
-    equality_tags: &BTreeMap<String, String>,
-) -> bool {
-    let mut want: Vec<_> = measurement_tag_keys.to_vec();
-    want.sort();
-    let mut have: Vec<_> = equality_tags.keys().cloned().collect();
-    have.sort();
-    want == have
-}
-
-/// `tag = 'a' AND region = 'b' AND time > 1` → tag map; non-tag equalities on `time` are ignored.
-fn tag_equalities_from_and(expr: &Expr) -> Option<BTreeMap<String, String>> {
-    let mut tags = BTreeMap::new();
-    if collect_and_tag_equalities(expr, &mut tags) {
-        Some(tags)
-    } else {
-        None
-    }
-}
-
-fn collect_and_tag_equalities(expr: &Expr, tags: &mut BTreeMap<String, String>) -> bool {
+/// AND terms: time bounds are skipped, and each other term must be an exact
+/// value set for a tag not already constrained.
+fn collect_tag_value_sets(expr: &Expr, sets: &mut BTreeMap<String, Vec<String>>) -> bool {
     match expr {
         Expr::BinaryExpr(be) => match be.op {
             BinaryOp::And => {
-                collect_and_tag_equalities(&be.left, tags)
-                    && collect_and_tag_equalities(&be.right, tags)
-            }
-            BinaryOp::Eq => {
-                if let Some((tag, value)) = parse_tag_identifier_eq(&be.left, &be.right) {
-                    if is_time_identifier(&tag) {
-                        return true;
-                    }
-                    tags.insert(tag, value);
-                    true
-                } else {
-                    false
-                }
+                collect_tag_value_sets(&be.left, sets) && collect_tag_value_sets(&be.right, sets)
             }
             BinaryOp::Gt | BinaryOp::Gte | BinaryOp::Lt | BinaryOp::Lte => {
                 is_time_bound_expr(&be.left) || is_time_bound_expr(&be.right)
             }
-            _ => false,
-        },
-        _ => false,
-    }
-}
-
-/// `(host = 'a' OR host = 'b')` → two series_ids for the same tag.
-fn same_tag_or_series_ids(
-    measurement: &str,
-    measurement_tag_keys: &[String],
-    expr: &Expr,
-) -> Option<Vec<u64>> {
-    let mut values = Vec::new();
-    let mut tag_name: Option<String> = None;
-    if !collect_or_tag_values(expr, &mut tag_name, &mut values) {
-        return None;
-    }
-    let tag = tag_name?;
-    if measurement_tag_keys.len() != 1 || measurement_tag_keys[0] != tag {
-        return None;
-    }
-    if values.is_empty() || values.len() > MAX_SERIES_IDS_FOR_ROUTING {
-        return None;
-    }
-    Some(
-        values
-            .into_iter()
-            .map(|v| {
-                let mut tags = BTreeMap::new();
-                tags.insert(tag.clone(), v);
-                series_id(measurement, &tags)
-            })
-            .collect(),
-    )
-}
-
-fn collect_or_tag_values(
-    expr: &Expr,
-    tag_name: &mut Option<String>,
-    values: &mut Vec<String>,
-) -> bool {
-    match expr {
-        Expr::BinaryExpr(be) => match be.op {
-            BinaryOp::Or => {
-                collect_or_tag_values(&be.left, tag_name, values)
-                    && collect_or_tag_values(&be.right, tag_name, values)
-            }
-            BinaryOp::Eq => {
-                let Some((tag, value)) = parse_tag_identifier_eq(&be.left, &be.right) else {
-                    return false;
-                };
-                if is_time_identifier(&tag) {
-                    return false;
-                }
-                match tag_name {
-                    None => *tag_name = Some(tag),
-                    Some(existing) if existing == &tag => {}
-                    Some(_) => return false,
-                }
-                values.push(value);
+            BinaryOp::Eq
+                if parse_tag_identifier_eq(&be.left, &be.right)
+                    .is_some_and(|(tag, _)| is_time_identifier(&tag)) =>
+            {
                 true
             }
-            _ => false,
+            _ => match tag_value_set(expr) {
+                Some((tag, values)) => sets.insert(tag, values).is_none(),
+                None => false,
+            },
         },
         _ => false,
     }
+}
+
+/// `tag = 'v'`, an OR of those on one tag, or `tag =~ /^(a|b)$/`.
+fn tag_value_set(expr: &Expr) -> Option<(String, Vec<String>)> {
+    let Expr::BinaryExpr(be) = expr else {
+        return None;
+    };
+    match be.op {
+        BinaryOp::Eq => {
+            let (tag, value) = parse_tag_identifier_eq(&be.left, &be.right)?;
+            (!is_time_identifier(&tag)).then(|| (tag, vec![value]))
+        }
+        BinaryOp::Or => {
+            let (tag, mut values) = tag_value_set(&be.left)?;
+            let (other, more) = tag_value_set(&be.right)?;
+            (tag == other).then(|| {
+                values.extend(more);
+                (tag, values)
+            })
+        }
+        BinaryOp::RegexMatch => match (&be.left, &be.right) {
+            (Expr::Identifier(tag), Expr::Regex(pattern)) if !is_time_identifier(tag) => {
+                Some((tag.clone(), regex_literal_alternatives(pattern)?))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The values an anchored regex of literal alternatives matches exactly:
+/// `^a$`, `^(a|b)$` or `^(?:a|b)$`, where a backslash escapes punctuation.
+/// None for anything else, which then goes to every region.
+fn regex_literal_alternatives(pattern: &str) -> Option<Vec<String>> {
+    let body = pattern.strip_prefix('^')?.strip_suffix('$')?;
+    let (body, grouped) = match body.strip_prefix("(?:").or_else(|| body.strip_prefix('(')) {
+        Some(inner) => (inner.strip_suffix(')')?, true),
+        None => (body, false),
+    };
+    let mut values = vec![String::new()];
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some(e) if e.is_ascii_punctuation() => values.last_mut()?.push(e),
+                _ => return None,
+            },
+            // Ungrouped, `^a|b$` is `(^a)|(b$)`.
+            '|' if grouped => values.push(String::new()),
+            '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' => {
+                return None;
+            }
+            c => values.last_mut()?.push(c),
+        }
+    }
+    (!values.iter().any(String::is_empty)).then_some(values)
 }
 
 fn parse_tag_identifier_eq(left: &Expr, right: &Expr) -> Option<(String, String)> {
@@ -409,6 +406,77 @@ mod tests {
             }
         }
         panic!("no host pair in different regions");
+    }
+
+    /// Grafana's multi-value variable next to a time bound: routed to the
+    /// regions of the listed hosts, not to every region.
+    #[test]
+    fn literal_regex_with_time_selects_subset() {
+        let space = four_region_space();
+        let (h1, h2) = two_hosts_in_different_regions(&space, "metrics");
+        for q in [
+            format!(
+                r#"SELECT last(value) FROM metrics WHERE host =~ /^({h1}|{h2})$/ AND time >= 0 GROUP BY host"#
+            ),
+            format!(r#"SELECT value FROM metrics WHERE time >= 0 AND host =~ /^(?:{h1}|{h2})$/"#),
+            format!(
+                r#"SELECT value FROM metrics WHERE (host = '{h1}' OR host = '{h2}') AND time >= 0"#
+            ),
+        ] {
+            let sel = select_regions_for_query(
+                &space,
+                "metrics",
+                Some(&host_only_tags()),
+                &select_stmt(&q),
+            );
+            assert_eq!(sel.region_count(space.regions.len()), 2, "{q}");
+        }
+        let one = format!(r#"SELECT value FROM metrics WHERE host =~ /^{h1}$/"#);
+        let sel = select_regions_for_query(
+            &space,
+            "metrics",
+            Some(&host_only_tags()),
+            &select_stmt(&one),
+        );
+        assert!(matches!(sel, RegionSelection::Single(_)), "{one}");
+    }
+
+    #[test]
+    fn regex_literal_alternatives_only_for_exact_sets() {
+        let alts = |p: &str| regex_literal_alternatives(p);
+        assert_eq!(alts("^(a|b)$"), Some(vec!["a".into(), "b".into()]));
+        assert_eq!(alts("^(?:a|b)$"), Some(vec!["a".into(), "b".into()]));
+        assert_eq!(
+            alts(r"^(web\.1|web\-2)$"),
+            Some(vec!["web.1".into(), "web-2".into()])
+        );
+        assert_eq!(alts("^s1$"), Some(vec!["s1".into()]));
+        for p in [
+            "^a|b$",     // (^a)|(b$)
+            "^(a|b)",    // unanchored end
+            "(a|b)$",    // unanchored start
+            "^(a.|b)$",  // metacharacter
+            "^(a|b)+$",  // repetition
+            "^(a)|(b)$", // two groups
+            "^(a||b)$",  // empty alternative matches ''
+            r"^(a|b)\$", // escaped dollar: no end anchor
+            r"^(a\d)$",  // class escape
+            "^(?i)a$",   // flags
+        ] {
+            assert_eq!(alts(p), None, "{p}");
+        }
+    }
+
+    #[test]
+    fn regex_with_two_tag_keys_needs_every_key() {
+        let space = four_region_space();
+        let tags = vec!["host".into(), "dc".into()];
+        let partial = select_stmt(r#"SELECT value FROM metrics WHERE host =~ /^(a|b)$/"#);
+        let sel = select_regions_for_query(&space, "metrics", Some(&tags), &partial);
+        assert!(matches!(sel, RegionSelection::All));
+        let full = select_stmt(r#"SELECT value FROM metrics WHERE host =~ /^(a|b)$/ AND dc = 'x'"#);
+        let sel = select_regions_for_query(&space, "metrics", Some(&tags), &full);
+        assert!(!matches!(sel, RegionSelection::All));
     }
 
     #[test]
