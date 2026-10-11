@@ -12,10 +12,10 @@ For what to expect when running it (timings, failure modes, metrics), see
 - **Sharding that scales writes.** A measurement is split into regions
   spread across the nodes (2 per node at creation), placed by rendezvous
   hashing, with replication factor 3 by default (the tests below used 2).
-  On a single shared 24-core host, writes went from 683k points/s at 3 nodes
-  to 1.35M at 6 (1.98x) and
-  1.72M at 8 (2.52x); the acceptance test (fresh cluster per size, equal
-  host load) passes at 1.82x for 6 nodes against a 1.80x bar.
+  On a single shared 24-core host the acceptance test (fresh cluster per
+  size, 90M points, equal host load) passes: 865k points/s at 3 nodes and
+  1.58M at 6 (1.82x against a 1.80x bar), every point read back. Right after
+  a 3 -> 6 scale-up, 6 nodes wrote 1.38M points/s.
 - **Scale-ups and scale-downs keep every point.** Regions are copied to a
   new node as a learner and promoted only when complete; a departing node is
   emptied before it leaves. In the final test, 1.02 billion points across six
@@ -32,8 +32,10 @@ For what to expect when running it (timings, failure modes, metrics), see
   `SHOW SETTINGS`, replicated to every node. The query pool now defaults to
   one connection per CPU plus one.
 - **Smaller WAL, faster ingest.** The sharded WAL keeps at most 1 GiB behind
-  the flush; WAL entries are bincode, uncompressed; ingest caches and series
-  ids are computed once per batch.
+  the flush (it used to keep 500k entries, 18-72 GB on n3); ingest caches and
+  series ids are computed once per batch. WAL files stay compressed: storing
+  them uncompressed (tried during this release) saturated a shared disk at
+  6 nodes and cut writes by about a third.
 
 ## Upgrading from 0.8.x
 
@@ -53,6 +55,9 @@ For what to expect when running it (timings, failure modes, metrics), see
 
 ## Known limits
 
+- **Disk space is not reclaimed after a scale-up:** a node keeps its copy of
+  a region it handed over (never read). After 3 -> 6 the cluster stored 1.65x
+  the rows replication needs.
 - **Region copies are slow:** about 2.2 MB/s per copy, so a scale-up of a
   few hundred million points takes 45 minutes or more to settle, and write
   throughput is lower until it does.

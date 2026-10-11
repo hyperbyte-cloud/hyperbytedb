@@ -47,11 +47,14 @@ All are opt-in, per cluster, and set on the `HyperbytedbCluster` object.
 
 ## Writes
 
-- **Throughput.** N=3 reached 1.12-1.28 M points/s. At N=6 and N=8 the same
-  bench gave anything from 0.33 M to 1.25 M points/s across runs. Runs
-  taken while region copies were still in progress were at the low end. An
-  earlier acceptance run under equal host load measured 1.98x at N=6 and 2.52x
-  at N=8 against N=3 (2026-10-05).
+- **Throughput.** The acceptance test (fresh cluster per size, 90M points,
+  equal host load via a twin cluster, 3 runs each; `20c761f`, 2026-10-11):
+  N=3 865k points/s (860-904k), N=6 1.58M (1.51-1.60M), **1.82x**, every
+  point read back, 0 restarts, 10.6-11.8 us of CPU per point. Without the
+  twin load, N=3 writes 1.05-1.24M points/s.
+- **Right after a scale-up** writes are close to a fresh cluster: 3 -> 6 with
+  90M points stored and a writer running, then N=6 wrote 1.38M points/s with
+  41 errors as soon as the layout settled.
 - **Errors under overload.** When a coordinator cannot reach another region's
   primary in time, the write fails with
   `write partially applied: X of Y forwarded regions failed (local bucket applied)`.
@@ -63,6 +66,33 @@ All are opt-in, per cluster, and set on the `HyperbytedbCluster` object.
   8 → 3, including a restart of every pod in the middle of it.
 - **Acknowledged writes survive a process crash**: the WAL is synchronous.
   On a sharded node the WAL keeps at most 1 GiB behind the flush.
+
+## Disks
+
+All of a node's writes (WAL, chDB parts, merges) land on its volume, and on
+a shared host the disk is usually what saturates first. On n3 every volume
+is on one NVMe: at 6 nodes writing flat out it carries 320-340 MB/s at about
+a third busy. Saturated, it looks like this:
+
+- writes refused with `write partially applied: ... operation timed out`
+  and HTTP 503 (`still rejected after 12 retries` from a client that
+  retries);
+- `hyperbytedb_shard_forward_capacity_retries_total` and
+  `hyperbytedb_write_admission_rejected_total{kind="shard"}` climbing fast
+  (about a million capacity retries in one 90M-point run);
+- the host's disk near 100% busy with write waits of 50 ms or more.
+
+That is what an uncompressed WAL did during this release (`ec65682`,
+reverted in `20c761f`): 490-540 MB/s, 69-75% busy, and N=6 writes down to
+0.72-1.02M points/s. Give each node its own disk where you can, and watch
+disk busy % alongside CPU.
+
+**Disk space after a scale-up is not reclaimed.** A node that gives a
+region to a new node keeps its copy of the rows (queries never read them;
+only the region's current peers are asked). After 3 -> 6 with about 91M
+points at replication factor 2 (182M rows needed), the cluster stored 300M:
+the three old nodes kept their full pre-scale-up copies. Size disks for the
+pre-scale-up data until this is fixed.
 
 ## Reads
 
@@ -80,6 +110,10 @@ All are opt-in, per cluster, and set on the `HyperbytedbCluster` object.
   about 55 ms, the same as one host.
 - A point lookup (`last(value)` for one host) is 30-60 ms p50 under the same
   load.
+- Read bench with 90M points (4 concurrent clients, p50), at 3 nodes and
+  then at 6 after scaling up: one-host `last` 72 / 46 ms, raw series 32 /
+  23 ms, 10-host `GROUP BY host` (`last`) 399 / 215 ms, the Grafana regex
+  form 207 / 110 ms, a full `count` 14.5 / 9.3 s. No query errors.
 - **A larger pool is not always faster.** Each chDB query uses several
   threads, so on 3-CPU pods a pool of 12 was 10-40% slower than 4 for
   10-host queries (p50 `GROUP BY host` 2.0-2.2 s vs 1.5-1.6 s, 2 interleaved
@@ -97,8 +131,8 @@ All are opt-in, per cluster, and set on the `HyperbytedbCluster` object.
    time (`sharding.schedule_limit`, default 4). A copy adds the new node as a
    learner, copies the data, then promotes it; reads never go to a learner.
 3. "Settled" means no copy is in flight and every node holds regions. 3 → 6
-   took 48 minutes with about 280 million points stored (105 region moves);
-   6 → 8 did not settle within an hour.
+   took 24 minutes with 91 million points stored and a writer running, and
+   48 minutes with about 280 million; 6 → 8 did not settle within an hour.
 
 **Copy speed is the main limit today**: about 2.2 MB/s per copy, ~4.5 MB/s
 for the whole cluster with two copies running. The movement budget
