@@ -208,7 +208,10 @@ counts in `GET /internal/shard/map`.
   (`0` turns it off).
 
 A `SET` goes through Raft, so it needs a leader; it reaches every node at
-once and survives restarts.
+once and survives restarts. On n3 (6 nodes, `d50523a`) each `SET` returned
+in under a second and `SHOW SETTINGS` on every pod showed it 5 s later; a
+restarted pod applied all 8 stored overrides at startup; `log_level` debug
+lines appeared within 20 s and stopped after `DEFAULT`. No Raft election.
 
 ## Restarts and upgrades
 

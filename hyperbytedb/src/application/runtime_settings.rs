@@ -273,7 +273,9 @@ pub fn usize_applier(f: impl Fn(usize) + Send + Sync + 'static) -> Applier {
         let n = v
             .as_i64()
             .and_then(|n| usize::try_from(n).ok())
-            .ok_or_else(|| HyperbytedbError::Internal(format!("not a count: {v:?}").into()))?;
+            .ok_or_else(|| {
+                HyperbytedbError::Internal(format!("not a count: {}", v.to_json()).into())
+            })?;
         f(n);
         Ok(())
     })
@@ -369,7 +371,8 @@ pub fn validate(
         Kind::Text => "a valid log filter in quotes".to_string(),
     };
     Err(HyperbytedbError::QueryParse(format!(
-        "{name} takes {want}, got {value:?}"
+        "{name} takes {want}, got {}",
+        value.to_json()
     )))
 }
 
