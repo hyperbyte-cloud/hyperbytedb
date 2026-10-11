@@ -34,6 +34,16 @@ For what to expect when running it (timings, failure modes, metrics), see
   admission, rate limit, cardinality limits, flush interval and the shard
   scheduler's gates, copy slots, copy budget and split/merge thresholds. The
   query pool now defaults to one connection per CPU plus one.
+- **Auth on clusters.** With auth on, nodes and the operator reach each
+  other's internal routes with a shared cluster token
+  (`auth.cluster_token`); before, a cluster with auth on could not run Raft
+  or replication at all. `auth.admin_username` / `admin_password` create the
+  first admin at startup. Operator v0.2.0 keeps all three in a Secret when
+  `spec.auth.enabled` is set.
+- **Per-database READ and WRITE.** `GRANT READ | WRITE | ALL ON <db>`,
+  `REVOKE` of one privilege, and `SHOW GRANTS FOR <user>`, as in InfluxDB v1.
+  Grants survive restarts, node syncs, `SET PASSWORD` and admin changes;
+  before, all of those silently dropped a user's grants.
 - **Smaller WAL, faster ingest.** The sharded WAL keeps at most 1 GiB behind
   the flush (it used to keep 500k entries, 18-72 GB on n3); ingest caches and
   series ids are computed once per batch. WAL files stay compressed: storing
@@ -53,6 +63,12 @@ For what to expect when running it (timings, failure modes, metrics), see
   `sharding.add_peer_proposals_enabled` and
   `sharding.remove_peer_proposals_enabled` for the duration (nodes on the
   older build cannot decode those Raft entries), and do not run `SET`.
+- **Raft timing.** Leaving `raft_heartbeat_interval_ms` unset now means a
+  third of the election timeout. Operator v0.2.0's CRD used to default both
+  to 1000, which Raft refuses (every node crash-loops); set
+  `raftHeartbeatIntervalMs` below `raftElectionTimeoutMs` on clusters made
+  from that CRD, or apply the new CRD (default 300, and a rule that rejects
+  the bad pair).
 - The `X-Influxdb-Version` header now reports the running version
   (`HyperbyteDB-0.9.0-beta`); it was fixed at 0.8.5.
 

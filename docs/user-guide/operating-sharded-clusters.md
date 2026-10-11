@@ -189,6 +189,30 @@ Watch: `GET /cluster/nodes` (each node's state),
 `hyperbytedb_shard_decommission_completed_total`, and the per-node peer
 counts in `GET /internal/shard/map`.
 
+## Auth
+
+With `spec.auth.enabled` the operator keeps the cluster token and the admin
+login in Secret `<cluster>-auth` and every node gets them as env (see
+[Authentication](authentication.md)). On the n3 UAT cluster (6 nodes,
+`b7aa4f4`, 5 Telegraf writers, 2026-10-11):
+
+- Membership, Raft and replication run as without auth: 6 active voters, no
+  restarts.
+- A `telegraf` user with `GRANT WRITE` writes but cannot read or create
+  users; a `grafana` user with `GRANT READ` reads but cannot write. Internal
+  routes refuse a missing or wrong token (401); the token does not work on
+  `/write`.
+- Grants survive restarting all six pods at once. Before `b7aa4f4` they did
+  not: a restarted node rebuilt every user without its grants, and Telegraf
+  got 403 on every write.
+- A non-admin running an admin statement (`CREATE USER`) gets HTTP 200 with
+  `forbidden: admin privileges required` in the body; a refused read or
+  write is a 403.
+- While all pods restart together, writers see 503s, connection refusals and
+  `write partially applied` 500s for about two minutes. Telegraf retries
+  from its buffer; all 13 of its measurements were present afterwards (point
+  counts across the restart were not checked).
+
 ## Runtime settings
 
 `SET <setting> = <value>` changes a running cluster without a restart;
