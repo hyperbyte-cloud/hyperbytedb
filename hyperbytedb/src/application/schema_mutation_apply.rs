@@ -130,18 +130,12 @@ async fn apply_schema_mutation_inner(
             username,
             password_hash,
             admin,
-        } => metadata.create_user(&username, &password_hash, admin).await,
+        } => create_user(metadata.as_ref(), &username, &password_hash, admin).await,
         MutationRequest::DropUser(username) => metadata.drop_user(&username).await,
         MutationRequest::SetPassword {
             username,
             password_hash,
-        } => {
-            let admin = match metadata.get_user(&username).await? {
-                Some(user) => user.admin,
-                None => false,
-            };
-            metadata.create_user(&username, &password_hash, admin).await
-        }
+        } => set_password(metadata.as_ref(), &username, &password_hash).await,
         MutationRequest::Delete {
             database,
             rp,
@@ -237,11 +231,7 @@ async fn apply_schema_mutation_inner(
             if let Some(db) = &database {
                 metadata.grant_privilege(&username, db, privilege).await?;
             } else {
-                if let Some(user) = metadata.get_user(&username).await? {
-                    metadata
-                        .create_user(&username, &user.password_hash, true)
-                        .await?;
-                }
+                set_admin(metadata.as_ref(), &username, true).await?;
             }
             Ok(())
         }
@@ -256,15 +246,59 @@ async fn apply_schema_mutation_inner(
             if let Some(db) = &database {
                 revoke_privilege(metadata.as_ref(), &username, db, privilege).await?;
             } else {
-                if let Some(user) = metadata.get_user(&username).await? {
-                    metadata
-                        .create_user(&username, &user.password_hash, false)
-                        .await?;
-                }
+                set_admin(metadata.as_ref(), &username, false).await?;
             }
             Ok(())
         }
     }
+}
+
+/// `CREATE USER`. On an existing user (a re-run, or a replayed entry) the
+/// password and admin flag are set and its grants kept.
+pub async fn create_user(
+    metadata: &dyn crate::ports::metadata::MetadataPort,
+    username: &str,
+    password_hash: &str,
+    admin: bool,
+) -> Result<(), HyperbytedbError> {
+    match metadata.get_user(username).await? {
+        Some(mut user) => {
+            user.password_hash = password_hash.to_string();
+            user.admin = admin;
+            metadata.put_user(username, &user).await
+        }
+        None => metadata.create_user(username, password_hash, admin).await,
+    }
+}
+
+/// `SET PASSWORD`: a new hash, privileges and admin flag kept. A user that
+/// doesn't exist is created (a replayed entry may arrive first).
+pub async fn set_password(
+    metadata: &dyn crate::ports::metadata::MetadataPort,
+    username: &str,
+    password_hash: &str,
+) -> Result<(), HyperbytedbError> {
+    match metadata.get_user(username).await? {
+        Some(mut user) => {
+            user.password_hash = password_hash.to_string();
+            metadata.put_user(username, &user).await
+        }
+        None => metadata.create_user(username, password_hash, false).await,
+    }
+}
+
+/// `GRANT` / `REVOKE ALL PRIVILEGES` without `ON`: the admin flag only,
+/// per-database grants kept. No-op for a user that doesn't exist.
+pub async fn set_admin(
+    metadata: &dyn crate::ports::metadata::MetadataPort,
+    username: &str,
+    admin: bool,
+) -> Result<(), HyperbytedbError> {
+    if let Some(mut user) = metadata.get_user(username).await? {
+        user.admin = admin;
+        metadata.put_user(username, &user).await?;
+    }
+    Ok(())
 }
 
 /// `REVOKE <privilege> ON <db>`: clear just that privilege, so revoking

@@ -1771,6 +1771,31 @@ impl MetadataPort for RocksDbMetadata {
         Ok(())
     }
 
+    async fn put_user(
+        &self,
+        username: &str,
+        user: &crate::domain::user::StoredUser,
+    ) -> Result<(), HyperbytedbError> {
+        let rdb = self.db.clone();
+        let key = user_key(username);
+        let value = serde_json::to_vec(user)
+            .map_err(|e| HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e)))?;
+        meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            rdb.put_cf(&cf, key, value).map_err(|e| {
+                HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+            })?;
+            Ok(())
+        })
+        .await?;
+        self.user_cache
+            .write()
+            .insert(username.to_string(), user.clone());
+        Ok(())
+    }
+
     async fn drop_user(&self, username: &str) -> Result<(), HyperbytedbError> {
         let rdb = self.db.clone();
         let key = user_key(username);

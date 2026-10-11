@@ -314,6 +314,14 @@ pub trait MetadataPort: Send + Sync {
         password_hash: &str,
         admin: bool,
     ) -> Result<(), HyperbytedbError>;
+    /// Write `user` whole, privileges included. `create_user` writes a new
+    /// user with none, so updating an existing one through it wiped its
+    /// grants.
+    async fn put_user(
+        &self,
+        username: &str,
+        user: &crate::domain::user::StoredUser,
+    ) -> Result<(), HyperbytedbError>;
     async fn drop_user(&self, username: &str) -> Result<(), HyperbytedbError>;
     async fn get_user(&self, username: &str) -> Result<Option<StoredUser>, HyperbytedbError>;
     async fn list_users(&self) -> Result<Vec<String>, HyperbytedbError>;

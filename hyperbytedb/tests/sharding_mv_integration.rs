@@ -676,6 +676,9 @@ async fn a_grant_replicates_its_privilege_to_every_node() {
         r#"CREATE USER "reader" WITH PASSWORD 'pw'"#,
         r#"GRANT ALL ON "gdb" TO "reader""#,
         r#"REVOKE WRITE ON "gdb" FROM "reader""#,
+        // Neither may drop the grant on the other node.
+        r#"SET PASSWORD FOR "reader" = 'pw2'"#,
+        r#"GRANT ALL PRIVILEGES TO "reader""#,
     ] {
         let resp = query_sql(&client, &nodes[0].url, "", q).await;
         assert!(resp.status().is_success(), "{q}");

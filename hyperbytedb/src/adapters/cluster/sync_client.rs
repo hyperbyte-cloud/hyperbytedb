@@ -416,9 +416,8 @@ impl SyncClient {
         } else if let Some(username) = entry.key.strip_prefix("user:") {
             let user: StoredUser = serde_json::from_slice(&entry.value)
                 .map_err(|e| HyperbytedbError::Metadata(format!("parse user: {e}").into()))?;
-            self.metadata
-                .create_user(username, &user.password_hash, user.admin)
-                .await?;
+            // Whole, so a node that syncs keeps every user's grants.
+            self.metadata.put_user(username, &user).await?;
         } else if entry.key.starts_with("tombstone:") {
             let parts: Vec<&str> = entry.key.splitn(5, ':').collect();
             if parts.len() == 5 {
@@ -650,6 +649,49 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         addr
+    }
+
+    /// A node that syncs gets every user whole. Importing through
+    /// `create_user` dropped grants: on n3 all six UAT nodes restarted after
+    /// the grants were made, and Telegraf's writes were refused from then on.
+    #[tokio::test]
+    async fn a_synced_user_keeps_its_grants() {
+        use crate::adapters::metadata::rocksdb_meta::RocksDbMetadata;
+        use crate::adapters::wal::rocksdb_wal::RocksDbWal;
+        use crate::domain::cluster::membership::{ClusterMembership, new_shared};
+        use crate::domain::user::{DatabasePrivilege, StoredUser};
+        use crate::ports::metadata::MetadataPort;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let metadata = Arc::new(RocksDbMetadata::open(dir.path().join("meta")).unwrap());
+        let client = super::SyncClient::new(
+            1,
+            "127.0.0.1:1".into(),
+            new_shared(ClusterMembership::new()),
+            metadata.clone(),
+            Arc::new(RocksDbWal::open(dir.path().join("wal")).unwrap()),
+            Vec::new(),
+        );
+        let user = StoredUser {
+            password_hash: "hash".into(),
+            admin: false,
+            created_at: "now".into(),
+            privileges: [("telegraf".to_string(), DatabasePrivilege::Write)].into(),
+        };
+        client
+            .import_metadata_entry(&crate::domain::cluster::sync::MetadataEntry {
+                key: "user:telegraf".into(),
+                value: serde_json::to_vec(&user).unwrap(),
+            })
+            .await
+            .unwrap();
+        let got = metadata.get_user("telegraf").await.unwrap().unwrap();
+        assert_eq!(
+            got.privileges.get("telegraf"),
+            Some(&DatabasePrivilege::Write)
+        );
+        assert_eq!(got.password_hash, "hash");
     }
 
     /// A sharded node never pulls a peer's WAL to sync: not on reconnect and

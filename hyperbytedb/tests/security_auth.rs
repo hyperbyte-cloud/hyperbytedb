@@ -631,3 +631,50 @@ async fn grant_read_write_and_partial_revoke() {
         "nothing left"
     );
 }
+
+/// Changing a user never drops its grants: SET PASSWORD, making it admin and
+/// back, and CREATE USER again all used to rewrite the user without them.
+#[tokio::test]
+#[serial(chdb)]
+async fn updating_a_user_keeps_its_grants() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = start_auth_cluster_node(dir.path()).await;
+    let client = reqwest::Client::new();
+    metadata_create_db(&node.url, &client).await;
+    let admin = |q: &'static str| {
+        let req = client.get(format!("{}/query", node.url)).query(&[
+            ("db", "mydb"),
+            ("q", q),
+            ("u", "admin"),
+            ("p", "adminpw"),
+        ]);
+        async move {
+            let body: serde_json::Value = req.send().await.unwrap().json().await.unwrap();
+            assert!(body["results"][0]["error"].is_null(), "{q}: {body}");
+            body
+        }
+    };
+    admin(r#"GRANT WRITE ON "mydb" TO "writer""#).await;
+    for q in [
+        r#"SET PASSWORD FOR "writer" = 'newpw'"#,
+        r#"GRANT ALL PRIVILEGES TO "writer""#,
+        r#"REVOKE ALL PRIVILEGES FROM "writer""#,
+        r#"CREATE USER "writer" WITH PASSWORD 'newpw'"#,
+    ] {
+        admin(q).await;
+        let body = admin(r#"SHOW GRANTS FOR "writer""#).await;
+        assert_eq!(
+            body["results"][0]["series"][0]["values"],
+            serde_json::json!([["mydb", "WRITE"]]),
+            "after {q}"
+        );
+    }
+    let write = client
+        .post(format!("{}/write", node.url))
+        .query(&[("db", "mydb"), ("u", "writer"), ("p", "newpw")])
+        .body("cpu,host=a value=1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(write.status(), StatusCode::NO_CONTENT);
+}

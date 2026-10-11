@@ -323,6 +323,13 @@ fn default_movement_budget_bytes_per_sec() -> u64 {
 impl HyperbytedbConfig {
     /// Validate cross-field constraints after Figment merge.
     pub fn validate(&self) -> Result<(), String> {
+        let (heartbeat, election) = self.cluster.raft_timing_ms();
+        if self.cluster.enabled && heartbeat >= election {
+            return Err(format!(
+                "cluster.raft_heartbeat_interval_ms ({heartbeat}) must be below \
+                 cluster.raft_election_timeout_ms ({election})"
+            ));
+        }
         if self.sharding.enabled && !self.cluster.enabled {
             return Err(
                 "sharding.enabled requires cluster.enabled = true (series sharding is cluster-only)"
@@ -663,7 +670,8 @@ pub struct ClusterConfig {
     /// When >0, peers with ack 0 and stale heartbeats are omitted from truncate barrier.
     #[serde(default = "default_replication_truncate_stale_peer_multiplier")]
     pub replication_truncate_stale_peer_multiplier: u64,
-    /// Raft heartbeat interval in milliseconds (default: 1000).
+    /// Raft heartbeat interval in milliseconds (default: a third of the
+    /// election timeout). Must be below `raft_election_timeout_ms`.
     pub raft_heartbeat_interval_ms: Option<u64>,
     /// Raft election timeout in milliseconds (default: 1000).
     pub raft_election_timeout_ms: Option<u64>,
@@ -685,6 +693,20 @@ pub struct ClusterConfig {
     /// fire-and-forget behavior.
     #[serde(default)]
     pub replication: ReplicationConfig,
+}
+
+impl ClusterConfig {
+    /// Raft (heartbeat, election timeout) in ms. Unset, the election
+    /// timeout is 1000 and the heartbeat a third of it: both at 1000, which
+    /// the operator's CRD defaults used to render, is refused by Raft.
+    #[must_use]
+    pub fn raft_timing_ms(&self) -> (u64, u64) {
+        let election = self.raft_election_timeout_ms.unwrap_or(1000);
+        let heartbeat = self
+            .raft_heartbeat_interval_ms
+            .unwrap_or_else(|| (election / 3).max(1));
+        (heartbeat, election)
+    }
 }
 
 /// Per-node, per-write replication mode. Controls only the COORDINATOR side
@@ -1518,6 +1540,25 @@ mod replicate_body_limit_tests {
 
 #[cfg(test)]
 mod admission_tests {
+
+    /// The operator's CRD defaulted both to 1000, which Raft refuses at
+    /// startup; a 6-node UAT cluster crash-looped on it.
+    #[test]
+    fn raft_heartbeat_must_be_below_the_election_timeout() {
+        let mut c = crate::config::HyperbytedbConfig::load(None).unwrap();
+        c.cluster.enabled = true;
+        assert_eq!(c.cluster.raft_timing_ms(), (333, 1000));
+        assert!(c.validate().is_ok());
+        c.cluster.raft_election_timeout_ms = Some(3000);
+        assert_eq!(c.cluster.raft_timing_ms(), (1000, 3000));
+        c.cluster.raft_heartbeat_interval_ms = Some(1000);
+        c.cluster.raft_election_timeout_ms = Some(1000);
+        let err = c.validate().unwrap_err();
+        assert!(err.contains("raft_heartbeat_interval_ms (1000)"), "{err}");
+        c.cluster.enabled = false;
+        assert!(c.validate().is_ok(), "no Raft without a cluster");
+    }
+
     use super::{INFLIGHT_WRITES_PER_CPU, resolve_max_inflight_writes};
 
     #[test]

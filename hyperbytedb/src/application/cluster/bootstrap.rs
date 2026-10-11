@@ -278,11 +278,12 @@ impl ClusterBootstrap {
 
         let network = Network::new(config.raft_rpc_timeout_secs, config.control_port);
 
+        let (heartbeat_ms, election_ms) = config.raft_timing_ms();
         let raft_config = Arc::new(
             (RaftConfig {
-                heartbeat_interval: config.raft_heartbeat_interval_ms.unwrap_or(1000),
-                election_timeout_min: config.raft_election_timeout_ms.unwrap_or(1000),
-                election_timeout_max: config.raft_election_timeout_ms.unwrap_or(1000) * 2,
+                heartbeat_interval: heartbeat_ms,
+                election_timeout_min: election_ms,
+                election_timeout_max: election_ms * 2,
                 snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(
                     config.raft_snapshot_threshold.unwrap_or(1000) as u64,
                 ),

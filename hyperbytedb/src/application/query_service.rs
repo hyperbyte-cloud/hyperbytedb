@@ -1572,9 +1572,13 @@ async fn execute_statement(
                 .map_err(|e| {
                     HyperbytedbError::Internal(crate::error::ChainedError::from_error(e))
                 })?;
-            svc.metadata
-                .create_user(username, &password_hash, *admin)
-                .await?;
+            crate::application::schema_mutation_apply::create_user(
+                svc.metadata.as_ref(),
+                username,
+                &password_hash,
+                *admin,
+            )
+            .await?;
             Ok(StatementResult {
                 statement_id,
                 series: Some(vec![]),
@@ -1590,15 +1594,16 @@ async fn execute_statement(
             })
         }
         Statement::SetPassword { username, password } => {
-            let existing = svc.metadata.get_user(username).await?;
-            let is_admin = existing.map(|u| u.admin).unwrap_or(false);
             let password_hash = crate::adapters::http::auth_middleware::hash_password(password)
                 .map_err(|e| {
                     HyperbytedbError::Internal(crate::error::ChainedError::from_error(e))
                 })?;
-            svc.metadata
-                .create_user(username, &password_hash, is_admin)
-                .await?;
+            crate::application::schema_mutation_apply::set_password(
+                svc.metadata.as_ref(),
+                username,
+                &password_hash,
+            )
+            .await?;
             Ok(StatementResult {
                 statement_id,
                 series: Some(vec![]),
@@ -1715,12 +1720,17 @@ async fn execute_statement(
                         .await?;
                 }
                 None => {
-                    let user = svc.metadata.get_user(username).await?.ok_or_else(|| {
-                        HyperbytedbError::QueryParse(format!("user '{username}' does not exist"))
-                    })?;
-                    svc.metadata
-                        .create_user(username, &user.password_hash, true)
-                        .await?;
+                    if svc.metadata.get_user(username).await?.is_none() {
+                        return Err(HyperbytedbError::QueryParse(format!(
+                            "user '{username}' does not exist"
+                        )));
+                    }
+                    crate::application::schema_mutation_apply::set_admin(
+                        svc.metadata.as_ref(),
+                        username,
+                        true,
+                    )
+                    .await?;
                 }
             }
             Ok(StatementResult {
@@ -1745,12 +1755,17 @@ async fn execute_statement(
                     .await?;
                 }
                 None => {
-                    let user = svc.metadata.get_user(username).await?.ok_or_else(|| {
-                        HyperbytedbError::QueryParse(format!("user '{username}' does not exist"))
-                    })?;
-                    svc.metadata
-                        .create_user(username, &user.password_hash, false)
-                        .await?;
+                    if svc.metadata.get_user(username).await?.is_none() {
+                        return Err(HyperbytedbError::QueryParse(format!(
+                            "user '{username}' does not exist"
+                        )));
+                    }
+                    crate::application::schema_mutation_apply::set_admin(
+                        svc.metadata.as_ref(),
+                        username,
+                        false,
+                    )
+                    .await?;
                 }
             }
             Ok(StatementResult {
