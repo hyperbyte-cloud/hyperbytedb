@@ -59,10 +59,10 @@ pub async fn run_raft_cluster_formation(
         None => return,
     };
 
-    let client = reqwest::Client::builder()
+    let client = crate::adapters::cluster::cluster_auth::client_builder()
         .timeout(Duration::from_secs(5))
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+        .unwrap_or_else(|_| crate::adapters::cluster::cluster_auth::client());
 
     // Give the local HTTP server a moment to start
     tokio::time::sleep(Duration::from_secs(1)).await;

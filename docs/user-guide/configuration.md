@@ -94,6 +94,8 @@ Authentication configuration.
 |-----|------|---------|-------------|
 | `enabled` | boolean | `false` | Enable authentication on `/write` and `/query` |
 | `allow_query_param_credentials` | boolean | `false` | Accept InfluxDB v1-style `?u=` / `?p=` credentials on the query string |
+| `cluster_token` | string | none | Shared secret nodes and the operator send on internal routes (`x-hyperbytedb-cluster-token`). **Required** for a cluster with auth on. Set it from a Secret (`HYPERBYTEDB__AUTH__CLUSTER_TOKEN`), not the config file |
+| `admin_username` / `admin_password` | string | none | An admin user each node creates at startup if no user has that name. An existing user and its password are left alone |
 
 When enabled, `/write` and `/query` require valid credentials. By default, credentials must be sent via HTTP headers (`Authorization: Basic` or `Authorization: Token`); query-string passwords are disabled because they can leak into access logs, reverse-proxy logs, browser history, and `Referer` headers. Set `allow_query_param_credentials = true` only when you need InfluxDB v1 URL compatibility and accept that risk.
 

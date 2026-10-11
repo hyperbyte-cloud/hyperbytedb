@@ -412,6 +412,7 @@ fn statement_auth_targets(stmt: &Statement, request_db: &str) -> StatementAuthTa
         | Statement::SetPassword { .. }
         | Statement::Grant { .. }
         | Statement::Revoke { .. }
+        | Statement::ShowGrants(_)
         | Statement::SetSetting { .. } => {
             targets.requires_admin = true;
         }
@@ -546,6 +547,7 @@ fn is_mutating_statement(stmt: &Statement) -> bool {
         | Statement::ShowSeries(_)
         | Statement::ShowRetentionPolicies(_)
         | Statement::ShowUsers
+        | Statement::ShowGrants(_)
         | Statement::ShowContinuousQueries
         | Statement::ShowMaterializedViews
         | Statement::ShowSettings => false,
@@ -681,6 +683,7 @@ async fn execute_statement(
             | Statement::DropUser(_)
             | Statement::SetPassword { .. }
             | Statement::ShowUsers
+            | Statement::ShowGrants(_)
             | Statement::ShowContinuousQueries
             | Statement::ShowMaterializedViews
             | Statement::SetSetting { .. }
@@ -1468,6 +1471,32 @@ async fn execute_statement(
                 error: None,
             })
         }
+        Statement::ShowGrants(username) => {
+            let user = svc.metadata.get_user(username).await?.ok_or_else(|| {
+                HyperbytedbError::QueryParse(format!("user '{username}' does not exist"))
+            })?;
+            let mut grants: Vec<_> = user.privileges.into_iter().collect();
+            grants.sort_by(|a, b| a.0.cmp(&b.0));
+            Ok(StatementResult {
+                statement_id,
+                series: Some(vec![SeriesResult {
+                    name: String::new(),
+                    tags: None,
+                    columns: vec!["database".to_string(), "privilege".to_string()],
+                    values: grants
+                        .into_iter()
+                        .map(|(db, p)| {
+                            vec![
+                                serde_json::Value::String(db),
+                                serde_json::Value::String(p.as_str().to_string()),
+                            ]
+                        })
+                        .collect(),
+                    partial: None,
+                }]),
+                error: None,
+            })
+        }
         Statement::ShowUsers => {
             let users = svc.metadata.list_users().await?;
             let columns = vec!["user".to_string(), "admin".to_string()];
@@ -1674,11 +1703,15 @@ async fn execute_statement(
                 error: None,
             })
         }
-        Statement::Grant { username, database } => {
+        Statement::Grant {
+            username,
+            database,
+            privilege,
+        } => {
             match database {
                 Some(db) => {
                     svc.metadata
-                        .grant_privilege(username, db, crate::domain::user::DatabasePrivilege::All)
+                        .grant_privilege(username, db, *privilege)
                         .await?;
                 }
                 None => {
@@ -1696,10 +1729,20 @@ async fn execute_statement(
                 error: None,
             })
         }
-        Statement::Revoke { username, database } => {
+        Statement::Revoke {
+            username,
+            database,
+            privilege,
+        } => {
             match database {
                 Some(db) => {
-                    svc.metadata.revoke_privilege(username, db).await?;
+                    crate::application::schema_mutation_apply::revoke_privilege(
+                        svc.metadata.as_ref(),
+                        username,
+                        db,
+                        *privilege,
+                    )
+                    .await?;
                 }
                 None => {
                     let user = svc.metadata.get_user(username).await?.ok_or_else(|| {

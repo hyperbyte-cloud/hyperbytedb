@@ -45,10 +45,10 @@ pub struct PeerQueryService {
 fn raft_http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+        crate::adapters::cluster::cluster_auth::client_builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
+            .unwrap_or_else(|_| crate::adapters::cluster::cluster_auth::client())
     })
 }
 
@@ -565,13 +565,23 @@ async fn mutation_request_from_statement(
                 name: name.clone(),
             })
         }
-        Statement::Grant { username, database } => Ok(MutationRequest::Grant {
+        Statement::Grant {
+            username,
+            database,
+            privilege,
+        } => Ok(MutationRequest::Grant {
             username: username.clone(),
             database: database.clone(),
+            privilege: *privilege,
         }),
-        Statement::Revoke { username, database } => Ok(MutationRequest::Revoke {
+        Statement::Revoke {
+            username,
+            database,
+            privilege,
+        } => Ok(MutationRequest::Revoke {
             username: username.clone(),
             database: database.clone(),
+            privilege: *privilege,
         }),
         Statement::SetSetting { name, value } => Ok(MutationRequest::SetSetting {
             name: name.clone(),
@@ -1083,6 +1093,7 @@ impl QueryService for PeerQueryService {
                 Statement::Grant {
                     ref username,
                     ref database,
+                    privilege,
                 } => {
                     let result = self
                         .execute_inner_statement(
@@ -1098,6 +1109,7 @@ impl QueryService for PeerQueryService {
                         self.replicate_mutation(MutationRequest::Grant {
                             username: username.clone(),
                             database: database.clone(),
+                            privilege,
                         })
                         .await?;
                     }
@@ -1106,6 +1118,7 @@ impl QueryService for PeerQueryService {
                 Statement::Revoke {
                     ref username,
                     ref database,
+                    privilege,
                 } => {
                     let result = self
                         .execute_inner_statement(
@@ -1121,6 +1134,7 @@ impl QueryService for PeerQueryService {
                         self.replicate_mutation(MutationRequest::Revoke {
                             username: username.clone(),
                             database: database.clone(),
+                            privilege,
                         })
                         .await?;
                     }

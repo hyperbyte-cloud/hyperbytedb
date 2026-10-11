@@ -1,3 +1,4 @@
+pub mod cluster_auth;
 pub mod dns_cache;
 pub mod forward_queue;
 pub mod hinted_handoff;

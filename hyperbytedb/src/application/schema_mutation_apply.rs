@@ -229,11 +229,13 @@ async fn apply_schema_mutation_inner(
         MutationRequest::DropMeasurement { database, rp, name } => {
             metadata.delete_measurement(&database, &rp, &name).await
         }
-        MutationRequest::Grant { username, database } => {
+        MutationRequest::Grant {
+            username,
+            database,
+            privilege,
+        } => {
             if let Some(db) = &database {
-                metadata
-                    .grant_privilege(&username, db, crate::domain::user::DatabasePrivilege::All)
-                    .await?;
+                metadata.grant_privilege(&username, db, privilege).await?;
             } else {
                 if let Some(user) = metadata.get_user(&username).await? {
                     metadata
@@ -246,9 +248,13 @@ async fn apply_schema_mutation_inner(
         MutationRequest::SetSetting { name, value } => {
             crate::application::runtime_settings::apply(metadata.as_ref(), &name, value).await
         }
-        MutationRequest::Revoke { username, database } => {
+        MutationRequest::Revoke {
+            username,
+            database,
+            privilege,
+        } => {
             if let Some(db) = &database {
-                metadata.revoke_privilege(&username, db).await?;
+                revoke_privilege(metadata.as_ref(), &username, db, privilege).await?;
             } else {
                 if let Some(user) = metadata.get_user(&username).await? {
                     metadata
@@ -258,6 +264,24 @@ async fn apply_schema_mutation_inner(
             }
             Ok(())
         }
+    }
+}
+
+/// `REVOKE <privilege> ON <db>`: clear just that privilege, so revoking
+/// READ from a user with ALL leaves WRITE.
+pub async fn revoke_privilege(
+    metadata: &dyn crate::ports::metadata::MetadataPort,
+    username: &str,
+    db: &str,
+    revoked: crate::domain::user::DatabasePrivilege,
+) -> Result<(), HyperbytedbError> {
+    let held = metadata
+        .get_user(username)
+        .await?
+        .and_then(|u| u.privileges.get(db).copied());
+    match held.and_then(|p| p.without(revoked)) {
+        Some(left) => metadata.grant_privilege(username, db, left).await,
+        None => metadata.revoke_privilege(username, db).await,
     }
 }
 

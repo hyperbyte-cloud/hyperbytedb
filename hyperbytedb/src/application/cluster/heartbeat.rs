@@ -191,7 +191,10 @@ pub async fn run_heartbeat_updater(
     sync_gates_readmit: bool,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
-    let client = match reqwest::Client::builder().timeout(probe_timeout).build() {
+    let client = match crate::adapters::cluster::cluster_auth::client_builder()
+        .timeout(probe_timeout)
+        .build()
+    {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "failed to build heartbeat probe client");

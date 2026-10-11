@@ -387,7 +387,7 @@ pub(crate) fn log_reverted(leader_matching: Option<u64>, target: Option<TargetRa
 
 /// The node's own Raft log position and liveness, or `None` if unreadable.
 async fn fetch_target_raft(addr: &str) -> Option<TargetRaft> {
-    let client = reqwest::Client::builder()
+    let client = crate::adapters::cluster::cluster_auth::client_builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .ok()?;

@@ -79,10 +79,14 @@ pub enum MutationRequest {
     Grant {
         username: String,
         database: Option<String>,
+        #[serde(default)]
+        privilege: crate::domain::user::DatabasePrivilege,
     },
     Revoke {
         username: String,
         database: Option<String>,
+        #[serde(default)]
+        privilege: crate::domain::user::DatabasePrivilege,
     },
     /// `SET <setting> = <value> | DEFAULT`. A node on a build without it
     /// cannot decode it: do not run `SET` during a rolling upgrade.

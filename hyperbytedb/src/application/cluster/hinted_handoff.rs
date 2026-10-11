@@ -16,10 +16,10 @@ pub async fn run_hinted_handoff_watcher(
     membership: SharedMembership,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
-    let sync_client = reqwest::Client::builder()
+    let sync_client = crate::adapters::cluster::cluster_auth::client_builder()
         .timeout(Duration::from_secs(10))
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+        .unwrap_or_else(|_| crate::adapters::cluster::cluster_auth::client());
 
     let mut prev_states: HashMap<u64, NodeState> = HashMap::new();
     // Peers with a drain running, so ticks do not start a second one.

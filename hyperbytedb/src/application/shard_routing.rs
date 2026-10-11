@@ -915,7 +915,7 @@ pub async fn propose_shard_map_op_via_raft(
 ) -> Result<ClusterResponse, HyperbytedbError> {
     let url = format!("http://{leader_addr}/cluster/raft/client-write");
     let req = ClusterRequest::ShardMapMutation(Box::new(op));
-    let client = reqwest::Client::new();
+    let client = crate::adapters::cluster::cluster_auth::client();
     let resp = client
         .post(&url)
         .json(&req)

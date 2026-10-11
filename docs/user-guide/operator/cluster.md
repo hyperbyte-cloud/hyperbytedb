@@ -246,7 +246,27 @@ own, and on 3-CPU pods 12 connections were 10-40% slower than 4.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | `false` | Enable authentication for the HTTP API |
-| `credentialsSecretName` | string | | Secret containing auth credentials |
+| `credentialsSecretName` | string | `<cluster>-auth` | Secret holding the cluster token and the bootstrap admin login |
+
+With `enabled: true` (HyperbyteDB 0.9.0-beta and later) the operator:
+
+- creates the Secret if it is missing, and fills in any key it lacks:
+  `cluster-token` (random), `admin-username` (`admin`) and `admin-password`
+  (random). Values already there are kept, so you can choose the admin
+  password yourself. A Secret it names `<cluster>-auth` is owned by the
+  cluster and deleted with it; one you name in `credentialsSecretName` is
+  kept.
+- passes the three keys to every pod as `HYPERBYTEDB__AUTH__CLUSTER_TOKEN`,
+  `HYPERBYTEDB__AUTH__ADMIN_USERNAME` and `HYPERBYTEDB__AUTH__ADMIN_PASSWORD`.
+  Each node creates the admin at startup if it is missing.
+- sends the token on its own calls (membership, decommission, leader) and in
+  the pods' drain hook.
+
+Read the admin login with
+`kubectl get secret <cluster>-auth -o jsonpath='{.data.admin-password}' | base64 -d`.
+Changing the token in the Secret takes effect as pods restart; restart them
+all together, since nodes with different tokens cannot talk to each other.
+Turning auth on for a running cluster rolls its pods once.
 
 ### `logging`
 

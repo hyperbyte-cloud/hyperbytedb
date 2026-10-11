@@ -61,10 +61,10 @@ impl SyncClient {
         max_points_per_request: usize,
         fallback_peer_addrs: Vec<String>,
     ) -> Self {
-        let client = reqwest::Client::builder()
+        let client = crate::adapters::cluster::cluster_auth::client_builder()
             .timeout(Duration::from_secs(300))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|_| crate::adapters::cluster::cluster_auth::client());
 
         Self {
             node_id,

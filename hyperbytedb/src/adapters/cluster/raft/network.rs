@@ -33,11 +33,11 @@ impl Network {
             // in which case `Client::new()` (same default config) would also
             // be unusable. Fall back to defaults so we don't panic on a path
             // that's exercised on the hot bootstrap line.
-            client: reqwest::Client::builder()
+            client: crate::adapters::cluster::cluster_auth::client_builder()
                 .timeout(default_timeout)
                 .dns_resolver(crate::adapters::cluster::dns_cache::CachingResolver::shared())
                 .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+                .unwrap_or_else(|_| crate::adapters::cluster::cluster_auth::client()),
             default_timeout,
             control_port,
         }

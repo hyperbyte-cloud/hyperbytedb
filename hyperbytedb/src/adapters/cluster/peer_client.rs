@@ -47,7 +47,7 @@ pub struct PeerClient {
 /// responsibility via per-request `.timeout(...)`. `builder.build()` only
 /// fails on broken TLS init, and `Client::new()` would also be unusable then.
 fn peer_http_client() -> reqwest::Client {
-    reqwest::Client::builder()
+    crate::adapters::cluster::cluster_auth::client_builder()
         .timeout(Duration::from_secs(10))
         .connect_timeout(Duration::from_secs(3))
         .tcp_keepalive(Duration::from_secs(60))
@@ -57,7 +57,7 @@ fn peer_http_client() -> reqwest::Client {
         .http2_keep_alive_interval(Duration::from_secs(30))
         .http2_keep_alive_while_idle(true)
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .unwrap_or_else(|_| crate::adapters::cluster::cluster_auth::client())
 }
 
 impl PeerClient {

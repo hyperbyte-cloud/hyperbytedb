@@ -273,6 +273,7 @@ SHOW FIELD KEYS [FROM <measurement>]
 SHOW SERIES [FROM <measurement>]
 SHOW RETENTION POLICIES [ON <database>]
 SHOW USERS
+SHOW GRANTS FOR <user>                -- admin; database, privilege
 SHOW CONTINUOUS QUERIES
 ```
 
@@ -292,6 +293,10 @@ DROP RETENTION POLICY "<name>" ON "<db>"
 CREATE USER "<name>" WITH PASSWORD '<password>'
 DROP USER "<name>"
 SET PASSWORD FOR "<name>" = '<password>'
+GRANT READ | WRITE | ALL ON "<db>" TO "<user>"
+REVOKE READ | WRITE | ALL ON "<db>" FROM "<user>"
+GRANT ALL PRIVILEGES TO "<user>"       -- make admin
+REVOKE ALL PRIVILEGES FROM "<user>"
 
 CREATE CONTINUOUS QUERY "<name>" ON "<db>"
   [RESAMPLE EVERY <interval> FOR <interval>]
@@ -381,7 +386,7 @@ DELETE marks data with tombstone records. Tombstoned data is excluded from queri
 | **Storage format** | chDB MergeTree tables instead of TSM shards. No direct TSM import. |
 | **fill(previous/linear)** | Via ClickHouse `INTERPOLATE`; may differ at series boundaries. |
 | **SELECT INTO with regex** | Not supported. Use explicit measurement names. |
-| **Permissions** | Admin vs non-admin only. No per-database GRANT/REVOKE. |
+| **Permissions** | Admin users, plus `GRANT`/`REVOKE` `READ`, `WRITE` or `ALL` per database, as in InfluxDB v1. |
 | **Subscriptions** | Not supported. |
 
 ### Recommendations

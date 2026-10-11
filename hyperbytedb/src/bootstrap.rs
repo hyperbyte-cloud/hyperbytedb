@@ -53,6 +53,14 @@ pub struct BootstrappedApp {
 /// returned handles.
 pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<BootstrappedApp> {
     config.validate().map_err(anyhow::Error::msg)?;
+    // Before any peer client is built: they all send it.
+    crate::adapters::cluster::cluster_auth::set_token(config.auth.cluster_token.as_deref());
+    if config.auth.enabled && config.cluster.enabled && config.auth.cluster_token.is_none() {
+        tracing::warn!(
+            "auth is on in a cluster without auth.cluster_token: nodes cannot call each \
+             other's internal routes"
+        );
+    }
 
     let prometheus_handle = {
         let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
@@ -168,6 +176,9 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
             error = %e,
             "failed to warm tag value count cache; counts rebuild on demand"
         ),
+    }
+    if let Err(e) = ensure_admin(metadata.as_ref(), &config.auth).await {
+        tracing::warn!(error = %e, "failed to create the configured admin user");
     }
     match metadata.warm_series().await {
         Ok(series) => tracing::info!(series, "warmed series dedup cache from metadata"),
@@ -655,4 +666,22 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         raft_leader_callbacks,
         rocks_shard_map,
     })
+}
+
+/// Create `auth.admin_username` as an admin if no user has that name. Each
+/// node does it for itself from the same config, so it needs no Raft leader.
+pub async fn ensure_admin(
+    metadata: &dyn MetadataPort,
+    auth: &crate::config::AuthConfig,
+) -> Result<(), crate::error::HyperbytedbError> {
+    let (Some(name), Some(password)) = (&auth.admin_username, &auth.admin_password) else {
+        return Ok(());
+    };
+    if name.is_empty() || password.is_empty() || metadata.get_user(name).await?.is_some() {
+        return Ok(());
+    }
+    let hash = crate::adapters::http::auth_middleware::hash_password(password)?;
+    metadata.create_user(name, &hash, true).await?;
+    tracing::info!(user = %name, "created the configured admin user");
+    Ok(())
 }

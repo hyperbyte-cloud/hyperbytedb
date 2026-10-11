@@ -564,7 +564,7 @@ pub struct CardinalityConfig {
     pub max_measurements_per_database: usize,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     pub enabled: bool,
@@ -572,6 +572,34 @@ pub struct AuthConfig {
     /// Disabled by default: passwords can leak into access logs and Referer headers.
     #[serde(default)]
     pub allow_query_param_credentials: bool,
+    /// Shared by every node of a cluster and the operator, and sent in
+    /// place of a user on internal routes. A cluster with auth on needs it:
+    /// without it nodes can't reach each other's Raft and replication routes.
+    #[serde(default)]
+    pub cluster_token: Option<String>,
+    /// An admin user each node creates at startup if no user has that name
+    /// (an existing user, and its password, are left alone). Lets the first
+    /// `CREATE USER` run with auth on.
+    #[serde(default)]
+    pub admin_username: Option<String>,
+    #[serde(default)]
+    pub admin_password: Option<String>,
+}
+
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redact = |v: &Option<String>| v.as_ref().map(|_| "<redacted>");
+        f.debug_struct("AuthConfig")
+            .field("enabled", &self.enabled)
+            .field(
+                "allow_query_param_credentials",
+                &self.allow_query_param_credentials,
+            )
+            .field("cluster_token", &redact(&self.cluster_token))
+            .field("admin_username", &self.admin_username)
+            .field("admin_password", &redact(&self.admin_password))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1010,6 +1038,9 @@ impl HyperbytedbConfig {
             auth: AuthConfig {
                 enabled: false,
                 allow_query_param_credentials: false,
+                cluster_token: None,
+                admin_username: None,
+                admin_password: None,
             },
             cardinality: CardinalityConfig {
                 max_tag_values_per_measurement: 100_000,

@@ -1,5 +1,6 @@
 //! Token-driven InfluxQL DDL/SHOW/auth parser (InfluxDB 1.x compatibility).
 
+use crate::domain::user::DatabasePrivilege;
 use crate::error::HyperbytedbError;
 use crate::timeseriesql::ast::*;
 use crate::timeseriesql::lexer::{
@@ -181,6 +182,11 @@ fn parse_show(cur: &mut TokenCursor<'_>) -> Result<Statement, HyperbytedbError> 
         TokenKind::Ident(word) if word.eq_ignore_ascii_case("SETTINGS") => {
             cur.bump();
             Ok(Statement::ShowSettings)
+        }
+        TokenKind::Ident(word) if word.eq_ignore_ascii_case("GRANTS") => {
+            cur.bump();
+            cur.expect_keyword("FOR")?;
+            Ok(Statement::ShowGrants(cur.take_ident()?))
         }
         _ => Err(HyperbytedbError::QueryParse("incomplete SHOW".to_string())),
     }
@@ -650,32 +656,69 @@ fn parse_set_password(cur: &mut TokenCursor<'_>) -> Result<Statement, Hyperbyted
     ))
 }
 
-fn parse_grant(cur: &mut TokenCursor<'_>) -> Result<Statement, HyperbytedbError> {
-    cur.expect_keyword("GRANT")?;
-    cur.expect_keyword("ALL")?;
-    let _ = cur.match_keyword("PRIVILEGES");
+/// `READ`, `WRITE` or `ALL [PRIVILEGES]`, then `[ON <db>]`. READ and WRITE
+/// are words, not keywords, so a field may still be called `read`.
+fn parse_privilege_on(
+    cur: &mut TokenCursor<'_>,
+    verb: &str,
+) -> Result<(DatabasePrivilege, Option<String>), HyperbytedbError> {
+    let word = match cur.peek() {
+        Some(Token {
+            kind: TokenKind::Keyword(k) | TokenKind::Ident(k),
+            ..
+        }) => k.to_ascii_uppercase(),
+        _ => String::new(),
+    };
+    let privilege = match word.as_str() {
+        "READ" => DatabasePrivilege::Read,
+        "WRITE" => DatabasePrivilege::Write,
+        "ALL" => DatabasePrivilege::All,
+        _ => {
+            return Err(HyperbytedbError::QueryParse(format!(
+                "expected READ, WRITE or ALL after {verb}"
+            )));
+        }
+    };
+    cur.bump();
+    if privilege == DatabasePrivilege::All {
+        let _ = cur.match_keyword("PRIVILEGES");
+    }
     let database = if cur.match_keyword("ON") {
         Some(cur.take_ident()?)
     } else {
         None
     };
+    if database.is_none() && privilege != DatabasePrivilege::All {
+        return Err(HyperbytedbError::QueryParse(format!(
+            "{verb} {} needs ON <database>",
+            privilege.as_str()
+        )));
+    }
+    Ok((privilege, database))
+}
+
+fn parse_grant(cur: &mut TokenCursor<'_>) -> Result<Statement, HyperbytedbError> {
+    cur.expect_keyword("GRANT")?;
+    let (privilege, database) = parse_privilege_on(cur, "GRANT")?;
     cur.expect_keyword("TO")?;
     let username = cur.take_ident()?;
-    Ok(Statement::Grant { username, database })
+    Ok(Statement::Grant {
+        username,
+        database,
+        privilege,
+    })
 }
 
 fn parse_revoke(cur: &mut TokenCursor<'_>) -> Result<Statement, HyperbytedbError> {
     cur.expect_keyword("REVOKE")?;
-    cur.expect_keyword("ALL")?;
-    let _ = cur.match_keyword("PRIVILEGES");
-    let database = if cur.match_keyword("ON") {
-        Some(cur.take_ident()?)
-    } else {
-        None
-    };
+    let (privilege, database) = parse_privilege_on(cur, "REVOKE")?;
     cur.expect_keyword("FROM")?;
     let username = cur.take_ident()?;
-    Ok(Statement::Revoke { username, database })
+    Ok(Statement::Revoke {
+        username,
+        database,
+        privilege,
+    })
 }
 
 fn parse_create_continuous_query(cur: &mut TokenCursor<'_>) -> Result<Statement, HyperbytedbError> {
@@ -1310,6 +1353,50 @@ mod tests {
     fn drop_measurement_rejects_regex() {
         let result = parse_ddl_statement(r#"DROP MEASUREMENT /^server/"#);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn grant_and_revoke_take_read_write_or_all() {
+        use DatabasePrivilege::{All, Read, Write};
+        let grant = |q: &str| match parse_ddl_statement(q).unwrap() {
+            Statement::Grant {
+                username,
+                database,
+                privilege,
+            } => (privilege, database, username),
+            other => panic!("{q}: {other:?}"),
+        };
+        let revoke = |q: &str| match parse_ddl_statement(q).unwrap() {
+            Statement::Revoke {
+                username,
+                database,
+                privilege,
+            } => (privilege, database, username),
+            other => panic!("{q}: {other:?}"),
+        };
+        let on = |p, db: &str, u: &str| (p, Some(db.to_string()), u.to_string());
+        assert_eq!(grant(r#"GRANT READ ON "db" TO "u""#), on(Read, "db", "u"));
+        assert_eq!(grant("grant write on db to u"), on(Write, "db", "u"));
+        assert_eq!(grant("GRANT ALL ON db TO u"), on(All, "db", "u"));
+        assert_eq!(grant("GRANT ALL PRIVILEGES ON db TO u"), on(All, "db", "u"));
+        assert_eq!(
+            grant("GRANT ALL PRIVILEGES TO u"),
+            (All, None, "u".to_string())
+        );
+        assert_eq!(revoke("REVOKE READ ON db FROM u"), on(Read, "db", "u"));
+        assert_eq!(revoke("revoke write on db from u"), on(Write, "db", "u"));
+        assert_eq!(
+            revoke("REVOKE ALL PRIVILEGES FROM u"),
+            (All, None, "u".to_string())
+        );
+        for bad in [
+            "GRANT READ TO u",
+            "REVOKE WRITE FROM u",
+            "GRANT SELECT ON db TO u",
+            "GRANT ON db TO u",
+        ] {
+            assert!(parse_ddl_statement(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

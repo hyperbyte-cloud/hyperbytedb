@@ -16,10 +16,10 @@ pub async fn run_leader_replication_monitor(
     // Wait for the cluster to stabilize before monitoring
     tokio::time::sleep(Duration::from_secs(30)).await;
 
-    let client = reqwest::Client::builder()
+    let client = crate::adapters::cluster::cluster_auth::client_builder()
         .timeout(Duration::from_secs(10))
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+        .unwrap_or_else(|_| crate::adapters::cluster::cluster_auth::client());
 
     loop {
         if *shutdown_rx.borrow() {

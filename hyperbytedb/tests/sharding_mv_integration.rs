@@ -661,3 +661,37 @@ async fn a_setting_replicates_to_every_node() {
     }
     assert!(seen, "node 2 never stored the SET");
 }
+
+/// `GRANT READ` / `REVOKE` reach every node through Raft with the privilege
+/// they named, not ALL.
+#[tokio::test]
+#[serial(chdb)]
+async fn a_grant_replicates_its_privilege_to_every_node() {
+    use hyperbytedb::domain::user::DatabasePrivilege;
+    let dir = tempfile::tempdir().unwrap();
+    let nodes = start_sharded_pair_cluster(dir.path(), ShardedClusterOptions::default()).await;
+    let client = reqwest::Client::new();
+    for q in [
+        r#"CREATE DATABASE "gdb""#,
+        r#"CREATE USER "reader" WITH PASSWORD 'pw'"#,
+        r#"GRANT ALL ON "gdb" TO "reader""#,
+        r#"REVOKE WRITE ON "gdb" FROM "reader""#,
+    ] {
+        let resp = query_sql(&client, &nodes[0].url, "", q).await;
+        assert!(resp.status().is_success(), "{q}");
+    }
+    let mut held = None;
+    for _ in 0..50 {
+        held = nodes[1]
+            .metadata
+            .get_user("reader")
+            .await
+            .unwrap()
+            .and_then(|u| u.privileges.get("gdb").copied());
+        if held == Some(DatabasePrivilege::Read) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(held, Some(DatabasePrivilege::Read), "node 2's privilege");
+}
