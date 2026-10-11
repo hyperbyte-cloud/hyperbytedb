@@ -8,6 +8,7 @@ use tokio::sync::watch;
 use crate::adapters::cluster::peer_client::PeerClient;
 use crate::adapters::cluster::raft::HyperbytedbRaft;
 use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
+use crate::application::runtime_settings as rs;
 use crate::application::shard_peer_resolution::is_active_peer;
 use crate::application::shard_routing::effective_replication_factor;
 use crate::application::shard_transfer::{
@@ -359,6 +360,8 @@ pub struct ShardScheduler {
     learners_seen: tokio::sync::RwLock<HashSet<(u64, u64)>>,
     /// Mover slots, `schedule_limit` of them, shared by every tick's moves.
     movers: Arc<tokio::sync::Semaphore>,
+    /// How many mover slots there are now (`SET schedule_limit` changes it).
+    mover_limit: std::sync::atomic::AtomicUsize,
     /// MiB of move data in flight, `movement_max_inflight_bytes` of them.
     move_bytes: Arc<tokio::sync::Semaphore>,
     /// True while [`ShardScheduler::run`] is re-staging leftover learners.
@@ -389,7 +392,8 @@ impl ShardScheduler {
         config: ShardingConfig,
         max_points_per_request: usize,
     ) -> Self {
-        let movers = Arc::new(tokio::sync::Semaphore::new(config.schedule_limit.max(1)));
+        let mover_limit = config.schedule_limit.max(1);
+        let movers = Arc::new(tokio::sync::Semaphore::new(mover_limit));
         let move_bytes = Arc::new(tokio::sync::Semaphore::new(move_budget_mib(&config)));
         Self {
             shard_map,
@@ -417,6 +421,7 @@ impl ShardScheduler {
             placement_stalls: tokio::sync::RwLock::new(HashMap::new()),
             placement_errors: tokio::sync::RwLock::new(HashMap::new()),
             learners_seen: tokio::sync::RwLock::new(HashSet::new()),
+            mover_limit: std::sync::atomic::AtomicUsize::new(mover_limit),
             movers,
             move_bytes,
             learners_busy: std::sync::atomic::AtomicBool::new(false),
@@ -677,8 +682,11 @@ impl ShardScheduler {
         let unhealthy = self.unhealthy_region_peers(region).await;
         let rate = move_rate_bytes_per_sec(
             move_tier(region, rf, &departing, &unhealthy),
-            self.config.movement_budget_bytes_per_sec,
-            self.config.schedule_limit,
+            rs::u64_or(
+                rs::MOVEMENT_BUDGET_BYTES_PER_SEC,
+                self.config.movement_budget_bytes_per_sec,
+            ),
+            self.schedule_limit(),
         );
         if self
             .stage_region_onto(key, region, peer, rate)
@@ -769,6 +777,22 @@ impl ShardScheduler {
     /// rollup destination sums it twice and is corrupted permanently. Contended
     /// lock counts as "yes" — skipping a placement costs a tick, guessing wrong
     /// costs the data.
+    /// Mover slots now.
+    fn schedule_limit(&self) -> usize {
+        self.mover_limit.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Make `limit` mover slots (`SET schedule_limit`). Slots held by copies
+    /// in flight are taken back as those copies finish.
+    pub fn resize_movers(&self, limit: usize) {
+        let limit = limit.max(1);
+        let was = self
+            .mover_limit
+            .swap(limit, std::sync::atomic::Ordering::Relaxed);
+        rs::resize_semaphore(&self.movers, was, limit);
+        tracing::info!(from = was, to = limit, "mover slots resized");
+    }
+
     /// Reload the materialized view destinations [`Self::is_rollup_dest`]
     /// answers from. Until this ran every tick the set stayed empty in
     /// production (its only caller was the dead reconciliation drain), and
@@ -999,7 +1023,7 @@ impl ShardScheduler {
 
     #[cfg(test)]
     fn movers_in_flight(&self) -> usize {
-        self.config.schedule_limit.max(1) - self.movers.available_permits()
+        self.schedule_limit() - self.movers.available_permits()
     }
 
     /// Re-stage and promote `learners` in the background, unless the previous
@@ -1260,8 +1284,8 @@ impl ShardScheduler {
                     series_count,
                     region.last_split_at,
                     now,
-                    self.config.region_split_series,
-                    self.config.region_max_series,
+                    rs::u64_or(rs::REGION_SPLIT_SERIES, self.config.region_split_series),
+                    rs::u64_or(rs::REGION_MAX_SERIES, self.config.region_max_series),
                     self.config.region_split_cooldown_secs,
                 );
 
@@ -1294,12 +1318,20 @@ impl ShardScheduler {
                 if idx + 1 < space.regions.len() {
                     let right = &space.regions[idx + 1];
                     let (right_series, _) = max_region_peer_heartbeat_stats(&hb, right);
-                    if series_count < self.config.region_merge_series
-                        && right_series < self.config.region_merge_series
+                    if series_count
+                        < rs::u64_or(rs::REGION_MERGE_SERIES, self.config.region_merge_series)
+                        && right_series
+                            < rs::u64_or(rs::REGION_MERGE_SERIES, self.config.region_merge_series)
                         && now.saturating_sub(region.last_split_at)
-                            >= self.config.split_merge_interval_secs
+                            >= rs::u64_or(
+                                rs::SPLIT_MERGE_INTERVAL_SECS,
+                                self.config.split_merge_interval_secs,
+                            )
                         && now.saturating_sub(right.last_split_at)
-                            >= self.config.split_merge_interval_secs
+                            >= rs::u64_or(
+                                rs::SPLIT_MERGE_INTERVAL_SECS,
+                                self.config.split_merge_interval_secs,
+                            )
                         && mergeable(region, right)
                         && !self.region_has_operator(right.region_id).await
                     {
@@ -1321,7 +1353,10 @@ impl ShardScheduler {
                 if self.config.load_split_qps_threshold > 0
                     && write_qps > self.config.load_split_qps_threshold
                     && now.saturating_sub(region.last_split_at)
-                        >= self.config.split_merge_interval_secs
+                        >= rs::u64_or(
+                            rs::SPLIT_MERGE_INTERVAL_SECS,
+                            self.config.split_merge_interval_secs,
+                        )
                 {
                     let key = space.key.clone();
                     let region = region.clone();
@@ -2171,12 +2206,19 @@ impl ShardScheduler {
         // balance moves ran one per tick however long the tick took.
         let rate = move_rate_bytes_per_sec(
             tier,
-            self.config.movement_budget_bytes_per_sec,
-            self.config.schedule_limit,
+            rs::u64_or(
+                rs::MOVEMENT_BUDGET_BYTES_PER_SEC,
+                self.config.movement_budget_bytes_per_sec,
+            ),
+            self.schedule_limit(),
         );
         match step {
             PlacementStep::Add(_) => {
-                if !self.config.add_peer_proposals_enabled || !may_copy {
+                if !rs::bool_or(
+                    rs::ADD_PEER_PROPOSALS_ENABLED,
+                    self.config.add_peer_proposals_enabled,
+                ) || !may_copy
+                {
                     return Ok(false);
                 }
                 // Every target member the region is missing, in target order —
@@ -2316,7 +2358,10 @@ impl ShardScheduler {
                 .await?;
             }
             PlacementStep::Remove(from_peer) => {
-                if !self.config.remove_peer_proposals_enabled {
+                if !rs::bool_or(
+                    rs::REMOVE_PEER_PROPOSALS_ENABLED,
+                    self.config.remove_peer_proposals_enabled,
+                ) {
                     return Ok(false);
                 }
                 self.propose(ShardMapOp::RemovePeer {
@@ -2464,7 +2509,7 @@ impl ShardScheduler {
         key: &MeasurementKey,
         region: &ShardRegion,
     ) -> Result<(), HyperbytedbError> {
-        if !self.config.peer_heal_enabled {
+        if !rs::bool_or(rs::PEER_HEAL_ENABLED, self.config.peer_heal_enabled) {
             return Ok(());
         }
         if self.peer_client.is_none() {
@@ -2492,7 +2537,10 @@ impl ShardScheduler {
             return Ok(());
         };
 
-        if !self.config.remove_peer_proposals_enabled {
+        if !rs::bool_or(
+            rs::REMOVE_PEER_PROPOSALS_ENABLED,
+            self.config.remove_peer_proposals_enabled,
+        ) {
             return Ok(());
         }
 
@@ -5059,6 +5107,29 @@ mod tests {
             !ops.iter()
                 .any(|op| matches!(op, ShardMapOp::AddPeer { .. })),
             "AddPeer must not be proposed while the gate is closed, got {ops:?}"
+        );
+    }
+
+    /// `SET add_peer_proposals_enabled = FALSE` closes the gate at the next
+    /// tick, over a config that has it open.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn a_set_closes_the_add_peer_gate() {
+        use crate::application::runtime_settings as rs;
+        let harness = PlacementTestHarness::new(true, &[(2, 0)], 1).await;
+        rs::apply_runtime(
+            rs::ADD_PEER_PROPOSALS_ENABLED,
+            Some(rs::SettingValue::Bool(false)),
+        )
+        .unwrap();
+        let ticked = harness.scheduler.tick_once_for_test().await;
+        rs::apply_runtime(rs::ADD_PEER_PROPOSALS_ENABLED, None).unwrap();
+        ticked.unwrap();
+        let ops = harness.proposals.lock().unwrap();
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op, ShardMapOp::AddPeer { .. })),
+            "the override must hold the gate, got {ops:?}"
         );
     }
 

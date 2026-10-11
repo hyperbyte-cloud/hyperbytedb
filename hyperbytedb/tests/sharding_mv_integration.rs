@@ -652,7 +652,7 @@ async fn a_setting_replicates_to_every_node() {
             .get_setting("query_pool_size")
             .await
             .unwrap()
-            == Some(3)
+            == Some(hyperbytedb::domain::setting::SettingValue::Int(3))
         {
             seen = true;
             break;

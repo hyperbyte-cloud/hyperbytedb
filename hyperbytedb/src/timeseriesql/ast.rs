@@ -69,7 +69,7 @@ pub enum Statement {
     /// every node. `None` clears the override.
     SetSetting {
         name: String,
-        value: Option<i64>,
+        value: Option<crate::domain::setting::SettingValue>,
     },
     /// `SHOW SETTINGS`.
     ShowSettings,

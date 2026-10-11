@@ -2105,7 +2105,10 @@ impl MetadataPort for RocksDbMetadata {
         Ok(())
     }
 
-    async fn get_setting(&self, name: &str) -> Result<Option<u64>, HyperbytedbError> {
+    async fn get_setting(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::domain::setting::SettingValue>, HyperbytedbError> {
         let rdb = self.db.clone();
         let key = format!("setting:{name}");
         meta_blocking(move || {
@@ -2125,7 +2128,11 @@ impl MetadataPort for RocksDbMetadata {
         .await
     }
 
-    async fn set_setting(&self, name: &str, value: Option<u64>) -> Result<(), HyperbytedbError> {
+    async fn set_setting(
+        &self,
+        name: &str,
+        value: Option<crate::domain::setting::SettingValue>,
+    ) -> Result<(), HyperbytedbError> {
         let rdb = self.db.clone();
         let key = format!("setting:{name}");
         meta_blocking(move || {

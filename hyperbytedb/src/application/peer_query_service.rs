@@ -575,7 +575,7 @@ async fn mutation_request_from_statement(
         }),
         Statement::SetSetting { name, value } => Ok(MutationRequest::SetSetting {
             name: name.clone(),
-            value: crate::application::runtime_settings::validate(name, *value)?,
+            value: crate::application::runtime_settings::validate(name, value.clone())?,
         }),
         _ => Err(HyperbytedbError::Internal(crate::error::ChainedError::new(
             "not a cluster mutation statement",
@@ -1143,7 +1143,10 @@ impl QueryService for PeerQueryService {
                     if result.error.is_none() {
                         self.replicate_mutation(MutationRequest::SetSetting {
                             name: name.clone(),
-                            value: crate::application::runtime_settings::validate(name, *value)?,
+                            value: crate::application::runtime_settings::validate(
+                                name,
+                                value.clone(),
+                            )?,
                         })
                         .await?;
                     }

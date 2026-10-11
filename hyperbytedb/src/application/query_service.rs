@@ -287,7 +287,10 @@ impl QueryServiceImpl {
         &self,
         fut: impl std::future::Future<Output = Result<T, HyperbytedbError>>,
     ) -> Result<T, HyperbytedbError> {
-        let timeout = std::time::Duration::from_secs(self.query_timeout_secs);
+        let timeout = std::time::Duration::from_secs(crate::application::runtime_settings::u64_or(
+            crate::application::runtime_settings::QUERY_TIMEOUT_SECS,
+            self.query_timeout_secs,
+        ));
         match tokio::time::timeout(timeout, fut).await {
             Ok(result) => result,
             Err(_) => Err(HyperbytedbError::QueryTimeout),
@@ -1365,7 +1368,7 @@ async fn execute_statement(
         Statement::SetSetting { name, value } => {
             // A single node; a cluster replicates the SET through Raft and
             // every node applies it the same way.
-            let value = crate::application::runtime_settings::validate(name, *value)?;
+            let value = crate::application::runtime_settings::validate(name, value.clone())?;
             crate::application::runtime_settings::apply(svc.metadata.as_ref(), name, value).await?;
             Ok(StatementResult {
                 statement_id,
@@ -1380,14 +1383,26 @@ async fn execute_statement(
                 series: Some(vec![SeriesResult {
                     name: "settings".to_string(),
                     tags: None,
-                    columns: vec!["name".into(), "value".into(), "source".into()],
+                    columns: vec![
+                        "name".into(),
+                        "value".into(),
+                        "source".into(),
+                        "config".into(),
+                        "description".into(),
+                    ],
                     values: rows
                         .into_iter()
-                        .map(|(name, value, source)| {
+                        .map(|r| {
                             vec![
-                                serde_json::Value::String(name),
-                                serde_json::Value::from(value),
-                                serde_json::Value::String(source.as_str().to_string()),
+                                serde_json::Value::String(r.name.to_string()),
+                                r.value
+                                    .as_ref()
+                                    .map_or(serde_json::Value::Null, |v| v.to_json()),
+                                r.source.map_or(serde_json::Value::Null, |s| {
+                                    serde_json::Value::String(s.as_str().to_string())
+                                }),
+                                serde_json::Value::String(r.config.to_string()),
+                                serde_json::Value::String(r.description.to_string()),
                             ]
                         })
                         .collect(),
@@ -1729,7 +1744,13 @@ async fn run_series_query(
 ) -> Result<Vec<SeriesResult>, HyperbytedbError> {
     let mut stage =
         crate::application::stage_timer::StageTimer::new("hyperbytedb_query_local_stage_seconds");
-    let sql = with_execution_time_limit(sql, svc.query_timeout_secs);
+    let sql = with_execution_time_limit(
+        sql,
+        crate::application::runtime_settings::u64_or(
+            crate::application::runtime_settings::QUERY_TIMEOUT_SECS,
+            svc.query_timeout_secs,
+        ),
+    );
     let mut batches = svc.query_port.execute_sql_arrow(&sql).await?;
     let mut builder = crate::application::query_arrow_series::SeriesBuilder::new(
         measurement,

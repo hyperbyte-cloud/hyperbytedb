@@ -186,7 +186,7 @@ fn parse_show(cur: &mut TokenCursor<'_>) -> Result<Statement, HyperbytedbError> 
     }
 }
 
-/// `SET PASSWORD ...` or `SET <setting> = <integer> | DEFAULT`.
+/// `SET PASSWORD ...` or `SET <setting> = <integer> | TRUE | FALSE | '<text>' | DEFAULT`.
 fn parse_set(cur: &mut TokenCursor<'_>) -> Result<Statement, HyperbytedbError> {
     if matches!(
         cur.tokens.get(cur.pos + 1).map(|t| &t.kind),
@@ -208,18 +208,32 @@ fn parse_set(cur: &mut TokenCursor<'_>) -> Result<Statement, HyperbytedbError> {
             )));
         }
     }
+    use crate::domain::setting::SettingValue;
     let value = match cur.bump() {
         Some(Token {
             kind: TokenKind::Number(n),
             ..
-        }) => Some(n),
+        }) => Some(SettingValue::Int(n)),
         Some(Token {
-            kind: TokenKind::Keyword(k),
+            kind: TokenKind::StringLit(s),
             ..
-        }) if k == "DEFAULT" => None,
+        }) => Some(SettingValue::Text(s)),
+        Some(Token {
+            kind: TokenKind::Keyword(k) | TokenKind::Ident(k),
+            ..
+        }) => match k.to_ascii_uppercase().as_str() {
+            "DEFAULT" => None,
+            "TRUE" => Some(SettingValue::Bool(true)),
+            "FALSE" => Some(SettingValue::Bool(false)),
+            _ => {
+                return Err(HyperbytedbError::QueryParse(format!(
+                    "expected a value or DEFAULT for {name}, found {k}"
+                )));
+            }
+        },
         other => {
             return Err(HyperbytedbError::QueryParse(format!(
-                "expected an integer or DEFAULT for {name}, found {:?}",
+                "expected a value or DEFAULT for {name}, found {:?}",
                 other.map(|t| t.kind)
             )));
         }
@@ -1114,14 +1128,38 @@ mod tests {
 
     #[test]
     fn set_and_show_settings_parse() {
-        for (q, value) in [
-            ("SET query_pool_size = 8", Some(8)),
-            ("set QUERY_POOL_SIZE = 4", Some(4)),
-            ("SET query_pool_size = DEFAULT", None),
+        use crate::domain::setting::SettingValue;
+        for (q, name, value) in [
+            (
+                "SET query_pool_size = 8",
+                "query_pool_size",
+                Some(SettingValue::Int(8)),
+            ),
+            (
+                "set QUERY_POOL_SIZE = 4",
+                "query_pool_size",
+                Some(SettingValue::Int(4)),
+            ),
+            ("SET query_pool_size = DEFAULT", "query_pool_size", None),
+            (
+                "SET peer_heal_enabled = false",
+                "peer_heal_enabled",
+                Some(SettingValue::Bool(false)),
+            ),
+            (
+                "SET peer_heal_enabled = TRUE",
+                "peer_heal_enabled",
+                Some(SettingValue::Bool(true)),
+            ),
+            (
+                "SET log_level = 'hyperbytedb=debug'",
+                "log_level",
+                Some(SettingValue::Text("hyperbytedb=debug".into())),
+            ),
         ] {
             match parse_ddl_statement(q).unwrap() {
-                Statement::SetSetting { name, value: v } => {
-                    assert_eq!(name, "query_pool_size", "{q}");
+                Statement::SetSetting { name: n, value: v } => {
+                    assert_eq!(n, name, "{q}");
                     assert_eq!(v, value, "{q}");
                 }
                 other => panic!("{q}: expected SetSetting, got {other:?}"),
@@ -1133,7 +1171,7 @@ mod tests {
         ));
         for bad in [
             "SET query_pool_size",
-            "SET query_pool_size = 'eight'",
+            "SET query_pool_size = maybe",
             "SET query_pool_size = 8 9",
         ] {
             assert!(parse_ddl_statement(bad).is_err(), "{bad}");

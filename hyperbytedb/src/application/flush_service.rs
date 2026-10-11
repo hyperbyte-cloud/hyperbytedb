@@ -160,13 +160,22 @@ impl FlushServiceImpl {
     }
 
     pub async fn run(&self, interval: std::time::Duration, mut shutdown_rx: watch::Receiver<bool>) {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
         tracing::info!("flush service started, interval = {:?}", interval);
+        let mut next = tokio::time::Instant::now();
         loop {
+            // Fixed rate, re-read each time: `SET flush_interval_secs`
+            // changes it. A flush that overran its slot starts the next one
+            // at once rather than falling behind.
+            let pause = std::time::Duration::from_secs(
+                crate::application::runtime_settings::u64_or(
+                    crate::application::runtime_settings::FLUSH_INTERVAL_SECS,
+                    interval.as_secs(),
+                )
+                .max(1),
+            );
+            next = (next + pause).max(tokio::time::Instant::now());
             tokio::select! {
-                _ = ticker.tick() => {
+                _ = tokio::time::sleep_until(next) => {
                     tracing::debug!("flush tick");
                     if let Err(e) = self.flush().await {
                         tracing::error!("flush error: {}", e);

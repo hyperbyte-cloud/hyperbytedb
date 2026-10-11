@@ -833,7 +833,10 @@ async fn build_metadata_snapshot(
         }
     }
 
-    for name in crate::application::runtime_settings::SETTINGS {
+    for name in crate::application::runtime_settings::SETTINGS
+        .iter()
+        .map(|d| d.name)
+    {
         if let Some(value) = metadata.get_setting(name).await? {
             entries.push(MetadataEntry {
                 key: format!("setting:{name}"),

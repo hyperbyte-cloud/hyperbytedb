@@ -168,10 +168,17 @@ Some settings change on a running cluster, applied on every node at once
 and kept across restarts (admin only):
 
 ```sql
-SHOW SETTINGS                      -- name, value, source: set | config | auto
-SET query_pool_size = 8            -- chDB query connections per node
-SET query_pool_size = DEFAULT      -- back to the config file, else CPUs + 1
+SHOW SETTINGS                              -- every setting, its value and source
+SET query_pool_size = 8                    -- chDB query connections per node
+SET log_level = 'hyperbytedb=debug,info'   -- debug logs without a restart
+SET add_peer_proposals_enabled = FALSE     -- hold placement during an upgrade
+SET max_inflight_writes = 256              -- admit more concurrent writes
+SET query_pool_size = DEFAULT              -- back to each node's config
 ```
+
+Pools, the query cap, write admission, the rate limit, the log filter and
+the scheduler's copy slots resize in place; the rest are read where they
+are used.
 
 See [API reference](reference.md#runtime-settings). For what scaling,
 restarts and scale-downs look like in practice, see

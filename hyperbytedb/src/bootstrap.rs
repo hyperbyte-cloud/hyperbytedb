@@ -19,6 +19,7 @@ use crate::application::query_service::QueryServiceImpl;
 use crate::application::raft_leader_callbacks::{RaftLeaderCallbacks, SharedRaftLeaderCallbacks};
 use crate::application::replication_apply::ReplicationApplyQueue;
 use crate::application::runtime::RegionWriteStats;
+use crate::application::runtime_settings as rs;
 use crate::application::shard_routing::ShardRoutingContext;
 use crate::application::statement_summary::StatementSummary;
 use crate::config::HyperbytedbConfig;
@@ -188,17 +189,37 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
     let write_pool_size = config.chdb.resolved_write_pool_size();
     let query_chdb = SharedSession::new_eager(&config.chdb.session_data_path, query_pool_size)?;
     let write_chdb = SharedSession::new_eager(&config.chdb.session_data_path, write_pool_size)?;
+    rs::set_config_fallbacks(config);
     {
-        use crate::application::runtime_settings::{Source, register_query_pool, restore};
         let source = if config.chdb.query_pool_size.is_some() || config.chdb.pool_size > 0 {
-            Source::Config
+            rs::Source::Config
         } else {
-            Source::Auto
+            rs::Source::Auto
         };
-        register_query_pool(&query_chdb.pool()?, query_pool_size, source);
-        // A `SET query_pool_size` made before this restart.
-        if let Err(e) = restore(metadata.as_ref()).await {
-            tracing::warn!(error = %e, "failed to apply stored settings");
+        let int = |n: usize| rs::SettingValue::Int(i64::try_from(n).unwrap_or(i64::MAX));
+        rs::set_fallback(rs::QUERY_POOL_SIZE, int(query_pool_size), source);
+        rs::set_fallback(
+            rs::WRITE_POOL_SIZE,
+            int(write_pool_size),
+            rs::Source::Config,
+        );
+        // Weak: libchdb takes one data path per process, and tests open a
+        // new one per case, so the registry must not keep an old pool open.
+        for (name, pool) in [
+            (rs::QUERY_POOL_SIZE, query_chdb.pool()?),
+            (rs::WRITE_POOL_SIZE, write_chdb.pool()?),
+        ] {
+            let pool = Arc::downgrade(&pool);
+            rs::register_applier(
+                name,
+                Arc::new(move |v| {
+                    let n = v.as_i64().and_then(|n| usize::try_from(n).ok());
+                    match (pool.upgrade(), n) {
+                        (Some(pool), Some(n)) => pool.resize(n).map(|_| ()),
+                        _ => Ok(()),
+                    }
+                }),
+            );
         }
     }
     tracing::info!(
@@ -217,9 +238,22 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
             "failed to attach restored chDB tables from on-disk metadata"
         ),
     }
-    let chdb_adapter =
-        ChdbQueryAdapter::from_shared(query_chdb, config.server.max_concurrent_queries);
-    let chdb: Arc<dyn crate::ports::query::QueryPort> = Arc::new(chdb_adapter);
+    let chdb_adapter = Arc::new(ChdbQueryAdapter::from_shared(
+        query_chdb,
+        config.server.max_concurrent_queries,
+    ));
+    {
+        let adapter = Arc::downgrade(&chdb_adapter);
+        rs::register_applier(
+            rs::MAX_CONCURRENT_QUERIES,
+            rs::usize_applier(move |n| {
+                if let Some(a) = adapter.upgrade() {
+                    a.set_concurrency_limit(n);
+                }
+            }),
+        );
+    }
+    let chdb: Arc<dyn crate::ports::query::QueryPort> = chdb_adapter;
 
     let native_sink = ChdbNativeAdapter::with_metadata_and_cache_limit(
         write_chdb,
@@ -513,6 +547,57 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
     );
 
+    let rate_limiter = Arc::new(rate_limit::EndpointRateLimiters::new(
+        if config.rate_limit.enabled {
+            config.rate_limit.max_requests_per_second
+        } else {
+            0
+        },
+    ));
+    let write_admission = Arc::new(crate::adapters::http::router::Admission::new(
+        inflight_writes,
+    ));
+    // KiB of forwarded body in flight: the same number of client-sized
+    // batches, measured in what they actually carry.
+    let shard_write_admission = Arc::new(crate::adapters::http::router::Admission::new(
+        inflight_writes * crate::config::SHARD_WRITE_KIB_PER_SLOT,
+    ));
+    rs::set_fallback(
+        rs::MAX_INFLIGHT_WRITES,
+        rs::SettingValue::Int(i64::try_from(inflight_writes).unwrap_or(i64::MAX)),
+        if config.server.max_inflight_writes > 0 {
+            rs::Source::Config
+        } else {
+            rs::Source::Auto
+        },
+    );
+    {
+        let (client, shard) = (
+            Arc::downgrade(&write_admission),
+            Arc::downgrade(&shard_write_admission),
+        );
+        rs::register_applier(
+            rs::MAX_INFLIGHT_WRITES,
+            rs::usize_applier(move |n| {
+                if let Some(a) = client.upgrade() {
+                    a.resize(n);
+                }
+                if let Some(a) = shard.upgrade() {
+                    a.resize(n * crate::config::SHARD_WRITE_KIB_PER_SLOT);
+                }
+            }),
+        );
+        let limiter = Arc::downgrade(&rate_limiter);
+        rs::register_applier(
+            rs::RATE_LIMIT_PER_SECOND,
+            rs::usize_applier(move |n| {
+                if let Some(l) = limiter.upgrade() {
+                    l.set_rate(n as u64);
+                }
+            }),
+        );
+    }
+
     let app_state = AppState {
         ingestion: ingestion_service,
         query: query_service,
@@ -541,22 +626,11 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
             .effective_replicate_body_limit_bytes(config.server.max_body_size_bytes),
         max_points_per_request: config.server.max_points_per_request,
         request_timeout_secs: config.server.request_timeout_secs,
-        rate_limiter: if config.rate_limit.enabled && config.rate_limit.max_requests_per_second > 0
-        {
-            Some(Arc::new(rate_limit::EndpointRateLimiters::new(
-                config.rate_limit.max_requests_per_second,
-            )))
-        } else {
-            None
-        },
-        write_admission: Some(Arc::new(crate::adapters::http::router::Admission::new(
-            inflight_writes,
-        ))),
-        // KiB of forwarded body in flight: the same number of client-sized
-        // batches, measured in what they actually carry.
-        shard_write_admission: Some(Arc::new(crate::adapters::http::router::Admission::new(
-            inflight_writes * crate::config::SHARD_WRITE_KIB_PER_SLOT,
-        ))),
+        // Always present so `SET rate_limit_per_second` can turn it on; at
+        // rate 0 it lets everything through.
+        rate_limiter: Some(rate_limiter),
+        write_admission: Some(write_admission),
+        shard_write_admission: Some(shard_write_admission),
         wal_batcher_alive,
         disk_read_only: disk_read_only.clone(),
         sharding_enabled: config.sharding.enabled,

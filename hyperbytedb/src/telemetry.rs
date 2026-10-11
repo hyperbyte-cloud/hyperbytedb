@@ -37,27 +37,62 @@ pub fn set_parent(span: &tracing::Span, headers: &axum::http::HeaderMap) {
 /// Install logging, plus the OTLP layer when the `otel` feature is built in
 /// and `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Returns a guard that flushes
 /// queued spans when dropped.
+///
+/// The log filter can be replaced at runtime with `SET log_level`.
 pub fn init_logging(
     filter: tracing_subscriber::EnvFilter,
     json: bool,
 ) -> anyhow::Result<TelemetryGuard> {
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let filter = reloadable(filter);
     #[cfg(feature = "otel")]
     if std::env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_some() {
         return otel::init(filter, json);
     }
+    let registry = tracing_subscriber::registry();
     if json {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .json()
+        registry
+            .with(tracing_subscriber::fmt::layer().json().with_filter(filter))
             .try_init()
-            .map_err(|e| anyhow::anyhow!("failed to set logging subscriber: {e}"))?;
     } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
+        registry
+            .with(tracing_subscriber::fmt::layer().with_filter(filter))
             .try_init()
-            .map_err(|e| anyhow::anyhow!("failed to set logging subscriber: {e}"))?;
     }
+    .map_err(|e| anyhow::anyhow!("failed to set logging subscriber: {e}"))?;
     Ok(TelemetryGuard::default())
+}
+
+type ReloadFilter =
+    tracing_subscriber::reload::Layer<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>;
+
+/// Wrap the log filter so `SET log_level` can swap it, and register that.
+fn reloadable(filter: tracing_subscriber::EnvFilter) -> ReloadFilter {
+    use crate::application::runtime_settings as rs;
+    rs::set_fallback(
+        rs::LOG_LEVEL,
+        rs::SettingValue::Text(filter.to_string()),
+        rs::Source::Config,
+    );
+    let (layer, handle) = tracing_subscriber::reload::Layer::new(filter);
+    rs::register_applier(
+        rs::LOG_LEVEL,
+        std::sync::Arc::new(move |v| {
+            let text = v.as_text().unwrap_or_default();
+            let filter = tracing_subscriber::EnvFilter::try_new(text).map_err(|e| {
+                crate::error::HyperbytedbError::Internal(format!("log_level: {e}").into())
+            })?;
+            handle.reload(filter).map_err(|e| {
+                crate::error::HyperbytedbError::Internal(format!("log_level: {e}").into())
+            })?;
+            tracing::info!(filter = text, "log filter replaced");
+            Ok(())
+        }),
+    );
+    layer
 }
 
 /// Flushes and shuts down the span exporter on drop.
@@ -98,10 +133,7 @@ mod otel {
             .unwrap_or(0.02)
     }
 
-    pub(super) fn init(
-        filter: tracing_subscriber::EnvFilter,
-        json: bool,
-    ) -> anyhow::Result<TelemetryGuard> {
+    pub(super) fn init(filter: super::ReloadFilter, json: bool) -> anyhow::Result<TelemetryGuard> {
         let exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_http()
             .build()
@@ -126,17 +158,18 @@ mod otel {
                 tracing_subscriber::filter::Targets::new()
                     .with_target(TARGET, tracing::Level::DEBUG),
             );
-        let registry = tracing_subscriber::registry().with(spans);
-        if json {
-            registry
-                .with(tracing_subscriber::fmt::layer().json().with_filter(filter))
-                .try_init()
+        // The log layer goes on the bare registry: the reloadable filter is
+        // typed for it.
+        let logs: Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync> = if json {
+            Box::new(tracing_subscriber::fmt::layer().json().with_filter(filter))
         } else {
-            registry
-                .with(tracing_subscriber::fmt::layer().with_filter(filter))
-                .try_init()
-        }
-        .map_err(|e| anyhow::anyhow!("failed to set logging subscriber: {e}"))?;
+            Box::new(tracing_subscriber::fmt::layer().with_filter(filter))
+        };
+        tracing_subscriber::registry()
+            .with(logs)
+            .with(spans)
+            .try_init()
+            .map_err(|e| anyhow::anyhow!("failed to set logging subscriber: {e}"))?;
         tracing::info!(ratio = sample_ratio(), "exporting request traces over OTLP");
         Ok(TelemetryGuard {
             provider: Some(provider),

@@ -225,6 +225,17 @@ async fn serve_inner(config: HyperbytedbConfig) -> anyhow::Result<()> {
                 config.server.max_points_per_request,
             ));
             app_state.shard_scheduler = Some(scheduler.clone());
+            {
+                let scheduler = Arc::downgrade(&scheduler);
+                crate::application::runtime_settings::register_applier(
+                    crate::application::runtime_settings::SCHEDULE_LIMIT,
+                    crate::application::runtime_settings::usize_applier(move |n| {
+                        if let Some(s) = scheduler.upgrade() {
+                            s.resize_movers(n);
+                        }
+                    }),
+                );
+            }
 
             if let (Some(sr), Some(pc), Some(rl)) = (
                 app_state.shard_routing.as_ref(),
@@ -369,6 +380,11 @@ async fn serve_inner(config: HyperbytedbConfig) -> anyhow::Result<()> {
         None
     };
 
+    // `SET`s made before this restart, now that every applier is registered.
+    if let Err(e) = crate::application::runtime_settings::restore(app_state.metadata.as_ref()).await
+    {
+        tracing::warn!(error = %e, "failed to apply stored settings");
+    }
     let app_state = Arc::new(app_state);
     let app = build_router(app_state.clone());
 

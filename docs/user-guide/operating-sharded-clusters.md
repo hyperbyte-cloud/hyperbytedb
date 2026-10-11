@@ -128,7 +128,8 @@ pre-scale-up data until this is fixed.
 
 1. The new pods start and join in seconds.
 2. The scheduler copies regions onto them in the background, a few at a
-   time (`sharding.schedule_limit`, default 4). A copy adds the new node as a
+   time (`sharding.schedule_limit`, default 4; `SET schedule_limit = <n>`
+   changes it live). A copy adds the new node as a
    learner, copies the data, then promotes it; reads never go to a learner.
 3. "Settled" means no copy is in flight and every node holds regions. 3 → 6
    took 24 minutes with 91 million points stored and a writer running, and
@@ -187,6 +188,27 @@ its regions placed on a departing node (see Materialized views).
 Watch: `GET /cluster/nodes` (each node's state),
 `hyperbytedb_shard_decommission_completed_total`, and the per-node peer
 counts in `GET /internal/shard/map`.
+
+## Runtime settings
+
+`SET <setting> = <value>` changes a running cluster without a restart;
+`SET <setting> = DEFAULT` puts each node back on its own config.
+`SHOW SETTINGS` lists all 19 with their source (full table in the
+[reference](reference.md#runtime-settings)). Uses that come up:
+
+- Debug one problem: `SET log_level = 'hyperbytedb=debug,info'`, then
+  `DEFAULT` when done.
+- Hold placement during an upgrade or an incident:
+  `SET add_peer_proposals_enabled = FALSE` (and `remove_...`). Copies in
+  flight finish; no new ones start.
+- More or fewer copies at once while scaling: `SET schedule_limit = <n>`.
+  Raising it only helps if the disk has headroom (see Disks).
+- Shed or admit write load: `SET max_inflight_writes = <n>` (per node; past
+  it clients get 503 and retry), `SET rate_limit_per_second = <n>`
+  (`0` turns it off).
+
+A `SET` goes through Raft, so it needs a leader; it reaches every node at
+once and survives restarts.
 
 ## Restarts and upgrades
 

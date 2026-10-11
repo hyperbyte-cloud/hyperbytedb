@@ -214,7 +214,7 @@ async fn admit(
     let Some(admission) = admission else {
         return next.run(request).await;
     };
-    let permits = admission_cost(cost, admission.capacity);
+    let permits = admission_cost(cost, admission.capacity());
     match admission.sem.clone().try_acquire_many_owned(permits) {
         Ok(permit) => {
             let start = std::time::Instant::now();

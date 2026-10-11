@@ -28,9 +28,12 @@ For what to expect when running it (timings, failure modes, metrics), see
 - **Faster reads.** Tag filters (equality, OR, and Grafana's
   `host =~ /^(a|b|c)$/`) go only to the regions that hold those series and are
   pushed down before the series join; results stream as Arrow.
-- **Runtime settings.** `SET query_pool_size = <n> | DEFAULT` and
-  `SHOW SETTINGS`, replicated to every node. The query pool now defaults to
-  one connection per CPU plus one.
+- **Runtime settings.** `SET <setting> = <value> | DEFAULT` and
+  `SHOW SETTINGS`, replicated to every node and kept across restarts. 19
+  settings: log level, query and write pools, query cap and timeout, write
+  admission, rate limit, cardinality limits, flush interval and the shard
+  scheduler's gates, copy slots, copy budget and split/merge thresholds. The
+  query pool now defaults to one connection per CPU plus one.
 - **Smaller WAL, faster ingest.** The sharded WAL keeps at most 1 GiB behind
   the flush (it used to keep 500k entries, 18-72 GB on n3); ingest caches and
   series ids are computed once per batch. WAL files stay compressed: storing

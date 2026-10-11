@@ -88,7 +88,7 @@ pub enum MutationRequest {
     /// cannot decode it: do not run `SET` during a rolling upgrade.
     SetSetting {
         name: String,
-        value: Option<u64>,
+        value: Option<crate::domain::setting::SettingValue>,
     },
 }
 

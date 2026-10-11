@@ -200,3 +200,112 @@ async fn backup_restore_roundtrip() {
         "restored server should return cpu rows: {after}"
     );
 }
+
+/// `SET` changes a running server through the production wiring
+/// (`build_services`), and `DEFAULT` puts the config back.
+#[tokio::test]
+#[serial(chdb)]
+async fn runtime_settings_take_effect_and_reset() {
+    let server = E2eFixture::new().start().await;
+    server.create_db(DB).await;
+    let set = |q: &'static str| {
+        let server = &server;
+        async move {
+            // The query endpoint shares the rate limiter under test.
+            for _ in 0..50 {
+                let resp = server.post_query(q).await;
+                if resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    return resp.status();
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            panic!("{q}: rate limited throughout");
+        }
+    };
+
+    // Cardinality: a second measurement is refused, then allowed.
+    assert!(
+        set("SET max_measurements_per_database = 1")
+            .await
+            .is_success()
+    );
+    assert!(server.write(DB, "m1 v=1 1").await.status().is_success());
+    assert!(!server.write(DB, "m2 v=1 1").await.status().is_success());
+    assert!(
+        set("SET max_measurements_per_database = DEFAULT")
+            .await
+            .is_success()
+    );
+    assert!(server.write(DB, "m2 v=1 1").await.status().is_success());
+
+    // The rate limiter is off in the config; a SET turns it on.
+    assert!(set("SET rate_limit_per_second = 1").await.is_success());
+    let mut limited = 0;
+    for i in 0..5 {
+        let status = server.write(DB, &format!("m1 v={i} {i}")).await.status();
+        limited += usize::from(status == reqwest::StatusCode::TOO_MANY_REQUESTS);
+    }
+    assert!(limited >= 3, "{limited} of 5 writes limited");
+    assert!(
+        set("SET rate_limit_per_second = DEFAULT")
+            .await
+            .is_success()
+    );
+    for i in 0..5 {
+        assert!(
+            server
+                .write(DB, &format!("m1 v={i} {i}"))
+                .await
+                .status()
+                .is_success()
+        );
+    }
+
+    // Resource settings resize live; bad values are refused.
+    for q in [
+        "SET query_pool_size = 3",
+        "SET write_pool_size = 3",
+        "SET max_concurrent_queries = 2",
+        "SET max_inflight_writes = 4",
+        "SET log_level = 'hyperbytedb=debug,info'",
+    ] {
+        assert!(set(q).await.is_success(), "{q}");
+    }
+    assert_eq!(
+        server.query(DB, "SELECT count(v) FROM m2").await["results"][0]["error"],
+        serde_json::Value::Null
+    );
+    for q in [
+        "SET log_level = 'hyperbytedb=loud'",
+        "SET max_inflight_writes = 0",
+        "SET peer_heal_enabled = 3",
+    ] {
+        assert_eq!(set(q).await, reqwest::StatusCode::BAD_REQUEST, "{q}");
+    }
+    let shown = server.query(DB, "SHOW SETTINGS").await;
+    let rows = shown["results"][0]["series"][0]["values"]
+        .as_array()
+        .unwrap();
+    let row = |name: &str| rows.iter().find(|r| r[0] == name).unwrap().clone();
+    assert_eq!(row("max_concurrent_queries")[1], 2);
+    assert_eq!(row("max_concurrent_queries")[2], "set");
+    assert_eq!(row("log_level")[1], "hyperbytedb=debug,info");
+    for name in [
+        "query_pool_size",
+        "write_pool_size",
+        "max_concurrent_queries",
+        "max_inflight_writes",
+        "log_level",
+    ] {
+        let q = format!("SET {name} = DEFAULT");
+        assert!(server.post_query(&q).await.status().is_success(), "{q}");
+    }
+    let shown = server.query(DB, "SHOW SETTINGS").await;
+    let rows = shown["results"][0]["series"][0]["values"]
+        .as_array()
+        .unwrap();
+    let row = |name: &str| rows.iter().find(|r| r[0] == name).unwrap().clone();
+    assert_eq!(row("max_concurrent_queries")[2], "config");
+    assert_eq!(row("query_pool_size")[2], "auto");
+    server.stop().await;
+}

@@ -303,15 +303,44 @@ CREATE MATERIALIZED VIEW "<name>" ON "<db>"
 DROP MATERIALIZED VIEW "<name>" ON "<db>"
 SHOW MATERIALIZED VIEWS
 
-SET <setting> = <integer> | DEFAULT   -- admin; applied on every node at once
-SHOW SETTINGS                         -- name, value, source (set | config | auto)
+SET <setting> = <integer> | TRUE | FALSE | '<text>' | DEFAULT
+                                      -- admin; applied on every node at once
+SHOW SETTINGS                         -- name, value, source, config, description
 ```
 
 ### Runtime settings
 
-| Setting | Range | Without `SET` |
-|---|---|---|
-| `query_pool_size` | 1-128 | `chdb.query_pool_size` (or legacy `chdb.pool_size`) from the config file, else one connection per CPU plus one |
+A `SET` overrides the config file on every node. `source` in
+`SHOW SETTINGS` is `set` (an override), `config` (the node's config file) or
+`auto` (derived from the node's CPUs). Each node keeps its own config value
+underneath, so `DEFAULT` returns every node to its own.
+
+| Setting | Values | Config key | Takes effect |
+|---|---|---|---|
+| `log_level` | filter text, e.g. `'info'`, `'hyperbytedb=debug,info'` | `logging.level` (or `RUST_LOG`) | next log line |
+| `query_pool_size` | 1-128 | `chdb.query_pool_size`, else CPUs + 1 | pool resizes at once |
+| `write_pool_size` | 1-128 | `chdb.write_pool_size` | pool resizes at once |
+| `max_concurrent_queries` | 0-100000 (0: unlimited) | `server.max_concurrent_queries` | next query; running ones finish under the old cap |
+| `query_timeout_secs` | 1-86400 | `server.query_timeout_secs` | next query |
+| `max_inflight_writes` | 1-1000000 | `server.max_inflight_writes`, else 32 per CPU | next request; a shrink takes permits back as writes finish |
+| `rate_limit_per_second` | 0 or more (0: off) | `rate_limit.max_requests_per_second` when `rate_limit.enabled` | next request; turning it on starts with a full bucket |
+| `max_tag_values_per_measurement` | 0 or more (0: unlimited) | `cardinality.max_tag_values_per_measurement` | next new series |
+| `max_measurements_per_database` | 0 or more (0: unlimited) | `cardinality.max_measurements_per_database` | next new measurement |
+| `flush_interval_secs` | 1-3600 | `flush.interval_secs` | after the current wait |
+| `add_peer_proposals_enabled` | `TRUE`/`FALSE` | `sharding.add_peer_proposals_enabled` | next scheduler tick |
+| `remove_peer_proposals_enabled` | `TRUE`/`FALSE` | `sharding.remove_peer_proposals_enabled` | next scheduler tick |
+| `peer_heal_enabled` | `TRUE`/`FALSE` | `sharding.peer_heal_enabled` | next scheduler tick |
+| `schedule_limit` | 1-256 | `sharding.schedule_limit` | at once; running copies finish |
+| `movement_budget_bytes_per_sec` | 0 or more (0: unlimited) | `sharding.movement_budget_bytes_per_sec` | next scheduler tick |
+| `region_split_series` | 1 or more | `sharding.region_split_series` | next split check |
+| `region_max_series` | 1 or more | `sharding.region_max_series` | next split check |
+| `region_merge_series` | 0 or more | `sharding.region_merge_series` | next merge check |
+| `split_merge_interval_secs` | 1-86400 | `sharding.split_merge_interval_secs` | next split check |
+
+The scheduler settings only do anything on a sharded cluster; elsewhere
+`SHOW SETTINGS` lists them without a value. Settings that need a restart
+anyway (listen addresses, data paths, Raft timing, replication factor, TLS,
+auth) are not runtime settings.
 
 `SET` is replicated through Raft and stored, so it survives a restart and
 reaches nodes that join later. `SET <setting> = DEFAULT` removes the

@@ -22,6 +22,25 @@ pub struct IngestCardinalityLimits {
     pub max_measurements_per_database: usize,
 }
 
+impl IngestCardinalityLimits {
+    /// These limits, or `SET max_tag_values_per_measurement` /
+    /// `SET max_measurements_per_database` where set.
+    #[must_use]
+    pub fn effective(self) -> Self {
+        use crate::application::runtime_settings as rs;
+        Self {
+            max_tag_values_per_measurement: rs::usize_or(
+                rs::MAX_TAG_VALUES_PER_MEASUREMENT,
+                self.max_tag_values_per_measurement,
+            ),
+            max_measurements_per_database: rs::usize_or(
+                rs::MAX_MEASUREMENTS_PER_DATABASE,
+                self.max_measurements_per_database,
+            ),
+        }
+    }
+}
+
 /// Reject ingest batches that exceed the configured per-request point cap.
 /// `max_points == 0` uses the same default as [`crate::config::default_max_points_per_request`].
 pub fn validate_point_count(count: usize, max_points: usize) -> Result<(), HyperbytedbError> {
@@ -445,6 +464,7 @@ pub async fn prepare_columnar_metadata(
     }
 
     // Slow path: schema unknown
+    let limits = limits.effective();
     if limits.max_measurements_per_database > 0 {
         let existing = metadata.list_measurements(db).await?;
         let is_new = !existing.contains(&batch.measurement);
@@ -696,6 +716,7 @@ pub async fn prepare_batch_metadata(
 
     // Slow path: schema is unknown (first write for a measurement, or schema changed).
     // Full validation + registration.
+    let limits = limits.effective();
 
     if limits.max_measurements_per_database > 0 {
         let existing = metadata.list_measurements(db).await?;

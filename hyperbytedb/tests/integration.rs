@@ -1369,7 +1369,7 @@ async fn queries_read_results_through_the_arrow_stream() {
 #[tokio::test]
 #[serial(chdb)]
 async fn set_query_pool_size_resizes_the_pool() {
-    use hyperbytedb::application::runtime_settings::{Source, register_query_pool};
+    use hyperbytedb::application::runtime_settings as rs;
 
     let dir = tempfile::tempdir().unwrap();
     let (state, _flush) = setup(&dir);
@@ -1377,7 +1377,24 @@ async fn set_query_pool_size_resizes_the_pool() {
         .unwrap()
         .pool()
         .unwrap();
-    register_query_pool(&pool, 2, Source::Auto);
+    rs::set_fallback(
+        rs::QUERY_POOL_SIZE,
+        rs::SettingValue::Int(2),
+        rs::Source::Auto,
+    );
+    {
+        // Weak, as in bootstrap: a pool the registry kept alive would hold
+        // libchdb's one data path open for every later test in the process.
+        let pool = Arc::downgrade(&pool);
+        rs::register_applier(
+            rs::QUERY_POOL_SIZE,
+            rs::usize_applier(move |n| {
+                if let Some(pool) = pool.upgrade() {
+                    pool.resize(n).unwrap();
+                }
+            }),
+        );
+    }
     let (url, _handle) = start_server(state.clone()).await;
     let client = reqwest::Client::new();
     let query = |q: &'static str| {
@@ -1394,14 +1411,22 @@ async fn set_query_pool_size_resizes_the_pool() {
             resp.json::<serde_json::Value>().await.unwrap()
         }
     };
-    let settings = |body: serde_json::Value| body["results"][0]["series"][0]["values"].clone();
+    // The query_pool_size row's name, value and source.
+    let settings = |body: serde_json::Value| {
+        let rows = body["results"][0]["series"][0]["values"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let row = rows.iter().find(|r| r[0] == "query_pool_size").unwrap();
+        serde_json::json!([[row[0], row[1], row[2]]])
+    };
 
     let body = query("SET query_pool_size = 5").await;
     assert!(body["results"][0]["error"].is_null(), "{body}");
     assert_eq!(pool.pool_size(), 5);
     assert_eq!(
         state.metadata.get_setting("query_pool_size").await.unwrap(),
-        Some(5)
+        Some(rs::SettingValue::Int(5))
     );
     assert_eq!(
         settings(query("SHOW SETTINGS").await),

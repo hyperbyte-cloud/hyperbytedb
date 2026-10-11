@@ -40,7 +40,7 @@ use super::{
 #[derive(Debug)]
 pub struct Admission {
     pub sem: Arc<tokio::sync::Semaphore>,
-    pub capacity: usize,
+    capacity: std::sync::atomic::AtomicUsize,
 }
 
 impl Admission {
@@ -48,8 +48,23 @@ impl Admission {
     pub fn new(capacity: usize) -> Self {
         Self {
             sem: Arc::new(tokio::sync::Semaphore::new(capacity)),
-            capacity,
+            capacity: std::sync::atomic::AtomicUsize::new(capacity),
         }
+    }
+
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.capacity.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// `SET max_inflight_writes`. Requests already admitted keep their
+    /// permits; a shrink takes them back as they finish.
+    pub fn resize(&self, capacity: usize) {
+        let capacity = capacity.max(1);
+        let was = self
+            .capacity
+            .swap(capacity, std::sync::atomic::Ordering::Relaxed);
+        crate::application::runtime_settings::resize_semaphore(&self.sem, was, capacity);
     }
 }
 
@@ -500,6 +515,22 @@ mod layer_routes_tests {
             StatusCode::REQUEST_TIMEOUT
         );
         assert_eq!(status_of(app, "/long").await, StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::Admission;
+
+    #[tokio::test]
+    async fn admission_resizes_live() {
+        let a = Admission::new(4);
+        a.resize(8);
+        assert_eq!((a.capacity(), a.sem.available_permits()), (8, 8));
+        a.resize(2);
+        assert_eq!((a.capacity(), a.sem.available_permits()), (2, 2));
+        a.resize(0);
+        assert_eq!(a.capacity(), 1, "never closes the door entirely");
     }
 }
 
