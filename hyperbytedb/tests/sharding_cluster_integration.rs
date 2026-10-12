@@ -2572,3 +2572,132 @@ async fn a_departing_node_waits_for_its_forward_queue_before_retiring() {
     assert!(queue.is_empty());
     assert_eq!(health(n1.url.clone()).await, "leaving");
 }
+
+/// With numeric `epoch` the coordinator sorts and fills `fill(null)`
+/// buckets and regions skip ORDER BY/WITH FILL; RFC 3339 times keep the old
+/// region fill. Both must give the same answer, buckets at the range edges
+/// and gaps included.
+#[tokio::test]
+#[serial(chdb)]
+async fn coordinator_fill_matches_region_fill() {
+    let dir = tempfile::tempdir().unwrap();
+    let nodes =
+        start_sharded_three_node_cluster(dir.path(), ShardedClusterOptions::default()).await;
+    let client = reqwest::Client::new();
+    create_db(&client, &nodes[0].url, "fdb").await;
+    bootstrap_two_regions(&nodes, "fdb", "autogen", "cpu").await;
+    let sides: std::collections::BTreeSet<bool> = (0..3)
+        .flat_map(|h| (0..2).map(move |c| (h, c)))
+        .map(|(h, c)| {
+            series_id(
+                "cpu",
+                &BTreeMap::from([
+                    ("host".into(), format!("h{h}")),
+                    ("cpu".into(), format!("cpu{c}")),
+                ]),
+            ) < u64::MAX / 2
+        })
+        .collect();
+    assert_eq!(sides.len(), 2, "series must span both regions");
+
+    // 3 hosts x 2 cpus, 10 s points with gaps, across 2 regions.
+    let base_s: i64 = 1_791_751_725;
+    let mut lines = Vec::new();
+    for h in 0..3 {
+        for c in 0..2 {
+            for i in 0..40i64 {
+                if (i + h + c) % 7 == 0 || (h == 1 && (10..25).contains(&i)) {
+                    continue;
+                }
+                let v = (h * 100 + c * 10) as f64 + i as f64 / 4.0;
+                lines.push(format!(
+                    "cpu,host=h{h},cpu=cpu{c} usage_idle={v} {}",
+                    (base_s + i * 10) * 1_000_000_000
+                ));
+            }
+        }
+    }
+    let resp = write_line(&client, &nodes[0].url, "fdb", &lines.join("\n")).await;
+    let status = resp.status();
+    assert!(
+        status.is_success(),
+        "{status}: {}",
+        resp.text().await.unwrap()
+    );
+    for n in &nodes {
+        flush_node(n).await;
+    }
+
+    let (lo_ms, hi_ms) = ((base_s - 95) * 1000, (base_s + 470) * 1000);
+    let run = |q: String, epoch: bool| {
+        let client = client.clone();
+        let url = nodes[0].url.clone();
+        async move {
+            let mut params = vec![("db", "fdb".to_string()), ("q", q.clone())];
+            if epoch {
+                params.push(("epoch", "ms".to_string()));
+            }
+            let resp = client
+                .get(format!("{url}/query"))
+                .query(&params)
+                .send()
+                .await
+                .unwrap();
+            assert!(resp.status().is_success(), "{q}");
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert!(body["results"][0]["error"].is_null(), "{q}: {body}");
+            // series name + tags -> rows with times in ms
+            let mut out = BTreeMap::new();
+            for s in body["results"][0]["series"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+            {
+                let rows: Vec<(i64, serde_json::Value)> = s["values"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| {
+                        let t = match &r[0] {
+                            serde_json::Value::String(t) => chrono::DateTime::parse_from_rfc3339(t)
+                                .unwrap()
+                                .timestamp_millis(),
+                            n => n.as_i64().unwrap(),
+                        };
+                        (t, r[1].clone())
+                    })
+                    .collect();
+                out.insert(s["tags"].to_string(), rows);
+            }
+            out
+        }
+    };
+    for (group, fill) in [
+        ("\"host\", \"cpu\"", "fill(null)"),
+        ("\"host\", \"cpu\"", ""),
+        ("\"host\"", "fill(null)"),
+        ("\"host\"", "fill(none)"),
+    ] {
+        let q = format!(
+            "SELECT mean(\"usage_idle\") FROM \"cpu\" WHERE time >= {lo_ms}ms AND time <= {hi_ms}ms \
+             GROUP BY time(30s), {group} {fill}"
+        );
+        let with_epoch = run(q.clone(), true).await;
+        let rfc3339 = run(q.clone(), false).await;
+        assert!(!with_epoch.is_empty(), "{q}");
+        assert_eq!(with_epoch, rfc3339, "{q}");
+        for rows in with_epoch.values() {
+            let times: Vec<i64> = rows.iter().map(|r| r.0).collect();
+            assert!(times.windows(2).all(|w| w[0] < w[1]), "{q}: order");
+            if fill != "fill(none)" {
+                // Every 30 s bucket from the one holding the lower bound to
+                // the one holding the upper bound.
+                let first = lo_ms.div_euclid(30_000) * 30_000;
+                let last = hi_ms.div_euclid(30_000) * 30_000;
+                assert_eq!(times.first(), Some(&first), "{q}");
+                assert_eq!(times.last(), Some(&last), "{q}");
+                assert_eq!(times.len() as i64, (last - first) / 30_000 + 1, "{q}");
+            }
+        }
+    }
+}

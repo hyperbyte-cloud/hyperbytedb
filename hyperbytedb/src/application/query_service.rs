@@ -2525,6 +2525,7 @@ async fn execute_sharded_measurement_query(
     {
         let mut plan = prepare_sharded_region_query(&effective_stmt)?;
         plan.epoch = epoch.map(str::to_string);
+        plan.move_fill_and_order_to_coordinator(&effective_stmt, time_min, time_max);
         Some(plan)
     } else {
         None
@@ -2534,7 +2535,12 @@ async fn execute_sharded_measurement_query(
         .map(|plan| &plan.region_stmt)
         .unwrap_or(&effective_stmt);
 
-    let mut sql = to_clickhouse::translate_native_table(
+    let translate = if sharded_plan.as_ref().is_some_and(|p| p.region_unordered) {
+        to_clickhouse::translate_native_table_unordered
+    } else {
+        to_clickhouse::translate_native_table
+    };
+    let mut sql = translate(
         translate_stmt,
         table.as_str(),
         effective_mapping.as_ref(),

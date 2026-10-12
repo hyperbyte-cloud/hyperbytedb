@@ -10,7 +10,10 @@ use crate::domain::rollup::{
     MeanRollupField, RollupCombine, aggregate_source_field_name, rollup_combine_from_field,
 };
 use crate::error::HyperbytedbError;
-use crate::timeseriesql::ast::{BinaryExpr, BinaryOp, Expr, Field, FunctionCall, SelectStatement};
+use crate::timeseriesql::ast::{
+    BinaryExpr, BinaryOp, Dimension, DurationUnit, Expr, Field, FillOption, FunctionCall,
+    SelectStatement,
+};
 use crate::timeseriesql::to_clickhouse::{select_has_true_aggregate, select_output_field_name};
 
 const MULTI_REGION_UNSUPPORTED: &str = "aggregate is not supported across shard regions yet";
@@ -40,6 +43,111 @@ pub struct ShardedQueryPlan {
     /// The response's time format (`epoch` query parameter), for times
     /// promoted from partial columns.
     pub epoch: Option<String>,
+    /// Regions skip ORDER BY; the coordinator's global sort orders the
+    /// result. See [`ShardedQueryPlan::move_fill_and_order_to_coordinator`].
+    pub region_unordered: bool,
+    /// `fill(null)` done here instead of in each region.
+    coordinator_fill: Option<CoordinatorFill>,
+}
+
+/// Buckets the coordinator adds as null rows: every `step_ns` from the
+/// bucket holding `min_ns` to the one holding `max_ns`, or between a
+/// series' own first and last bucket when the query has no bounds (as
+/// ClickHouse's WITH FILL without FROM/TO does).
+#[derive(Debug, Clone)]
+struct CoordinatorFill {
+    step_ns: i64,
+    bounds_ns: Option<(i64, i64)>,
+}
+
+/// More buckets than this per series and the region fills, as before.
+const COORDINATOR_FILL_MAX_BUCKETS: i64 = 1_000_000;
+
+/// Nanoseconds per unit of a numeric `epoch`, or `None` for RFC 3339 times.
+fn epoch_unit_nanos(epoch: Option<&str>) -> Option<i64> {
+    match epoch? {
+        "ns" | "n" => Some(1),
+        "u" | "us" => Some(1_000),
+        "ms" => Some(1_000_000),
+        "s" => Some(1_000_000_000),
+        _ => None,
+    }
+}
+
+impl ShardedQueryPlan {
+    /// Let regions skip ORDER BY and WITH FILL, and sort and fill the merged
+    /// result here instead. On n3 a region's ORDER BY (tags, then time, which
+    /// WITH FILL needs) was half of its query time, and the coordinator
+    /// sorts the merged rows again anyway.
+    ///
+    /// Only where the result is the same: a time-bucketed aggregate without
+    /// a region LIMIT or SLIMIT, and `fill(none)` or `fill(null)`; for
+    /// `fill(null)` also no offset or tz() (buckets are then plain multiples
+    /// of the interval from the epoch, as in ClickHouse's toStartOfInterval),
+    /// an interval of at most a minute, numeric `epoch` times and a bounded
+    /// number of buckets. Returns whether it did.
+    pub fn move_fill_and_order_to_coordinator(
+        &mut self,
+        stmt: &SelectStatement,
+        time_min: Option<i64>,
+        time_max: Option<i64>,
+    ) -> bool {
+        let Some(Dimension::Time { interval, offset }) =
+            stmt.group_by.as_ref().and_then(|gb| gb.time_dimension())
+        else {
+            return false;
+        };
+        if !self.needs_global_sort
+            || !select_has_true_aggregate(stmt)
+            || stmt.into.is_some()
+            || self.region_stmt.limit.is_some()
+            || self.region_stmt.offset.is_some()
+            || stmt.slimit.is_some()
+            || stmt.soffset.is_some()
+        {
+            return false;
+        }
+        match stmt.fill {
+            Some(FillOption::None) => {}
+            None | Some(FillOption::Null) => {
+                let step_ns = interval.to_nanos();
+                let Some(unit_ns) = epoch_unit_nanos(self.epoch.as_deref()) else {
+                    return false;
+                };
+                let small_unit = matches!(
+                    interval.unit,
+                    DurationUnit::Nanosecond
+                        | DurationUnit::Microsecond
+                        | DurationUnit::Millisecond
+                        | DurationUnit::Second
+                        | DurationUnit::Minute
+                );
+                if offset.is_some()
+                    || stmt.timezone.is_some()
+                    || !small_unit
+                    || step_ns <= 0
+                    || step_ns % unit_ns != 0
+                {
+                    return false;
+                }
+                let bounds_ns = match (time_min, time_max) {
+                    (Some(lo), Some(hi)) if lo <= hi => {
+                        let (lo, hi) = (lo.div_euclid(step_ns), hi.div_euclid(step_ns));
+                        if hi - lo >= COORDINATOR_FILL_MAX_BUCKETS {
+                            return false;
+                        }
+                        Some((lo * step_ns, hi * step_ns))
+                    }
+                    _ => None,
+                };
+                self.region_stmt.fill = Some(FillOption::None);
+                self.coordinator_fill = Some(CoordinatorFill { step_ns, bounds_ns });
+            }
+            _ => return false,
+        }
+        self.region_unordered = true;
+        true
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +177,8 @@ pub fn prepare_sharded_region_query(
         needs_global_sort: false,
         point_time_col: None,
         epoch: None,
+        region_unordered: false,
+        coordinator_fill: None,
     };
 
     validate_no_non_mergeable_aggs(stmt)?;
@@ -490,11 +600,65 @@ pub fn apply_sharded_post_merge(
     } else {
         response
     };
+    if let Some(fill) = &plan.coordinator_fill {
+        resp = fill_missing_buckets(resp, fill, plan.epoch.as_deref());
+    }
 
     if plan.needs_global_sort || plan.saved_limit.is_some() || plan.saved_offset.is_some() {
         resp = apply_global_sort_limit_offset(resp, original, plan)?;
     }
     Ok(resp)
+}
+
+/// Add a null row for every bucket a series lacks; the global sort that
+/// follows puts them in place. Only called when [`epoch_unit_nanos`] knows
+/// the time format.
+fn fill_missing_buckets(
+    mut response: QueryResponse,
+    fill: &CoordinatorFill,
+    epoch: Option<&str>,
+) -> QueryResponse {
+    let Some(unit_ns) = epoch_unit_nanos(epoch) else {
+        return response;
+    };
+    for result in &mut response.results {
+        for series in result.series.iter_mut().flatten() {
+            let Some(ti) = series
+                .columns
+                .iter()
+                .position(|c| c == "time" || c == "__time")
+            else {
+                continue;
+            };
+            let present: HashSet<i64> = series
+                .values
+                .iter()
+                .filter_map(|row| row.get(ti).and_then(json_as_i64))
+                .map(|t| t.saturating_mul(unit_ns))
+                .collect();
+            let (lo, hi) = match fill.bounds_ns {
+                Some(b) => b,
+                None => match (present.iter().min(), present.iter().max()) {
+                    (Some(&lo), Some(&hi)) => (lo, hi),
+                    _ => continue,
+                },
+            };
+            let width = series.columns.len();
+            let mut t = lo;
+            while t <= hi {
+                if !present.contains(&t) {
+                    let mut row = vec![Value::Null; width];
+                    row[ti] = crate::domain::query_result::time_value_from_nanos(t, epoch);
+                    series.values.push(row);
+                }
+                t = t.saturating_add(fill.step_ns);
+                if fill.step_ns <= 0 {
+                    break;
+                }
+            }
+        }
+    }
+    response
 }
 
 /// Merge partial materialized-view destination rows from multiple shard regions.
@@ -554,65 +718,81 @@ fn merge_rows_with_rules(
     let mut merged: IndexMap<String, (SeriesResult, IndexMap<String, Vec<Value>>)> =
         IndexMap::new();
 
+    // A series only one part returned has nothing to merge with (with
+    // GROUP BY on every tag, each series lives in one region): it is kept
+    // whole instead of keyed row by row.
+    let mut keyed: Vec<(String, SeriesResult)> = Vec::new();
     for part in parts {
         for stmt_result in part.results {
-            let Some(series_list) = stmt_result.series else {
-                continue;
-            };
-            for mut series in series_list {
-                let values = std::mem::take(&mut series.values);
-                let key = series_key(&series);
-                let time_idx = series
+            keyed.extend(
+                stmt_result
+                    .series
+                    .into_iter()
+                    .flatten()
+                    .map(|s| (series_key(&s), s)),
+            );
+        }
+    }
+    let mut occurrences: HashMap<String, usize> = HashMap::new();
+    for (key, _) in &keyed {
+        *occurrences.entry(key.clone()).or_default() += 1;
+    }
+    let mut whole: Vec<SeriesResult> = Vec::new();
+    for (key, mut series) in keyed {
+        if occurrences.get(&key) == Some(&1) {
+            whole.push(series);
+            continue;
+        }
+        let values = std::mem::take(&mut series.values);
+        let time_idx = series
+            .columns
+            .iter()
+            .position(|c| c == "time" || c == "__time");
+        let distinct: Vec<(&String, usize)> = row_key_distinct_cols
+            .iter()
+            .filter_map(|c| series.columns.iter().position(|x| x == c).map(|i| (c, i)))
+            .collect();
+        let (header, rows) = merged
+            .entry(key)
+            .or_insert_with(|| (series.clone(), IndexMap::new()));
+        // Rows are merged in the first part's column order.
+        let remap: Option<Vec<usize>> = if header.columns == series.columns {
+            None
+        } else {
+            Some(
+                header
                     .columns
                     .iter()
-                    .position(|c| c == "time" || c == "__time");
-                let distinct: Vec<(&String, usize)> = row_key_distinct_cols
-                    .iter()
-                    .filter_map(|c| series.columns.iter().position(|x| x == c).map(|i| (c, i)))
-                    .collect();
-                let (header, rows) = merged
-                    .entry(key)
-                    .or_insert_with(|| (series.clone(), IndexMap::new()));
-                // Rows are merged in the first part's column order.
-                let remap: Option<Vec<usize>> = if header.columns == series.columns {
-                    None
-                } else {
-                    Some(
-                        header
-                            .columns
-                            .iter()
-                            .map(|c| series.columns.iter().position(|x| x == c))
-                            .collect::<Option<Vec<_>>>()
-                            .ok_or_else(ragged_merge_row)?,
-                    )
-                };
-                for row in values {
-                    if row.len() != series.columns.len() {
-                        return Err(ragged_merge_row());
-                    }
-                    let mut row_key = String::new();
-                    if let Some(i) = time_idx {
-                        row_key.push_str(&row[i].to_string());
-                    }
-                    for (col, i) in &distinct {
-                        row_key.push('|');
-                        row_key.push_str(col);
-                        row_key.push('=');
-                        row_key.push_str(&row[*i].to_string());
-                    }
-                    let row = match &remap {
-                        None => row,
-                        Some(map) => map.iter().map(|&i| row[i].clone()).collect(),
-                    };
-                    match rows.entry(row_key) {
-                        indexmap::map::Entry::Occupied(mut e) => {
-                            let merged_row = merge_row(&header.columns, rules, e.get(), &row)?;
-                            *e.get_mut() = merged_row;
-                        }
-                        indexmap::map::Entry::Vacant(e) => {
-                            e.insert(row);
-                        }
-                    }
+                    .map(|c| series.columns.iter().position(|x| x == c))
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(ragged_merge_row)?,
+            )
+        };
+        for row in values {
+            if row.len() != series.columns.len() {
+                return Err(ragged_merge_row());
+            }
+            let mut row_key = String::new();
+            if let Some(i) = time_idx {
+                row_key.push_str(&row[i].to_string());
+            }
+            for (col, i) in &distinct {
+                row_key.push('|');
+                row_key.push_str(col);
+                row_key.push('=');
+                row_key.push_str(&row[*i].to_string());
+            }
+            let row = match &remap {
+                None => row,
+                Some(map) => map.iter().map(|&i| row[i].clone()).collect(),
+            };
+            match rows.entry(row_key) {
+                indexmap::map::Entry::Occupied(mut e) => {
+                    let merged_row = merge_row(&header.columns, rules, e.get(), &row)?;
+                    *e.get_mut() = merged_row;
+                }
+                indexmap::map::Entry::Vacant(e) => {
+                    e.insert(row);
                 }
             }
         }
@@ -624,6 +804,7 @@ fn merge_rows_with_rules(
             header.values = rows.into_values().collect();
             header
         })
+        .chain(whole)
         .collect();
     series.sort_by(series_order);
     Ok(QueryResponse::single(statement_id, series))
@@ -1635,6 +1816,178 @@ mod tests {
             took < std::time::Duration::from_secs(2),
             "merge took {took:?}"
         );
+    }
+
+    /// GROUP BY on every tag: each series comes from one region and is kept
+    /// whole, but its mean is still finalized from the sum and count.
+    #[test]
+    fn a_series_from_one_region_is_kept_whole_and_finalized() {
+        let stmt = mean_by_time_and_host();
+        let plan = prepare_sharded_region_query(&stmt).unwrap();
+        let cols = plan.mean_partials.values().next().unwrap().clone();
+        let part = |host: &str, sum: i64| {
+            QueryResponse::single(
+                0,
+                vec![SeriesResult {
+                    name: "cpu".into(),
+                    tags: Some(HashMap::from([("host".into(), host.into())])),
+                    columns: vec!["time".into(), cols.sum_col.clone(), cols.count_col.clone()],
+                    values: vec![
+                        vec![json!(30_000), json!(sum), json!(4)],
+                        vec![json!(0), json!(sum * 2), json!(4)],
+                    ],
+                    partial: None,
+                }],
+            )
+        };
+        let merged =
+            merge_sharded_query_results(vec![part("b", 8), part("a", 4)], &stmt, Some(&plan))
+                .unwrap();
+        let series = merged.results[0].series.as_ref().unwrap();
+        let got: Vec<_> = series
+            .iter()
+            .map(|s| (s.tags.as_ref().unwrap()["host"].clone(), s.values.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "a".to_string(),
+                    vec![vec![json!(0), json!(2.0)], vec![json!(30_000), json!(1.0)]]
+                ),
+                (
+                    "b".to_string(),
+                    vec![vec![json!(0), json!(4.0)], vec![json!(30_000), json!(2.0)]]
+                ),
+            ]
+        );
+    }
+
+    /// When the coordinator takes over fill and order, and when it must not.
+    #[test]
+    fn fill_and_order_move_to_the_coordinator_only_when_the_answer_is_the_same() {
+        let moved =
+            |stmt: &SelectStatement, epoch: Option<&str>, bounds: (Option<i64>, Option<i64>)| {
+                let mut plan = prepare_sharded_region_query(stmt).unwrap();
+                plan.epoch = epoch.map(str::to_string);
+                let did = plan.move_fill_and_order_to_coordinator(stmt, bounds.0, bounds.1);
+                (did, plan)
+            };
+        let day = (Some(0), Some(86_400_000_000_000));
+        let stmt = mean_by_time_and_host();
+        let (did, plan) = moved(&stmt, Some("ms"), day);
+        assert!(did && plan.region_unordered);
+        assert!(matches!(plan.region_stmt.fill, Some(FillOption::None)));
+
+        let with = |f: &dyn Fn(&mut SelectStatement)| {
+            let mut s = mean_by_time_and_host();
+            f(&mut s);
+            s
+        };
+        // fill(none): nothing to fill, but the order still moves.
+        let none = with(&|s| s.fill = Some(FillOption::None));
+        assert!(moved(&none, None, day).0);
+        for (why, stmt, epoch, bounds) in [
+            ("RFC 3339 times", stmt.clone(), None, day),
+            (
+                "tz()",
+                with(&|s| s.timezone = Some("Europe/Paris".into())),
+                Some("ms"),
+                day,
+            ),
+            (
+                "fill(previous)",
+                with(&|s| s.fill = Some(FillOption::Previous)),
+                Some("ms"),
+                day,
+            ),
+            (
+                "fill(0)",
+                with(&|s| s.fill = Some(FillOption::Value(0.0))),
+                Some("ms"),
+                day,
+            ),
+            (
+                "region LIMIT",
+                with(&|s| s.limit = Some(10)),
+                Some("ms"),
+                day,
+            ),
+            ("SLIMIT", with(&|s| s.slimit = Some(2)), Some("ms"), day),
+            (
+                "too many buckets",
+                stmt.clone(),
+                Some("ms"),
+                (Some(0), Some(i64::MAX / 2)),
+            ),
+            (
+                "1 h buckets",
+                with(&|s| {
+                    if let Some(Dimension::Time { interval, .. }) =
+                        s.group_by.as_mut().unwrap().dimensions.get_mut(0)
+                    {
+                        interval.unit = DurationUnit::Hour;
+                        interval.value = 1;
+                    }
+                }),
+                Some("ms"),
+                day,
+            ),
+        ] {
+            let (did, plan) = moved(&stmt, epoch, bounds);
+            assert!(!did, "{why}");
+            assert!(!plan.region_unordered, "{why}");
+            assert!(plan.coordinator_fill.is_none(), "{why}");
+        }
+    }
+
+    /// Missing buckets become null rows, from the bucket holding the lower
+    /// bound to the one holding the upper bound, as ClickHouse's WITH FILL
+    /// FROM .. TO did in each region.
+    #[test]
+    fn missing_buckets_are_filled_with_nulls_between_the_bounds() {
+        let fill = CoordinatorFill {
+            step_ns: 30_000_000_000,
+            bounds_ns: Some((0, 120_000_000_000)),
+        };
+        let series = SeriesResult {
+            name: "cpu".into(),
+            tags: None,
+            columns: vec!["time".into(), "mean".into()],
+            values: vec![
+                vec![json!(30_000), json!(1.5)],
+                vec![json!(90_000), json!(2.5)],
+            ],
+            partial: None,
+        };
+        let out = fill_missing_buckets(
+            QueryResponse::single(0, vec![series.clone()]),
+            &fill,
+            Some("ms"),
+        );
+        let mut rows = out.results[0].series.as_ref().unwrap()[0].values.clone();
+        rows.sort_by_key(|r| r[0].as_i64().unwrap());
+        assert_eq!(
+            rows,
+            vec![
+                vec![json!(0), Value::Null],
+                vec![json!(30_000), json!(1.5)],
+                vec![json!(60_000), Value::Null],
+                vec![json!(90_000), json!(2.5)],
+                vec![json!(120_000), Value::Null],
+            ]
+        );
+        // Without bounds: only the gaps between a series' own buckets.
+        let unbounded = CoordinatorFill {
+            bounds_ns: None,
+            ..fill
+        };
+        let out = fill_missing_buckets(
+            QueryResponse::single(0, vec![series]),
+            &unbounded,
+            Some("ms"),
+        );
+        assert_eq!(out.results[0].series.as_ref().unwrap()[0].values.len(), 3);
     }
 
     #[test]

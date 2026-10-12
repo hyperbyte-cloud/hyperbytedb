@@ -25,12 +25,38 @@ pub fn translate_native_table(
     translate_inner(stmt, table_source, mapping, series, time_bounds)
 }
 
+/// [`translate_native_table`] without ORDER BY, for a sharded region's
+/// partial when the coordinator sorts (and fills) the merged result. Sorting
+/// ~35k region rows by tag and time was half of each region query on n3.
+/// The caller must have removed fill and any region LIMIT, which need the
+/// order.
+pub fn translate_native_table_unordered(
+    stmt: &SelectStatement,
+    table_source: &str,
+    mapping: Option<&ColumnMapping>,
+    series: Option<SeriesJoin<'_>>,
+    time_bounds: Option<(Option<i64>, Option<i64>)>,
+) -> Result<String, HyperbytedbError> {
+    translate_inner_ordered(stmt, table_source, mapping, series, time_bounds, false)
+}
+
 pub(super) fn translate_inner(
     stmt: &SelectStatement,
     from_source: &str,
     mapping: Option<&ColumnMapping>,
     series: Option<SeriesJoin<'_>>,
     time_bounds: Option<(Option<i64>, Option<i64>)>,
+) -> Result<String, HyperbytedbError> {
+    translate_inner_ordered(stmt, from_source, mapping, series, time_bounds, true)
+}
+
+fn translate_inner_ordered(
+    stmt: &SelectStatement,
+    from_source: &str,
+    mapping: Option<&ColumnMapping>,
+    series: Option<SeriesJoin<'_>>,
+    time_bounds: Option<(Option<i64>, Option<i64>)>,
+    ordered: bool,
 ) -> Result<String, HyperbytedbError> {
     // Every computed column gets its InfluxQL name before anything reads it,
     // so `mean(a), mean(b)` is `mean`, `mean_1` in the SQL and the merge alike.
@@ -194,10 +220,10 @@ pub(super) fn translate_inner(
     // to sort on: GROUP BY time() buckets, raw per-point selects (incl. `*`), or
     // bare window transforms (which are per-point and project raw `time`).
     // Aggregates without GROUP BY time() collapse to one row and need no ordering.
-    let has_orderable_time =
-        time_col.is_some() || (!has_aggregate && !has_group_by_time) || projects_point_time;
+    let has_orderable_time = ordered
+        && (time_col.is_some() || (!has_aggregate && !has_group_by_time) || projects_point_time);
     let time_desc = stmt.order_by.as_ref().is_some_and(|o| o.time_desc);
-    let do_fill = needs_with_fill && time_col.is_some();
+    let do_fill = ordered && needs_with_fill && time_col.is_some();
     // ClickHouse WITH FILL on a DESC-ordered column never matches the ascending
     // FROM/TO anchors we emit, so no fill rows are generated. Fill ascending in
     // this (inner) SELECT and re-order descending in a wrapper below.

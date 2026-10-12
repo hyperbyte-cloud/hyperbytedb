@@ -168,19 +168,30 @@ pub fn build_router(state: Arc<AppState>) -> Router {
                     auth_middleware::rate_limit_write_layer,
                 )),
         )
-        .route(
-            "/query",
-            get(query::handle_query_get)
-                .post(query::handle_query_post)
-                .layer(DefaultBodyLimit::max(body_limit))
-                .layer(axum::middleware::from_fn_with_state(
-                    auth_state.clone(),
-                    auth_middleware::auth_layer,
-                ))
-                .layer(axum::middleware::from_fn_with_state(
-                    auth_state.clone(),
-                    auth_middleware::rate_limit_query_layer,
-                )),
+        .merge(
+            Router::new()
+                .route(
+                    "/query",
+                    get(query::handle_query_get)
+                        .post(query::handle_query_post)
+                        .layer(DefaultBodyLimit::max(body_limit))
+                        .layer(axum::middleware::from_fn_with_state(
+                            auth_state.clone(),
+                            auth_middleware::auth_layer,
+                        ))
+                        .layer(axum::middleware::from_fn_with_state(
+                            auth_state.clone(),
+                            auth_middleware::rate_limit_query_layer,
+                        )),
+                )
+                // gzip when the client asks (Grafana does), as InfluxDB v1
+                // does: a 245-series Grafana panel was 11.4 MB of JSON.
+                // Fastest level: most of the gain for a fraction of the CPU.
+                .layer(
+                    tower_http::compression::CompressionLayer::new()
+                        .gzip(true)
+                        .quality(tower_http::CompressionLevel::Fastest),
+                ),
         )
         .route("/metrics", get(metrics::handle_metrics))
         .merge(statements_router)

@@ -1604,3 +1604,36 @@ fn a_materialized_view_source_filter_applies_to_raw_rows() {
         "{inner}"
     );
 }
+
+/// A sharded region's partial without ORDER BY or WITH FILL, for the
+/// coordinator to sort and fill.
+#[test]
+fn an_unordered_translation_has_no_order_or_fill() {
+    let stmt = parse_select(
+        "SELECT mean(\"usage_idle\") FROM \"cpu\" WHERE time >= 0 AND time <= 3600000000000 \
+         GROUP BY time(30s), \"host\" fill(none)",
+    );
+    let ordered = translate_native_table(
+        &stmt,
+        "t",
+        None,
+        None,
+        Some((Some(0), Some(3_600_000_000_000))),
+    )
+    .unwrap();
+    let unordered = translate_native_table_unordered(
+        &stmt,
+        "t",
+        None,
+        None,
+        Some((Some(0), Some(3_600_000_000_000))),
+    )
+    .unwrap();
+    assert!(ordered.contains("ORDER BY"), "{ordered}");
+    assert!(!unordered.contains("ORDER BY"), "{unordered}");
+    assert!(!unordered.contains("WITH FILL"), "{unordered}");
+    assert_eq!(
+        unordered.replace('\n', " "),
+        ordered[..ordered.find("\nORDER BY").unwrap()].replace('\n', " ")
+    );
+}

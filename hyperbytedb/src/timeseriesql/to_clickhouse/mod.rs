@@ -27,7 +27,8 @@ pub use materialized_view::{
 };
 pub use select::{
     legacy_field_alias, select_has_true_aggregate, select_output_field_name,
-    translate_native_table, translate_with_source, with_output_names,
+    translate_native_table, translate_native_table_unordered, translate_with_source,
+    with_output_names,
 };
 
 /// `SELECT ... INTO` requires `GROUP BY time(<interval>)` so results are bucketed

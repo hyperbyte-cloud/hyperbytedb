@@ -1459,3 +1459,42 @@ async fn set_query_pool_size_resizes_the_pool() {
     }
     assert_eq!(pool.pool_size(), 2, "a refused SET changes nothing");
 }
+
+/// `/query` answers gzipped when the client asks, as InfluxDB v1 does, and
+/// plain otherwise. A 245-series Grafana panel was 11.4 MB uncompressed.
+#[tokio::test]
+#[serial(chdb)]
+async fn query_responses_are_gzipped_on_request() {
+    use std::io::Read;
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _flush) = setup(&dir);
+    let (url, _handle) = start_server(state).await;
+    let client = reqwest::Client::new();
+    let get = |gzip: bool| {
+        let mut req = client
+            .get(format!("{url}/query"))
+            .query(&[("q", "SHOW DATABASES")]);
+        if gzip {
+            req = req.header("accept-encoding", "gzip");
+        }
+        async move { req.send().await.unwrap() }
+    };
+
+    let plain = get(false).await;
+    assert_eq!(plain.headers().get("content-encoding"), None);
+    let plain_body = plain.bytes().await.unwrap();
+
+    let gz = get(true).await;
+    assert_eq!(gz.status(), StatusCode::OK);
+    assert_eq!(
+        gz.headers()
+            .get("content-encoding")
+            .map(|v| v.to_str().unwrap()),
+        Some("gzip")
+    );
+    let mut decoded = Vec::new();
+    flate2::read::GzDecoder::new(&gz.bytes().await.unwrap()[..])
+        .read_to_end(&mut decoded)
+        .unwrap();
+    assert_eq!(decoded, plain_body);
+}
