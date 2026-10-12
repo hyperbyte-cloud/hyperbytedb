@@ -143,7 +143,12 @@ and splits once a region passes `region_split_series` (100k). Small
 neighbouring regions (under `region_merge_series`, 20k, together) are moved
 onto the same nodes and merged back. A query touches every region it can
 not rule out, and waits for the slowest, so fewer regions is faster: on UAT
-a 1-region query took 11-13 ms where a 10-region one took 20-60 ms.
+a 1-region query took 11-13 ms where a 10-region one took 20-60 ms. After
+UAT's 130 regions collapsed to 13 (one per measurement; 7 minutes with
+`split_merge_interval_secs = 60`), per-host panels took 15-22 ms p50. A
+245-series panel over 2 h took 117 ms against 53 ms on 10 regions: one
+region's data is read by one node, so very wide queries lose the fan-out
+they had (InfluxDB took 200 ms).
 
 Before `ebd92e8`, `bootstrap_regions_per_node` defaulted to 2: every
 new measurement started with two regions per node, even one of 30 rows, and
