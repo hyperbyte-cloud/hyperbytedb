@@ -250,6 +250,10 @@ async fn post_region_heartbeat(
     let resp = peer_client
         .http_client()
         .post(url)
+        .header(
+            crate::domain::sharding::types::NODE_FEATURES_HEADER,
+            crate::domain::sharding::types::FEATURE_CROSS_EPOCH_MERGE,
+        )
         .json(hb)
         .timeout(Duration::from_secs(5))
         .send()

@@ -374,6 +374,15 @@ mod locate_tests {
     }
 }
 
+/// Header on region heartbeats listing what the reporting build supports.
+/// A header, not a heartbeat field: `RegionHeartbeat` refuses unknown fields,
+/// so a leader on an older build would have rejected every report.
+pub const NODE_FEATURES_HEADER: &str = "x-hyperbytedb-features";
+/// The node applies a `Merge` whose two regions are at different epochs
+/// (`right_epoch`). Proposed only once every node reports it: an older node
+/// would refuse such a merge that the others apply.
+pub const FEATURE_CROSS_EPOCH_MERGE: &str = "cross-epoch-merge";
+
 /// Per-region stats reported by store nodes to the Raft leader (PD-lite).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

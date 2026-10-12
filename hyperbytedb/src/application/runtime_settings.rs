@@ -83,6 +83,7 @@ pub const REGION_SPLIT_SERIES: &str = "region_split_series";
 pub const REGION_MAX_SERIES: &str = "region_max_series";
 pub const REGION_MERGE_SERIES: &str = "region_merge_series";
 pub const SPLIT_MERGE_INTERVAL_SECS: &str = "split_merge_interval_secs";
+pub const BOOTSTRAP_REGIONS_PER_NODE: &str = "bootstrap_regions_per_node";
 
 const BIG: i64 = 1 << 50;
 
@@ -213,6 +214,13 @@ pub const SETTINGS: &[Def] = &[
         86_400,
         "sharding.split_merge_interval_secs",
         "least time between a region's splits",
+    ),
+    int(
+        BOOTSTRAP_REGIONS_PER_NODE,
+        0,
+        16,
+        "sharding.bootstrap_regions_per_node",
+        "regions per node a new measurement starts with (0: one region that splits as it grows)",
     ),
 ];
 
@@ -516,6 +524,11 @@ pub fn set_config_fallbacks(config: &crate::config::HyperbytedbConfig) {
         set_fallback(REGION_MAX_SERIES, i(s.region_max_series), c);
         set_fallback(REGION_MERGE_SERIES, i(s.region_merge_series), c);
         set_fallback(SPLIT_MERGE_INTERVAL_SECS, i(s.split_merge_interval_secs), c);
+        set_fallback(
+            BOOTSTRAP_REGIONS_PER_NODE,
+            i(s.bootstrap_regions_per_node as u64),
+            c,
+        );
     }
 }
 

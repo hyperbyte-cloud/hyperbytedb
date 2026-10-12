@@ -128,8 +128,10 @@ pub struct ShardingConfig {
     #[serde(default)]
     pub forward_coalesce: bool,
     /// A new measurement starts with this many regions per active node,
-    /// already placed across the cluster (`0` or `1` node: one region, the
-    /// old behaviour). See `ShardMapOp::BootstrapMeasurementPresplit`.
+    /// already placed across the cluster. `0` (the default): one region, which
+    /// splits as it grows. Pre-splitting gave every measurement, even one of
+    /// 30 rows, ~10 regions on 5 nodes, and every query on it waited for the
+    /// slowest of them. See `ShardMapOp::BootstrapMeasurementPresplit`.
     #[serde(default = "default_bootstrap_regions_per_node")]
     pub bootstrap_regions_per_node: usize,
     /// Cluster-wide cap on region-transfer bytes per second for
@@ -298,7 +300,7 @@ fn default_binary_points_wire() -> bool {
 }
 
 fn default_bootstrap_regions_per_node() -> usize {
-    2
+    0
 }
 
 fn default_async_forward() -> bool {

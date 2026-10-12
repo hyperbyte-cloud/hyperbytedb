@@ -999,6 +999,7 @@ pub async fn handle_mv_handoff_chunk(
 
 pub async fn handle_shard_heartbeat(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<RegionHeartbeat>,
 ) -> impl IntoResponse {
     if req.node_id == 0 {
@@ -1059,6 +1060,16 @@ pub async fn handle_shard_heartbeat(
             .await;
         scheduler
             .record_split_hint(req.region_id, reporter, req.split_key_hint)
+            .await;
+        let cross_epoch_merge = headers
+            .get(crate::domain::sharding::types::NODE_FEATURES_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| {
+                v.split(',')
+                    .any(|f| f.trim() == crate::domain::sharding::types::FEATURE_CROSS_EPOCH_MERGE)
+            });
+        scheduler
+            .record_cross_epoch_merge(reporter, cross_epoch_merge)
             .await;
     }
     if stale_epoch {

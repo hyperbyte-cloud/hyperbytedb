@@ -508,8 +508,73 @@ pub fn move_rate_bytes_per_sec(tier: MoveTier, cap: u64, movers: usize) -> u64 {
     (cap / movers.max(1) as u64).max(1)
 }
 
+/// Give each run of small neighbouring regions the target of its first
+/// region, so they come to share nodes and can merge. `regions` is one
+/// measurement's regions in key order as `(region_id, series)`, `None` for a
+/// region not to touch (no size report yet, just split, ...). A run stops
+/// before its series would reach `merge_series`, where merging stops too.
+///
+/// Without this, regions spread across nodes by design never shared a node
+/// set, so they never merged: a measurement pre-split into 10 regions kept
+/// 10 though it held 30 rows, and every query waited on all of them.
+pub fn colocate_small_neighbours(
+    plan: &mut std::collections::HashMap<u64, Vec<u64>>,
+    regions: &[(u64, Option<u64>)],
+    merge_series: u64,
+) {
+    let mut run: Option<(u64, u64)> = None; // (head region, series so far)
+    for &(id, series) in regions {
+        let Some(series) = series.filter(|s| *s < merge_series) else {
+            run = None;
+            continue;
+        };
+        match run {
+            Some((head, total)) if total + series < merge_series => {
+                if let Some(target) = plan.get(&head).cloned() {
+                    plan.insert(id, target);
+                }
+                run = Some((head, total + series));
+            }
+            _ => run = Some((id, series)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn small_neighbours_share_their_first_regions_target() {
+        use std::collections::HashMap;
+        let t = |n: u64| vec![n, n + 1, n + 2];
+        let mut plan: HashMap<u64, Vec<u64>> = (1..=7).map(|id| (id, t(id * 10))).collect();
+        // 1-3 small (one run), 4 too big, 5 not reported, 6-7 small but the
+        // run would reach the threshold at 7.
+        colocate_small_neighbours(
+            &mut plan,
+            &[
+                (1, Some(10)),
+                (2, Some(20)),
+                (3, Some(30)),
+                (4, Some(1_000)),
+                (5, None),
+                (6, Some(400)),
+                (7, Some(600)),
+            ],
+            1_000,
+        );
+        assert_eq!(plan[&2], t(10));
+        assert_eq!(plan[&3], t(10));
+        assert_eq!(plan[&4], t(40), "too big to merge");
+        assert_eq!(plan[&5], t(50), "not reported");
+        assert_eq!(plan[&6], t(60));
+        assert_eq!(plan[&7], t(70), "6 + 7 would reach the threshold");
+        // A threshold of 0 turns merging, and so this, off.
+        let before = plan.clone();
+        colocate_small_neighbours(&mut plan, &[(1, Some(0)), (2, Some(0))], 0);
+        assert_eq!(plan, before);
+    }
+
     use super::*;
     use crate::domain::sharding::types::MeasurementKey;
 

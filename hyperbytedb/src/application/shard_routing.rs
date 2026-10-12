@@ -261,10 +261,11 @@ pub async fn build_bootstrap_op(
     measurement: &str,
 ) -> Result<ShardMapOp, HyperbytedbError> {
     let candidates = bootstrap_candidates(ctx).await;
-    let regions_wanted = ctx
-        .config
-        .bootstrap_regions_per_node
-        .saturating_mul(candidates.len());
+    let regions_wanted = crate::application::runtime_settings::usize_or(
+        crate::application::runtime_settings::BOOTSTRAP_REGIONS_PER_NODE,
+        ctx.config.bootstrap_regions_per_node,
+    )
+    .saturating_mul(candidates.len());
     // One node gains nothing from splitting: every region would land on it.
     if regions_wanted > 1 && candidates.len() > 1 {
         let map = ctx.shard_map.snapshot().await?;
@@ -1484,14 +1485,39 @@ mod scatter_tests {
         h3.abort();
     }
 
+    /// By default a new measurement is one region, which splits as it grows:
+    /// pre-splitting gave a 30-row measurement ~10 regions, and every query
+    /// on it waited for the slowest of them (UAT).
     #[tokio::test]
-    async fn a_new_measurement_is_bootstrapped_presplit_by_default() {
-        // Default config, three members: the bootstrap op itself carries
-        // every region, already spread, so the first writes never pile onto
-        // one node (n3 at N=12: one node led 17 of 25 regions and OOMed).
+    async fn a_new_measurement_starts_as_one_region_by_default() {
         let membership =
             membership_with(&[(1, "127.0.0.1:1"), (2, "127.0.0.1:2"), (3, "127.0.0.1:3")]);
         let ctx = test_ctx(membership, ShardingConfig::default(), 1);
+        let op = build_bootstrap_op(&ctx, "db", "autogen", "cpu")
+            .await
+            .unwrap();
+        assert!(
+            matches!(op, ShardMapOp::BootstrapMeasurement { .. }),
+            "expected one region, got {op:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_measurement_is_presplit_when_configured() {
+        // Three members, two regions per node: the bootstrap op itself
+        // carries every region, already spread, so the first writes never
+        // pile onto one node (n3 at N=12: one node led 17 of 25 regions and
+        // OOMed).
+        let membership =
+            membership_with(&[(1, "127.0.0.1:1"), (2, "127.0.0.1:2"), (3, "127.0.0.1:3")]);
+        let ctx = test_ctx(
+            membership,
+            ShardingConfig {
+                bootstrap_regions_per_node: 2,
+                ..ShardingConfig::default()
+            },
+            1,
+        );
         let op = build_bootstrap_op(&ctx, "db", "autogen", "cpu")
             .await
             .unwrap();

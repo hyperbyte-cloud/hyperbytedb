@@ -238,6 +238,7 @@ fn merge_op_consolidates_adjacent_regions() {
             left_region_id: 1,
             right_region_id: 2,
             epoch: left.epoch,
+            right_epoch: None,
             merged,
         },
     )

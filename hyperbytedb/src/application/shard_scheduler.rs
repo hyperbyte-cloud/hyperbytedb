@@ -102,17 +102,19 @@ const ROLLUP_HANDOFF_GIVE_UP: Duration = Duration::from_secs(30 * 60);
 const MAX_PROPOSAL_STEPS_PER_TICK: usize = 64;
 
 /// Whether two regions may merge: on exactly the same peers, none of them a
-/// learner, so no data moves; and at the same epoch, because the `Merge` op
-/// carries one epoch and its apply checks both regions against it. Pairs whose
-/// epochs had drifted apart were proposed, refused, and proposed again every
-/// tick, and their regions were never placed: on n3 that kept a decommission
-/// from finishing for 20 hours.
-fn mergeable(a: &ShardRegion, b: &ShardRegion) -> bool {
+/// learner, so no data moves; and at the same epoch unless every node applies
+/// a merge carrying both (`cross_epoch`). Moving a region's copies onto its
+/// neighbour's nodes changes its epoch, so co-located neighbours almost never
+/// share one. Before nodes could apply both epochs, pairs whose epochs had
+/// drifted apart were proposed, refused, and proposed again every tick, and
+/// their regions were never placed: on n3 that kept a decommission from
+/// finishing for 20 hours.
+fn mergeable(a: &ShardRegion, b: &ShardRegion, cross_epoch: bool) -> bool {
     let set = |r: &ShardRegion| r.peers.iter().copied().collect::<HashSet<u64>>();
     a.staging_peers.is_empty()
         && b.staging_peers.is_empty()
         && set(a) == set(b)
-        && a.epoch == b.epoch
+        && (cross_epoch || a.epoch == b.epoch)
 }
 
 /// Two adjacent regions a tick chose to merge.
@@ -300,6 +302,8 @@ pub struct ShardScheduler {
     heartbeats: tokio::sync::RwLock<Vec<RegionHeartbeatRow>>,
     /// (region_id, reporter) -> that peer's median series id for the region.
     split_hints: tokio::sync::RwLock<HashMap<(u64, u64), u64>>,
+    /// node -> whether its last heartbeat said it applies cross-epoch merges.
+    cross_epoch_merge: tokio::sync::RwLock<HashMap<u64, bool>>,
     /// region_id -> planned target (primary first), balancing copies and
     /// primaries across nodes; refreshed each tick. See `plan_placement`.
     placement_plan: tokio::sync::RwLock<HashMap<u64, Vec<u64>>>,
@@ -409,6 +413,7 @@ impl ShardScheduler {
             max_points_per_request,
             heartbeats: tokio::sync::RwLock::new(Vec::new()),
             split_hints: tokio::sync::RwLock::new(HashMap::new()),
+            cross_epoch_merge: tokio::sync::RwLock::new(HashMap::new()),
             placement_plan: tokio::sync::RwLock::new(HashMap::new()),
             region_operators: tokio::sync::RwLock::new(HashMap::new()),
             placement_last_attempted: tokio::sync::RwLock::new(HashMap::new()),
@@ -880,6 +885,26 @@ impl ShardScheduler {
         ));
     }
 
+    /// Remember whether `node_id`'s build applies cross-epoch merges.
+    pub async fn record_cross_epoch_merge(&self, node_id: u64, supported: bool) {
+        self.cross_epoch_merge
+            .write()
+            .await
+            .insert(node_id, supported);
+    }
+
+    /// Every node that may hold regions has said it applies a merge of two
+    /// regions at different epochs. Until then (a rolling upgrade, or a node
+    /// yet to report) only same-epoch merges are proposed. This node runs
+    /// this build, so it counts.
+    async fn cross_epoch_merge_ready(&self) -> bool {
+        let candidates = self.active_candidate_ids().await;
+        let reported = self.cross_epoch_merge.read().await;
+        candidates
+            .iter()
+            .all(|id| *id == self.node_id || reported.get(id).copied().unwrap_or(false))
+    }
+
     /// Remember (or forget) a peer's split-key hint for a region.
     pub async fn record_split_hint(&self, region_id: u64, node_id: u64, hint: Option<u64>) {
         let mut hints = self.split_hints.write().await;
@@ -1122,12 +1147,36 @@ impl ShardScheduler {
         }
         let rf = effective_replication_factor(self.config.replication_factor, candidates.len());
         let mut inputs = Vec::new();
+        let merge_series = rs::u64_or(rs::REGION_MERGE_SERIES, self.config.region_merge_series);
+        let cooldown = rs::u64_or(
+            rs::SPLIT_MERGE_INTERVAL_SECS,
+            self.config.split_merge_interval_secs,
+        );
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Per measurement, in key order: a region's series if it may be
+        // co-located with its neighbours for a merge.
+        let mut merge_runs: Vec<Vec<(u64, Option<u64>)>> = Vec::new();
         {
             let hb = self.heartbeats.read().await;
             for space in map.spaces.values() {
                 if self.is_rollup_dest(&space.key).await {
                     continue;
                 }
+                merge_runs.push(
+                    space
+                        .regions
+                        .iter()
+                        .map(|r| {
+                            let reported = hb.iter().any(|row| row.0 == r.region_id);
+                            let settled = now.saturating_sub(r.last_split_at) >= cooldown;
+                            let series = max_region_peer_heartbeat_stats(&hb, r).0;
+                            (r.region_id, (reported && settled).then_some(series))
+                        })
+                        .collect(),
+                );
                 let reported: Vec<(u64, u64)> = space
                     .regions
                     .iter()
@@ -1158,7 +1207,14 @@ impl ShardScheduler {
                 }
             }
         }
-        let plan = plan_placement(&inputs, rf, PRIMARY_BALANCE_TOLERANCE_PCT);
+        let mut plan = plan_placement(&inputs, rf, PRIMARY_BALANCE_TOLERANCE_PCT);
+        for run in &merge_runs {
+            crate::domain::sharding::placement::colocate_small_neighbours(
+                &mut plan,
+                run,
+                merge_series,
+            );
+        }
         *self.placement_plan.write().await = plan;
     }
 
@@ -1209,6 +1265,7 @@ impl ShardScheduler {
         let map = self.shard_map.snapshot().await?;
         self.prune_region_counters(&map).await;
         self.refresh_placement_plan(&map).await;
+        let cross_epoch = self.cross_epoch_merge_ready().await;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -1332,7 +1389,7 @@ impl ShardScheduler {
                                 rs::SPLIT_MERGE_INTERVAL_SECS,
                                 self.config.split_merge_interval_secs,
                             )
-                        && mergeable(region, right)
+                        && mergeable(region, right, cross_epoch)
                         && !self.region_has_operator(right.region_id).await
                     {
                         // Run in the background, holding both regions: a
@@ -1924,7 +1981,8 @@ impl ShardScheduler {
         // a snapshot, and the right's writes during the copy never reached
         // them: on n3 one merge lost 2.02M acked points, 1.1% of the writes
         // of a 3 -> 6 scale-up.
-        if !mergeable(left, &right) {
+        let cross_epoch = self.cross_epoch_merge_ready().await;
+        if !mergeable(left, &right, cross_epoch) {
             tracing::debug!(
                 left_region_id = left.region_id,
                 right_region_id = right.region_id,
@@ -1934,7 +1992,12 @@ impl ShardScheduler {
         }
         let mut merged = left.clone();
         merged.end = right.end;
-        merged.epoch = left.epoch.bump_version();
+        // Newer than both halves, so a report at either old epoch reads stale.
+        merged.epoch = crate::domain::sharding::ShardEpoch {
+            conf_ver: left.epoch.conf_ver.max(right.epoch.conf_ver),
+            version: left.epoch.version.max(right.epoch.version),
+        }
+        .bump_version();
         merged.last_split_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -1945,6 +2008,7 @@ impl ShardScheduler {
             left_region_id: left.region_id,
             right_region_id: right.region_id,
             epoch: left.epoch,
+            right_epoch: (right.epoch != left.epoch).then_some(right.epoch),
             merged,
         };
         self.propose(op).await?;
@@ -6467,16 +6531,103 @@ mod tests {
             "the apply checks both regions against one epoch, so it would refuse"
         );
 
+        // Once every node applies a merge at two epochs, it is proposed,
+        // carrying the right region's.
+        harness.scheduler.record_cross_epoch_merge(2, true).await;
+        harness
+            .scheduler
+            .try_merge(&key, &left, right.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            merges(&harness),
+            1,
+            "every node applies a cross-epoch merge"
+        );
+        let carried = harness
+            .proposals
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|op| match op {
+                ShardMapOp::Merge {
+                    right_epoch,
+                    merged,
+                    ..
+                } => Some((*right_epoch, merged.epoch)),
+                _ => None,
+            });
+        let (right_epoch, merged_epoch) = carried.unwrap();
+        assert_eq!(right_epoch, Some(right.epoch));
+        assert!(
+            merged_epoch.conf_ver >= right.epoch.conf_ver
+                && merged_epoch.version > left.epoch.version
+        );
+        harness.scheduler.record_cross_epoch_merge(2, false).await;
+
         right.epoch = left.epoch;
         harness
             .scheduler
             .try_merge(&key, &left, right)
             .await
             .unwrap();
-        assert_eq!(merges(&harness), 1, "same peers in any order may merge");
+        assert_eq!(merges(&harness), 2, "same peers in any order may merge");
         assert!(
             harness.pushes[&2].lock().unwrap().is_empty(),
             "a merge moves no data"
+        );
+    }
+
+    /// Small neighbouring regions on different nodes are planned onto the
+    /// first one's nodes, so they can merge; a big one keeps its own target.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn small_neighbours_are_planned_onto_the_same_nodes() {
+        let harness = PlacementTestHarness::new(true, &[(2, 0), (3, 0), (4, 0)], 1).await;
+        let key = PlacementTestHarness::key();
+        let third = u64::MAX / 3;
+        let region = |id: u64, start: u64, end: u64, peers: Vec<u64>| {
+            let mut r = sample_region_peers(peers.clone(), peers[0]);
+            r.region_id = id;
+            r.start = start;
+            r.end = end;
+            r
+        };
+        let mut map = ShardMap::default();
+        map.spaces.insert(
+            key.clone(),
+            crate::domain::sharding::types::MeasurementShardSpace {
+                key: key.clone(),
+                regions: vec![
+                    region(11, 0, third, vec![1, 2, 3]),
+                    region(12, third, 2 * third, vec![2, 3, 4]),
+                    region(13, 2 * third, u64::MAX, vec![4, 1, 2]),
+                ],
+            },
+        );
+        harness.scheduler.record_heartbeat(11, 1, 30, 0, 0).await;
+        harness.scheduler.record_heartbeat(12, 2, 40, 0, 0).await;
+        harness
+            .scheduler
+            .record_heartbeat(13, 4, 500_000, 0, 0)
+            .await;
+        harness.scheduler.refresh_placement_plan(&map).await;
+        let plan = harness.scheduler.placement_plan.read().await.clone();
+        let set = |id: u64| {
+            let mut v = plan[&id].clone();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(
+            set(12),
+            set(11),
+            "small neighbours share a target: {plan:?}"
+        );
+        assert_eq!(plan[&12][0], plan[&11][0], "and a primary");
+        assert_ne!(
+            set(13),
+            set(11),
+            "a region too big to merge keeps its own: {plan:?}"
         );
     }
 

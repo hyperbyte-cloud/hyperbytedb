@@ -62,6 +62,12 @@ pub enum ShardMapOp {
         right_region_id: u64,
         #[serde(default)]
         epoch: ShardEpoch,
+        /// The right region's epoch when it differs from the left's (moving
+        /// one region's copies onto its neighbour's nodes changes only its
+        /// epoch). Absent: both are at `epoch`, as every merge was before;
+        /// omitted then, so an older node decodes the op unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        right_epoch: Option<ShardEpoch>,
         merged: ShardRegion,
     },
     MovePeer {
@@ -370,6 +376,7 @@ pub fn apply_shard_map_op(
             left_region_id,
             right_region_id,
             epoch,
+            right_epoch,
             merged,
         } => {
             let space = map
@@ -398,7 +405,7 @@ pub fn apply_shard_map_op(
             // The right half's data was staged onto the merged owner based on
             // its state at proposal time; a concurrently changed right region
             // (MovePeer/TransferPrimary) invalidates that staging.
-            if space.regions[ri].epoch != epoch {
+            if space.regions[ri].epoch != right_epoch.unwrap_or(epoch) {
                 return Err(ShardMapApplyError::StaleEpoch("Merge right region"));
             }
             space.regions.remove(ri);
@@ -717,6 +724,7 @@ mod tests {
                 left_region_id: 1,
                 right_region_id: 2,
                 epoch: left.epoch,
+                right_epoch: None,
                 merged,
             },
         )
@@ -765,10 +773,11 @@ mod tests {
         let err = apply_shard_map_op(
             &mut map,
             ShardMapOp::Merge {
-                key,
+                key: key.clone(),
                 left_region_id: 1,
                 right_region_id: 2,
                 epoch: ShardEpoch::default(),
+                right_epoch: None,
                 merged: sample_region(1, 0, u64::MAX, 1),
             },
         )
@@ -777,6 +786,37 @@ mod tests {
             err.to_string().contains("stale epoch on Merge right"),
             "{err}"
         );
+
+        // Carrying the right region's own epoch, the same merge applies.
+        let right_now = map.spaces[&key].regions[1].epoch;
+        let op = ShardMapOp::Merge {
+            key: key.clone(),
+            left_region_id: 1,
+            right_region_id: 2,
+            epoch: ShardEpoch::default(),
+            right_epoch: Some(right_now),
+            merged: sample_region(1, 0, u64::MAX, 1),
+        };
+        apply_shard_map_op(&mut map, op).unwrap();
+        assert_eq!(map.spaces[&key].regions.len(), 1);
+    }
+
+    /// A same-epoch merge serializes as before `right_epoch` existed, so a
+    /// node on an older build decodes it unchanged.
+    #[test]
+    fn a_same_epoch_merge_omits_right_epoch() {
+        let op = ShardMapOp::Merge {
+            key: MeasurementKey::new("db", "autogen", "cpu"),
+            left_region_id: 1,
+            right_region_id: 2,
+            epoch: ShardEpoch::default(),
+            right_epoch: None,
+            merged: sample_region(1, 0, u64::MAX, 1),
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        assert!(!json.contains("right_epoch"), "{json}");
+        let back: ShardMapOp = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, op);
     }
 
     #[test]
