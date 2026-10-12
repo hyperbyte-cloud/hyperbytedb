@@ -108,6 +108,11 @@ pre-scale-up data until this is fixed.
   10-host `GROUP BY host` queries over 6 regions, p50 was 250-450 ms with a
   pool of 1 and 90-130 ms with a pool of 4; a single such query alone takes
   about 55 ms, the same as one host.
+- The coordinator merges every region's partial result. Before `bbadb08`
+  that merge was quadratic in rows per series: a Grafana panel (mean per
+  30 s by host over 12 h, 5 hosts, 10 regions) spent 746 of 804 ms merging.
+  On `bbadb08` the same query takes 70-150 ms on the UAT cluster: about
+  60-90 ms in the region queries and 18 ms merging.
 - A point lookup (`last(value)` for one host) is 30-60 ms p50 under the same
   load.
 - Read bench with 90M points (4 concurrent clients, p50), at 3 nodes and
@@ -212,6 +217,11 @@ login in Secret `<cluster>-auth` and every node gets them as env (see
   `write partially applied` 500s for about two minutes. Telegraf retries
   from its buffer; all 13 of its measurements were present afterwards (point
   counts across the restart were not checked).
+
+- Changing `spec.version` (or the image) rolls the pods one at a time
+  through the StatefulSet: 6 UAT pods took 13 minutes, about 2 minutes each
+  (mostly the old pod draining). Telegraf logged 50 retried write errors over
+  the whole rollout.
 
 ## Runtime settings
 
