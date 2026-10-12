@@ -293,14 +293,46 @@ fn encode_wal_chunk(points: &[Point]) -> Result<Vec<u8>, HyperbytedbError> {
 /// Returns `(encoded_body, exported_count, last_series_id_in_batch)`; an empty
 /// body means export is complete.
 #[allow(clippy::too_many_arguments)]
+/// Where a region export resumes: strictly after this row in the fact table's
+/// order, `(series_id, time, ingest_seq)`.
+///
+/// The export paged on `series_id` alone, re-reading the boundary series
+/// from its start. A series with more rows than one chunk then never
+/// advanced, and its remaining rows were skipped with a warning: any series
+/// older than about 6 days at 10 s resolution lost rows on every move.
+/// `ingest_seq` keeps two versions of one point split across chunks from
+/// losing the second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExportCursor {
+    pub series_id: u64,
+    pub time_nanos: i64,
+    pub ingest_seq: u64,
+}
+
+/// One chunk of a region export: the line-protocol body, the points in it,
+/// the rows read (a row without fields sends nothing but still counts), and
+/// where the next chunk starts (`None` when nothing was read).
+pub struct ExportChunk {
+    pub body: Vec<u8>,
+    pub points: usize,
+    pub rows: usize,
+    pub next: Option<ExportCursor>,
+}
+
 pub async fn export_region_points_from_chdb(
     query: &dyn QueryPort,
     metadata: &dyn MetadataPort,
     key: &MeasurementKey,
     region: &ShardRegion,
-    after_series_id: Option<u64>,
+    after: Option<ExportCursor>,
     max_points: usize,
-) -> Result<(Vec<u8>, usize, Option<u64>), HyperbytedbError> {
+) -> Result<ExportChunk, HyperbytedbError> {
+    let empty = ExportChunk {
+        body: Vec::new(),
+        points: 0,
+        rows: 0,
+        next: None,
+    };
     use crate::domain::chdb_naming::{
         field_column_name, quote_backticks, quoted_series_table_name, quoted_table_name,
     };
@@ -315,15 +347,23 @@ pub async fn export_region_points_from_chdb(
         .get_measurement(&key.db, &key.rp, &key.measurement)
         .await?
     else {
-        return Ok((Vec::new(), 0, None));
+        return Ok(empty);
     };
 
     let mapping = ColumnMapping::from_measurement_meta(&meta);
     let fact = quoted_table_name(&key.db, &key.rp, &key.measurement);
     let series = quoted_series_table_name(&key.db, &key.rp, &key.measurement);
 
-    let mut fact_cols = vec!["`time`".to_string(), "`series_id`".to_string()];
-    let mut select_cols = vec!["f.`time`".to_string(), "f.`series_id`".to_string()];
+    let mut fact_cols = vec![
+        "`time`".to_string(),
+        "`series_id`".to_string(),
+        "`ingest_seq`".to_string(),
+    ];
+    let mut select_cols = vec![
+        "f.`time`".to_string(),
+        "f.`series_id`".to_string(),
+        "f.`ingest_seq`".to_string(),
+    ];
     for field in mapping.field_names.iter() {
         let phys = quote_backticks(&field_column_name(field));
         select_cols.push(format!("f.{phys}"));
@@ -342,17 +382,24 @@ pub async fn export_region_points_from_chdb(
     // "this node has no series row for this series_id at all".
     select_cols.push("s.`series_id` AS `__joined_series_id`".to_string());
 
-    let mut predicates = Vec::new();
-    match after_series_id {
-        // Inclusive re-read of the boundary series keeps tie-grouped rows
-        // (same series, split across chunk boundaries) from being skipped.
-        Some(sid) => predicates.push(format!("`series_id` >= {sid}")),
-        None => predicates.push(format!("`series_id` >= {}", region.start)),
-    }
+    // Series range for both tables; the fact table also resumes after the
+    // cursor row.
+    let mut predicates = vec![format!(
+        "`series_id` >= {}",
+        after.map_or(region.start, |c| c.series_id)
+    )];
     if region.end != u64::MAX {
         predicates.push(format!("`series_id` < {}", region.end));
     }
     let range = predicates.join(" AND ");
+    let fact_range = match after {
+        Some(c) => format!(
+            "{range} AND (`series_id`, `time`, `ingest_seq`) > \
+             ({}, fromUnixTimestamp64Nano({}, 'UTC'), {})",
+            c.series_id, c.time_nanos, c.ingest_seq
+        ),
+        None => range.clone(),
+    };
 
     // The chunk is cut from the fact table before the join, in its sort
     // order, so it reads about one chunk; and only the range's series are
@@ -360,11 +407,11 @@ pub async fn export_region_points_from_chdb(
     // hashed every series on the node for each chunk: on n3 0.24 s a chunk
     // against 0.06 s, for the same 50,000 rows.
     let sql = format!(
-        "SELECT {} FROM (SELECT {} FROM {fact} WHERE {range} \
-         ORDER BY `series_id`, `time` LIMIT {max_points}) AS f \
+        "SELECT {} FROM (SELECT {} FROM {fact} WHERE {fact_range} \
+         ORDER BY `series_id`, `time`, `ingest_seq` LIMIT {max_points}) AS f \
          ANY LEFT JOIN (SELECT {} FROM {series} WHERE {range}) AS s \
          ON f.`series_id` = s.`series_id` \
-         ORDER BY f.`series_id`, f.`time` \
+         ORDER BY f.`series_id`, f.`time`, f.`ingest_seq` \
          FORMAT JSONEachRow",
         select_cols.join(", "),
         fact_cols.join(", "),
@@ -373,10 +420,12 @@ pub async fn export_region_points_from_chdb(
 
     let raw = query.execute_sql(&sql).await?;
     if raw.trim().is_empty() {
-        return Ok((Vec::new(), 0, None));
+        return Ok(empty);
     }
 
     let mut points = Vec::new();
+    let mut rows = 0usize;
+    let mut next: Option<ExportCursor> = None;
     for line in raw.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -417,6 +466,17 @@ pub async fn export_region_points_from_chdb(
             ));
         }
 
+        let timestamp = point_timestamp(obj, &key.measurement)?;
+        rows += 1;
+        next = Some(ExportCursor {
+            series_id: fact_sid,
+            time_nanos: timestamp,
+            ingest_seq: obj
+                .get("ingest_seq")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+        });
+
         let mut tags = BTreeMap::new();
         for tag in &mapping.tag_keys {
             let phys = mapping.physical_tag_column_name(tag);
@@ -440,7 +500,6 @@ pub async fn export_region_points_from_chdb(
             }
         }
 
-        let timestamp = point_timestamp(obj, &key.measurement)?;
         if fields.is_empty() {
             continue;
         }
@@ -454,13 +513,17 @@ pub async fn export_region_points_from_chdb(
         });
     }
 
-    let count = points.len();
-    if count == 0 {
-        return Ok((Vec::new(), 0, None));
-    }
-    let last_sid = series_id_for_point(&points[count - 1]);
-    let body = encode_points_to_line_protocol(&points, Precision::Nanosecond)?;
-    Ok((body, count, Some(last_sid)))
+    let body = if points.is_empty() {
+        Vec::new()
+    } else {
+        encode_points_to_line_protocol(&points, Precision::Nanosecond)?
+    };
+    Ok(ExportChunk {
+        body,
+        points: points.len(),
+        rows,
+        next,
+    })
 }
 
 /// Extract a point timestamp from an exported chDB row.
@@ -669,6 +732,32 @@ fn new_transfer_id() -> u64 {
 /// 16 GiB on every scale-up on n3.
 pub(crate) const TRANSFER_CHUNK_POINTS: usize = 50_000;
 
+/// Fewest points a chunk is cut down to after 413s.
+const MIN_TRANSFER_CHUNK_POINTS: usize = 100;
+
+/// Whether a push was refused as too large and the chunk can still shrink;
+/// if so `max_points` is halved for the rest of the transfer.
+fn smaller_chunks_after(
+    pushed: &Result<(u64, u64), HyperbytedbError>,
+    max_points: &mut usize,
+) -> bool {
+    if matches!(
+        pushed,
+        Err(HyperbytedbError::TransferRejected { status: 413, .. })
+    ) && *max_points > MIN_TRANSFER_CHUNK_POINTS
+    {
+        *max_points = (*max_points / 2).max(MIN_TRANSFER_CHUNK_POINTS);
+        counter!("hyperbytedb_shard_transfer_chunk_shrunk_total").increment(1);
+        tracing::info!(
+            max_points = *max_points,
+            "transfer chunk too large for the receiver; halved"
+        );
+        true
+    } else {
+        false
+    }
+}
+
 /// How long to wait so `sent` bytes over `elapsed` stay at or under `rate`
 /// bytes per second. A rate of 0 is unpaced.
 fn pacing_delay(rate: u64, sent: u64, elapsed: std::time::Duration) -> std::time::Duration {
@@ -703,7 +792,11 @@ async fn transfer_region_data(
             bytes: 0,
         });
     }
-    let max_points = max_points.clamp(1, TRANSFER_CHUNK_POINTS);
+    // Halved when the receiver refuses a chunk as too large (413): the cap is
+    // in points, the receiver's limit in bytes, and a point of a wide
+    // measurement (Telegraf's cpu: 10 fields plus tags) is many times one of
+    // a single field. The move otherwise retried the same chunk forever.
+    let mut max_points = max_points.clamp(1, TRANSFER_CHUNK_POINTS);
     let transfer_id = new_transfer_id();
     let mut seq = 0u64;
     let mut exported = 0u64;
@@ -732,7 +825,7 @@ async fn transfer_region_data(
         let (body, count, next_cursor) =
             export_region_points_from_wal_chunked(wal, key, region, cursor, max_points, 0).await?;
         if !body.is_empty() {
-            let (chunk_applied, chunk_bytes) = push_region_transfer(
+            let pushed = push_region_transfer(
                 peer_client.as_ref(),
                 source_node_id,
                 key,
@@ -744,7 +837,11 @@ async fn transfer_region_data(
                 false,
                 stage,
             )
-            .await?;
+            .await;
+            if smaller_chunks_after(&pushed, &mut max_points) {
+                continue; // the same rows again, in a smaller chunk
+            }
+            let (chunk_applied, chunk_bytes) = pushed?;
             exported += count as u64;
             applied += chunk_applied;
             bytes += chunk_bytes;
@@ -772,22 +869,30 @@ async fn transfer_region_data(
     // `GROUP BY (series_id, time)` coalescing view, so a re-exported row
     // collapses against the replicated one before any aggregate sees it.
     if let Some(query) = query_port {
-        let mut after_series_id: Option<u64> = None;
+        let mut after: Option<ExportCursor> = None;
         loop {
-            let (body, count, last_sid) = export_region_points_from_chdb(
+            let chunk = export_region_points_from_chdb(
                 query.as_ref(),
                 metadata.as_ref(),
                 key,
                 region,
-                after_series_id,
+                after,
                 max_points,
             )
             .await?;
-            if body.is_empty() {
+            if chunk.rows == 0 {
                 break;
             }
-            let done = count < max_points;
-            let (chunk_applied, chunk_bytes) = push_region_transfer(
+            let done = chunk.rows < max_points;
+            if chunk.body.is_empty() {
+                after = chunk.next;
+                if done {
+                    break;
+                }
+                continue;
+            }
+            let (body, count) = (chunk.body, chunk.points);
+            let pushed = push_region_transfer(
                 peer_client.as_ref(),
                 source_node_id,
                 key,
@@ -799,7 +904,12 @@ async fn transfer_region_data(
                 done,
                 stage,
             )
-            .await?;
+            .await;
+            if smaller_chunks_after(&pushed, &mut max_points) {
+                continue; // `after` unchanged: the same rows, smaller chunks
+            }
+            let (chunk_applied, chunk_bytes) = pushed?;
+            after = chunk.next;
             exported += count as u64;
             applied += chunk_applied;
             bytes += chunk_bytes;
@@ -810,24 +920,6 @@ async fn transfer_region_data(
             }
             if done {
                 break;
-            }
-            // Full batch whose boundary series did not advance means one
-            // single series exceeds the chunk cap: force past it rather than
-            // re-reading the same rows forever (remainder skipped, warned).
-            match (last_sid, after_series_id) {
-                (Some(ls), prev) if ls == prev.unwrap_or(u64::MAX) && ls != u64::MAX => {
-                    tracing::warn!(
-                        db = %key.db,
-                        rp = %key.rp,
-                        measurement = %key.measurement,
-                        series_id = ls,
-                        max_points,
-                        "single series exceeds transfer chunk cap; skipping its overflow rows"
-                    );
-                    after_series_id = Some(ls.saturating_add(1));
-                }
-                (Some(ls), _) => after_series_id = Some(ls),
-                (None, _) => break,
             }
         }
     }
@@ -1132,7 +1224,7 @@ mod tests {
             staged_from: None,
             staging_peers: Vec::new(),
         };
-        let (body, count, last) = export_region_points_from_chdb(
+        let chunk = export_region_points_from_chdb(
             query.as_ref(),
             metadata.as_ref(),
             &MeasurementKey::new("db", "autogen", "cpu_1m"),
@@ -1142,9 +1234,180 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(body.is_empty());
-        assert_eq!(count, 0);
-        assert_eq!(last, None);
+        assert!(chunk.body.is_empty());
+        assert_eq!(chunk.points, 0);
+        assert_eq!(chunk.next, None);
+    }
+
+    /// A copy sends every row of a series longer than a chunk, and of a wide
+    /// measurement whose chunks are too big for the receiver. Paging on
+    /// series_id alone never got past a long series and skipped its rest; a
+    /// chunk over the receiver's byte limit was refused (413) forever.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn a_copy_sends_long_series_whole_and_shrinks_chunks_on_413() {
+        use crate::adapters::chdb::native_adapter::ChdbNativeAdapter;
+        use crate::adapters::chdb::query_adapter::ChdbQueryAdapter;
+        use crate::adapters::chdb::session::SharedSession;
+        use crate::adapters::cluster::peer_client::PeerClient;
+        use crate::adapters::cluster::replication_log::ReplicationLog;
+        use crate::adapters::wal::rocksdb_wal::RocksDbWal;
+        use crate::application::ingest_metadata::{
+            IngestCardinalityLimits, prepare_batch_metadata,
+        };
+        use crate::domain::cluster::membership::{
+            ClusterMembership, NodeInfo, NodeState, new_shared,
+        };
+        use crate::domain::point::{FieldValue, Point};
+        use crate::ports::points_sink::PointsSinkPort;
+
+        const LIMIT: usize = 15_000;
+        let received: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let refused = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (seen, nope) = (received.clone(), refused.clone());
+        let app = axum::Router::new().route(
+            "/internal/shard/transfer",
+            axum::routing::post(move |body: axum::body::Bytes| {
+                let (seen, nope) = (seen.clone(), nope.clone());
+                async move {
+                    if body.len() > LIMIT {
+                        nope.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        return (axum::http::StatusCode::PAYLOAD_TOO_LARGE, "too big")
+                            .into_response();
+                    }
+                    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let raw: Vec<u8> = payload["body"]
+                        .as_array()
+                        .map(|b| {
+                            b.iter()
+                                .filter_map(|v| v.as_u64())
+                                .map(|n| n as u8)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let lines: Vec<String> = String::from_utf8_lossy(&raw)
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .map(str::to_string)
+                        .collect();
+                    let n = lines.len();
+                    seen.lock().unwrap().extend(lines);
+                    axum::Json(serde_json::json!({ "applied": n })).into_response()
+                }
+            }),
+        );
+        use axum::response::IntoResponse;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = ClusterMembership::new();
+        m.add_node(NodeInfo {
+            node_id: 2,
+            addr,
+            state: NodeState::Active,
+            joined_at: 0,
+            last_heartbeat: 0,
+            needs_sync: false,
+            consecutive_misses: 0,
+        });
+        let pc = Arc::new(PeerClient::new(
+            1,
+            "127.0.0.1:1".into(),
+            new_shared(m),
+            Arc::new(ReplicationLog::open(dir.path().join("repl")).unwrap()),
+            3,
+            64,
+            2,
+            1 << 20,
+        ));
+        let chdb = SharedSession::new_eager(dir.path().join("chdb").to_str().unwrap(), 1).unwrap();
+        let query: Arc<dyn QueryPort> = Arc::new(ChdbQueryAdapter::from_shared(chdb.clone(), 0));
+        let sink = ChdbNativeAdapter::new(chdb);
+        let metadata: Arc<dyn MetadataPort> =
+            Arc::new(RocksDbMetadata::open(dir.path().join("meta")).unwrap());
+        let wal: Arc<dyn WalPort> = Arc::new(RocksDbWal::open(dir.path().join("wal")).unwrap());
+
+        let point = |host: &str, i: i64, v: f64| Point {
+            measurement: "cpu".into(),
+            tags: host_tag(host),
+            fields: [("v".to_string(), FieldValue::Float(v))].into(),
+            timestamp: (i + 1) * 1_000_000_000,
+            series_id_cache: Default::default(),
+        };
+        // One series of 1,000 points (more than a chunk), a second short
+        // one, and a second version of one point of the first.
+        let long: Vec<Point> = (0..1_000).map(|i| point("h0", i, 1.0)).collect();
+        let short: Vec<Point> = (0..10).map(|i| point("h1", i, 2.0)).collect();
+        let again = vec![point("h0", 400, 9.0)];
+        let limits = IngestCardinalityLimits {
+            max_tag_values_per_measurement: 0,
+            max_measurements_per_database: 0,
+        };
+        let all: Vec<Point> = long.iter().chain(&short).chain(&again).cloned().collect();
+        prepare_batch_metadata(&metadata, "db", "autogen", &all, limits, None)
+            .await
+            .unwrap();
+        for (seq, pts) in [(1u64, &long), (10_000, &short), (20_000, &again)] {
+            sink.write_points("db", "autogen", "cpu", &vec![0; pts.len()], seq, pts)
+                .await
+                .unwrap();
+        }
+        wal.set_flushed_through(u64::MAX / 2);
+
+        let region = ShardRegion {
+            region_id: 1,
+            start: 0,
+            end: u64::MAX,
+            epoch: Default::default(),
+            peers: vec![1],
+            primary: 1,
+            last_split_at: 0,
+            transfer_verified: None,
+            transfer_first_seen: None,
+            state: Default::default(),
+            staged_from: None,
+            staging_peers: Vec::new(),
+        };
+        let outcome = transfer_region_data(
+            &pc,
+            &metadata,
+            &wal,
+            Some(&query),
+            1,
+            &MeasurementKey::new("db", "autogen", "cpu"),
+            &region,
+            2,
+            400,
+            true,
+            0,
+        )
+        .await
+        .unwrap();
+
+        let lines = received.lock().unwrap().clone();
+        assert!(
+            refused.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the receiver refused some"
+        );
+        assert_eq!(
+            lines.len(),
+            1_011,
+            "every row once, both versions of the doubled point"
+        );
+        assert_eq!(outcome.exported, 1_011);
+        let h0: std::collections::BTreeSet<&str> = lines
+            .iter()
+            .filter(|l| l.contains("host=h0"))
+            .map(|l| l.rsplit(' ').next().unwrap())
+            .collect();
+        assert_eq!(h0.len(), 1_000, "every timestamp of the long series");
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("v=9")).count(),
+            1,
+            "the second version"
+        );
     }
 
     /// A copy sends each row once: flushed rows from chDB, the rest from the
