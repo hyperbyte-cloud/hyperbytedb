@@ -136,6 +136,22 @@ pre-scale-up data until this is fixed.
 - During a restart, a query that needs a node that is not up yet fails with
   `peer unreachable` (HTTP 502) rather than returning partial results.
 
+## Regions per measurement
+
+A new measurement starts as one region with `replication_factor` copies,
+and splits once a region passes `region_split_series` (100k). Small
+neighbouring regions (under `region_merge_series`, 20k, together) are moved
+onto the same nodes and merged back. A query touches every region it can
+not rule out, and waits for the slowest, so fewer regions is faster: on UAT
+a 1-region query took 11-13 ms where a 10-region one took 20-60 ms.
+
+Before `ebd92e8`, `bootstrap_regions_per_node` defaulted to 2: every
+new measurement started with two regions per node, even one of 30 rows, and
+since regions spread across nodes by design never shared a node set, they
+never merged back. Set it (or `SET bootstrap_regions_per_node = 2`) only
+when a new measurement will take heavy writes at once; it spreads them from
+the first point instead of after the first split.
+
 ## Scaling up
 
 1. The new pods start and join in seconds.
@@ -241,7 +257,7 @@ login in Secret `<cluster>-auth` and every node gets them as env (see
 
 `SET <setting> = <value>` changes a running cluster without a restart;
 `SET <setting> = DEFAULT` puts each node back on its own config.
-`SHOW SETTINGS` lists all 19 with their source (full table in the
+`SHOW SETTINGS` lists all 20 with their source (full table in the
 [reference](reference.md#runtime-settings)). Uses that come up:
 
 - Debug one problem: `SET log_level = 'hyperbytedb=debug,info'`, then

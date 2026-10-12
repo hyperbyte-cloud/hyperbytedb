@@ -325,6 +325,7 @@ Automatic `series_id` range sharding across cluster nodes (experimental). Requir
 | `region_split_series` | `100000` | Target series per region before split |
 | `region_max_series` | `150000` | Hard split threshold (~1.5× target) |
 | `region_merge_series` | `20000` | Merge when adjacent regions fall below |
+| `bootstrap_regions_per_node` | `0` | Regions per node a new measurement starts with; `0` is one region that splits as it grows. Also `SET bootstrap_regions_per_node` |
 | `split_merge_interval_secs` | `3600` | Cooldown between split/merge on a region |
 | `schedule_limit` | `4` | Max concurrent split/move/merge operators |
 | `heartbeat_interval_secs` | `10` | Region stats report interval |

@@ -29,7 +29,7 @@ For what to expect when running it (timings, failure modes, metrics), see
   `host =~ /^(a|b|c)$/`) go only to the regions that hold those series and are
   pushed down before the series join; results stream as Arrow.
 - **Runtime settings.** `SET <setting> = <value> | DEFAULT` and
-  `SHOW SETTINGS`, replicated to every node and kept across restarts. 19
+  `SHOW SETTINGS`, replicated to every node and kept across restarts. 20
   settings: log level, query and write pools, query cap and timeout, write
   admission, rate limit, cardinality limits, flush interval and the shard
   scheduler's gates, copy slots, copy budget and split/merge thresholds. The
@@ -49,6 +49,12 @@ For what to expect when running it (timings, failure modes, metrics), see
   (all three were ignored); aggregates keep answering while a region's
   primary restarts; wide panels merge and fill on the coordinator instead of
   sorting in every region.
+- **One region per new measurement.** A new measurement starts as one
+  region and splits as it grows (`sharding.bootstrap_regions_per_node`
+  now defaults to 0; it was 2). Small neighbouring regions are moved onto
+  the same nodes and merged, so measurements pre-split before this collapse
+  back. A merge of two regions at different epochs is only proposed once
+  every node runs a build that applies it.
 - **Smaller WAL, faster ingest.** The sharded WAL keeps at most 1 GiB behind
   the flush (it used to keep 500k entries, 18-72 GB on n3); ingest caches and
   series ids are computed once per batch. WAL files stay compressed: storing

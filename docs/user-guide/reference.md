@@ -344,6 +344,7 @@ underneath, so `DEFAULT` returns every node to its own.
 | `region_max_series` | 1 or more | `sharding.region_max_series` | next split check |
 | `region_merge_series` | 0 or more | `sharding.region_merge_series` | next merge check |
 | `split_merge_interval_secs` | 1-86400 | `sharding.split_merge_interval_secs` | next split check |
+| `bootstrap_regions_per_node` | 0-16 (0: one region) | `sharding.bootstrap_regions_per_node` | next new measurement |
 
 The scheduler settings only do anything on a sharded cluster; elsewhere
 `SHOW SETTINGS` lists them without a value. Settings that need a restart
