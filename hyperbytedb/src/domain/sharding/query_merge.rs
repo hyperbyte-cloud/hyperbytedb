@@ -16,7 +16,6 @@ use crate::timeseriesql::ast::{
 };
 use crate::timeseriesql::to_clickhouse::{select_has_true_aggregate, select_output_field_name};
 
-const MULTI_REGION_UNSUPPORTED: &str = "aggregate is not supported across shard regions yet";
 /// Coordinator-side merge refuses unbounded DISTINCT / series fan-in.
 const SHARD_MERGE_MAX_DISTINCT_SERIES: usize = 500_000;
 
@@ -181,8 +180,6 @@ pub fn prepare_sharded_region_query(
         coordinator_fill: None,
     };
 
-    validate_no_non_mergeable_aggs(stmt)?;
-
     let mut region_fields = Vec::new();
     for field in &stmt.fields {
         region_fields.extend(rewrite_field_for_region(field, &mut plan)?);
@@ -278,20 +275,6 @@ fn ensure_time_field_for_global_sort(fields: &mut Vec<Field>) {
             },
         );
     }
-}
-
-fn validate_no_non_mergeable_aggs(stmt: &SelectStatement) -> Result<(), HyperbytedbError> {
-    for field in &stmt.fields {
-        if let Expr::Call(func) = &field.expr
-            && is_non_mergeable_agg(func)
-        {
-            return Err(HyperbytedbError::QueryParse(format!(
-                "{MULTI_REGION_UNSUPPORTED}: {}",
-                func.name.to_lowercase()
-            )));
-        }
-    }
-    Ok(())
 }
 
 fn is_non_mergeable_agg(func: &FunctionCall) -> bool {
@@ -467,6 +450,10 @@ fn build_merge_rules(
             continue;
         };
         if rules.contains_key(&name) {
+            continue;
+        }
+        if matches!(&field.expr, Expr::Call(func) if is_non_mergeable_agg(func)) {
+            rules.insert(name, ColumnMerge::WholeGroupOnly);
             continue;
         }
         let merge = if let Ok(combine) = rollup_combine_from_field(field) {
@@ -845,6 +832,11 @@ enum ColumnMerge {
     DistinctKeep,
     Skip,
     Unsupported,
+    /// PERCENTILE/MEDIAN/MODE/SPREAD: exact only from one region's points.
+    /// A group (series and bucket) one region returned passes through; a
+    /// second region's value for it is an error, not a guess. A region with
+    /// no points for the group returns null and gives way.
+    WholeGroupOnly,
 }
 
 fn column_merge_rules(stmt: &SelectStatement) -> HashMap<String, ColumnMerge> {
@@ -966,6 +958,15 @@ fn merge_values(
     right_row: &[Value],
 ) -> Result<Value, HyperbytedbError> {
     match rule {
+        ColumnMerge::WholeGroupOnly => match (left.is_null(), right.is_null()) {
+            (_, true) => Ok(left.clone()),
+            (true, false) => Ok(right.clone()),
+            (false, false) => Err(HyperbytedbError::QueryParse(format!(
+                "{} needs each group's points in one region, and one group here spans \
+                 several: filter to single series or GROUP BY every tag",
+                columns.get(col_idx).map_or("aggregate", String::as_str)
+            ))),
+        },
         ColumnMerge::DistinctKeep | ColumnMerge::Skip | ColumnMerge::Unsupported => {
             Ok(left.clone())
         }
@@ -2094,30 +2095,70 @@ mod tests {
         assert_eq!(series.values[0], [json!(5000), json!(99)]);
     }
 
+    /// PERCENTILE across regions: exact when each group comes from one
+    /// region (a region without points gives null and gives way), an error
+    /// when two regions both have points for one group.
     #[test]
-    fn rejects_percentile_on_multi_region() {
-        let stmt = SelectStatement {
-            fields: vec![Field {
-                expr: Expr::Call(FunctionCall {
-                    name: "percentile".into(),
-                    args: vec![Expr::Identifier("value".into()), Expr::IntegerLiteral(95)],
-                }),
-                alias: None,
-            }],
-            into: None,
-            from: vec![],
-            condition: None,
-            group_by: None,
-            order_by: None,
-            limit: None,
-            offset: None,
-            slimit: None,
-            soffset: None,
-            fill: None,
-            timezone: None,
+    fn percentile_merges_only_whole_groups() {
+        let mut stmt = mean_by_time_and_host();
+        stmt.fields = vec![Field {
+            expr: Expr::Call(FunctionCall {
+                name: "percentile".into(),
+                args: vec![
+                    Expr::Identifier("usage_idle".into()),
+                    Expr::IntegerLiteral(95),
+                ],
+            }),
+            alias: None,
+        }];
+        let plan = prepare_sharded_region_query(&stmt).unwrap();
+        let part = |host: &str, rows: Vec<Vec<Value>>| {
+            QueryResponse::single(
+                0,
+                vec![SeriesResult {
+                    name: "cpu".into(),
+                    tags: Some(HashMap::from([("host".into(), host.into())])),
+                    columns: vec!["time".into(), "percentile".into()],
+                    values: rows,
+                    partial: None,
+                }],
+            )
         };
-        let err = prepare_sharded_region_query(&stmt).unwrap_err();
-        assert!(err.to_string().contains(MULTI_REGION_UNSUPPORTED));
+        let merged = merge_sharded_query_results(
+            vec![
+                part("a", vec![vec![json!(0), json!(90.5)]]),
+                part("b", vec![vec![json!(0), json!(80.0)]]),
+                part("a", vec![vec![json!(0), Value::Null]]),
+            ],
+            &stmt,
+            Some(&plan),
+        )
+        .unwrap();
+        let got: Vec<_> = merged.results[0]
+            .series
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|s| s.values.clone())
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                vec![vec![json!(0), json!(90.5)]],
+                vec![vec![json!(0), json!(80.0)]]
+            ]
+        );
+
+        let err = merge_sharded_query_results(
+            vec![
+                part("a", vec![vec![json!(0), json!(90.5)]]),
+                part("a", vec![vec![json!(0), json!(70.0)]]),
+            ],
+            &stmt,
+            Some(&plan),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("spans"), "{err}");
     }
 
     #[test]

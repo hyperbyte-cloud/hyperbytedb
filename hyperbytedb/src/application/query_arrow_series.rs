@@ -58,9 +58,11 @@ impl Layout {
         }
         let tag_set: std::collections::HashSet<&str> =
             group_by_tags.iter().map(String::as_str).collect();
+        // `series_id` is storage, not data: `SELECT *` returned it as a
+        // column, which InfluxDB has no notion of.
         let mut pairs: Vec<(usize, String)> = by_name
             .iter()
-            .filter(|(name, _)| !tag_set.contains(name.as_str()))
+            .filter(|(name, _)| !tag_set.contains(name.as_str()) && name.as_str() != "series_id")
             .map(|(name, idx)| {
                 let display = if name == "__time" {
                     "time".to_string()

@@ -870,7 +870,9 @@ async fn multi_region_percentile_returns_error() {
         &format!("cpu,host={host_high} value=2 1000000001"),
     )
     .await;
-    flush_node(&nodes[0]).await;
+    for node in &nodes {
+        flush_node(node).await;
+    }
 
     let resp = query_sql(
         &client,
@@ -879,9 +881,13 @@ async fn multi_region_percentile_returns_error() {
         "SELECT percentile(value, 95) FROM cpu",
     )
     .await;
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    // Both regions have points for the one group (the whole measurement):
+    // refused, not merged.
     assert!(
-        !resp.status().is_success(),
-        "percentile should fail on multi-region fan-out"
+        !status.is_success() && body.contains("spans"),
+        "percentile over a group spanning regions must fail: {status} {body}"
     );
 }
 
@@ -2844,4 +2850,77 @@ async fn show_tag_values_where_spans_regions() {
         .map(|r| r[1].as_str().unwrap().to_string())
         .collect();
     assert_eq!(got, want_h0, "{body}");
+}
+
+/// PERCENTILE/MEDIAN on a sharded measurement: exact when every group is
+/// one series (in one region), refused when a group spans regions. They
+/// were refused outright, though Grafana's "p95 by host" pins one series per
+/// host.
+#[tokio::test]
+#[serial(chdb)]
+async fn percentile_answers_when_groups_are_whole_series() {
+    let dir = tempfile::tempdir().unwrap();
+    let nodes =
+        start_sharded_three_node_cluster(dir.path(), ShardedClusterOptions::default()).await;
+    let client = reqwest::Client::new();
+    create_db(&client, &nodes[0].url, "pdb").await;
+    bootstrap_two_regions(&nodes, "pdb", "autogen", "cpu").await;
+    let mut lines = Vec::new();
+    let mut sides = std::collections::BTreeSet::new();
+    for c in 0..4 {
+        let tags = BTreeMap::from([
+            ("host".to_string(), "h0".to_string()),
+            ("cpu".to_string(), format!("cpu{c}")),
+        ]);
+        sides.insert(series_id("cpu", &tags) < u64::MAX / 2);
+        for i in 1..=20i64 {
+            lines.push(format!(
+                "cpu,host=h0,cpu=cpu{c} v={} {}",
+                i * (c + 1),
+                i * 1_000_000_000
+            ));
+        }
+    }
+    assert_eq!(sides.len(), 2, "h0's series must span both regions");
+    let resp = write_line(&client, &nodes[0].url, "pdb", &lines.join("\n")).await;
+    assert!(resp.status().is_success(), "{}", resp.status());
+    for n in &nodes {
+        flush_node(n).await;
+    }
+    let ask = |q: &str| {
+        let q = q.to_string();
+        let client = client.clone();
+        let url = nodes[2].url.clone();
+        async move {
+            let resp = query_sql(&client, &url, "pdb", &q).await;
+            resp.json::<serde_json::Value>().await.unwrap()
+        }
+    };
+    // One series per group: each cpu's median is that of i * (c + 1), i = 1..20.
+    let body = ask(r#"SELECT median("v") FROM "cpu" GROUP BY "host", "cpu""#).await;
+    assert!(body["results"][0]["error"].is_null(), "{body}");
+    let mut got: Vec<(String, f64)> = body["results"][0]["series"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            (
+                s["tags"]["cpu"].as_str().unwrap().to_string(),
+                s["values"][0][1].as_f64().unwrap(),
+            )
+        })
+        .collect();
+    got.sort_by(|a, b| a.0.cmp(&b.0));
+    let want: Vec<(String, f64)> = (0..4)
+        .map(|c| (format!("cpu{c}"), 10.5 * (c + 1) as f64))
+        .collect();
+    assert_eq!(got, want, "{body}");
+    // A group (host h0) that spans both regions is refused, not guessed.
+    let body = ask(r#"SELECT median("v") FROM "cpu" GROUP BY "host""#).await;
+    let err = body["error"]
+        .as_str()
+        .or_else(|| body["results"][0]["error"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(err.contains("spans"), "{body}");
 }

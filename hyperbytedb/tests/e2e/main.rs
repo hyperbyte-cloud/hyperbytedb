@@ -404,3 +404,49 @@ async fn aggregate_time_is_the_lower_bound() {
     );
     server.stop().await;
 }
+
+/// Columns come back in the SELECT's order, as in InfluxDB; `SELECT *`
+/// stays sorted. They were always sorted by name.
+#[tokio::test]
+#[serial(chdb)]
+async fn columns_follow_the_select_order() {
+    let server = E2eFixture::new().start().await;
+    server.create_db(DB).await;
+    assert!(
+        server
+            .write(DB, "m,h=x b=1,a=2 1000000000\nm,h=x b=3,a=4 2000000000")
+            .await
+            .status()
+            .is_success()
+    );
+    let columns = |q: &'static str| {
+        let server = &server;
+        async move {
+            for _ in 0..50 {
+                let body = server.query(DB, q).await;
+                if let Some(c) = body["results"][0]["series"][0]["columns"].as_array() {
+                    return c
+                        .iter()
+                        .map(|v| v.as_str().unwrap().to_string())
+                        .collect::<Vec<_>>();
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            panic!("{q}: no rows");
+        }
+    };
+    assert_eq!(
+        columns("SELECT max(b), min(b), count(b) FROM m").await,
+        ["time", "max", "min", "count"]
+    );
+    assert_eq!(
+        columns(
+            "SELECT mean(b), count(b) FROM m WHERE time >= 0s AND time <= 5s GROUP BY time(1s)"
+        )
+        .await,
+        ["time", "mean", "count"]
+    );
+    assert_eq!(columns("SELECT b, a FROM m").await, ["time", "b", "a"]);
+    assert_eq!(columns("SELECT * FROM m").await, ["time", "a", "b", "h"]);
+    server.stop().await;
+}

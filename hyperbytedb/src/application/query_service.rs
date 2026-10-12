@@ -1157,6 +1157,7 @@ async fn execute_statement(
             }
 
             stamp_aggregate_time(select_stmt, &mut all_series, epoch, time_min);
+            order_columns_like_select(select_stmt, &mut all_series);
 
             // Apply SLIMIT/SOFFSET (series-level pagination)
             if select_stmt.slimit.is_some() || select_stmt.soffset.is_some() {
@@ -2005,6 +2006,57 @@ fn stamp_aggregate_time(
         s.columns.insert(0, "time".to_string());
         for row in &mut s.values {
             row.insert(0, stamp.clone());
+        }
+    }
+}
+
+/// Columns in the SELECT's order, `time` first, as InfluxDB returns them.
+/// Results came back sorted by name (`SELECT max, min, count` as
+/// `count, max, min`), which reorders Grafana tables. `SELECT *` stays
+/// sorted, as in InfluxDB. Columns the SELECT does not name keep their
+/// place after the named ones.
+fn order_columns_like_select(stmt: &SelectStatement, series: &mut [SeriesResult]) {
+    use crate::timeseriesql::ast::Expr;
+    if stmt
+        .fields
+        .iter()
+        .any(|f| matches!(f.expr, Expr::Star | Expr::Wildcard))
+    {
+        return;
+    }
+    let named = to_clickhouse::with_output_names(stmt);
+    let wanted: Vec<String> = std::iter::once("time".to_string())
+        .chain(named.fields.iter().filter_map(|f| {
+            // A bare field reference is named by its column.
+            to_clickhouse::select_output_field_name(f).or_else(|| match &f.expr {
+                Expr::Identifier(n) | Expr::FieldRef { name: n, .. } => Some(n.clone()),
+                _ => None,
+            })
+        }))
+        .collect();
+    for s in series {
+        let mut order: Vec<usize> = Vec::with_capacity(s.columns.len());
+        for w in &wanted {
+            // `SELECT time, value` names time twice (it leads anyway).
+            if let Some(i) = s.columns.iter().position(|c| c == w)
+                && !order.contains(&i)
+            {
+                order.push(i);
+            }
+        }
+        for i in 0..s.columns.len() {
+            if !order.contains(&i) {
+                order.push(i);
+            }
+        }
+        if order.iter().enumerate().all(|(k, &i)| k == i) {
+            continue;
+        }
+        s.columns = order.iter().map(|&i| s.columns[i].clone()).collect();
+        for row in &mut s.values {
+            if row.len() == order.len() {
+                *row = order.iter().map(|&i| row[i].clone()).collect();
+            }
         }
     }
 }
