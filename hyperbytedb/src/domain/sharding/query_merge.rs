@@ -1,3 +1,4 @@
+use indexmap::IndexMap;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
@@ -545,24 +546,71 @@ fn merge_rows_with_rules(
     rules: &HashMap<String, ColumnMerge>,
     row_key_distinct_cols: &HashSet<String>,
 ) -> Result<QueryResponse, HyperbytedbError> {
-    let mut rows: HashMap<String, (SeriesResult, Vec<Value>)> = HashMap::new();
+    // Series by name and tag set; within each, rows by time (and any
+    // distinct columns). Each series' header is kept once. Keeping a clone
+    // of the whole series beside every row made this quadratic: 746 of
+    // 804 ms for 5 hosts x 1,441 buckets on n3, against 56 ms for the
+    // region queries themselves.
+    let mut merged: IndexMap<String, (SeriesResult, IndexMap<String, Vec<Value>>)> =
+        IndexMap::new();
 
     for part in parts {
         for stmt_result in part.results {
             let Some(series_list) = stmt_result.series else {
                 continue;
             };
-            for series in series_list {
-                for row in &series.values {
-                    let key = series_row_key(&series, row, row_key_distinct_cols)?;
-                    match rows.entry(key) {
-                        Entry::Occupied(mut e) => {
-                            let (existing_series, merged_row) = e.get_mut();
-                            *merged_row =
-                                merge_row(&existing_series.columns, rules, merged_row, row)?;
+            for mut series in series_list {
+                let values = std::mem::take(&mut series.values);
+                let key = series_key(&series);
+                let time_idx = series
+                    .columns
+                    .iter()
+                    .position(|c| c == "time" || c == "__time");
+                let distinct: Vec<(&String, usize)> = row_key_distinct_cols
+                    .iter()
+                    .filter_map(|c| series.columns.iter().position(|x| x == c).map(|i| (c, i)))
+                    .collect();
+                let (header, rows) = merged
+                    .entry(key)
+                    .or_insert_with(|| (series.clone(), IndexMap::new()));
+                // Rows are merged in the first part's column order.
+                let remap: Option<Vec<usize>> = if header.columns == series.columns {
+                    None
+                } else {
+                    Some(
+                        header
+                            .columns
+                            .iter()
+                            .map(|c| series.columns.iter().position(|x| x == c))
+                            .collect::<Option<Vec<_>>>()
+                            .ok_or_else(ragged_merge_row)?,
+                    )
+                };
+                for row in values {
+                    if row.len() != series.columns.len() {
+                        return Err(ragged_merge_row());
+                    }
+                    let mut row_key = String::new();
+                    if let Some(i) = time_idx {
+                        row_key.push_str(&row[i].to_string());
+                    }
+                    for (col, i) in &distinct {
+                        row_key.push('|');
+                        row_key.push_str(col);
+                        row_key.push('=');
+                        row_key.push_str(&row[*i].to_string());
+                    }
+                    let row = match &remap {
+                        None => row,
+                        Some(map) => map.iter().map(|&i| row[i].clone()).collect(),
+                    };
+                    match rows.entry(row_key) {
+                        indexmap::map::Entry::Occupied(mut e) => {
+                            let merged_row = merge_row(&header.columns, rules, e.get(), &row)?;
+                            *e.get_mut() = merged_row;
                         }
-                        Entry::Vacant(e) => {
-                            e.insert((series.clone(), row.clone()));
+                        indexmap::map::Entry::Vacant(e) => {
+                            e.insert(row);
                         }
                     }
                 }
@@ -570,34 +618,31 @@ fn merge_rows_with_rules(
         }
     }
 
-    let mut by_series: HashMap<String, SeriesResult> = HashMap::new();
-    for (_, (series, row)) in rows {
-        let series_key = format!(
-            "{}:{:?}",
-            series.name,
-            series.tags.as_ref().map(|t| {
-                let mut pairs: Vec<_> = t.iter().collect();
-                pairs.sort_by_key(|(k, _)| *k);
-                pairs
-            })
-        );
-        match by_series.entry(series_key) {
-            Entry::Occupied(mut e) => e.get_mut().values.push(row),
-            Entry::Vacant(e) => {
-                e.insert(SeriesResult {
-                    name: series.name,
-                    tags: series.tags,
-                    columns: series.columns,
-                    values: vec![row],
-                    partial: series.partial,
-                });
-            }
-        }
-    }
-
-    let mut series: Vec<SeriesResult> = by_series.into_values().collect();
+    let mut series: Vec<SeriesResult> = merged
+        .into_values()
+        .map(|(mut header, rows)| {
+            header.values = rows.into_values().collect();
+            header
+        })
+        .collect();
     series.sort_by(series_order);
     Ok(QueryResponse::single(statement_id, series))
+}
+
+/// A series' identity for merging: its name and sorted tag set.
+fn series_key(series: &SeriesResult) -> String {
+    let mut key = series.name.clone();
+    if let Some(tags) = &series.tags {
+        let mut pairs: Vec<_> = tags.iter().collect();
+        pairs.sort_by_key(|(k, _)| *k);
+        for (k, v) in pairs {
+            key.push('|');
+            key.push_str(k);
+            key.push('=');
+            key.push_str(v);
+        }
+    }
+    key
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -651,43 +696,6 @@ fn column_merge_rules(stmt: &SelectStatement) -> HashMap<String, ColumnMerge> {
         rules.insert(name, merge);
     }
     rules
-}
-
-fn series_row_key(
-    series: &SeriesResult,
-    row: &[Value],
-    row_key_distinct_cols: &HashSet<String>,
-) -> Result<String, HyperbytedbError> {
-    let mut key = series.name.clone();
-    if let Some(tags) = &series.tags {
-        let mut pairs: Vec<_> = tags.iter().collect();
-        pairs.sort_by_key(|(k, _)| *k);
-        for (k, v) in pairs {
-            key.push('|');
-            key.push_str(k);
-            key.push('=');
-            key.push_str(v);
-        }
-    }
-    if let Some(idx) = series
-        .columns
-        .iter()
-        .position(|c| c == "time" || c == "__time")
-    {
-        let cell = row.get(idx).ok_or_else(ragged_merge_row)?;
-        key.push('|');
-        key.push_str(&cell.to_string());
-    }
-    for col in row_key_distinct_cols {
-        if let Some(idx) = series.columns.iter().position(|c| c == col) {
-            let cell = row.get(idx).ok_or_else(ragged_merge_row)?;
-            key.push('|');
-            key.push_str(col);
-            key.push('=');
-            key.push_str(&cell.to_string());
-        }
-    }
-    Ok(key)
 }
 
 fn json_as_f64(v: &Value) -> Option<f64> {
@@ -1277,17 +1285,17 @@ fn apply_global_sort_limit_offset(
         }
     }
 
-    flat.sort_by(|a, b| {
-        if let Some(ti) = time_idx {
-            let at = a.1.get(ti).map(json_sortable_time).unwrap_or(0);
-            let bt = b.1.get(ti).map(json_sortable_time).unwrap_or(0);
-            if time_desc { bt.cmp(&at) } else { at.cmp(&bt) }
-        } else {
-            let av = a.1.first().map(|v| v.to_string()).unwrap_or_default();
-            let bv = b.1.first().map(|v| v.to_string()).unwrap_or_default();
-            if time_desc { bv.cmp(&av) } else { av.cmp(&bv) }
-        }
-    });
+    // Each row's sort key is computed once (an RFC 3339 time is parsed),
+    // not on every comparison. Stable, so equal keys keep their order.
+    use std::cmp::Reverse;
+    let time = |row: &[Value]| time_idx.and_then(|ti| row.get(ti)).map(json_sortable_time);
+    let first = |row: &[Value]| row.first().map(|v| v.to_string()).unwrap_or_default();
+    match (time_idx.is_some(), time_desc) {
+        (true, false) => flat.sort_by_cached_key(|(_, r)| time(r).unwrap_or(0)),
+        (true, true) => flat.sort_by_cached_key(|(_, r)| Reverse(time(r).unwrap_or(0))),
+        (false, false) => flat.sort_by_cached_key(|(_, r)| first(r)),
+        (false, true) => flat.sort_by_cached_key(|(_, r)| Reverse(first(r))),
+    }
 
     let offset = plan.saved_offset.unwrap_or(0) as usize;
     if offset > 0 {
@@ -1531,6 +1539,102 @@ mod tests {
         let row = &merged.results[0].series.as_ref().unwrap()[0].values[0];
         assert_eq!(row[0], json!(1000));
         assert_eq!(row[1], json!(6.0));
+    }
+
+    fn mean_by_time_and_host() -> SelectStatement {
+        SelectStatement {
+            fields: vec![Field {
+                expr: Expr::Call(FunctionCall {
+                    name: "mean".into(),
+                    args: vec![Expr::Identifier("usage_idle".into())],
+                }),
+                alias: None,
+            }],
+            into: None,
+            from: vec![],
+            condition: None,
+            group_by: Some(GroupBy {
+                dimensions: vec![
+                    Dimension::Time {
+                        interval: Duration {
+                            value: 30,
+                            unit: DurationUnit::Second,
+                        },
+                        offset: None,
+                    },
+                    Dimension::Tag("host".into()),
+                ],
+            }),
+            order_by: None,
+            limit: None,
+            offset: None,
+            slimit: None,
+            soffset: None,
+            fill: None,
+            timezone: None,
+        }
+    }
+
+    /// The UAT dashboard's query: 10 regions each returning 5 hosts x 1,441
+    /// buckets. Means come from every region's sums and counts, and a part
+    /// whose columns arrive in another order is merged by name. The merge
+    /// used to copy a whole series per new row (746 ms on n3, seconds in a
+    /// debug build); the bound only catches that, not normal variation.
+    #[test]
+    fn a_wide_time_and_tag_merge_is_linear_and_exact() {
+        let stmt = mean_by_time_and_host();
+        let plan = prepare_sharded_region_query(&stmt).unwrap();
+        let cols = plan.mean_partials.values().next().unwrap().clone();
+        let (regions, hosts, buckets) = (10_i64, 5, 1_441_i64);
+        let part = |region: i64| {
+            let swapped = region == 3;
+            let columns = if swapped {
+                vec!["time".into(), cols.count_col.clone(), cols.sum_col.clone()]
+            } else {
+                vec!["time".into(), cols.sum_col.clone(), cols.count_col.clone()]
+            };
+            let series = (0..hosts)
+                .map(|h| SeriesResult {
+                    name: "cpu".into(),
+                    tags: Some(HashMap::from([("host".into(), format!("h{h}"))])),
+                    columns: columns.clone(),
+                    values: (0..buckets)
+                        .map(|b| {
+                            // Each region holds one point of value `region` per bucket.
+                            let (sum, count) = (json!(region), json!(1));
+                            if swapped {
+                                vec![json!(b * 30_000), count, sum]
+                            } else {
+                                vec![json!(b * 30_000), sum, count]
+                            }
+                        })
+                        .collect(),
+                    partial: None,
+                })
+                .collect();
+            QueryResponse::single(0, series)
+        };
+        let parts: Vec<_> = (0..regions).map(part).collect();
+
+        let start = std::time::Instant::now();
+        let merged = merge_sharded_query_results(parts, &stmt, Some(&plan)).unwrap();
+        let took = start.elapsed();
+
+        let series = merged.results[0].series.as_ref().unwrap();
+        assert_eq!(series.len(), 5);
+        let want_mean = (0..regions).sum::<i64>() as f64 / regions as f64;
+        for s in series {
+            assert_eq!(s.values.len(), buckets as usize);
+            let times: Vec<i64> = s.values.iter().map(|r| r[0].as_i64().unwrap()).collect();
+            assert!(times.windows(2).all(|w| w[0] < w[1]), "time order");
+            for row in &s.values {
+                assert_eq!(row[1], json!(want_mean), "{row:?}");
+            }
+        }
+        assert!(
+            took < std::time::Duration::from_secs(2),
+            "merge took {took:?}"
+        );
     }
 
     #[test]
