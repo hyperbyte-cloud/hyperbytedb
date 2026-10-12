@@ -113,6 +113,13 @@ pre-scale-up data until this is fixed.
   30 s by host over 12 h, 5 hosts, 10 regions) spent 746 of 804 ms merging.
   On `bbadb08` the same query takes 70-150 ms on the UAT cluster: about
   60-90 ms in the region queries and 18 ms merging.
+- Against InfluxDB 1.11 on the same Telegraf data (UAT, 6 nodes vs 1, ~500
+  series, `110ff32`, p50): single-series reads 11-33 ms (InfluxDB 1-2 ms),
+  per-host panels 18-37 ms (2-7 ms), 245-series panels 53-56 ms (177-178 ms),
+  `SHOW` calls 2-23 ms (1-2 ms). Every query touches several regions, so
+  HyperbyteDB pays a fan-out cost InfluxDB does not; it wins once a query
+  returns many series. Before `0182f6f` set TCP_NODELAY, every query that
+  touched a remote region waited up to 40 ms more (delayed ACK).
 - A point lookup (`last(value)` for one host) is 30-60 ms p50 under the same
   load.
 - Read bench with 90M points (4 concurrent clients, p50), at 3 nodes and
