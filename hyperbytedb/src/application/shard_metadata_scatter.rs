@@ -433,3 +433,56 @@ pub async fn scatter_series_keys(
     }
     Ok(keys.into_iter().collect())
 }
+
+/// Every series' tags for the measurement across the cluster, each series
+/// once: this node's own, and one peer's for each serving region it does not
+/// hold. For SHOW ... WHERE. A peer on an older build returns no `tagged`
+/// list and is reported, not read as having no series.
+pub async fn scatter_series_tags(
+    ctx: &ShardRoutingContext,
+    metadata: &dyn MetadataPort,
+    db: &str,
+    rp: &str,
+    measurement: &str,
+) -> Result<Vec<BTreeMap<String, String>>, HyperbytedbError> {
+    let mut by_id: std::collections::HashMap<u64, BTreeMap<String, String>> =
+        std::collections::HashMap::new();
+    let map = ctx.shard_map.snapshot().await?;
+    let serving = ctx
+        .location_cache
+        .serving_regions(&map, db, rp, measurement);
+    if serving.is_empty() || serving.iter().any(|r| r.peers.contains(&ctx.node_id)) {
+        by_id.extend(metadata.list_series(db, rp, measurement).await?);
+    }
+    let remote_regions: Vec<ShardRegion> = serving
+        .iter()
+        .filter(|region| !region.peers.contains(&ctx.node_id))
+        .cloned()
+        .collect();
+    let remote_parts = fetch_remote_metadata_bounded(
+        ctx,
+        db,
+        rp,
+        measurement,
+        remote_regions,
+        ShardMetadataKind::Series,
+    )
+    .await?;
+    for part in remote_parts {
+        let Some(tagged) = part.get("tagged").and_then(|v| v.as_array()) else {
+            return Err(HyperbytedbError::PeerUnreachable(
+                "a peer returned series without tags (older build); retry when all nodes run this one"
+                    .into(),
+            ));
+        };
+        for s in tagged {
+            if let (Some(id), Ok(tags)) = (
+                s.get("id").and_then(serde_json::Value::as_u64),
+                serde_json::from_value::<BTreeMap<String, String>>(s["tags"].clone()),
+            ) {
+                by_id.insert(id, tags);
+            }
+        }
+    }
+    Ok(by_id.into_values().collect())
+}

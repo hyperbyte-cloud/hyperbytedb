@@ -54,6 +54,10 @@ pub enum TokenKind {
     Slash,
     /// Regex literal /pattern/
     Regex(String),
+    /// `::`, as in `"host"::tag`. The WHERE of a SHOW is re-parsed from its
+    /// text, which handles the cast; without the token Grafana's
+    /// `SHOW TAG VALUES ... WHERE "host"::tag = '...'` failed to tokenize.
+    DoubleColon,
     Eof,
 }
 
@@ -522,6 +526,15 @@ impl<'a> Lexer<'a> {
                     kind: TokenKind::Tilde,
                     start,
                     end: start + 1,
+                })
+            }
+            ':' if self.input[start..].starts_with("::") => {
+                self.bump_char();
+                self.bump_char();
+                Ok(Token {
+                    kind: TokenKind::DoubleColon,
+                    start,
+                    end: start + 2,
                 })
             }
             ';' => {

@@ -36,4 +36,5 @@ pub mod shard_transfer;
 pub mod sharded_mv_backfill;
 pub mod stage_timer;
 pub mod statement_summary;
+pub mod tag_condition;
 pub mod wal_append;

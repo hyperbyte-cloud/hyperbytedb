@@ -858,6 +858,81 @@ async fn execute_statement(
 
             let matching_keys: Vec<String> =
                 filter_names_by_selector(&all_tag_keys, Some(&s.tag_key));
+
+            // With a WHERE: the values of the series that match it. It used
+            // to be ignored, so a Grafana variable chained on another (the
+            // CPUs of the chosen host) listed every value.
+            if let Some(cond) = &s.condition {
+                let predicate = crate::application::tag_condition::TagPredicate::compile(cond)?;
+                let measurements: Vec<String> = match measurement {
+                    Some(name) => vec![name.to_string()],
+                    None => svc.metadata.list_measurements(db).await?,
+                };
+                let (query_db, rp) = match s.from.as_ref() {
+                    Some(m) if m.retention_policy.is_some() => {
+                        let query_db = m.database.as_deref().unwrap_or(db);
+                        let rp = resolve_retention_policy(
+                            svc.metadata.as_ref(),
+                            query_db,
+                            m.retention_policy.as_deref(),
+                        )
+                        .await?;
+                        (query_db, rp)
+                    }
+                    Some(m) => (m.database.as_deref().unwrap_or(db), default_rp.clone()),
+                    None => (db, default_rp.clone()),
+                };
+                let mut pairs = std::collections::BTreeSet::new();
+                for name in &measurements {
+                    let series = match svc.shard_routing.as_ref() {
+                        Some(ctx) => {
+                            crate::application::shard_metadata_scatter::scatter_series_tags(
+                                ctx,
+                                svc.metadata.as_ref(),
+                                query_db,
+                                &rp,
+                                name,
+                            )
+                            .await?
+                        }
+                        None => svc
+                            .metadata
+                            .list_series(query_db, &rp, name)
+                            .await?
+                            .into_iter()
+                            .map(|(_, tags)| tags)
+                            .collect(),
+                    };
+                    for tags in series.iter().filter(|t| predicate.matches(t)) {
+                        for key in &matching_keys {
+                            if let Some(v) = tags.get(key) {
+                                pairs.insert((key.clone(), v.clone()));
+                            }
+                        }
+                    }
+                }
+                let values = limit_offset(
+                    pairs
+                        .into_iter()
+                        .map(|(k, v)| {
+                            vec![serde_json::Value::String(k), serde_json::Value::String(v)]
+                        })
+                        .collect(),
+                    s.limit,
+                    s.offset,
+                );
+                return Ok(StatementResult {
+                    statement_id,
+                    series: Some(vec![SeriesResult {
+                        name: measurement.unwrap_or("").to_string(),
+                        tags: None,
+                        columns: vec!["key".to_string(), "value".to_string()],
+                        values,
+                        partial: None,
+                    }]),
+                    error: None,
+                });
+            }
             let default_rp_for_values = default_rp.clone();
 
             let key_value_futures: Vec<_> = matching_keys
@@ -932,7 +1007,7 @@ async fn execute_statement(
                     name: measurement.unwrap_or("").to_string(),
                     tags: None,
                     columns,
-                    values: all_values,
+                    values: limit_offset(all_values, s.limit, s.offset),
                     partial: None,
                 }]),
                 error: None,
@@ -2757,6 +2832,13 @@ async fn execute_local_measurement_query(
     )?;
     sql = inject_tombstone_predicates(sql, &tombstones);
     run_series_query(svc, &sql, measurement, epoch, &resolved_group_by_tags).await
+}
+
+/// A SHOW's OFFSET then LIMIT over its rows (they were ignored).
+fn limit_offset<T>(rows: Vec<T>, limit: Option<u64>, offset: Option<u64>) -> Vec<T> {
+    let skip = usize::try_from(offset.unwrap_or(0)).unwrap_or(usize::MAX);
+    let take = limit.map_or(usize::MAX, |l| usize::try_from(l).unwrap_or(usize::MAX));
+    rows.into_iter().skip(skip).take(take).collect()
 }
 
 fn tag_keys_from_mapping(

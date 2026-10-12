@@ -2792,3 +2792,55 @@ async fn aggregates_survive_a_restarting_primary() {
         resp.status()
     );
 }
+
+/// SHOW TAG VALUES ... WHERE across regions on different nodes: the series
+/// of the other region come from its owner.
+#[tokio::test]
+#[serial(chdb)]
+async fn show_tag_values_where_spans_regions() {
+    let dir = tempfile::tempdir().unwrap();
+    let nodes =
+        start_sharded_three_node_cluster(dir.path(), ShardedClusterOptions::default()).await;
+    let client = reqwest::Client::new();
+    create_db(&client, &nodes[0].url, "tdb").await;
+    bootstrap_two_regions(&nodes, "tdb", "autogen", "cpu").await;
+    let mut lines = Vec::new();
+    let mut want_h0 = std::collections::BTreeSet::new();
+    let mut sides = std::collections::BTreeSet::new();
+    for h in 0..3 {
+        for c in 0..4 {
+            lines.push(format!("cpu,host=h{h},cpu=cpu{h}{c} v=1 1000000000"));
+            let tags = BTreeMap::from([
+                ("host".to_string(), format!("h{h}")),
+                ("cpu".to_string(), format!("cpu{h}{c}")),
+            ]);
+            if h == 0 {
+                want_h0.insert(format!("cpu{h}{c}"));
+                sides.insert(series_id("cpu", &tags) < u64::MAX / 2);
+            }
+        }
+    }
+    assert_eq!(sides.len(), 2, "host h0's series must span both regions");
+    let resp = write_line(&client, &nodes[0].url, "tdb", &lines.join("\n")).await;
+    assert!(resp.status().is_success(), "{}", resp.status());
+    for n in &nodes {
+        flush_node(n).await;
+    }
+    // Ask a node that holds only one of the regions.
+    let resp = query_sql(
+        &client,
+        &nodes[2].url,
+        "tdb",
+        r#"SHOW TAG VALUES FROM "cpu" WITH KEY = "cpu" WHERE "host"::tag = 'h0'"#,
+    )
+    .await;
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let got: std::collections::BTreeSet<String> = body["results"][0]["series"][0]["values"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|r| r[1].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(got, want_h0, "{body}");
+}

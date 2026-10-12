@@ -309,3 +309,56 @@ async fn runtime_settings_take_effect_and_reset() {
     assert_eq!(row("query_pool_size")[2], "auto");
     server.stop().await;
 }
+
+/// SHOW TAG VALUES applies its WHERE (with or without `::tag`), LIMIT and
+/// OFFSET; all three were ignored.
+#[tokio::test]
+#[serial(chdb)]
+async fn show_tag_values_filters_by_where_and_limits() {
+    let server = E2eFixture::new().start().await;
+    server.create_db(DB).await;
+    let lines = "cpu,host=a,cpu=cpu0 v=1 1\ncpu,host=a,cpu=cpu1 v=1 1\ncpu,host=b,cpu=cpu2 v=1 1";
+    assert!(server.write(DB, lines).await.status().is_success());
+    let values = |q: &'static str| {
+        let server = &server;
+        async move {
+            let body = server.query(DB, q).await;
+            assert!(body["results"][0]["error"].is_null(), "{q}: {body}");
+            body["results"][0]["series"][0]["values"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| r[1].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+    for _ in 0..50 {
+        if values(r#"SHOW TAG VALUES FROM "cpu" WITH KEY = "cpu""#)
+            .await
+            .len()
+            == 3
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        values(r#"SHOW TAG VALUES FROM "cpu" WITH KEY = "cpu" WHERE "host"::tag = 'a'"#).await,
+        ["cpu0", "cpu1"]
+    );
+    assert_eq!(
+        values(r#"SHOW TAG VALUES FROM "cpu" WITH KEY = "cpu" WHERE "host" =~ /^b$/"#).await,
+        ["cpu2"]
+    );
+    assert!(
+        values(r#"SHOW TAG VALUES FROM "cpu" WITH KEY = "cpu" WHERE "host" = 'zzz'"#)
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        values(r#"SHOW TAG VALUES FROM "cpu" WITH KEY = "cpu" LIMIT 1 OFFSET 1"#).await,
+        ["cpu1"]
+    );
+    server.stop().await;
+}

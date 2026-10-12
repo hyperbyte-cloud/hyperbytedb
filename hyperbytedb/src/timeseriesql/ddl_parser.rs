@@ -1355,6 +1355,22 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Grafana's chained variables cast the tag: `"host"::tag = '...'`.
+    #[test]
+    fn show_tag_values_where_takes_a_tag_cast() {
+        match parse_ddl_statement(
+            r#"SHOW TAG VALUES FROM "cpu" WITH KEY = "cpu" WHERE "host"::tag = 'a' LIMIT 2 OFFSET 1"#,
+        )
+        .unwrap()
+        {
+            Statement::ShowTagValues(s) => {
+                assert!(s.condition.is_some());
+                assert_eq!((s.limit, s.offset), (Some(2), Some(1)));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn grant_and_revoke_take_read_write_or_all() {
         use DatabasePrivilege::{All, Read, Write};

@@ -1521,10 +1521,16 @@ pub async fn handle_shard_metadata(
             {
                 Ok(series) => {
                     let keys: Vec<String> = series
-                        .into_iter()
+                        .iter()
                         .map(|(id, tags)| format!("{id}:{tags:?}"))
                         .collect();
-                    Json(serde_json::json!({"series": keys})).into_response()
+                    // Structured, for SHOW ... WHERE; `series` stays for
+                    // coordinators on an older build.
+                    let tagged: Vec<serde_json::Value> = series
+                        .into_iter()
+                        .map(|(id, tags)| serde_json::json!({"id": id, "tags": tags}))
+                        .collect();
+                    Json(serde_json::json!({"series": keys, "tagged": tagged})).into_response()
                 }
                 Err(e) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
