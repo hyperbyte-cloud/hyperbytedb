@@ -1156,7 +1156,7 @@ async fn execute_statement(
                 all_series.append(&mut series);
             }
 
-            stamp_aggregate_time(select_stmt, &mut all_series, epoch);
+            stamp_aggregate_time(select_stmt, &mut all_series, epoch, time_min);
 
             // Apply SLIMIT/SOFFSET (series-level pagination)
             if select_stmt.slimit.is_some() || select_stmt.soffset.is_some() {
@@ -1977,11 +1977,18 @@ fn inject_tombstone_predicates(sql: String, tombstones: &[(String, String)]) -> 
 }
 
 /// Give aggregate results the `time` column InfluxDB always returns. An
-/// aggregate without GROUP BY time() has one row per series, stamped with
-/// epoch 0 whatever the WHERE range (InfluxQL docs: `SELECT INTEGRAL(..)
-/// WHERE time >= '2015-08-18T00:00:00Z' ..` returns 1970-01-01T00:00:00Z).
-/// A lone FIRST/LAST/MAX/MIN already carries its point's time.
-fn stamp_aggregate_time(stmt: &SelectStatement, series: &mut [SeriesResult], epoch: Option<&str>) {
+/// aggregate without GROUP BY time() has one row per series, stamped as
+/// InfluxDB 1.11 does: with the WHERE clause's lower time bound, or epoch 0
+/// without one (checked side by side on the UAT cluster; this used epoch 0
+/// for everything, so Grafana tables showed 1970). InfluxDB stamps INTEGRAL
+/// with epoch 0; it is not supported here. A lone FIRST/LAST/MAX/MIN
+/// already carries its point's time.
+fn stamp_aggregate_time(
+    stmt: &SelectStatement,
+    series: &mut [SeriesResult],
+    epoch: Option<&str>,
+    time_min: Option<i64>,
+) {
     let buckets = stmt
         .group_by
         .as_ref()
@@ -1989,7 +1996,8 @@ fn stamp_aggregate_time(stmt: &SelectStatement, series: &mut [SeriesResult], epo
     if buckets || !to_clickhouse::select_has_true_aggregate(stmt) {
         return;
     }
-    let stamp = crate::application::query_arrow_series::time_value_from_nanos(0, epoch);
+    let stamp =
+        crate::application::query_arrow_series::time_value_from_nanos(time_min.unwrap_or(0), epoch);
     for s in series {
         if s.columns.iter().any(|c| c == "time") {
             continue;

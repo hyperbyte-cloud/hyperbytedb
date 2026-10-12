@@ -269,6 +269,9 @@ SHOW TAG KEYS [FROM <measurement>]
 SHOW TAG VALUES [FROM <measurement>] WITH KEY = "<key>"
 SHOW TAG VALUES [FROM <measurement>] WITH KEY =~ /<regex>/
 SHOW TAG VALUES [FROM <measurement>] WITH KEY IN ("<key1>", "<key2>")
+  [WHERE <tag conditions>] [LIMIT <n>] [OFFSET <n>]
+                                      -- tag conditions: =, !=, =~, !~, AND, OR,
+                                      -- with or without ::tag; time is ignored
 SHOW FIELD KEYS [FROM <measurement>]
 SHOW SERIES [FROM <measurement>]
 SHOW RETENTION POLICIES [ON <database>]

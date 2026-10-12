@@ -362,3 +362,45 @@ async fn show_tag_values_filters_by_where_and_limits() {
     );
     server.stop().await;
 }
+
+/// An aggregate without GROUP BY time() is stamped as InfluxDB 1.11 does:
+/// the WHERE's lower time bound, or epoch 0 without one. Every one was epoch
+/// 0, so Grafana tables showed 1970.
+#[tokio::test]
+#[serial(chdb)]
+async fn aggregate_time_is_the_lower_bound() {
+    let server = E2eFixture::new().start().await;
+    server.create_db(DB).await;
+    let lines = "m v=1 10000000000\nm v=2 20000000000\nm v=3 30000000000";
+    assert!(server.write(DB, lines).await.status().is_success());
+    let stamp = |q: &'static str| {
+        let server = &server;
+        async move {
+            for _ in 0..50 {
+                let body = server.query(DB, q).await;
+                if let Some(t) = body["results"][0]["series"][0]["values"][0][0].as_str() {
+                    return t.to_string();
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            panic!("{q}: no rows");
+        }
+    };
+    assert_eq!(
+        stamp("SELECT count(v) FROM m WHERE time >= 15s").await,
+        "1970-01-01T00:00:15Z"
+    );
+    assert_eq!(
+        stamp("SELECT mean(v) FROM m WHERE time >= 5s AND time <= 40s").await,
+        "1970-01-01T00:00:05Z"
+    );
+    assert_eq!(
+        stamp("SELECT sum(v) FROM m WHERE time <= 40s").await,
+        "1970-01-01T00:00:00Z"
+    );
+    assert_eq!(
+        stamp("SELECT count(v) FROM m").await,
+        "1970-01-01T00:00:00Z"
+    );
+    server.stop().await;
+}

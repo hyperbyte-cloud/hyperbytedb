@@ -691,10 +691,11 @@ async fn multi_region_selectors_report_the_selected_points_time() {
             "1970-01-01T00:00:00Z",
             10.0,
         ),
+        // Stamped with the WHERE's lower bound, as InfluxDB 1.11 does.
         (
             "SELECT count(value) FROM cpu WHERE time >= 5s",
             "count",
-            "1970-01-01T00:00:00Z",
+            "1970-01-01T00:00:05Z",
             3.0,
         ),
     ];

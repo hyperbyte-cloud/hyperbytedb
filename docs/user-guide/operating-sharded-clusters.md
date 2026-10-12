@@ -221,7 +221,14 @@ login in Secret `<cluster>-auth` and every node gets them as env (see
 - Changing `spec.version` (or the image) rolls the pods one at a time
   through the StatefulSet: 6 UAT pods took 13 minutes, about 2 minutes each
   (mostly the old pod draining). Telegraf logged 50 retried write errors over
-  the whole rollout.
+  the whole rollout: writes need the region primary, and a draining primary
+  takes none until its regions' primacy has moved.
+- Reads keep working through a rollout from `23fe04b`. Before it, aggregates
+  read only from the region primary, and a draining one counted as down:
+  Grafana showed `no active peers for region 121` while the pods holding
+  that region restarted. Now a draining primary still answers, and when the
+  primary is gone a replica does (it can lag by the replication delay). The
+  next rollout logged no such error.
 
 ## Runtime settings
 

@@ -44,6 +44,11 @@ For what to expect when running it (timings, failure modes, metrics), see
   `REVOKE` of one privilege, and `SHOW GRANTS FOR <user>`, as in InfluxDB v1.
   Grants survive restarts, node syncs, `SET PASSWORD` and admin changes;
   before, all of those silently dropped a user's grants.
+- **Grafana fixes from UAT.** `/query` answers gzipped when asked;
+  `SHOW TAG VALUES` applies `WHERE` (with `::tag`), `LIMIT` and `OFFSET`
+  (all three were ignored); aggregates keep answering while a region's
+  primary restarts; wide panels merge and fill on the coordinator instead of
+  sorting in every region.
 - **Smaller WAL, faster ingest.** The sharded WAL keeps at most 1 GiB behind
   the flush (it used to keep 500k entries, 18-72 GB on n3); ingest caches and
   series ids are computed once per batch. WAL files stay compressed: storing
