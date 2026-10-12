@@ -55,6 +55,10 @@ For what to expect when running it (timings, failure modes, metrics), see
   the same nodes and merged, so measurements pre-split before this collapse
   back. A merge of two regions at different epochs is only proposed once
   every node runs a build that applies it.
+- **Region copies keep every row.** Copies page on `(series_id, time,
+  ingest_seq)`; a series longer than one chunk (50,000 rows) had the rest of
+  its rows skipped on every move. A chunk too big for the receiver (413) is
+  halved instead of retried forever.
 - **Smaller WAL, faster ingest.** The sharded WAL keeps at most 1 GiB behind
   the flush (it used to keep 500k entries, 18-72 GB on n3); ingest caches and
   series ids are computed once per batch. WAL files stay compressed: storing

@@ -169,6 +169,14 @@ for the whole cluster with two copies running. The movement budget
 limits it. `79a4eaf` makes the chunk export about 4x cheaper (0.24 s → 0.06 s
 per 50,000 rows); the rest of the per-chunk cost is still being profiled.
 
+Before `3934cf8` a copy could lose or never finish: it paged through a
+region by series id alone, so a series with more than 50,000 rows (about 6
+days at 10 s) had the rest of its rows skipped, and a chunk of a wide
+measurement (Telegraf's `cpu`, 10 fields) was over the receiver's size limit
+and refused (413) forever, leaving its new copies unpromoted. Copies now page
+on `(series_id, time, ingest_seq)` and halve their chunks on a 413
+(`hyperbytedb_shard_transfer_chunk_shrunk_total`).
+
 Watch: `hyperbytedb_shard_transfer_bytes` (rate per pod),
 `hyperbytedb_shard_learners_added_total` and
 `hyperbytedb_shard_learners_promoted_total`, and the layout at
