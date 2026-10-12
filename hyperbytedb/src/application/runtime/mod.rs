@@ -401,7 +401,7 @@ async fn serve_inner(config: HyperbytedbConfig) -> anyhow::Result<()> {
             match tokio::net::TcpListener::bind(&control_addr).await {
                 Ok(listener) => {
                     tracing::info!(addr = %control_addr, "control listener up");
-                    if let Err(e) = axum::serve(listener, control_app).await {
+                    if let Err(e) = axum::serve(nodelay(listener), control_app).await {
                         tracing::error!(error = %e, "control listener stopped");
                     }
                 }
@@ -501,7 +501,7 @@ async fn serve_inner(config: HyperbytedbConfig) -> anyhow::Result<()> {
         let api_rx = _api_shutdown_rx;
         tracing::info!(addr = %addr, "Hyperbytedb listening");
         let listener = tokio::net::TcpListener::bind(&addr).await?;
-        axum::serve(listener, app)
+        axum::serve(nodelay(listener), app)
             .with_graceful_shutdown(async move {
                 match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
                     Ok(mut term) => {
@@ -585,4 +585,19 @@ async fn serve_inner(config: HyperbytedbConfig) -> anyhow::Result<()> {
     tracing::info!("Hyperbytedb shut down cleanly");
 
     Ok(())
+}
+
+/// Accepted connections with Nagle off. Region results stream back in
+/// several small writes; with Nagle each one after the first waited for the
+/// peer's delayed ACK, up to 40 ms on Linux. Every query that touched a
+/// remote region on the UAT cluster took ~55 ms or ~20 ms at random.
+fn nodelay(
+    listener: tokio::net::TcpListener,
+) -> impl axum::serve::Listener<Io = tokio::net::TcpStream, Addr = std::net::SocketAddr> {
+    use axum::serve::ListenerExt;
+    listener.tap_io(|tcp| {
+        if let Err(e) = tcp.set_nodelay(true) {
+            tracing::debug!(error = %e, "TCP_NODELAY not set");
+        }
+    })
 }
