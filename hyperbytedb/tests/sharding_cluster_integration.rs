@@ -2701,3 +2701,94 @@ async fn coordinator_fill_matches_region_fill() {
         }
     }
 }
+
+/// Aggregates keep answering while a region's primary restarts. A rolling
+/// update drains each pod for ~2 minutes; aggregates went only to the
+/// primary and failed with "no active peers" the whole time (Grafana on the
+/// n3 UAT cluster). A draining primary still answers; a stopped one is
+/// covered by a replica, here the coordinator's own copy. Writes still need
+/// the primary.
+#[tokio::test]
+#[serial(chdb)]
+async fn aggregates_survive_a_restarting_primary() {
+    use hyperbytedb::domain::cluster::membership::NodeState;
+    let dir = tempfile::tempdir().unwrap();
+    let mut nodes =
+        start_sharded_three_node_cluster(dir.path(), ShardedClusterOptions::default()).await;
+    // The coordinator (node 3) holds the only other copy.
+    bootstrap_region_on_all_nodes(&nodes, "rdb", "autogen", "cpu", vec![1, 3], 1).await;
+    let client = reqwest::Client::new();
+    for node in &nodes {
+        create_db(&client, &node.url, "rdb").await;
+    }
+    let lines: Vec<String> = (0..50)
+        .map(|i: i64| format!("cpu,host=h{} value={i} {}", i % 5, (i + 1) * 1_000_000_000))
+        .collect();
+    let resp = write_line(&client, &nodes[0].url, "rdb", &lines.join("\n")).await;
+    assert!(resp.status().is_success(), "{}", resp.status());
+    for node in &nodes {
+        flush_node(node).await;
+    }
+    // Both copies hold the rows before the primary goes away.
+    for node in [&nodes[0], &nodes[2]] {
+        let mut rows = 0;
+        for _ in 0..50 {
+            rows = chdb_row_count(node.query_port.as_ref(), "rdb_autogen_cpu").await;
+            if rows >= 50 {
+                break;
+            }
+            flush_node(node).await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(rows, 50, "node {} copy", node.node_id);
+    }
+
+    let count = |url: String| {
+        let client = client.clone();
+        async move {
+            let resp = query_sql(&client, &url, "rdb", "SELECT count(value) FROM cpu").await;
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert!(status.is_success(), "{status}: {body}");
+            assert!(body["results"][0]["error"].is_null(), "{body}");
+            body["results"][0]["series"][0]["values"][0][1].clone()
+        }
+    };
+    let coordinator = nodes[2].url.clone();
+    assert_eq!(count(coordinator.clone()).await, serde_json::json!(50));
+
+    // The primary drains: still up, still answers.
+    set_node_state(&nodes[2].membership, 1, NodeState::Draining).await;
+    assert_eq!(
+        count(coordinator.clone()).await,
+        serde_json::json!(50),
+        "draining primary"
+    );
+
+    // The primary is gone: a replica answers.
+    stop_node(&mut nodes[0]);
+    assert_eq!(
+        count(coordinator.clone()).await,
+        serde_json::json!(50),
+        "stopped primary"
+    );
+    set_node_state(&nodes[2].membership, 1, NodeState::Disconnected).await;
+    assert_eq!(
+        count(coordinator.clone()).await,
+        serde_json::json!(50),
+        "disconnected primary"
+    );
+
+    let resp = write_line(
+        &client,
+        &coordinator,
+        "rdb",
+        "cpu,host=h0 value=1 99000000000",
+    )
+    .await;
+    assert!(
+        !resp.status().is_success(),
+        "a write must not land on a replica: {}",
+        resp.status()
+    );
+}

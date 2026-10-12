@@ -2213,6 +2213,10 @@ async fn try_query_sharded_region(
     if region.peers.contains(&ctx.node_id) && ctx.node_id == region.primary {
         return run_series_query(svc, region_sql, measurement, epoch, resolved_group_by_tags).await;
     }
+    // Holding a copy, this node answers itself when no other copy can
+    // (primary restarting or gone, no other replica): a copy that may lag by
+    // the replication delay beats failing the query.
+    let local_copy = region.is_serving_peer(ctx.node_id);
 
     let route_to_primary = region.peers.contains(&ctx.node_id) && ctx.node_id != region.primary;
     if route_to_primary {
@@ -2239,7 +2243,7 @@ async fn try_query_sharded_region(
     } else {
         RegionTargetRole::Read
     };
-    scatter_to_region_peers(
+    let remote = scatter_to_region_peers(
         ctx,
         region,
         scatter_role,
@@ -2278,7 +2282,15 @@ async fn try_query_sharded_region(
             }
         },
     )
-    .await
+    .await;
+    match remote {
+        Err(HyperbytedbError::PeerUnreachable(e)) if local_copy => {
+            tracing::debug!(region_id = region.region_id, error = %e, "remote copies failed; reading this node's copy");
+            metrics::counter!("hyperbytedb_shard_query_local_copy_total").increment(1);
+            run_series_query(svc, region_sql, measurement, epoch, resolved_group_by_tags).await
+        }
+        other => other,
+    }
 }
 
 /// One node's partial rollups for a materialized view destination.
