@@ -1140,10 +1140,10 @@ async fn columns_and_time_follow_influxql() {
     assert_eq!(cols, ["time", "count"]);
     assert_eq!(row, [json!("1970-01-01T00:00:00Z"), json!(3)]);
 
-    // A time range does not move the stamp: still epoch 0.
+    // With a time range the stamp is its lower bound, as in InfluxDB.
     let (cols, row) = shape("SELECT count(v) FROM cpu WHERE time >= 15s").await;
     assert_eq!(cols, ["time", "count"]);
-    assert_eq!(row, [json!("1970-01-01T00:00:00Z"), json!(2)]);
+    assert_eq!(row, [json!("1970-01-01T00:00:15Z"), json!(2)]);
 
     let (cols, row) = shape("SELECT mean(v), mean(w), sum(v) AS total FROM cpu").await;
     assert_eq!(cols, ["time", "mean", "mean_1", "total"]);

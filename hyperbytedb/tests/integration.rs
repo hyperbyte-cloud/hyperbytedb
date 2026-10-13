@@ -1469,7 +1469,9 @@ async fn query_responses_are_gzipped_on_request() {
     let dir = tempfile::tempdir().unwrap();
     let (state, _flush) = setup(&dir);
     let (url, _handle) = start_server(state).await;
-    let client = reqwest::Client::new();
+    // The CLI turns on reqwest's gzip feature in a workspace build, and the
+    // client would then decompress and drop Content-Encoding.
+    let client = reqwest::Client::builder().no_gzip().build().unwrap();
     let get = |gzip: bool| {
         let mut req = client
             .get(format!("{url}/query"))
