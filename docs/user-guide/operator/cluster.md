@@ -38,7 +38,7 @@ metadata:
 spec:
   replicas: 5
   image: hyperbytedb:latest
-  version: "0.9.0-beta"
+  version: "0.9.1-beta"
   server:
     port: 8086
     requestTimeoutSecs: 60
@@ -132,7 +132,7 @@ metadata:
 spec:
   replicas: 3
   image: hyperbytedb:latest
-  version: "0.9.0-beta"
+  version: "0.9.1-beta"
   server:
     port: 8086
     tls:
@@ -248,7 +248,7 @@ own, and on 3-CPU pods 12 connections were 10-40% slower than 4.
 | `enabled` | bool | `false` | Enable authentication for the HTTP API |
 | `credentialsSecretName` | string | `<cluster>-auth` | Secret holding the cluster token and the bootstrap admin login |
 
-With `enabled: true` (HyperbyteDB 0.9.0-beta and later) the operator:
+With `enabled: true` (HyperbyteDB 0.9.1-beta and later) the operator:
 
 - creates the Secret if it is missing, and fills in any key it lacks:
   `cluster-token` (random), `admin-username` (`admin`) and `admin-password`

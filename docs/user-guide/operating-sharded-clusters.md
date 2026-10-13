@@ -29,7 +29,7 @@ No points were lost in any of these steps on build `8d7086e` / `792c94b`
 
 ## Versions
 
-This page describes HyperbyteDB 0.9.0-beta with operator v0.2.0. The
+This page describes HyperbyteDB 0.9.1-beta with operator v0.3.0. The
 operator renders each cluster for the HyperbyteDB version it runs (see
 [HyperbytedbCluster: annotations and versions](operator/cluster.md#annotations-and-versions));
 on 0.8.x the sharding, control-listener and evacuate-together features below

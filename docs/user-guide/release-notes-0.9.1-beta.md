@@ -1,8 +1,9 @@
-# HyperbyteDB 0.9.0-beta
+# HyperbyteDB 0.9.1-beta
 
 The beta of sharded clusters whose write throughput grows with the number of
 nodes, and that scale up and down without losing points or materialized
-view rollups. 204 commits since 0.8.5-beta. Pair it with operator v0.2.0.
+view rollups. 228 commits since 0.8.5-beta. Pair it with operator v0.3.0.
+0.9.0-beta was tagged but never published; this release replaces it.
 
 For what to expect when running it (timings, failure modes, metrics), see
 [Operating a sharded cluster](operating-sharded-clusters.md).
@@ -38,7 +39,7 @@ For what to expect when running it (timings, failure modes, metrics), see
   other's internal routes with a shared cluster token
   (`auth.cluster_token`); before, a cluster with auth on could not run Raft
   or replication at all. `auth.admin_username` / `admin_password` create the
-  first admin at startup. Operator v0.2.0 keeps all three in a Secret when
+  first admin at startup. Operator v0.3.0 keeps all three in a Secret when
   `spec.auth.enabled` is set.
 - **Per-database READ and WRITE.** `GRANT READ | WRITE | ALL ON <db>`,
   `REVOKE` of one privilege, and `SHOW GRANTS FOR <user>`, as in InfluxDB v1.
@@ -64,11 +65,13 @@ For what to expect when running it (timings, failure modes, metrics), see
   series ids are computed once per batch. WAL files stay compressed: storing
   them uncompressed (tried during this release) saturated a shared disk at
   6 nodes and cut writes by about a third.
+- **Python client.** `clients/python`: standard library only, batched and
+  gzipped writes that back off on 503 / `Retry-After`, InfluxQL queries.
 
 ## Upgrading from 0.8.x
 
 - **Config is strict now.** 0.9 refuses to start on a config key it does not
-  know (0.8 ignored them). Operator v0.2.0 renders each cluster for the
+  know (0.8 ignored them). Operator v0.2.0 and later render each cluster for the
   version it runs; with a hand-written config, remove keys 0.9 does not list
   in [Configuration](configuration.md).
 - **Pools.** `chdb.query_pool_size` and `chdb.write_pool_size` replace the
@@ -85,7 +88,7 @@ For what to expect when running it (timings, failure modes, metrics), see
   from that CRD, or apply the new CRD (default 300, and a rule that rejects
   the bad pair).
 - The `X-Influxdb-Version` header now reports the running version
-  (`HyperbyteDB-0.9.0-beta`); it was fixed at 0.8.5.
+  (`HyperbyteDB-0.9.1-beta`); it was fixed at 0.8.5.
 
 ## Known limits
 
@@ -101,3 +104,5 @@ For what to expect when running it (timings, failure modes, metrics), see
 - Destination regions of materialized views keep naming nodes that have
   left (no effect on data or queries).
 - Do not scale up while a scale-down is still in progress.
+- Boolean fields are returned as `1` / `0`, not `true` / `false`.
+- `SHOW TAG VALUES FROM /regex/` is not parsed; omit `FROM` or name the measurement.
