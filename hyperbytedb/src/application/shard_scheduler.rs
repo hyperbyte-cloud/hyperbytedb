@@ -308,7 +308,8 @@ pub struct ShardScheduler {
     /// primaries across nodes; refreshed each tick. See `plan_placement`.
     placement_plan: tokio::sync::RwLock<HashMap<u64, Vec<u64>>>,
     /// Regions with an in-flight operator (split/merge/rebalance/failover/transfer).
-    region_operators: tokio::sync::RwLock<HashMap<u64, ()>>,
+    /// Claimed through [`RegionOperator`], which releases on drop.
+    region_operators: Arc<parking_lot::Mutex<HashSet<u64>>>,
     /// region_id -> the attempt sequence number of its last convergence move.
     /// Sorting the mover queue by this is what makes it round-robin: without
     /// it the queue was ordered by tier alone, so map order decided everything
@@ -415,7 +416,7 @@ impl ShardScheduler {
             split_hints: tokio::sync::RwLock::new(HashMap::new()),
             cross_epoch_merge: tokio::sync::RwLock::new(HashMap::new()),
             placement_plan: tokio::sync::RwLock::new(HashMap::new()),
-            region_operators: tokio::sync::RwLock::new(HashMap::new()),
+            region_operators: Arc::new(parking_lot::Mutex::new(HashSet::new())),
             placement_last_attempted: tokio::sync::RwLock::new(HashMap::new()),
             placement_attempt_seq: std::sync::atomic::AtomicU64::new(0),
             unhealthy_primaries: tokio::sync::RwLock::new(HashMap::new()),
@@ -649,7 +650,7 @@ impl ShardScheduler {
                     }
                     // A mover still copying onto it: ticks no longer wait for
                     // moves, so a learner seen twice is not necessarily stale.
-                    if self.region_has_operator(region.region_id).await {
+                    if self.region_has_operator(region.region_id) {
                         continue;
                     }
                     out.push((space.key.clone(), region.region_id, peer));
@@ -662,11 +663,10 @@ impl ShardScheduler {
     /// Re-stage one leftover learner and promote it, holding the region's
     /// operator throughout so no mover or split touches it mid-copy.
     async fn promote_learner(&self, key: &MeasurementKey, region_id: u64, peer: u64) {
-        if !self.acquire_operator(region_id).await {
+        let Some(_operator) = self.acquire_operator(region_id) else {
             return;
-        }
+        };
         self.restage_and_promote(key, region_id, peer).await;
-        self.release_operator(region_id).await;
     }
 
     async fn restage_and_promote(&self, key: &MeasurementKey, region_id: u64, peer: u64) {
@@ -1020,15 +1020,15 @@ impl ShardScheduler {
             };
             // One mover per region. A region the planning pass or another
             // mover holds is left for a later tick.
-            if !self.acquire_operator(job.region_id).await {
+            let Some(operator) = self.acquire_operator(job.region_id) else {
                 continue;
-            }
+            };
             let this = Arc::clone(self);
             tokio::spawn(async move {
                 let _slots = slots;
+                let _operator = operator;
                 this.note_placement_attempt(job.region_id).await;
                 this.run_one_placement(&job).await;
-                this.release_operator(job.region_id).await;
             });
         }
     }
@@ -1062,10 +1062,10 @@ impl ShardScheduler {
         }
         let this = Arc::clone(self);
         tokio::spawn(async move {
+            let _busy = ClearOnDrop(&this.learners_busy);
             for (key, region_id, peer) in learners {
                 this.promote_learner(&key, region_id, peer).await;
             }
-            this.learners_busy.store(false, Ordering::Release);
         });
     }
 
@@ -1078,23 +1078,22 @@ impl ShardScheduler {
         }
         let this = Arc::clone(self);
         tokio::spawn(async move {
+            let _busy = ClearOnDrop(&this.merges_busy);
             for merge in merges {
                 this.run_merge(merge).await;
             }
-            this.merges_busy.store(false, Ordering::Release);
         });
     }
 
     /// Merge one pair, holding both regions' operators so no mover or split
     /// touches either while the right half is copied.
     async fn run_merge(&self, merge: PendingMerge) {
-        if !self.acquire_operator(merge.left_id).await {
+        let Some(_left) = self.acquire_operator(merge.left_id) else {
             return;
-        }
-        if !self.acquire_operator(merge.right_id).await {
-            self.release_operator(merge.left_id).await;
+        };
+        let Some(_right) = self.acquire_operator(merge.right_id) else {
             return;
-        }
+        };
         // The regions as they are now, not as the tick saw them: a move may
         // have committed in between, and the proposal carries the epoch.
         if let Ok(map) = self.shard_map.snapshot().await
@@ -1111,29 +1110,24 @@ impl ShardScheduler {
                 "shard merge failed"
             );
         }
-        self.release_operator(merge.right_id).await;
-        self.release_operator(merge.left_id).await;
     }
 
     /// Claim `region_id` for one operator (split, merge, heal, move). Only
     /// exclusivity: how many moves run at once is the mover pool's
     /// `schedule_limit`. Capping this table at `schedule_limit` as well let
     /// four background movers lock the planning pass out of every region.
-    async fn acquire_operator(&self, region_id: u64) -> bool {
-        let mut ops = self.region_operators.write().await;
-        if ops.contains_key(&region_id) {
-            return false;
-        }
-        ops.insert(region_id, ());
-        true
+    fn acquire_operator(&self, region_id: u64) -> Option<RegionOperator> {
+        self.region_operators
+            .lock()
+            .insert(region_id)
+            .then(|| RegionOperator {
+                held: Arc::clone(&self.region_operators),
+                region_id,
+            })
     }
 
-    async fn release_operator(&self, region_id: u64) {
-        self.region_operators.write().await.remove(&region_id);
-    }
-
-    async fn region_has_operator(&self, region_id: u64) -> bool {
-        self.region_operators.read().await.contains_key(&region_id)
+    fn region_has_operator(&self, region_id: u64) -> bool {
+        self.region_operators.lock().contains(&region_id)
     }
 
     /// Recompute every region's target so that both the copies each node
@@ -1313,13 +1307,13 @@ impl ShardScheduler {
                     continue;
                 }
 
-                if self.region_has_operator(region.region_id).await {
+                if self.region_has_operator(region.region_id) {
                     continue;
                 }
 
-                if !self.acquire_operator(region.region_id).await {
+                let Some(operator) = self.acquire_operator(region.region_id) else {
                     continue;
-                }
+                };
 
                 // Availability before shape. Heal and failover run first so a
                 // region that cannot split — capped, too narrow, or carrying
@@ -1355,7 +1349,7 @@ impl ShardScheduler {
                     let region = region.clone();
                     match self.try_split(&key, &region, series_count).await {
                         Ok(outcome) if outcome.is_proposed() => {
-                            self.release_operator(region.region_id).await;
+                            drop(operator);
                             continue;
                         }
                         Ok(SplitOutcome::Refused(SplitRefusal::RegionCap)) => {
@@ -1390,7 +1384,7 @@ impl ShardScheduler {
                                 self.config.split_merge_interval_secs,
                             )
                         && mergeable(region, right, cross_epoch)
-                        && !self.region_has_operator(right.region_id).await
+                        && !self.region_has_operator(right.region_id)
                     {
                         // Run in the background, holding both regions: a
                         // merge used to copy data, and inside the tick two
@@ -1402,7 +1396,7 @@ impl ShardScheduler {
                             right_id: right.region_id,
                         });
                         merging_right = Some(right.region_id);
-                        self.release_operator(region.region_id).await;
+                        drop(operator);
                         continue;
                     }
                 }
@@ -1419,7 +1413,7 @@ impl ShardScheduler {
                     let region = region.clone();
                     match self.try_split(&key, &region, series_count).await {
                         Ok(outcome) if outcome.is_proposed() => {
-                            self.release_operator(region.region_id).await;
+                            drop(operator);
                             continue;
                         }
                         Ok(SplitOutcome::Refused(SplitRefusal::RegionCap)) => {
@@ -1447,7 +1441,7 @@ impl ShardScheduler {
                     });
                 }
 
-                self.release_operator(region.region_id).await;
+                drop(operator);
             }
 
             // One line per measurement per tick, not one per region: at the cap
@@ -1510,12 +1504,11 @@ impl ShardScheduler {
                 let Ok(_bytes) = self.move_bytes.acquire_many(want).await else {
                     return;
                 };
-                if !self.acquire_operator(job.region_id).await {
+                let Some(_operator) = self.acquire_operator(job.region_id) else {
                     return;
-                }
+                };
                 self.note_placement_attempt(job.region_id).await;
                 self.run_one_placement(&job).await;
-                self.release_operator(job.region_id).await;
             })
             .await;
     }
@@ -3262,17 +3255,17 @@ impl ShardScheduler {
                 self.remove_reconciliation(&entry.key, region.region_id);
                 continue;
             }
-            if entry.parked || self.region_has_operator(region.region_id).await {
+            if entry.parked || self.region_has_operator(region.region_id) {
                 continue;
             }
-            if !self.acquire_operator(region.region_id).await {
+            let Some(operator) = self.acquire_operator(region.region_id) else {
                 continue;
-            }
+            };
 
             let outcome = self
                 .attempt_reconciliation(&entry.key, &region, &entry)
                 .await;
-            self.release_operator(region.region_id).await;
+            drop(operator);
 
             match outcome {
                 ReconcileOutcome::Cleared => {
@@ -3558,6 +3551,30 @@ async fn pick_learner_survivor(
                 || m.get_node(*id)
                     .is_some_and(|n| n.state == NodeState::Active)
         })
+}
+
+/// A region claimed for one operator. Dropping it releases the claim, so a
+/// task that panics or is cancelled cannot leave the region locked: no mover,
+/// split or merge would touch it again until the node restarted.
+struct RegionOperator {
+    held: Arc<parking_lot::Mutex<HashSet<u64>>>,
+    region_id: u64,
+}
+
+impl Drop for RegionOperator {
+    fn drop(&mut self) {
+        self.held.lock().remove(&self.region_id);
+    }
+}
+
+/// Clears a busy flag on drop, panic included, so one failed batch does not
+/// stop every later one.
+struct ClearOnDrop<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for ClearOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 #[cfg(test)]
@@ -6222,6 +6239,41 @@ mod tests {
     /// The operator table was capped at `schedule_limit`. With movers running
     /// in the background holding their regions, that cap would stop every
     /// split, merge and heal until the moves finished.
+    /// A mover that panics mid-move must not leave its region claimed: before
+    /// the guard, nothing moved, split or merged it again until a restart.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn a_panicking_operator_releases_its_region() {
+        let harness = PlacementTestHarness::new_tuned(true, &[(2, 0)], 2, |_| {}).await;
+        let scheduler = Arc::clone(&harness.scheduler);
+        let task = tokio::spawn(async move {
+            let _operator = scheduler.acquire_operator(1).expect("region 1 is free");
+            panic!("mover failed mid-move");
+        });
+        assert!(task.await.unwrap_err().is_panic());
+        assert!(!harness.scheduler.region_has_operator(1));
+        let _again = harness
+            .scheduler
+            .acquire_operator(1)
+            .expect("released by the panic");
+        assert!(
+            harness.scheduler.acquire_operator(1).is_none(),
+            "still exclusive"
+        );
+    }
+
+    #[test]
+    fn a_busy_flag_clears_when_its_batch_panics() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let busy = AtomicBool::new(true);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _busy = ClearOnDrop(&busy);
+            panic!("merge failed");
+        }));
+        assert!(result.is_err());
+        assert!(!busy.load(Ordering::Acquire));
+    }
+
     #[tokio::test]
     #[serial_test::serial(chdb)]
     async fn a_split_is_planned_while_movers_hold_other_regions() {
@@ -6231,7 +6283,10 @@ mod tests {
         })
         .await;
         // Region 2 is mid-move: its mover holds the only schedule_limit slot.
-        assert!(harness.scheduler.acquire_operator(2).await);
+        let _held = harness
+            .scheduler
+            .acquire_operator(2)
+            .expect("region 2 is free");
         harness
             .scheduler
             .record_heartbeat(1, 1, 1_000_000, 0, 0)
@@ -6284,9 +6339,8 @@ mod tests {
         let held: Vec<u64> = harness
             .scheduler
             .region_operators
-            .read()
-            .await
-            .keys()
+            .lock()
+            .iter()
             .copied()
             .collect();
         let split_region = (1..=REGIONS as u64).find(|r| !held.contains(r)).unwrap();
@@ -6339,7 +6393,10 @@ mod tests {
                 .any(|op| matches!(op, ShardMapOp::PromotePeer { peer: 2, .. }))
         };
 
-        assert!(harness.scheduler.acquire_operator(region.region_id).await);
+        let held = harness
+            .scheduler
+            .acquire_operator(region.region_id)
+            .expect("region is free");
         for _ in 0..2 {
             let map = harness.scheduler.shard_map.snapshot().await.unwrap();
             harness.scheduler.try_promote_learners(&map).await;
@@ -6349,7 +6406,7 @@ mod tests {
             "re-staged a learner its mover still holds"
         );
 
-        harness.scheduler.release_operator(region.region_id).await;
+        drop(held);
         let map = harness.scheduler.shard_map.snapshot().await.unwrap();
         harness.scheduler.try_promote_learners(&map).await;
         assert!(
@@ -6676,7 +6733,7 @@ mod tests {
         });
         // Measure from the moment the slow move holds its region.
         for _ in 0..50 {
-            if harness.scheduler.region_has_operator(slow).await {
+            if harness.scheduler.region_has_operator(slow) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -6686,7 +6743,7 @@ mod tests {
         // Proposals go to a sink, so the map never changes and the fast
         // region wants its move again on every tick it can get a slot.
         let fast_moves = adds(&harness, fast) - before;
-        let still_slow = harness.scheduler.region_has_operator(slow).await;
+        let still_slow = harness.scheduler.region_has_operator(slow);
         let _ = tx.send(true);
         run.abort();
         assert!(
@@ -6739,10 +6796,7 @@ mod tests {
         // Two ticks to call the learner stale, then its re-stage starts.
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(
-            harness
-                .scheduler
-                .region_has_operator(region.region_id)
-                .await,
+            harness.scheduler.region_has_operator(region.region_id),
             "the learner should be re-staging"
         );
         let split_region = (1..=REGIONS as u64)
@@ -6757,10 +6811,7 @@ mod tests {
         let split = harness.proposals.lock().unwrap().iter().any(
             |op| matches!(op, ShardMapOp::Split { region_id, .. } if *region_id == split_region),
         );
-        let still_restaging = harness
-            .scheduler
-            .region_has_operator(region.region_id)
-            .await;
+        let still_restaging = harness.scheduler.region_has_operator(region.region_id);
         let _ = tx.send(true);
         run.abort();
         assert!(

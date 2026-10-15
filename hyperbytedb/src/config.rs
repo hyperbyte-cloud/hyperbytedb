@@ -332,6 +332,19 @@ impl HyperbytedbConfig {
                  cluster.raft_election_timeout_ms ({election})"
             ));
         }
+        // Peers send the token as a header. One that is not a valid header
+        // value is left off every request, so all internal routes answer
+        // 401; a trailing newline (a Secret made with `echo`) is the usual
+        // cause. The value is a secret: the error does not show it.
+        if let Some(token) = &self.auth.cluster_token
+            && !token.bytes().all(|b| b.is_ascii_graphic())
+        {
+            return Err(
+                "auth.cluster_token must be printable ASCII with no spaces or newlines \
+                 (a Secret written with `echo` ends in a newline; use `echo -n`)"
+                    .into(),
+            );
+        }
         if self.sharding.enabled && !self.cluster.enabled {
             return Err(
                 "sharding.enabled requires cluster.enabled = true (series sharding is cluster-only)"
@@ -1559,6 +1572,26 @@ mod admission_tests {
         assert!(err.contains("raft_heartbeat_interval_ms (1000)"), "{err}");
         c.cluster.enabled = false;
         assert!(c.validate().is_ok(), "no Raft without a cluster");
+    }
+
+    /// A token peers cannot send as a header is refused at startup, without
+    /// echoing the secret.
+    #[test]
+    fn cluster_token_must_be_a_valid_header_value() {
+        let mut c = crate::config::HyperbytedbConfig::load(None).unwrap();
+        for ok in ["", "Zx9_-.~+/=AbC"] {
+            c.auth.cluster_token = Some(ok.into());
+            assert!(c.validate().is_ok(), "{ok:?}");
+        }
+        for bad in ["s3cret\n", " s3cret", "s3 cret", "s3cret\t", "sécret"] {
+            c.auth.cluster_token = Some(bad.into());
+            let err = c.validate().unwrap_err();
+            assert!(err.contains("auth.cluster_token"), "{bad:?}: {err}");
+            assert!(
+                !err.contains("s3"),
+                "the error must not show the token: {err}"
+            );
+        }
     }
 
     use super::{INFLIGHT_WRITES_PER_CPU, resolve_max_inflight_writes};

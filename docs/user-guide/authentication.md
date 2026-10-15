@@ -84,6 +84,9 @@ send the token in the `x-hyperbytedb-cluster-token` header instead. Every
 node must have the same token. A wrong token is refused even alongside an
 admin login; the token does not work on `/write` or `/query`. Without it a
 node logs a warning at startup and its peers' internal calls fail with 401.
+The token must be printable ASCII with no spaces: a node refuses to start
+otherwise. A Secret written with `echo` (not `echo -n`) ends in a newline,
+which is the usual cause.
 
 On Kubernetes the operator does all of this when `spec.auth.enabled` is true:
 it keeps the admin login and the token in a Secret and passes them to the
