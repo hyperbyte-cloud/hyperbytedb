@@ -81,20 +81,16 @@ pub trait WalPort: Send + Sync {
     /// Highest sequence whose entries are all in the local store, as the flush
     /// last recorded it. 0 means unknown (nothing flushed since start), and a
     /// reader must then treat every entry as possibly unflushed.
-    fn flushed_through(&self) -> u64 {
-        0
-    }
+    fn flushed_through(&self) -> u64;
 
     /// Record that every entry up to `sequence` is in the local store.
-    fn set_flushed_through(&self, _sequence: u64) {}
+    fn set_flushed_through(&self, sequence: u64);
 
     /// Where to truncate so that at most `max_bytes` of the entries up to
     /// `through` stay: the highest sequence that may go. Entries whose size
     /// is not known (written before this process started) count as over the
-    /// budget. Default: keep nothing.
-    fn flushed_margin_start(&self, through: u64, _max_bytes: u64) -> u64 {
-        through
-    }
+    /// budget.
+    fn flushed_margin_start(&self, through: u64, max_bytes: u64) -> u64;
 
     /// Remove all durable and in-memory WAL entries for `database`.
     async fn purge_database(&self, database: &str) -> Result<(), HyperbytedbError> {

@@ -251,4 +251,9 @@ impl IngestionPort for IngestionServiceImpl {
 
         Ok(())
     }
+
+    /// This service writes only locally, so it never owes another node.
+    fn pending_forwards(&self) -> usize {
+        0
+    }
 }

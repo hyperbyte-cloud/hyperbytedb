@@ -367,20 +367,14 @@ pub trait MetadataPort: Send + Sync {
     async fn get_setting(
         &self,
         name: &str,
-    ) -> Result<Option<crate::domain::setting::SettingValue>, HyperbytedbError> {
-        let _ = name;
-        Ok(None)
-    }
+    ) -> Result<Option<crate::domain::setting::SettingValue>, HyperbytedbError>;
 
     /// Store (`Some`) or remove (`None`) a runtime setting override.
     async fn set_setting(
         &self,
         name: &str,
         value: Option<crate::domain::setting::SettingValue>,
-    ) -> Result<(), HyperbytedbError> {
-        let _ = (name, value);
-        Ok(())
-    }
+    ) -> Result<(), HyperbytedbError>;
 
     async fn store_continuous_query(
         &self,
