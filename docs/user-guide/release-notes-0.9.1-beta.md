@@ -65,6 +65,9 @@ For what to expect when running it (timings, failure modes, metrics), see
   series ids are computed once per batch. WAL files stay compressed: storing
   them uncompressed (tried during this release) saturated a shared disk at
   6 nodes and cut writes by about a third.
+- **Cardinality limits set at run time apply to client writes only.** A
+  `SET max_tag_values_per_measurement` (or `max_measurements_per_database`)
+  also refused region copies and replicas of measurements already over it.
 - **Python client.** `clients/python`: standard library only, batched and
   gzipped writes that back off on 503 / `Retry-After`, InfluxQL queries.
 

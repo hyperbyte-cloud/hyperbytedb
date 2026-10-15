@@ -346,6 +346,10 @@ underneath, so `DEFAULT` returns every node to its own.
 | `split_merge_interval_secs` | 1-86400 | `sharding.split_merge_interval_secs` | next split check |
 | `bootstrap_regions_per_node` | 0-16 (0: one region) | `sharding.bootstrap_regions_per_node` | next new measurement |
 
+The cardinality limits apply to client writes. Region copies, replicas and
+node syncs copy data that already exists, so a lower limit never refuses
+them.
+
 The scheduler settings only do anything on a sharded cluster; elsewhere
 `SHOW SETTINGS` lists them without a value. Settings that need a restart
 anyway (listen addresses, data paths, Raft timing, replication factor, TLS,
