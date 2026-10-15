@@ -127,6 +127,7 @@ impl HttpTestContext {
             drain_service: None,
             raft: None,
             auth_enabled: false,
+            runtime_settings: Default::default(),
             cluster_auth: Default::default(),
             auth_allow_query_param_credentials: false,
             prometheus_handle: None,

@@ -35,6 +35,8 @@ pub struct ShardRoutingContext {
     pub region_write_stats: Arc<RegionWriteStats>,
     /// Shares one request per destination node among concurrent writes.
     pub forward_coalescer: Arc<crate::application::forward_coalescer::ForwardCoalescer>,
+    /// This node's runtime settings (`SET bootstrap_regions_per_node`).
+    pub runtime_settings: Arc<crate::application::runtime_settings::RuntimeSettings>,
 }
 
 pub struct PointBuckets {
@@ -261,11 +263,13 @@ pub async fn build_bootstrap_op(
     measurement: &str,
 ) -> Result<ShardMapOp, HyperbytedbError> {
     let candidates = bootstrap_candidates(ctx).await;
-    let regions_wanted = crate::application::runtime_settings::usize_or(
-        crate::application::runtime_settings::BOOTSTRAP_REGIONS_PER_NODE,
-        ctx.config.bootstrap_regions_per_node,
-    )
-    .saturating_mul(candidates.len());
+    let regions_wanted = ctx
+        .runtime_settings
+        .usize_or(
+            crate::application::runtime_settings::BOOTSTRAP_REGIONS_PER_NODE,
+            ctx.config.bootstrap_regions_per_node,
+        )
+        .saturating_mul(candidates.len());
     // One node gains nothing from splitting: every region would land on it.
     if regions_wanted > 1 && candidates.len() > 1 {
         let map = ctx.shard_map.snapshot().await?;
@@ -1189,6 +1193,7 @@ mod scatter_tests {
             peer_client,
             region_write_stats: Arc::new(RegionWriteStats::new()),
             forward_coalescer: Default::default(),
+            runtime_settings: Default::default(),
         }
     }
 

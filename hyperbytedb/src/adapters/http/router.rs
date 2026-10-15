@@ -83,6 +83,8 @@ pub struct AppState {
     pub drain_service: Option<Arc<DrainService>>,
     pub raft: Option<HyperbytedbRaft>,
     pub auth_enabled: bool,
+    /// This node's runtime settings (`SET`, `SHOW SETTINGS`).
+    pub runtime_settings: Arc<crate::application::runtime_settings::RuntimeSettings>,
     /// The cluster token peers send and this node accepts on internal routes.
     pub cluster_auth: crate::adapters::cluster::cluster_auth::ClusterAuth,
     /// When false (default), `?u=` / `?p=` query credentials are ignored.

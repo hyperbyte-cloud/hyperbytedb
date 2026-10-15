@@ -43,6 +43,8 @@ type MeasurementBatch = (Vec<Point>, Vec<u64>);
 type MeasurementBatchMap = BTreeMap<MeasurementBatchKey, MeasurementBatch>;
 
 pub struct FlushServiceImpl {
+    /// For `SET flush_interval_secs`; without them the interval is fixed.
+    runtime_settings: Option<Arc<crate::application::runtime_settings::RuntimeSettings>>,
     wal: Arc<dyn WalPort>,
     last_flushed: Arc<Mutex<u64>>,
     max_points_per_batch: usize,
@@ -107,6 +109,7 @@ impl FlushServiceImpl {
             max_points_per_batch: effective_limit,
             replication_log: None,
             membership: None,
+            runtime_settings: None,
             node_id: 0,
             last_local_wal_seq: std::sync::atomic::AtomicU64::new(0),
             heartbeat_interval_secs: 0,
@@ -153,6 +156,14 @@ impl FlushServiceImpl {
         self
     }
 
+    pub fn with_runtime_settings(
+        mut self,
+        settings: Arc<crate::application::runtime_settings::RuntimeSettings>,
+    ) -> Self {
+        self.runtime_settings = Some(settings);
+        self
+    }
+
     pub fn with_membership(mut self, node_id: u64, membership: SharedMembership) -> Self {
         self.node_id = node_id;
         self.membership = Some(membership);
@@ -166,13 +177,16 @@ impl FlushServiceImpl {
             // Fixed rate, re-read each time: `SET flush_interval_secs`
             // changes it. A flush that overran its slot starts the next one
             // at once rather than falling behind.
-            let pause = std::time::Duration::from_secs(
-                crate::application::runtime_settings::u64_or(
-                    crate::application::runtime_settings::FLUSH_INTERVAL_SECS,
-                    interval.as_secs(),
-                )
-                .max(1),
-            );
+            let secs = self
+                .runtime_settings
+                .as_ref()
+                .map_or(interval.as_secs(), |s| {
+                    s.u64_or(
+                        crate::application::runtime_settings::FLUSH_INTERVAL_SECS,
+                        interval.as_secs(),
+                    )
+                });
+            let pause = std::time::Duration::from_secs(secs.max(1));
             next = (next + pause).max(tokio::time::Instant::now());
             tokio::select! {
                 _ = tokio::time::sleep_until(next) => {

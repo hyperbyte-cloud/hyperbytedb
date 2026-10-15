@@ -55,6 +55,8 @@ pub struct SchemaMutationDeps<'a> {
     pub points_sink: Option<&'a Arc<dyn PointsSinkPort>>,
     pub wal: Option<&'a Arc<dyn WalPort>>,
     pub shard_routing: Option<&'a Arc<ShardRoutingContext>>,
+    /// This node's runtime settings, so a replicated `SET` applies at once.
+    pub runtime_settings: Option<&'a crate::application::runtime_settings::RuntimeSettings>,
 }
 
 /// Apply a schema mutation locally, including chDB DDL where required.
@@ -107,6 +109,7 @@ async fn apply_schema_mutation_inner(
         points_sink,
         wal,
         shard_routing,
+        runtime_settings,
     } = deps;
     match mutation {
         MutationRequest::CreateDatabase { name, rp } => {
@@ -236,7 +239,13 @@ async fn apply_schema_mutation_inner(
             Ok(())
         }
         MutationRequest::SetSetting { name, value } => {
-            crate::application::runtime_settings::apply(metadata.as_ref(), &name, value).await
+            crate::application::runtime_settings::apply_or_store(
+                runtime_settings,
+                metadata.as_ref(),
+                &name,
+                value,
+            )
+            .await
         }
         MutationRequest::Revoke {
             username,

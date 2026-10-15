@@ -58,10 +58,10 @@ async fn main() -> anyhow::Result<()> {
         Err(_) => tracing_subscriber::EnvFilter::new(&config.logging.level),
     };
 
-    let _telemetry = hyperbytedb::telemetry::init_logging(filter, config.logging.format == "json")?;
+    let telemetry = hyperbytedb::telemetry::init_logging(filter, config.logging.format == "json")?;
 
     match cli.command {
-        Commands::Serve => serve(config).await,
+        Commands::Serve => serve(config, telemetry.log_level()).await,
         Commands::Backup { output } => backup(config, &output).await,
         Commands::Restore { input } => restore(config, &input).await,
     }

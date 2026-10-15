@@ -19,6 +19,8 @@ pub struct ClusterBootstrap {
     pub replication_log: Arc<ReplicationLog>,
     pub hinted_handoff: Arc<HintedHandoff>,
     pub peer_addrs: Vec<String>,
+    /// This node's runtime settings, for `SET`s that arrive by Raft or sync.
+    pub runtime_settings: Arc<crate::application::runtime_settings::RuntimeSettings>,
 }
 
 impl ClusterBootstrap {
@@ -26,6 +28,7 @@ impl ClusterBootstrap {
         config: &ClusterConfig,
         max_hints_per_peer: u64,
         cluster_auth: crate::adapters::cluster::cluster_auth::ClusterAuth,
+        runtime_settings: Arc<crate::application::runtime_settings::RuntimeSettings>,
     ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(&config.replication_log_dir)?;
         let repl_log = Arc::new(
@@ -95,6 +98,7 @@ impl ClusterBootstrap {
             replication_log: repl_log,
             hinted_handoff: hh,
             peer_addrs,
+            runtime_settings,
         })
     }
 
@@ -126,6 +130,7 @@ impl ClusterBootstrap {
             self.peer_addrs.clone(),
             self.peer_client.cluster_auth(),
         );
+        sync_client = sync_client.with_runtime_settings(self.runtime_settings.clone());
         if let Some(map) = shard_map {
             sync_client = sync_client.with_shard_map(map);
         }
@@ -265,7 +270,8 @@ impl ClusterBootstrap {
             .with_metadata(metadata)
             .with_mv_service(mv_service)
             .with_points_sink(points_sink)
-            .with_wal(wal);
+            .with_wal(wal)
+            .with_runtime_settings(self.runtime_settings.clone());
         if let Some((map, cache)) = shard_map {
             raft_store = raft_store.with_shard_map(map, cache);
         }

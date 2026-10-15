@@ -22,19 +22,30 @@ use crate::ports::wal::WalPort;
 use crate::application::runtime::control;
 use crate::application::runtime::shard_heartbeat;
 
-pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
+/// Run the server. `log_level` lets `SET log_level` replace the process's
+/// log filter.
+pub async fn serve(
+    config: HyperbytedbConfig,
+    log_level: Option<crate::telemetry::LogLevel>,
+) -> anyhow::Result<()> {
     // The control runtime lives exactly as long as the server: installed
     // before Raft starts, stopped after everything else has shut down.
     if config.cluster.enabled {
         control::install()?;
     }
-    let result = serve_inner(config).await;
+    let result = serve_inner(config, log_level).await;
     control::shutdown();
     result
 }
 
-async fn serve_inner(config: HyperbytedbConfig) -> anyhow::Result<()> {
+async fn serve_inner(
+    config: HyperbytedbConfig,
+    log_level: Option<crate::telemetry::LogLevel>,
+) -> anyhow::Result<()> {
     let bootstrapped = build_services(&config).await?;
+    if let Some(log_level) = log_level {
+        log_level.register(&bootstrapped.app_state.runtime_settings);
+    }
     crate::application::stage_timer::spawn_scheduling_probe();
     let disk_paths = bootstrapped.disk_paths.clone();
     let disk_config = bootstrapped.disk_config.clone();
@@ -227,11 +238,12 @@ async fn serve_inner(config: HyperbytedbConfig) -> anyhow::Result<()> {
                 config.cluster.node_id,
                 config.sharding.clone(),
                 config.server.max_points_per_request,
+                app_state.runtime_settings.clone(),
             ));
             app_state.shard_scheduler = Some(scheduler.clone());
             {
                 let scheduler = Arc::downgrade(&scheduler);
-                crate::application::runtime_settings::register_applier(
+                app_state.runtime_settings.register_applier(
                     crate::application::runtime_settings::SCHEDULE_LIMIT,
                     crate::application::runtime_settings::usize_applier(move |n| {
                         if let Some(s) = scheduler.upgrade() {
@@ -385,7 +397,10 @@ async fn serve_inner(config: HyperbytedbConfig) -> anyhow::Result<()> {
     };
 
     // `SET`s made before this restart, now that every applier is registered.
-    if let Err(e) = crate::application::runtime_settings::restore(app_state.metadata.as_ref()).await
+    if let Err(e) = app_state
+        .runtime_settings
+        .restore(app_state.metadata.as_ref())
+        .await
     {
         tracing::warn!(error = %e, "failed to apply stored settings");
     }

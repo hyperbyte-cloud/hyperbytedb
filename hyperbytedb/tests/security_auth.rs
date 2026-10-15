@@ -163,6 +163,7 @@ async fn start_auth_cluster_node_with(
         drain_service: None,
         raft: None,
         auth_enabled: true,
+        runtime_settings: Default::default(),
         cluster_auth: cluster_auth.clone(),
         auth_allow_query_param_credentials: true,
         prometheus_handle: None,

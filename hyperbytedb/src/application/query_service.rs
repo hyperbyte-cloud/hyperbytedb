@@ -83,6 +83,9 @@ pub struct QueryServiceImpl {
     /// by the scheduler, which has its own Raft handle.
     shard_is_leader: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     shard_leader_addr: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
+    /// This node's runtime settings. Without them `SET` and `SHOW SETTINGS`
+    /// are refused rather than changing nothing.
+    runtime_settings: Option<Arc<crate::application::runtime_settings::RuntimeSettings>>,
 }
 
 impl QueryServiceImpl {
@@ -114,6 +117,7 @@ impl QueryServiceImpl {
             shard_routing: None,
             shard_is_leader: None,
             shard_leader_addr: None,
+            runtime_settings: None,
         }
     }
 
@@ -185,6 +189,35 @@ impl QueryServiceImpl {
                  until the next successful drop of the same scope"
             );
         }
+    }
+
+    #[must_use]
+    pub fn with_runtime_settings(
+        mut self,
+        settings: Arc<crate::application::runtime_settings::RuntimeSettings>,
+    ) -> Self {
+        self.runtime_settings = Some(settings);
+        self
+    }
+
+    /// The query timeout, or its `SET` override.
+    fn query_timeout_secs(&self) -> u64 {
+        self.runtime_settings
+            .as_ref()
+            .map_or(self.query_timeout_secs, |s| {
+                s.u64_or(
+                    crate::application::runtime_settings::QUERY_TIMEOUT_SECS,
+                    self.query_timeout_secs,
+                )
+            })
+    }
+
+    fn settings(
+        &self,
+    ) -> Result<&crate::application::runtime_settings::RuntimeSettings, HyperbytedbError> {
+        self.runtime_settings.as_deref().ok_or_else(|| {
+            HyperbytedbError::Internal("runtime settings are not available on this service".into())
+        })
     }
 
     #[must_use]
@@ -289,10 +322,7 @@ impl QueryServiceImpl {
         &self,
         fut: impl std::future::Future<Output = Result<T, HyperbytedbError>>,
     ) -> Result<T, HyperbytedbError> {
-        let timeout = std::time::Duration::from_secs(crate::application::runtime_settings::u64_or(
-            crate::application::runtime_settings::QUERY_TIMEOUT_SECS,
-            self.query_timeout_secs,
-        ));
+        let timeout = std::time::Duration::from_secs(self.query_timeout_secs());
         match tokio::time::timeout(timeout, fut).await {
             Ok(result) => result,
             Err(_) => Err(HyperbytedbError::QueryTimeout),
@@ -1450,7 +1480,9 @@ async fn execute_statement(
             // A single node; a cluster replicates the SET through Raft and
             // every node applies it the same way.
             let value = crate::application::runtime_settings::validate(name, value.clone())?;
-            crate::application::runtime_settings::apply(svc.metadata.as_ref(), name, value).await?;
+            svc.settings()?
+                .apply(svc.metadata.as_ref(), name, value)
+                .await?;
             Ok(StatementResult {
                 statement_id,
                 series: Some(vec![]),
@@ -1458,7 +1490,7 @@ async fn execute_statement(
             })
         }
         Statement::ShowSettings => {
-            let rows = crate::application::runtime_settings::show(svc.metadata.as_ref()).await?;
+            let rows = svc.settings()?.show(svc.metadata.as_ref()).await?;
             Ok(StatementResult {
                 statement_id,
                 series: Some(vec![SeriesResult {
@@ -1880,13 +1912,7 @@ async fn run_series_query(
 ) -> Result<Vec<SeriesResult>, HyperbytedbError> {
     let mut stage =
         crate::application::stage_timer::StageTimer::new("hyperbytedb_query_local_stage_seconds");
-    let sql = with_execution_time_limit(
-        sql,
-        crate::application::runtime_settings::u64_or(
-            crate::application::runtime_settings::QUERY_TIMEOUT_SECS,
-            svc.query_timeout_secs,
-        ),
-    );
+    let sql = with_execution_time_limit(sql, svc.query_timeout_secs());
     let mut batches = svc.query_port.execute_sql_arrow(&sql).await?;
     let mut builder = crate::application::query_arrow_series::SeriesBuilder::new(
         measurement,

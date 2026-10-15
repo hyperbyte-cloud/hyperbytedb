@@ -128,6 +128,7 @@ pub struct RaftStore {
     shard_map: Option<Arc<dyn ShardMapPort>>,
     shard_location_cache: Option<Arc<ShardLocationCache>>,
     shard_routing: Option<Arc<ShardRoutingContext>>,
+    runtime_settings: Option<Arc<crate::application::runtime_settings::RuntimeSettings>>,
 }
 
 impl RaftStore {
@@ -205,6 +206,7 @@ impl RaftStore {
             shard_map: None,
             shard_location_cache: None,
             shard_routing: None,
+            runtime_settings: None,
         })
     }
 
@@ -323,6 +325,15 @@ impl RaftStore {
     ) -> Self {
         self.shard_map = Some(shard_map);
         self.shard_location_cache = Some(location_cache);
+        self
+    }
+
+    /// This node's runtime settings, so a committed `SET` applies at once.
+    pub fn with_runtime_settings(
+        mut self,
+        settings: Arc<crate::application::runtime_settings::RuntimeSettings>,
+    ) -> Self {
+        self.runtime_settings = Some(settings);
         self
     }
 
@@ -527,6 +538,7 @@ impl RaftStorage<TypeConfig> for RaftStore {
             shard_map: self.shard_map.clone(),
             shard_location_cache: self.shard_location_cache.clone(),
             shard_routing: self.shard_routing.clone(),
+            runtime_settings: self.runtime_settings.clone(),
         }
     }
 
@@ -698,6 +710,7 @@ impl RaftStorage<TypeConfig> for RaftStore {
             shard_map: self.shard_map.clone(),
             shard_location_cache: self.shard_location_cache.clone(),
             shard_routing: self.shard_routing.clone(),
+            runtime_settings: self.runtime_settings.clone(),
         }
     }
 
@@ -928,6 +941,7 @@ impl RaftStore {
                             points_sink: self.points_sink.as_ref(),
                             wal: self.wal.as_ref(),
                             shard_routing: self.shard_routing.as_ref(),
+                            runtime_settings: self.runtime_settings.as_deref(),
                         },
                         *mutation,
                     )

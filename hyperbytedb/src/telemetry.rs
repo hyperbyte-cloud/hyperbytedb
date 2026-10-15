@@ -47,10 +47,13 @@ pub fn init_logging(
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
-    let filter = reloadable(filter);
+    let (filter, log_level) = reloadable(filter);
     #[cfg(feature = "otel")]
     if std::env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_some() {
-        return otel::init(filter, json);
+        return otel::init(filter, json).map(|mut guard| {
+            guard.log_level = Some(log_level);
+            guard
+        });
     }
     let registry = tracing_subscriber::registry();
     if json {
@@ -63,36 +66,57 @@ pub fn init_logging(
             .try_init()
     }
     .map_err(|e| anyhow::anyhow!("failed to set logging subscriber: {e}"))?;
-    Ok(TelemetryGuard::default())
+    let mut guard = TelemetryGuard::default();
+    guard.log_level = Some(log_level);
+    Ok(guard)
 }
 
 type ReloadFilter =
     tracing_subscriber::reload::Layer<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>;
 
-/// Wrap the log filter so `SET log_level` can swap it, and register that.
-fn reloadable(filter: tracing_subscriber::EnvFilter) -> ReloadFilter {
-    use crate::application::runtime_settings as rs;
-    rs::set_fallback(
-        rs::LOG_LEVEL,
-        rs::SettingValue::Text(filter.to_string()),
-        rs::Source::Config,
-    );
+/// Wrap the log filter so `SET log_level` can swap it.
+fn reloadable(filter: tracing_subscriber::EnvFilter) -> (ReloadFilter, LogLevel) {
+    let initial = filter.to_string();
     let (layer, handle) = tracing_subscriber::reload::Layer::new(filter);
-    rs::register_applier(
-        rs::LOG_LEVEL,
-        std::sync::Arc::new(move |v| {
-            let text = v.as_text().unwrap_or_default();
-            let filter = tracing_subscriber::EnvFilter::try_new(text).map_err(|e| {
-                crate::error::HyperbytedbError::Internal(format!("log_level: {e}").into())
-            })?;
-            handle.reload(filter).map_err(|e| {
-                crate::error::HyperbytedbError::Internal(format!("log_level: {e}").into())
-            })?;
-            tracing::info!(filter = text, "log filter replaced");
-            Ok(())
-        }),
-    );
-    layer
+    (layer, LogLevel { initial, handle })
+}
+
+/// This process's log filter, for `SET log_level`.
+#[derive(Clone)]
+pub struct LogLevel {
+    initial: String,
+    handle: tracing_subscriber::reload::Handle<
+        tracing_subscriber::EnvFilter,
+        tracing_subscriber::Registry,
+    >,
+}
+
+impl LogLevel {
+    /// Let `settings` replace the filter; without an override it is the one
+    /// logging started with.
+    pub fn register(&self, settings: &crate::application::runtime_settings::RuntimeSettings) {
+        use crate::application::runtime_settings as rs;
+        settings.set_fallback(
+            rs::LOG_LEVEL,
+            rs::SettingValue::Text(self.initial.clone()),
+            rs::Source::Config,
+        );
+        let handle = self.handle.clone();
+        settings.register_applier(
+            rs::LOG_LEVEL,
+            std::sync::Arc::new(move |v| {
+                let text = v.as_text().unwrap_or_default();
+                let filter = tracing_subscriber::EnvFilter::try_new(text).map_err(|e| {
+                    crate::error::HyperbytedbError::Internal(format!("log_level: {e}").into())
+                })?;
+                handle.reload(filter).map_err(|e| {
+                    crate::error::HyperbytedbError::Internal(format!("log_level: {e}").into())
+                })?;
+                tracing::info!(filter = text, "log filter replaced");
+                Ok(())
+            }),
+        );
+    }
 }
 
 /// Flushes and shuts down the span exporter on drop.
@@ -100,6 +124,15 @@ fn reloadable(filter: tracing_subscriber::EnvFilter) -> ReloadFilter {
 pub struct TelemetryGuard {
     #[cfg(feature = "otel")]
     provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
+    log_level: Option<LogLevel>,
+}
+
+impl TelemetryGuard {
+    /// What `SET log_level` changes; `None` without [`init_logging`].
+    #[must_use]
+    pub fn log_level(&self) -> Option<LogLevel> {
+        self.log_level.clone()
+    }
 }
 
 impl Drop for TelemetryGuard {
@@ -173,6 +206,7 @@ mod otel {
         tracing::info!(ratio = sample_ratio(), "exporting request traces over OTLP");
         Ok(TelemetryGuard {
             provider: Some(provider),
+            log_level: None,
         })
     }
 

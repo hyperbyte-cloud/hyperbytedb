@@ -162,6 +162,10 @@ pub async fn start_sharded_node(
         .with_http2_connections(4),
     );
 
+    // One per node, as each process has: SET on one node must not reach
+    // another node's pools through a shared registry.
+    let runtime_settings =
+        Arc::new(hyperbytedb::application::runtime_settings::RuntimeSettings::default());
     let shard_map = Arc::new(RocksDbShardMap::open(&meta_dir, true).unwrap());
     let location_cache = Arc::new(ShardLocationCache::new());
     let shard_routing = Arc::new(ShardRoutingContext {
@@ -172,6 +176,7 @@ pub async fn start_sharded_node(
         peer_client: peer_client.clone(),
         region_write_stats: Arc::new(hyperbytedb::application::runtime::RegionWriteStats::new()),
         forward_coalescer: Default::default(),
+        runtime_settings: runtime_settings.clone(),
     });
 
     let replication_apply = Some(ReplicationApplyQueue::with_sink_and_sharding(
@@ -208,6 +213,7 @@ pub async fn start_sharded_node(
         30,
         sink.clone(),
     )
+    .with_runtime_settings(runtime_settings.clone())
     .with_sharding(shard_routing.clone());
     base_query =
         base_query.with_cluster_replication(peer_client.clone(), node_id, opts.replication.clone());
@@ -274,6 +280,7 @@ pub async fn start_sharded_node(
                 node_id,
                 opts.sharding.clone(),
                 0,
+                runtime_settings.clone(),
             ),
         )
     });
@@ -300,6 +307,7 @@ pub async fn start_sharded_node(
         drain_service: None,
         raft: opts.raft.clone(),
         auth_enabled: false,
+        runtime_settings: runtime_settings.clone(),
         cluster_auth: Default::default(),
         auth_allow_query_param_credentials: false,
         prometheus_handle: None,

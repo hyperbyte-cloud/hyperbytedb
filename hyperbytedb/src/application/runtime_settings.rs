@@ -14,7 +14,7 @@
 //! `SET` calls with the new value.
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use parking_lot::RwLock;
 
@@ -257,22 +257,17 @@ struct Registry {
     appliers: HashMap<&'static str, Applier>,
 }
 
-static REGISTRY: LazyLock<RwLock<Registry>> = LazyLock::new(|| RwLock::new(Registry::default()));
+/// One node's runtime settings: the `SET` overrides, the values to fall
+/// back to, and the appliers that make a resource follow a change. Built
+/// at startup and handed to what reads or changes settings, so nodes run
+/// in one process (tests) each have their own.
+#[derive(Default)]
+pub struct RuntimeSettings {
+    registry: RwLock<Registry>,
+}
 
 fn def(name: &str) -> Option<&'static Def> {
     SETTINGS.iter().find(|d| d.name == name)
-}
-
-/// The value this node uses without an override, and where it comes from,
-/// for `SHOW SETTINGS` and for appliers when an override is removed.
-pub fn set_fallback(name: &'static str, value: SettingValue, source: Source) {
-    REGISTRY.write().fallbacks.insert(name, (value, source));
-}
-
-/// Register the applier for a setting that holds a resource; a later call
-/// replaces it.
-pub fn register_applier(name: &'static str, applier: Applier) {
-    REGISTRY.write().appliers.insert(name, applier);
 }
 
 /// An applier for a count: `f` gets the value as a `usize`.
@@ -307,44 +302,6 @@ pub fn resize_semaphore(sem: &Arc<tokio::sync::Semaphore>, from: usize, to: usiz
             });
         }
     }
-}
-
-/// The override for an integer setting, if one is set.
-#[must_use]
-pub fn override_i64(name: &str) -> Option<i64> {
-    REGISTRY
-        .read()
-        .overrides
-        .get(name)
-        .and_then(SettingValue::as_i64)
-}
-
-/// The override for a boolean setting, if one is set.
-#[must_use]
-pub fn override_bool(name: &str) -> Option<bool> {
-    REGISTRY
-        .read()
-        .overrides
-        .get(name)
-        .and_then(SettingValue::as_bool)
-}
-
-/// `value`, or the override for `name` if one is set.
-#[must_use]
-pub fn usize_or(name: &str, value: usize) -> usize {
-    override_i64(name).map_or(value, |v| usize::try_from(v.max(0)).unwrap_or(usize::MAX))
-}
-
-/// `value`, or the override for `name` if one is set.
-#[must_use]
-pub fn u64_or(name: &str, value: u64) -> u64 {
-    override_i64(name).map_or(value, |v| u64::try_from(v.max(0)).unwrap_or(0))
-}
-
-/// `value`, or the override for `name` if one is set.
-#[must_use]
-pub fn bool_or(name: &str, value: bool) -> bool {
-    override_bool(name).unwrap_or(value)
 }
 
 /// Check a `SET`: a known setting, and a value of its kind and range.
@@ -384,59 +341,6 @@ pub fn validate(
     )))
 }
 
-/// Make `value` (or the fallback, for `None`) this node's value, without
-/// storing it.
-pub(crate) fn apply_runtime(
-    name: &str,
-    value: Option<SettingValue>,
-) -> Result<(), HyperbytedbError> {
-    let Some(d) = def(name) else {
-        return Ok(());
-    };
-    let (effective, applier) = {
-        let mut reg = REGISTRY.write();
-        let effective = match value {
-            Some(v) => {
-                reg.overrides.insert(d.name, v.clone());
-                Some(v)
-            }
-            None => {
-                reg.overrides.remove(d.name);
-                reg.fallbacks.get(d.name).map(|(v, _)| v.clone())
-            }
-        };
-        (effective, reg.appliers.get(d.name).cloned())
-    };
-    if let (Some(v), Some(applier)) = (effective, applier) {
-        applier(&v)?;
-    }
-    Ok(())
-}
-
-/// Store and apply a `SET` on this node. Every node runs this for a
-/// replicated `SET`.
-pub async fn apply(
-    metadata: &dyn MetadataPort,
-    name: &str,
-    value: Option<SettingValue>,
-) -> Result<(), HyperbytedbError> {
-    metadata.set_setting(name, value.clone()).await?;
-    apply_runtime(name, value)
-}
-
-/// Apply the stored overrides at startup, after the appliers are registered.
-pub async fn restore(metadata: &dyn MetadataPort) -> Result<(), HyperbytedbError> {
-    for d in SETTINGS {
-        if let Some(value) = metadata.get_setting(d.name).await? {
-            tracing::info!(setting = d.name, value = ?value, "applying stored setting");
-            if let Err(e) = apply_runtime(d.name, Some(value)) {
-                tracing::warn!(setting = d.name, error = %e, "stored setting not applied");
-            }
-        }
-    }
-    Ok(())
-}
-
 /// One `SHOW SETTINGS` row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
@@ -449,86 +353,219 @@ pub struct Row {
     pub description: &'static str,
 }
 
-/// `SHOW SETTINGS`: every setting with this node's value and its source.
-pub async fn show(metadata: &dyn MetadataPort) -> Result<Vec<Row>, HyperbytedbError> {
-    let mut rows = Vec::with_capacity(SETTINGS.len());
-    for d in SETTINGS {
-        let (value, source) = match metadata.get_setting(d.name).await? {
-            Some(v) => (Some(v), Some(Source::Set)),
-            None => match REGISTRY.read().fallbacks.get(d.name) {
-                Some((v, s)) => (Some(v.clone()), Some(*s)),
-                None => (None, None),
-            },
-        };
-        rows.push(Row {
-            name: d.name,
-            value,
-            source,
-            config: d.config,
-            description: d.description,
-        });
+/// Store a `SET` and, with this node's `settings`, apply it. Without them
+/// (a component built without settings) it is only stored, and takes
+/// effect when the node next starts.
+pub async fn apply_or_store(
+    settings: Option<&RuntimeSettings>,
+    metadata: &dyn MetadataPort,
+    name: &str,
+    value: Option<SettingValue>,
+) -> Result<(), HyperbytedbError> {
+    match settings {
+        Some(settings) => settings.apply(metadata, name, value).await,
+        None => {
+            tracing::warn!(
+                setting = name,
+                "SET stored but not applied here: no runtime settings; it applies at the next start"
+            );
+            metadata.set_setting(name, value).await
+        }
     }
-    Ok(rows)
 }
 
-/// Record the config file's values, for `SHOW SETTINGS` and for removing
-/// an override. The pools and the log level are recorded where they are
-/// resolved.
-pub fn set_config_fallbacks(config: &crate::config::HyperbytedbConfig) {
-    let i = |v: u64| SettingValue::Int(i64::try_from(v).unwrap_or(i64::MAX));
-    let c = Source::Config;
-    set_fallback(
-        MAX_CONCURRENT_QUERIES,
-        i(config.server.max_concurrent_queries as u64),
-        c,
-    );
-    set_fallback(QUERY_TIMEOUT_SECS, i(config.server.query_timeout_secs), c);
-    let rate = if config.rate_limit.enabled {
-        config.rate_limit.max_requests_per_second
-    } else {
-        0
-    };
-    set_fallback(RATE_LIMIT_PER_SECOND, i(rate), c);
-    set_fallback(
-        MAX_TAG_VALUES_PER_MEASUREMENT,
-        i(config.cardinality.max_tag_values_per_measurement as u64),
-        c,
-    );
-    set_fallback(
-        MAX_MEASUREMENTS_PER_DATABASE,
-        i(config.cardinality.max_measurements_per_database as u64),
-        c,
-    );
-    set_fallback(FLUSH_INTERVAL_SECS, i(config.flush.interval_secs), c);
-    if config.sharding.enabled {
-        let s = &config.sharding;
-        let b = SettingValue::Bool;
-        set_fallback(
-            ADD_PEER_PROPOSALS_ENABLED,
-            b(s.add_peer_proposals_enabled),
+impl RuntimeSettings {
+    /// The value this node uses without an override, and where it comes from,
+    /// for `SHOW SETTINGS` and for appliers when an override is removed.
+    pub fn set_fallback(&self, name: &'static str, value: SettingValue, source: Source) {
+        self.registry
+            .write()
+            .fallbacks
+            .insert(name, (value, source));
+    }
+
+    /// Register the applier for a setting that holds a resource; a later call
+    /// replaces it.
+    pub fn register_applier(&self, name: &'static str, applier: Applier) {
+        self.registry.write().appliers.insert(name, applier);
+    }
+
+    /// The override for an integer setting, if one is set.
+    #[must_use]
+    pub fn override_i64(&self, name: &str) -> Option<i64> {
+        self.registry
+            .read()
+            .overrides
+            .get(name)
+            .and_then(SettingValue::as_i64)
+    }
+
+    /// The override for a boolean setting, if one is set.
+    #[must_use]
+    pub fn override_bool(&self, name: &str) -> Option<bool> {
+        self.registry
+            .read()
+            .overrides
+            .get(name)
+            .and_then(SettingValue::as_bool)
+    }
+
+    /// `value`, or the override for `name` if one is set.
+    #[must_use]
+    pub fn usize_or(&self, name: &str, value: usize) -> usize {
+        self.override_i64(name)
+            .map_or(value, |v| usize::try_from(v.max(0)).unwrap_or(usize::MAX))
+    }
+
+    /// `value`, or the override for `name` if one is set.
+    #[must_use]
+    pub fn u64_or(&self, name: &str, value: u64) -> u64 {
+        self.override_i64(name)
+            .map_or(value, |v| u64::try_from(v.max(0)).unwrap_or(0))
+    }
+
+    /// `value`, or the override for `name` if one is set.
+    #[must_use]
+    pub fn bool_or(&self, name: &str, value: bool) -> bool {
+        self.override_bool(name).unwrap_or(value)
+    }
+
+    /// Make `value` (or the fallback, for `None`) this node's value, without
+    /// storing it.
+    pub(crate) fn apply_runtime(
+        &self,
+        name: &str,
+        value: Option<SettingValue>,
+    ) -> Result<(), HyperbytedbError> {
+        let Some(d) = def(name) else {
+            return Ok(());
+        };
+        let (effective, applier) = {
+            let mut reg = self.registry.write();
+            let effective = match value {
+                Some(v) => {
+                    reg.overrides.insert(d.name, v.clone());
+                    Some(v)
+                }
+                None => {
+                    reg.overrides.remove(d.name);
+                    reg.fallbacks.get(d.name).map(|(v, _)| v.clone())
+                }
+            };
+            (effective, reg.appliers.get(d.name).cloned())
+        };
+        if let (Some(v), Some(applier)) = (effective, applier) {
+            applier(&v)?;
+        }
+        Ok(())
+    }
+
+    /// Store and apply a `SET` on this node. Every node runs this for a
+    /// replicated `SET`.
+    pub async fn apply(
+        &self,
+        metadata: &dyn MetadataPort,
+        name: &str,
+        value: Option<SettingValue>,
+    ) -> Result<(), HyperbytedbError> {
+        metadata.set_setting(name, value.clone()).await?;
+        self.apply_runtime(name, value)
+    }
+
+    /// Apply the stored overrides at startup, after the appliers are registered.
+    pub async fn restore(&self, metadata: &dyn MetadataPort) -> Result<(), HyperbytedbError> {
+        for d in SETTINGS {
+            if let Some(value) = metadata.get_setting(d.name).await? {
+                tracing::info!(setting = d.name, value = ?value, "applying stored setting");
+                if let Err(e) = self.apply_runtime(d.name, Some(value)) {
+                    tracing::warn!(setting = d.name, error = %e, "stored setting not applied");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `SHOW SETTINGS`: every setting with this node's value and its source.
+    pub async fn show(&self, metadata: &dyn MetadataPort) -> Result<Vec<Row>, HyperbytedbError> {
+        let mut rows = Vec::with_capacity(SETTINGS.len());
+        for d in SETTINGS {
+            let (value, source) = match metadata.get_setting(d.name).await? {
+                Some(v) => (Some(v), Some(Source::Set)),
+                None => match self.registry.read().fallbacks.get(d.name) {
+                    Some((v, s)) => (Some(v.clone()), Some(*s)),
+                    None => (None, None),
+                },
+            };
+            rows.push(Row {
+                name: d.name,
+                value,
+                source,
+                config: d.config,
+                description: d.description,
+            });
+        }
+        Ok(rows)
+    }
+
+    /// Record the config file's values, for `SHOW SETTINGS` and for removing
+    /// an override. The pools and the log level are recorded where they are
+    /// resolved.
+    pub fn set_config_fallbacks(&self, config: &crate::config::HyperbytedbConfig) {
+        let i = |v: u64| SettingValue::Int(i64::try_from(v).unwrap_or(i64::MAX));
+        let c = Source::Config;
+        self.set_fallback(
+            MAX_CONCURRENT_QUERIES,
+            i(config.server.max_concurrent_queries as u64),
             c,
         );
-        set_fallback(
-            REMOVE_PEER_PROPOSALS_ENABLED,
-            b(s.remove_peer_proposals_enabled),
+        self.set_fallback(QUERY_TIMEOUT_SECS, i(config.server.query_timeout_secs), c);
+        let rate = if config.rate_limit.enabled {
+            config.rate_limit.max_requests_per_second
+        } else {
+            0
+        };
+        self.set_fallback(RATE_LIMIT_PER_SECOND, i(rate), c);
+        self.set_fallback(
+            MAX_TAG_VALUES_PER_MEASUREMENT,
+            i(config.cardinality.max_tag_values_per_measurement as u64),
             c,
         );
-        set_fallback(PEER_HEAL_ENABLED, b(s.peer_heal_enabled), c);
-        set_fallback(SCHEDULE_LIMIT, i(s.schedule_limit as u64), c);
-        set_fallback(
-            MOVEMENT_BUDGET_BYTES_PER_SEC,
-            i(s.movement_budget_bytes_per_sec),
+        self.set_fallback(
+            MAX_MEASUREMENTS_PER_DATABASE,
+            i(config.cardinality.max_measurements_per_database as u64),
             c,
         );
-        set_fallback(REGION_SPLIT_SERIES, i(s.region_split_series), c);
-        set_fallback(REGION_MAX_SERIES, i(s.region_max_series), c);
-        set_fallback(REGION_MERGE_SERIES, i(s.region_merge_series), c);
-        set_fallback(SPLIT_MERGE_INTERVAL_SECS, i(s.split_merge_interval_secs), c);
-        set_fallback(
-            BOOTSTRAP_REGIONS_PER_NODE,
-            i(s.bootstrap_regions_per_node as u64),
-            c,
-        );
+        self.set_fallback(FLUSH_INTERVAL_SECS, i(config.flush.interval_secs), c);
+        if config.sharding.enabled {
+            let s = &config.sharding;
+            let b = SettingValue::Bool;
+            self.set_fallback(
+                ADD_PEER_PROPOSALS_ENABLED,
+                b(s.add_peer_proposals_enabled),
+                c,
+            );
+            self.set_fallback(
+                REMOVE_PEER_PROPOSALS_ENABLED,
+                b(s.remove_peer_proposals_enabled),
+                c,
+            );
+            self.set_fallback(PEER_HEAL_ENABLED, b(s.peer_heal_enabled), c);
+            self.set_fallback(SCHEDULE_LIMIT, i(s.schedule_limit as u64), c);
+            self.set_fallback(
+                MOVEMENT_BUDGET_BYTES_PER_SEC,
+                i(s.movement_budget_bytes_per_sec),
+                c,
+            );
+            self.set_fallback(REGION_SPLIT_SERIES, i(s.region_split_series), c);
+            self.set_fallback(REGION_MAX_SERIES, i(s.region_max_series), c);
+            self.set_fallback(REGION_MERGE_SERIES, i(s.region_merge_series), c);
+            self.set_fallback(SPLIT_MERGE_INTERVAL_SECS, i(s.split_merge_interval_secs), c);
+            self.set_fallback(
+                BOOTSTRAP_REGIONS_PER_NODE,
+                i(s.bootstrap_regions_per_node as u64),
+                c,
+            );
+        }
     }
 }
 
@@ -570,6 +607,48 @@ mod tests {
         assert!(validate(LOG_LEVEL, text("hyperbytedb=debug,info")).is_ok());
         assert!(validate(LOG_LEVEL, text("hyperbytedb=loud")).is_err());
         assert!(validate("max_threads", int(4)).is_err());
+    }
+
+    /// Two nodes in one process (the sharded test harness) each have their
+    /// own settings: a SET on one resizes only its own pool. With one
+    /// process-wide registry the last node to register won every applier.
+    #[test]
+    fn each_node_has_its_own_settings() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (a, b) = (RuntimeSettings::default(), RuntimeSettings::default());
+        let (pool_a, pool_b) = (Arc::new(AtomicUsize::new(2)), Arc::new(AtomicUsize::new(2)));
+        for (settings, pool) in [(&a, &pool_a), (&b, &pool_b)] {
+            let pool = Arc::clone(pool);
+            settings.register_applier(
+                QUERY_POOL_SIZE,
+                usize_applier(move |n| pool.store(n, Ordering::SeqCst)),
+            );
+        }
+        a.apply_runtime(QUERY_POOL_SIZE, Some(SettingValue::Int(5)))
+            .unwrap();
+        assert_eq!(pool_a.load(Ordering::SeqCst), 5);
+        assert_eq!(pool_b.load(Ordering::SeqCst), 2);
+        assert_eq!(a.usize_or(QUERY_POOL_SIZE, 2), 5);
+        assert_eq!(b.usize_or(QUERY_POOL_SIZE, 2), 2);
+    }
+
+    /// Without settings a SET is stored, so the node applies it at its next
+    /// start, rather than lost.
+    #[tokio::test]
+    async fn a_set_without_settings_is_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta =
+            crate::adapters::metadata::rocksdb_meta::RocksDbMetadata::open(dir.path()).unwrap();
+        apply_or_store(None, &meta, QUERY_POOL_SIZE, Some(SettingValue::Int(4)))
+            .await
+            .unwrap();
+        assert_eq!(
+            meta.get_setting(QUERY_POOL_SIZE).await.unwrap(),
+            Some(SettingValue::Int(4))
+        );
+        let later = RuntimeSettings::default();
+        later.restore(&meta).await.unwrap();
+        assert_eq!(later.usize_or(QUERY_POOL_SIZE, 2), 4);
     }
 
     #[test]

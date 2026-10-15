@@ -42,6 +42,7 @@ pub async fn apply_schema_mutation(
             points_sink: None,
             wal: None,
             shard_routing: None,
+            runtime_settings: None,
         },
         mutation,
     )

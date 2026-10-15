@@ -747,6 +747,7 @@ async fn apply_mutation(
             points_sink: Some(&state.points_sink),
             wal: Some(&state.wal),
             shard_routing: state.shard_routing.as_ref(),
+            runtime_settings: Some(&state.runtime_settings),
         },
         req,
     )
@@ -895,6 +896,7 @@ pub async fn handle_sync_trigger(State(state): State<Arc<AppState>>) -> impl Int
     let max_points_per_request = state.max_points_per_request;
     let shard_map = state.shard_map.clone();
     let cluster_auth = state.cluster_auth.clone();
+    let runtime_settings = state.runtime_settings.clone();
 
     let membership_clone = membership.clone();
 
@@ -923,6 +925,7 @@ pub async fn handle_sync_trigger(State(state): State<Arc<AppState>>) -> impl Int
             fallback_peers,
             &cluster_auth,
         );
+        sync_client = sync_client.with_runtime_settings(runtime_settings);
         if let Some(ref map) = shard_map {
             let sm: Arc<dyn crate::ports::sharding::ShardMapPort> = map.clone();
             sync_client = sync_client.with_shard_map(sm);

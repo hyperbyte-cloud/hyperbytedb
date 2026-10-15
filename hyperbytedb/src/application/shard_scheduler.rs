@@ -288,6 +288,8 @@ const RECONCILE_PARK_AFTER_TICKS: u32 = 10;
 const RECONCILE_MIN_AGE_SECS: i64 = 300;
 
 pub struct ShardScheduler {
+    /// This node's runtime settings: `SET` overrides for the gates below.
+    runtime_settings: Arc<rs::RuntimeSettings>,
     shard_map: Arc<RocksDbShardMap>,
     membership: SharedMembership,
     raft: HyperbytedbRaft,
@@ -396,11 +398,13 @@ impl ShardScheduler {
         node_id: u64,
         config: ShardingConfig,
         max_points_per_request: usize,
+        runtime_settings: Arc<rs::RuntimeSettings>,
     ) -> Self {
         let mover_limit = config.schedule_limit.max(1);
         let movers = Arc::new(tokio::sync::Semaphore::new(mover_limit));
         let move_bytes = Arc::new(tokio::sync::Semaphore::new(move_budget_mib(&config)));
         Self {
+            runtime_settings,
             shard_map,
             membership,
             raft,
@@ -687,7 +691,7 @@ impl ShardScheduler {
         let unhealthy = self.unhealthy_region_peers(region).await;
         let rate = move_rate_bytes_per_sec(
             move_tier(region, rf, &departing, &unhealthy),
-            rs::u64_or(
+            self.runtime_settings.u64_or(
                 rs::MOVEMENT_BUDGET_BYTES_PER_SEC,
                 self.config.movement_budget_bytes_per_sec,
             ),
@@ -1141,8 +1145,10 @@ impl ShardScheduler {
         }
         let rf = effective_replication_factor(self.config.replication_factor, candidates.len());
         let mut inputs = Vec::new();
-        let merge_series = rs::u64_or(rs::REGION_MERGE_SERIES, self.config.region_merge_series);
-        let cooldown = rs::u64_or(
+        let merge_series = self
+            .runtime_settings
+            .u64_or(rs::REGION_MERGE_SERIES, self.config.region_merge_series);
+        let cooldown = self.runtime_settings.u64_or(
             rs::SPLIT_MERGE_INTERVAL_SECS,
             self.config.split_merge_interval_secs,
         );
@@ -1335,8 +1341,10 @@ impl ShardScheduler {
                     series_count,
                     region.last_split_at,
                     now,
-                    rs::u64_or(rs::REGION_SPLIT_SERIES, self.config.region_split_series),
-                    rs::u64_or(rs::REGION_MAX_SERIES, self.config.region_max_series),
+                    self.runtime_settings
+                        .u64_or(rs::REGION_SPLIT_SERIES, self.config.region_split_series),
+                    self.runtime_settings
+                        .u64_or(rs::REGION_MAX_SERIES, self.config.region_max_series),
                     self.config.region_split_cooldown_secs,
                 );
 
@@ -1370,16 +1378,20 @@ impl ShardScheduler {
                     let right = &space.regions[idx + 1];
                     let (right_series, _) = max_region_peer_heartbeat_stats(&hb, right);
                     if series_count
-                        < rs::u64_or(rs::REGION_MERGE_SERIES, self.config.region_merge_series)
+                        < self
+                            .runtime_settings
+                            .u64_or(rs::REGION_MERGE_SERIES, self.config.region_merge_series)
                         && right_series
-                            < rs::u64_or(rs::REGION_MERGE_SERIES, self.config.region_merge_series)
+                            < self
+                                .runtime_settings
+                                .u64_or(rs::REGION_MERGE_SERIES, self.config.region_merge_series)
                         && now.saturating_sub(region.last_split_at)
-                            >= rs::u64_or(
+                            >= self.runtime_settings.u64_or(
                                 rs::SPLIT_MERGE_INTERVAL_SECS,
                                 self.config.split_merge_interval_secs,
                             )
                         && now.saturating_sub(right.last_split_at)
-                            >= rs::u64_or(
+                            >= self.runtime_settings.u64_or(
                                 rs::SPLIT_MERGE_INTERVAL_SECS,
                                 self.config.split_merge_interval_secs,
                             )
@@ -1404,7 +1416,7 @@ impl ShardScheduler {
                 if self.config.load_split_qps_threshold > 0
                     && write_qps > self.config.load_split_qps_threshold
                     && now.saturating_sub(region.last_split_at)
-                        >= rs::u64_or(
+                        >= self.runtime_settings.u64_or(
                             rs::SPLIT_MERGE_INTERVAL_SECS,
                             self.config.split_merge_interval_secs,
                         )
@@ -2263,7 +2275,7 @@ impl ShardScheduler {
         // balance moves ran one per tick however long the tick took.
         let rate = move_rate_bytes_per_sec(
             tier,
-            rs::u64_or(
+            self.runtime_settings.u64_or(
                 rs::MOVEMENT_BUDGET_BYTES_PER_SEC,
                 self.config.movement_budget_bytes_per_sec,
             ),
@@ -2271,7 +2283,7 @@ impl ShardScheduler {
         );
         match step {
             PlacementStep::Add(_) => {
-                if !rs::bool_or(
+                if !self.runtime_settings.bool_or(
                     rs::ADD_PEER_PROPOSALS_ENABLED,
                     self.config.add_peer_proposals_enabled,
                 ) || !may_copy
@@ -2415,7 +2427,7 @@ impl ShardScheduler {
                 .await?;
             }
             PlacementStep::Remove(from_peer) => {
-                if !rs::bool_or(
+                if !self.runtime_settings.bool_or(
                     rs::REMOVE_PEER_PROPOSALS_ENABLED,
                     self.config.remove_peer_proposals_enabled,
                 ) {
@@ -2566,7 +2578,10 @@ impl ShardScheduler {
         key: &MeasurementKey,
         region: &ShardRegion,
     ) -> Result<(), HyperbytedbError> {
-        if !rs::bool_or(rs::PEER_HEAL_ENABLED, self.config.peer_heal_enabled) {
+        if !self
+            .runtime_settings
+            .bool_or(rs::PEER_HEAL_ENABLED, self.config.peer_heal_enabled)
+        {
             return Ok(());
         }
         if self.peer_client.is_none() {
@@ -2594,7 +2609,7 @@ impl ShardScheduler {
             return Ok(());
         };
 
-        if !rs::bool_or(
+        if !self.runtime_settings.bool_or(
             rs::REMOVE_PEER_PROPOSALS_ENABLED,
             self.config.remove_peer_proposals_enabled,
         ) {
@@ -3841,7 +3856,9 @@ mod tests {
         cluster_cfg.raft_heartbeat_interval_ms = Some(200);
         cluster_cfg.raft_election_timeout_ms = Some(500);
 
-        let bootstrap = ClusterBootstrap::init(&cluster_cfg, 1000, Default::default()).unwrap();
+        let bootstrap =
+            ClusterBootstrap::init(&cluster_cfg, 1000, Default::default(), Default::default())
+                .unwrap();
 
         let shard_map = Arc::new(RocksDbShardMap::open(&meta_dir, true).unwrap());
         let location_cache = Arc::new(ShardLocationCache::new());
@@ -3911,6 +3928,7 @@ mod tests {
             99,
             sharding,
             0,
+            Default::default(),
         )
         .with_test_force_leader(true)
         .with_test_propose_sink(proposals.clone());
@@ -3997,7 +4015,9 @@ mod tests {
         cluster_cfg.raft_heartbeat_interval_ms = Some(200);
         cluster_cfg.raft_election_timeout_ms = Some(500);
 
-        let bootstrap = ClusterBootstrap::init(&cluster_cfg, 1000, Default::default()).unwrap();
+        let bootstrap =
+            ClusterBootstrap::init(&cluster_cfg, 1000, Default::default(), Default::default())
+                .unwrap();
         let shard_map = Arc::new(RocksDbShardMap::open(&meta_dir, true).unwrap());
         let location_cache = Arc::new(ShardLocationCache::new());
         let raft = bootstrap
@@ -4058,6 +4078,7 @@ mod tests {
             1,
             sharding,
             0,
+            Default::default(),
         )
         .with_test_force_leader(true)
         .with_test_propose_sink(proposals.clone());
@@ -4134,7 +4155,9 @@ mod tests {
         cluster_cfg.raft_heartbeat_interval_ms = Some(200);
         cluster_cfg.raft_election_timeout_ms = Some(500);
 
-        let bootstrap = ClusterBootstrap::init(&cluster_cfg, 1000, Default::default()).unwrap();
+        let bootstrap =
+            ClusterBootstrap::init(&cluster_cfg, 1000, Default::default(), Default::default())
+                .unwrap();
         let shard_map = Arc::new(RocksDbShardMap::open(&meta_dir, true).unwrap());
         let location_cache = Arc::new(ShardLocationCache::new());
         let raft = bootstrap
@@ -4197,6 +4220,7 @@ mod tests {
             1,
             sharding,
             0,
+            Default::default(),
         )
         .with_test_force_leader(true)
         .with_test_propose_sink(proposals.clone());
@@ -4709,7 +4733,9 @@ mod tests {
             cluster_cfg.raft_heartbeat_interval_ms = Some(200);
             cluster_cfg.raft_election_timeout_ms = Some(500);
 
-            let bootstrap = ClusterBootstrap::init(&cluster_cfg, 1000, Default::default()).unwrap();
+            let bootstrap =
+                ClusterBootstrap::init(&cluster_cfg, 1000, Default::default(), Default::default())
+                    .unwrap();
             let shard_map = Arc::new(RocksDbShardMap::open(&meta_dir, true).unwrap());
             let location_cache = Arc::new(ShardLocationCache::new());
             let raft = bootstrap
@@ -4801,6 +4827,7 @@ mod tests {
                 1,
                 sharding,
                 10_000,
+                Default::default(),
             )
             .with_test_force_leader(true)
             .with_test_propose_sink(proposals.clone());
@@ -5191,14 +5218,16 @@ mod tests {
     async fn a_set_closes_the_add_peer_gate() {
         use crate::application::runtime_settings as rs;
         let harness = PlacementTestHarness::new(true, &[(2, 0)], 1).await;
-        rs::apply_runtime(
-            rs::ADD_PEER_PROPOSALS_ENABLED,
-            Some(rs::SettingValue::Bool(false)),
-        )
-        .unwrap();
-        let ticked = harness.scheduler.tick_once_for_test().await;
-        rs::apply_runtime(rs::ADD_PEER_PROPOSALS_ENABLED, None).unwrap();
-        ticked.unwrap();
+        // This node's settings only: nothing to reset for other tests.
+        harness
+            .scheduler
+            .runtime_settings
+            .apply_runtime(
+                rs::ADD_PEER_PROPOSALS_ENABLED,
+                Some(rs::SettingValue::Bool(false)),
+            )
+            .unwrap();
+        harness.scheduler.tick_once_for_test().await.unwrap();
         let ops = harness.proposals.lock().unwrap();
         assert!(
             !ops.iter()
@@ -5248,7 +5277,9 @@ mod tests {
             cluster_cfg.raft_heartbeat_interval_ms = Some(200);
             cluster_cfg.raft_election_timeout_ms = Some(500);
 
-            let bootstrap = ClusterBootstrap::init(&cluster_cfg, 1000, Default::default()).unwrap();
+            let bootstrap =
+                ClusterBootstrap::init(&cluster_cfg, 1000, Default::default(), Default::default())
+                    .unwrap();
             let shard_map = Arc::new(RocksDbShardMap::open(&meta_dir, true).unwrap());
             let location_cache = Arc::new(ShardLocationCache::new());
             let raft = bootstrap
@@ -5281,6 +5312,7 @@ mod tests {
                 99,
                 sharding,
                 0,
+                Default::default(),
             )
             .with_test_force_leader(true)
             .with_test_propose_sink(proposals.clone());

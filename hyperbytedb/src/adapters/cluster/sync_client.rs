@@ -29,6 +29,7 @@ pub struct SyncClient {
     /// membership has no active peers yet (Raft hasn't formed).
     fallback_peer_addrs: Vec<String>,
     shard_map: Option<Arc<dyn ShardMapPort>>,
+    runtime_settings: Option<Arc<crate::application::runtime_settings::RuntimeSettings>>,
 }
 
 impl SyncClient {
@@ -83,7 +84,17 @@ impl SyncClient {
             client,
             fallback_peer_addrs,
             shard_map: None,
+            runtime_settings: None,
         }
+    }
+
+    /// This node's runtime settings, so synced `SET`s apply at once.
+    pub fn with_runtime_settings(
+        mut self,
+        settings: Arc<crate::application::runtime_settings::RuntimeSettings>,
+    ) -> Self {
+        self.runtime_settings = Some(settings);
+        self
     }
 
     pub fn with_shard_map(mut self, map: Arc<dyn ShardMapPort>) -> Self {
@@ -453,8 +464,13 @@ impl SyncClient {
         } else if let Some(name) = entry.key.strip_prefix("setting:") {
             let value: crate::domain::setting::SettingValue = serde_json::from_slice(&entry.value)
                 .map_err(|e| HyperbytedbError::Metadata(format!("parse setting: {e}").into()))?;
-            crate::application::runtime_settings::apply(self.metadata.as_ref(), name, Some(value))
-                .await?;
+            crate::application::runtime_settings::apply_or_store(
+                self.runtime_settings.as_deref(),
+                self.metadata.as_ref(),
+                name,
+                Some(value),
+            )
+            .await?;
         } else if entry.key.starts_with("mv:") {
             let parts: Vec<&str> = entry.key.splitn(3, ':').collect();
             if parts.len() == 3 {

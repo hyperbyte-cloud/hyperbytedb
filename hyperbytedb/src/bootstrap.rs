@@ -202,7 +202,9 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
     let write_pool_size = config.chdb.resolved_write_pool_size();
     let query_chdb = SharedSession::new_eager(&config.chdb.session_data_path, query_pool_size)?;
     let write_chdb = SharedSession::new_eager(&config.chdb.session_data_path, write_pool_size)?;
-    rs::set_config_fallbacks(config);
+    // This node's runtime settings: SET overrides, fallbacks and appliers.
+    let runtime_settings = Arc::new(rs::RuntimeSettings::default());
+    runtime_settings.set_config_fallbacks(config);
     {
         let source = if config.chdb.query_pool_size.is_some() || config.chdb.pool_size > 0 {
             rs::Source::Config
@@ -210,8 +212,8 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
             rs::Source::Auto
         };
         let int = |n: usize| rs::SettingValue::Int(i64::try_from(n).unwrap_or(i64::MAX));
-        rs::set_fallback(rs::QUERY_POOL_SIZE, int(query_pool_size), source);
-        rs::set_fallback(
+        runtime_settings.set_fallback(rs::QUERY_POOL_SIZE, int(query_pool_size), source);
+        runtime_settings.set_fallback(
             rs::WRITE_POOL_SIZE,
             int(write_pool_size),
             rs::Source::Config,
@@ -223,7 +225,7 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
             (rs::WRITE_POOL_SIZE, write_chdb.pool()?),
         ] {
             let pool = Arc::downgrade(&pool);
-            rs::register_applier(
+            runtime_settings.register_applier(
                 name,
                 Arc::new(move |v| {
                     let n = v.as_i64().and_then(|n| usize::try_from(n).ok());
@@ -257,7 +259,7 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
     ));
     {
         let adapter = Arc::downgrade(&chdb_adapter);
-        rs::register_applier(
+        runtime_settings.register_applier(
             rs::MAX_CONCURRENT_QUERIES,
             rs::usize_applier(move |n| {
                 if let Some(a) = adapter.upgrade() {
@@ -314,6 +316,7 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
             &config.cluster,
             config.hinted_handoff.max_hints_per_peer,
             cluster_auth.clone(),
+            runtime_settings.clone(),
         )?)
     } else {
         None
@@ -341,12 +344,12 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
     // sync use their own unlimited ones.
     {
         let limits = ingest_cardinality.clone();
-        rs::register_applier(
+        runtime_settings.register_applier(
             rs::MAX_TAG_VALUES_PER_MEASUREMENT,
             rs::usize_applier(move |n| limits.set_max_tag_values_per_measurement(n)),
         );
         let limits = ingest_cardinality.clone();
-        rs::register_applier(
+        runtime_settings.register_applier(
             rs::MAX_MEASUREMENTS_PER_DATABASE,
             rs::usize_applier(move |n| limits.set_max_measurements_per_database(n)),
         );
@@ -362,6 +365,7 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
                 peer_client: pc.clone(),
                 region_write_stats: Arc::new(RegionWriteStats::new()),
                 forward_coalescer: Default::default(),
+                runtime_settings: runtime_settings.clone(),
             })),
             _ => None,
         }
@@ -419,6 +423,7 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
             config.server.query_timeout_secs,
             points_sink.clone(),
         )
+        .with_runtime_settings(runtime_settings.clone())
         .with_max_points_per_request(max_points_per_request);
         if let Some(ref pc) = peer_client {
             qs = qs.with_cluster_replication(
@@ -531,7 +536,8 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
             wal.clone(),
             config.flush.max_points_per_batch,
             points_sink.clone(),
-        );
+        )
+        .with_runtime_settings(runtime_settings.clone());
         if let Some(ref rl) = replication_log_arc {
             fs = fs.with_replication_log(rl.clone());
         }
@@ -591,7 +597,7 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
     let shard_write_admission = Arc::new(crate::adapters::http::router::Admission::new(
         inflight_writes * crate::config::SHARD_WRITE_KIB_PER_SLOT,
     ));
-    rs::set_fallback(
+    runtime_settings.set_fallback(
         rs::MAX_INFLIGHT_WRITES,
         rs::SettingValue::Int(i64::try_from(inflight_writes).unwrap_or(i64::MAX)),
         if config.server.max_inflight_writes > 0 {
@@ -605,7 +611,7 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
             Arc::downgrade(&write_admission),
             Arc::downgrade(&shard_write_admission),
         );
-        rs::register_applier(
+        runtime_settings.register_applier(
             rs::MAX_INFLIGHT_WRITES,
             rs::usize_applier(move |n| {
                 if let Some(a) = client.upgrade() {
@@ -617,7 +623,7 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
             }),
         );
         let limiter = Arc::downgrade(&rate_limiter);
-        rs::register_applier(
+        runtime_settings.register_applier(
             rs::RATE_LIMIT_PER_SECOND,
             rs::usize_applier(move |n| {
                 if let Some(l) = limiter.upgrade() {
@@ -642,6 +648,7 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         drain_service,
         raft: None,
         auth_enabled: config.auth.enabled,
+        runtime_settings: runtime_settings.clone(),
         cluster_auth,
         auth_allow_query_param_credentials: config.auth.allow_query_param_credentials,
         prometheus_handle: Some(prometheus_handle.clone()),

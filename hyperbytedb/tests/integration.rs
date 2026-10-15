@@ -71,14 +71,18 @@ fn setup(dir: &tempfile::TempDir) -> (Arc<AppState>, Arc<FlushServiceImpl>) {
         IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 10_000, 0),
     );
 
-    let query_service: Arc<dyn hyperbytedb::adapters::http::router::QueryService> =
-        Arc::new(QueryServiceImpl::new(
+    let runtime_settings =
+        Arc::new(hyperbytedb::application::runtime_settings::RuntimeSettings::default());
+    let query_service: Arc<dyn hyperbytedb::adapters::http::router::QueryService> = Arc::new(
+        QueryServiceImpl::new(
             chdb.clone(),
             metadata.clone(),
             wal.clone(),
             30,
             points_sink.clone(),
-        ));
+        )
+        .with_runtime_settings(runtime_settings.clone()),
+    );
 
     let flush_service = Arc::new(FlushServiceImpl::new(wal.clone(), 0, points_sink.clone()));
 
@@ -104,6 +108,7 @@ fn setup(dir: &tempfile::TempDir) -> (Arc<AppState>, Arc<FlushServiceImpl>) {
         drain_service: None,
         raft: None,
         auth_enabled: false,
+        runtime_settings,
         cluster_auth: Default::default(),
         auth_allow_query_param_credentials: false,
         prometheus_handle: None,
@@ -201,6 +206,7 @@ async fn test_auth_blocks_unauthenticated() {
         drain_service: None,
         raft: None,
         auth_enabled: true,
+        runtime_settings: Default::default(),
         cluster_auth: Default::default(),
         auth_allow_query_param_credentials: false,
         prometheus_handle: None,
@@ -327,6 +333,7 @@ async fn test_cardinality_limit() {
         drain_service: None,
         raft: None,
         auth_enabled: false,
+        runtime_settings: Default::default(),
         cluster_auth: Default::default(),
         auth_allow_query_param_credentials: false,
         prometheus_handle: None,
@@ -488,6 +495,7 @@ async fn test_metrics_endpoint() {
         drain_service: None,
         raft: None,
         auth_enabled: false,
+        runtime_settings: Default::default(),
         cluster_auth: Default::default(),
         auth_allow_query_param_credentials: false,
         prometheus_handle: Some(prometheus_handle),
@@ -835,6 +843,7 @@ async fn admission_app(permits: usize) -> (tempfile::TempDir, Arc<AppState>) {
         drain_service: None,
         raft: None,
         auth_enabled: false,
+        runtime_settings: Default::default(),
         cluster_auth: Default::default(),
         auth_allow_query_param_credentials: false,
         prometheus_handle: Some(prometheus_handle),
@@ -1007,6 +1016,7 @@ async fn test_rate_limiter_refills_and_denies() {
         drain_service: None,
         raft: None,
         auth_enabled: false,
+        runtime_settings: Default::default(),
         cluster_auth: Default::default(),
         auth_allow_query_param_credentials: false,
         prometheus_handle: Some(prometheus_handle),
@@ -1176,6 +1186,7 @@ async fn test_cross_database_on_clause_requires_authorization() {
         drain_service: None,
         raft: None,
         auth_enabled: true,
+        runtime_settings: Default::default(),
         cluster_auth: Default::default(),
         auth_allow_query_param_credentials: true,
         prometheus_handle: None,
@@ -1384,7 +1395,7 @@ async fn set_query_pool_size_resizes_the_pool() {
         .unwrap()
         .pool()
         .unwrap();
-    rs::set_fallback(
+    state.runtime_settings.set_fallback(
         rs::QUERY_POOL_SIZE,
         rs::SettingValue::Int(2),
         rs::Source::Auto,
@@ -1393,7 +1404,7 @@ async fn set_query_pool_size_resizes_the_pool() {
         // Weak, as in bootstrap: a pool the registry kept alive would hold
         // libchdb's one data path open for every later test in the process.
         let pool = Arc::downgrade(&pool);
-        rs::register_applier(
+        state.runtime_settings.register_applier(
             rs::QUERY_POOL_SIZE,
             rs::usize_applier(move |n| {
                 if let Some(pool) = pool.upgrade() {
