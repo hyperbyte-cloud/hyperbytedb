@@ -167,11 +167,13 @@ impl QueryServiceImpl {
         let result = match (is_leader, leader_addr) {
             // Raft-less sharding: this node's map is the placement authority.
             (_, None) => ctx.shard_map.apply_op(op).await.map(|_| ()),
-            (_, Some(addr)) => {
-                crate::application::shard_routing::propose_shard_map_op_via_raft(&addr, op)
-                    .await
-                    .map(|_| ())
-            }
+            (_, Some(addr)) => crate::application::shard_routing::propose_shard_map_op_via_raft(
+                ctx.peer_client.http_client(),
+                &addr,
+                op,
+            )
+            .await
+            .map(|_| ()),
         };
         if let Err(e) = result {
             tracing::warn!(

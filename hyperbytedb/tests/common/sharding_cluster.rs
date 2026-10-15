@@ -157,6 +157,7 @@ pub async fn start_sharded_node(
             8192,
             8,
             8 * 1024 * 1024,
+            Default::default(),
         )
         .with_http2_connections(4),
     );
@@ -247,7 +248,12 @@ pub async fn start_sharded_node(
     ingestion_svc.spawn_forward_drainer();
     let ingestion: Arc<dyn hyperbytedb::ports::ingestion::IngestionPort> = ingestion_svc;
 
-    let peer_query = PeerQueryService::new(base_query, metadata.clone(), peer_client.clone());
+    let peer_query = PeerQueryService::new(
+        base_query,
+        metadata.clone(),
+        peer_client.clone(),
+        peer_client.cluster_auth(),
+    );
     peer_query.set_shard_routing(shard_routing.clone());
     let query: Arc<dyn QueryService> = Arc::new(peer_query);
 
@@ -294,6 +300,7 @@ pub async fn start_sharded_node(
         drain_service: None,
         raft: opts.raft.clone(),
         auth_enabled: false,
+        cluster_auth: Default::default(),
         auth_allow_query_param_credentials: false,
         prometheus_handle: None,
         statement_summary: None,

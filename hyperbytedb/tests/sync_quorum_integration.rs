@@ -130,6 +130,7 @@ async fn start_node_on(
         8192,
         8,
         8 * 1024 * 1024,
+        Default::default(),
     ));
 
     let replication_apply = Some(ReplicationApplyQueue::with_defaults(
@@ -157,9 +158,13 @@ async fn start_node_on(
             replication,
         ));
 
-    let query: Arc<dyn hyperbytedb::adapters::http::router::QueryService> = Arc::new(
-        PeerQueryService::new(base_query, metadata.clone(), peer_client.clone()),
-    );
+    let query: Arc<dyn hyperbytedb::adapters::http::router::QueryService> =
+        Arc::new(PeerQueryService::new(
+            base_query,
+            metadata.clone(),
+            peer_client.clone(),
+            peer_client.cluster_auth(),
+        ));
 
     let app_state = Arc::new(AppState {
         ingestion,
@@ -182,6 +187,7 @@ async fn start_node_on(
         drain_service: None,
         raft: None,
         auth_enabled: false,
+        cluster_auth: Default::default(),
         auth_allow_query_param_credentials: false,
         prometheus_handle: None,
         statement_summary: None,

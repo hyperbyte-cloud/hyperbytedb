@@ -315,6 +315,7 @@ async fn transfer_moves_flushed_data_and_drops_source_range() {
             8192,
             8,
             8 * 1024 * 1024,
+            Default::default(),
         ),
     );
 
@@ -1283,6 +1284,7 @@ async fn joiner_receives_existing_region_as_replica() {
             8192,
             8,
             8 * 1024 * 1024,
+            Default::default(),
         ),
     );
     let metadata: Arc<dyn MetadataPort> = node1.metadata.clone();
@@ -1444,6 +1446,7 @@ async fn joiner_takes_region_primary_and_applies_writes_locally() {
             8192,
             8,
             8 * 1024 * 1024,
+            Default::default(),
         ),
     );
     let metadata: Arc<dyn MetadataPort> = node1.metadata.clone();
@@ -1684,6 +1687,7 @@ async fn fourth_node_joining_rf_complete_cluster_takes_a_region() {
             8192,
             8,
             8 * 1024 * 1024,
+            Default::default(),
         ),
     );
     let metadata: Arc<dyn MetadataPort> = nodes[0].metadata.clone();

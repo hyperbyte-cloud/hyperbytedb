@@ -33,6 +33,13 @@ struct AuthClusterNode {
 }
 
 async fn start_auth_cluster_node(dir: &std::path::Path) -> AuthClusterNode {
+    start_auth_cluster_node_with(dir, Default::default()).await
+}
+
+async fn start_auth_cluster_node_with(
+    dir: &std::path::Path,
+    cluster_auth: hyperbytedb::adapters::cluster::cluster_auth::ClusterAuth,
+) -> AuthClusterNode {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let listener_addr = listener.local_addr().unwrap();
     let url = format!("http://{}", listener_addr);
@@ -93,6 +100,7 @@ async fn start_auth_cluster_node(dir: &std::path::Path) -> AuthClusterNode {
         8192,
         8,
         8 * 1024 * 1024,
+        cluster_auth.clone(),
     ));
 
     let replication_apply = Some(ReplicationApplyQueue::with_workers_and_sink(
@@ -126,9 +134,13 @@ async fn start_auth_cluster_node(dir: &std::path::Path) -> AuthClusterNode {
             IngestCardinalityLimits::default(),
         ));
 
-    let query_service: Arc<dyn hyperbytedb::adapters::http::router::QueryService> = Arc::new(
-        PeerQueryService::new(base_query_service, metadata.clone(), peer_client.clone()),
-    );
+    let query_service: Arc<dyn hyperbytedb::adapters::http::router::QueryService> =
+        Arc::new(PeerQueryService::new(
+            base_query_service,
+            metadata.clone(),
+            peer_client.clone(),
+            peer_client.cluster_auth(),
+        ));
 
     let app_state = Arc::new(AppState {
         ingestion: ingestion_service,
@@ -151,6 +163,7 @@ async fn start_auth_cluster_node(dir: &std::path::Path) -> AuthClusterNode {
         drain_service: None,
         raft: None,
         auth_enabled: true,
+        cluster_auth: cluster_auth.clone(),
         auth_allow_query_param_credentials: true,
         prometheus_handle: None,
         statement_summary: Some(Arc::new(StatementSummary::new(100))),
@@ -455,13 +468,14 @@ async fn grant_revoke_controls_query_access() {
 #[tokio::test]
 #[serial(chdb)]
 async fn the_cluster_token_opens_internal_routes_only() {
-    use hyperbytedb::adapters::cluster::cluster_auth;
+    use hyperbytedb::adapters::cluster::cluster_auth::{self, ClusterAuth};
+    use hyperbytedb::ports::peer_http::PeerHttp;
 
     let dir = tempfile::tempdir().unwrap();
-    let node = start_auth_cluster_node(dir.path()).await;
-    cluster_auth::set_token(Some("cluster-s3cret"));
+    let auth = ClusterAuth::new(Some("cluster-s3cret")).unwrap();
+    let node = start_auth_cluster_node_with(dir.path(), auth.clone()).await;
     let plain = reqwest::Client::new();
-    let peer = cluster_auth::client();
+    let peer = auth.client_builder().build().unwrap();
     let membership = format!("{}/internal/membership", node.url);
 
     let status = |r: reqwest::Response| r.status();
@@ -498,11 +512,15 @@ async fn the_cluster_token_opens_internal_routes_only() {
         StatusCode::UNAUTHORIZED,
         "the token is not a user"
     );
-    cluster_auth::set_token(None);
+    let other_cluster = ClusterAuth::new(Some("another-cluster"))
+        .unwrap()
+        .client_builder()
+        .build()
+        .unwrap();
     assert_eq!(
-        status(peer.get(&membership).send().await.unwrap()),
+        status(other_cluster.get(&membership).send().await.unwrap()),
         StatusCode::UNAUTHORIZED,
-        "a token the node no longer has"
+        "another cluster's peers are refused"
     );
 }
 

@@ -110,7 +110,7 @@ pub async fn internal_auth_layer(
     }
     // A peer or the operator.
     if let Some(token) = headers.get(crate::adapters::cluster::cluster_auth::HEADER) {
-        if crate::adapters::cluster::cluster_auth::token_matches(token.as_bytes()) {
+        if state.cluster_auth.token_matches(token.as_bytes()) {
             return next.run(request).await;
         }
         return (StatusCode::UNAUTHORIZED, "authorization failed").into_response();

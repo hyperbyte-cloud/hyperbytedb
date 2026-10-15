@@ -1,6 +1,8 @@
 use std::time::Duration;
 
 use crate::domain::cluster::membership::{NodeState, SharedMembership};
+use crate::ports::peer_http::PeerHttp;
+use std::sync::Arc;
 
 /// Self-reported readiness fields parsed from a peer's `/health` body.
 ///
@@ -182,6 +184,7 @@ pub async fn run_heartbeat_logger(
 /// membership view toward each peer's self-reported state. Peers that fail to
 /// answer at all are transitioned to `Disconnected` (unless already
 /// `Draining`/`Leaving`).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_heartbeat_updater(
     self_id: u64,
     membership: SharedMembership,
@@ -189,12 +192,10 @@ pub async fn run_heartbeat_updater(
     interval: Duration,
     probe_timeout: Duration,
     sync_gates_readmit: bool,
+    peer_http: Arc<dyn PeerHttp>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
-    let client = match crate::adapters::cluster::cluster_auth::client_builder()
-        .timeout(probe_timeout)
-        .build()
-    {
+    let client = match peer_http.client_builder().timeout(probe_timeout).build() {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "failed to build heartbeat probe client");

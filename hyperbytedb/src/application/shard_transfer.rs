@@ -1321,6 +1321,7 @@ mod tests {
             64,
             2,
             1 << 20,
+            Default::default(),
         ));
         let chdb = SharedSession::new_eager(dir.path().join("chdb").to_str().unwrap(), 1).unwrap();
         let query: Arc<dyn QueryPort> = Arc::new(ChdbQueryAdapter::from_shared(chdb.clone(), 0));
@@ -1483,6 +1484,7 @@ mod tests {
             64,
             2,
             1 << 20,
+            Default::default(),
         ));
         let chdb = SharedSession::new_eager(dir.path().join("chdb").to_str().unwrap(), 1).unwrap();
         let query: Arc<dyn QueryPort> = Arc::new(ChdbQueryAdapter::from_shared(chdb.clone(), 0));

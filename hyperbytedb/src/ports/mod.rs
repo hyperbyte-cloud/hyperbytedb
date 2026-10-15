@@ -3,6 +3,7 @@ pub mod flush;
 pub mod forward_queue;
 pub mod ingestion;
 pub mod metadata;
+pub mod peer_http;
 pub mod points_sink;
 pub mod query;
 pub mod replication;

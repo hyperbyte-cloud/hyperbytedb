@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 use openraft::BasicNode;
 use openraft::error::ForwardToLeader;
@@ -21,6 +20,7 @@ use crate::domain::query_result::{QueryResponse, StatementResult};
 use crate::error::HyperbytedbError;
 use crate::ports::metadata::ContinuousQueryDef;
 use crate::ports::metadata::MetadataPort;
+use crate::ports::peer_http::PeerHttp;
 use crate::ports::query::QueryService;
 use crate::ports::replication::ReplicationPort;
 use crate::timeseriesql::ast::{
@@ -40,16 +40,8 @@ pub struct PeerQueryService {
     raft: std::sync::OnceLock<HyperbytedbRaft>,
     membership: std::sync::OnceLock<Arc<tokio::sync::RwLock<ClusterMembership>>>,
     shard_routing: std::sync::OnceLock<Arc<ShardRoutingContext>>,
-}
-
-fn raft_http_client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        crate::adapters::cluster::cluster_auth::client_builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .unwrap_or_else(|_| crate::adapters::cluster::cluster_auth::client())
-    })
+    /// For schema mutations forwarded to the Raft leader.
+    raft_client: reqwest::Client,
 }
 
 impl PeerQueryService {
@@ -57,8 +49,14 @@ impl PeerQueryService {
         inner: Arc<dyn QueryService>,
         metadata: Arc<dyn MetadataPort>,
         replication_port: Arc<dyn ReplicationPort>,
+        peer_http: &dyn PeerHttp,
     ) -> Self {
         Self {
+            raft_client: peer_http.build(
+                peer_http
+                    .client_builder()
+                    .timeout(std::time::Duration::from_secs(10)),
+            ),
             inner,
             metadata,
             replication_port,
@@ -150,7 +148,14 @@ impl PeerQueryService {
                             attempt,
                             "forwarding schema mutation to raft leader"
                         );
-                        match forward_client_write(forward, raft, self.membership.get(), &req).await
+                        match forward_client_write(
+                            &self.raft_client,
+                            forward,
+                            raft,
+                            self.membership.get(),
+                            &req,
+                        )
+                        .await
                         {
                             Ok(()) => return Ok(()),
                             Err(forward_err) => {
@@ -276,6 +281,7 @@ fn resolve_leader_addr_with_lookup(
 }
 
 async fn forward_client_write(
+    client: &reqwest::Client,
     forward: &ForwardToLeader<u64, BasicNode>,
     raft: &HyperbytedbRaft,
     membership: Option<&Arc<tokio::sync::RwLock<ClusterMembership>>>,
@@ -284,16 +290,11 @@ async fn forward_client_write(
     let leader_addr = resolve_forward_leader_addr(forward, raft, membership).await?;
 
     let url = format!("http://{leader_addr}/cluster/raft/client-write");
-    let resp = raft_http_client()
-        .post(&url)
-        .json(req)
-        .send()
-        .await
-        .map_err(|e| {
-            HyperbytedbError::Internal(
-                format!("raft replication failed: forward to leader {url}: {e}").into(),
-            )
-        })?;
+    let resp = client.post(&url).json(req).send().await.map_err(|e| {
+        HyperbytedbError::Internal(
+            format!("raft replication failed: forward to leader {url}: {e}").into(),
+        )
+    })?;
 
     let status = resp.status();
     let body_text = resp.text().await.map_err(|e| {

@@ -5,6 +5,7 @@ use crate::adapters::http::router::AppState;
 use crate::application::cluster::sync_manifest;
 use crate::domain::cluster::membership::is_departing;
 use crate::domain::cluster::sync::{RegionWatermark, SyncManifest};
+use crate::ports::peer_http::PeerHttp;
 
 /// Periodically checks if this node is the Raft leader; if so, queries each
 /// follower's sync manifest and triggers a re-sync on significantly lagging nodes.
@@ -16,10 +17,8 @@ pub async fn run_leader_replication_monitor(
     // Wait for the cluster to stabilize before monitoring
     tokio::time::sleep(Duration::from_secs(30)).await;
 
-    let client = crate::adapters::cluster::cluster_auth::client_builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .unwrap_or_else(|_| crate::adapters::cluster::cluster_auth::client());
+    let auth: &dyn PeerHttp = &state.cluster_auth;
+    let client = auth.build(auth.client_builder().timeout(Duration::from_secs(10)));
 
     loop {
         if *shutdown_rx.borrow() {

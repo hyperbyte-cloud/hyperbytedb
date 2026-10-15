@@ -19,25 +19,25 @@ pub struct Network {
     control_port: u16,
 }
 
-impl Default for Network {
-    fn default() -> Self {
-        Self::new(10, 0)
-    }
-}
-
 impl Network {
-    pub fn new(default_timeout_secs: u64, control_port: u16) -> Self {
+    pub fn new(
+        default_timeout_secs: u64,
+        control_port: u16,
+        cluster_auth: &crate::adapters::cluster::cluster_auth::ClusterAuth,
+    ) -> Self {
+        use crate::ports::peer_http::PeerHttp;
         let default_timeout = Duration::from_secs(default_timeout_secs);
         Self {
             // `Client::builder().build()` only fails if TLS init is broken,
             // in which case `Client::new()` (same default config) would also
             // be unusable. Fall back to defaults so we don't panic on a path
             // that's exercised on the hot bootstrap line.
-            client: crate::adapters::cluster::cluster_auth::client_builder()
-                .timeout(default_timeout)
-                .dns_resolver(crate::adapters::cluster::dns_cache::CachingResolver::shared())
-                .build()
-                .unwrap_or_else(|_| crate::adapters::cluster::cluster_auth::client()),
+            client: cluster_auth.build(
+                cluster_auth
+                    .client_builder()
+                    .timeout(default_timeout)
+                    .dns_resolver(crate::adapters::cluster::dns_cache::CachingResolver::shared()),
+            ),
             default_timeout,
             control_port,
         }

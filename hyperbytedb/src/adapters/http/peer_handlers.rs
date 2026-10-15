@@ -894,6 +894,7 @@ pub async fn handle_sync_trigger(State(state): State<Arc<AppState>>) -> impl Int
     let mv_service = state.mv_service.clone();
     let max_points_per_request = state.max_points_per_request;
     let shard_map = state.shard_map.clone();
+    let cluster_auth = state.cluster_auth.clone();
 
     let membership_clone = membership.clone();
 
@@ -920,6 +921,7 @@ pub async fn handle_sync_trigger(State(state): State<Arc<AppState>>) -> impl Int
             Some(points_sink),
             max_points_per_request,
             fallback_peers,
+            &cluster_auth,
         );
         if let Some(ref map) = shard_map {
             let sm: Arc<dyn crate::ports::sharding::ShardMapPort> = map.clone();

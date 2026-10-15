@@ -112,6 +112,8 @@ async fn serve_inner(config: HyperbytedbConfig) -> anyhow::Result<()> {
         // Under sharding `needs_sync` is not a readiness signal; see
         // `decide_transition_with`.
         let sync_gates_readmit = !config.sharding.enabled;
+        let peer_http: Arc<dyn crate::ports::peer_http::PeerHttp> =
+            Arc::new(app_state.cluster_auth.clone());
         Some(tokio::spawn(async move {
             heartbeat::run_heartbeat_updater(
                 self_id,
@@ -120,6 +122,7 @@ async fn serve_inner(config: HyperbytedbConfig) -> anyhow::Result<()> {
                 hb_interval,
                 probe_timeout,
                 sync_gates_readmit,
+                peer_http,
                 rx,
             )
             .await;

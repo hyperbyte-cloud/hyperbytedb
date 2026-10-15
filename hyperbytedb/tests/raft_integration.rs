@@ -83,6 +83,7 @@ async fn start_cluster_node_with_listener(
         8192,
         8,
         8 * 1024 * 1024,
+        Default::default(),
     ));
 
     let replication_apply = Some(ReplicationApplyQueue::with_workers_and_sink(
@@ -118,9 +119,13 @@ async fn start_cluster_node_with_listener(
             IngestCardinalityLimits::default(),
         ));
 
-    let query_service: Arc<dyn hyperbytedb::adapters::http::router::QueryService> = Arc::new(
-        PeerQueryService::new(base_query_service, metadata.clone(), peer_client.clone()),
-    );
+    let query_service: Arc<dyn hyperbytedb::adapters::http::router::QueryService> =
+        Arc::new(PeerQueryService::new(
+            base_query_service,
+            metadata.clone(),
+            peer_client.clone(),
+            peer_client.cluster_auth(),
+        ));
 
     let app_state = Arc::new(AppState {
         ingestion: ingestion_service,
@@ -143,6 +148,7 @@ async fn start_cluster_node_with_listener(
         drain_service: None,
         raft: None,
         auth_enabled: false,
+        cluster_auth: Default::default(),
         auth_allow_query_param_credentials: false,
         prometheus_handle: None,
         statement_summary: None,
@@ -356,6 +362,7 @@ async fn test_cluster_endpoints_without_peers() {
         drain_service: None,
         raft: None,
         auth_enabled: false,
+        cluster_auth: Default::default(),
         auth_allow_query_param_credentials: false,
         prometheus_handle: None,
         statement_summary: None,

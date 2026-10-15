@@ -64,7 +64,7 @@ async fn primary_failover_updates_shard_map_after_unhealthy_timeout() {
     ));
 
     let cluster_cfg = test_cluster_config(dir.path(), &addr);
-    let bootstrap = ClusterBootstrap::init(&cluster_cfg, 1000).unwrap();
+    let bootstrap = ClusterBootstrap::init(&cluster_cfg, 1000, Default::default()).unwrap();
 
     let shard_map = Arc::new(RocksDbShardMap::open(&meta_dir, true).unwrap());
     let location_cache = Arc::new(ShardLocationCache::new());
@@ -197,7 +197,7 @@ async fn a_stale_epoch_heartbeat_from_a_region_peer_is_still_recorded() {
         sink.clone(),
     ));
     let cluster_cfg = test_cluster_config(dir.path(), &raft_addr);
-    let bootstrap = ClusterBootstrap::init(&cluster_cfg, 1000).unwrap();
+    let bootstrap = ClusterBootstrap::init(&cluster_cfg, 1000, Default::default()).unwrap();
     // The scheduler needs a Raft handle to exist; this test never proposes
     // through it, so it is wired against its own throwaway map.
     let raft = bootstrap

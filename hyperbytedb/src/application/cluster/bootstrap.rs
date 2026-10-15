@@ -22,7 +22,11 @@ pub struct ClusterBootstrap {
 }
 
 impl ClusterBootstrap {
-    pub fn init(config: &ClusterConfig, max_hints_per_peer: u64) -> anyhow::Result<Self> {
+    pub fn init(
+        config: &ClusterConfig,
+        max_hints_per_peer: u64,
+        cluster_auth: crate::adapters::cluster::cluster_auth::ClusterAuth,
+    ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(&config.replication_log_dir)?;
         let repl_log = Arc::new(
             ReplicationLog::open(&config.replication_log_dir)
@@ -79,6 +83,7 @@ impl ClusterBootstrap {
                 config.replication_queue_depth,
                 config.replication_max_inflight_batches,
                 config.replication_max_coalesce_body_bytes,
+                cluster_auth,
             )
             .with_hinted_handoff(hh.clone())
             .with_http2_connections(config.internal_http2_connections),
@@ -119,6 +124,7 @@ impl ClusterBootstrap {
             points_sink,
             max_points_per_request,
             self.peer_addrs.clone(),
+            self.peer_client.cluster_auth(),
         );
         if let Some(map) = shard_map {
             sync_client = sync_client.with_shard_map(map);
@@ -276,7 +282,11 @@ impl ClusterBootstrap {
             .await;
         let (log_store, state_machine) = Adaptor::<TypeConfig, RaftStore>::new(raft_store);
 
-        let network = Network::new(config.raft_rpc_timeout_secs, config.control_port);
+        let network = Network::new(
+            config.raft_rpc_timeout_secs,
+            config.control_port,
+            self.peer_client.cluster_auth(),
+        );
 
         let (heartbeat_ms, election_ms) = config.raft_timing_ms();
         let raft_config = Arc::new(

@@ -181,7 +181,7 @@ pub async fn ensure_measurement_bootstrapped(
     if is_raft_leader {
         let op = build_bootstrap_op(ctx, db, rp, measurement).await?;
         if let Some(addr) = leader_addr {
-            propose_shard_map_op_via_raft(addr, op).await?;
+            propose_shard_map_op_via_raft(ctx.peer_client.http_client(), addr, op).await?;
         } else {
             // No leader address resolves: this is raft-less sharding (async
             // replication without OpenRaft), where this node's shard map IS
@@ -910,13 +910,15 @@ pub async fn region_replication_targets(
     active_region_peer_targets(region, ctx.node_id, &membership)
 }
 
+/// Propose `op` to the Raft leader at `leader_addr`, over this node's pooled
+/// peer `client` (it carries the cluster credential).
 pub async fn propose_shard_map_op_via_raft(
+    client: &reqwest::Client,
     leader_addr: &str,
     op: ShardMapOp,
 ) -> Result<ClusterResponse, HyperbytedbError> {
     let url = format!("http://{leader_addr}/cluster/raft/client-write");
     let req = ClusterRequest::ShardMapMutation(Box::new(op));
-    let client = crate::adapters::cluster::cluster_auth::client();
     let resp = client
         .post(&url)
         .json(&req)
@@ -1175,6 +1177,7 @@ mod scatter_tests {
             1024,
             1,
             1024,
+            Default::default(),
         ));
         let map_dir = tempfile::tempdir().unwrap();
         let shard_map = Arc::new(RocksDbShardMap::open(map_dir.path(), true).unwrap());

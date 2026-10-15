@@ -3841,7 +3841,7 @@ mod tests {
         cluster_cfg.raft_heartbeat_interval_ms = Some(200);
         cluster_cfg.raft_election_timeout_ms = Some(500);
 
-        let bootstrap = ClusterBootstrap::init(&cluster_cfg, 1000).unwrap();
+        let bootstrap = ClusterBootstrap::init(&cluster_cfg, 1000, Default::default()).unwrap();
 
         let shard_map = Arc::new(RocksDbShardMap::open(&meta_dir, true).unwrap());
         let location_cache = Arc::new(ShardLocationCache::new());
@@ -3997,7 +3997,7 @@ mod tests {
         cluster_cfg.raft_heartbeat_interval_ms = Some(200);
         cluster_cfg.raft_election_timeout_ms = Some(500);
 
-        let bootstrap = ClusterBootstrap::init(&cluster_cfg, 1000).unwrap();
+        let bootstrap = ClusterBootstrap::init(&cluster_cfg, 1000, Default::default()).unwrap();
         let shard_map = Arc::new(RocksDbShardMap::open(&meta_dir, true).unwrap());
         let location_cache = Arc::new(ShardLocationCache::new());
         let raft = bootstrap
@@ -4134,7 +4134,7 @@ mod tests {
         cluster_cfg.raft_heartbeat_interval_ms = Some(200);
         cluster_cfg.raft_election_timeout_ms = Some(500);
 
-        let bootstrap = ClusterBootstrap::init(&cluster_cfg, 1000).unwrap();
+        let bootstrap = ClusterBootstrap::init(&cluster_cfg, 1000, Default::default()).unwrap();
         let shard_map = Arc::new(RocksDbShardMap::open(&meta_dir, true).unwrap());
         let location_cache = Arc::new(ShardLocationCache::new());
         let raft = bootstrap
@@ -4709,7 +4709,7 @@ mod tests {
             cluster_cfg.raft_heartbeat_interval_ms = Some(200);
             cluster_cfg.raft_election_timeout_ms = Some(500);
 
-            let bootstrap = ClusterBootstrap::init(&cluster_cfg, 1000).unwrap();
+            let bootstrap = ClusterBootstrap::init(&cluster_cfg, 1000, Default::default()).unwrap();
             let shard_map = Arc::new(RocksDbShardMap::open(&meta_dir, true).unwrap());
             let location_cache = Arc::new(ShardLocationCache::new());
             let raft = bootstrap
@@ -4779,6 +4779,7 @@ mod tests {
                 8192,
                 8,
                 8 * 1024 * 1024,
+                Default::default(),
             ));
 
             let mut sharding = crate::config::ShardingConfig {
@@ -5247,7 +5248,7 @@ mod tests {
             cluster_cfg.raft_heartbeat_interval_ms = Some(200);
             cluster_cfg.raft_election_timeout_ms = Some(500);
 
-            let bootstrap = ClusterBootstrap::init(&cluster_cfg, 1000).unwrap();
+            let bootstrap = ClusterBootstrap::init(&cluster_cfg, 1000, Default::default()).unwrap();
             let shard_map = Arc::new(RocksDbShardMap::open(&meta_dir, true).unwrap());
             let location_cache = Arc::new(ShardLocationCache::new());
             let raft = bootstrap
@@ -6032,6 +6033,7 @@ mod tests {
             8192,
             2,
             8 * 1024 * 1024,
+            Default::default(),
         );
         assert_eq!(
             pick_best_primary(&membership, &learner_only, 9, Some(&pc)).await,

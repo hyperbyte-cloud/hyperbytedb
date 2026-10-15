@@ -1,3 +1,5 @@
+use crate::adapters::cluster::cluster_auth::ClusterAuth;
+use crate::ports::peer_http::PeerHttp;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,6 +39,7 @@ impl SyncClient {
         metadata: Arc<dyn MetadataPort>,
         wal: Arc<dyn WalPort>,
         fallback_peer_addrs: Vec<String>,
+        cluster_auth: &ClusterAuth,
     ) -> Self {
         Self::with_points_sink(
             node_id,
@@ -47,6 +50,7 @@ impl SyncClient {
             None,
             0,
             fallback_peer_addrs,
+            cluster_auth,
         )
     }
 
@@ -60,11 +64,13 @@ impl SyncClient {
         points_sink: Option<Arc<dyn PointsSinkPort>>,
         max_points_per_request: usize,
         fallback_peer_addrs: Vec<String>,
+        cluster_auth: &ClusterAuth,
     ) -> Self {
-        let client = crate::adapters::cluster::cluster_auth::client_builder()
-            .timeout(Duration::from_secs(300))
-            .build()
-            .unwrap_or_else(|_| crate::adapters::cluster::cluster_auth::client());
+        let client = cluster_auth.build(
+            cluster_auth
+                .client_builder()
+                .timeout(Duration::from_secs(300)),
+        );
 
         Self {
             node_id,
@@ -672,6 +678,7 @@ mod tests {
             metadata.clone(),
             Arc::new(RocksDbWal::open(dir.path().join("wal")).unwrap()),
             Vec::new(),
+            &Default::default(),
         );
         let user = StoredUser {
             password_hash: "hash".into(),
@@ -730,6 +737,7 @@ mod tests {
             Arc::new(RocksDbMetadata::open(dir.path().join("meta2")).unwrap()),
             Arc::new(RocksDbWal::open(dir.path().join("wal")).unwrap()),
             Vec::new(),
+            &Default::default(),
         )
         .with_shard_map(Arc::new(
             RocksDbShardMap::open(&dir.path().join("meta"), true).unwrap(),

@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{Semaphore, oneshot};
 
+use crate::adapters::cluster::cluster_auth::ClusterAuth;
 use crate::adapters::cluster::hinted_handoff::HintedHandoff;
 use crate::adapters::cluster::replication_log::ReplicationLog;
 use crate::domain::cluster::membership::{ClusterMembership, SharedMembership};
@@ -18,6 +19,7 @@ use crate::domain::cluster::types::{
     MutationReplicateRequest, MutationReplicateResponse, MutationRequest,
 };
 use crate::error::HyperbytedbError;
+use crate::ports::peer_http::PeerHttp;
 use crate::ports::replication::{OutboundReplicationBatch, ReplicationPort};
 
 pub struct PeerClient {
@@ -27,6 +29,8 @@ pub struct PeerClient {
     /// One client per HTTP/2 connection to keep to each peer: each has its
     /// own pool, so each holds its own connection.
     clients: Vec<reqwest::Client>,
+    /// What every client sends to peers; kept to build more of them.
+    cluster_auth: ClusterAuth,
     next_client: std::sync::atomic::AtomicUsize,
     node_id: u64,
     node_addr: String,
@@ -46,18 +50,18 @@ pub struct PeerClient {
 /// behind NAT/firewalls. Operation timeouts remain the caller's
 /// responsibility via per-request `.timeout(...)`. `builder.build()` only
 /// fails on broken TLS init, and `Client::new()` would also be unusable then.
-fn peer_http_client() -> reqwest::Client {
-    crate::adapters::cluster::cluster_auth::client_builder()
-        .timeout(Duration::from_secs(10))
-        .connect_timeout(Duration::from_secs(3))
-        .tcp_keepalive(Duration::from_secs(60))
-        .dns_resolver(crate::adapters::cluster::dns_cache::CachingResolver::shared())
-        .http2_prior_knowledge()
-        .http2_adaptive_window(true)
-        .http2_keep_alive_interval(Duration::from_secs(30))
-        .http2_keep_alive_while_idle(true)
-        .build()
-        .unwrap_or_else(|_| crate::adapters::cluster::cluster_auth::client())
+fn peer_http_client(auth: &ClusterAuth) -> reqwest::Client {
+    auth.build(
+        auth.client_builder()
+            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(3))
+            .tcp_keepalive(Duration::from_secs(60))
+            .dns_resolver(crate::adapters::cluster::dns_cache::CachingResolver::shared())
+            .http2_prior_knowledge()
+            .http2_adaptive_window(true)
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .http2_keep_alive_while_idle(true),
+    )
 }
 
 impl PeerClient {
@@ -71,9 +75,10 @@ impl PeerClient {
         outbound_queue_depth: usize,
         max_inflight_batches: usize,
         max_coalesce_body_bytes: usize,
+        cluster_auth: ClusterAuth,
     ) -> Self {
         let depth = outbound_queue_depth.max(1);
-        let client = peer_http_client();
+        let client = peer_http_client(&cluster_auth);
         let (outbound_tx, outbound_rx) =
             tokio::sync::mpsc::channel::<OutboundReplicationBatch>(depth);
         let inflight = max_inflight_batches.max(1);
@@ -83,6 +88,7 @@ impl PeerClient {
             replication_log,
             hinted_handoff: None,
             clients: vec![client],
+            cluster_auth,
             next_client: std::sync::atomic::AtomicUsize::new(0),
             node_id,
             node_addr,
@@ -104,13 +110,19 @@ impl PeerClient {
         &self.membership
     }
 
+    /// The cluster credential this client sends, for building other clients
+    /// to peers.
+    pub fn cluster_auth(&self) -> &ClusterAuth {
+        &self.cluster_auth
+    }
+
     /// Keep `connections` HTTP/2 connections to each peer; requests take
     /// them in turn. One connection carried a peer's whole load on one TCP
     /// stream; TiKV keeps 4 per store. See `cluster.internal_http2_connections`.
     #[must_use]
     pub fn with_http2_connections(mut self, connections: usize) -> Self {
         self.clients = (0..connections.max(1))
-            .map(|_| peer_http_client())
+            .map(|_| peer_http_client(&self.cluster_auth))
             .collect();
         self
     }
@@ -1379,6 +1391,7 @@ mod replicate_batch_tests {
             64,
             2,
             1 << 20,
+            Default::default(),
         );
 
         pc.replicate_round(vec![
@@ -1424,6 +1437,7 @@ mod replicate_batch_tests {
                 1,
                 2,
                 1 << 20,
+                Default::default(),
             )
             .with_hinted_handoff(hh.clone()),
         );
@@ -1501,8 +1515,18 @@ mod http2_tests {
         let membership = crate::domain::cluster::membership::new_shared(
             crate::domain::cluster::membership::ClusterMembership::new(),
         );
-        let pc = super::PeerClient::new(1, "127.0.0.1:9".into(), membership, log, 1, 16, 1, 1024)
-            .with_http2_connections(4);
+        let pc = super::PeerClient::new(
+            1,
+            "127.0.0.1:9".into(),
+            membership,
+            log,
+            1,
+            16,
+            1,
+            1024,
+            Default::default(),
+        )
+        .with_http2_connections(4);
         for _ in 0..32 {
             let r = pc
                 .http_client()
@@ -1519,12 +1543,68 @@ mod http2_tests {
         );
     }
 
+    /// Every connection of a PeerClient, extra HTTP/2 ones included, sends
+    /// the credential it was built with, and it is kept for other clients.
+    #[tokio::test]
+    async fn a_peer_client_sends_its_cluster_token() {
+        use crate::adapters::cluster::cluster_auth::{ClusterAuth, HEADER};
+        let app = axum::Router::new().route(
+            "/t",
+            axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                headers
+                    .get(HEADER)
+                    .map(|v| v.to_str().unwrap().to_string())
+                    .unwrap_or_default()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = std::sync::Arc::new(
+            crate::adapters::cluster::replication_log::ReplicationLog::open(dir.path()).unwrap(),
+        );
+        let membership = crate::domain::cluster::membership::new_shared(
+            crate::domain::cluster::membership::ClusterMembership::new(),
+        );
+        let pc = super::PeerClient::new(
+            1,
+            "127.0.0.1:9".into(),
+            membership,
+            log,
+            1,
+            16,
+            1,
+            1024,
+            ClusterAuth::new(Some("t0ken")).unwrap(),
+        )
+        .with_http2_connections(3);
+        for _ in 0..3 {
+            let got = pc
+                .http_client()
+                .get(format!("http://{addr}/t"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            assert_eq!(got, "t0ken");
+        }
+        assert!(pc.cluster_auth().token_matches(b"t0ken"));
+    }
+
     /// The peer client speaks HTTP/2 to the axum server (cleartext, no
     /// upgrade round trip).
     #[tokio::test]
     async fn peer_client_speaks_http2() {
         let url = version_echo().await;
-        let resp = peer_http_client().get(&url).send().await.unwrap();
+        let resp = peer_http_client(&super::ClusterAuth::default())
+            .get(&url)
+            .send()
+            .await
+            .unwrap();
         assert_eq!(resp.text().await.unwrap(), "HTTP/2.0");
     }
 }

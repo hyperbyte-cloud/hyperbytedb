@@ -53,8 +53,10 @@ pub struct BootstrappedApp {
 /// returned handles.
 pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<BootstrappedApp> {
     config.validate().map_err(anyhow::Error::msg)?;
-    // Before any peer client is built: they all send it.
-    crate::adapters::cluster::cluster_auth::set_token(config.auth.cluster_token.as_deref());
+    // Every peer client sends it and every internal route checks it.
+    let cluster_auth = crate::adapters::cluster::cluster_auth::ClusterAuth::new(
+        config.auth.cluster_token.as_deref(),
+    )?;
     if config.auth.enabled && config.cluster.enabled && config.auth.cluster_token.is_none() {
         tracing::warn!(
             "auth is on in a cluster without auth.cluster_token: nodes cannot call each \
@@ -311,6 +313,7 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         Some(ClusterBootstrap::init(
             &config.cluster,
             config.hinted_handoff.max_hints_per_peer,
+            cluster_auth.clone(),
         )?)
     } else {
         None
@@ -499,6 +502,7 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
                 base_query_service.clone(),
                 metadata.clone(),
                 pc.clone(),
+                pc.cluster_auth(),
             ),
         )
     });
@@ -625,6 +629,7 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         drain_service,
         raft: None,
         auth_enabled: config.auth.enabled,
+        cluster_auth,
         auth_allow_query_param_credentials: config.auth.allow_query_param_credentials,
         prometheus_handle: Some(prometheus_handle.clone()),
         statement_summary,

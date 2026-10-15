@@ -83,6 +83,8 @@ pub struct AppState {
     pub drain_service: Option<Arc<DrainService>>,
     pub raft: Option<HyperbytedbRaft>,
     pub auth_enabled: bool,
+    /// The cluster token peers send and this node accepts on internal routes.
+    pub cluster_auth: crate::adapters::cluster::cluster_auth::ClusterAuth,
     /// When false (default), `?u=` / `?p=` query credentials are ignored.
     pub auth_allow_query_param_credentials: bool,
     pub prometheus_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,

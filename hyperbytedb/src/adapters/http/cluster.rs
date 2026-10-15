@@ -223,7 +223,11 @@ pub async fn handle_cluster_add_node(
         .as_ref()
         .and_then(|r| r.get(&req.node_id).copied().flatten())
         .map(|l| l.index);
-    let reverted = in_raft && log_reverted(leader_matching, fetch_target_raft(&req.addr).await);
+    let reverted = in_raft
+        && log_reverted(
+            leader_matching,
+            fetch_target_raft(&state.cluster_auth, &req.addr).await,
+        );
     let change = if reverted {
         reset_change(&voters_now, in_raft, req.node_id, state.node_id)
     } else {
@@ -386,8 +390,13 @@ pub(crate) fn log_reverted(leader_matching: Option<u64>, target: Option<TargetRa
 }
 
 /// The node's own Raft log position and liveness, or `None` if unreadable.
-async fn fetch_target_raft(addr: &str) -> Option<TargetRaft> {
-    let client = crate::adapters::cluster::cluster_auth::client_builder()
+async fn fetch_target_raft(
+    cluster_auth: &crate::adapters::cluster::cluster_auth::ClusterAuth,
+    addr: &str,
+) -> Option<TargetRaft> {
+    use crate::ports::peer_http::PeerHttp;
+    let client = cluster_auth
+        .client_builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .ok()?;
