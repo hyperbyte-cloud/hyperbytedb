@@ -1,0 +1,604 @@
+//! The `serve` process: build the services, start the background tasks and
+//! the HTTP listeners, and shut them down in order. Top-level wiring, like
+//! [`crate::bootstrap`], so the application layer does not build routers.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::adapters::http::router::{build_control_router, build_router};
+use crate::application::cluster::heartbeat;
+use crate::application::cluster::hinted_handoff;
+use crate::application::cluster::leader_monitor;
+use crate::application::cluster::raft_formation;
+use crate::application::continuous_query_service::ContinuousQueryService;
+use crate::application::disk_monitor;
+use crate::application::retention_service::RetentionService;
+use crate::bootstrap::build_services;
+use crate::config::{HyperbytedbConfig, RetentionConfig};
+use crate::ports::metadata::MetadataPort;
+use crate::ports::points_sink::PointsSinkPort;
+use crate::ports::wal::WalPort;
+
+use crate::application::runtime::control;
+use crate::application::runtime::shard_heartbeat;
+
+pub async fn serve(config: HyperbytedbConfig) -> anyhow::Result<()> {
+    // The control runtime lives exactly as long as the server: installed
+    // before Raft starts, stopped after everything else has shut down.
+    if config.cluster.enabled {
+        control::install()?;
+    }
+    let result = serve_inner(config).await;
+    control::shutdown();
+    result
+}
+
+async fn serve_inner(config: HyperbytedbConfig) -> anyhow::Result<()> {
+    let bootstrapped = build_services(&config).await?;
+    crate::application::stage_timer::spawn_scheduling_probe();
+    let disk_paths = bootstrapped.disk_paths.clone();
+    let disk_config = bootstrapped.disk_config.clone();
+    let disk_read_only = bootstrapped.disk_read_only.clone();
+    let raft_leader_callbacks = bootstrapped.raft_leader_callbacks.clone();
+    let rocks_shard_map = bootstrapped.rocks_shard_map.clone();
+    let mut app_state = bootstrapped.app_state;
+    let flush_service = bootstrapped.flush_service;
+    let cluster = bootstrapped.cluster;
+    let peer_query_service_ref = bootstrapped.peer_query_service;
+
+    let peer_client = app_state.peer_client.clone();
+    let membership = app_state.membership.clone();
+    let _replication_log_arc = app_state.replication_log.clone();
+
+    // Two-phase shutdown
+    let (api_shutdown_tx, _api_shutdown_rx) = tokio::sync::watch::channel(false);
+    let (service_shutdown_tx, service_shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // Spawn background flush service
+    let flush_interval = Duration::from_secs(config.flush.interval_secs);
+    let flush_handle = {
+        let flush = flush_service.clone();
+        let rx = service_shutdown_rx.clone();
+        tokio::spawn(async move {
+            flush.run(flush_interval, rx).await;
+        })
+    };
+
+    // Spawn uptime gauge updater
+    let uptime_handle = {
+        let rx = service_shutdown_rx.clone();
+        let start_time = std::time::Instant::now();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(15));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        metrics::gauge!("hyperbytedb_uptime_seconds").set(start_time.elapsed().as_secs_f64());
+                    }
+                    _ = async {
+                        while !*rx.borrow() {
+                            rx.clone().changed().await.ok();
+                        }
+                    } => { break; }
+                }
+            }
+        })
+    };
+
+    // Spawn cluster heartbeat logger (every 60s)
+    let cluster_heartbeat_handle = if let (Some(pc), Some(m_ref)) = (&peer_client, &membership) {
+        let node_addr = pc.node_addr().to_string();
+        let membership_ref = m_ref.clone();
+        let self_id = config.cluster.node_id;
+        let rx = service_shutdown_rx.clone();
+        Some(tokio::spawn(async move {
+            heartbeat::run_heartbeat_logger(node_addr, self_id, membership_ref, rx).await;
+        }))
+    } else {
+        None
+    };
+
+    // Spawn periodic peer heartbeat updater (probes peers and updates last_heartbeat)
+    let peer_heartbeat_handle = if let Some(m_ref) = &membership {
+        let m = m_ref.clone();
+        let self_id = config.cluster.node_id;
+        let hb_interval = Duration::from_secs(config.cluster.heartbeat_interval_secs.max(1));
+        let probe_timeout = Duration::from_secs(5);
+        // Reuses the existing cluster.heartbeat_miss_threshold knob, already
+        // surfaced in the CRD and until now consumed only by flush_service.
+        let miss_threshold =
+            u32::try_from(config.cluster.heartbeat_miss_threshold).unwrap_or(u32::MAX);
+        let rx = service_shutdown_rx.clone();
+        // Under sharding `needs_sync` is not a readiness signal; see
+        // `decide_transition_with`.
+        let sync_gates_readmit = !config.sharding.enabled;
+        Some(tokio::spawn(async move {
+            heartbeat::run_heartbeat_updater(
+                self_id,
+                m,
+                miss_threshold,
+                hb_interval,
+                probe_timeout,
+                sync_gates_readmit,
+                rx,
+            )
+            .await;
+        }))
+    } else {
+        None
+    };
+
+    // Run startup sync and initialize Raft if cluster mode is enabled.
+    let raft_instance = match &cluster {
+        Some(c) => {
+            let meta_port: Arc<dyn MetadataPort> = app_state.metadata.clone();
+            let wal_port: Arc<dyn WalPort> = app_state.wal.clone();
+            let sink_port: Arc<dyn PointsSinkPort> = app_state.points_sink.clone();
+            c.run_startup_sync(
+                &config.cluster,
+                &meta_port,
+                &wal_port,
+                Some(sink_port),
+                config.server.max_points_per_request,
+                rocks_shard_map
+                    .as_ref()
+                    .map(|m| m.clone() as Arc<dyn crate::ports::sharding::ShardMapPort>),
+            )
+            .await?;
+            Some(
+                c.start_raft(
+                    &config.cluster,
+                    app_state.metadata.clone(),
+                    app_state.mv_service.clone(),
+                    app_state.points_sink.clone(),
+                    app_state.wal.clone(),
+                    rocks_shard_map
+                        .as_ref()
+                        .zip(Some(app_state.shard_location_cache.clone()))
+                        .map(|(m, cache)| (m.clone(), cache)),
+                    app_state.shard_routing.clone(),
+                )
+                .await?,
+            )
+        }
+        None => None,
+    };
+
+    // Wire Raft to PeerQueryService for consensus-based schema replication
+    if let (Some(raft), Some(pqs)) = (&raft_instance, &peer_query_service_ref) {
+        pqs.set_raft(raft.clone());
+        if let Some(m) = &membership {
+            pqs.set_membership(m.clone());
+        }
+        if let Some(ctx) = &app_state.shard_routing {
+            pqs.set_shard_routing(ctx.clone());
+        }
+        tracing::info!("schema mutations will be routed through raft consensus");
+    }
+
+    // Spawn hinted handoff drain watcher (drains queued writes when peers reconnect)
+    let hinted_handoff_handle = if let (Some(pc), Some(m)) = (&peer_client, &membership) {
+        let pc = pc.clone();
+        let m = m.clone();
+        let self_id = config.cluster.node_id;
+        let rx = service_shutdown_rx.clone();
+        Some(tokio::spawn(async move {
+            hinted_handoff::run_hinted_handoff_watcher(self_id, pc, m, rx).await;
+        }))
+    } else {
+        None
+    };
+
+    if config.cluster.anti_entropy_enabled {
+        tracing::warn!(
+            "cluster.anti_entropy_enabled is set but Merkle anti-entropy was \
+             removed in 0.7; this flag is ignored."
+        );
+    }
+
+    // Keep handles for the shutdown sequence
+    let shutdown_wal = app_state.wal.clone();
+    let shutdown_drain_service = app_state.drain_service.clone();
+
+    // Set Raft instance on AppState before building the router
+    app_state.raft = raft_instance.clone();
+
+    if let (Some(raft), Some(callbacks)) = (&raft_instance, &raft_leader_callbacks) {
+        callbacks.set_raft(raft.clone());
+    }
+
+    // Shard scheduler (leader-only PD-lite) and periodic region heartbeats.
+    let shard_scheduler_handle = if config.sharding.enabled {
+        if let (Some(raft), Some(map), Some(membership)) =
+            (&raft_instance, &rocks_shard_map, &membership)
+        {
+            let scheduler = Arc::new(crate::application::shard_scheduler::ShardScheduler::new(
+                map.clone(),
+                membership.clone(),
+                raft.clone(),
+                peer_client.clone(),
+                app_state.metadata.clone(),
+                app_state.wal.clone(),
+                Some(app_state.query_port.clone()),
+                Some(app_state.points_sink.clone()),
+                config.cluster.node_id,
+                config.sharding.clone(),
+                config.server.max_points_per_request,
+            ));
+            app_state.shard_scheduler = Some(scheduler.clone());
+            {
+                let scheduler = Arc::downgrade(&scheduler);
+                crate::application::runtime_settings::register_applier(
+                    crate::application::runtime_settings::SCHEDULE_LIMIT,
+                    crate::application::runtime_settings::usize_applier(move |n| {
+                        if let Some(s) = scheduler.upgrade() {
+                            s.resize_movers(n);
+                        }
+                    }),
+                );
+            }
+
+            if let (Some(sr), Some(pc), Some(rl)) = (
+                app_state.shard_routing.as_ref(),
+                peer_client.as_ref(),
+                &app_state.replication_log,
+            ) {
+                use crate::application::cluster::drain::DrainService;
+                use crate::ports::flush::FlushPort;
+                let flush_for_drain: Arc<dyn FlushPort> = flush_service.clone();
+                app_state.drain_service = Some(Arc::new(
+                    DrainService::new(
+                        config.cluster.node_id,
+                        membership.clone(),
+                        flush_for_drain,
+                        rl.clone(),
+                        app_state.wal.clone(),
+                    )
+                    .with_sharding(
+                        sr.clone(),
+                        pc.clone(),
+                        app_state.metadata.clone(),
+                        app_state.points_sink.clone(),
+                        app_state.query_port.clone(),
+                        raft.clone(),
+                        config.server.max_points_per_request,
+                    ),
+                ));
+            }
+
+            let interval = Duration::from_secs(config.sharding.heartbeat_interval_secs.max(1));
+            let rx = service_shutdown_rx.clone();
+            let sched = scheduler.clone();
+            let hb_handle = {
+                let pc = peer_client.clone();
+                let node_id = config.cluster.node_id;
+                let map = map.clone();
+                let meta = app_state.metadata.clone();
+                let query_port = app_state.query_port.clone();
+                let region_write_stats = app_state
+                    .shard_routing
+                    .as_ref()
+                    .map(|sr| sr.region_write_stats.clone())
+                    .unwrap_or_else(|| {
+                        Arc::new(crate::application::runtime::RegionWriteStats::new())
+                    });
+                let raft = raft.clone();
+                let m = membership.clone();
+                let hb_interval =
+                    Duration::from_secs(config.sharding.heartbeat_interval_secs.max(1));
+                let hb_rx = service_shutdown_rx.clone();
+                let split_hint_min_series = config.sharding.region_split_series;
+                Some(tokio::spawn(async move {
+                    if let Some(pc) = pc {
+                        shard_heartbeat::run_region_heartbeat_reporter(
+                            node_id,
+                            pc,
+                            m,
+                            map,
+                            raft,
+                            meta,
+                            query_port,
+                            region_write_stats,
+                            hb_interval,
+                            split_hint_min_series,
+                            hb_rx,
+                        )
+                        .await;
+                    }
+                }))
+            };
+
+            let sched_handle = tokio::spawn(async move {
+                sched.run(interval, rx).await;
+            });
+            Some((sched_handle, hb_handle))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Continuous queries run on a single node: the Raft leader when cluster
+    // mode is enabled, otherwise the sole local instance.
+    let cq_handle = {
+        let cq_service = Arc::new(ContinuousQueryService::new(
+            app_state.metadata.clone(),
+            app_state.query.clone(),
+            app_state.raft.clone(),
+            config.cluster.node_id,
+        ));
+        let rx = service_shutdown_rx.clone();
+        tokio::spawn(async move {
+            cq_service.run(Duration::from_secs(10), rx).await;
+        })
+    };
+
+    // Retention enforcement runs on the Raft leader when cluster mode is
+    // enabled, otherwise the sole local instance (mirrors CQ service).
+    let retention_handle = if config.retention.enabled {
+        let retention_interval = config.retention.interval_duration();
+        if retention_interval == RetentionConfig::FALLBACK_INTERVAL
+            && config.retention.interval.trim() != "60s"
+        {
+            tracing::warn!(
+                configured = %config.retention.interval,
+                fallback_secs = retention_interval.as_secs(),
+                "retention.interval is invalid or zero, falling back to default"
+            );
+        }
+        let retention_service = Arc::new(
+            RetentionService::new(
+                app_state.metadata.clone(),
+                app_state.query_port.clone(),
+                app_state.raft.clone(),
+                config.cluster.node_id,
+            )
+            .with_sharding(config.sharding.enabled, app_state.shard_map.clone()),
+        );
+        let rx = service_shutdown_rx.clone();
+        Some(tokio::spawn(async move {
+            retention_service.run(retention_interval, rx).await;
+        }))
+    } else {
+        tracing::info!("retention service disabled by config");
+        None
+    };
+
+    let disk_monitor_handle = if disk_config.enabled {
+        let paths = disk_paths;
+        let cfg = disk_config;
+        // Guaranteed by bootstrap: disk_read_only is Some when disk_config.enabled.
+        #[allow(clippy::expect_used)]
+        let ro = disk_read_only
+            .clone()
+            .expect("disk_read_only set when disk monitor enabled");
+        let rx = service_shutdown_rx.clone();
+        Some(tokio::spawn(async move {
+            disk_monitor::run_disk_monitor(paths, cfg, ro, rx).await;
+        }))
+    } else {
+        None
+    };
+
+    // `SET`s made before this restart, now that every applier is registered.
+    if let Err(e) = crate::application::runtime_settings::restore(app_state.metadata.as_ref()).await
+    {
+        tracing::warn!(error = %e, "failed to apply stored settings");
+    }
+    let app_state = Arc::new(app_state);
+    let app = build_router(app_state.clone());
+
+    // Control listener on the control runtime, next to the Raft core: probes
+    // and Raft RPCs are answered even while the write path is saturated.
+    if config.cluster.enabled && config.cluster.control_port > 0 {
+        let control_app = build_control_router(app_state.clone());
+        let control_addr = format!(
+            "{}:{}",
+            config.server.bind_address, config.cluster.control_port
+        );
+        let spawn_here = tokio::runtime::Handle::current();
+        control::handle().unwrap_or(&spawn_here).spawn(async move {
+            match tokio::net::TcpListener::bind(&control_addr).await {
+                Ok(listener) => {
+                    tracing::info!(addr = %control_addr, "control listener up");
+                    if let Err(e) = axum::serve(nodelay(listener), control_app).await {
+                        tracing::error!(error = %e, "control listener stopped");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(addr = %control_addr, error = %e, "control listener failed to bind");
+                }
+            }
+        });
+    }
+
+    // ── Raft cluster formation ───────────────────────────────────────────
+    // Spawned before the server starts; the task retries with back-off
+    // until the local HTTP server (and peers) are reachable.
+    let raft_formation_handle =
+        if config.cluster.enabled && config.cluster.node_id == 1 && app_state.raft.is_some() {
+            let state_ref = app_state.clone();
+            let formation_node_id = config.cluster.node_id;
+            let formation_peers = cluster
+                .as_ref()
+                .map(|c| c.peer_addrs.clone())
+                .unwrap_or_default();
+            let rx = service_shutdown_rx.clone();
+            Some(tokio::spawn(async move {
+                raft_formation::run_raft_cluster_formation(
+                    state_ref,
+                    formation_node_id,
+                    formation_peers,
+                    rx,
+                )
+                .await;
+            }))
+        } else {
+            None
+        };
+
+    // ── Leader-driven replication lag monitor ─────────────────────────────
+    // Only the Raft leader actively monitors followers for data divergence
+    // and triggers re-sync on lagging nodes.
+    let _leader_monitor_handle = if config.cluster.enabled && app_state.raft.is_some() {
+        let state_ref = app_state.clone();
+        let monitor_node_id = config.cluster.node_id;
+        let rx = service_shutdown_rx.clone();
+        Some(tokio::spawn(async move {
+            leader_monitor::run_leader_replication_monitor(state_ref, monitor_node_id, rx).await;
+        }))
+    } else {
+        None
+    };
+
+    // ── Phase 1: Start HTTP server ──────────────────────────────────────
+    // The server will accept requests until the shutdown signal fires.
+    let addr = format!("{}:{}", config.server.bind_address, config.server.port);
+    if config.server.tls_enabled {
+        use axum_server::tls_rustls::RustlsConfig;
+
+        if config.server.tls_cert_path.is_empty() || config.server.tls_key_path.is_empty() {
+            anyhow::bail!("tls_enabled is true but tls_cert_path or tls_key_path is not set");
+        }
+        if !std::path::Path::new(&config.server.tls_cert_path).exists() {
+            anyhow::bail!("TLS cert file not found: {}", config.server.tls_cert_path);
+        }
+        if !std::path::Path::new(&config.server.tls_key_path).exists() {
+            anyhow::bail!("TLS key file not found: {}", config.server.tls_key_path);
+        }
+
+        let tls_config =
+            RustlsConfig::from_pem_file(&config.server.tls_cert_path, &config.server.tls_key_path)
+                .await
+                .map_err(|e| anyhow::anyhow!("TLS config error: {}", e))?;
+
+        let handle = axum_server::Handle::new();
+        let shutdown_handle = handle.clone();
+        tokio::spawn(async move {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut term) => {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {},
+                        _ = term.recv() => {},
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to install SIGTERM handler, SIGINT only");
+                    tokio::signal::ctrl_c().await.ok();
+                }
+            }
+            tracing::info!("shutdown signal received, stopping API server");
+            let _ = api_shutdown_tx.send(true);
+            shutdown_handle.graceful_shutdown(Some(Duration::from_secs(10)));
+        });
+
+        tracing::info!(addr = %addr, "Hyperbytedb listening (TLS)");
+        axum_server::bind_rustls(addr.parse()?, tls_config)
+            .handle(handle)
+            .serve(app.into_make_service())
+            .await?;
+    } else {
+        let api_rx = _api_shutdown_rx;
+        tracing::info!(addr = %addr, "Hyperbytedb listening");
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        axum::serve(nodelay(listener), app)
+            .with_graceful_shutdown(async move {
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                    Ok(mut term) => {
+                        tokio::select! {
+                            _ = tokio::signal::ctrl_c() => {},
+                            _ = term.recv() => {},
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to install SIGTERM handler, SIGINT only");
+                        tokio::signal::ctrl_c().await.ok();
+                    }
+                }
+                tracing::info!("shutdown signal received, stopping API server");
+                let _ = api_shutdown_tx.send(true);
+                // Also consume api_rx so it is moved into this future
+                drop(api_rx);
+            })
+            .await?;
+    }
+
+    // ── Phase 2: API is down — stop background flush before drain ───────
+    tracing::info!("API server stopped, stopping background services before drain");
+    let _ = service_shutdown_tx.send(true);
+    if let Err(e) = flush_handle.await {
+        tracing::warn!(error = %e, "flush service task join error");
+    }
+
+    tracing::info!("flushing WAL to disk");
+    if let Err(e) = shutdown_wal.flush_wal().await {
+        tracing::error!(error = %e, "WAL flush before drain failed");
+    }
+
+    if let Some(ref ds) = shutdown_drain_service {
+        // Skip drain if it already ran, e.g. triggered by the Kubernetes
+        // preStop hook. A successful drain now ends in `Draining`, not
+        // `Leaving` (draining keeps the node's seat and its data, so it must
+        // never reach the terminal `Leaving` state), so "already drained" can
+        // no longer be read off membership state -- `has_drained()` tracks it
+        // directly instead.
+        if ds.has_drained() {
+            tracing::info!("drain already completed (preStop hook), skipping");
+        } else {
+            tracing::info!("running drain procedure before stopping services");
+            if let Err(e) = ds.drain().await {
+                tracing::error!(error = %e, "drain procedure failed during shutdown");
+            }
+        }
+    }
+
+    // ── Phase 3: Stop remaining background services ─────────────────────
+    tracing::info!("stopping remaining background services");
+
+    cq_handle.await?;
+    if let Some(h) = disk_monitor_handle {
+        h.await?;
+    }
+    if let Some(h) = retention_handle {
+        h.await?;
+    }
+    uptime_handle.await?;
+    if let Some(h) = cluster_heartbeat_handle {
+        h.await?;
+    }
+    if let Some(h) = peer_heartbeat_handle {
+        h.await?;
+    }
+    if let Some(h) = raft_formation_handle {
+        h.abort();
+        let _ = h.await;
+    }
+    if let Some(h) = hinted_handoff_handle {
+        h.await?;
+    }
+    if let Some((sched, hb)) = shard_scheduler_handle {
+        sched.await?;
+        if let Some(h) = hb {
+            h.await?;
+        }
+    }
+    tracing::info!("Hyperbytedb shut down cleanly");
+
+    Ok(())
+}
+
+/// Accepted connections with Nagle off. Region results stream back in
+/// several small writes; with Nagle each one after the first waited for the
+/// peer's delayed ACK, up to 40 ms on Linux. Every query that touched a
+/// remote region on the UAT cluster took ~55 ms or ~20 ms at random.
+fn nodelay(
+    listener: tokio::net::TcpListener,
+) -> impl axum::serve::Listener<Io = tokio::net::TcpStream, Addr = std::net::SocketAddr> {
+    use axum::serve::ListenerExt;
+    listener.tap_io(|tcp| {
+        if let Err(e) = tcp.set_nodelay(true) {
+            tracing::debug!(error = %e, "TCP_NODELAY not set");
+        }
+    })
+}

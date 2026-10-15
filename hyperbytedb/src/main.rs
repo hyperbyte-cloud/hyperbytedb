@@ -12,8 +12,8 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use clap::{Parser, Subcommand};
 
 use hyperbytedb::application::backup::{backup, restore};
-use hyperbytedb::application::runtime::serve;
 use hyperbytedb::config::HyperbytedbConfig;
+use hyperbytedb::server::serve;
 
 #[derive(Parser)]
 #[command(
