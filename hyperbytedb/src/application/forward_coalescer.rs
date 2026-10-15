@@ -50,6 +50,9 @@ struct Limits {
 }
 
 pub struct ForwardCoalescer {
+    /// Unbounded on purpose: every sender awaits its job's reply before
+    /// sending another, so a lane never holds more jobs than there are
+    /// writes in flight, which write admission already bounds.
     lanes: parking_lot::Mutex<HashMap<String, mpsc::UnboundedSender<Job>>>,
     limits: Limits,
 }

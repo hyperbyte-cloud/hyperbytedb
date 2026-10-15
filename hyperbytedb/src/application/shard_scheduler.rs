@@ -465,11 +465,11 @@ impl ShardScheduler {
         peer: u64,
         addr: &str,
         cluster_ver: u64,
-        client: &reqwest::Client,
+        pc: &PeerClient,
     ) -> Option<(u64, u64)> {
         let cell = self.probe_cell(&self.peer_map_versions, peer).await;
         *cell
-            .get_or_init(|| self.probe_peer_map_version(peer, addr, cluster_ver, client))
+            .get_or_init(|| self.probe_peer_map_version(peer, addr, cluster_ver, pc))
             .await
     }
 
@@ -496,9 +496,9 @@ impl ShardScheduler {
         peer: u64,
         addr: &str,
         cluster_ver: u64,
-        client: &reqwest::Client,
+        pc: &PeerClient,
     ) -> Option<(u64, u64)> {
-        match fetch_peer_map_version(client, addr).await {
+        match pc.fetch_map_version(addr).await {
             Ok(version) => Some((version, cluster_ver)),
             Err(e) => {
                 // Warn, not debug: the shipped image pins the log level to
@@ -2526,7 +2526,7 @@ impl ShardScheduler {
         }
         for (id, addr) in candidates {
             let Some((ver, probed_against)) = self
-                .cached_peer_map_version(*id, addr, cluster_ver, pc.http_client())
+                .cached_peer_map_version(*id, addr, cluster_ver, pc)
                 .await
             else {
                 continue;
@@ -2688,7 +2688,7 @@ async fn post_rehome(
     req: &ShardRehomeRequest,
     idle: Duration,
 ) -> Result<serde_json::Value, HyperbytedbError> {
-    use crate::adapters::http::shard_handlers::REHOME_PROGRESS_HEADER;
+    use crate::domain::sharding::types::REHOME_PROGRESS_HEADER;
     let unreachable = |e: String| HyperbytedbError::PeerUnreachable(format!("{url}: {e}"));
     let mut resp = http
         .post(url)
@@ -2728,7 +2728,9 @@ async fn post_rehome(
             .and_then(serde_json::Value::as_str)
             .unwrap_or("no reason");
         return Err(HyperbytedbError::TransferRejected {
-            status: status as u16,
+            // A peer's number, not ours: one that is not an HTTP status is a
+            // bad gateway, not a truncated code.
+            status: u16::try_from(status).unwrap_or(502),
             reason: reason.into(),
         });
     }
@@ -2853,16 +2855,6 @@ pub fn current_region<'a>(
         .regions
         .iter()
         .find(|r| r.region_id == region_id)
-}
-
-/// Read a peer's committed `map_version` via `/internal/shard/map`.
-pub async fn fetch_peer_map_version(
-    client: &reqwest::Client,
-    peer_addr: &str,
-) -> Result<u64, HyperbytedbError> {
-    let map =
-        crate::adapters::cluster::sync_client::fetch_shard_map(client.clone(), peer_addr).await?;
-    Ok(map.map_version)
 }
 
 #[allow(clippy::too_many_arguments)]

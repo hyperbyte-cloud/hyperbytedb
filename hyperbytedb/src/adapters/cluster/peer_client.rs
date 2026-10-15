@@ -115,6 +115,13 @@ impl PeerClient {
         self
     }
 
+    /// A peer's committed `map_version`, read from `/internal/shard/map`.
+    pub async fn fetch_map_version(&self, peer_addr: &str) -> Result<u64, HyperbytedbError> {
+        let map =
+            super::sync_client::fetch_shard_map(self.http_client().clone(), peer_addr).await?;
+        Ok(map.map_version)
+    }
+
     /// The client for the next peer request (round-robin over connections).
     pub fn http_client(&self) -> &reqwest::Client {
         let i = self

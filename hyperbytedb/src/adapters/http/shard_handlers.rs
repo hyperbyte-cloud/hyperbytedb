@@ -18,6 +18,7 @@ use crate::application::shard_transfer::apply_transfer;
 use crate::application::sharded_mv_backfill::apply_mv_backfill_sql;
 use crate::application::wal_append::append_points_with_prepared;
 use crate::domain::point::Point;
+use crate::domain::sharding::types::REHOME_PROGRESS_HEADER;
 use crate::domain::sharding::{
     MeasurementKey, RegionHeartbeat, ShardBootstrapRequest, ShardDeleteRequest, ShardEpoch,
     ShardMap, ShardMapJson, ShardMetadataKind, ShardMetadataRequest, ShardMvBackfillRequest,
@@ -1300,12 +1301,7 @@ pub async fn handle_shard_rehome(
     (StatusCode::OK, Body::from_stream(stream)).into_response()
 }
 
-/// Request header asking `/internal/shard/rehome` to stream progress: a
-/// newline every [`REHOME_PROGRESS_INTERVAL`] while copying, then the result
-/// JSON with its status in `"status"`. A header, not a body field, because
-/// the request is `deny_unknown_fields` and an older node would refuse the
-/// whole request; an older node ignores the header and answers as before.
-pub const REHOME_PROGRESS_HEADER: &str = "x-hyperbytedb-rehome-progress";
+/// How often a streamed rehome ([`REHOME_PROGRESS_HEADER`]) sends a newline.
 const REHOME_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 /// How long a rehome waits for this node's map to reach the request's epoch.
 const REHOME_EPOCH_WAIT: std::time::Duration = std::time::Duration::from_secs(10);

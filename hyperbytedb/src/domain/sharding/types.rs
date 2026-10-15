@@ -383,6 +383,13 @@ pub const NODE_FEATURES_HEADER: &str = "x-hyperbytedb-features";
 /// would refuse such a merge that the others apply.
 pub const FEATURE_CROSS_EPOCH_MERGE: &str = "cross-epoch-merge";
 
+/// Request header asking `/internal/shard/rehome` to stream progress: a
+/// newline every few seconds while copying, then the result JSON with its
+/// status in `"status"`. A header, not a body field, because the request is
+/// `deny_unknown_fields` and an older node would refuse the whole request;
+/// an older node ignores the header and answers as before.
+pub const REHOME_PROGRESS_HEADER: &str = "x-hyperbytedb-rehome-progress";
+
 /// Per-region stats reported by store nodes to the Raft leader (PD-lite).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
