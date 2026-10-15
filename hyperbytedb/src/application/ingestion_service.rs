@@ -39,8 +39,7 @@ impl IngestionServiceImpl {
             wal,
             None,
             metadata,
-            max_tag_values,
-            max_measurements,
+            IngestCardinalityLimits::new(max_tag_values, max_measurements),
             max_points_per_request,
         )
     }
@@ -49,18 +48,14 @@ impl IngestionServiceImpl {
         wal: Arc<dyn WalPort>,
         sink: Option<Arc<dyn PointsSinkPort>>,
         metadata: Arc<dyn crate::ports::metadata::MetadataPort>,
-        max_tag_values: usize,
-        max_measurements: usize,
+        limits: IngestCardinalityLimits,
         max_points_per_request: usize,
     ) -> Self {
         Self {
             wal,
             sink,
             metadata,
-            limits: IngestCardinalityLimits {
-                max_tag_values_per_measurement: max_tag_values,
-                max_measurements_per_database: max_measurements,
-            },
+            limits,
             max_points_per_request,
             schema_cache: IngestSchemaCache::new(),
         }
@@ -130,7 +125,7 @@ impl IngestionPort for IngestionServiceImpl {
                 db,
                 &retention_policy,
                 &wire,
-                self.limits,
+                &self.limits,
                 Some(&self.schema_cache),
             )
             .await?;
@@ -210,7 +205,7 @@ impl IngestionPort for IngestionServiceImpl {
             db,
             &retention_policy,
             &points,
-            self.limits,
+            &self.limits,
             Some(&self.schema_cache),
         )
         .await?;

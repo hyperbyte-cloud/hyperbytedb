@@ -85,11 +85,8 @@ pub async fn apply_transfer_push(
         return Ok(0);
     }
 
-    let limits = IngestCardinalityLimits {
-        max_tag_values_per_measurement: 0,
-        max_measurements_per_database: 0,
-    };
-    prepare_batch_metadata(metadata, &req.db, &req.rp, &filtered, limits, None).await?;
+    let limits = IngestCardinalityLimits::unlimited();
+    prepare_batch_metadata(metadata, &req.db, &req.rp, &filtered, &limits, None).await?;
 
     append_points_with_prepared(
         wal.as_ref(),
@@ -1342,12 +1339,9 @@ mod tests {
         let long: Vec<Point> = (0..1_000).map(|i| point("h0", i, 1.0)).collect();
         let short: Vec<Point> = (0..10).map(|i| point("h1", i, 2.0)).collect();
         let again = vec![point("h0", 400, 9.0)];
-        let limits = IngestCardinalityLimits {
-            max_tag_values_per_measurement: 0,
-            max_measurements_per_database: 0,
-        };
+        let limits = IngestCardinalityLimits::unlimited();
         let all: Vec<Point> = long.iter().chain(&short).chain(&again).cloned().collect();
-        prepare_batch_metadata(&metadata, "db", "autogen", &all, limits, None)
+        prepare_batch_metadata(&metadata, "db", "autogen", &all, &limits, None)
             .await
             .unwrap();
         for (seq, pts) in [(1u64, &long), (10_000, &short), (20_000, &again)] {
@@ -1512,11 +1506,8 @@ mod tests {
         };
         let (flushed, unflushed) = (points(0, 100), points(100, 50));
         let all: Vec<Point> = flushed.iter().chain(&unflushed).cloned().collect();
-        let limits = IngestCardinalityLimits {
-            max_tag_values_per_measurement: 0,
-            max_measurements_per_database: 0,
-        };
-        prepare_batch_metadata(&metadata, "db", "autogen", &all, limits, None)
+        let limits = IngestCardinalityLimits::unlimited();
+        prepare_batch_metadata(&metadata, "db", "autogen", &all, &limits, None)
             .await
             .unwrap();
 

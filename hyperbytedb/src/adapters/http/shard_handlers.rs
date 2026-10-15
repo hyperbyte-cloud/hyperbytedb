@@ -541,7 +541,7 @@ async fn append_forwarded_group(
         db,
         rp,
         &points,
-        state.ingest_cardinality,
+        &state.ingest_cardinality,
         Some(&state.ingest_schema_cache),
     )
     .await
@@ -667,7 +667,7 @@ async fn apply_shard_write(
         &req.db,
         &req.rp,
         &points,
-        state.ingest_cardinality,
+        &state.ingest_cardinality,
         Some(&state.ingest_schema_cache),
     )
     .await

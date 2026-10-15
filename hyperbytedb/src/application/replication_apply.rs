@@ -250,12 +250,9 @@ struct ApplyContext {
 
 fn replica_metadata_limits(ctx: &ApplyContext) -> IngestCardinalityLimits {
     if ctx.sharding_enabled {
-        IngestCardinalityLimits {
-            max_tag_values_per_measurement: 0,
-            max_measurements_per_database: 0,
-        }
+        IngestCardinalityLimits::unlimited()
     } else {
-        ctx.limits
+        ctx.limits.clone()
     }
 }
 
@@ -313,7 +310,7 @@ async fn apply_batch(
         database,
         retention_policy,
         &points,
-        replica_metadata_limits(ctx),
+        &replica_metadata_limits(ctx),
         Some(schema_cache),
     )
     .await

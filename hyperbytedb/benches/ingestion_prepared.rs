@@ -117,8 +117,7 @@ fn setup_prepared_ingest() -> PreparedIngestEnv {
         wal_port,
         Some(sink),
         metadata,
-        100_000,
-        10_000,
+        hyperbytedb::application::ingest_metadata::IngestCardinalityLimits::new(100_000, 10_000),
         0,
     ));
 

@@ -15,29 +15,69 @@ use crate::error::HyperbytedbError;
 use crate::ports::metadata::{MeasurementMeta, MetadataPort};
 use crate::ports::query::QueryPort;
 
-/// Cardinality limits (0 = unlimited for that bound), matching [`crate::config::CardinalityConfig`].
-#[derive(Debug, Clone, Copy, Default)]
+/// Cardinality limits (0 = unlimited for that bound), matching
+/// [`crate::config::CardinalityConfig`].
+///
+/// Clones share the values. The client-facing limits built at startup get
+/// `SET max_tag_values_per_measurement` / `SET max_measurements_per_database`
+/// through appliers; limits made elsewhere ([`Self::unlimited`] for copies of
+/// data that already exists: region transfers, replicas, sync) never do.
+/// The registry used to override whatever limits a caller passed, so after
+/// such a `SET` a region copy or replica of an existing measurement was
+/// refused.
+#[derive(Debug, Clone, Default)]
 pub struct IngestCardinalityLimits {
+    inner: Arc<SharedLimits>,
+}
+
+#[derive(Debug, Default)]
+struct SharedLimits {
+    max_tag_values_per_measurement: std::sync::atomic::AtomicUsize,
+    max_measurements_per_database: std::sync::atomic::AtomicUsize,
+}
+
+/// The limits at one moment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CardinalityLimitValues {
     pub max_tag_values_per_measurement: usize,
     pub max_measurements_per_database: usize,
 }
 
 impl IngestCardinalityLimits {
-    /// These limits, or `SET max_tag_values_per_measurement` /
-    /// `SET max_measurements_per_database` where set.
     #[must_use]
-    pub fn effective(self) -> Self {
-        use crate::application::runtime_settings as rs;
-        Self {
-            max_tag_values_per_measurement: rs::usize_or(
-                rs::MAX_TAG_VALUES_PER_MEASUREMENT,
-                self.max_tag_values_per_measurement,
-            ),
-            max_measurements_per_database: rs::usize_or(
-                rs::MAX_MEASUREMENTS_PER_DATABASE,
-                self.max_measurements_per_database,
-            ),
+    pub fn new(
+        max_tag_values_per_measurement: usize,
+        max_measurements_per_database: usize,
+    ) -> Self {
+        let limits = Self::default();
+        limits.set_max_tag_values_per_measurement(max_tag_values_per_measurement);
+        limits.set_max_measurements_per_database(max_measurements_per_database);
+        limits
+    }
+
+    /// No limits, and no `SET` reaches them.
+    #[must_use]
+    pub fn unlimited() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn current(&self) -> CardinalityLimitValues {
+        use std::sync::atomic::Ordering::Relaxed;
+        CardinalityLimitValues {
+            max_tag_values_per_measurement: self.inner.max_tag_values_per_measurement.load(Relaxed),
+            max_measurements_per_database: self.inner.max_measurements_per_database.load(Relaxed),
         }
+    }
+
+    pub fn set_max_tag_values_per_measurement(&self, n: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.inner.max_tag_values_per_measurement.store(n, Relaxed);
+    }
+
+    pub fn set_max_measurements_per_database(&self, n: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.inner.max_measurements_per_database.store(n, Relaxed);
     }
 }
 
@@ -409,7 +449,7 @@ pub async fn prepare_columnar_metadata(
     db: &str,
     rp: &str,
     batch: &crate::application::columnar_msgpack::ColumnarMsgpackBatch,
-    limits: IngestCardinalityLimits,
+    limits: &IngestCardinalityLimits,
     schema_cache: Option<&IngestSchemaCache>,
 ) -> Result<(), HyperbytedbError> {
     let mut field_types: HashMap<String, u8> = HashMap::with_capacity(1);
@@ -464,7 +504,7 @@ pub async fn prepare_columnar_metadata(
     }
 
     // Slow path: schema unknown
-    let limits = limits.effective();
+    let limits = limits.current();
     if limits.max_measurements_per_database > 0 {
         let existing = metadata.list_measurements(db).await?;
         let is_new = !existing.contains(&batch.measurement);
@@ -594,7 +634,7 @@ pub async fn prepare_batch_metadata(
     db: &str,
     rp: &str,
     points: &[Point],
-    limits: IngestCardinalityLimits,
+    limits: &IngestCardinalityLimits,
     schema_cache: Option<&IngestSchemaCache>,
 ) -> Result<(), HyperbytedbError> {
     // Series registration short-circuit: steady-state batches whose series are
@@ -716,7 +756,7 @@ pub async fn prepare_batch_metadata(
 
     // Slow path: schema is unknown (first write for a measurement, or schema changed).
     // Full validation + registration.
-    let limits = limits.effective();
+    let limits = limits.current();
 
     if limits.max_measurements_per_database > 0 {
         let existing = metadata.list_measurements(db).await?;
@@ -848,6 +888,50 @@ mod tests {
         }
     }
 
+    /// A SET changes the client-facing limits (every clone of them) and
+    /// never the unlimited ones that copies of existing data use: before,
+    /// `SET max_tag_values_per_measurement` refused region transfers and
+    /// replicas of any measurement already over it.
+    #[tokio::test]
+    async fn a_set_limit_reaches_clients_not_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta: Arc<dyn MetadataPort> =
+            Arc::new(RocksDbMetadata::open(dir.path().join("meta")).unwrap());
+        meta.create_database("db").await.unwrap();
+        let host = |h: &str, ts: i64| {
+            let mut p = point("cpu", &[("v", FieldValue::Float(1.0))], ts);
+            p.tags.insert("host".into(), h.into());
+            p
+        };
+        let client = IngestCardinalityLimits::new(0, 0);
+        let held_by_a_service = client.clone();
+        client.set_max_tag_values_per_measurement(1);
+        assert_eq!(
+            held_by_a_service.current().max_tag_values_per_measurement,
+            1
+        );
+
+        let two_hosts = [host("a", 1), host("b", 2)];
+        let copy = IngestCardinalityLimits::unlimited();
+        prepare_batch_metadata(&meta, "db", "autogen", &two_hosts, &copy, None)
+            .await
+            .expect("a copy of existing data is never refused");
+        let err = prepare_batch_metadata(
+            &meta,
+            "db",
+            "autogen",
+            &[host("c", 3)],
+            &held_by_a_service,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, HyperbytedbError::CardinalityExceeded { limit: 1, .. }),
+            "{err:?}"
+        );
+    }
+
     /// Tag checks run only for points of series not seen before. A new tag
     /// value always means a new series id, so a new host under a schema that
     /// is already known must still have its tag value persisted, and a batch
@@ -872,7 +956,7 @@ mod tests {
             "db",
             "autogen",
             &[host("a", 1)],
-            limits,
+            &limits,
             Some(&cache),
         )
         .await
@@ -883,7 +967,7 @@ mod tests {
             "db",
             "autogen",
             &[host("a", 2), host("b", 3)],
-            limits,
+            &limits,
             Some(&cache),
         )
         .await
@@ -905,7 +989,7 @@ mod tests {
         let again = [host("a", 4), host("b", 5)];
         let (unknown, fresh) = cache.unknown_series_by_measurement("db", "autogen", &again);
         assert!(unknown.is_empty() && fresh.is_empty());
-        prepare_batch_metadata(&meta, "db", "autogen", &again, limits, Some(&cache))
+        prepare_batch_metadata(&meta, "db", "autogen", &again, &limits, Some(&cache))
             .await
             .unwrap();
         assert!(
@@ -960,7 +1044,7 @@ mod tests {
             "db",
             "autogen",
             &points,
-            IngestCardinalityLimits::default(),
+            &IngestCardinalityLimits::default(),
             None,
         )
         .await
@@ -995,7 +1079,7 @@ mod tests {
             "db",
             "autogen",
             &full,
-            IngestCardinalityLimits::default(),
+            &IngestCardinalityLimits::default(),
             None,
         )
         .await
@@ -1011,7 +1095,7 @@ mod tests {
             "db",
             "autogen",
             &partial,
-            IngestCardinalityLimits::default(),
+            &IngestCardinalityLimits::default(),
             None,
         )
         .await

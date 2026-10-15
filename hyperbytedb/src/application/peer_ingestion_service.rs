@@ -703,7 +703,7 @@ impl PeerIngestionService {
                 db,
                 rp,
                 &all_local,
-                self.limits,
+                &self.limits,
                 Some(&self.schema_cache),
             )
             .await?;
@@ -802,7 +802,7 @@ impl IngestionPort for PeerIngestionService {
                 db,
                 &retention_policy,
                 &wire,
-                self.limits,
+                &self.limits,
                 Some(&self.schema_cache),
             )
             .await?;
@@ -932,7 +932,7 @@ impl IngestionPort for PeerIngestionService {
             db,
             &retention_policy,
             &points,
-            self.limits,
+            &self.limits,
             Some(&self.schema_cache),
         )
         .await?;

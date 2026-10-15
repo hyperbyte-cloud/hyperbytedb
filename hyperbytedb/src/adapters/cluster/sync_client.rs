@@ -533,7 +533,7 @@ impl SyncClient {
             &entry.database,
             &entry.retention_policy,
             &entry.points,
-            IngestCardinalityLimits::default(),
+            &IngestCardinalityLimits::unlimited(),
             None,
         )
         .await?;

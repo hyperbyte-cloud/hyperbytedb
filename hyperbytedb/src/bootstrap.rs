@@ -333,10 +333,24 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
 
     let max_points_per_request = config.server.max_points_per_request;
 
-    let ingest_cardinality = IngestCardinalityLimits {
-        max_tag_values_per_measurement: config.cardinality.max_tag_values_per_measurement,
-        max_measurements_per_database: config.cardinality.max_measurements_per_database,
-    };
+    let ingest_cardinality = IngestCardinalityLimits::new(
+        config.cardinality.max_tag_values_per_measurement,
+        config.cardinality.max_measurements_per_database,
+    );
+    // SET reaches these limits, and only these: transfers, replicas and
+    // sync use their own unlimited ones.
+    {
+        let limits = ingest_cardinality.clone();
+        rs::register_applier(
+            rs::MAX_TAG_VALUES_PER_MEASUREMENT,
+            rs::usize_applier(move |n| limits.set_max_tag_values_per_measurement(n)),
+        );
+        let limits = ingest_cardinality.clone();
+        rs::register_applier(
+            rs::MAX_MEASUREMENTS_PER_DATABASE,
+            rs::usize_applier(move |n| limits.set_max_measurements_per_database(n)),
+        );
+    }
 
     let shard_routing = if config.sharding.enabled {
         match (peer_client.as_ref(), rocks_shard_map.clone()) {
@@ -439,7 +453,7 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
                 metadata.clone(),
                 pc.clone(),
                 config.cluster.node_id,
-                ingest_cardinality,
+                ingest_cardinality.clone(),
                 max_points_per_request,
                 config.cluster.replication.clone(),
             );
@@ -474,8 +488,7 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
             wal.clone(),
             Some(points_sink.clone()),
             metadata.clone(),
-            config.cardinality.max_tag_values_per_measurement,
-            config.cardinality.max_measurements_per_database,
+            ingest_cardinality.clone(),
             max_points_per_request,
         ))
     };
@@ -486,7 +499,7 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
             metadata.clone(),
             wal.clone(),
             Some(points_sink.clone()),
-            ingest_cardinality,
+            ingest_cardinality.clone(),
             max_points_per_request,
             config.sharding.enabled,
             config.cluster.node_id,

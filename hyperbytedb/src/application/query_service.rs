@@ -3288,10 +3288,7 @@ async fn write_series_as_points(
                     db,
                     rp,
                     &all_local,
-                    crate::application::ingest_metadata::IngestCardinalityLimits {
-                        max_tag_values_per_measurement: 0,
-                        max_measurements_per_database: 0,
-                    },
+                    &crate::application::ingest_metadata::IngestCardinalityLimits::unlimited(),
                     None,
                 )
                 .await?;

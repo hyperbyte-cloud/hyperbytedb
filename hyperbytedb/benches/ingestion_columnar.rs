@@ -119,7 +119,7 @@ fn bench_metadata(c: &mut Criterion) {
                 "benchdb",
                 "autogen",
                 &points,
-                limits,
+                &limits,
                 Some(&cache),
             ))
             .expect("metadata");
@@ -156,7 +156,7 @@ fn bench_wal(c: &mut Criterion) {
                 "benchdb",
                 "autogen",
                 &points,
-                limits,
+                &limits,
                 Some(&cache),
             ))
             .expect("metadata");
@@ -224,7 +224,7 @@ fn bench_metadata_fast(c: &mut Criterion) {
                 "benchdb",
                 "autogen",
                 black_box(&batch),
-                limits,
+                &limits,
                 Some(&cache),
             ))
             .expect("metadata");
@@ -260,7 +260,7 @@ fn bench_wal_fast(c: &mut Criterion) {
                 "benchdb",
                 "autogen",
                 &wire,
-                limits,
+                &limits,
                 Some(&cache),
             ))
             .expect("metadata");
@@ -342,13 +342,14 @@ fn bench_metadata_concurrent(c: &mut Criterion) {
                             let batch = Arc::clone(&batch);
                             let meta_port = Arc::clone(&meta_port);
                             let cache = Arc::clone(&cache);
+                            let limits = limits.clone();
                             set.spawn(async move {
                                 prepare_columnar_metadata(
                                     &meta_port,
                                     "benchdb",
                                     "autogen",
                                     batch.as_ref(),
-                                    limits,
+                                    &limits,
                                     Some(cache.as_ref()),
                                 )
                                 .await
@@ -398,6 +399,7 @@ fn bench_wal_concurrent(c: &mut Criterion) {
                             let meta_port = Arc::clone(&meta_port);
                             let wal = Arc::clone(&wal);
                             let cache = Arc::clone(&cache);
+                            let limits = limits.clone();
                             set.spawn(async move {
                                 let wire = decode_columnar_batch(body.as_slice()).expect("decode");
                                 prepare_columnar_metadata(
@@ -405,7 +407,7 @@ fn bench_wal_concurrent(c: &mut Criterion) {
                                     "benchdb",
                                     "autogen",
                                     &wire,
-                                    limits,
+                                    &limits,
                                     Some(cache.as_ref()),
                                 )
                                 .await
@@ -474,6 +476,7 @@ fn bench_wal_batched_concurrent(c: &mut Criterion) {
                             let meta_port = Arc::clone(&meta_port);
                             let wal: Arc<dyn hyperbytedb::ports::wal::WalPort> = wal.clone();
                             let cache = Arc::clone(&cache);
+                            let limits = limits.clone();
                             set.spawn(async move {
                                 let wire = decode_columnar_batch(body.as_slice()).expect("decode");
                                 prepare_columnar_metadata(
@@ -481,7 +484,7 @@ fn bench_wal_batched_concurrent(c: &mut Criterion) {
                                     "benchdb",
                                     "autogen",
                                     &wire,
-                                    limits,
+                                    &limits,
                                     Some(cache.as_ref()),
                                 )
                                 .await
