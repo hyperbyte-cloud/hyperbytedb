@@ -1,3 +1,4 @@
+pub mod forward;
 pub mod membership;
 pub mod replication_wire;
 pub mod sync;

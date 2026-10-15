@@ -451,6 +451,7 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
             );
             // The queue shares the replication log's RocksDB, next to
             // hinted handoff.
+            use crate::ports::forward_queue::ForwardQueuePort;
             let queue = crate::adapters::cluster::forward_queue::ForwardQueue::new(
                 pc.replication_log().db().clone(),
             )?;

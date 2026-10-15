@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use crate::adapters::cluster::forward_queue::{self, ForwardEntry, ForwardQueue};
 use crate::application::stage_timer::StageTimer;
+use crate::ports::forward_queue::{ForwardEntry, ForwardQueuePort};
 use async_trait::async_trait;
 use metrics::{counter, histogram};
 
@@ -55,8 +55,8 @@ pub struct PeerIngestionService {
     is_raft_leader: Arc<dyn Fn() -> bool + Send + Sync>,
     raft_leader_addr: Arc<dyn Fn() -> Option<String> + Send + Sync>,
     /// Durable queue of forwards owed to other primaries; `None` forwards
-    /// every write synchronously. See [`ForwardQueue`].
-    forward_queue: Option<Arc<ForwardQueue>>,
+    /// every write synchronously. See [`ForwardQueuePort`].
+    forward_queue: Option<Arc<dyn ForwardQueuePort>>,
 }
 
 /// Times a coordinator resends regions a primary refused at capacity before
@@ -177,7 +177,7 @@ impl PeerIngestionService {
     /// Acknowledge writes once their forwarded share is in `queue`; see
     /// `ShardingConfig::async_forward`. Call [`Self::spawn_forward_drainer`]
     /// to deliver it.
-    pub fn with_forward_queue(mut self, queue: Arc<ForwardQueue>) -> Self {
+    pub fn with_forward_queue(mut self, queue: Arc<dyn ForwardQueuePort>) -> Self {
         self.forward_queue = Some(queue);
         self
     }
@@ -250,7 +250,10 @@ impl PeerIngestionService {
         let precision_val = Precision::from_str_opt(precision);
         stage.lap("partition");
 
-        if self.queue_forwards(ctx, db, rp, precision, &buckets.forward) {
+        if self
+            .queue_forwards(ctx, db, rp, precision, &buckets.forward)
+            .await
+        {
             // Acknowledged once the forwarded share is durable here; the
             // drainer delivers it to the primaries.
             stage.lap("queue_forwards");
@@ -380,7 +383,7 @@ impl PeerIngestionService {
     /// forwarding is on and the queue is keeping up. `false` means the caller
     /// forwards synchronously, which also slows clients while the queue
     /// catches up.
-    fn queue_forwards(
+    async fn queue_forwards(
         &self,
         ctx: &ShardRoutingContext,
         db: &str,
@@ -394,7 +397,7 @@ impl PeerIngestionService {
         if forward.is_empty() || !ctx.config.async_forward {
             return false;
         }
-        let now = forward_queue::now_ms();
+        let now = now_ms();
         let behind = if queue.oldest_age_ms(now) > ctx.config.async_forward_max_lag_ms {
             Some("lag")
         } else if queue.bytes() > ctx.config.async_forward_max_bytes {
@@ -427,7 +430,7 @@ impl PeerIngestionService {
             attempts: 0,
             body,
         };
-        match queue.enqueue(&entry) {
+        match queue.enqueue(entry).await {
             Ok(_) => {
                 counter!("hyperbytedb_forward_queue_enqueued_total").increment(1);
                 true
@@ -493,7 +496,7 @@ impl PeerIngestionService {
         tokio::spawn(async move {
             let permits = Arc::new(tokio::sync::Semaphore::new(FORWARD_DRAIN_CONCURRENCY));
             loop {
-                let now = forward_queue::now_ms();
+                let now = now_ms();
                 metrics::gauge!("hyperbytedb_forward_queue_entries").set(queue.len() as f64);
                 metrics::gauge!("hyperbytedb_forward_queue_bytes").set(queue.bytes() as f64);
                 metrics::gauge!("hyperbytedb_forward_queue_oldest_age_seconds")
@@ -501,14 +504,16 @@ impl PeerIngestionService {
                 let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
                     return;
                 };
-                let batch =
-                    match queue.claim(now, FORWARD_DRAIN_MAX_ENTRIES, FORWARD_DRAIN_MAX_BYTES) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "forward queue claim failed");
-                            Vec::new()
-                        }
-                    };
+                let batch = match queue
+                    .claim(now, FORWARD_DRAIN_MAX_ENTRIES, FORWARD_DRAIN_MAX_BYTES)
+                    .await
+                {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "forward queue claim failed");
+                        Vec::new()
+                    }
+                };
                 if batch.is_empty() {
                     drop(permit);
                     tokio::select! {
@@ -520,7 +525,7 @@ impl PeerIngestionService {
                 let this = Arc::clone(&this);
                 let queue = Arc::clone(&queue);
                 tokio::spawn(async move {
-                    this.drain_forward_batch(&queue, batch).await;
+                    this.drain_forward_batch(queue.as_ref(), batch).await;
                     drop(permit);
                 });
             }
@@ -529,7 +534,11 @@ impl PeerIngestionService {
 
     /// Deliver one claimed batch. Regions that fail go back on the queue with
     /// their original timestamp; the batch's entries are then removed.
-    async fn drain_forward_batch(&self, queue: &ForwardQueue, batch: Vec<(u64, ForwardEntry)>) {
+    async fn drain_forward_batch(
+        &self,
+        queue: &dyn ForwardQueuePort,
+        batch: Vec<(u64, ForwardEntry)>,
+    ) {
         let Some(ctx) = self.shard_routing.as_ref() else {
             return;
         };
@@ -570,20 +579,31 @@ impl PeerIngestionService {
         }
 
         for (head, seqs, points) in groups {
-            let now = forward_queue::now_ms();
+            let now = now_ms();
             match self
                 .deliver_forwards(ctx, &head.db, &head.rp, head.precision.as_deref(), points)
                 .await
             {
                 Ok(failed) => {
-                    if failed.is_empty() {
+                    let retry = if failed.is_empty() {
                         metrics::histogram!("hyperbytedb_forward_queue_delivery_lag_seconds")
                             .record(now.saturating_sub(head.enqueued_ms) as f64 / 1000.0);
+                        None
                     } else {
-                        self.requeue_forwards(queue, &head, failed, now);
-                    }
-                    if let Err(e) = queue.complete(&seqs) {
-                        tracing::warn!(error = %e, "forward queue complete failed");
+                        retry_forwards(&head, &failed, now)
+                    };
+                    let retried = retry.is_some();
+                    match queue.complete(seqs.clone(), retry).await {
+                        Ok(()) if retried => {
+                            counter!("hyperbytedb_forward_queue_retried_total").increment(1);
+                        }
+                        Ok(()) => {}
+                        // Nothing was written: hand the entries back, so they
+                        // are sent again rather than held until a restart.
+                        Err(e) => {
+                            tracing::warn!(error = %e, "forward queue complete failed");
+                            queue.release(&seqs, now + forward_backoff_ms(head.attempts));
+                        }
                     }
                 }
                 Err(e) => {
@@ -637,55 +657,6 @@ impl PeerIngestionService {
         }
         counter!("hyperbytedb_forward_queue_delivered_regions_total").increment(delivered);
         Ok(failed)
-    }
-
-    fn requeue_forwards(
-        &self,
-        queue: &ForwardQueue,
-        head: &ForwardEntry,
-        failed: Vec<crate::domain::point::Point>,
-        now: u64,
-    ) {
-        let attempts = head.attempts + 1;
-        if attempts >= FORWARD_MAX_ATTEMPTS {
-            tracing::error!(
-                points = failed.len(),
-                attempts,
-                db = %head.db,
-                "dropping queued forward after repeated delivery failures"
-            );
-            counter!("hyperbytedb_forward_queue_dropped_total", "reason" => "attempts")
-                .increment(1);
-            metrics::counter!("hyperbytedb_forward_queue_dropped_points_total")
-                .increment(failed.len() as u64);
-            return;
-        }
-        let body = match crate::application::line_protocol::encode_points_binary(&failed) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::error!(error = %e, "could not re-encode failed forwards; dropping");
-                counter!("hyperbytedb_forward_queue_dropped_total", "reason" => "encode")
-                    .increment(1);
-                return;
-            }
-        };
-        let entry = ForwardEntry {
-            db: head.db.clone(),
-            rp: head.rp.clone(),
-            precision: head.precision.clone(),
-            enqueued_ms: head.enqueued_ms,
-            not_before_ms: now + forward_backoff_ms(attempts),
-            attempts,
-            body,
-        };
-        match queue.enqueue(&entry) {
-            Ok(_) => counter!("hyperbytedb_forward_queue_retried_total").increment(1),
-            Err(e) => {
-                tracing::error!(error = %e, "could not requeue failed forwards; dropping");
-                counter!("hyperbytedb_forward_queue_dropped_total", "reason" => "requeue")
-                    .increment(1);
-            }
-        }
     }
 
     /// Append this node's own regions of a write to the WAL and replicate
@@ -1048,6 +1019,53 @@ fn partial_write_error(
         )
         .into(),
     )
+}
+
+/// The entry that retries `failed` (points of `head`'s entries that did not
+/// land), or `None` once they have used up their attempts or cannot be
+/// encoded; either way they are dropped and counted.
+fn retry_forwards(
+    head: &ForwardEntry,
+    failed: &[crate::domain::point::Point],
+    now: u64,
+) -> Option<ForwardEntry> {
+    let attempts = head.attempts + 1;
+    if attempts >= FORWARD_MAX_ATTEMPTS {
+        tracing::error!(
+            points = failed.len(),
+            attempts,
+            db = %head.db,
+            "dropping queued forward after repeated delivery failures"
+        );
+        counter!("hyperbytedb_forward_queue_dropped_total", "reason" => "attempts").increment(1);
+        metrics::counter!("hyperbytedb_forward_queue_dropped_points_total")
+            .increment(failed.len() as u64);
+        return None;
+    }
+    let body = match crate::application::line_protocol::encode_points_binary(failed) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!(error = %e, "could not re-encode failed forwards; dropping");
+            counter!("hyperbytedb_forward_queue_dropped_total", "reason" => "encode").increment(1);
+            return None;
+        }
+    };
+    Some(ForwardEntry {
+        db: head.db.clone(),
+        rp: head.rp.clone(),
+        precision: head.precision.clone(),
+        enqueued_ms: head.enqueued_ms,
+        not_before_ms: now + forward_backoff_ms(attempts),
+        attempts,
+        body,
+    })
+}
+
+/// Wall-clock milliseconds, as the queue's timestamps are kept.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]

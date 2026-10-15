@@ -4,6 +4,7 @@ use common::sharding_cluster::*;
 use hyperbytedb::domain::query_result::QueryResponse;
 use hyperbytedb::domain::series::series_id;
 use hyperbytedb::domain::sharding::{MeasurementKey, ShardEpoch, ShardMapOp, ShardRegion};
+use hyperbytedb::ports::forward_queue::ForwardQueuePort;
 use hyperbytedb::ports::sharding::ShardMapPort;
 use serial_test::serial;
 use std::collections::BTreeMap;
@@ -2566,11 +2567,12 @@ async fn a_departing_node_waits_for_its_forward_queue_before_retiring() {
     for _ in 0..200 {
         let owed: Vec<u64> = queue
             .claim(u64::MAX, 100, u64::MAX)
+            .await
             .unwrap()
             .into_iter()
             .map(|(s, _)| s)
             .collect();
-        queue.complete(&owed).unwrap();
+        queue.complete(owed, None).await.unwrap();
         if queue.is_empty() {
             break;
         }
