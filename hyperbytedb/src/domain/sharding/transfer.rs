@@ -15,6 +15,12 @@ pub enum TransferPhase {
     Ack,
 }
 
+/// Header of a raw transfer push (`/internal/shard/transfer/raw`): the
+/// [`ShardTransferPayload`] without its body, as base64 of its JSON. The
+/// body is the line protocol itself; in a JSON payload every byte of it was
+/// a number in an array, 3-4x the bytes to write, send and parse.
+pub const TRANSFER_PAYLOAD_HEADER: &str = "x-hyperbytedb-transfer";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShardTransferPayload {

@@ -374,6 +374,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
                     .layer(DefaultBodyLimit::max(replicate_body_limit)),
             )
             .route(
+                "/internal/shard/transfer/raw",
+                post(shard_handlers::handle_shard_transfer_raw)
+                    .layer(DefaultBodyLimit::max(replicate_body_limit)),
+            )
+            .route(
                 "/internal/shard/rehome",
                 post(shard_handlers::handle_shard_rehome),
             )

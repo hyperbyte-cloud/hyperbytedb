@@ -18,6 +18,7 @@ use crate::application::shard_transfer::apply_transfer;
 use crate::application::sharded_mv_backfill::apply_mv_backfill_sql;
 use crate::application::wal_append::append_points_with_prepared;
 use crate::domain::point::Point;
+use crate::domain::sharding::transfer::TRANSFER_PAYLOAD_HEADER;
 use crate::domain::sharding::types::REHOME_PROGRESS_HEADER;
 use crate::domain::sharding::{
     MeasurementKey, RegionHeartbeat, ShardBootstrapRequest, ShardDeleteRequest, ShardEpoch,
@@ -1087,7 +1088,43 @@ pub async fn handle_shard_heartbeat(
 pub async fn handle_shard_transfer(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ShardTransferPayload>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    apply_shard_transfer(state, req).await
+}
+
+/// POST /internal/shard/transfer/raw — a transfer push whose body is the raw
+/// line protocol, with the rest of the payload in
+/// [`TRANSFER_PAYLOAD_HEADER`]. Older nodes do not have this route; their
+/// 404 sends the pusher back to the JSON one.
+pub async fn handle_shard_transfer_raw(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> axum::response::Response {
+    use base64::Engine as _;
+    let payload = headers
+        .get(TRANSFER_PAYLOAD_HEADER)
+        .and_then(|v| {
+            base64::engine::general_purpose::STANDARD
+                .decode(v.as_bytes())
+                .ok()
+        })
+        .and_then(|json| serde_json::from_slice::<ShardTransferPayload>(&json).ok());
+    let Some(mut req) = payload else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "missing or invalid transfer header"})),
+        )
+            .into_response();
+    };
+    req.body = Some(body.to_vec());
+    apply_shard_transfer(state, req).await
+}
+
+async fn apply_shard_transfer(
+    state: Arc<AppState>,
+    req: ShardTransferPayload,
+) -> axum::response::Response {
     if req.stage {
         // Pre-commit staging (split optimization, and replica placement onto a
         // joiner): the range is not owned by the destination in the committed

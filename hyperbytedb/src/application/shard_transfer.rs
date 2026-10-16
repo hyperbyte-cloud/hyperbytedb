@@ -290,20 +290,20 @@ fn encode_wal_chunk(points: &[Point]) -> Result<Vec<u8>, HyperbytedbError> {
 /// Returns `(encoded_body, exported_count, last_series_id_in_batch)`; an empty
 /// body means export is complete.
 #[allow(clippy::too_many_arguments)]
-/// Where a region export resumes: strictly after this row in the fact table's
-/// order, `(series_id, time, ingest_seq)`.
+/// Where a region export resumes: strictly after this `(series_id, time)`,
+/// the fact table's sort key.
 ///
 /// The export paged on `series_id` alone, re-reading the boundary series
 /// from its start. A series with more rows than one chunk then never
 /// advanced, and its remaining rows were skipped with a warning: any series
 /// older than about 6 days at 10 s resolution lost rows on every move.
-/// `ingest_seq` keeps two versions of one point split across chunks from
-/// losing the second.
+/// Every version of one point (same series and time, another `ingest_seq`)
+/// lands in the same chunk (`LIMIT ... WITH TIES`), so resuming after the
+/// time cannot lose one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExportCursor {
     pub series_id: u64,
     pub time_nanos: i64,
-    pub ingest_seq: u64,
 }
 
 /// One chunk of a region export: the line-protocol body, the points in it,
@@ -389,11 +389,14 @@ pub async fn export_region_points_from_chdb(
         predicates.push(format!("`series_id` < {}", region.end));
     }
     let range = predicates.join(" AND ");
+    // Spelled out rather than as a tuple comparison, which the primary key
+    // index does not narrow: 0.10 s against 0.62 s a chunk on n3.
     let fact_range = match after {
         Some(c) => format!(
-            "{range} AND (`series_id`, `time`, `ingest_seq`) > \
-             ({}, fromUnixTimestamp64Nano({}, 'UTC'), {})",
-            c.series_id, c.time_nanos, c.ingest_seq
+            "{range} AND (`series_id` > {sid} OR (`series_id` = {sid} \
+             AND `time` > fromUnixTimestamp64Nano({t}, 'UTC')))",
+            sid = c.series_id,
+            t = c.time_nanos
         ),
         None => range.clone(),
     };
@@ -403,9 +406,14 @@ pub async fn export_region_points_from_chdb(
     // joined. Joining first sorted every remaining row of the region and
     // hashed every series on the node for each chunk: on n3 0.24 s a chunk
     // against 0.06 s, for the same 50,000 rows.
+    //
+    // The cut orders by the sort key alone so ClickHouse reads in index
+    // order and stops after one chunk. Adding `ingest_seq` made it sort
+    // every remaining row of the region for each chunk: 3.7 s a chunk on a
+    // 280M-row region on n3 (0.13 s now), and copies ran at 0.3-0.5 MB/s.
     let sql = format!(
         "SELECT {} FROM (SELECT {} FROM {fact} WHERE {fact_range} \
-         ORDER BY `series_id`, `time`, `ingest_seq` LIMIT {max_points}) AS f \
+         ORDER BY `series_id`, `time` LIMIT {max_points} WITH TIES) AS f \
          ANY LEFT JOIN (SELECT {} FROM {series} WHERE {range}) AS s \
          ON f.`series_id` = s.`series_id` \
          ORDER BY f.`series_id`, f.`time`, f.`ingest_seq` \
@@ -468,10 +476,6 @@ pub async fn export_region_points_from_chdb(
         next = Some(ExportCursor {
             series_id: fact_sid,
             time_nanos: timestamp,
-            ingest_seq: obj
-                .get("ingest_seq")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or_default(),
         });
 
         let mut tags = BTreeMap::new();
@@ -649,15 +653,7 @@ pub async fn push_region_transfer(
             done,
         )
     };
-    let url = format!("http://{addr}/internal/shard/transfer");
-    let resp = peer_client
-        .http_client()
-        .post(&url)
-        .json(&payload)
-        .timeout(Duration::from_secs(TRANSFER_PUSH_TIMEOUT_SECS))
-        .send()
-        .await
-        .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
+    let resp = send_transfer_push(peer_client.http_client(), &addr, payload).await?;
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
         return Err(HyperbytedbError::TransferRejected {
@@ -669,6 +665,49 @@ pub async fn push_region_transfer(
     counter!("hyperbytedb_shard_transfer_bytes").increment(wire_bytes);
     counter!("hyperbytedb_shard_transfers_total").increment(1);
     Ok((applied, wire_bytes))
+}
+
+/// Send one push: the line protocol as the raw body, the rest of the payload
+/// in a header. A node without the raw route (an older build) answers 404,
+/// and gets the JSON push instead.
+async fn send_transfer_push(
+    client: &reqwest::Client,
+    addr: &str,
+    mut payload: ShardTransferPayload,
+) -> Result<reqwest::Response, HyperbytedbError> {
+    use base64::Engine as _;
+    let unreachable = |e: reqwest::Error| HyperbytedbError::PeerUnreachable(e.to_string());
+    let timeout = Duration::from_secs(TRANSFER_PUSH_TIMEOUT_SECS);
+    // Bytes: the fallback below resends it without a copy.
+    let body = bytes::Bytes::from(payload.body.take().unwrap_or_default());
+    let header = serde_json::to_vec(&payload)
+        .map(|json| base64::engine::general_purpose::STANDARD.encode(json))
+        .map_err(|e| HyperbytedbError::Internal(format!("transfer header: {e}").into()))?;
+    let resp = client
+        .post(format!("http://{addr}/internal/shard/transfer/raw"))
+        .header(
+            crate::domain::sharding::transfer::TRANSFER_PAYLOAD_HEADER,
+            header,
+        )
+        .header(reqwest::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(body.clone())
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(unreachable)?;
+    if resp.status() != reqwest::StatusCode::NOT_FOUND {
+        return Ok(resp);
+    }
+    // An older node, or a region the receiver does not know: the JSON route
+    // answers the second the same way.
+    payload.body = Some(body.to_vec());
+    client
+        .post(format!("http://{addr}/internal/shard/transfer"))
+        .json(&payload)
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(unreachable)
 }
 
 pub async fn ack_region_transfer(
@@ -1243,6 +1282,18 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(chdb)]
     async fn a_copy_sends_long_series_whole_and_shrinks_chunks_on_413() {
+        long_series_copy(true).await;
+    }
+
+    /// A receiver on an older build has only the JSON route: its 404 on the
+    /// raw one sends the same chunk as JSON.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn a_copy_to_an_older_node_falls_back_to_json() {
+        long_series_copy(false).await;
+    }
+
+    async fn long_series_copy(raw_route: bool) {
         use crate::adapters::chdb::native_adapter::ChdbNativeAdapter;
         use crate::adapters::chdb::query_adapter::ChdbQueryAdapter;
         use crate::adapters::chdb::session::SharedSession;
@@ -1258,20 +1309,37 @@ mod tests {
         use crate::domain::point::{FieldValue, Point};
         use crate::ports::points_sink::PointsSinkPort;
 
-        const LIMIT: usize = 15_000;
+        // A raw chunk is a third of its JSON form: a lower limit still
+        // makes the receiver refuse the first, larger chunks.
+        let limit: usize = if raw_route { 5_000 } else { 15_000 };
         let received: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
         let refused = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let (seen, nope) = (received.clone(), refused.clone());
-        let app = axum::Router::new().route(
+        let raw_pushes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // Applies one push's line protocol: refuses it over LIMIT bytes (on
+        // the wire), else records its lines.
+        let apply = {
+            let (seen, nope) = (received.clone(), refused.clone());
+            move |wire_len: usize, raw: Vec<u8>| {
+                if wire_len > limit {
+                    nope.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return (axum::http::StatusCode::PAYLOAD_TOO_LARGE, "too big").into_response();
+                }
+                let lines: Vec<String> = String::from_utf8_lossy(&raw)
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .map(str::to_string)
+                    .collect();
+                let n = lines.len();
+                seen.lock().unwrap().extend(lines);
+                axum::Json(serde_json::json!({ "applied": n })).into_response()
+            }
+        };
+        let json_apply = apply.clone();
+        let mut app = axum::Router::new().route(
             "/internal/shard/transfer",
             axum::routing::post(move |body: axum::body::Bytes| {
-                let (seen, nope) = (seen.clone(), nope.clone());
+                let apply = json_apply.clone();
                 async move {
-                    if body.len() > LIMIT {
-                        nope.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        return (axum::http::StatusCode::PAYLOAD_TOO_LARGE, "too big")
-                            .into_response();
-                    }
                     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
                     let raw: Vec<u8> = payload["body"]
                         .as_array()
@@ -1282,17 +1350,35 @@ mod tests {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    let lines: Vec<String> = String::from_utf8_lossy(&raw)
-                        .lines()
-                        .filter(|l| !l.trim().is_empty())
-                        .map(str::to_string)
-                        .collect();
-                    let n = lines.len();
-                    seen.lock().unwrap().extend(lines);
-                    axum::Json(serde_json::json!({ "applied": n })).into_response()
+                    apply(body.len(), raw)
                 }
             }),
         );
+        if raw_route {
+            let raw_seen = raw_pushes.clone();
+            app = app.route(
+                "/internal/shard/transfer/raw",
+                axum::routing::post(
+                    move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                        let (apply, raw_seen) = (apply.clone(), raw_seen.clone());
+                        async move {
+                            use base64::Engine as _;
+                            let header = headers
+                                .get(crate::domain::sharding::transfer::TRANSFER_PAYLOAD_HEADER)
+                                .unwrap();
+                            let json = base64::engine::general_purpose::STANDARD
+                                .decode(header.as_bytes())
+                                .unwrap();
+                            let payload: ShardTransferPayload =
+                                serde_json::from_slice(&json).unwrap();
+                            assert!(payload.body.is_none(), "the body is not in the header");
+                            raw_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            apply(body.len(), body.to_vec())
+                        }
+                    },
+                ),
+            );
+        }
         use axum::response::IntoResponse;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -1403,6 +1489,88 @@ mod tests {
             1,
             "the second version"
         );
+        assert_eq!(
+            raw_pushes.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            raw_route,
+            "pushes go raw where the route exists"
+        );
+    }
+
+    /// Two versions of one point at a chunk boundary both go: a chunk ends
+    /// only after every version of its last (series, time).
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn a_chunk_never_splits_the_versions_of_a_point() {
+        use crate::adapters::chdb::native_adapter::ChdbNativeAdapter;
+        use crate::adapters::chdb::query_adapter::ChdbQueryAdapter;
+        use crate::adapters::chdb::session::SharedSession;
+        use crate::application::ingest_metadata::{
+            IngestCardinalityLimits, prepare_batch_metadata,
+        };
+        use crate::domain::point::{FieldValue, Point};
+        use crate::ports::points_sink::PointsSinkPort;
+
+        let dir = tempfile::tempdir().unwrap();
+        let chdb = SharedSession::new_eager(dir.path().join("chdb").to_str().unwrap(), 1).unwrap();
+        let query = ChdbQueryAdapter::from_shared(chdb.clone(), 0);
+        let sink = ChdbNativeAdapter::new(chdb);
+        let metadata: Arc<dyn MetadataPort> =
+            Arc::new(RocksDbMetadata::open(dir.path().join("meta")).unwrap());
+        let point = |secs: i64, v: f64| Point {
+            measurement: "cpu".into(),
+            tags: host_tag("h0"),
+            fields: [("v".to_string(), FieldValue::Float(v))].into(),
+            timestamp: secs * 1_000_000_000,
+            series_id_cache: Default::default(),
+        };
+        let first = vec![point(1, 1.0), point(2, 1.0), point(3, 1.0)];
+        let second = vec![point(2, 2.0)];
+        let all: Vec<Point> = first.iter().chain(&second).cloned().collect();
+        prepare_batch_metadata(
+            &metadata,
+            "db",
+            "autogen",
+            &all,
+            &IngestCardinalityLimits::unlimited(),
+            None,
+        )
+        .await
+        .unwrap();
+        sink.write_points("db", "autogen", "cpu", &[0; 3], 1, &first)
+            .await
+            .unwrap();
+        sink.write_points("db", "autogen", "cpu", &[0], 10, &second)
+            .await
+            .unwrap();
+
+        let region = ShardRegion {
+            region_id: 1,
+            start: 0,
+            end: u64::MAX,
+            epoch: Default::default(),
+            peers: vec![1],
+            primary: 1,
+            last_split_at: 0,
+            transfer_verified: None,
+            transfer_first_seen: None,
+            state: Default::default(),
+            staged_from: None,
+            staging_peers: Vec::new(),
+        };
+        let key = MeasurementKey::new("db", "autogen", "cpu");
+        let (mut after, mut rows) = (None, 0);
+        loop {
+            let chunk =
+                export_region_points_from_chdb(&query, metadata.as_ref(), &key, &region, after, 2)
+                    .await
+                    .unwrap();
+            if chunk.rows == 0 {
+                break;
+            }
+            rows += chunk.rows;
+            after = chunk.next;
+        }
+        assert_eq!(rows, 4, "both versions of the point at 2 s");
     }
 
     /// A copy sends each row once: flushed rows from chDB, the rest from the
