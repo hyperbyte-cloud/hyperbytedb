@@ -905,9 +905,8 @@ async fn transfer_region_data(
     // `GROUP BY (series_id, time)` coalescing view, so a re-exported row
     // collapses against the replicated one before any aggregate sees it.
     if let Some(query) = query_port {
-        let mut after: Option<ExportCursor> = None;
-        loop {
-            let chunk = export_region_points_from_chdb(
+        let export = |after: Option<ExportCursor>, max_points: usize| {
+            export_region_points_from_chdb(
                 query.as_ref(),
                 metadata.as_ref(),
                 key,
@@ -915,7 +914,10 @@ async fn transfer_region_data(
                 after,
                 max_points,
             )
-            .await?;
+        };
+        let mut after: Option<ExportCursor> = None;
+        let mut chunk = export(after, max_points).await?;
+        loop {
             if chunk.rows == 0 {
                 break;
             }
@@ -925,10 +927,11 @@ async fn transfer_region_data(
                 if done {
                     break;
                 }
+                chunk = export(after, max_points).await?;
                 continue;
             }
-            let (body, count) = (chunk.body, chunk.points);
-            let pushed = push_region_transfer(
+            let (body, count, chunk_end) = (chunk.body, chunk.points, chunk.next);
+            let push = push_region_transfer(
                 peer_client.as_ref(),
                 source_node_id,
                 key,
@@ -939,13 +942,23 @@ async fn transfer_region_data(
                 seq,
                 done,
                 stage,
-            )
-            .await;
+            );
+            // Read the next chunk while this one is sent and applied: done in
+            // turn, the sender sat idle through every apply. A chunk the
+            // receiver refuses as too large discards the read-ahead.
+            let (pushed, read_ahead) = if done {
+                (push.await, None)
+            } else {
+                let (pushed, next) = tokio::join!(push, export(chunk_end, max_points));
+                (pushed, Some(next))
+            };
             if smaller_chunks_after(&pushed, &mut max_points) {
-                continue; // `after` unchanged: the same rows, smaller chunks
+                // `after` unchanged: the same rows, smaller chunks.
+                chunk = export(after, max_points).await?;
+                continue;
             }
             let (chunk_applied, chunk_bytes) = pushed?;
-            after = chunk.next;
+            after = chunk_end;
             exported += count as u64;
             applied += chunk_applied;
             bytes += chunk_bytes;
@@ -954,8 +967,9 @@ async fn transfer_region_data(
             if !wait.is_zero() {
                 tokio::time::sleep(wait).await;
             }
-            if done {
-                break;
+            match read_ahead {
+                Some(next) => chunk = next?,
+                None => break,
             }
         }
     }
