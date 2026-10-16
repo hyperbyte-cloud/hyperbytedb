@@ -90,7 +90,7 @@ wait_ready() {
 
 # Every region of every space: id, primary, peers. Changes on any split,
 # merge or move.
-# "<regions> <hash> <ok>". ok=1 once no learner is staging and exactly $1
+# "<regions> <hash> staging=<n> nodes=<n> <ok>". ok=1 once no learner is staging and exactly $1
 # nodes hold region copies: before moves start the layout is just as stable,
 # and calling that settled timed a 3 -> 6 scale-up at 46 s. An empty map (a
 # fresh cluster) is settled.
@@ -105,7 +105,8 @@ regs=[r for sp in d.get('spaces',[]) for r in sp['regions']]
 rs=sorted((r['region_id'],r['primary'],tuple(sorted(r['peers'])),tuple(sorted(r.get('staging_peers',[])))) for r in regs)
 nodes={p for r in regs for p in r['peers']}
 ok=int(not regs or (not any(r.get('staging_peers') for r in regs) and len(nodes)==want))
-print(len(rs), hash(tuple(rs)), ok)" "$1" 2>/dev/null || echo unavailable
+staging=sum(len(r.get('staging_peers',[])) for r in regs)
+print(len(rs), hash(tuple(rs)), f'staging={staging} nodes={len(nodes)}', ok)" "$1" 2>/dev/null || echo unavailable
 }
 # Seconds from $1 (SECONDS at the change) until the layout last changed, once
 # it is complete for $2 nodes and has then held for SETTLE_SECS.
@@ -113,6 +114,7 @@ wait_settled() {
   local since=$1 nodes=$2 last="" changed=$SECONDS deadline=$(( SECONDS + 3600 ))
   while (( SECONDS < deadline )); do
     local now; now=$(layout "$nodes")
+    echo "$(date -u +%H:%M:%S) $now" >>"$OUT_DIR/layout-$nodes.log"
     if [[ "$now" != "$last" ]]; then last=$now; changed=$SECONDS; fi
     if (( SECONDS - changed >= SETTLE_SECS )) && [[ "$now" == *" 1" ]]; then
       echo $(( changed - since )); return 0
@@ -153,20 +155,36 @@ except Exception: print('')" 2>/dev/null || true)
     if [[ -n "$n" && "$n" == "$last" ]]; then same=$(( same + 1 )); (( same >= 3 )) && break; else same=0; fi
     last=$n; sleep 30
   done
-  echo "${n:-0}"
+  # No answer (a timeout or an error) is not zero points.
+  echo "${n:-unreadable}"
+}
+
+# A statement on the first node (SET is replicated to every node).
+sql() {
+  k exec "${CR_NAME}-0" -c hyperbytedb -- curl -sS -m 30 -XPOST http://127.0.0.1:8086/query \
+    --data-urlencode "q=$1" >/dev/null 2>&1 || true
 }
 declare -A EXPECT=()
 # Read back every database written so far; record lost points per database.
 readback_all() {
-  local step=$1 lost=0
+  local step=$1 lost=0 unreadable=0
+  # A count over a few hundred million points takes longer than the default
+  # 30 s query timeout; a timed-out count read as zero points lost.
+  sql "SET query_timeout_secs = 900"
   for db in "${!EXPECT[@]}"; do
     local got; got=$(readback "$db" "${EXPECT[$db]}")
-    local miss=$(( ${EXPECT[$db]} - ${got:-0} ))
     record "$step" "readback.$db" "$got/${EXPECT[$db]}"
-    (( miss > 0 )) && lost=$(( lost + miss ))
+    if [[ "$got" =~ ^[0-9]+$ ]]; then
+      local miss=$(( ${EXPECT[$db]} - got ))
+      (( miss > 0 )) && lost=$(( lost + miss ))
+    else
+      unreadable=$(( unreadable + 1 ))
+    fi
   done
+  sql "SET query_timeout_secs = DEFAULT"
   record "$step" "lost_points" "$lost"
-  log "$step: read-back of ${#EXPECT[@]} databases, lost points: $lost"
+  record "$step" "unreadable_databases" "$unreadable"
+  log "$step: read-back of ${#EXPECT[@]} databases, lost points: $lost, unreadable: $unreadable"
 }
 
 # Every log line of a Job's pods.
