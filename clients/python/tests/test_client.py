@@ -142,6 +142,13 @@ def test_query_results_and_errors(fake):
         client(url).query("SELEC", "db")
 
 
+def test_health_answers_503_without_retrying(fake):
+    f, url = fake
+    f.script = [(503, {"Content-Type": "application/json"}, b'{"status":"draining"}')]
+    assert client(url, backoff=5).health() == {"status": "draining"}
+    assert len(f.requests) == 1, "a 503 health answer is not retried"
+
+
 def test_unreachable_server_raises_after_retries():
     from hyperbytedb import HyperbyteDBError
 

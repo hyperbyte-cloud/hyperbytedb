@@ -33,8 +33,7 @@ main() {
   fi
 
   curl -sf -X POST "$(api_url 0)/query" --data-urlencode "q=CREATE DATABASE ${DB}" >/dev/null 2>&1 || true
-  baseline_remove=$(metric_max_across_pods 'hyperbytedb_shard_remove_peer_proposals_total' "$FULL_REPLICAS" 2>/dev/null || echo 0)
-  case "$baseline_remove" in ''|*[!0-9]*) baseline_remove=0 ;; esac
+  baseline_remove=$(metric_max_across_pods 'hyperbytedb_shard_remove_peer_proposals_total' "$FULL_REPLICAS" 2>/dev/null || echo ERR)
 
   i=0
   while [ "$i" -lt "$FULL_REPLICAS" ]; do
@@ -51,14 +50,22 @@ main() {
     i=$((i + 1))
   done
 
-  after_remove=$(metric_max_across_pods 'hyperbytedb_shard_remove_peer_proposals_total' "$FULL_REPLICAS" 2>/dev/null || echo 0)
-  case "$after_remove" in ''|*[!0-9]*) after_remove=0 ;; esac
-  delta=$((after_remove - baseline_remove))
-  if [ "$delta" -le 2 ]; then
-    pass R7 "RemovePeer proposals delta=${delta} (no mass eviction)"
-  else
-    fail R7 "RemovePeer proposals increased by ${delta} during rolling restart"
-  fi
+  after_remove=$(metric_max_across_pods 'hyperbytedb_shard_remove_peer_proposals_total' "$FULL_REPLICAS" 2>/dev/null || echo ERR)
+  # An unreadable counter proves nothing: it fails the check rather than
+  # reading as 0, which would pass after a mass eviction.
+  case "${baseline_remove}${after_remove}" in
+    ''|*[!0-9]*)
+      fail R7 "RemovePeer proposals unreadable (before=${baseline_remove:-none} after=${after_remove:-none})"
+      ;;
+    *)
+      delta=$((after_remove - baseline_remove))
+      if [ "$delta" -le 2 ]; then
+        pass R7 "RemovePeer proposals delta=${delta} (no mass eviction)"
+      else
+        fail R7 "RemovePeer proposals increased by ${delta} during rolling restart"
+      fi
+      ;;
+  esac
 
   write_report
   if [ "$FAILURES" -gt 0 ]; then

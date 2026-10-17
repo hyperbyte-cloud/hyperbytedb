@@ -59,6 +59,9 @@ def _field_value(v: FieldValue) -> Optional[str]:
             return None
         return repr(v)
     if isinstance(v, str):
+        if "\n" in v:
+            # A newline ends the line even inside quotes; there is no escape.
+            raise ValueError(f"newline in line protocol string field: {v!r}")
         return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
     raise TypeError(f"unsupported field value type: {type(v).__name__}")
 

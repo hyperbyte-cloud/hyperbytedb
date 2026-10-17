@@ -42,6 +42,8 @@ def test_datetime_times_follow_the_precision():
 def test_newlines_are_refused():
     with pytest.raises(ValueError):
         encode_point(Point("m", {"v": 1.0}, {"host": "a\nb"}))
+    with pytest.raises(ValueError):
+        encode_point(Point("m", {"msg": "two\nlines"}))
 
 
 def test_bad_precision_is_refused():

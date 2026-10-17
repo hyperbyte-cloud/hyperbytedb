@@ -56,10 +56,15 @@ For what to expect when running it (timings, failure modes, metrics), see
   the same nodes and merged, so measurements pre-split before this collapse
   back. A merge of two regions at different epochs is only proposed once
   every node runs a build that applies it.
-- **Region copies keep every row.** Copies page on `(series_id, time,
-  ingest_seq)`; a series longer than one chunk (50,000 rows) had the rest of
-  its rows skipped on every move. A chunk too big for the receiver (413) is
-  halved instead of retried forever.
+- **Region copies keep every row, and run 20-30x faster.** Copies page on
+  `(series_id, time)` in the table's index order, with every version of a
+  point in one chunk; a series longer than one chunk (50,000 rows) had the
+  rest of its rows skipped on every move. A chunk too big for the receiver
+  (413) is halved instead of retried forever. Chunks were sorted from the
+  whole remaining region, went as JSON with one number per byte, and were
+  read only after the previous one was applied: on n3 a copy ran at
+  0.3-0.5 MB/s on 2.4 cores, and now runs at about 10 MB/s per copy
+  (20 MB/s from one sending node) at 0.14 cores per MB/s.
 - **Smaller WAL, faster ingest.** The sharded WAL keeps at most 1 GiB behind
   the flush (it used to keep 500k entries, 18-72 GB on n3); ingest caches and
   series ids are computed once per batch. WAL files stay compressed: storing
@@ -98,9 +103,17 @@ For what to expect when running it (timings, failure modes, metrics), see
 - **Disk space is not reclaimed after a scale-up:** a node keeps its copy of
   a region it handed over (never read). After 3 -> 6 the cluster stored 1.65x
   the rows replication needs.
-- **Region copies are slow:** about 2.2 MB/s per copy, so a scale-up of a
-  few hundred million points takes 45 minutes or more to settle, and write
-  throughput is lower until it does.
+- **Regions split by series count only.** A measurement with few series and
+  many points (50,000 series, 280M points on n3) stays one region, and that
+  region moves as one copy: about half an hour at 10 MB/s.
+- **Replicas of a region can disagree after a scale-down under writes.** In
+  one 8 -> 3 run on n3, a database created as the scale-down began ended with
+  two of three replicas (the primary among them) short of 3.9M of 282M
+  acknowledged points; the third replica had them all, so nothing was lost,
+  but queries read the short primary. Being investigated; avoid creating
+  measurements while nodes are being removed.
+- **Queries are cut off at `server.request_timeout_secs` (30 s)** whatever
+  `query_timeout_secs` is set to: raise both for long queries.
 - **Query cost grows with regions per node:** a 10-host `GROUP BY host` took
   about 120 ms on a 6-region measurement and 1.5 s on a 48-region one.
 - A departing node can stay Raft leader until its pod is deleted.

@@ -118,9 +118,11 @@ class HyperbyteDBClient:
         params: Optional[Mapping[str, str]] = None,
         body: Optional[bytes] = None,
         headers: Optional[Mapping[str, str]] = None,
+        answers: "frozenset[int]" = frozenset(),
     ) -> "tuple[int, Mapping[str, str], bytes]":
         """One request with retries. Returns (status, headers, body) for any
-        status the caller should handle; raises after the last retry."""
+        status the caller should handle; raises after the last retry.
+        Statuses in ``answers`` are returned at once, not retried."""
         url = self.url + path
         if params:
             url += "?" + urllib.parse.urlencode(params)
@@ -137,7 +139,7 @@ class HyperbyteDBClient:
                     return resp.status, resp.headers, _read(resp)
             except urllib.error.HTTPError as e:
                 payload = _read(e)
-                if e.code not in RETRYABLE or attempt >= self.retries:
+                if e.code not in RETRYABLE or e.code in answers or attempt >= self.retries:
                     return e.code, e.headers, payload
                 retry_after = _retry_after(e.headers)
             except (urllib.error.URLError, OSError) as e:
@@ -161,7 +163,8 @@ class HyperbyteDBClient:
 
     def health(self) -> Dict[str, Any]:
         """``/health``: the node's state, as JSON."""
-        status, _, payload = self._request("GET", "/health")
+        # 503 is the node's answer (draining, syncing), not a failure to retry.
+        status, _, payload = self._request("GET", "/health", answers=frozenset({503}))
         if status >= 300 and status != 503:
             raise ServerError(status, _error_text(payload))
         return json.loads(payload or b"{}")
