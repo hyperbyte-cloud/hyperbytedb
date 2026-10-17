@@ -9,10 +9,12 @@ use axum::response::IntoResponse;
 use metrics::{counter, gauge};
 
 use crate::application::replication_apply::ReplicationApplyError;
-use crate::domain::cluster::membership::{NodeInfo, NodeState};
+use crate::domain::cluster::membership::{ClusterMembership, NodeInfo, NodeState};
 use crate::domain::cluster::replication_wire::{
-    HTTP_HEADER_DATABASE, HTTP_HEADER_ORIGIN_NODE, HTTP_HEADER_PRECISION,
+    HTTP_HEADER_DATABASE, HTTP_HEADER_ORIGIN_NODE, HTTP_HEADER_PRECISION, HTTP_HEADER_REGION,
     HTTP_HEADER_RETENTION_POLICY, HTTP_HEADER_SYNC, LINE_PROTOCOL_MEDIA_TYPE_V1,
+    REPLICATE_BATCH_MEDIA_TYPE_V1, ReplicateBatchPart, ReplicateBatchRequest,
+    ReplicateBatchResponse, ReplicatePartOutcome,
 };
 use crate::domain::cluster::sync::{
     JoinRequest, JoinResponse, LeaveRequest, LeaveResponse, MetadataEntry, MetadataSnapshot,
@@ -20,6 +22,7 @@ use crate::domain::cluster::sync::{
 };
 use crate::domain::cluster::types::{MutationReplicateRequest, MutationRequest};
 use crate::ports::metadata::MetadataPort;
+use crate::ports::sharding::ShardMapPort as _;
 
 use super::router::AppState;
 
@@ -67,6 +70,44 @@ pub async fn handle_replicate_write(
         return (
             status,
             Json(serde_json::json!({"error": "invalid origin node id"})),
+        );
+    }
+
+    // B.4 — region check, deliberately narrow.
+    //
+    // Absent header means "no region scoping available": unsharded writes, and
+    // replayed hinted-handoff records, whose on-disk format predates the
+    // region being carried. Those apply as before. Rejecting them would turn
+    // a permanent 4xx into permanent unavailability, because the hint drain
+    // re-enqueues on ANY non-success and retries the same head-of-queue record
+    // forever, wedging every hint behind it.
+    //
+    // Epoch is NOT checked here. The sender is authoritative about which
+    // region a row belongs to; the receiver's shard map merely lags, and every
+    // AddPeer/Split/PromotePeer moves the epoch. Rejecting on skew would drop
+    // legitimate writes during exactly the window convergence is busiest —
+    // and those writes then burn the retry budget into the hint queue. Only a
+    // sender that is not a member of the region at all is refused.
+    if let Some(region_id) = headers
+        .get(HTTP_HEADER_REGION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        && let Some(ctx) = state.shard_routing.as_ref()
+        && let Ok(map) = ctx.shard_map.snapshot().await
+        && let Some(region) = crate::application::shard_routing::region_by_id(&map, region_id)
+        && !region.peers.contains(&state.node_id)
+    {
+        counter!(
+            "hyperbytedb_replicate_rejected_total",
+            "reason" => "not_a_region_peer"
+        )
+        .increment(1);
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "not a peer of this region",
+                "region_id": region_id,
+            })),
         );
     }
 
@@ -186,6 +227,157 @@ pub async fn handle_replicate_write(
                 Json(serde_json::json!({"error": "apply worker dropped before completing"})),
             )
         }
+    }
+}
+
+/// Apply-queue groups for one [`ReplicateBatchRequest`]: parts that share a
+/// database, retention policy, precision and encoding are applied as one job,
+/// so a batch of many small region parts costs one WAL append per group
+/// rather than one per part.
+struct ReplicateApplyGroup {
+    database: String,
+    retention_policy: String,
+    precision: Option<String>,
+    parts: Vec<usize>,
+    body: Vec<u8>,
+}
+
+/// Sort the parts of a replicate batch into apply groups. `is_peer(region)`
+/// says whether this node may accept a part for `region`; a part that fails
+/// it is answered `NotARegionPeer` and joins no group.
+fn group_replicate_parts(
+    parts: Vec<ReplicateBatchPart>,
+    is_peer: impl Fn(u64) -> bool,
+) -> (Vec<ReplicatePartOutcome>, Vec<ReplicateApplyGroup>) {
+    let mut outcomes = vec![ReplicatePartOutcome::Accepted; parts.len()];
+    let mut groups: Vec<ReplicateApplyGroup> = Vec::new();
+    for (i, part) in parts.into_iter().enumerate() {
+        if part.database.is_empty() || part.retention_policy.is_empty() {
+            outcomes[i] =
+                ReplicatePartOutcome::Failed("missing database or retention policy".into());
+            continue;
+        }
+        if let Some(region) = part.region_id
+            && !is_peer(region)
+        {
+            outcomes[i] = ReplicatePartOutcome::NotARegionPeer;
+            continue;
+        }
+        let binary = crate::application::line_protocol::is_binary_points(&part.body);
+        let group = groups.iter_mut().find(|g| {
+            g.database == part.database
+                && g.retention_policy == part.retention_policy
+                && g.precision == part.precision
+                && crate::application::line_protocol::is_binary_points(&g.body) == binary
+        });
+        match group {
+            Some(g) => {
+                // Frames skip whitespace between them, so one separator
+                // serves both encodings.
+                g.body.push(b'\n');
+                g.body.extend_from_slice(&part.body);
+                g.parts.push(i);
+            }
+            None => groups.push(ReplicateApplyGroup {
+                database: part.database,
+                retention_policy: part.retention_policy,
+                precision: part.precision,
+                parts: vec![i],
+                body: part.body,
+            }),
+        }
+    }
+    (outcomes, groups)
+}
+
+/// Receives every replication part a peer had queued for this node, in one
+/// request. Same contract as [`handle_replicate_write`] per part (async: a
+/// part is acknowledged once queued for apply), with one outcome per part.
+pub async fn handle_replicate_batch(
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> impl IntoResponse {
+    let req: ReplicateBatchRequest = match bincode::deserialize(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("bad replicate batch: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    if let Err(status) = validate_origin_node_id(&state, req.origin_node).await {
+        return (
+            status,
+            Json(serde_json::json!({"error": "invalid origin node id"})),
+        )
+            .into_response();
+    }
+    let Some(queue) = state.replication_apply.as_ref() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "replication apply queue not configured"})),
+        )
+            .into_response();
+    };
+
+    // Same narrow region check as the single-part path: refuse only a part
+    // for a region this node is known not to hold.
+    let map = match state.shard_routing.as_ref() {
+        Some(ctx) => ctx.shard_map.snapshot().await.ok(),
+        None => None,
+    };
+    let node_id = state.node_id;
+    let (mut outcomes, groups) = group_replicate_parts(req.parts, |region_id| {
+        map.as_ref()
+            .and_then(|m| crate::application::shard_routing::region_by_id(m, region_id))
+            .is_none_or(|r| r.peers.contains(&node_id))
+    });
+    let refused = outcomes
+        .iter()
+        .filter(|o| **o == ReplicatePartOutcome::NotARegionPeer)
+        .count();
+    if refused > 0 {
+        counter!(
+            "hyperbytedb_replicate_rejected_total",
+            "reason" => "not_a_region_peer"
+        )
+        .increment(refused as u64);
+    }
+
+    for g in groups {
+        let outcome = match queue.try_enqueue(
+            g.database,
+            g.retention_policy,
+            g.precision,
+            Bytes::from(g.body),
+            req.origin_node,
+        ) {
+            Ok(_) => continue,
+            Err(ReplicationApplyError::QueueFull) => {
+                counter!("hyperbytedb_replication_apply_queue_full_total").increment(1);
+                ReplicatePartOutcome::QueueFull
+            }
+            Err(_) => ReplicatePartOutcome::Failed("replication apply worker unavailable".into()),
+        };
+        for i in g.parts {
+            outcomes[i] = outcome.clone();
+        }
+    }
+
+    match bincode::serialize(&ReplicateBatchResponse { results: outcomes }) {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [(CONTENT_TYPE, REPLICATE_BATCH_MEDIA_TYPE_V1)],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("encode response: {e}")})),
+        )
+            .into_response(),
     }
 }
 
@@ -336,6 +528,7 @@ pub async fn handle_join(
             joined_at: now,
             last_heartbeat: now,
             needs_sync: false,
+            consecutive_misses: 0,
         });
 
         gauge!("hyperbytedb_cluster_peers").set(m.active_peers(state.node_id).len() as f64);
@@ -358,6 +551,17 @@ pub async fn handle_join(
     }
 }
 
+/// Move `node_id` into `Draining` for a self-reported leave, refusing to
+/// downgrade a terminal lifecycle state.
+///
+/// Pulled out of [`handle_leave`] so the guard is directly unit-testable:
+/// `/internal/membership/leave` self-calls used to `set_state` unconditionally,
+/// which let this call clobber a `Decommissioning` node back into a
+/// placement-eligible state. Returns whether the transition happened.
+fn apply_self_leave(m: &mut ClusterMembership, node_id: u64) -> bool {
+    m.transition(node_id, NodeState::Draining)
+}
+
 /// Handle a leave request from a node.
 pub async fn handle_leave(
     State(state): State<Arc<AppState>>,
@@ -377,12 +581,19 @@ pub async fn handle_leave(
 
     if req.node_id == state.node_id {
         let mut m = membership.write().await;
-        m.set_state(req.node_id, NodeState::Draining);
-        gauge!("hyperbytedb_cluster_node_state").set(4.0); // Draining
-        tracing::info!(node_id = req.node_id, "local node entering drain mode");
+        if apply_self_leave(&mut m, req.node_id) {
+            gauge!("hyperbytedb_cluster_node_state").set(4.0); // Draining
+            tracing::info!(node_id = req.node_id, "local node entering drain mode");
+        } else {
+            tracing::info!(
+                node_id = req.node_id,
+                current = ?m.get_node(req.node_id).map(|n| n.state),
+                "self-leave ignored: node already in a terminal lifecycle state"
+            );
+        }
     } else {
         let mut m = membership.write().await;
-        m.set_state(req.node_id, NodeState::Leaving);
+        m.transition(req.node_id, NodeState::Leaving);
         m.remove_node(req.node_id);
         if let Some(ref rl) = state.replication_log {
             let _ = rl.remove_peer(req.node_id);
@@ -499,6 +710,32 @@ pub async fn handle_drain(State(state): State<Arc<AppState>>) -> impl IntoRespon
     )
 }
 
+/// Execute the full decommission procedure (mark decommissioning, hand off
+/// primaries, flush, wait for acks). Region evacuation and the eventual
+/// `Leaving` transition are the shard scheduler's job, not this request's.
+pub async fn handle_decommission(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let drain_service = match &state.drain_service {
+        Some(ds) => ds.clone(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "drain service not available"})),
+            );
+        }
+    };
+
+    tokio::spawn(async move {
+        if let Err(e) = drain_service.decommission().await {
+            tracing::error!(error = %e, "decommission procedure failed");
+        }
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({"ok": true, "message": "decommission initiated"})),
+    )
+}
+
 async fn apply_mutation(
     state: &Arc<crate::adapters::http::router::AppState>,
     req: MutationRequest,
@@ -510,6 +747,7 @@ async fn apply_mutation(
             points_sink: Some(&state.points_sink),
             wal: Some(&state.wal),
             shard_routing: state.shard_routing.as_ref(),
+            runtime_settings: Some(&state.runtime_settings),
         },
         req,
     )
@@ -596,6 +834,22 @@ async fn build_metadata_snapshot(
         }
     }
 
+    for name in crate::application::runtime_settings::SETTINGS
+        .iter()
+        .map(|d| d.name)
+    {
+        if let Some(value) = metadata.get_setting(name).await? {
+            entries.push(MetadataEntry {
+                key: format!("setting:{name}"),
+                value: serde_json::to_vec(&value).map_err(|e| {
+                    crate::error::HyperbytedbError::Metadata(
+                        crate::error::ChainedError::from_error(e),
+                    )
+                })?,
+            });
+        }
+    }
+
     Ok(MetadataSnapshot { entries })
 }
 
@@ -641,6 +895,8 @@ pub async fn handle_sync_trigger(State(state): State<Arc<AppState>>) -> impl Int
     let mv_service = state.mv_service.clone();
     let max_points_per_request = state.max_points_per_request;
     let shard_map = state.shard_map.clone();
+    let cluster_auth = state.cluster_auth.clone();
+    let runtime_settings = state.runtime_settings.clone();
 
     let membership_clone = membership.clone();
 
@@ -667,7 +923,9 @@ pub async fn handle_sync_trigger(State(state): State<Arc<AppState>>) -> impl Int
             Some(points_sink),
             max_points_per_request,
             fallback_peers,
+            &cluster_auth,
         );
+        sync_client = sync_client.with_runtime_settings(runtime_settings);
         if let Some(ref map) = shard_map {
             let sm: Arc<dyn crate::ports::sharding::ShardMapPort> = map.clone();
             sync_client = sync_client.with_shard_map(sm);
@@ -684,7 +942,7 @@ pub async fn handle_sync_trigger(State(state): State<Arc<AppState>>) -> impl Int
             tracing::info!("sync trigger: new node, running join_and_sync");
             {
                 let mut m = membership_clone.write().await;
-                m.set_state(node_id, NodeState::Syncing);
+                m.begin_sync_to_syncing(node_id);
             }
             gauge!("hyperbytedb_cluster_node_state").set(3.0);
             sync_client.join_and_sync().await
@@ -713,7 +971,8 @@ pub async fn handle_sync_trigger(State(state): State<Arc<AppState>>) -> impl Int
             // the leader from reaching us), but a failed sync must keep the
             // `needs_sync` flag set: peers parse it to avoid promoting this
             // node as caught-up, and the leader keeps triggering re-syncs.
-            m.set_state(node_id, NodeState::Active);
+            // Never clobber Decommissioning/Leaving — that would undo scale-down.
+            m.complete_sync_to_active(node_id);
             m.set_needs_sync(node_id, sync_failed);
         }
         gauge!("hyperbytedb_cluster_node_state").set(1.0);
@@ -727,4 +986,102 @@ pub async fn handle_sync_trigger(State(state): State<Arc<AppState>>) -> impl Int
             "message": "Background sync has been triggered"
         })),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_node(id: u64, state: NodeState) -> NodeInfo {
+        NodeInfo {
+            node_id: id,
+            addr: format!("127.0.0.1:{}", 8080 + id),
+            state,
+            joined_at: 0,
+            last_heartbeat: 0,
+            needs_sync: false,
+            consecutive_misses: 0,
+        }
+    }
+
+    #[test]
+    fn self_leave_transitions_active_to_draining() {
+        let mut m = ClusterMembership::new();
+        m.add_node(make_node(1, NodeState::Active));
+
+        assert!(apply_self_leave(&mut m, 1));
+        assert_eq!(m.get_node(1).map(|n| n.state), Some(NodeState::Draining));
+    }
+
+    #[test]
+    fn self_leave_does_not_downgrade_a_decommissioning_node() {
+        // /internal/membership/leave{node_id: self} used to `set_state`
+        // unconditionally, so this self-call could clobber Decommissioning
+        // back into Draining -- re-admitting the node as a placement
+        // candidate mid-evacuation.
+        let mut m = ClusterMembership::new();
+        m.add_node(make_node(1, NodeState::Decommissioning));
+
+        assert!(!apply_self_leave(&mut m, 1));
+        assert_eq!(
+            m.get_node(1).map(|n| n.state),
+            Some(NodeState::Decommissioning)
+        );
+    }
+
+    #[test]
+    fn self_leave_does_not_downgrade_a_leaving_node() {
+        let mut m = ClusterMembership::new();
+        m.add_node(make_node(1, NodeState::Leaving));
+
+        assert!(!apply_self_leave(&mut m, 1));
+        assert_eq!(m.get_node(1).map(|n| n.state), Some(NodeState::Leaving));
+    }
+
+    #[test]
+    fn self_leave_on_unknown_node_is_false() {
+        let mut m = ClusterMembership::new();
+        assert!(!apply_self_leave(&mut m, 99));
+    }
+}
+
+#[cfg(test)]
+mod replicate_batch_tests {
+    use super::*;
+
+    fn part(db: &str, region: Option<u64>, body: &[u8]) -> ReplicateBatchPart {
+        ReplicateBatchPart {
+            database: db.into(),
+            retention_policy: "autogen".into(),
+            precision: None,
+            region_id: region,
+            body: body.to_vec(),
+        }
+    }
+
+    #[test]
+    fn parts_are_grouped_per_database_and_encoding_and_foreign_regions_refused() {
+        let binary = crate::application::line_protocol::encode_points_binary(&[]).unwrap();
+        let parts = vec![
+            part("a", Some(1), b"cpu v=1"),
+            part("a", Some(7), b"cpu v=2"),
+            part("b", Some(2), b"cpu v=3"),
+            part("a", Some(3), b"cpu v=4"),
+            part("a", Some(4), &binary),
+            part("a", None, b"cpu v=5"),
+            part("", Some(5), b"cpu v=6"),
+        ];
+        let (outcomes, groups) = group_replicate_parts(parts, |region| region != 7);
+        assert_eq!(outcomes[1], ReplicatePartOutcome::NotARegionPeer);
+        assert!(matches!(outcomes[6], ReplicatePartOutcome::Failed(_)));
+        let shape: Vec<(&str, Vec<usize>)> = groups
+            .iter()
+            .map(|g| (g.database.as_str(), g.parts.clone()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![("a", vec![0, 3, 5]), ("b", vec![2]), ("a", vec![4])]
+        );
+        assert_eq!(groups[0].body, b"cpu v=1\ncpu v=4\ncpu v=5".to_vec());
+    }
 }

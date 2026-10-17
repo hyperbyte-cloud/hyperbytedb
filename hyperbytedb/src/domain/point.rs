@@ -84,4 +84,13 @@ pub struct Point {
     pub tags: BTreeMap<String, String>,
     pub fields: BTreeMap<String, FieldValue>,
     pub timestamp: i64, // always nanoseconds since epoch
+    /// This point's series id, computed on first use by
+    /// [`crate::domain::series::series_id_for_point`]. A point's measurement
+    /// and tags do not change once it is built, and the write path asked for
+    /// the id three times per point (routing, the metadata cache, the WAL
+    /// slot): 5.6% of a node's CPU on n3. Not serialized, so the WAL and wire
+    /// formats are unchanged; build a new point rather than editing the
+    /// measurement or tags of one whose id may have been read.
+    #[serde(skip)]
+    pub series_id_cache: std::sync::OnceLock<u64>,
 }

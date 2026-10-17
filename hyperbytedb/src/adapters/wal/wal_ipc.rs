@@ -374,6 +374,7 @@ mod tests {
                 tags,
                 fields,
                 timestamp: 1,
+                series_id_cache: Default::default(),
             }],
             origin_node_id: 7,
         }

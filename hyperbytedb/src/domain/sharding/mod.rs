@@ -1,5 +1,6 @@
 pub mod location_cache;
 pub mod ops;
+pub mod placement;
 pub mod query_merge;
 pub mod transfer;
 pub mod types;
@@ -15,5 +16,6 @@ pub use types::{
     MeasurementKey, MeasurementShardSpace, MvBackfillPhase, RegionHeartbeat, ShardBootstrapRequest,
     ShardDeleteRequest, ShardEpoch, ShardMap, ShardMapJson, ShardMetadataKind,
     ShardMetadataRequest, ShardMvBackfillRequest, ShardQueryRequest, ShardRegion,
-    ShardTransferRequest, ShardWriteRequest,
+    ShardTransferRequest, ShardWriteBatch, ShardWriteBatchResponse, ShardWritePartResult,
+    ShardWriteRequest,
 };

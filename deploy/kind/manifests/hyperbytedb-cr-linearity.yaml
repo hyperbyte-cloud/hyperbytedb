@@ -1,0 +1,56 @@
+# Resource-capped sharded cluster for linearity bench (replicas patched at runtime).
+apiVersion: hyperbytedb.hyperbyte.cloud/v1alpha1
+kind: HyperbytedbCluster
+metadata:
+  name: hyperbytedb
+  namespace: hyperbytedb
+spec:
+  replicas: 3
+  image: hyperbytedb:local
+  imagePullPolicy: Never
+  server:
+    port: 8086
+    maxBodySizeBytes: 26214400
+    requestTimeoutSecs: 60
+    queryTimeoutSecs: 60
+    maxConcurrentQueries: 16
+  storage:
+    volumeClaimTemplate:
+      size: 32Gi
+  chdb:
+    poolSize: 2
+  flush:
+    intervalSecs: 5
+    maxPointsPerBatch: 100000
+  cluster:
+    heartbeatIntervalSecs: 2
+    heartbeatMissThreshold: 5
+    raftHeartbeatIntervalMs: 1000
+    raftElectionTimeoutMs: 5000
+    replication:
+      mode: async
+  resources:
+    requests:
+      cpu: 500m
+      memory: 2Gi
+    limits:
+      cpu: "2"
+      memory: 4Gi
+  proxy:
+    enabled: false
+  # The sweep drives 125k series per node (N=48 => 6M). The default limit is
+  # 100,000, so WITHOUT this block every forwarded write is rejected 422 by the
+  # receiving node once cardinality passes the default — which is what made the
+  # N=6 point fail 750 of 750 batches while still reporting a throughput
+  # number.
+  cardinality:
+    maxTagValuesPerMeasurement: 10000000
+    maxMeasurementsPerDatabase: 10000
+  sharding:
+    enabled: true
+    replicationFactor: 2
+    regionSplitSeries: 100000
+    regionMaxSeries: 150000
+    regionMergeSeries: 50000
+    splitMergeIntervalSecs: 30
+    heartbeatIntervalSecs: 10

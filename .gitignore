@@ -118,3 +118,6 @@ Desktop.ini
 hyperbytedb-operator
 chdb-rust
 docs/audits/
+# Python
+__pycache__/
+integrations/checkmk/dist/

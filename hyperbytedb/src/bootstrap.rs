@@ -19,6 +19,7 @@ use crate::application::query_service::QueryServiceImpl;
 use crate::application::raft_leader_callbacks::{RaftLeaderCallbacks, SharedRaftLeaderCallbacks};
 use crate::application::replication_apply::ReplicationApplyQueue;
 use crate::application::runtime::RegionWriteStats;
+use crate::application::runtime_settings as rs;
 use crate::application::shard_routing::ShardRoutingContext;
 use crate::application::statement_summary::StatementSummary;
 use crate::config::HyperbytedbConfig;
@@ -52,6 +53,16 @@ pub struct BootstrappedApp {
 /// returned handles.
 pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<BootstrappedApp> {
     config.validate().map_err(anyhow::Error::msg)?;
+    // Every peer client sends it and every internal route checks it.
+    let cluster_auth = crate::adapters::cluster::cluster_auth::ClusterAuth::new(
+        config.auth.cluster_token.as_deref(),
+    )?;
+    if config.auth.enabled && config.cluster.enabled && config.auth.cluster_token.is_none() {
+        tracing::warn!(
+            "auth is on in a cluster without auth.cluster_token: nodes cannot call each \
+             other's internal routes"
+        );
+    }
 
     let prometheus_handle = {
         let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
@@ -168,6 +179,9 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
             "failed to warm tag value count cache; counts rebuild on demand"
         ),
     }
+    if let Err(e) = ensure_admin(metadata.as_ref(), &config.auth).await {
+        tracing::warn!(error = %e, "failed to create the configured admin user");
+    }
     match metadata.warm_series().await {
         Ok(series) => tracing::info!(series, "warmed series dedup cache from metadata"),
         Err(e) => tracing::warn!(
@@ -188,8 +202,43 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
     let write_pool_size = config.chdb.resolved_write_pool_size();
     let query_chdb = SharedSession::new_eager(&config.chdb.session_data_path, query_pool_size)?;
     let write_chdb = SharedSession::new_eager(&config.chdb.session_data_path, write_pool_size)?;
+    // This node's runtime settings: SET overrides, fallbacks and appliers.
+    let runtime_settings = Arc::new(rs::RuntimeSettings::default());
+    runtime_settings.set_config_fallbacks(config);
+    {
+        let source = if config.chdb.query_pool_size.is_some() || config.chdb.pool_size > 0 {
+            rs::Source::Config
+        } else {
+            rs::Source::Auto
+        };
+        let int = |n: usize| rs::SettingValue::Int(i64::try_from(n).unwrap_or(i64::MAX));
+        runtime_settings.set_fallback(rs::QUERY_POOL_SIZE, int(query_pool_size), source);
+        runtime_settings.set_fallback(
+            rs::WRITE_POOL_SIZE,
+            int(write_pool_size),
+            rs::Source::Config,
+        );
+        // Weak: libchdb takes one data path per process, and tests open a
+        // new one per case, so the registry must not keep an old pool open.
+        for (name, pool) in [
+            (rs::QUERY_POOL_SIZE, query_chdb.pool()?),
+            (rs::WRITE_POOL_SIZE, write_chdb.pool()?),
+        ] {
+            let pool = Arc::downgrade(&pool);
+            runtime_settings.register_applier(
+                name,
+                Arc::new(move |v| {
+                    let n = v.as_i64().and_then(|n| usize::try_from(n).ok());
+                    match (pool.upgrade(), n) {
+                        (Some(pool), Some(n)) => pool.resize(n).map(|_| ()),
+                        _ => Ok(()),
+                    }
+                }),
+            );
+        }
+    }
     tracing::info!(
-        query_pool_size = query_chdb.configured_pool_size(),
+        query_pool_size = query_chdb.pool()?.pool_size(),
         write_pool_size = write_chdb.configured_pool_size(),
         path = %config.chdb.session_data_path,
         "chDB query and write connection pools ready"
@@ -204,9 +253,22 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
             "failed to attach restored chDB tables from on-disk metadata"
         ),
     }
-    let chdb_adapter =
-        ChdbQueryAdapter::from_shared(query_chdb, config.server.max_concurrent_queries);
-    let chdb: Arc<dyn crate::ports::query::QueryPort> = Arc::new(chdb_adapter);
+    let chdb_adapter = Arc::new(ChdbQueryAdapter::from_shared(
+        query_chdb,
+        config.server.max_concurrent_queries,
+    ));
+    {
+        let adapter = Arc::downgrade(&chdb_adapter);
+        runtime_settings.register_applier(
+            rs::MAX_CONCURRENT_QUERIES,
+            rs::usize_applier(move |n| {
+                if let Some(a) = adapter.upgrade() {
+                    a.set_concurrency_limit(n);
+                }
+            }),
+        );
+    }
+    let chdb: Arc<dyn crate::ports::query::QueryPort> = chdb_adapter;
 
     let native_sink = ChdbNativeAdapter::with_metadata_and_cache_limit(
         write_chdb,
@@ -253,6 +315,8 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         Some(ClusterBootstrap::init(
             &config.cluster,
             config.hinted_handoff.max_hints_per_peer,
+            cluster_auth.clone(),
+            runtime_settings.clone(),
         )?)
     } else {
         None
@@ -272,10 +336,24 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
 
     let max_points_per_request = config.server.max_points_per_request;
 
-    let ingest_cardinality = IngestCardinalityLimits {
-        max_tag_values_per_measurement: config.cardinality.max_tag_values_per_measurement,
-        max_measurements_per_database: config.cardinality.max_measurements_per_database,
-    };
+    let ingest_cardinality = IngestCardinalityLimits::new(
+        config.cardinality.max_tag_values_per_measurement,
+        config.cardinality.max_measurements_per_database,
+    );
+    // SET reaches these limits, and only these: transfers, replicas and
+    // sync use their own unlimited ones.
+    {
+        let limits = ingest_cardinality.clone();
+        runtime_settings.register_applier(
+            rs::MAX_TAG_VALUES_PER_MEASUREMENT,
+            rs::usize_applier(move |n| limits.set_max_tag_values_per_measurement(n)),
+        );
+        let limits = ingest_cardinality.clone();
+        runtime_settings.register_applier(
+            rs::MAX_MEASUREMENTS_PER_DATABASE,
+            rs::usize_applier(move |n| limits.set_max_measurements_per_database(n)),
+        );
+    }
 
     let shard_routing = if config.sharding.enabled {
         match (peer_client.as_ref(), rocks_shard_map.clone()) {
@@ -286,6 +364,8 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
                 node_id: config.cluster.node_id,
                 peer_client: pc.clone(),
                 region_write_stats: Arc::new(RegionWriteStats::new()),
+                forward_coalescer: Default::default(),
+                runtime_settings: runtime_settings.clone(),
             })),
             _ => None,
         }
@@ -343,6 +423,7 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
             config.server.query_timeout_secs,
             points_sink.clone(),
         )
+        .with_runtime_settings(runtime_settings.clone())
         .with_max_points_per_request(max_points_per_request);
         if let Some(ref pc) = peer_client {
             qs = qs.with_cluster_replication(
@@ -377,7 +458,7 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
                 metadata.clone(),
                 pc.clone(),
                 config.cluster.node_id,
-                ingest_cardinality,
+                ingest_cardinality.clone(),
                 max_points_per_request,
                 config.cluster.replication.clone(),
             );
@@ -390,15 +471,29 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
                 Arc::new(move || cb_leader.is_leader()),
                 Arc::new(move || cb_addr.leader_addr()),
             );
+            // The queue shares the replication log's RocksDB, next to
+            // hinted handoff.
+            use crate::ports::forward_queue::ForwardQueuePort;
+            let queue = crate::adapters::cluster::forward_queue::ForwardQueue::new(
+                pc.replication_log().db().clone(),
+            )?;
+            if !queue.is_empty() {
+                tracing::info!(
+                    entries = queue.len(),
+                    "forward queue has writes from a previous run; delivering them"
+                );
+            }
+            svc = svc.with_forward_queue(Arc::new(queue));
         }
-        Arc::new(svc)
+        let svc = Arc::new(svc);
+        svc.spawn_forward_drainer();
+        svc
     } else {
         Arc::new(IngestionServiceImpl::with_sink(
             wal.clone(),
             Some(points_sink.clone()),
             metadata.clone(),
-            config.cardinality.max_tag_values_per_measurement,
-            config.cardinality.max_measurements_per_database,
+            ingest_cardinality.clone(),
             max_points_per_request,
         ))
     };
@@ -409,7 +504,7 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
             metadata.clone(),
             wal.clone(),
             Some(points_sink.clone()),
-            ingest_cardinality,
+            ingest_cardinality.clone(),
             max_points_per_request,
             config.sharding.enabled,
             config.cluster.node_id,
@@ -425,6 +520,7 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
                 base_query_service.clone(),
                 metadata.clone(),
                 pc.clone(),
+                pc.cluster_auth(),
             ),
         )
     });
@@ -440,7 +536,8 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
             wal.clone(),
             config.flush.max_points_per_batch,
             points_sink.clone(),
-        );
+        )
+        .with_runtime_settings(runtime_settings.clone());
         if let Some(ref rl) = replication_log_arc {
             fs = fs.with_replication_log(rl.clone());
         }
@@ -480,6 +577,62 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         None
     };
 
+    let inflight_writes = crate::config::resolve_max_inflight_writes(
+        config.server.max_inflight_writes,
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+    );
+
+    let rate_limiter = Arc::new(rate_limit::EndpointRateLimiters::new(
+        if config.rate_limit.enabled {
+            config.rate_limit.max_requests_per_second
+        } else {
+            0
+        },
+    ));
+    let write_admission = Arc::new(crate::adapters::http::router::Admission::new(
+        inflight_writes,
+    ));
+    // KiB of forwarded body in flight: the same number of client-sized
+    // batches, measured in what they actually carry.
+    let shard_write_admission = Arc::new(crate::adapters::http::router::Admission::new(
+        inflight_writes * crate::config::SHARD_WRITE_KIB_PER_SLOT,
+    ));
+    runtime_settings.set_fallback(
+        rs::MAX_INFLIGHT_WRITES,
+        rs::SettingValue::Int(i64::try_from(inflight_writes).unwrap_or(i64::MAX)),
+        if config.server.max_inflight_writes > 0 {
+            rs::Source::Config
+        } else {
+            rs::Source::Auto
+        },
+    );
+    {
+        let (client, shard) = (
+            Arc::downgrade(&write_admission),
+            Arc::downgrade(&shard_write_admission),
+        );
+        runtime_settings.register_applier(
+            rs::MAX_INFLIGHT_WRITES,
+            rs::usize_applier(move |n| {
+                if let Some(a) = client.upgrade() {
+                    a.resize(n);
+                }
+                if let Some(a) = shard.upgrade() {
+                    a.resize(n * crate::config::SHARD_WRITE_KIB_PER_SLOT);
+                }
+            }),
+        );
+        let limiter = Arc::downgrade(&rate_limiter);
+        runtime_settings.register_applier(
+            rs::RATE_LIMIT_PER_SECOND,
+            rs::usize_applier(move |n| {
+                if let Some(l) = limiter.upgrade() {
+                    l.set_rate(n as u64);
+                }
+            }),
+        );
+    }
+
     let app_state = AppState {
         ingestion: ingestion_service,
         query: query_service,
@@ -495,6 +648,8 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         drain_service,
         raft: None,
         auth_enabled: config.auth.enabled,
+        runtime_settings: runtime_settings.clone(),
+        cluster_auth,
         auth_allow_query_param_credentials: config.auth.allow_query_param_credentials,
         prometheus_handle: Some(prometheus_handle.clone()),
         statement_summary,
@@ -508,14 +663,11 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
             .effective_replicate_body_limit_bytes(config.server.max_body_size_bytes),
         max_points_per_request: config.server.max_points_per_request,
         request_timeout_secs: config.server.request_timeout_secs,
-        rate_limiter: if config.rate_limit.enabled && config.rate_limit.max_requests_per_second > 0
-        {
-            Some(Arc::new(rate_limit::EndpointRateLimiters::new(
-                config.rate_limit.max_requests_per_second,
-            )))
-        } else {
-            None
-        },
+        // Always present so `SET rate_limit_per_second` can turn it on; at
+        // rate 0 it lets everything through.
+        rate_limiter: Some(rate_limiter),
+        write_admission: Some(write_admission),
+        shard_write_admission: Some(shard_write_admission),
         wal_batcher_alive,
         disk_read_only: disk_read_only.clone(),
         sharding_enabled: config.sharding.enabled,
@@ -540,4 +692,22 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         raft_leader_callbacks,
         rocks_shard_map,
     })
+}
+
+/// Create `auth.admin_username` as an admin if no user has that name. Each
+/// node does it for itself from the same config, so it needs no Raft leader.
+pub async fn ensure_admin(
+    metadata: &dyn MetadataPort,
+    auth: &crate::config::AuthConfig,
+) -> Result<(), crate::error::HyperbytedbError> {
+    let (Some(name), Some(password)) = (&auth.admin_username, &auth.admin_password) else {
+        return Ok(());
+    };
+    if name.is_empty() || password.is_empty() || metadata.get_user(name).await?.is_some() {
+        return Ok(());
+    }
+    let hash = crate::adapters::http::auth_middleware::hash_password(password)?;
+    metadata.create_user(name, &hash, true).await?;
+    tracing::info!(user = %name, "created the configured admin user");
+    Ok(())
 }

@@ -1,3 +1,5 @@
+use crate::adapters::cluster::cluster_auth::ClusterAuth;
+use crate::ports::peer_http::PeerHttp;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,6 +9,7 @@ use crate::domain::cluster::membership::{NodeState, SharedMembership};
 use crate::domain::cluster::sync::{
     JoinRequest, JoinResponse, MetadataSnapshot, SyncManifest, WalSyncResponse,
 };
+use crate::domain::sharding::{ShardMap, ShardMapJson};
 use crate::error::HyperbytedbError;
 use crate::ports::metadata::MetadataPort;
 use crate::ports::points_sink::PointsSinkPort;
@@ -26,6 +29,7 @@ pub struct SyncClient {
     /// membership has no active peers yet (Raft hasn't formed).
     fallback_peer_addrs: Vec<String>,
     shard_map: Option<Arc<dyn ShardMapPort>>,
+    runtime_settings: Option<Arc<crate::application::runtime_settings::RuntimeSettings>>,
 }
 
 impl SyncClient {
@@ -36,6 +40,7 @@ impl SyncClient {
         metadata: Arc<dyn MetadataPort>,
         wal: Arc<dyn WalPort>,
         fallback_peer_addrs: Vec<String>,
+        cluster_auth: &ClusterAuth,
     ) -> Self {
         Self::with_points_sink(
             node_id,
@@ -46,6 +51,7 @@ impl SyncClient {
             None,
             0,
             fallback_peer_addrs,
+            cluster_auth,
         )
     }
 
@@ -59,11 +65,13 @@ impl SyncClient {
         points_sink: Option<Arc<dyn PointsSinkPort>>,
         max_points_per_request: usize,
         fallback_peer_addrs: Vec<String>,
+        cluster_auth: &ClusterAuth,
     ) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(300))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        let client = cluster_auth.build(
+            cluster_auth
+                .client_builder()
+                .timeout(Duration::from_secs(300)),
+        );
 
         Self {
             node_id,
@@ -76,7 +84,17 @@ impl SyncClient {
             client,
             fallback_peer_addrs,
             shard_map: None,
+            runtime_settings: None,
         }
+    }
+
+    /// This node's runtime settings, so synced `SET`s apply at once.
+    pub fn with_runtime_settings(
+        mut self,
+        settings: Arc<crate::application::runtime_settings::RuntimeSettings>,
+    ) -> Self {
+        self.runtime_settings = Some(settings);
+        self
     }
 
     pub fn with_shard_map(mut self, map: Arc<dyn ShardMapPort>) -> Self {
@@ -86,6 +104,13 @@ impl SyncClient {
 
     /// Reconnect after a disconnect: detect WAL gap and do WAL catch-up or
     /// a full metadata re-sync when the gap is large.
+    ///
+    /// Sharded: metadata and the shard map only. A node's WAL holds the writes
+    /// it took, numbered by its own sequence, so "the gap" compared unrelated
+    /// numbers, and the catch-up copied another node's regions into this
+    /// one's store. On n3 that took ~20 minutes per reconnect with the node
+    /// Syncing (not ready). A sharded replica gets missed writes from hinted
+    /// handoff, and a new copy of a region from a learner stage.
     pub async fn reconnect_sync(&self) -> Result<bool, HyperbytedbError> {
         let peer_addr = self.pick_sync_peer().await;
         let peer_addr = match peer_addr {
@@ -97,6 +122,13 @@ impl SyncClient {
         };
 
         tracing::debug!(peer = %peer_addr, "starting reconnect sync");
+
+        if self.shard_map.is_some() {
+            self.sync_metadata(&peer_addr).await?;
+            self.sync_shard_map(&peer_addr).await?;
+            tracing::info!("reconnect sync complete (metadata and shard map), node is Active");
+            return Ok(true);
+        }
 
         let manifest = self.get_manifest(&peer_addr).await?;
         let local_wal_seq = self.wal.last_sequence().await?;
@@ -125,7 +157,7 @@ impl SyncClient {
         } else {
             {
                 let mut m = self.membership.write().await;
-                m.set_state(self.node_id, NodeState::Syncing);
+                m.begin_sync_to_syncing(self.node_id);
             }
             tracing::info!(
                 gap = gap,
@@ -133,6 +165,7 @@ impl SyncClient {
             );
 
             self.sync_metadata(&peer_addr).await?;
+            self.sync_shard_map(&peer_addr).await?;
 
             let updated_wal_seq = self.wal.last_sequence().await?;
             let applied = self.wal_catchup(&peer_addr, updated_wal_seq).await?;
@@ -141,7 +174,7 @@ impl SyncClient {
 
             {
                 let mut m = self.membership.write().await;
-                m.set_state(self.node_id, NodeState::Active);
+                m.complete_sync_to_active(self.node_id);
             }
         }
 
@@ -178,31 +211,34 @@ impl SyncClient {
         );
 
         self.sync_metadata(&peer_addr).await?;
-
-        let mut applied = 0u64;
-        if let Some(ref shard_map) = self.shard_map {
-            let map = shard_map.snapshot().await?;
-            for space in map.spaces.values() {
-                for region in &space.regions {
-                    if !region.peers.contains(&self.node_id) || region.primary == self.node_id {
-                        continue;
-                    }
-                    let primary_addr = {
-                        let m = self.membership.read().await;
-                        m.get_node(region.primary).map(|n| n.addr.clone())
-                    };
-                    if let Some(addr) = primary_addr {
-                        applied += self.wal_catchup(&addr, local_wal_seq).await?;
-                    }
-                }
-            }
+        // Install the committed map before any region data movement so the
+        // joiner's map_version matches the cluster at Active.
+        //
+        // Best-effort: `/internal/shard/map` only exists on peers that have
+        // sharding enabled and run a build that serves it, so a 404 here says
+        // nothing about whether this node can catch up its WAL. Failing hard
+        // used to abort the join before `wal_catchup`, and after the retries
+        // were exhausted the node went Active having synced nothing at all.
+        // Skipping is safe: without a map there are no regions to move below,
+        // and the leader's own catch-up check gates placement onto this node.
+        if let Err(e) = self.sync_shard_map(&peer_addr).await {
+            tracing::warn!(
+                error = %e,
+                peer = %peer_addr,
+                "shard map install failed; continuing with WAL catch-up"
+            );
         }
-        applied += self.wal_catchup(&peer_addr, local_wal_seq).await?;
-        let local_after = self.wal.last_sequence().await?;
-        verify_catchup_progress(local_wal_seq, manifest.wal_last_seq, applied, local_after)?;
+
+        // Sharded: no WAL catch-up (see `reconnect_sync`). A joiner gets a
+        // region's rows when it is added as a learner and staged.
+        if self.shard_map.is_none() {
+            let applied = self.wal_catchup(&peer_addr, local_wal_seq).await?;
+            let local_after = self.wal.last_sequence().await?;
+            verify_catchup_progress(local_wal_seq, manifest.wal_last_seq, applied, local_after)?;
+        }
 
         let mut m = self.membership.write().await;
-        m.set_state(self.node_id, NodeState::Active);
+        m.complete_sync_to_active(self.node_id);
         tracing::info!("node sync complete, transitioned to Active");
         Ok(true)
     }
@@ -328,6 +364,42 @@ impl SyncClient {
         Ok(())
     }
 
+    /// Copy the peer's committed shard map so `map_version` matches before
+    /// region rows are transferred onto this joiner.
+    pub async fn sync_shard_map(&self, peer_addr: &str) -> Result<(), HyperbytedbError> {
+        let Some(shard_map) = self.shard_map.as_ref() else {
+            return Ok(());
+        };
+        let remote = fetch_shard_map(self.client.clone(), peer_addr).await?;
+        let version = remote.map_version;
+
+        // Never move the map backwards. `map_version` counts local applies and
+        // the sync peer is whichever Active node came first out of a HashMap —
+        // not the leader, and not necessarily the most-applied node. Installing
+        // an older snapshot would drop ops Raft will never redeliver, because
+        // `replace_map` bypasses the state machine and leaves `last_applied`
+        // untouched; every later op would then fail StaleEpoch/UnknownRegion
+        // and the node would silently stop owning regions it holds data for.
+        let local = shard_map.snapshot().await?.map_version;
+        if !remote_map_is_newer(version, local) {
+            tracing::info!(
+                peer = %peer_addr,
+                remote_map_version = version,
+                local_map_version = local,
+                "peer shard map is not newer; keeping local map"
+            );
+            return Ok(());
+        }
+
+        shard_map.replace_map(remote).await?;
+        tracing::info!(
+            peer = %peer_addr,
+            map_version = version,
+            "installed peer shard map before region movement"
+        );
+        Ok(())
+    }
+
     async fn import_metadata_entry(
         &self,
         entry: &crate::domain::cluster::sync::MetadataEntry,
@@ -361,9 +433,8 @@ impl SyncClient {
         } else if let Some(username) = entry.key.strip_prefix("user:") {
             let user: StoredUser = serde_json::from_slice(&entry.value)
                 .map_err(|e| HyperbytedbError::Metadata(format!("parse user: {e}").into()))?;
-            self.metadata
-                .create_user(username, &user.password_hash, user.admin)
-                .await?;
+            // Whole, so a node that syncs keeps every user's grants.
+            self.metadata.put_user(username, &user).await?;
         } else if entry.key.starts_with("tombstone:") {
             let parts: Vec<&str> = entry.key.splitn(5, ':').collect();
             if parts.len() == 5 {
@@ -390,6 +461,16 @@ impl SyncClient {
                     .store_continuous_query(db, &cq.name, &cq)
                     .await?;
             }
+        } else if let Some(name) = entry.key.strip_prefix("setting:") {
+            let value: crate::domain::setting::SettingValue = serde_json::from_slice(&entry.value)
+                .map_err(|e| HyperbytedbError::Metadata(format!("parse setting: {e}").into()))?;
+            crate::application::runtime_settings::apply_or_store(
+                self.runtime_settings.as_deref(),
+                self.metadata.as_ref(),
+                name,
+                Some(value),
+            )
+            .await?;
         } else if entry.key.starts_with("mv:") {
             let parts: Vec<&str> = entry.key.splitn(3, ':').collect();
             if parts.len() == 3 {
@@ -468,7 +549,7 @@ impl SyncClient {
             &entry.database,
             &entry.retention_policy,
             &entry.points,
-            IngestCardinalityLimits::default(),
+            &IngestCardinalityLimits::unlimited(),
             None,
         )
         .await?;
@@ -485,6 +566,39 @@ impl SyncClient {
         .await?;
         Ok(())
     }
+}
+
+/// GET `/internal/shard/map` from `peer_addr` and return the committed snapshot.
+/// Whether a peer's shard map may replace the local one.
+///
+/// Strictly-newer only. Equal is a no-op, and older must be refused: a sync
+/// peer is whichever Active node came first out of a `HashMap`, so it is not
+/// necessarily the leader or the most-applied node.
+#[must_use]
+pub fn remote_map_is_newer(remote_version: u64, local_version: u64) -> bool {
+    remote_version > local_version
+}
+
+pub async fn fetch_shard_map(
+    client: reqwest::Client,
+    peer_addr: &str,
+) -> Result<ShardMap, HyperbytedbError> {
+    let url = format!("http://{peer_addr}/internal/shard/map");
+    let resp =
+        client.get(&url).send().await.map_err(|e| {
+            HyperbytedbError::PeerUnreachable(format!("shard map request failed: {e}"))
+        })?;
+    if !resp.status().is_success() {
+        return Err(HyperbytedbError::SyncFailed(format!(
+            "shard map request failed: {}",
+            resp.status()
+        )));
+    }
+    let json: ShardMapJson = resp
+        .json()
+        .await
+        .map_err(|e| HyperbytedbError::SyncFailed(format!("parse shard map: {e}")))?;
+    Ok(ShardMap::from(json))
 }
 
 /// Fail closed when the peer advertises a higher WAL watermark but returns no
@@ -509,8 +623,156 @@ fn verify_catchup_progress(
 
 #[cfg(test)]
 mod tests {
-    use super::verify_catchup_progress;
+    use super::{remote_map_is_newer, verify_catchup_progress};
     use crate::error::HyperbytedbError;
+
+    /// A peer that answers sync calls and counts WAL catch-up requests.
+    async fn spawn_sync_peer(wal_requests: std::sync::Arc<std::sync::atomic::AtomicU64>) -> String {
+        use axum::routing::{get, post};
+        let app = axum::Router::new()
+            .route(
+                "/internal/sync/manifest",
+                get(|| async {
+                    axum::Json(serde_json::json!({
+                        "node_id": 2, "wal_last_seq": 500_000, "databases": [],
+                        "shard_map_version": 0,
+                    }))
+                }),
+            )
+            .route(
+                "/internal/sync/metadata",
+                get(|| async { axum::Json(serde_json::json!({ "entries": [] })) }),
+            )
+            .route(
+                "/internal/shard/map",
+                get(|| async {
+                    axum::Json(serde_json::json!({
+                        "map_version": 0, "next_region_id": 1, "spaces": [],
+                    }))
+                }),
+            )
+            .route(
+                "/internal/sync/wal",
+                get(move || {
+                    let n = wal_requests.clone();
+                    async move {
+                        n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                }),
+            )
+            .route(
+                "/internal/membership/join",
+                post(|| async { axum::http::StatusCode::OK }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        addr
+    }
+
+    /// A node that syncs gets every user whole. Importing through
+    /// `create_user` dropped grants: on n3 all six UAT nodes restarted after
+    /// the grants were made, and Telegraf's writes were refused from then on.
+    #[tokio::test]
+    async fn a_synced_user_keeps_its_grants() {
+        use crate::adapters::metadata::rocksdb_meta::RocksDbMetadata;
+        use crate::adapters::wal::rocksdb_wal::RocksDbWal;
+        use crate::domain::cluster::membership::{ClusterMembership, new_shared};
+        use crate::domain::user::{DatabasePrivilege, StoredUser};
+        use crate::ports::metadata::MetadataPort;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let metadata = Arc::new(RocksDbMetadata::open(dir.path().join("meta")).unwrap());
+        let client = super::SyncClient::new(
+            1,
+            "127.0.0.1:1".into(),
+            new_shared(ClusterMembership::new()),
+            metadata.clone(),
+            Arc::new(RocksDbWal::open(dir.path().join("wal")).unwrap()),
+            Vec::new(),
+            &Default::default(),
+        );
+        let user = StoredUser {
+            password_hash: "hash".into(),
+            admin: false,
+            created_at: "now".into(),
+            privileges: [("telegraf".to_string(), DatabasePrivilege::Write)].into(),
+        };
+        client
+            .import_metadata_entry(&crate::domain::cluster::sync::MetadataEntry {
+                key: "user:telegraf".into(),
+                value: serde_json::to_vec(&user).unwrap(),
+            })
+            .await
+            .unwrap();
+        let got = metadata.get_user("telegraf").await.unwrap().unwrap();
+        assert_eq!(
+            got.privileges.get("telegraf"),
+            Some(&DatabasePrivilege::Write)
+        );
+        assert_eq!(got.password_hash, "hash");
+    }
+
+    /// A sharded node never pulls a peer's WAL to sync: not on reconnect and
+    /// not on join. Comparing its own WAL sequence with a peer's compared
+    /// unrelated numbers, and copied the peer's regions into this node (~20
+    /// minutes per reconnect on n3, with the node not ready meanwhile).
+    #[tokio::test]
+    async fn a_sharded_node_syncs_without_pulling_a_peer_wal() {
+        use crate::adapters::metadata::rocksdb_meta::RocksDbMetadata;
+        use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
+        use crate::adapters::wal::rocksdb_wal::RocksDbWal;
+        use crate::domain::cluster::membership::{
+            ClusterMembership, NodeInfo, NodeState, new_shared,
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let wal_requests = Arc::new(AtomicU64::new(0));
+        let peer = spawn_sync_peer(wal_requests.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = ClusterMembership::new();
+        m.add_node(NodeInfo {
+            node_id: 2,
+            addr: peer,
+            state: NodeState::Active,
+            joined_at: 0,
+            last_heartbeat: 0,
+            needs_sync: false,
+            consecutive_misses: 0,
+        });
+        std::fs::create_dir_all(dir.path().join("meta")).unwrap();
+        let client = super::SyncClient::new(
+            1,
+            "127.0.0.1:1".into(),
+            new_shared(m),
+            Arc::new(RocksDbMetadata::open(dir.path().join("meta2")).unwrap()),
+            Arc::new(RocksDbWal::open(dir.path().join("wal")).unwrap()),
+            Vec::new(),
+            &Default::default(),
+        )
+        .with_shard_map(Arc::new(
+            RocksDbShardMap::open(&dir.path().join("meta"), true).unwrap(),
+        ));
+
+        assert!(client.reconnect_sync().await.unwrap());
+        client.join_and_sync().await.unwrap();
+        assert_eq!(wal_requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn remote_map_installs_only_when_strictly_newer() {
+        assert!(remote_map_is_newer(10, 0), "fresh joiner takes the map");
+        assert!(remote_map_is_newer(10, 9));
+        assert!(!remote_map_is_newer(10, 10), "equal is a no-op");
+        // The case that silently strands a node: syncing from a less-applied
+        // peer would drop ops Raft never redelivers.
+        assert!(!remote_map_is_newer(8, 10));
+    }
 
     #[test]
     fn verify_catchup_progress_ok_when_caught_up() {

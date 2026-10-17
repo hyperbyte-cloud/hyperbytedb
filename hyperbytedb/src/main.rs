@@ -12,8 +12,8 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use clap::{Parser, Subcommand};
 
 use hyperbytedb::application::backup::{backup, restore};
-use hyperbytedb::application::runtime::serve;
 use hyperbytedb::config::HyperbytedbConfig;
+use hyperbytedb::server::serve;
 
 #[derive(Parser)]
 #[command(
@@ -58,21 +58,10 @@ async fn main() -> anyhow::Result<()> {
         Err(_) => tracing_subscriber::EnvFilter::new(&config.logging.level),
     };
 
-    if config.logging.format == "json" {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .json()
-            .try_init()
-            .map_err(|e| anyhow::anyhow!("failed to set logging subscriber: {e}"))?;
-    } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .try_init()
-            .map_err(|e| anyhow::anyhow!("failed to set logging subscriber: {e}"))?;
-    }
+    let telemetry = hyperbytedb::telemetry::init_logging(filter, config.logging.format == "json")?;
 
     match cli.command {
-        Commands::Serve => serve(config).await,
+        Commands::Serve => serve(config, telemetry.log_level()).await,
         Commands::Backup { output } => backup(config, &output).await,
         Commands::Restore { input } => restore(config, &input).await,
     }

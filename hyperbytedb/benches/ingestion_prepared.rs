@@ -117,8 +117,7 @@ fn setup_prepared_ingest() -> PreparedIngestEnv {
         wal_port,
         Some(sink),
         metadata,
-        100_000,
-        10_000,
+        hyperbytedb::application::ingest_metadata::IngestCardinalityLimits::new(100_000, 10_000),
         0,
     ));
 
@@ -229,6 +228,7 @@ fn synthetic_points(n: usize) -> Vec<Point> {
                 tags,
                 fields,
                 timestamp: BASE_NS + i as i64 * 1_000_000,
+                series_id_cache: Default::default(),
             }
         })
         .collect()

@@ -47,9 +47,17 @@ pub struct ShardedTestNode {
     pub location_cache: Arc<ShardLocationCache>,
     pub membership: SharedMembership,
     pub query_port: Arc<ChdbQueryAdapter>,
+    /// Present only when the node was started with a Raft handle; the
+    /// heartbeat endpoint is a no-op without it.
+    pub scheduler: Option<Arc<hyperbytedb::application::shard_scheduler::ShardScheduler>>,
+    /// Shared with other in-process peers — libchdb allows one session per process.
+    pub chdb: SharedSession,
     flush: Arc<FlushServiceImpl>,
     handle: tokio::task::JoinHandle<()>,
     shutdown: Option<watch::Sender<bool>>,
+    pub shard_routing: Arc<ShardRoutingContext>,
+    /// Set when started with `ShardedClusterOptions::forward_queue`.
+    pub forward_queue: Option<Arc<hyperbytedb::adapters::cluster::forward_queue::ForwardQueue>>,
 }
 
 #[derive(Clone)]
@@ -63,6 +71,9 @@ pub struct ShardedClusterOptions {
     pub replication: ReplicationConfig,
     pub raft: Option<HyperbytedbRaft>,
     pub leader_callbacks: Option<Arc<RaftLeaderCallbacks>>,
+    /// Acknowledge writes once their forwards are queued, as a server does.
+    /// Off by default: most suites assert on synchronous forwarding.
+    pub forward_queue: bool,
 }
 
 impl Default for ShardedClusterOptions {
@@ -72,11 +83,15 @@ impl Default for ShardedClusterOptions {
                 enabled: true,
                 scatter_peer_timeout_ms: 500,
                 scatter_max_peer_attempts: 3,
+                // Most suites assert on a measurement's single first region.
+                // Pre-split has its own test.
+                bootstrap_regions_per_node: 0,
                 ..Default::default()
             },
             replication: ReplicationConfig::default(),
             raft: None,
             leader_callbacks: None,
+            forward_queue: false,
         }
     }
 }
@@ -99,6 +114,7 @@ pub fn build_shared_membership(specs: &[(u64, String)]) -> SharedMembership {
             joined_at: now,
             last_heartbeat: now,
             needs_sync: false,
+            consecutive_misses: 0,
         });
     }
     new_shared(membership)
@@ -123,7 +139,7 @@ pub async fn start_sharded_node(
     let wal = Arc::new(RocksDbWal::open(&wal_dir).unwrap());
     let metadata = Arc::new(RocksDbMetadata::open(&meta_dir).unwrap());
     let chdb_adapter = Arc::new(ChdbQueryAdapter::from_shared(chdb.clone(), 0));
-    let sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(chdb));
+    let sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(chdb.clone()));
     let flush: Arc<FlushServiceImpl> =
         Arc::new(FlushServiceImpl::new(wal.clone(), 0, sink.clone()));
 
@@ -131,17 +147,25 @@ pub async fn start_sharded_node(
     let url = format!("http://{addr}");
 
     let replication_log = Arc::new(ReplicationLog::open(&repl_dir).unwrap());
-    let peer_client = Arc::new(PeerClient::new(
-        node_id,
-        addr.clone(),
-        shared_membership.clone(),
-        replication_log,
-        2,
-        8192,
-        8,
-        8 * 1024 * 1024,
-    ));
+    let peer_client = Arc::new(
+        PeerClient::new(
+            node_id,
+            addr.clone(),
+            shared_membership.clone(),
+            replication_log,
+            2,
+            8192,
+            8,
+            8 * 1024 * 1024,
+            Default::default(),
+        )
+        .with_http2_connections(4),
+    );
 
+    // One per node, as each process has: SET on one node must not reach
+    // another node's pools through a shared registry.
+    let runtime_settings =
+        Arc::new(hyperbytedb::application::runtime_settings::RuntimeSettings::default());
     let shard_map = Arc::new(RocksDbShardMap::open(&meta_dir, true).unwrap());
     let location_cache = Arc::new(ShardLocationCache::new());
     let shard_routing = Arc::new(ShardRoutingContext {
@@ -151,6 +175,8 @@ pub async fn start_sharded_node(
         node_id,
         peer_client: peer_client.clone(),
         region_write_stats: Arc::new(hyperbytedb::application::runtime::RegionWriteStats::new()),
+        forward_coalescer: Default::default(),
+        runtime_settings: runtime_settings.clone(),
     });
 
     let replication_apply = Some(ReplicationApplyQueue::with_sink_and_sharding(
@@ -187,6 +213,7 @@ pub async fn start_sharded_node(
         30,
         sink.clone(),
     )
+    .with_runtime_settings(runtime_settings.clone())
     .with_sharding(shard_routing.clone());
     base_query =
         base_query.with_cluster_replication(peer_client.clone(), node_id, opts.replication.clone());
@@ -197,29 +224,66 @@ pub async fn start_sharded_node(
     );
     let base_query: Arc<dyn QueryService> = Arc::new(base_query);
 
-    let ingestion: Arc<dyn hyperbytedb::ports::ingestion::IngestionPort> = Arc::new(
-        PeerIngestionService::with_replication_and_sink(
-            wal.clone(),
-            Some(sink.clone()),
-            metadata.clone(),
-            peer_client.clone(),
-            node_id,
-            IngestCardinalityLimits::default(),
-            0,
-            opts.replication.clone(),
-        )
-        .with_sharding(
-            shard_routing.clone(),
-            is_leader.clone(),
-            leader_addr.clone(),
-        ),
+    let mut ingestion_svc = PeerIngestionService::with_replication_and_sink(
+        wal.clone(),
+        Some(sink.clone()),
+        metadata.clone(),
+        peer_client.clone(),
+        node_id,
+        IngestCardinalityLimits::default(),
+        0,
+        opts.replication.clone(),
+    )
+    .with_sharding(
+        shard_routing.clone(),
+        is_leader.clone(),
+        leader_addr.clone(),
     );
+    let forward_queue = opts.forward_queue.then(|| {
+        Arc::new(
+            hyperbytedb::adapters::cluster::forward_queue::ForwardQueue::new(
+                peer_client.replication_log().db().clone(),
+            )
+            .unwrap(),
+        )
+    });
+    if let Some(q) = forward_queue.clone() {
+        ingestion_svc = ingestion_svc.with_forward_queue(q);
+    }
+    let ingestion_svc = Arc::new(ingestion_svc);
+    ingestion_svc.spawn_forward_drainer();
+    let ingestion: Arc<dyn hyperbytedb::ports::ingestion::IngestionPort> = ingestion_svc;
 
-    let query: Arc<dyn QueryService> = Arc::new(PeerQueryService::new(
+    let peer_query = PeerQueryService::new(
         base_query,
         metadata.clone(),
         peer_client.clone(),
-    ));
+        peer_client.cluster_auth(),
+    );
+    peer_query.set_shard_routing(shard_routing.clone());
+    let query: Arc<dyn QueryService> = Arc::new(peer_query);
+
+    // Only with a Raft handle: the scheduler owns proposals, and there is
+    // nothing to propose through without one. Its presence is what makes the
+    // heartbeat endpoint record anything.
+    let scheduler = opts.raft.clone().map(|raft| {
+        Arc::new(
+            hyperbytedb::application::shard_scheduler::ShardScheduler::new(
+                shard_map.clone(),
+                shared_membership.clone(),
+                raft,
+                Some(peer_client.clone()),
+                metadata.clone(),
+                wal.clone(),
+                Some(chdb_adapter.clone() as Arc<dyn QueryPort>),
+                Some(sink.clone()),
+                node_id,
+                opts.sharding.clone(),
+                0,
+                runtime_settings.clone(),
+            ),
+        )
+    });
 
     let (shutdown_tx, _) = watch::channel(false);
 
@@ -243,6 +307,8 @@ pub async fn start_sharded_node(
         drain_service: None,
         raft: opts.raft.clone(),
         auth_enabled: false,
+        runtime_settings: runtime_settings.clone(),
+        cluster_auth: Default::default(),
         auth_allow_query_param_credentials: false,
         prometheus_handle: None,
         statement_summary: None,
@@ -255,13 +321,15 @@ pub async fn start_sharded_node(
         max_points_per_request: 0,
         request_timeout_secs: 30,
         rate_limiter: None,
+        write_admission: None,
+        shard_write_admission: None,
         wal_batcher_alive: None,
         disk_read_only: None,
         sharding_enabled: true,
         shard_map: Some(shard_map.clone() as Arc<dyn ShardMapPort>),
         shard_location_cache: location_cache.clone(),
-        shard_routing: Some(shard_routing),
-        shard_scheduler: None,
+        shard_routing: Some(shard_routing.clone()),
+        shard_scheduler: scheduler.clone().map(|s| s as Arc<_>),
         ingest_cardinality: IngestCardinalityLimits::default(),
         ingest_schema_cache: Default::default(),
         cluster_replication: opts.replication.clone(),
@@ -284,10 +352,143 @@ pub async fn start_sharded_node(
         location_cache,
         membership: shared_membership,
         query_port: chdb_adapter,
+        scheduler,
+        chdb,
         flush,
         handle,
         shutdown: Some(shutdown_tx),
+        shard_routing,
+        forward_queue,
     }
+}
+
+pub async fn fetch_shard_map(
+    client: &reqwest::Client,
+    url: &str,
+) -> hyperbytedb::domain::sharding::ShardMap {
+    let resp = client
+        .get(format!("{url}/internal/shard/map"))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "shard map fetch failed: {}",
+        resp.status()
+    );
+    let json: hyperbytedb::domain::sharding::ShardMapJson = resp.json().await.unwrap();
+    json.into()
+}
+
+pub async fn install_shard_map_from_peer(from: &ShardedTestNode, onto: &ShardedTestNode) {
+    let client = reqwest::Client::new();
+    let map = fetch_shard_map(&client, &from.url).await;
+    onto.shard_map.replace_map(map).await.unwrap();
+    let snap = onto.shard_map.snapshot().await.unwrap();
+    onto.location_cache.refresh_from_map(&snap);
+}
+
+/// Start `node_id` sharing `existing`'s membership and chDB session (libchdb
+/// is process-global). Marks the joiner Active before serving.
+pub async fn start_sharded_joiner(
+    dir: &Path,
+    existing: &ShardedTestNode,
+    node_id: u64,
+    opts: &ShardedClusterOptions,
+) -> ShardedTestNode {
+    let listener = bind_ephemeral().await;
+    let addr = listener.local_addr().unwrap().to_string();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    {
+        let mut m = existing.membership.write().await;
+        m.add_node(NodeInfo {
+            node_id,
+            addr,
+            state: NodeState::Active,
+            joined_at: now,
+            last_heartbeat: now,
+            needs_sync: false,
+            consecutive_misses: 0,
+        });
+    }
+    start_sharded_node(
+        dir,
+        node_id,
+        listener,
+        existing.membership.clone(),
+        opts,
+        existing.chdb.clone(),
+    )
+    .await
+}
+
+pub async fn apply_add_peer_on_nodes(
+    nodes: &[&ShardedTestNode],
+    db: &str,
+    rp: &str,
+    measurement: &str,
+    to_peer: u64,
+) {
+    for node in nodes {
+        let map = node.shard_map.snapshot().await.unwrap();
+        let region = map
+            .space(db, rp, measurement)
+            .and_then(|s| s.regions.first())
+            .cloned()
+            .expect("region for AddPeer");
+        let op = ShardMapOp::AddPeer {
+            key: MeasurementKey::new(db, rp, measurement),
+            region_id: region.region_id,
+            to_peer,
+            epoch: region.epoch,
+            staging: false,
+        };
+        node.shard_map.apply_op(op).await.unwrap();
+        let snap = node.shard_map.snapshot().await.unwrap();
+        node.location_cache.refresh_from_map(&snap);
+    }
+}
+
+pub async fn apply_move_peer_on_nodes(
+    nodes: &[&ShardedTestNode],
+    db: &str,
+    rp: &str,
+    measurement: &str,
+    from_peer: u64,
+    to_peer: u64,
+) {
+    for node in nodes {
+        let map = node.shard_map.snapshot().await.unwrap();
+        let region = map
+            .space(db, rp, measurement)
+            .and_then(|s| s.regions.first())
+            .cloned()
+            .expect("region for MovePeer");
+        let op = ShardMapOp::MovePeer {
+            key: MeasurementKey::new(db, rp, measurement),
+            region_id: region.region_id,
+            from_peer,
+            to_peer,
+            epoch: region.epoch,
+        };
+        node.shard_map.apply_op(op).await.unwrap();
+        let snap = node.shard_map.snapshot().await.unwrap();
+        node.location_cache.refresh_from_map(&snap);
+    }
+}
+
+pub async fn start_sharded_single_node(dir: &Path, opts: ShardedClusterOptions) -> ShardedTestNode {
+    let chdb_dir = dir.join("chdb-shared");
+    std::fs::create_dir_all(&chdb_dir).unwrap();
+    let chdb = SharedSession::new_eager(chdb_dir.to_str().unwrap(), 1).unwrap();
+
+    let l1 = bind_ephemeral().await;
+    let a1 = l1.local_addr().unwrap().to_string();
+    let membership = build_shared_membership(&[(1, a1)]);
+    start_sharded_node(dir, 1, l1, membership, &opts, chdb).await
 }
 
 pub async fn start_sharded_pair_cluster(
@@ -351,6 +552,9 @@ pub async fn bootstrap_region_on_all_nodes(
         last_split_at: 0,
         transfer_verified: None,
         transfer_first_seen: None,
+        state: Default::default(),
+        staged_from: None,
+        staging_peers: Vec::new(),
     };
     let op = ShardMapOp::BootstrapMeasurement {
         key: MeasurementKey::new(db, rp, measurement),
@@ -371,6 +575,17 @@ pub async fn set_node_state(membership: &SharedMembership, node_id: u64, state: 
 /// without waiting for the scheduler).
 pub async fn promote_region_primary_on_all_nodes(
     nodes: &[ShardedTestNode],
+    db: &str,
+    rp: &str,
+    measurement: &str,
+    new_primary: u64,
+) {
+    let refs: Vec<&ShardedTestNode> = nodes.iter().collect();
+    promote_region_primary_on_nodes(&refs, db, rp, measurement, new_primary).await;
+}
+
+pub async fn promote_region_primary_on_nodes(
+    nodes: &[&ShardedTestNode],
     db: &str,
     rp: &str,
     measurement: &str,

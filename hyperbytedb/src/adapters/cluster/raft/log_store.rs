@@ -128,6 +128,7 @@ pub struct RaftStore {
     shard_map: Option<Arc<dyn ShardMapPort>>,
     shard_location_cache: Option<Arc<ShardLocationCache>>,
     shard_routing: Option<Arc<ShardRoutingContext>>,
+    runtime_settings: Option<Arc<crate::application::runtime_settings::RuntimeSettings>>,
 }
 
 impl RaftStore {
@@ -205,6 +206,7 @@ impl RaftStore {
             shard_map: None,
             shard_location_cache: None,
             shard_routing: None,
+            runtime_settings: None,
         })
     }
 
@@ -276,6 +278,7 @@ impl RaftStore {
                     joined_at: now,
                     last_heartbeat: now,
                     needs_sync: false,
+                    consecutive_misses: 0,
                 });
             }
         }
@@ -322,6 +325,15 @@ impl RaftStore {
     ) -> Self {
         self.shard_map = Some(shard_map);
         self.shard_location_cache = Some(location_cache);
+        self
+    }
+
+    /// This node's runtime settings, so a committed `SET` applies at once.
+    pub fn with_runtime_settings(
+        mut self,
+        settings: Arc<crate::application::runtime_settings::RuntimeSettings>,
+    ) -> Self {
+        self.runtime_settings = Some(settings);
         self
     }
 
@@ -526,6 +538,7 @@ impl RaftStorage<TypeConfig> for RaftStore {
             shard_map: self.shard_map.clone(),
             shard_location_cache: self.shard_location_cache.clone(),
             shard_routing: self.shard_routing.clone(),
+            runtime_settings: self.runtime_settings.clone(),
         }
     }
 
@@ -697,6 +710,7 @@ impl RaftStorage<TypeConfig> for RaftStore {
             shard_map: self.shard_map.clone(),
             shard_location_cache: self.shard_location_cache.clone(),
             shard_routing: self.shard_routing.clone(),
+            runtime_settings: self.runtime_settings.clone(),
         }
     }
 
@@ -887,6 +901,7 @@ impl RaftStore {
                     joined_at: now,
                     last_heartbeat: now,
                     needs_sync: false,
+                    consecutive_misses: 0,
                 });
             }
         }
@@ -916,43 +931,160 @@ impl RaftStore {
                 ClusterResponse::success()
             }
             ClusterRequest::SchemaMutation(mutation) => {
+                let space_drop = schema_mutation_apply::drop_space_for(&mutation);
+                let op = schema_mutation_apply::schema_mutation_op_label(&mutation);
                 if let Some(ref metadata) = self.metadata {
-                    match schema_mutation_apply::apply_schema_mutation(
+                    let resp = match schema_mutation_apply::apply_schema_mutation(
                         SchemaMutationDeps {
                             metadata,
                             mv_service: self.mv_service.as_deref(),
                             points_sink: self.points_sink.as_ref(),
                             wal: self.wal.as_ref(),
                             shard_routing: self.shard_routing.as_ref(),
+                            runtime_settings: self.runtime_settings.as_deref(),
                         },
                         *mutation,
                     )
                     .await
                     {
                         Ok(()) => ClusterResponse::success(),
-                        Err(e) => ClusterResponse::error(e.to_string()),
+                        Err(e) => {
+                            // Only the proposer sees the response; on every
+                            // other node this is the one trace of the failure.
+                            tracing::warn!(op, error = %e, "schema mutation apply failed");
+                            ClusterResponse::error(e.to_string())
+                        }
+                    };
+                    // Drop the shard space in the same log entry, so every
+                    // node drops it at the same point. Only when sharding is
+                    // on; `DropSpace` on an absent space is a no-op.
+                    if let Some(op) = space_drop
+                        && self.shard_map.is_some()
+                    {
+                        let dropped = self.apply_shard_map_op(op).await;
+                        if !dropped.ok {
+                            tracing::warn!(
+                                error = ?dropped.message,
+                                "schema drop applied but its shard space drop failed"
+                            );
+                        }
                     }
+                    resp
                 } else {
                     ClusterResponse::error("metadata port not available")
                 }
             }
-            ClusterRequest::ShardMapMutation(op) => {
-                if let Some(ref shard_map) = self.shard_map {
-                    let measurement_key = op.measurement_key().clone();
-                    match shard_map.apply_op(*op).await {
-                        Ok(map) => {
-                            if let Some(ref cache) = self.shard_location_cache {
-                                cache.refresh_measurement(&map, &measurement_key);
-                            }
-                            ClusterResponse::success()
-                        }
-                        Err(e) => ClusterResponse::error(e.to_string()),
-                    }
-                } else {
-                    ClusterResponse::error("shard map not available")
-                }
-            }
+            ClusterRequest::ShardMapMutation(op) => self.apply_shard_map_op(*op).await,
         }
+    }
+
+    async fn apply_shard_map_op(
+        &self,
+        op: crate::domain::sharding::ops::ShardMapOp,
+    ) -> ClusterResponse {
+        let Some(ref shard_map) = self.shard_map else {
+            return ClusterResponse::error("shard map not available");
+        };
+        // Against the pre-apply map: a `DropSpace` removes spaces, and every
+        // one of them needs its cache entry refreshed.
+        let changed = match shard_map.snapshot().await {
+            Ok(before) => op.affected_space_keys(&before),
+            Err(_) => op.measurement_key().cloned().into_iter().collect(),
+        };
+        match shard_map.apply_op(op).await {
+            Ok(map) => {
+                if let Some(ref cache) = self.shard_location_cache {
+                    for key in &changed {
+                        cache.refresh_measurement(&map, key);
+                    }
+                }
+                ClusterResponse::success()
+            }
+            Err(e) => ClusterResponse::error(e.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod schema_drop_tests {
+    use std::sync::Arc;
+
+    use super::RaftStore;
+    use crate::adapters::cluster::raft::types::ClusterRequest;
+    use crate::adapters::metadata::rocksdb_meta::RocksDbMetadata;
+    use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
+    use crate::domain::cluster::membership::new_shared;
+    use crate::domain::cluster::types::MutationRequest;
+    use crate::domain::sharding::location_cache::ShardLocationCache;
+    use crate::domain::sharding::ops::ShardMapOp;
+    use crate::domain::sharding::types::{MeasurementKey, ShardEpoch, ShardRegion};
+    use crate::ports::sharding::ShardMapPort;
+
+    /// Through the Raft apply path, not the helper: a clustered `DROP DATABASE`
+    /// arrives as a `SchemaMutation`, and the shard space must go with it.
+    /// On n3 it did not, and the orphan space's regions failed every transfer.
+    #[tokio::test]
+    async fn a_raft_database_drop_also_drops_its_shard_spaces() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let metadata = Arc::new(RocksDbMetadata::open(tmp.path().join("meta")).unwrap());
+        let shard_map: Arc<dyn ShardMapPort> =
+            Arc::new(RocksDbShardMap::open(&tmp.path().join("shard"), true).unwrap());
+        let store = RaftStore::open(tmp.path().join("raft"), new_shared(Default::default()))
+            .unwrap()
+            .with_metadata(metadata)
+            .with_shard_map(shard_map.clone(), Arc::new(ShardLocationCache::new()));
+
+        let key = MeasurementKey::new("linearity", "autogen", "cpu");
+        let other = MeasurementKey::new("keep", "autogen", "cpu");
+        for (id, k) in [(1, &key), (2, &other)] {
+            let resp = store
+                .apply_request(ClusterRequest::ShardMapMutation(Box::new(
+                    ShardMapOp::BootstrapMeasurement {
+                        key: k.clone(),
+                        region: ShardRegion {
+                            region_id: id,
+                            start: 0,
+                            end: u64::MAX,
+                            epoch: ShardEpoch::default(),
+                            peers: vec![1, 2],
+                            primary: 1,
+                            last_split_at: 0,
+                            transfer_verified: None,
+                            transfer_first_seen: None,
+                            state: Default::default(),
+                            staged_from: None,
+                            staging_peers: Vec::new(),
+                        },
+                    },
+                )))
+                .await;
+            assert!(resp.ok, "bootstrap {k:?}: {:?}", resp.message);
+        }
+        store
+            .apply_request(ClusterRequest::SchemaMutation(Box::new(
+                MutationRequest::CreateDatabase {
+                    name: "linearity".into(),
+                    rp: None,
+                },
+            )))
+            .await;
+
+        let resp = store
+            .apply_request(ClusterRequest::SchemaMutation(Box::new(
+                MutationRequest::DropDatabase("linearity".into()),
+            )))
+            .await;
+        assert!(resp.ok, "drop: {:?}", resp.message);
+
+        let map = shard_map.snapshot().await.unwrap();
+        assert!(
+            !map.spaces.contains_key(&key),
+            "dropped database kept its shard space"
+        );
+        assert!(
+            map.spaces.contains_key(&other),
+            "an unrelated space was dropped"
+        );
     }
 }
 
@@ -982,6 +1114,7 @@ mod tests {
                 joined_at: 100,
                 last_heartbeat: 100,
                 needs_sync: false,
+                consecutive_misses: 0,
             },
         );
         nodes.insert(
@@ -993,6 +1126,7 @@ mod tests {
                 joined_at: 100,
                 last_heartbeat: 100,
                 needs_sync: false,
+                consecutive_misses: 0,
             },
         );
         ClusterMembership { version: 7, nodes }
@@ -1103,6 +1237,7 @@ mod tests {
             joined_at: 1,
             last_heartbeat: 50,
             needs_sync: false,
+            consecutive_misses: 0,
         });
 
         let mut incoming = ClusterMembership::new();
@@ -1115,6 +1250,7 @@ mod tests {
             joined_at: 1,
             last_heartbeat: 99,
             needs_sync: false,
+            consecutive_misses: 0,
         });
         incoming.add_node(NodeInfo {
             node_id: 3,
@@ -1123,6 +1259,7 @@ mod tests {
             joined_at: 2,
             last_heartbeat: 99,
             needs_sync: false,
+            consecutive_misses: 0,
         });
 
         merge_snapshot_membership(&mut shared, incoming);
@@ -1196,6 +1333,7 @@ mod tests {
             joined_at: 100,
             last_heartbeat: 100,
             needs_sync: false,
+            consecutive_misses: 0,
         });
         let shared = new_shared(initial);
         let store = RaftStore::open(&raft_dir, shared.clone()).expect("open");

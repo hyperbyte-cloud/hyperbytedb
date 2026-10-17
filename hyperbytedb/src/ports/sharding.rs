@@ -27,6 +27,12 @@ pub trait ShardMapPort: Send + Sync {
 
     async fn apply_op(&self, op: ShardMapOp) -> Result<ShardMap, HyperbytedbError>;
 
+    /// Replace the local map with a peer snapshot (join catch-up).
+    ///
+    /// Used so a joiner's `map_version` matches the cluster before region
+    /// data movement starts. Does not change membership or region peers.
+    async fn replace_map(&self, map: ShardMap) -> Result<(), HyperbytedbError>;
+
     /// Returns true when this node holds a replica of any series for the measurement.
     async fn node_owns_measurement(
         &self,
@@ -70,6 +76,10 @@ impl ShardMapPort for DisabledShardMap {
     }
 
     async fn apply_op(&self, _op: ShardMapOp) -> Result<ShardMap, HyperbytedbError> {
+        Err(HyperbytedbError::Internal("sharding is disabled".into()))
+    }
+
+    async fn replace_map(&self, _map: ShardMap) -> Result<(), HyperbytedbError> {
         Err(HyperbytedbError::Internal("sharding is disabled".into()))
     }
 

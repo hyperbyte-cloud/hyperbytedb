@@ -1,0 +1,48 @@
+# 1-node sharded cluster for scale-up e2e (S0–S6).
+apiVersion: hyperbytedb.hyperbyte.cloud/v1alpha1
+kind: HyperbytedbCluster
+metadata:
+  name: hyperbytedb
+  namespace: hyperbytedb
+spec:
+  replicas: 1
+  image: hyperbytedb:local
+  imagePullPolicy: Never
+  server:
+    port: 8086
+    maxBodySizeBytes: 26214400
+    requestTimeoutSecs: 30
+    queryTimeoutSecs: 30
+    maxConcurrentQueries: 8
+  storage:
+    volumeClaimTemplate:
+      size: 16Gi
+  chdb:
+    poolSize: 1
+  flush:
+    intervalSecs: 5
+    maxPointsPerBatch: 100000
+  cluster:
+    heartbeatIntervalSecs: 2
+    heartbeatMissThreshold: 5
+    raftHeartbeatIntervalMs: 1000
+    raftElectionTimeoutMs: 5000
+    replication:
+      mode: async
+  resources:
+    requests:
+      cpu: 500m
+      memory: 2Gi
+    limits:
+      cpu: "2"
+      memory: 4Gi
+  proxy:
+    enabled: false
+  sharding:
+    enabled: true
+    replicationFactor: 2
+    regionSplitSeries: 25
+    regionMaxSeries: 40
+    regionMergeSeries: 2
+    splitMergeIntervalSecs: 30
+    heartbeatIntervalSecs: 10

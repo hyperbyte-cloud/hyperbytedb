@@ -200,3 +200,253 @@ async fn backup_restore_roundtrip() {
         "restored server should return cpu rows: {after}"
     );
 }
+
+/// `SET` changes a running server through the production wiring
+/// (`build_services`), and `DEFAULT` puts the config back.
+#[tokio::test]
+#[serial(chdb)]
+async fn runtime_settings_take_effect_and_reset() {
+    let server = E2eFixture::new().start().await;
+    server.create_db(DB).await;
+    let set = |q: &'static str| {
+        let server = &server;
+        async move {
+            // The query endpoint shares the rate limiter under test.
+            for _ in 0..50 {
+                let resp = server.post_query(q).await;
+                if resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    return resp.status();
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            panic!("{q}: rate limited throughout");
+        }
+    };
+
+    // Cardinality: a second measurement is refused, then allowed.
+    assert!(
+        set("SET max_measurements_per_database = 1")
+            .await
+            .is_success()
+    );
+    assert!(server.write(DB, "m1 v=1 1").await.status().is_success());
+    assert!(!server.write(DB, "m2 v=1 1").await.status().is_success());
+    assert!(
+        set("SET max_measurements_per_database = DEFAULT")
+            .await
+            .is_success()
+    );
+    assert!(server.write(DB, "m2 v=1 1").await.status().is_success());
+
+    // The rate limiter is off in the config; a SET turns it on.
+    assert!(set("SET rate_limit_per_second = 1").await.is_success());
+    let mut limited = 0;
+    for i in 0..5 {
+        let status = server.write(DB, &format!("m1 v={i} {i}")).await.status();
+        limited += usize::from(status == reqwest::StatusCode::TOO_MANY_REQUESTS);
+    }
+    assert!(limited >= 3, "{limited} of 5 writes limited");
+    assert!(
+        set("SET rate_limit_per_second = DEFAULT")
+            .await
+            .is_success()
+    );
+    for i in 0..5 {
+        assert!(
+            server
+                .write(DB, &format!("m1 v={i} {i}"))
+                .await
+                .status()
+                .is_success()
+        );
+    }
+
+    // Resource settings resize live; bad values are refused.
+    for q in [
+        "SET query_pool_size = 3",
+        "SET write_pool_size = 3",
+        "SET max_concurrent_queries = 2",
+        "SET max_inflight_writes = 4",
+        "SET log_level = 'hyperbytedb=debug,info'",
+    ] {
+        assert!(set(q).await.is_success(), "{q}");
+    }
+    assert_eq!(
+        server.query(DB, "SELECT count(v) FROM m2").await["results"][0]["error"],
+        serde_json::Value::Null
+    );
+    for q in [
+        "SET log_level = 'hyperbytedb=loud'",
+        "SET max_inflight_writes = 0",
+        "SET peer_heal_enabled = 3",
+    ] {
+        assert_eq!(set(q).await, reqwest::StatusCode::BAD_REQUEST, "{q}");
+    }
+    let shown = server.query(DB, "SHOW SETTINGS").await;
+    let rows = shown["results"][0]["series"][0]["values"]
+        .as_array()
+        .unwrap();
+    let row = |name: &str| rows.iter().find(|r| r[0] == name).unwrap().clone();
+    assert_eq!(row("max_concurrent_queries")[1], 2);
+    assert_eq!(row("max_concurrent_queries")[2], "set");
+    assert_eq!(row("log_level")[1], "hyperbytedb=debug,info");
+    for name in [
+        "query_pool_size",
+        "write_pool_size",
+        "max_concurrent_queries",
+        "max_inflight_writes",
+        "log_level",
+    ] {
+        let q = format!("SET {name} = DEFAULT");
+        assert!(server.post_query(&q).await.status().is_success(), "{q}");
+    }
+    let shown = server.query(DB, "SHOW SETTINGS").await;
+    let rows = shown["results"][0]["series"][0]["values"]
+        .as_array()
+        .unwrap();
+    let row = |name: &str| rows.iter().find(|r| r[0] == name).unwrap().clone();
+    assert_eq!(row("max_concurrent_queries")[2], "config");
+    assert_eq!(row("query_pool_size")[2], "auto");
+    server.stop().await;
+}
+
+/// SHOW TAG VALUES applies its WHERE (with or without `::tag`), LIMIT and
+/// OFFSET; all three were ignored.
+#[tokio::test]
+#[serial(chdb)]
+async fn show_tag_values_filters_by_where_and_limits() {
+    let server = E2eFixture::new().start().await;
+    server.create_db(DB).await;
+    let lines = "cpu,host=a,cpu=cpu0 v=1 1\ncpu,host=a,cpu=cpu1 v=1 1\ncpu,host=b,cpu=cpu2 v=1 1";
+    assert!(server.write(DB, lines).await.status().is_success());
+    let values = |q: &'static str| {
+        let server = &server;
+        async move {
+            let body = server.query(DB, q).await;
+            assert!(body["results"][0]["error"].is_null(), "{q}: {body}");
+            body["results"][0]["series"][0]["values"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| r[1].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+    for _ in 0..50 {
+        if values(r#"SHOW TAG VALUES FROM "cpu" WITH KEY = "cpu""#)
+            .await
+            .len()
+            == 3
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        values(r#"SHOW TAG VALUES FROM "cpu" WITH KEY = "cpu" WHERE "host"::tag = 'a'"#).await,
+        ["cpu0", "cpu1"]
+    );
+    assert_eq!(
+        values(r#"SHOW TAG VALUES FROM "cpu" WITH KEY = "cpu" WHERE "host" =~ /^b$/"#).await,
+        ["cpu2"]
+    );
+    assert!(
+        values(r#"SHOW TAG VALUES FROM "cpu" WITH KEY = "cpu" WHERE "host" = 'zzz'"#)
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        values(r#"SHOW TAG VALUES FROM "cpu" WITH KEY = "cpu" LIMIT 1 OFFSET 1"#).await,
+        ["cpu1"]
+    );
+    server.stop().await;
+}
+
+/// An aggregate without GROUP BY time() is stamped as InfluxDB 1.11 does:
+/// the WHERE's lower time bound, or epoch 0 without one. Every one was epoch
+/// 0, so Grafana tables showed 1970.
+#[tokio::test]
+#[serial(chdb)]
+async fn aggregate_time_is_the_lower_bound() {
+    let server = E2eFixture::new().start().await;
+    server.create_db(DB).await;
+    let lines = "m v=1 10000000000\nm v=2 20000000000\nm v=3 30000000000";
+    assert!(server.write(DB, lines).await.status().is_success());
+    let stamp = |q: &'static str| {
+        let server = &server;
+        async move {
+            for _ in 0..50 {
+                let body = server.query(DB, q).await;
+                if let Some(t) = body["results"][0]["series"][0]["values"][0][0].as_str() {
+                    return t.to_string();
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            panic!("{q}: no rows");
+        }
+    };
+    assert_eq!(
+        stamp("SELECT count(v) FROM m WHERE time >= 15s").await,
+        "1970-01-01T00:00:15Z"
+    );
+    assert_eq!(
+        stamp("SELECT mean(v) FROM m WHERE time >= 5s AND time <= 40s").await,
+        "1970-01-01T00:00:05Z"
+    );
+    assert_eq!(
+        stamp("SELECT sum(v) FROM m WHERE time <= 40s").await,
+        "1970-01-01T00:00:00Z"
+    );
+    assert_eq!(
+        stamp("SELECT count(v) FROM m").await,
+        "1970-01-01T00:00:00Z"
+    );
+    server.stop().await;
+}
+
+/// Columns come back in the SELECT's order, as in InfluxDB; `SELECT *`
+/// stays sorted. They were always sorted by name.
+#[tokio::test]
+#[serial(chdb)]
+async fn columns_follow_the_select_order() {
+    let server = E2eFixture::new().start().await;
+    server.create_db(DB).await;
+    assert!(
+        server
+            .write(DB, "m,h=x b=1,a=2 1000000000\nm,h=x b=3,a=4 2000000000")
+            .await
+            .status()
+            .is_success()
+    );
+    let columns = |q: &'static str| {
+        let server = &server;
+        async move {
+            for _ in 0..50 {
+                let body = server.query(DB, q).await;
+                if let Some(c) = body["results"][0]["series"][0]["columns"].as_array() {
+                    return c
+                        .iter()
+                        .map(|v| v.as_str().unwrap().to_string())
+                        .collect::<Vec<_>>();
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            panic!("{q}: no rows");
+        }
+    };
+    assert_eq!(
+        columns("SELECT max(b), min(b), count(b) FROM m").await,
+        ["time", "max", "min", "count"]
+    );
+    assert_eq!(
+        columns(
+            "SELECT mean(b), count(b) FROM m WHERE time >= 0s AND time <= 5s GROUP BY time(1s)"
+        )
+        .await,
+        ["time", "mean", "count"]
+    );
+    assert_eq!(columns("SELECT b, a FROM m").await, ["time", "b", "a"]);
+    assert_eq!(columns("SELECT * FROM m").await, ["time", "a", "b", "h"]);
+    server.stop().await;
+}

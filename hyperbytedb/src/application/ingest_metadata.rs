@@ -15,11 +15,70 @@ use crate::error::HyperbytedbError;
 use crate::ports::metadata::{MeasurementMeta, MetadataPort};
 use crate::ports::query::QueryPort;
 
-/// Cardinality limits (0 = unlimited for that bound), matching [`crate::config::CardinalityConfig`].
-#[derive(Debug, Clone, Copy, Default)]
+/// Cardinality limits (0 = unlimited for that bound), matching
+/// [`crate::config::CardinalityConfig`].
+///
+/// Clones share the values. The client-facing limits built at startup get
+/// `SET max_tag_values_per_measurement` / `SET max_measurements_per_database`
+/// through appliers; limits made elsewhere ([`Self::unlimited`] for copies of
+/// data that already exists: region transfers, replicas, sync) never do.
+/// The registry used to override whatever limits a caller passed, so after
+/// such a `SET` a region copy or replica of an existing measurement was
+/// refused.
+#[derive(Debug, Clone, Default)]
 pub struct IngestCardinalityLimits {
+    inner: Arc<SharedLimits>,
+}
+
+#[derive(Debug, Default)]
+struct SharedLimits {
+    max_tag_values_per_measurement: std::sync::atomic::AtomicUsize,
+    max_measurements_per_database: std::sync::atomic::AtomicUsize,
+}
+
+/// The limits at one moment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CardinalityLimitValues {
     pub max_tag_values_per_measurement: usize,
     pub max_measurements_per_database: usize,
+}
+
+impl IngestCardinalityLimits {
+    #[must_use]
+    pub fn new(
+        max_tag_values_per_measurement: usize,
+        max_measurements_per_database: usize,
+    ) -> Self {
+        let limits = Self::default();
+        limits.set_max_tag_values_per_measurement(max_tag_values_per_measurement);
+        limits.set_max_measurements_per_database(max_measurements_per_database);
+        limits
+    }
+
+    /// No limits, and no `SET` reaches them.
+    #[must_use]
+    pub fn unlimited() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn current(&self) -> CardinalityLimitValues {
+        use std::sync::atomic::Ordering::Relaxed;
+        CardinalityLimitValues {
+            max_tag_values_per_measurement: self.inner.max_tag_values_per_measurement.load(Relaxed),
+            max_measurements_per_database: self.inner.max_measurements_per_database.load(Relaxed),
+        }
+    }
+
+    pub fn set_max_tag_values_per_measurement(&self, n: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.inner.max_tag_values_per_measurement.store(n, Relaxed);
+    }
+
+    pub fn set_max_measurements_per_database(&self, n: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.inner.max_measurements_per_database.store(n, Relaxed);
+    }
 }
 
 /// Reject ingest batches that exceed the configured per-request point cap.
@@ -41,18 +100,32 @@ pub fn validate_point_count(count: usize, max_points: usize) -> Result<(), Hyper
 /// Cache misses are harmless (fall back to a RocksDB lookup).
 const MAX_CACHED_TAG_HASHES: usize = 1_048_576;
 
+/// Unregistered series per measurement: series id → its tags.
+type SeriesByMeasurement = HashMap<String, BTreeMap<u64, BTreeMap<String, String>>>;
+
 /// Fast in-memory cache for the ingest hot path.  Tracks which measurement
 /// schemas and tag values have already been persisted so that
 /// `prepare_batch_metadata` can return immediately with zero I/O when
 /// nothing has changed (the common steady-state case).
 pub struct IngestSchemaCache {
     /// (db, rp, measurement) → hash of (field_types, tag_keys) for schema identity.
-    schema: RwLock<HashMap<u64, u64>>,
+    schema: RwLock<HashMap<u64, u64, FastHash>>,
     /// Set of hashed (db, measurement, tag_key, tag_value) tuples already persisted.
-    tags: RwLock<HashSet<u64>>,
+    tags: RwLock<HashSet<u64, FastHash>>,
     /// Set of hashed (db, rp, measurement, series_id) tuples already registered,
     /// letting steady-state batches skip `register_series_batch` entirely.
-    series: RwLock<HashSet<u64>>,
+    series: RwLock<HashSet<u64, FastHash>>,
+}
+
+/// The cache's keys and sets live only in memory, so they use foldhash rather
+/// than std's SipHash: every tag of every point is hashed on each write, and
+/// SipHash was 4.1% of a node's CPU on n3.
+type FastHash = foldhash::fast::FixedState;
+
+fn fast_hasher() -> foldhash::fast::FoldHasher<'static> {
+    use std::hash::BuildHasher;
+    static STATE: FastHash = FastHash::with_seed(0x5ca1_ab1e_d00d_f00d);
+    STATE.build_hasher()
 }
 
 impl Default for IngestSchemaCache {
@@ -64,14 +137,14 @@ impl Default for IngestSchemaCache {
 impl IngestSchemaCache {
     pub fn new() -> Self {
         Self {
-            schema: RwLock::new(HashMap::with_capacity(256)),
-            tags: RwLock::new(HashSet::with_capacity(4096)),
-            series: RwLock::new(HashSet::with_capacity(8192)),
+            schema: RwLock::new(HashMap::with_capacity_and_hasher(256, FastHash::default())),
+            tags: RwLock::new(HashSet::with_capacity_and_hasher(4096, FastHash::default())),
+            series: RwLock::new(HashSet::with_capacity_and_hasher(8192, FastHash::default())),
         }
     }
 
     fn hash_key(db: &str, rp: &str, meas: &str) -> u64 {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let mut h = fast_hasher();
         db.hash(&mut h);
         rp.hash(&mut h);
         meas.hash(&mut h);
@@ -79,7 +152,7 @@ impl IngestSchemaCache {
     }
 
     fn hash_schema(field_types: &HashMap<String, u8>, tag_keys: &BTreeSet<String>) -> u64 {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let mut h = fast_hasher();
         let mut fields: Vec<(&String, &u8)> = field_types.iter().collect();
         fields.sort_by_key(|(k, _)| *k);
         for (k, v) in &fields {
@@ -93,7 +166,7 @@ impl IngestSchemaCache {
     }
 
     pub fn hash_tag(db: &str, rp: &str, meas: &str, tag_key: &str, tag_value: &str) -> u64 {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let mut h = fast_hasher();
         db.hash(&mut h);
         rp.hash(&mut h);
         meas.hash(&mut h);
@@ -135,6 +208,17 @@ impl IngestSchemaCache {
         self.is_tag_known_by_hash(h)
     }
 
+    /// Whether every tag value of every point is already persisted, under one
+    /// read lock rather than one per tag.
+    fn all_tags_known(&self, db: &str, rp: &str, points: &[&Point]) -> bool {
+        let cache = self.tags.read();
+        points.iter().all(|p| {
+            p.tags
+                .iter()
+                .all(|(k, v)| cache.contains(&Self::hash_tag(db, rp, &p.measurement, k, v)))
+        })
+    }
+
     fn is_tag_known_by_hash(&self, h: u64) -> bool {
         let cache = self.tags.read();
         cache.contains(&h)
@@ -152,7 +236,7 @@ impl IngestSchemaCache {
     }
 
     fn hash_series(db: &str, rp: &str, meas: &str, sid: u64) -> u64 {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let mut h = fast_hasher();
         db.hash(&mut h);
         rp.hash(&mut h);
         meas.hash(&mut h);
@@ -161,15 +245,17 @@ impl IngestSchemaCache {
     }
 
     /// Split `points` into per-measurement subsets containing only series this
-    /// cache has never seen registered. Empty map ⇒ every series is already
-    /// known and `register_series_batch` can be skipped entirely.
-    fn unknown_series_by_measurement(
+    /// cache has never seen registered, plus the points of those series. Empty
+    /// map ⇒ every series is already known and `register_series_batch` can be
+    /// skipped entirely.
+    fn unknown_series_by_measurement<'p>(
         &self,
         db: &str,
         rp: &str,
-        points: &[Point],
-    ) -> HashMap<String, BTreeMap<u64, BTreeMap<String, String>>> {
+        points: &'p [Point],
+    ) -> (SeriesByMeasurement, Vec<&'p Point>) {
         let mut out: HashMap<String, BTreeMap<u64, BTreeMap<String, String>>> = HashMap::new();
+        let mut fresh = Vec::new();
         let series = self.series.read();
         for p in points {
             let sid = crate::domain::series::series_id_for_point(p);
@@ -177,15 +263,22 @@ impl IngestSchemaCache {
             if series.contains(&h) {
                 continue;
             }
+            fresh.push(p);
             out.entry(p.measurement.clone())
                 .or_default()
                 .entry(sid)
                 .or_insert_with(|| p.tags.clone());
         }
-        out
+        (out, fresh)
     }
 
-    fn mark_series_seen(&self, db: &str, rp: &str, points: &[Point]) {
+    /// Mark these points' series as registered. Called only once their tag
+    /// values are persisted too, which is what lets later batches skip the
+    /// tag check for every point of a known series.
+    fn mark_series_seen(&self, db: &str, rp: &str, points: &[&Point]) {
+        if points.is_empty() {
+            return;
+        }
         let mut cache = self.series.write();
         if cache.len() > MAX_CACHED_TAG_HASHES {
             cache.clear();
@@ -356,7 +449,7 @@ pub async fn prepare_columnar_metadata(
     db: &str,
     rp: &str,
     batch: &crate::application::columnar_msgpack::ColumnarMsgpackBatch,
-    limits: IngestCardinalityLimits,
+    limits: &IngestCardinalityLimits,
     schema_cache: Option<&IngestSchemaCache>,
 ) -> Result<(), HyperbytedbError> {
     let mut field_types: HashMap<String, u8> = HashMap::with_capacity(1);
@@ -411,6 +504,7 @@ pub async fn prepare_columnar_metadata(
     }
 
     // Slow path: schema unknown
+    let limits = limits.current();
     if limits.max_measurements_per_database > 0 {
         let existing = metadata.list_measurements(db).await?;
         let is_new = !existing.contains(&batch.measurement);
@@ -540,20 +634,27 @@ pub async fn prepare_batch_metadata(
     db: &str,
     rp: &str,
     points: &[Point],
-    limits: IngestCardinalityLimits,
+    limits: &IngestCardinalityLimits,
     schema_cache: Option<&IngestSchemaCache>,
 ) -> Result<(), HyperbytedbError> {
     // Series registration short-circuit: steady-state batches whose series are
     // all already known skip the RocksDB registration round-trip entirely.
     // Unknown subsets register per measurement; registration is an idempotent
     // upsert, so a racing batch duplicating one new series is harmless.
+    //
+    // `fresh` is the points of series not seen before. A seen series had all
+    // its tag values persisted when it was first written (series are marked
+    // seen only after that), so only fresh points can carry an unseen tag
+    // value. Checking every tag of every point instead was ~5% of a node's
+    // CPU on n3, nearly all of it on series that were long known.
+    let mut fresh: Vec<&Point> = Vec::new();
     match schema_cache {
         Some(sc) => {
-            let unknown = sc.unknown_series_by_measurement(db, rp, points);
+            let (unknown, new_points) = sc.unknown_series_by_measurement(db, rp, points);
             if !unknown.is_empty() {
                 register_series_entries(metadata, db, rp, unknown).await?;
-                sc.mark_series_seen(db, rp, points);
             }
+            fresh = new_points;
         }
         None => register_series_from_points(metadata, db, rp, points).await?,
     }
@@ -561,9 +662,15 @@ pub async fn prepare_batch_metadata(
     let mut measurements: HashMap<String, (HashMap<String, u8>, BTreeSet<String>)> = HashMap::new();
 
     for point in points {
-        let entry = measurements
-            .entry(point.measurement.clone())
-            .or_insert_with(|| (HashMap::new(), BTreeSet::new()));
+        // Clone a name only the first time it is seen: this loop runs per
+        // point, and cloning the measurement and every tag key on every
+        // point was most of prepare_batch_metadata's own time.
+        if !measurements.contains_key(&point.measurement) {
+            measurements.insert(point.measurement.clone(), (HashMap::new(), BTreeSet::new()));
+        }
+        let Some(entry) = measurements.get_mut(&point.measurement) else {
+            continue;
+        };
         for (k, v) in &point.fields {
             let disc = v.type_discriminant();
             match entry.0.get_mut(k) {
@@ -578,7 +685,9 @@ pub async fn prepare_batch_metadata(
             }
         }
         for k in point.tags.keys() {
-            entry.1.insert(k.clone());
+            if !entry.1.contains(k) {
+                entry.1.insert(k.clone());
+            }
         }
     }
 
@@ -589,13 +698,10 @@ pub async fn prepare_batch_metadata(
 
         if all_schemas_known {
             // Schema is known → field types are unchanged, check_field_types is redundant.
-            let all_tags_known = points.iter().all(|p| {
-                p.tags
-                    .iter()
-                    .all(|(k, v)| sc.is_tag_known(db, rp, &p.measurement, k, v))
-            });
+            let all_tags_known = sc.all_tags_known(db, rp, &fresh);
             if all_tags_known {
                 // Full cache hit: zero I/O.
+                sc.mark_series_seen(db, rp, &fresh);
                 metrics::counter!("hyperbytedb_ingest_schema_cache_hits_total").increment(1);
                 return Ok(());
             }
@@ -604,7 +710,7 @@ pub async fn prepare_batch_metadata(
             // Tag values are only needed for SHOW TAG VALUES queries, not write
             // correctness, but import-style bulk loads query metadata immediately
             // after the write returns.
-            let novel_hashes: Vec<(u64,)> = points
+            let novel_hashes: Vec<(u64,)> = fresh
                 .iter()
                 .flat_map(|p| {
                     p.tags.iter().filter_map(move |(k, v)| {
@@ -624,7 +730,7 @@ pub async fn prepare_batch_metadata(
             for meas_name in measurements.keys() {
                 let mut seen: HashSet<(String, String)> = HashSet::new();
                 let mut batch: Vec<(String, String)> = Vec::new();
-                for point in points.iter().filter(|pt| pt.measurement == *meas_name) {
+                for point in fresh.iter().filter(|pt| pt.measurement == *meas_name) {
                     for (k, v) in &point.tags {
                         let h = IngestSchemaCache::hash_tag(db, rp, &point.measurement, k, v);
                         if novel_set.contains(&h) && seen.insert((k.clone(), v.clone())) {
@@ -642,6 +748,7 @@ pub async fn prepare_batch_metadata(
                     .await?;
                 sc.mark_tags(&novel_hashes);
             }
+            sc.mark_series_seen(db, rp, &fresh);
             metrics::counter!("hyperbytedb_ingest_schema_cache_hits_total").increment(1);
             return Ok(());
         }
@@ -649,6 +756,7 @@ pub async fn prepare_batch_metadata(
 
     // Slow path: schema is unknown (first write for a measurement, or schema changed).
     // Full validation + registration.
+    let limits = limits.current();
 
     if limits.max_measurements_per_database > 0 {
         let existing = metadata.list_measurements(db).await?;
@@ -753,6 +861,7 @@ pub async fn prepare_batch_metadata(
             })
             .collect();
         sc.mark_tags(&novel_hashes);
+        sc.mark_series_seen(db, rp, &fresh);
     }
 
     Ok(())
@@ -775,7 +884,133 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.clone()))
                 .collect(),
             timestamp: ts,
+            series_id_cache: Default::default(),
         }
+    }
+
+    /// A SET changes the client-facing limits (every clone of them) and
+    /// never the unlimited ones that copies of existing data use: before,
+    /// `SET max_tag_values_per_measurement` refused region transfers and
+    /// replicas of any measurement already over it.
+    #[tokio::test]
+    async fn a_set_limit_reaches_clients_not_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta: Arc<dyn MetadataPort> =
+            Arc::new(RocksDbMetadata::open(dir.path().join("meta")).unwrap());
+        meta.create_database("db").await.unwrap();
+        let host = |h: &str, ts: i64| {
+            let mut p = point("cpu", &[("v", FieldValue::Float(1.0))], ts);
+            p.tags.insert("host".into(), h.into());
+            p
+        };
+        let client = IngestCardinalityLimits::new(0, 0);
+        let held_by_a_service = client.clone();
+        client.set_max_tag_values_per_measurement(1);
+        assert_eq!(
+            held_by_a_service.current().max_tag_values_per_measurement,
+            1
+        );
+
+        let two_hosts = [host("a", 1), host("b", 2)];
+        let copy = IngestCardinalityLimits::unlimited();
+        prepare_batch_metadata(&meta, "db", "autogen", &two_hosts, &copy, None)
+            .await
+            .expect("a copy of existing data is never refused");
+        let err = prepare_batch_metadata(
+            &meta,
+            "db",
+            "autogen",
+            &[host("c", 3)],
+            &held_by_a_service,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, HyperbytedbError::CardinalityExceeded { limit: 1, .. }),
+            "{err:?}"
+        );
+    }
+
+    /// Tag checks run only for points of series not seen before. A new tag
+    /// value always means a new series id, so a new host under a schema that
+    /// is already known must still have its tag value persisted, and a batch
+    /// of known series must not re-check any tag.
+    #[tokio::test]
+    async fn only_new_series_have_their_tag_values_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta: Arc<dyn MetadataPort> =
+            Arc::new(RocksDbMetadata::open(dir.path().join("meta")).unwrap());
+        meta.create_database("db").await.unwrap();
+        let cache = IngestSchemaCache::new();
+        let host = |h: &str, ts: i64| {
+            let mut p = point("cpu", &[("v", FieldValue::Float(1.0))], ts);
+            p.tags.insert("host".into(), h.into());
+            p
+        };
+        let limits = IngestCardinalityLimits::default();
+
+        // First write: schema unknown, slow path registers host=a.
+        prepare_batch_metadata(
+            &meta,
+            "db",
+            "autogen",
+            &[host("a", 1)],
+            &limits,
+            Some(&cache),
+        )
+        .await
+        .unwrap();
+        // Known schema, new series: host=b must still be persisted.
+        prepare_batch_metadata(
+            &meta,
+            "db",
+            "autogen",
+            &[host("a", 2), host("b", 3)],
+            &limits,
+            Some(&cache),
+        )
+        .await
+        .unwrap();
+        for h in ["a", "b"] {
+            assert!(
+                meta.tag_value_is_known("db", "autogen", "cpu", "host", h)
+                    .await
+                    .unwrap(),
+                "host={h} must be persisted"
+            );
+        }
+        let tag_hash = |h: &str| IngestSchemaCache::hash_tag("db", "autogen", "cpu", "host", h);
+        assert!(cache.is_tag_known_by_hash(tag_hash("b")));
+
+        // Known series only: no point is fresh, so no tag is looked at. Drop
+        // the tag cache to prove it: a re-check would now see "unknown".
+        cache.tags.write().clear();
+        let again = [host("a", 4), host("b", 5)];
+        let (unknown, fresh) = cache.unknown_series_by_measurement("db", "autogen", &again);
+        assert!(unknown.is_empty() && fresh.is_empty());
+        prepare_batch_metadata(&meta, "db", "autogen", &again, &limits, Some(&cache))
+            .await
+            .unwrap();
+        assert!(
+            !cache.is_tag_known_by_hash(tag_hash("a")),
+            "known series must not trigger tag work"
+        );
+    }
+
+    /// The batch tag check passes only when every tag value of every point is
+    /// cached.
+    #[test]
+    fn all_tags_known_needs_every_tag_value() {
+        let cache = IngestSchemaCache::new();
+        let known = point("cpu", &[("v", FieldValue::Float(1.0))], 1);
+        cache.mark_tags(&[(IngestSchemaCache::hash_tag("db", "rp", "cpu", "host", "h"),)]);
+        assert!(cache.all_tags_known("db", "rp", &[&known]));
+
+        let mut other = point("cpu", &[("v", FieldValue::Float(1.0))], 2);
+        other.tags.insert("host".into(), "new".into());
+        assert!(!cache.all_tags_known("db", "rp", &[&known, &other]));
+        assert!(!cache.all_tags_known("other_db", "rp", &[&known]));
     }
 
     /// Simulates two cluster nodes that seeded `uptime` differently in local
@@ -809,7 +1044,7 @@ mod tests {
             "db",
             "autogen",
             &points,
-            IngestCardinalityLimits::default(),
+            &IngestCardinalityLimits::default(),
             None,
         )
         .await
@@ -844,7 +1079,7 @@ mod tests {
             "db",
             "autogen",
             &full,
-            IngestCardinalityLimits::default(),
+            &IngestCardinalityLimits::default(),
             None,
         )
         .await
@@ -860,7 +1095,7 @@ mod tests {
             "db",
             "autogen",
             &partial,
-            IngestCardinalityLimits::default(),
+            &IngestCardinalityLimits::default(),
             None,
         )
         .await

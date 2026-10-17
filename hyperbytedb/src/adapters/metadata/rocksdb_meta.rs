@@ -309,15 +309,20 @@ impl RocksDbMetadata {
     ) -> Result<u64, HyperbytedbError> {
         let rdb = self.db.clone();
         let prefix = series_prefix(db, rp, measurement);
+        let first = series_storage_key(db, rp, measurement, start);
         meta_blocking(move || {
             let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
                 HyperbytedbError::Metadata("metadata column family not found".into())
             })?;
             let pbytes = prefix.as_bytes();
+            // Seek to the first id in range: ids are fixed-width hex, so key
+            // order is id order. Starting at the prefix walked every series
+            // below `start`, for every region, on every heartbeat, and a
+            // node's series count grows with the cluster.
             let iter = rdb.iterator_cf_opt(
                 &cf,
                 rocksdb::ReadOptions::default(),
-                IteratorMode::From(pbytes, rocksdb::Direction::Forward),
+                IteratorMode::From(first.as_bytes(), rocksdb::Direction::Forward),
             );
             let mut count = 0u64;
             for item in iter {
@@ -356,15 +361,17 @@ impl RocksDbMetadata {
     ) -> Result<Option<u64>, HyperbytedbError> {
         let rdb = self.db.clone();
         let prefix = series_prefix(db, rp, measurement);
+        let first = series_storage_key(db, rp, measurement, start);
         meta_blocking(move || {
             let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
                 HyperbytedbError::Metadata("metadata column family not found".into())
             })?;
             let pbytes = prefix.as_bytes();
+            // Seek to the first id in range, as in `count_series_ids_blocking`.
             let iter = rdb.iterator_cf_opt(
                 &cf,
                 rocksdb::ReadOptions::default(),
-                IteratorMode::From(pbytes, rocksdb::Direction::Forward),
+                IteratorMode::From(first.as_bytes(), rocksdb::Direction::Forward),
             );
             let mut seen = 0u64;
             for item in iter {
@@ -716,30 +723,30 @@ impl MetadataPort for RocksDbMetadata {
             let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
                 HyperbytedbError::Metadata("metadata column family not found".into())
             })?;
-            let db_prefix = format!("db:{}", name_owned);
-            let meas_prefix = format!("meas:{}:", name_owned);
-            let tag_prefix = format!("tag_val:{}:", name_owned);
-            let series_db_prefix = format!("series:{}:", name_owned);
-
-            let iter =
-                rdb.iterator_cf_opt(&cf, rocksdb::ReadOptions::default(), IteratorMode::Start);
-            let mut to_delete = Vec::new();
-            for item in iter {
-                if let Ok((key, _)) = item
-                    && let Ok(k) = std::str::from_utf8(&key)
-                    && (k.starts_with(&db_prefix)
-                        || k.starts_with(&meas_prefix)
-                        || k.starts_with(&tag_prefix)
-                        || k.starts_with(&series_db_prefix))
-                {
-                    to_delete.push(key.to_vec());
+            // The database's own key exactly, and everything under its
+            // prefixes as ranges. Collecting every matching key from a scan
+            // of the whole column family held millions of series keys in
+            // memory at once and deleted them one by one; and "db:{name}"
+            // as a prefix also matched "db:{name}_other", so dropping one
+            // database could delete another's record.
+            let mut batch = rocksdb::WriteBatch::default();
+            batch.delete_cf(&cf, db_key(&name_owned));
+            for prefix in [
+                format!("meas:{name_owned}:"),
+                format!("tag_val:{name_owned}:"),
+                format!("series:{name_owned}:"),
+            ] {
+                let start = prefix.into_bytes();
+                let mut end = start.clone();
+                // Every prefix ends in ':', so bumping it bounds the range.
+                if let Some(last) = end.last_mut() {
+                    *last += 1;
                 }
+                batch.delete_range_cf(&cf, start, end);
             }
-            for k in to_delete {
-                rdb.delete_cf(&cf, k).map_err(|e| {
-                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
-                })?;
-            }
+            rdb.write(batch).map_err(|e| {
+                HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+            })?;
             Ok(())
         })
         .await?;
@@ -1764,6 +1771,31 @@ impl MetadataPort for RocksDbMetadata {
         Ok(())
     }
 
+    async fn put_user(
+        &self,
+        username: &str,
+        user: &crate::domain::user::StoredUser,
+    ) -> Result<(), HyperbytedbError> {
+        let rdb = self.db.clone();
+        let key = user_key(username);
+        let value = serde_json::to_vec(user)
+            .map_err(|e| HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e)))?;
+        meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            rdb.put_cf(&cf, key, value).map_err(|e| {
+                HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+            })?;
+            Ok(())
+        })
+        .await?;
+        self.user_cache
+            .write()
+            .insert(username.to_string(), user.clone());
+        Ok(())
+    }
+
     async fn drop_user(&self, username: &str) -> Result<(), HyperbytedbError> {
         let rdb = self.db.clone();
         let key = user_key(username);
@@ -2098,6 +2130,54 @@ impl MetadataPort for RocksDbMetadata {
         Ok(())
     }
 
+    async fn get_setting(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::domain::setting::SettingValue>, HyperbytedbError> {
+        let rdb = self.db.clone();
+        let key = format!("setting:{name}");
+        meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            match rdb.get_cf(&cf, key.as_bytes()) {
+                Ok(Some(v)) => serde_json::from_slice(&v).map(Some).map_err(|e| {
+                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                }),
+                Ok(None) => Ok(None),
+                Err(e) => Err(HyperbytedbError::Metadata(
+                    crate::error::ChainedError::from_error(e),
+                )),
+            }
+        })
+        .await
+    }
+
+    async fn set_setting(
+        &self,
+        name: &str,
+        value: Option<crate::domain::setting::SettingValue>,
+    ) -> Result<(), HyperbytedbError> {
+        let rdb = self.db.clone();
+        let key = format!("setting:{name}");
+        meta_blocking(move || {
+            let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
+                HyperbytedbError::Metadata("metadata column family not found".into())
+            })?;
+            let result = match value {
+                Some(v) => rdb.put_cf(
+                    &cf,
+                    key.as_bytes(),
+                    serde_json::to_vec(&v).unwrap_or_default(),
+                ),
+                None => rdb.delete_cf(&cf, key.as_bytes()),
+            };
+            result
+                .map_err(|e| HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e)))
+        })
+        .await
+    }
+
     async fn store_continuous_query(
         &self,
         db: &str,
@@ -2386,5 +2466,98 @@ impl MetadataPort for RocksDbMetadata {
         .await?;
         *self.mv_cache.write() = None;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod series_range_tests {
+    use super::*;
+
+    /// Dropping a database removes its own metadata and nothing of a database
+    /// whose name it prefixes. "db:{name}" was matched as a prefix, so
+    /// dropping "foo" also deleted "foobar"'s record.
+    #[tokio::test]
+    async fn dropping_a_database_leaves_one_it_prefixes_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = RocksDbMetadata::open(dir.path()).unwrap();
+        for db in ["foo", "foobar"] {
+            meta.create_database(db).await.unwrap();
+            meta.register_measurement(
+                db,
+                "autogen",
+                &MeasurementMeta {
+                    name: "cpu".into(),
+                    tag_keys: vec!["host".into()],
+                    field_types: [("value".into(), 0_u8)].into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let series: Vec<(u64, BTreeMap<String, String>)> = (1..=50u64)
+                .map(|id| (id, [("host".to_string(), format!("h{id}"))].into()))
+                .collect();
+            meta.register_series_batch(db, "autogen", "cpu", &series)
+                .await
+                .unwrap();
+        }
+
+        meta.drop_database("foo").await.unwrap();
+        // Read back from disk, not from the in-memory caches.
+        drop(meta);
+        let meta = RocksDbMetadata::open(dir.path()).unwrap();
+
+        assert!(meta.get_database("foo").await.unwrap().is_none());
+        assert!(
+            meta.list_series_ids("foo", "autogen", "cpu")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            meta.get_database("foobar").await.unwrap().is_some(),
+            "dropping foo deleted foobar"
+        );
+        assert_eq!(
+            meta.list_series_ids("foobar", "autogen", "cpu")
+                .await
+                .unwrap()
+                .len(),
+            50
+        );
+    }
+
+    /// Ranges that start mid-space, with series exactly at `start` (in) and
+    /// at `end` (out), and another measurement sorting right after this one.
+    #[tokio::test]
+    async fn range_counts_and_medians_cover_exactly_start_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = RocksDbMetadata::open(dir.path()).unwrap();
+        let ids: Vec<u64> = vec![1, 10, 100, 1_000, 1 << 40, 1 << 62, u64::MAX - 1];
+        let series: Vec<(u64, BTreeMap<String, String>)> =
+            ids.iter().map(|id| (*id, BTreeMap::new())).collect();
+        meta.register_series_batch("db", "autogen", "cpu", &series)
+            .await
+            .unwrap();
+        meta.register_series_batch("db", "autogen", "cpu2", &series)
+            .await
+            .unwrap();
+
+        let count = |start, end| meta.count_series_ids_in_range("db", "autogen", "cpu", start, end);
+        assert_eq!(count(0, u64::MAX).await.unwrap(), 7);
+        assert_eq!(
+            count(10, 1_000).await.unwrap(),
+            2,
+            "10 and 100; 1000 is the end"
+        );
+        assert_eq!(count(11, 1 << 40).await.unwrap(), 2, "100 and 1000");
+        assert_eq!(count(1 << 40, u64::MAX).await.unwrap(), 3);
+        assert_eq!(count(2, 10).await.unwrap(), 0);
+
+        let median =
+            |start, end| meta.median_series_id_in_range("db", "autogen", "cpu", start, end);
+        assert_eq!(median(10, 1 << 62).await.unwrap(), Some(1_000));
+        assert_eq!(median(1 << 40, u64::MAX).await.unwrap(), Some(1 << 62));
+        assert_eq!(median(2, 10).await.unwrap(), None);
     }
 }

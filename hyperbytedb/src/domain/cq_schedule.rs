@@ -283,6 +283,7 @@ mod tests {
             coverage_interval_secs: 0,
             is_advanced: false,
             last_run_at: None,
+            influxql_names: true,
         };
         meta.apply_to(&mut def);
         def

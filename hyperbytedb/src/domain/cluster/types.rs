@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::domain::continuous_query::ContinuousQueryDef;
 use crate::domain::database::RetentionPolicy;
 use crate::domain::materialized_view::MaterializedViewDef;
+use crate::domain::measurement::MeasurementMeta;
 use crate::timeseriesql::ast::RetentionPolicyChange;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +50,11 @@ pub enum MutationRequest {
         database: String,
         name: String,
         definition: MaterializedViewDef,
+        /// The source measurement's schema on the proposing node. With
+        /// sharding a node has the measurement only once rows for it land
+        /// there, and it needs it to create the view before the first row.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_meta: Option<Box<MeasurementMeta>>,
     },
     DropMaterializedView {
         database: String,
@@ -73,10 +79,20 @@ pub enum MutationRequest {
     Grant {
         username: String,
         database: Option<String>,
+        #[serde(default)]
+        privilege: crate::domain::user::DatabasePrivilege,
     },
     Revoke {
         username: String,
         database: Option<String>,
+        #[serde(default)]
+        privilege: crate::domain::user::DatabasePrivilege,
+    },
+    /// `SET <setting> = <value> | DEFAULT`. A node on a build without it
+    /// cannot decode it: do not run `SET` during a rolling upgrade.
+    SetSetting {
+        name: String,
+        value: Option<crate::domain::setting::SettingValue>,
     },
 }
 

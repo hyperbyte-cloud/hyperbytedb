@@ -187,6 +187,10 @@ SELECT <field_expression>[, ...] FROM <measurement>
 - Aliases: `mean("value") AS avg_value`
 - Type hints: `"host"::tag`, `"value"::field`
 
+**Column names** follow InfluxQL: an alias wins; otherwise a function call is named after the function (`mean("value")` → `mean`), an expression after the fields and functions in it (`"a" + "b"` → `a_b`), and a repeated name gets `_1`, `_2` (`mean("a"), mean("b")` → `mean`, `mean_1`).
+
+**The `time` column** is always first. Raw selects return each point's time and `GROUP BY time()` returns each bucket's start. An aggregate without `GROUP BY time()` returns one row stamped `1970-01-01T00:00:00Z`, whatever the `WHERE` time range; a lone `first()`, `last()`, `max()` or `min()` returns the selected point's own time.
+
 **FROM clause:**
 - Single: `FROM "cpu"`
 - Fully-qualified: `FROM "mydb"."myrp"."cpu"`
@@ -265,10 +269,14 @@ SHOW TAG KEYS [FROM <measurement>]
 SHOW TAG VALUES [FROM <measurement>] WITH KEY = "<key>"
 SHOW TAG VALUES [FROM <measurement>] WITH KEY =~ /<regex>/
 SHOW TAG VALUES [FROM <measurement>] WITH KEY IN ("<key1>", "<key2>")
+  [WHERE <tag conditions>] [LIMIT <n>] [OFFSET <n>]
+                                      -- tag conditions: =, !=, =~, !~, AND, OR,
+                                      -- with or without ::tag; time is ignored
 SHOW FIELD KEYS [FROM <measurement>]
 SHOW SERIES [FROM <measurement>]
 SHOW RETENTION POLICIES [ON <database>]
 SHOW USERS
+SHOW GRANTS FOR <user>                -- admin; database, privilege
 SHOW CONTINUOUS QUERIES
 ```
 
@@ -288,6 +296,10 @@ DROP RETENTION POLICY "<name>" ON "<db>"
 CREATE USER "<name>" WITH PASSWORD '<password>'
 DROP USER "<name>"
 SET PASSWORD FOR "<name>" = '<password>'
+GRANT READ | WRITE | ALL ON "<db>" TO "<user>"
+REVOKE READ | WRITE | ALL ON "<db>" FROM "<user>"
+GRANT ALL PRIVILEGES TO "<user>"       -- make admin
+REVOKE ALL PRIVILEGES FROM "<user>"
 
 CREATE CONTINUOUS QUERY "<name>" ON "<db>"
   [RESAMPLE EVERY <interval> FOR <interval>]
@@ -295,10 +307,58 @@ CREATE CONTINUOUS QUERY "<name>" ON "<db>"
 DROP CONTINUOUS QUERY "<name>" ON "<db>"
 
 CREATE MATERIALIZED VIEW "<name>" ON "<db>"
-  AS <select_into_statement>
+  AS <select_into_statement>          -- every column needs AS "<name>"
 DROP MATERIALIZED VIEW "<name>" ON "<db>"
 SHOW MATERIALIZED VIEWS
+
+SET <setting> = <integer> | TRUE | FALSE | '<text>' | DEFAULT
+                                      -- admin; applied on every node at once
+SHOW SETTINGS                         -- name, value, source, config, description
 ```
+
+### Runtime settings
+
+A `SET` overrides the config file on every node. `source` in
+`SHOW SETTINGS` is `set` (an override), `config` (the node's config file) or
+`auto` (derived from the node's CPUs). Each node keeps its own config value
+underneath, so `DEFAULT` returns every node to its own.
+
+| Setting | Values | Config key | Takes effect |
+|---|---|---|---|
+| `log_level` | filter text, e.g. `'info'`, `'hyperbytedb=debug,info'` | `logging.level` (or `RUST_LOG`) | next log line |
+| `query_pool_size` | 1-128 | `chdb.query_pool_size`, else CPUs + 1 | pool resizes at once |
+| `write_pool_size` | 1-128 | `chdb.write_pool_size` | pool resizes at once |
+| `max_concurrent_queries` | 0-100000 (0: unlimited) | `server.max_concurrent_queries` | next query; running ones finish under the old cap |
+| `query_timeout_secs` | 1-86400 | `server.query_timeout_secs` | next query |
+| `max_inflight_writes` | 1-1000000 | `server.max_inflight_writes`, else 32 per CPU | next request; a shrink takes permits back as writes finish |
+| `rate_limit_per_second` | 0 or more (0: off) | `rate_limit.max_requests_per_second` when `rate_limit.enabled` | next request; turning it on starts with a full bucket |
+| `max_tag_values_per_measurement` | 0 or more (0: unlimited) | `cardinality.max_tag_values_per_measurement` | next new series |
+| `max_measurements_per_database` | 0 or more (0: unlimited) | `cardinality.max_measurements_per_database` | next new measurement |
+| `flush_interval_secs` | 1-3600 | `flush.interval_secs` | after the current wait |
+| `add_peer_proposals_enabled` | `TRUE`/`FALSE` | `sharding.add_peer_proposals_enabled` | next scheduler tick |
+| `remove_peer_proposals_enabled` | `TRUE`/`FALSE` | `sharding.remove_peer_proposals_enabled` | next scheduler tick |
+| `peer_heal_enabled` | `TRUE`/`FALSE` | `sharding.peer_heal_enabled` | next scheduler tick |
+| `schedule_limit` | 1-256 | `sharding.schedule_limit` | at once; running copies finish |
+| `movement_budget_bytes_per_sec` | 0 or more (0: unlimited) | `sharding.movement_budget_bytes_per_sec` | next scheduler tick |
+| `region_split_series` | 1 or more | `sharding.region_split_series` | next split check |
+| `region_max_series` | 1 or more | `sharding.region_max_series` | next split check |
+| `region_merge_series` | 0 or more | `sharding.region_merge_series` | next merge check |
+| `split_merge_interval_secs` | 1-86400 | `sharding.split_merge_interval_secs` | next split check |
+| `bootstrap_regions_per_node` | 0-16 (0: one region) | `sharding.bootstrap_regions_per_node` | next new measurement |
+
+The cardinality limits apply to client writes. Region copies, replicas and
+node syncs copy data that already exists, so a lower limit never refuses
+them.
+
+The scheduler settings only do anything on a sharded cluster; elsewhere
+`SHOW SETTINGS` lists them without a value. Settings that need a restart
+anyway (listen addresses, data paths, Raft timing, replication factor, TLS,
+auth) are not runtime settings.
+
+`SET` is replicated through Raft and stored, so it survives a restart and
+reaches nodes that join later. `SET <setting> = DEFAULT` removes the
+override. Do not run `SET` while a rolling upgrade from a version without it
+is in progress: nodes on the older build cannot decode it.
 
 ### DELETE
 
@@ -334,7 +394,7 @@ DELETE marks data with tombstone records. Tombstoned data is excluded from queri
 | **Storage format** | chDB MergeTree tables instead of TSM shards. No direct TSM import. |
 | **fill(previous/linear)** | Via ClickHouse `INTERPOLATE`; may differ at series boundaries. |
 | **SELECT INTO with regex** | Not supported. Use explicit measurement names. |
-| **Permissions** | Admin vs non-admin only. No per-database GRANT/REVOKE. |
+| **Permissions** | Admin users, plus `GRANT`/`REVOKE` `READ`, `WRITE` or `ALL` per database, as in InfluxDB v1. |
 | **Subscriptions** | Not supported. |
 
 ### Recommendations

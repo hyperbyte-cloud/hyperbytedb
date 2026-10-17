@@ -88,3 +88,128 @@ async fn build_prepared_wal_slot_keeps_all_measurements_in_telegraf_batch() {
     assert_eq!(cpu_batch.row_count, 2);
     assert_eq!(slot.total_rows(), points.len());
 }
+
+/// The engine's columns are probed (`DESCRIBE TABLE`) only while this
+/// process has not yet materialized the table. Probing on every batch queued
+/// each write behind flush inserts on the shared chDB pool: ~0.5s per Arrow
+/// build at scale.
+#[tokio::test]
+#[serial(chdb)]
+async fn engine_columns_are_probed_once_per_table_not_per_batch() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let meta_path = tmpdir.path().join("meta");
+    let chdb_path = tmpdir.path().join("chdb");
+    std::fs::create_dir_all(&meta_path).unwrap();
+    std::fs::create_dir_all(&chdb_path).unwrap();
+    let metadata = std::sync::Arc::new(RocksDbMetadata::open(&meta_path).unwrap());
+    metadata.create_database("db").await.unwrap();
+    let shared = SharedSession::new_eager(chdb_path.to_str().unwrap(), 1).unwrap();
+
+    let sink = ChdbNativeAdapter::with_metadata(shared.clone(), Some(metadata.clone()));
+    for i in 0..5 {
+        let line = format!("cpu,host=h{i} v=1 {}", 1_780_000_000_000_000_000i64 + i);
+        let points = parse_line_body_to_points(line.as_bytes(), None).unwrap();
+        sink.build_prepared_wal_slot("db", "autogen", 1, &points)
+            .await
+            .unwrap();
+    }
+    assert_eq!(sink.engine_probe_count(), 1, "one probe, then the cache");
+
+    // A new adapter (a restart) starts cold and must probe again, once.
+    let restarted = ChdbNativeAdapter::with_metadata(shared, Some(metadata));
+    for i in 0..3 {
+        let line = format!("cpu,host=h{i} v=2 {}", 1_780_000_000_000_000_100i64 + i);
+        let points = parse_line_body_to_points(line.as_bytes(), None).unwrap();
+        restarted
+            .build_prepared_wal_slot("db", "autogen", 1, &points)
+            .await
+            .unwrap();
+    }
+    assert_eq!(restarted.engine_probe_count(), 1);
+}
+
+/// Two writers can both plan a table CREATE before either records it: the
+/// plan runs under the DDL lock, the CREATE after it. The second CREATE is a
+/// no-op (`IF NOT EXISTS`), but its writer still cached ITS columns. On n3
+/// the series table was created without `host`, the cache said it had it,
+/// and every flush on two nodes failed with NO_SUCH_COLUMN_IN_TABLE while
+/// their WAL grew until they were OOM-killed.
+///
+/// Reproduced deterministically: one adapter creates the tables without the
+/// tag column, then a second adapter (cold cache, same engine) writes points
+/// that carry it.
+#[tokio::test]
+#[serial(chdb)]
+async fn a_table_created_by_another_writer_still_gets_this_writers_columns() {
+    use hyperbytedb::domain::measurement::MeasurementMeta;
+    use hyperbytedb::ports::points_sink::PointsSinkPort;
+
+    let tmpdir = tempfile::tempdir().unwrap();
+    let chdb_path = tmpdir.path().join("chdb");
+    std::fs::create_dir_all(&chdb_path).unwrap();
+    let shared = SharedSession::new_eager(chdb_path.to_str().unwrap(), 1).unwrap();
+
+    let first = ChdbNativeAdapter::new(shared.clone());
+    let mut meta = MeasurementMeta {
+        name: "cpu".into(),
+        ..Default::default()
+    };
+    meta.field_types.insert("v".into(), 0);
+    first
+        .ensure_measurement_schema("db", "autogen", &meta)
+        .await
+        .unwrap();
+
+    let second = ChdbNativeAdapter::new(shared);
+    let points = parse_line_body_to_points(b"cpu,host=a v=1 1780000000000000000", None).unwrap();
+    second
+        .write_points("db", "autogen", "cpu", &[1], 1, &points)
+        .await
+        .expect("the write must add the missing tag column, not trust its cache");
+}
+
+/// If the cache and the table disagree anyway, the failed insert makes the
+/// adapter re-plan the table instead of failing the same way forever: a
+/// flush retries until it succeeds, and each failure grows the WAL.
+#[tokio::test]
+#[serial(chdb)]
+async fn an_insert_missing_a_column_repairs_the_table_on_retry() {
+    use hyperbytedb::adapters::chdb::query_adapter::ChdbQueryAdapter;
+    use hyperbytedb::ports::points_sink::PointsSinkPort;
+    use hyperbytedb::ports::query::QueryPort;
+
+    let tmpdir = tempfile::tempdir().unwrap();
+    let chdb_path = tmpdir.path().join("chdb");
+    std::fs::create_dir_all(&chdb_path).unwrap();
+    let shared = SharedSession::new_eager(chdb_path.to_str().unwrap(), 1).unwrap();
+    let sink = ChdbNativeAdapter::new(shared.clone());
+    let write = |ts: i64, host: &str| {
+        parse_line_body_to_points(format!("cpu,host={host} v=1 {ts}").as_bytes(), None).unwrap()
+    };
+    sink.write_points(
+        "db",
+        "autogen",
+        "cpu",
+        &[1],
+        1,
+        &write(1_780_000_000_000_000_000, "a"),
+    )
+    .await
+    .unwrap();
+
+    ChdbQueryAdapter::from_shared(shared, 0)
+        .execute_sql("ALTER TABLE default.db_autogen_cpu_series DROP COLUMN host")
+        .await
+        .unwrap();
+
+    let again = write(1_780_000_000_000_000_001, "b");
+    assert!(
+        sink.write_points("db", "autogen", "cpu", &[1], 2, &again)
+            .await
+            .is_err(),
+        "the cache still believes in the dropped column"
+    );
+    sink.write_points("db", "autogen", "cpu", &[1], 3, &again)
+        .await
+        .expect("the retry re-plans the table and adds the column back");
+}

@@ -1,12 +1,92 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use super::types::{MeasurementKey, ShardEpoch, ShardMap, ShardRegion};
+use super::types::{MeasurementKey, RegionState, ShardEpoch, ShardMap, ShardRegion};
 
 #[derive(Debug, Clone)]
 struct CachedMeasurement {
     map_version: u64,
     regions: Vec<ShardRegion>,
+}
+
+/// The routable view of a measurement's regions.
+///
+/// A `Staging` region is in the map but must not be routed to: the donor named
+/// by `staged_from` still physically holds its rows. Rather than make every
+/// caller reason about that, the cache resolves it once, when the Raft apply
+/// refreshes the entry -- so a query is a single lookup against a coherent,
+/// serving-only picture with no indirection to follow.
+///
+/// A staging region keeps its RANGE and takes the donor's routing identity
+/// (region id, epoch, peers, primary). The ranges therefore stay an exact
+/// partition, which matters because the query path scatters to every selected
+/// region and sums: an earlier version extended the donor's range back over
+/// the child instead, which could overlap a sibling that was already serving
+/// and double-count it -- observed as 5160 rows against a 5000-row dataset.
+///
+/// Substituting identity is sound because the receiving node validates a
+/// request by region id and epoch, not by series range, and the donor still
+/// holds the rows for the child's range until cutover.
+///
+/// A staging region whose donor is no longer in the map is kept as-is: it may
+/// answer nothing, but dropping it would leave the range routable to nobody,
+/// which is strictly worse.
+fn materialise_serving(regions: &[ShardRegion]) -> Vec<ShardRegion> {
+    if regions.iter().all(ShardRegion::is_serving) {
+        return regions.to_vec();
+    }
+
+    let by_id: HashMap<u64, ShardRegion> =
+        regions.iter().map(|r| (r.region_id, r.clone())).collect();
+
+    let mut out: Vec<ShardRegion> = Vec::with_capacity(regions.len());
+    for region in regions {
+        if region.is_serving() {
+            out.push(region.clone());
+            continue;
+        }
+        // Walk to the first serving ancestor. Bounded by the region count so a
+        // corrupt `staged_from` cycle cannot spin.
+        let mut cursor = region.staged_from;
+        let mut hops = 0;
+        let mut donor: Option<&ShardRegion> = None;
+        while let Some(donor_id) = cursor {
+            hops += 1;
+            if hops > regions.len() {
+                break;
+            }
+            let Some(candidate) = by_id.get(&donor_id) else {
+                break;
+            };
+            if candidate.is_serving() {
+                donor = Some(candidate);
+                break;
+            }
+            cursor = candidate.staged_from;
+        }
+
+        match donor {
+            Some(d) => out.push(ShardRegion {
+                // The child's range, the donor's identity.
+                region_id: d.region_id,
+                start: region.start,
+                end: region.end,
+                epoch: d.epoch,
+                peers: d.peers.clone(),
+                primary: d.primary,
+                last_split_at: region.last_split_at,
+                transfer_verified: None,
+                transfer_first_seen: None,
+                state: RegionState::Serving,
+                staged_from: None,
+                staging_peers: Vec::new(),
+            }),
+            None => out.push(region.clone()),
+        }
+    }
+
+    out.sort_by_key(|r| r.start);
+    out
 }
 
 fn locate_in_regions(regions: &[ShardRegion], series_id: u64) -> Option<&ShardRegion> {
@@ -66,7 +146,7 @@ impl ShardLocationCache {
                 key,
                 CachedMeasurement {
                     map_version: map.map_version,
-                    regions: space.regions.clone(),
+                    regions: materialise_serving(&space.regions),
                 },
             );
         }
@@ -81,7 +161,7 @@ impl ShardLocationCache {
                 cache_key,
                 CachedMeasurement {
                     map_version: map.map_version,
-                    regions: space.regions.clone(),
+                    regions: materialise_serving(&space.regions),
                 },
             );
         } else {
@@ -99,6 +179,45 @@ impl ShardLocationCache {
         inner
             .by_measurement
             .remove(&Self::measurement_key(&key.db, &key.rp, &key.measurement));
+    }
+
+    /// The routable regions for a measurement.
+    ///
+    /// Callers that iterate regions in order to scatter MUST use this rather
+    /// than `map.space(..).regions`: a raw snapshot contains staging regions,
+    /// which are in the map but must not be routed to. Sending a query to one
+    /// fails with "no active peers" -- correct, but needless, because the
+    /// donor still serves that range and this view says so.
+    pub fn serving_regions(
+        &self,
+        map: &ShardMap,
+        db: &str,
+        rp: &str,
+        measurement: &str,
+    ) -> Vec<ShardRegion> {
+        let cache_key = Self::measurement_key(db, rp, measurement);
+        {
+            let inner = self.read_inner();
+            if let Some(cached) = inner.by_measurement.get(&cache_key)
+                && cached.map_version == map.map_version
+            {
+                return cached.regions.clone();
+            }
+        }
+        let Some(space) = map.space(db, rp, measurement) else {
+            return Vec::new();
+        };
+        let regions = materialise_serving(&space.regions);
+        let mut inner = self.write_inner();
+        inner.map_version = inner.map_version.max(map.map_version);
+        inner.by_measurement.insert(
+            cache_key,
+            CachedMeasurement {
+                map_version: map.map_version,
+                regions: regions.clone(),
+            },
+        );
+        regions
     }
 
     pub fn locate(
@@ -128,7 +247,7 @@ impl ShardLocationCache {
                 cache_key,
                 CachedMeasurement {
                     map_version: map.map_version,
-                    regions: space.regions.clone(),
+                    regions: materialise_serving(&space.regions),
                 },
             );
         }
@@ -175,7 +294,7 @@ impl ShardLocationCache {
                 cache_key,
                 CachedMeasurement {
                     map_version: map.map_version,
-                    regions: space.regions.clone(),
+                    regions: materialise_serving(&space.regions),
                 },
             );
         }
@@ -207,7 +326,7 @@ impl ShardLocationCache {
 mod tests {
     use super::*;
     use crate::domain::sharding::ops::{ShardMapOp, apply_shard_map_op};
-    use crate::domain::sharding::types::ShardEpoch;
+    use crate::domain::sharding::types::{RegionState, ShardEpoch};
 
     fn sample_region(id: u64, start: u64, end: u64) -> ShardRegion {
         ShardRegion {
@@ -220,7 +339,124 @@ mod tests {
             last_split_at: 0,
             transfer_verified: None,
             transfer_first_seen: None,
+            state: Default::default(),
+            staged_from: None,
+            staging_peers: Vec::new(),
         }
+    }
+
+    fn staging_region(id: u64, start: u64, end: u64, donor: u64, primary: u64) -> ShardRegion {
+        let mut r = sample_region(id, start, end);
+        r.state = RegionState::Staging;
+        r.staged_from = Some(donor);
+        r.primary = primary;
+        r.peers = vec![primary];
+        r
+    }
+
+    /// A staging child's range must resolve to the donor that holds its rows,
+    /// without disturbing the range partition.
+    #[test]
+    fn a_staging_child_routes_to_its_donor() {
+        let donor = sample_region(1, 0, 100);
+        let child = staging_region(2, 100, 200, 1, 7);
+        let view = materialise_serving(&[donor, child]);
+
+        assert_eq!(
+            view.len(),
+            2,
+            "the range partition must be preserved: {view:?}"
+        );
+        assert!(
+            view.iter().all(ShardRegion::is_serving),
+            "nothing staging may be offered for routing: {view:?}"
+        );
+        assert_eq!((view[0].start, view[0].end), (0, 100));
+        assert_eq!((view[1].start, view[1].end), (100, 200));
+
+        let hit = locate_in_regions(&view, 150).expect("staged range must still resolve");
+        assert_eq!(hit.primary, 1, "reads in the staged range go to the donor");
+        assert_eq!(
+            hit.region_id, 1,
+            "and carry the donor's identity, since the receiver validates by \
+             region id and epoch rather than by range"
+        );
+    }
+
+    /// The ranges must stay an exact partition with no overlap.
+    ///
+    /// An earlier version extended the donor's range back over the staging
+    /// child instead of substituting identity. When the donor had a sibling
+    /// that was already serving, the extension covered it too -- and because
+    /// the query path scatters to every selected region and sums, those rows
+    /// were counted twice. Seen live as 5160 rows against a 5000-row dataset.
+    #[test]
+    fn a_staging_child_must_not_make_ranges_overlap() {
+        let donor = sample_region(1, 0, 50);
+        let sibling = sample_region(3, 50, 150);
+        let child = staging_region(2, 150, 200, 1, 7);
+        let view = materialise_serving(&[donor, sibling, child]);
+
+        for pair in view.windows(2) {
+            assert!(
+                pair[0].end <= pair[1].start,
+                "regions must not overlap: {:?} then {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        // Every series still resolves to exactly one region.
+        for sid in [0_u64, 49, 50, 149, 150, 199] {
+            assert!(
+                locate_in_regions(&view, sid).is_some(),
+                "series {sid} must resolve"
+            );
+        }
+    }
+
+    /// Once cutover flips the child, both regions route on their own identity.
+    #[test]
+    fn after_cutover_both_regions_are_routable() {
+        let donor = sample_region(1, 0, 100);
+        let mut child = staging_region(2, 100, 200, 1, 7);
+        child.state = RegionState::Serving;
+        child.staged_from = None;
+
+        let view = materialise_serving(&[donor, child]);
+        assert_eq!(view.len(), 2);
+        assert_eq!(locate_in_regions(&view, 50).unwrap().region_id, 1);
+        assert_eq!(
+            locate_in_regions(&view, 150).unwrap().region_id,
+            2,
+            "after cutover the child serves its own range"
+        );
+    }
+
+    /// A split of a region that is itself still staging must resolve to the
+    /// first serving ancestor, not to another region nobody may read.
+    #[test]
+    fn staging_chains_resolve_to_the_first_serving_ancestor() {
+        let donor = sample_region(1, 0, 100);
+        let child = staging_region(2, 100, 200, 1, 7);
+        let grandchild = staging_region(3, 200, 300, 2, 8);
+        let view = materialise_serving(&[donor, child, grandchild]);
+
+        assert_eq!(view.len(), 3);
+        assert!(view.iter().all(ShardRegion::is_serving));
+        assert_eq!(locate_in_regions(&view, 250).unwrap().primary, 1);
+        assert_eq!(locate_in_regions(&view, 150).unwrap().primary, 1);
+    }
+
+    /// If the donor is gone, keeping the staging region is strictly better
+    /// than dropping it: it may answer nothing, but dropping it leaves the
+    /// range routable to nobody.
+    #[test]
+    fn a_staging_region_whose_donor_vanished_is_kept() {
+        let orphan = staging_region(2, 100, 200, 99, 7);
+        let view = materialise_serving(&[orphan]);
+        assert_eq!(view.len(), 1);
+        assert_eq!(view[0].region_id, 2);
+        assert!(locate_in_regions(&view, 150).is_some());
     }
 
     #[test]

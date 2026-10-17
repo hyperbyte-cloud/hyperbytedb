@@ -354,7 +354,7 @@ fn test_fill_value() {
     // ifNull only reaches existing rows; WITH FILL-generated rows need a
     // constant INTERPOLATE or they surface as column defaults, not the value.
     assert!(
-        sql.contains("INTERPOLATE (\"mean_value\" AS 0)"),
+        sql.contains("INTERPOLATE (\"mean\" AS 0)"),
         "fill(N) must INTERPOLATE generated rows with N, got: {sql}"
     );
 }
@@ -1033,7 +1033,7 @@ fn telegraf_cpu_multi_field_query_coalesces_partial_rows() {
         "expected coalesced fact view, got: {sql}"
     );
     assert!(
-        sql.contains("ANY LEFT JOIN `mydb_autogen_cpu_series` AS s"),
+        sql.contains("ANY LEFT JOIN (SELECT * FROM `mydb_autogen_cpu_series` WHERE"),
         "tag filter should join series table, got: {sql}"
     );
     assert!(sql.contains("avg(\"usage_idle\")"), "got: {sql}");
@@ -1045,10 +1045,12 @@ fn telegraf_cpu_multi_field_query_coalesces_partial_rows() {
 
 #[test]
 fn series_where_tag_filter_joins_dimension() {
-    let stmt = parse_select(r#"SELECT mean("usage_idle") FROM cpu WHERE "host" = 'h1'"#);
+    // Grouping by a tag needs its column, so the series table is joined.
+    let stmt =
+        parse_select(r#"SELECT mean("usage_idle") FROM cpu WHERE "host" = 'h1' GROUP BY "host""#);
     let sql = translate_series(&stmt, &cpu_mapping());
     assert!(
-        sql.contains("ANY LEFT JOIN `mydb_autogen_cpu_series` AS s"),
+        sql.contains("ANY LEFT JOIN (SELECT * FROM `mydb_autogen_cpu_series` WHERE"),
         "tag filter should join the series table, got: {sql}"
     );
     assert!(
@@ -1057,6 +1059,127 @@ fn series_where_tag_filter_joins_dimension() {
     );
     // The tag predicate resolves against the joined view's tag column.
     assert!(sql.contains("\"host\" = 'h1'"), "got: {sql}");
+}
+
+/// The part of the coalesced fact view before `GROUP BY`.
+fn inner_fact_where(sql: &str) -> Option<&str> {
+    let start =
+        sql.find("FROM `mydb_autogen_cpu` WHERE ")? + "FROM `mydb_autogen_cpu` WHERE ".len();
+    let end = sql[start..].find(" GROUP BY `series_id`, `time`")?;
+    Some(&sql[start..start + end])
+}
+
+/// Time bounds and tag equalities filter fact rows before they are coalesced,
+/// so a one-series lookup reads that series, not the whole table.
+#[test]
+fn time_and_tag_equality_filter_fact_rows_before_coalescing() {
+    let stmt = parse_select(
+        r#"SELECT last(usage_idle) FROM cpu WHERE "host" = 'h1' AND time >= 1800000000s"#,
+    );
+    let sql = translate_series(&stmt, &cpu_mapping());
+    let inner = inner_fact_where(&sql).unwrap_or_else(|| panic!("no inner filter: {sql}"));
+    assert!(
+        inner.contains("time >= fromUnixTimestamp(1800000000)"),
+        "{inner}"
+    );
+    assert!(
+        inner.contains(
+            "`series_id` IN (SELECT `series_id` FROM `mydb_autogen_cpu_series` WHERE (\"host\" = 'h1'))"
+        ),
+        "{inner}"
+    );
+    // No tag is output or grouped by, so there is no join, and the pushed
+    // tag term leaves the outer WHERE with it.
+    assert!(!sql.contains("JOIN"), "{sql}");
+    assert!(
+        sql.ends_with("WHERE (time >= fromUnixTimestamp(1800000000))"),
+        "{sql}"
+    );
+
+    // Grouped by the tag: joined, against only the selected series, and the
+    // full WHERE applies after the join.
+    let grouped = translate_series(
+        &parse_select(
+            r#"SELECT last(usage_idle) FROM cpu WHERE "host" = 'h1' AND time >= 1800000000s GROUP BY "host""#,
+        ),
+        &cpu_mapping(),
+    );
+    assert!(
+        grouped.contains(
+            "ANY LEFT JOIN (SELECT * FROM `mydb_autogen_cpu_series` WHERE (\"host\" = 'h1')) AS s"
+        ),
+        "{grouped}"
+    );
+    assert!(
+        grouped.contains("WHERE ((\"host\" = 'h1') AND (time >= fromUnixTimestamp(1800000000)))"),
+        "{grouped}"
+    );
+
+    // A tag condition that is not pushed keeps the join, and all of WHERE.
+    let mixed = translate_series(
+        &parse_select(
+            r#"SELECT mean(usage_idle) FROM cpu WHERE "host" = 'h1' AND "region" != 'x'"#,
+        ),
+        &cpu_mapping(),
+    );
+    assert!(mixed.contains("ANY LEFT JOIN"), "{mixed}");
+    assert!(
+        mixed.contains("(\"region\" != 'x')") && mixed.contains("(\"host\" = 'h1')"),
+        "{mixed}"
+    );
+}
+
+/// Grafana multi-value selections (`=~ /^(a|b)$/`) and ORs of tag
+/// equalities select series by tag alone, so they become the series lookup.
+#[test]
+fn tag_regex_and_or_selections_filter_fact_rows_before_coalescing() {
+    for (q, pushed) in [
+        (
+            r#"SELECT mean(usage_idle) FROM cpu WHERE "host" =~ /^(a|b)$/ AND time > 5s"#,
+            "match(\"host\", '^(a|b)$')",
+        ),
+        (
+            r#"SELECT mean(usage_idle) FROM cpu WHERE "host" = 'a' OR "region" = 'eu'"#,
+            "(\"host\" = 'a') OR (\"region\" = 'eu')",
+        ),
+    ] {
+        let sql = translate_series(&parse_select(q), &cpu_mapping());
+        let inner = inner_fact_where(&sql).unwrap_or_else(|| panic!("{q} not pushed: {sql}"));
+        assert!(
+            inner.contains("`series_id` IN (SELECT `series_id` FROM"),
+            "{inner}"
+        );
+        assert!(inner.contains(pushed), "{q}: {inner}");
+    }
+}
+
+/// Only terms that cannot change the result are pushed: OR, negation, an
+/// empty tag value (which a missing series row also matches through the LEFT
+/// JOIN) and field predicates stay outside.
+#[test]
+fn predicates_that_could_change_the_result_are_not_pushed() {
+    for q in [
+        r#"SELECT mean(usage_idle) FROM cpu WHERE "host" = 'a' OR usage_idle > 5"#,
+        r#"SELECT mean(usage_idle) FROM cpu WHERE "host" != 'a'"#,
+        r#"SELECT mean(usage_idle) FROM cpu WHERE "host" = ''"#,
+        r#"SELECT mean(usage_idle) FROM cpu WHERE usage_idle > 5"#,
+        r#"SELECT mean(usage_idle) FROM cpu WHERE "host" =~ /a*/"#,
+        r#"SELECT mean(usage_idle) FROM cpu WHERE "host" =~ /^(a|)$/"#,
+        r#"SELECT mean(usage_idle) FROM cpu WHERE "host" !~ /a/"#,
+    ] {
+        let sql = translate_series(&parse_select(q), &cpu_mapping());
+        assert!(inner_fact_where(&sql).is_none(), "{q} pushed: {sql}");
+    }
+    // A pushable term alongside an unpushable one: only the time bound moves.
+    let sql = translate_series(
+        &parse_select(r#"SELECT mean(usage_idle) FROM cpu WHERE time > 5s AND usage_idle > 5"#),
+        &cpu_mapping(),
+    );
+    let inner = inner_fact_where(&sql).unwrap_or_else(|| panic!("no inner filter: {sql}"));
+    assert!(
+        inner.contains("time >") && !inner.contains("usage_idle"),
+        "{inner}"
+    );
 }
 
 #[test]
@@ -1266,7 +1389,7 @@ fn test_difference_without_group_by_time_projects_time_and_orders() {
         "transform must wrap to filter NULL rows, got: {sql}"
     );
     assert!(
-        sql.contains(") WHERE \"difference_value\" IS NOT NULL"),
+        sql.contains(") WHERE \"difference\" IS NOT NULL"),
         "leading NULL transform rows must be filtered, got: {sql}"
     );
 }
@@ -1453,4 +1576,64 @@ fn test_timezone_string_is_escaped() {
 
 fn translate_test_tz(stmt: &SelectStatement) -> String {
     translate_native_table(stmt, test_table().as_str(), None, None, None).unwrap()
+}
+
+/// A materialized view's source filter applies to the raw source rows, inside
+/// the coalescing subquery: that is where `origin_node_id` exists.
+#[test]
+fn a_materialized_view_source_filter_applies_to_raw_rows() {
+    let stmt = parse_select(
+        r#"SELECT mean("usage_idle") INTO "cpu_5m" FROM "cpu" GROUP BY time(5m), "host""#,
+    );
+    let sql = translate_materialized_view_select_with_source_filter(
+        &stmt,
+        &test_table(),
+        &test_series_table(),
+        "cpu_5m",
+        &cpu_mapping(),
+        Some("`origin_node_id` IN (0, 7)"),
+    )
+    .unwrap();
+    let inner = sql
+        .split_once("FROM (SELECT `series_id`, `time`")
+        .and_then(|(_, rest)| rest.split_once(") AS t"))
+        .map(|(inner, _)| inner)
+        .unwrap_or_else(|| panic!("no source subquery: {sql}"));
+    assert!(
+        inner.contains("WHERE `origin_node_id` IN (0, 7) GROUP BY `series_id`, `time`"),
+        "{inner}"
+    );
+}
+
+/// A sharded region's partial without ORDER BY or WITH FILL, for the
+/// coordinator to sort and fill.
+#[test]
+fn an_unordered_translation_has_no_order_or_fill() {
+    let stmt = parse_select(
+        "SELECT mean(\"usage_idle\") FROM \"cpu\" WHERE time >= 0 AND time <= 3600000000000 \
+         GROUP BY time(30s), \"host\" fill(none)",
+    );
+    let ordered = translate_native_table(
+        &stmt,
+        "t",
+        None,
+        None,
+        Some((Some(0), Some(3_600_000_000_000))),
+    )
+    .unwrap();
+    let unordered = translate_native_table_unordered(
+        &stmt,
+        "t",
+        None,
+        None,
+        Some((Some(0), Some(3_600_000_000_000))),
+    )
+    .unwrap();
+    assert!(ordered.contains("ORDER BY"), "{ordered}");
+    assert!(!unordered.contains("ORDER BY"), "{unordered}");
+    assert!(!unordered.contains("WITH FILL"), "{unordered}");
+    assert_eq!(
+        unordered.replace('\n', " "),
+        ordered[..ordered.find("\nORDER BY").unwrap()].replace('\n', " ")
+    );
 }

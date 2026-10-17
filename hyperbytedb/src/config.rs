@@ -46,6 +46,9 @@ pub struct ShardingConfig {
     /// Cooldown between split and merge on the same region (seconds).
     #[serde(default = "default_split_merge_interval_secs")]
     pub split_merge_interval_secs: u64,
+    /// Minimum seconds between series-driven splits on the same region.
+    #[serde(default = "default_region_split_cooldown_secs")]
+    pub region_split_cooldown_secs: u64,
     /// Max concurrent split/move/merge operators.
     #[serde(default = "default_schedule_limit")]
     pub schedule_limit: usize,
@@ -61,12 +64,37 @@ pub struct ShardingConfig {
     /// Hard cap on regions per measurement (safety guard against runaway splits).
     #[serde(default = "default_max_regions_per_measurement")]
     pub max_regions_per_measurement: usize,
+    /// Minimum percentage of the best-known holder's per-region progress a
+    /// candidate must show before a *planned* promotion will hand it primacy.
+    ///
+    /// Relative rather than absolute on purpose: heartbeats are sampled on an
+    /// interval, so under continuous writes a healthy replica is always some
+    /// thousands of series behind the last reported figure. A fixed allowance
+    /// either blocks every promotion or permits every one depending on write
+    /// rate; a percentage asks whether the replica is broadly keeping up.
+    /// Emergency failover does not consult this — see
+    /// `failover_watermark_safe`.
+    #[serde(default = "default_promote_min_progress_pct")]
+    pub promote_min_progress_pct: u64,
+    /// Ceiling on bytes the mover pool holds in flight between its moves.
+    ///
+    /// `schedule_limit` bounds how many moves run at once; this bounds how much
+    /// data they may hold between them. A move streams one transfer chunk at a
+    /// time and is charged that, not its region's size.
+    #[serde(default = "default_movement_max_inflight_bytes")]
+    pub movement_max_inflight_bytes: u64,
     /// Seconds a region primary may stay non-Active before Raft leader proposes TransferPrimary.
     #[serde(default = "default_primary_failover_after_secs")]
     pub primary_failover_after_secs: u64,
-    /// Per-candidate HTTP timeout for sharded scatter (queries, metadata, forwards).
+    /// Per-candidate HTTP timeout for sharded scatter of metadata and forwards.
     #[serde(default = "default_scatter_peer_timeout_ms")]
     pub scatter_peer_timeout_ms: u64,
+    /// Per-candidate HTTP timeout for a region query sent to a peer. A region
+    /// query scans data and may take as long as the query itself, so it gets
+    /// the query budget: under the 5 s forward timeout, a 90M-point scan on
+    /// n3 answered 502 while the peer was still working.
+    #[serde(default = "default_scatter_query_timeout_ms")]
+    pub scatter_query_timeout_ms: u64,
     /// Max Active peers tried per region per scatter request.
     #[serde(default = "default_scatter_max_peer_attempts")]
     pub scatter_max_peer_attempts: usize,
@@ -79,6 +107,59 @@ pub struct ShardingConfig {
     /// older than the `ClearVerified` op cannot decode it from the Raft log.
     #[serde(default = "default_transfer_clear_proposals_enabled")]
     pub transfer_clear_proposals_enabled: bool,
+    /// Propose `AddPeer` shard-map ops to place a joiner as a region replica.
+    /// Disable for the duration of a rolling upgrade: a node on a build older
+    /// than the `AddPeer` op cannot decode it, rejects the append RPC carrying
+    /// it, and stops replicating until every node is upgraded.
+    #[serde(default = "default_add_peer_proposals_enabled")]
+    pub add_peer_proposals_enabled: bool,
+    /// Propose `RemovePeer` shard-map ops to shrink a region's replica set.
+    #[serde(default = "default_remove_peer_proposals_enabled")]
+    pub remove_peer_proposals_enabled: bool,
+    /// Forward and replicate points between nodes as binary frames instead
+    /// of line protocol, so primaries and replicas decode rather than
+    /// re-parse. Every node must run a build that reads them.
+    #[serde(default = "default_binary_points_wire")]
+    pub binary_points_wire: bool,
+    /// Share one forward request per destination node among concurrent
+    /// writes (TiKV client-go style). Off: on n3 it merged ~2.8 writes per
+    /// request, did not lower CPU per point at N=8, and the queueing raised
+    /// write latency and client 503s.
+    #[serde(default)]
+    pub forward_coalesce: bool,
+    /// A new measurement starts with this many regions per active node,
+    /// already placed across the cluster. `0` (the default): one region, which
+    /// splits as it grows. Pre-splitting gave every measurement, even one of
+    /// 30 rows, ~10 regions on 5 nodes, and every query on it waited for the
+    /// slowest of them. See `ShardMapOp::BootstrapMeasurementPresplit`.
+    #[serde(default = "default_bootstrap_regions_per_node")]
+    pub bootstrap_regions_per_node: usize,
+    /// Cluster-wide cap on region-transfer bytes per second for
+    /// convergence-tier moves, split evenly across `schedule_limit` movers and
+    /// enforced chunk by chunk on the sending node. 0 = unlimited. RF
+    /// violations and decommission evacuation are never throttled.
+    #[serde(default = "default_movement_budget_bytes_per_sec")]
+    pub movement_budget_bytes_per_sec: u64,
+    /// After this many seconds without a heartbeat while `Disconnected`, a node
+    /// is excluded from placement candidates and may be removed from regions.
+    #[serde(default = "default_dead_node_timeout_secs")]
+    pub dead_node_timeout_secs: u64,
+    /// Acknowledge a write once the regions it forwards to other primaries
+    /// are durable in this node's forward queue, and forward them in the
+    /// background. Replication is already asynchronous; this bounds how far a
+    /// primary trails its coordinators instead of making every client write
+    /// wait for the slowest of N-1 forwards. Takes effect where the queue is
+    /// wired (a clustered server).
+    #[serde(default = "default_async_forward")]
+    pub async_forward: bool,
+    /// When the oldest queued forward is older than this, new writes forward
+    /// synchronously again until the queue catches up. Keeps primaries well
+    /// inside the few seconds of lag users would notice.
+    #[serde(default = "default_async_forward_max_lag_ms")]
+    pub async_forward_max_lag_ms: u64,
+    /// Queued forward bytes above which new writes forward synchronously.
+    #[serde(default = "default_async_forward_max_bytes")]
+    pub async_forward_max_bytes: u64,
 }
 
 impl Default for ShardingConfig {
@@ -90,18 +171,44 @@ impl Default for ShardingConfig {
             region_max_series: default_region_max_series(),
             region_merge_series: default_region_merge_series(),
             split_merge_interval_secs: default_split_merge_interval_secs(),
+            region_split_cooldown_secs: default_region_split_cooldown_secs(),
             schedule_limit: default_schedule_limit(),
             heartbeat_interval_secs: default_shard_heartbeat_interval_secs(),
             load_split_qps_threshold: 0,
             bootstrap_timeout_ms: default_shard_bootstrap_timeout_ms(),
             max_regions_per_measurement: default_max_regions_per_measurement(),
+            promote_min_progress_pct: default_promote_min_progress_pct(),
+            movement_max_inflight_bytes: default_movement_max_inflight_bytes(),
             primary_failover_after_secs: default_primary_failover_after_secs(),
             scatter_peer_timeout_ms: default_scatter_peer_timeout_ms(),
+            scatter_query_timeout_ms: default_scatter_query_timeout_ms(),
             scatter_max_peer_attempts: default_scatter_max_peer_attempts(),
             peer_heal_enabled: default_peer_heal_enabled(),
             transfer_clear_proposals_enabled: default_transfer_clear_proposals_enabled(),
+            add_peer_proposals_enabled: default_add_peer_proposals_enabled(),
+            remove_peer_proposals_enabled: default_remove_peer_proposals_enabled(),
+            binary_points_wire: default_binary_points_wire(),
+            forward_coalesce: false,
+            bootstrap_regions_per_node: default_bootstrap_regions_per_node(),
+            async_forward: default_async_forward(),
+            async_forward_max_lag_ms: default_async_forward_max_lag_ms(),
+            async_forward_max_bytes: default_async_forward_max_bytes(),
+            movement_budget_bytes_per_sec: default_movement_budget_bytes_per_sec(),
+            dead_node_timeout_secs: default_dead_node_timeout_secs(),
         }
     }
+}
+
+fn default_dead_node_timeout_secs() -> u64 {
+    600
+}
+
+fn default_promote_min_progress_pct() -> u64 {
+    50
+}
+
+fn default_movement_max_inflight_bytes() -> u64 {
+    256 * 1024 * 1024
 }
 
 fn default_max_regions_per_measurement() -> usize {
@@ -128,6 +235,10 @@ fn default_split_merge_interval_secs() -> u64 {
     3600
 }
 
+fn default_region_split_cooldown_secs() -> u64 {
+    60
+}
+
 fn default_schedule_limit() -> usize {
     4
 }
@@ -148,6 +259,11 @@ fn default_scatter_peer_timeout_ms() -> u64 {
     5000
 }
 
+/// The server's default query timeout (`server.query_timeout_secs`, 30 s).
+fn default_scatter_query_timeout_ms() -> u64 {
+    30_000
+}
+
 fn default_scatter_max_peer_attempts() -> usize {
     3
 }
@@ -160,9 +276,75 @@ fn default_transfer_clear_proposals_enabled() -> bool {
     true
 }
 
+/// On, matching `transfer_clear_proposals_enabled`: the flag is an opt-out for
+/// a mixed-version rollout, not an opt-in for the feature.
+///
+/// The hazard is real but bounded. A follower on a build that does not know
+/// `AddPeer` fails to deserialize the whole append RPC — axum rejects the body
+/// before the handler runs — so it stops replicating and the leader can lose
+/// commit quorum for the duration. It is self-healing: replication resumes as
+/// soon as every node runs a build that knows the op, and ingest does not go
+/// through Raft. Defaulting off instead would leave region placement inert for
+/// everyone who enables sharding, which is the worse trade while sharding is
+/// beta and clusters are rebuilt more often than rolling-upgraded.
+fn default_add_peer_proposals_enabled() -> bool {
+    true
+}
+
+fn default_remove_peer_proposals_enabled() -> bool {
+    true
+}
+
+fn default_binary_points_wire() -> bool {
+    true
+}
+
+fn default_bootstrap_regions_per_node() -> usize {
+    0
+}
+
+fn default_async_forward() -> bool {
+    // Off until it beats synchronous forwarding: on n3 at N=12 it still
+    // lagged up to 5-7 s and raised client errors, because primaries refuse
+    // forwarded writes past their admission budget and the queue falls back.
+    false
+}
+
+fn default_async_forward_max_lag_ms() -> u64 {
+    1_000
+}
+
+fn default_async_forward_max_bytes() -> u64 {
+    256 * 1024 * 1024
+}
+
+fn default_movement_budget_bytes_per_sec() -> u64 {
+    50 * 1024 * 1024
+}
+
 impl HyperbytedbConfig {
     /// Validate cross-field constraints after Figment merge.
     pub fn validate(&self) -> Result<(), String> {
+        let (heartbeat, election) = self.cluster.raft_timing_ms();
+        if self.cluster.enabled && heartbeat >= election {
+            return Err(format!(
+                "cluster.raft_heartbeat_interval_ms ({heartbeat}) must be below \
+                 cluster.raft_election_timeout_ms ({election})"
+            ));
+        }
+        // Peers send the token as a header. One that is not a valid header
+        // value is left off every request, so all internal routes answer
+        // 401; a trailing newline (a Secret made with `echo`) is the usual
+        // cause. The value is a secret: the error does not show it.
+        if let Some(token) = &self.auth.cluster_token
+            && !token.bytes().all(|b| b.is_ascii_graphic())
+        {
+            return Err(
+                "auth.cluster_token must be printable ASCII with no spaces or newlines \
+                 (a Secret written with `echo` ends in a newline; use `echo -n`)"
+                    .into(),
+            );
+        }
         if self.sharding.enabled && !self.cluster.enabled {
             return Err(
                 "sharding.enabled requires cluster.enabled = true (series sharding is cluster-only)"
@@ -213,11 +395,47 @@ pub struct ServerConfig {
     #[serde(default = "default_max_points_per_request")]
     pub max_points_per_request: usize,
     pub request_timeout_secs: u64,
+    /// Client `/write` requests allowed in flight on this node at once; the
+    /// rest get an immediate 503 with `Retry-After`. `0` sizes it from the
+    /// CPUs this process may use (see [`resolve_max_inflight_writes`]).
+    ///
+    /// Without a bound, past saturation every request was accepted, CPU hit
+    /// the cgroup limit, Raft heartbeats and probes starved, and throughput
+    /// collapsed from ~860k to ~50k points/s with most batches timing out
+    /// after 5s instead of being turned away at once.
+    #[serde(default)]
+    pub max_inflight_writes: usize,
     pub query_timeout_secs: u64,
     pub max_concurrent_queries: usize,
     pub tls_enabled: bool,
     pub tls_cert_path: String,
     pub tls_key_path: String,
+}
+
+/// Per-CPU in-flight `/write` allowance when `max_inflight_writes` is `0`.
+///
+/// Was 8. Under sharding an admitted write spends much of its life waiting
+/// on forwards to other nodes, so at 8 per CPU a node's slots filled with
+/// waiting requests while its CPU sat idle. On n3 (3-CPU pods), 16 per CPU
+/// raised N=3 from 673k to 733k points/s and N=12 from 1.62M to 1.80M, with
+/// half the client retries and no errors or restarts. 32 per CPU left
+/// throughput unchanged at N=3/6/8 (757k/1.20M/1.44M vs 742k/1.22M/1.42M)
+/// and cut clients giving up after 12 retries from 286/543/681 to 2/17/26.
+pub const INFLIGHT_WRITES_PER_CPU: usize = 32;
+
+/// KiB of forwarded write body admitted per client write slot on a region
+/// primary. A 1,000-line batch is ~40 KiB of line protocol.
+pub const SHARD_WRITE_KIB_PER_SLOT: usize = 64;
+
+/// The effective `/write` admission limit: the configured value, or
+/// [`INFLIGHT_WRITES_PER_CPU`] per usable CPU when `configured` is `0`.
+#[must_use]
+pub fn resolve_max_inflight_writes(configured: usize, cpus: usize) -> usize {
+    if configured > 0 {
+        configured
+    } else {
+        INFLIGHT_WRITES_PER_CPU * cpus.max(1)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -303,7 +521,8 @@ pub struct ChdbConfig {
     #[serde(default)]
     pub pool_size: usize,
     /// chDB connections for queries (`ChdbQueryAdapter`). When unset, uses
-    /// `pool_size` if non-zero, else 4. Clamped to 1..=128.
+    /// `pool_size` if non-zero, else one per CPU plus one. Clamped to 1..=128.
+    /// `SET query_pool_size = n` overrides it at run time.
     #[serde(default)]
     pub query_pool_size: Option<usize>,
     /// chDB connections for ingest/flush (`ChdbNativeAdapter`). When unset, uses
@@ -345,7 +564,7 @@ impl ChdbConfig {
     pub fn resolved_query_pool_size(&self) -> usize {
         self.query_pool_size
             .or((self.pool_size > 0).then_some(self.pool_size))
-            .unwrap_or(crate::adapters::chdb::connection_pool::DEFAULT_QUERY_POOL_SIZE)
+            .unwrap_or_else(crate::adapters::chdb::connection_pool::default_query_pool_size)
     }
 
     pub fn resolved_write_pool_size(&self) -> usize {
@@ -367,7 +586,7 @@ pub struct CardinalityConfig {
     pub max_measurements_per_database: usize,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     pub enabled: bool,
@@ -375,6 +594,34 @@ pub struct AuthConfig {
     /// Disabled by default: passwords can leak into access logs and Referer headers.
     #[serde(default)]
     pub allow_query_param_credentials: bool,
+    /// Shared by every node of a cluster and the operator, and sent in
+    /// place of a user on internal routes. A cluster with auth on needs it:
+    /// without it nodes can't reach each other's Raft and replication routes.
+    #[serde(default)]
+    pub cluster_token: Option<String>,
+    /// An admin user each node creates at startup if no user has that name
+    /// (an existing user, and its password, are left alone). Lets the first
+    /// `CREATE USER` run with auth on.
+    #[serde(default)]
+    pub admin_username: Option<String>,
+    #[serde(default)]
+    pub admin_password: Option<String>,
+}
+
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redact = |v: &Option<String>| v.as_ref().map(|_| "<redacted>");
+        f.debug_struct("AuthConfig")
+            .field("enabled", &self.enabled)
+            .field(
+                "allow_query_param_credentials",
+                &self.allow_query_param_credentials,
+            )
+            .field("cluster_token", &redact(&self.cluster_token))
+            .field("admin_username", &self.admin_username)
+            .field("admin_password", &redact(&self.admin_password))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -417,6 +664,13 @@ pub struct ClusterConfig {
     /// Max bytes for coalescing consecutive WAL batches (same db/rp/precision).
     #[serde(default = "default_replication_max_coalesce_body_bytes")]
     pub replication_max_coalesce_body_bytes: usize,
+    /// HTTP/2 connections kept to each peer for forwards and replication;
+    /// requests take them in turn. Peers always talk cleartext HTTP/2 (prior
+    /// knowledge): requests share multiplexed streams instead of holding one
+    /// HTTP/1.1 connection each (on n3, 834 -> 162 established connections
+    /// per pod). One connection put a peer's whole load on one TCP stream.
+    #[serde(default = "default_internal_http2_connections")]
+    pub internal_http2_connections: usize,
     /// Max HTTP body size for `/internal/replicate` and `/internal/replicate-mutation`.
     /// `0` resolves at startup to `max(4 × replication_max_coalesce_body_bytes,
     /// server.max_body_size_bytes)`.
@@ -431,7 +685,8 @@ pub struct ClusterConfig {
     /// When >0, peers with ack 0 and stale heartbeats are omitted from truncate barrier.
     #[serde(default = "default_replication_truncate_stale_peer_multiplier")]
     pub replication_truncate_stale_peer_multiplier: u64,
-    /// Raft heartbeat interval in milliseconds (default: 1000).
+    /// Raft heartbeat interval in milliseconds (default: a third of the
+    /// election timeout). Must be below `raft_election_timeout_ms`.
     pub raft_heartbeat_interval_ms: Option<u64>,
     /// Raft election timeout in milliseconds (default: 1000).
     pub raft_election_timeout_ms: Option<u64>,
@@ -440,11 +695,33 @@ pub struct ClusterConfig {
     /// Default HTTP timeout for outbound Raft RPCs when no per-RPC deadline is supplied (seconds).
     #[serde(default = "default_raft_rpc_timeout_secs")]
     pub raft_rpc_timeout_secs: u64,
+    /// Port for the control listener (`/ping`, `/health`, Raft RPCs), served
+    /// with the Raft core on a dedicated runtime so write saturation cannot
+    /// starve heartbeats or probes. `0` (default) disables it; Raft then
+    /// uses the main port only. Every node must agree on the value: Raft
+    /// RPCs go to a peer's host on this port, falling back to its main
+    /// address when nothing listens there (mixed versions mid-roll).
+    #[serde(default)]
+    pub control_port: u16,
     /// Per-node replication mode and tuning. When the entire `[cluster.replication]`
     /// block is omitted, the resolved mode is `async`, exactly preserving today's
     /// fire-and-forget behavior.
     #[serde(default)]
     pub replication: ReplicationConfig,
+}
+
+impl ClusterConfig {
+    /// Raft (heartbeat, election timeout) in ms. Unset, the election
+    /// timeout is 1000 and the heartbeat a third of it: both at 1000, which
+    /// the operator's CRD defaults used to render, is refused by Raft.
+    #[must_use]
+    pub fn raft_timing_ms(&self) -> (u64, u64) {
+        let election = self.raft_election_timeout_ms.unwrap_or(1000);
+        let heartbeat = self
+            .raft_heartbeat_interval_ms
+            .unwrap_or_else(|| (election / 3).max(1));
+        (heartbeat, election)
+    }
 }
 
 /// Per-node, per-write replication mode. Controls only the COORDINATOR side
@@ -564,6 +841,10 @@ fn default_anti_entropy_interval_secs() -> u64 {
 
 fn default_replication_max_inflight_batches() -> usize {
     8
+}
+
+fn default_internal_http2_connections() -> usize {
+    16
 }
 
 fn default_replication_max_coalesce_body_bytes() -> usize {
@@ -760,6 +1041,7 @@ impl HyperbytedbConfig {
                 max_body_size_bytes: 25 * 1024 * 1024,
                 max_points_per_request: default_max_points_per_request(),
                 request_timeout_secs: 30,
+                max_inflight_writes: 0,
                 query_timeout_secs: 30,
                 max_concurrent_queries: 0,
                 tls_enabled: false,
@@ -793,6 +1075,9 @@ impl HyperbytedbConfig {
             auth: AuthConfig {
                 enabled: false,
                 allow_query_param_credentials: false,
+                cluster_token: None,
+                admin_username: None,
+                admin_password: None,
             },
             cardinality: CardinalityConfig {
                 max_tag_values_per_measurement: 100_000,
@@ -813,6 +1098,7 @@ impl HyperbytedbConfig {
                 replication_queue_depth: default_replication_queue_depth(),
                 replication_max_inflight_batches: default_replication_max_inflight_batches(),
                 replication_max_coalesce_body_bytes: default_replication_max_coalesce_body_bytes(),
+                internal_http2_connections: default_internal_http2_connections(),
                 replicate_body_limit_bytes: 0,
                 replicate_receiver_queue_depth: default_replicate_receiver_queue_depth(),
                 replicate_receiver_workers: default_replicate_receiver_workers(),
@@ -822,6 +1108,7 @@ impl HyperbytedbConfig {
                 raft_election_timeout_ms: None,
                 raft_snapshot_threshold: None,
                 raft_rpc_timeout_secs: default_raft_rpc_timeout_secs(),
+                control_port: 0,
                 replication: ReplicationConfig::default(),
             },
             logging: LoggingConfig {
@@ -1018,7 +1305,10 @@ mod chdb_pool_config_tests {
             insert_max_insert_block_size: 0,
             tag_low_cardinality_max: None,
         };
-        assert_eq!(c.resolved_query_pool_size(), 4);
+        assert_eq!(
+            c.resolved_query_pool_size(),
+            crate::adapters::chdb::connection_pool::default_query_pool_size()
+        );
         assert_eq!(c.resolved_write_pool_size(), 4);
     }
 
@@ -1203,6 +1493,7 @@ mod replicate_body_limit_tests {
             replication_queue_depth: 8192,
             replication_max_inflight_batches: 8,
             replication_max_coalesce_body_bytes: 8 * 1024 * 1024,
+            internal_http2_connections: super::default_internal_http2_connections(),
             replicate_body_limit_bytes: 0,
             replicate_receiver_queue_depth: 1024,
             replicate_receiver_workers: 1,
@@ -1211,6 +1502,7 @@ mod replicate_body_limit_tests {
             raft_election_timeout_ms: None,
             raft_snapshot_threshold: None,
             raft_rpc_timeout_secs: super::default_raft_rpc_timeout_secs(),
+            control_port: 0,
             replication: super::ReplicationConfig::default(),
         }
     }
@@ -1242,5 +1534,75 @@ mod replicate_body_limit_tests {
             c.effective_replicate_body_limit_bytes(25 * 1024 * 1024),
             64 * 1024 * 1024
         );
+    }
+
+    /// Shard-map op gates are opt-*outs* for a rolling upgrade, not opt-ins for
+    /// the feature. Defaulting one off leaves the behaviour it guards inert for
+    /// everyone who never finds the flag.
+    #[test]
+    fn shard_map_op_gates_default_on() {
+        let s = super::ShardingConfig::default();
+        assert!(s.add_peer_proposals_enabled);
+        assert!(s.remove_peer_proposals_enabled);
+        assert_eq!(
+            s.movement_budget_bytes_per_sec,
+            50 * 1024 * 1024,
+            "convergence-tier moves share a 50 MiB/s cluster-wide cap"
+        );
+        assert!(s.transfer_clear_proposals_enabled);
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+
+    /// The operator's CRD defaulted both to 1000, which Raft refuses at
+    /// startup; a 6-node UAT cluster crash-looped on it.
+    #[test]
+    fn raft_heartbeat_must_be_below_the_election_timeout() {
+        let mut c = crate::config::HyperbytedbConfig::load(None).unwrap();
+        c.cluster.enabled = true;
+        assert_eq!(c.cluster.raft_timing_ms(), (333, 1000));
+        assert!(c.validate().is_ok());
+        c.cluster.raft_election_timeout_ms = Some(3000);
+        assert_eq!(c.cluster.raft_timing_ms(), (1000, 3000));
+        c.cluster.raft_heartbeat_interval_ms = Some(1000);
+        c.cluster.raft_election_timeout_ms = Some(1000);
+        let err = c.validate().unwrap_err();
+        assert!(err.contains("raft_heartbeat_interval_ms (1000)"), "{err}");
+        c.cluster.enabled = false;
+        assert!(c.validate().is_ok(), "no Raft without a cluster");
+    }
+
+    /// A token peers cannot send as a header is refused at startup, without
+    /// echoing the secret.
+    #[test]
+    fn cluster_token_must_be_a_valid_header_value() {
+        let mut c = crate::config::HyperbytedbConfig::load(None).unwrap();
+        for ok in ["", "Zx9_-.~+/=AbC"] {
+            c.auth.cluster_token = Some(ok.into());
+            assert!(c.validate().is_ok(), "{ok:?}");
+        }
+        for bad in ["s3cret\n", " s3cret", "s3 cret", "s3cret\t", "sécret"] {
+            c.auth.cluster_token = Some(bad.into());
+            let err = c.validate().unwrap_err();
+            assert!(err.contains("auth.cluster_token"), "{bad:?}: {err}");
+            assert!(
+                !err.contains("s3"),
+                "the error must not show the token: {err}"
+            );
+        }
+    }
+
+    use super::{INFLIGHT_WRITES_PER_CPU, resolve_max_inflight_writes};
+
+    #[test]
+    fn an_explicit_limit_wins_and_zero_scales_with_cpus() {
+        assert_eq!(resolve_max_inflight_writes(100, 6), 100);
+        assert_eq!(
+            resolve_max_inflight_writes(0, 6),
+            6 * INFLIGHT_WRITES_PER_CPU
+        );
+        assert_eq!(resolve_max_inflight_writes(0, 0), INFLIGHT_WRITES_PER_CPU);
     }
 }

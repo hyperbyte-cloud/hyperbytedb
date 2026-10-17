@@ -31,6 +31,11 @@ pub struct ContinuousQueryDef {
     /// RFC3339 timestamp of the last successful execution.
     #[serde(default)]
     pub last_run_at: Option<String>,
+    /// Unaliased columns take InfluxQL names (`mean`). False for queries
+    /// stored before that, which keep writing the fields they always wrote
+    /// (`mean_usage_idle`) instead of starting a second one.
+    #[serde(default)]
+    pub influxql_names: bool,
 }
 
 impl ContinuousQueryDef {
@@ -56,6 +61,7 @@ impl ContinuousQueryDef {
             coverage_interval_secs: 0,
             is_advanced: false,
             last_run_at: None,
+            influxql_names: true,
         };
         meta.apply_to(&mut def);
         Ok(def)

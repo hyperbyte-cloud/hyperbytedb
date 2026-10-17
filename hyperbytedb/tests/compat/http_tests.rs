@@ -28,6 +28,13 @@ struct MockQueryPort;
 
 #[async_trait]
 impl QueryPort for MockQueryPort {
+    async fn execute_sql_arrow(
+        &self,
+        _sql: &str,
+    ) -> Result<hyperbytedb::ports::query::ArrowBatchStream, HyperbytedbError> {
+        Ok(hyperbytedb::ports::query::empty_arrow_stream())
+    }
+
     async fn execute_sql(&self, sql: &str) -> Result<String, HyperbytedbError> {
         if sql.contains("FROM system.tables") {
             Ok("1".into())
@@ -120,6 +127,8 @@ impl HttpTestContext {
             drain_service: None,
             raft: None,
             auth_enabled: false,
+            runtime_settings: Default::default(),
+            cluster_auth: Default::default(),
             auth_allow_query_param_credentials: false,
             prometheus_handle: None,
             statement_summary: None,
@@ -132,6 +141,8 @@ impl HttpTestContext {
             max_points_per_request: 0,
             request_timeout_secs: 30,
             rate_limiter: None,
+            write_admission: None,
+            shard_write_admission: None,
             wal_batcher_alive: None,
             disk_read_only: None,
             sharding_enabled: false,

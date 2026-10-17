@@ -3,7 +3,9 @@ use std::time::Duration;
 
 use crate::adapters::http::router::AppState;
 use crate::application::cluster::sync_manifest;
-use crate::domain::cluster::sync::SyncManifest;
+use crate::domain::cluster::membership::is_departing;
+use crate::domain::cluster::sync::{RegionWatermark, SyncManifest};
+use crate::ports::peer_http::PeerHttp;
 
 /// Periodically checks if this node is the Raft leader; if so, queries each
 /// follower's sync manifest and triggers a re-sync on significantly lagging nodes.
@@ -15,10 +17,8 @@ pub async fn run_leader_replication_monitor(
     // Wait for the cluster to stabilize before monitoring
     tokio::time::sleep(Duration::from_secs(30)).await;
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+    let auth: &dyn PeerHttp = &state.cluster_auth;
+    let client = auth.build(auth.client_builder().timeout(Duration::from_secs(10)));
 
     loop {
         if *shutdown_rx.borrow() {
@@ -71,6 +71,7 @@ pub async fn run_leader_replication_monitor(
             let m = membership.read().await;
             m.all_peers(node_id)
                 .iter()
+                .filter(|p| !is_departing(p))
                 .map(|p| (p.node_id, p.addr.clone(), p.needs_sync))
                 .collect::<Vec<_>>()
         };
@@ -119,31 +120,31 @@ pub async fn run_leader_replication_monitor(
                     else {
                         continue;
                     };
-                    for rw in &local_meas.region_watermarks {
-                        let peer_wm = peer_meas
-                            .region_watermarks
-                            .iter()
-                            .find(|p| p.region_id == rw.region_id)
-                            .map(|p| p.wal_watermark)
-                            .unwrap_or(0);
-                        if rw.wal_watermark.saturating_sub(peer_wm) > 0 {
-                            region_lag = true;
-                            metrics::gauge!(
-                                "hyperbytedb_shard_region_lag_wal_seq",
-                                "peer_id" => peer_id.to_string(),
-                                "region_id" => rw.region_id.to_string()
-                            )
-                            .set(rw.wal_watermark.saturating_sub(peer_wm) as f64);
-                        }
+                    if peer_is_lagging_on_regions(
+                        &local_meas.region_watermarks,
+                        &peer_meas.region_watermarks,
+                    ) {
+                        region_lag = true;
                     }
                 }
             }
 
-            if wal_gap == 0 && !*needs_sync && !region_lag {
+            if !*needs_sync && !region_lag && (state.shard_map.is_some() || wal_gap == 0) {
                 continue;
             }
 
-            let should_trigger = *needs_sync || wal_gap > 0 || region_lag;
+            // `wal_last_seq` is a per-node counter incremented on every local
+            // append. Once sharding gives nodes disjoint region sets they
+            // legitimately diverge -- observed live at 622 on one node against
+            // ~220 on the rest -- so a cross-node difference says nothing about
+            // lag. Worse, acting on it makes the follower request a sequence
+            // range that never existed in the peer's counter space, the peer
+            // truthfully returns nothing, catch-up fails closed, and the loop
+            // repeats forever. Only an explicit `needs_sync` or a real
+            // per-region lag may trigger a re-sync under sharding.
+            let sharded = state.shard_map.is_some();
+            let gap_is_meaningful = !sharded && wal_gap > 0;
+            let should_trigger = *needs_sync || gap_is_meaningful || region_lag;
 
             if should_trigger {
                 tracing::warn!(
@@ -177,5 +178,95 @@ pub async fn run_leader_replication_monitor(
                 }
             }
         }
+    }
+}
+
+/// Pure decision mirroring the `region_lag` comparison performed inline in
+/// the monitor loop above (lines ~107-142). Extracted here so the bug can be
+/// exercised without a live cluster.
+///
+/// `RegionWatermark` entries only exist in a manifest for a region where the
+/// *reporting* node is the `primary` (see
+/// `sync_manifest::build_manifest`, which filters `r.primary == node_id`
+/// before ever pushing a `RegionWatermark`). So a peer's manifest carries NO
+/// entry for any region where that peer is a healthy secondary replica, or
+/// has no involvement in the region at all -- that is the expected, correct
+/// shape of the data, not evidence the peer is behind.
+///
+/// The current inline logic instead treats a missing peer entry as "peer is
+/// at watermark 0" via `.unwrap_or(0)`, which makes it indistinguishable
+/// from "peer never applied anything for this region" -- so a peer that is
+/// perfectly caught up (or not a replica of the region at all) is flagged as
+/// lagging on literally every leader-primary region, every single monitor
+/// cycle, forever, driving the infinite re-sync loop even when `wal_gap == 0`
+/// and `needs_sync == false`. See `region_lag_tests` below.
+pub(crate) fn peer_is_lagging_on_regions(
+    local_regions: &[RegionWatermark],
+    peer_regions: &[RegionWatermark],
+) -> bool {
+    local_regions.iter().any(|rw| {
+        // A region the peer does not report is a region it does not own, not a
+        // region it is infinitely behind on. `sync_manifest` emits watermarks
+        // only for regions where the node is PRIMARY, so a peer never reports
+        // one the leader primaries -- reading that silence as watermark 0 made
+        // every peer look behind on every region, every cycle, forever.
+        peer_regions
+            .iter()
+            .find(|p| p.region_id == rw.region_id)
+            .is_some_and(|p| rw.wal_watermark.saturating_sub(p.wal_watermark) > 0)
+    })
+}
+
+#[cfg(test)]
+mod region_lag_tests {
+    use super::{RegionWatermark, peer_is_lagging_on_regions};
+
+    /// Regression for the infinite re-sync loop reproduced live on the
+    /// `feat/linear-scaling-p1` kind cluster: the leader (node 2) triggers a
+    /// re-sync on every one of its 5 peers, every ~30s, indefinitely, with
+    /// `wal_gap == 0` and `needs_sync == false` in 100% of the ~4000 captured
+    /// events -- the only remaining condition in
+    /// `wal_gap > 0 || needs_sync || region_lag` that can be true every time
+    /// is `region_lag`.
+    ///
+    /// A peer that is the up-to-date SECONDARY replica for a region (or does
+    /// not host the region at all) never publishes a watermark for it, by
+    /// design. The leader must not treat that absence as "peer is behind".
+    /// Today it does -- this test fails against the current logic and should
+    /// pass once the fix lands (skip the comparison when the peer has no
+    /// entry for the region, instead of defaulting to watermark 0).
+    #[test]
+    fn healthy_secondary_replica_is_not_flagged_as_lagging() {
+        let local = vec![RegionWatermark {
+            region_id: 4,
+            wal_watermark: 216,
+        }];
+        // Peer is current for region 4 (or simply isn't a replica of it) --
+        // its manifest has no entry for region 4 at all, matching what
+        // `sync_manifest::build_manifest` actually produces for a non-primary
+        // node.
+        let peer: Vec<RegionWatermark> = vec![];
+
+        assert!(
+            !peer_is_lagging_on_regions(&local, &peer),
+            "a peer reporting no watermark for a region it doesn't \
+             primary-own must not be treated as lagging on that region"
+        );
+    }
+
+    /// Sanity check: a peer that DOES report a region watermark lower than
+    /// the leader's is genuinely lagging and must still be flagged.
+    #[test]
+    fn peer_reporting_lower_watermark_is_flagged_as_lagging() {
+        let local = vec![RegionWatermark {
+            region_id: 4,
+            wal_watermark: 216,
+        }];
+        let peer = vec![RegionWatermark {
+            region_id: 4,
+            wal_watermark: 200,
+        }];
+
+        assert!(peer_is_lagging_on_regions(&local, &peer));
     }
 }

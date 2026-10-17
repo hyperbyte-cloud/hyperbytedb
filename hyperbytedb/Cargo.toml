@@ -1,14 +1,15 @@
 [package]
 name = "hyperbytedb"
-version = "0.8.5"
+version = "0.9.1-beta"
 edition = "2024"
 
 [dependencies]
+foldhash = "0.2"
 # HTTP
-axum = { version = "0.8", features = ["macros"] }
+axum = { version = "0.8", features = ["macros", "http2"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors", "set-header", "timeout"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "set-header", "timeout", "compression-gzip"] }
 
 # Async runtime (`full` pulls in unused extras like `process` and `io-std`)
 tokio = { version = "1", features = [
@@ -40,6 +41,7 @@ tempfile = "3"
 # WAL + metadata
 rocksdb = { version = "0.24", features = ["multi-threaded-cf"] }
 bincode = "1"
+pprof = { version = "0.14", optional = true, default-features = false }
 libc = "0.2"
 
 # Global allocator. The default glibc malloc holds freed heap in its arenas
@@ -76,7 +78,7 @@ metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 
 # HTTP client (peer-to-peer replication)
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
 
 # Compression (gzip decompression for write endpoint)
 flate2 = "1"
@@ -106,10 +108,28 @@ colored = "3.1.1"
 simd-json = { version = "0.17.0", features = ["serde_impl"] }
 humantime = "2"
 lru = "0.12"
+opentelemetry = { version = "0.33.0", optional = true }
+opentelemetry_sdk = { version = "0.33.0", optional = true }
+tracing-opentelemetry = { version = "0.34.0", optional = true }
+opentelemetry-otlp = { version = "0.33.0", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace"], optional = true }
 
 [features]
 default = ["columnar-ingest"]
 columnar-ingest = []
+# In-process CPU profiler at /debug/pprof/profile on the control listener.
+# Off by default; build with it (and unstripped symbols) to diagnose hot spots.
+profiling = ["dep:pprof"]
+# jemalloc heap profiling: run with _RJEM_MALLOC_CONF="prof:true,..." and
+# read the dumps with jeprof against an unstripped binary.
+heap-profiling = ["tikv-jemallocator/profiling"]
+# Export request traces over OTLP (set OTEL_EXPORTER_OTLP_ENDPOINT).
+# Off by default; see src/telemetry.rs.
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+]
 
 [[bench]]
 name = "ingestion_line_protocol"

@@ -69,6 +69,7 @@ async fn start_cluster_node_with_listener(
             joined_at: now,
             last_heartbeat: now,
             needs_sync: false,
+            consecutive_misses: 0,
         });
     }
     let shared_membership = new_shared(membership);
@@ -82,6 +83,7 @@ async fn start_cluster_node_with_listener(
         8192,
         8,
         8 * 1024 * 1024,
+        Default::default(),
     ));
 
     let replication_apply = Some(ReplicationApplyQueue::with_workers_and_sink(
@@ -117,9 +119,13 @@ async fn start_cluster_node_with_listener(
             IngestCardinalityLimits::default(),
         ));
 
-    let query_service: Arc<dyn hyperbytedb::adapters::http::router::QueryService> = Arc::new(
-        PeerQueryService::new(base_query_service, metadata.clone(), peer_client.clone()),
-    );
+    let query_service: Arc<dyn hyperbytedb::adapters::http::router::QueryService> =
+        Arc::new(PeerQueryService::new(
+            base_query_service,
+            metadata.clone(),
+            peer_client.clone(),
+            peer_client.cluster_auth(),
+        ));
 
     let app_state = Arc::new(AppState {
         ingestion: ingestion_service,
@@ -142,6 +148,8 @@ async fn start_cluster_node_with_listener(
         drain_service: None,
         raft: None,
         auth_enabled: false,
+        runtime_settings: Default::default(),
+        cluster_auth: Default::default(),
         auth_allow_query_param_credentials: false,
         prometheus_handle: None,
         statement_summary: None,
@@ -154,6 +162,8 @@ async fn start_cluster_node_with_listener(
         max_points_per_request: 0,
         request_timeout_secs: 30,
         rate_limiter: None,
+        write_admission: None,
+        shard_write_admission: None,
         wal_batcher_alive: None,
         disk_read_only: None,
 
@@ -353,6 +363,8 @@ async fn test_cluster_endpoints_without_peers() {
         drain_service: None,
         raft: None,
         auth_enabled: false,
+        runtime_settings: Default::default(),
+        cluster_auth: Default::default(),
         auth_allow_query_param_credentials: false,
         prometheus_handle: None,
         statement_summary: None,
@@ -365,6 +377,8 @@ async fn test_cluster_endpoints_without_peers() {
         max_points_per_request: 0,
         request_timeout_secs: 30,
         rate_limiter: None,
+        write_admission: None,
+        shard_write_admission: None,
         wal_batcher_alive: None,
         disk_read_only: None,
 
@@ -450,7 +464,7 @@ async fn test_materialized_view_replicates_to_peer() {
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     node_b.flush.flush().await.unwrap();
 
-    let create_mv = r#"CREATE MATERIALIZED VIEW "mv_cpu_5m" ON "mvdb" AS SELECT mean("value") INTO "cpu_5m" FROM "cpu" GROUP BY time(5m), *"#;
+    let create_mv = r#"CREATE MATERIALIZED VIEW "mv_cpu_5m" ON "mvdb" AS SELECT mean("value") AS "mean_value" INTO "cpu_5m" FROM "cpu" GROUP BY time(5m), *"#;
     let resp = client
         .get(format!("{}/query", node_a.url))
         .query(&[("q", create_mv), ("db", "mvdb")])

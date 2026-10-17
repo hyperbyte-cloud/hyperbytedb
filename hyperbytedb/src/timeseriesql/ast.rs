@@ -18,6 +18,8 @@ pub enum Statement {
     DropSeries(DropSeriesStatement),
     ShowRetentionPolicies(String),
     ShowUsers,
+    /// `SHOW GRANTS FOR <user>`: database and privilege, admin only.
+    ShowGrants(String),
     DropUser(String),
     CreateRetentionPolicyStmt {
         name: String,
@@ -48,13 +50,17 @@ pub enum Statement {
         username: String,
         password: String,
     },
+    /// `GRANT READ | WRITE | ALL [PRIVILEGES] [ON <db>] TO <user>`; READ
+    /// and WRITE need `ON`.
     Grant {
         username: String,
         database: Option<String>,
+        privilege: crate::domain::user::DatabasePrivilege,
     },
     Revoke {
         username: String,
         database: Option<String>,
+        privilege: crate::domain::user::DatabasePrivilege,
     },
     Delete(DeleteStatement),
     CreateContinuousQuery(CreateContinuousQueryStatement),
@@ -65,6 +71,14 @@ pub enum Statement {
     },
     CreateMaterializedView(CreateMaterializedViewStatement),
     ShowMaterializedViews,
+    /// `SET <setting> = <value> | DEFAULT`: a runtime setting, replicated to
+    /// every node. `None` clears the override.
+    SetSetting {
+        name: String,
+        value: Option<crate::domain::setting::SettingValue>,
+    },
+    /// `SHOW SETTINGS`.
+    ShowSettings,
     DropMaterializedView {
         name: String,
         db: String,

@@ -69,9 +69,28 @@ The server examines sources in this order; the first successful extraction wins.
 ```toml
 [auth]
 enabled = true
+admin_username = "admin"   # created at startup if missing
+admin_password = "..."     # use HYPERBYTEDB__AUTH__ADMIN_PASSWORD from a Secret
+cluster_token = "..."      # clusters only; HYPERBYTEDB__AUTH__CLUSTER_TOKEN
 ```
 
-Then create users with TimeseriesQL (via `/query` over HTTP, or a client that supports the same). First session may need a bootstrap path if you lock `/query` immediately—typical flow is: enable auth, create admin user in same deployment step, or use a side channel for the first `CREATE USER`.
+Each node creates `admin_username` as an admin at startup if no user has that
+name, so the first `CREATE USER` can run with auth already on. It never
+changes an existing user, so a later `SET PASSWORD` survives restarts.
+
+**Clusters need `cluster_token`.** Nodes call each other's internal routes
+(Raft, replication, forwarded writes and queries) and carry no user; they
+send the token in the `x-hyperbytedb-cluster-token` header instead. Every
+node must have the same token. A wrong token is refused even alongside an
+admin login; the token does not work on `/write` or `/query`. Without it a
+node logs a warning at startup and its peers' internal calls fail with 401.
+The token must be printable ASCII with no spaces: a node refuses to start
+otherwise. A Secret written with `echo` (not `echo -n`) ends in a newline,
+which is the usual cause.
+
+On Kubernetes the operator does all of this when `spec.auth.enabled` is true:
+it keeps the admin login and the token in a Secret and passes them to the
+pods (see [operator: cluster](operator/cluster.md)).
 
 ---
 
@@ -86,10 +105,13 @@ Run through `/query` (or `POST` with form `q=...`).
 | List users | `SHOW USERS` |
 | Change password | `SET PASSWORD FOR "reader" = 'newsecret'` |
 | Remove user | `DROP USER "reader"` |
+| Grant on a database | `GRANT READ ON "db" TO "reader"`, `GRANT WRITE ON "db" TO "telegraf"`, `GRANT ALL ON "db" TO "app"` |
+| Revoke | `REVOKE READ ON "db" FROM "app"` (ALL becomes WRITE), `REVOKE ALL ON "db" FROM "app"` |
+| Show a user's grants | `SHOW GRANTS FOR "app"` (admin only) |
 
 **Admin flag:** the parser sets `admin` if the `CREATE USER` text contains `ALL PRIVILEGES` or `ADMIN` (case-insensitive). Only admin users can access **internal** cluster routes when auth is on.
 
-**Authorization model:** per-database `GRANT ALL ON <db> TO <user>` / `REVOKE ALL ON <db> FROM <user>` control write and query access for non-admin users. Non-admin users without a grant on a database cannot read or write it. Admin users bypass per-database checks. `GRANT ALL PRIVILEGES TO <user>` (no `ON` clause) promotes an existing user to admin; `REVOKE ALL PRIVILEGES FROM <user>` removes admin.
+**Authorization model:** per-database `GRANT READ | WRITE | ALL ON <db> TO <user>` control query (READ) and write (WRITE) access for non-admin users; ALL is both. As in InfluxDB v1, a `GRANT` sets the privilege (GRANT WRITE on a READ user leaves WRITE only), and `REVOKE READ` or `REVOKE WRITE` clears just that one; `REVOKE ALL ON <db>` clears both. Non-admin users without a grant on a database cannot read or write it. Admin users bypass per-database checks. `GRANT ALL PRIVILEGES TO <user>` (no `ON` clause) promotes an existing user to admin; `REVOKE ALL PRIVILEGES FROM <user>` removes admin.
 
 ---
 

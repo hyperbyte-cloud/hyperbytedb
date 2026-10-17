@@ -19,10 +19,17 @@ pub struct ClusterBootstrap {
     pub replication_log: Arc<ReplicationLog>,
     pub hinted_handoff: Arc<HintedHandoff>,
     pub peer_addrs: Vec<String>,
+    /// This node's runtime settings, for `SET`s that arrive by Raft or sync.
+    pub runtime_settings: Arc<crate::application::runtime_settings::RuntimeSettings>,
 }
 
 impl ClusterBootstrap {
-    pub fn init(config: &ClusterConfig, max_hints_per_peer: u64) -> anyhow::Result<Self> {
+    pub fn init(
+        config: &ClusterConfig,
+        max_hints_per_peer: u64,
+        cluster_auth: crate::adapters::cluster::cluster_auth::ClusterAuth,
+        runtime_settings: Arc<crate::application::runtime_settings::RuntimeSettings>,
+    ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(&config.replication_log_dir)?;
         let repl_log = Arc::new(
             ReplicationLog::open(&config.replication_log_dir)
@@ -38,6 +45,7 @@ impl ClusterBootstrap {
             joined_at: now,
             last_heartbeat: now,
             needs_sync: false,
+            consecutive_misses: 0,
         });
 
         let shared_membership = crate::domain::cluster::membership::new_shared(cluster_membership);
@@ -78,8 +86,10 @@ impl ClusterBootstrap {
                 config.replication_queue_depth,
                 config.replication_max_inflight_batches,
                 config.replication_max_coalesce_body_bytes,
+                cluster_auth,
             )
-            .with_hinted_handoff(hh.clone()),
+            .with_hinted_handoff(hh.clone())
+            .with_http2_connections(config.internal_http2_connections),
         );
 
         Ok(Self {
@@ -88,6 +98,7 @@ impl ClusterBootstrap {
             replication_log: repl_log,
             hinted_handoff: hh,
             peer_addrs,
+            runtime_settings,
         })
     }
 
@@ -98,6 +109,7 @@ impl ClusterBootstrap {
         wal: &Arc<dyn WalPort>,
         points_sink: Option<Arc<dyn PointsSinkPort>>,
         max_points_per_request: usize,
+        shard_map: Option<Arc<dyn crate::ports::sharding::ShardMapPort>>,
     ) -> anyhow::Result<()> {
         {
             let mut m = self.membership.write().await;
@@ -107,7 +119,7 @@ impl ClusterBootstrap {
 
         tracing::info!("startup phase: syncing with cluster before accepting traffic");
 
-        let sync_client = SyncClient::with_points_sink(
+        let mut sync_client = SyncClient::with_points_sink(
             config.node_id,
             config.cluster_addr.clone(),
             self.membership.clone(),
@@ -116,7 +128,12 @@ impl ClusterBootstrap {
             points_sink,
             max_points_per_request,
             self.peer_addrs.clone(),
+            self.peer_client.cluster_auth(),
         );
+        sync_client = sync_client.with_runtime_settings(self.runtime_settings.clone());
+        if let Some(map) = shard_map {
+            sync_client = sync_client.with_shard_map(map);
+        }
 
         let dbs = metadata.list_databases().await?;
         let has_data = !dbs.is_empty();
@@ -253,7 +270,8 @@ impl ClusterBootstrap {
             .with_metadata(metadata)
             .with_mv_service(mv_service)
             .with_points_sink(points_sink)
-            .with_wal(wal);
+            .with_wal(wal)
+            .with_runtime_settings(self.runtime_settings.clone());
         if let Some((map, cache)) = shard_map {
             raft_store = raft_store.with_shard_map(map, cache);
         }
@@ -270,13 +288,18 @@ impl ClusterBootstrap {
             .await;
         let (log_store, state_machine) = Adaptor::<TypeConfig, RaftStore>::new(raft_store);
 
-        let network = Network::new(config.raft_rpc_timeout_secs);
+        let network = Network::new(
+            config.raft_rpc_timeout_secs,
+            config.control_port,
+            self.peer_client.cluster_auth(),
+        );
 
+        let (heartbeat_ms, election_ms) = config.raft_timing_ms();
         let raft_config = Arc::new(
             (RaftConfig {
-                heartbeat_interval: config.raft_heartbeat_interval_ms.unwrap_or(1000),
-                election_timeout_min: config.raft_election_timeout_ms.unwrap_or(1000),
-                election_timeout_max: config.raft_election_timeout_ms.unwrap_or(1000) * 2,
+                heartbeat_interval: heartbeat_ms,
+                election_timeout_min: election_ms,
+                election_timeout_max: election_ms * 2,
                 snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(
                     config.raft_snapshot_threshold.unwrap_or(1000) as u64,
                 ),
@@ -286,13 +309,15 @@ impl ClusterBootstrap {
             .map_err(|e| anyhow::anyhow!("invalid raft config: {e}"))?,
         );
 
-        let raft = HyperbytedbRaft::new(
-            config.node_id,
-            raft_config,
-            network,
-            log_store,
-            state_machine,
-        )
+        // On the control runtime: `Raft::new` spawns the Raft core, its
+        // state-machine worker and (as leader) its replication tasks on the
+        // runtime it runs on. Left on the main runtime they queued behind
+        // write tasks under saturation, and heartbeats arrived late enough
+        // to trigger elections (~70 in a one-minute run on n3).
+        let node_id = config.node_id;
+        let raft = crate::application::runtime::control::on_control(async move {
+            HyperbytedbRaft::new(node_id, raft_config, network, log_store, state_machine).await
+        })
         .await
         .map_err(|e| anyhow::anyhow!("failed to initialize raft: {e}"))?;
 

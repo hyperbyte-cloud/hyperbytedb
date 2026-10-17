@@ -222,6 +222,16 @@ impl E2eServer {
             .expect("write request")
     }
 
+    /// POST a statement (`SET`, `CREATE`, ...) and return the raw response.
+    pub async fn post_query(&self, q: &str) -> reqwest::Response {
+        self.client
+            .post(format!("{}/query", self.url))
+            .form(&[("q", q)])
+            .send()
+            .await
+            .expect("query request")
+    }
+
     pub async fn query(&self, db: &str, q: &str) -> serde_json::Value {
         let resp = self
             .client

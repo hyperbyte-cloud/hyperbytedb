@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::application::ingest_metadata::register_series_from_series_table;
+use crate::application::shard_metadata_scatter::scatter_measurement_meta;
 use crate::application::shard_routing::{ShardRoutingContext, ensure_measurement_bootstrapped};
 use crate::application::sharded_mv_backfill::{
     MeasurementShardRef, ShardedMvBackfillPlan, ShardedMvBackfillPorts, scatter_mv_backfill,
@@ -22,6 +23,7 @@ use crate::timeseriesql::to_clickhouse::{
     self, build_create_fact_materialized_view, build_create_series_materialized_view,
 };
 
+#[derive(Clone)]
 pub struct MaterializedViewService {
     metadata: Arc<dyn MetadataPort>,
     query_port: Arc<dyn QueryPort>,
@@ -72,6 +74,18 @@ impl MaterializedViewService {
         &self,
         mv: &CreateMaterializedViewStatement,
     ) -> Result<MaterializedViewDef, HyperbytedbError> {
+        self.create_with(mv, true).await
+    }
+
+    /// `bootstrap_now: false` leaves the shard spaces to the caller: from a
+    /// Raft apply, proposing the bootstrap waits on an entry that cannot apply
+    /// until this one returns (see [`Self::apply_replicated_definition`]).
+    async fn create_with(
+        &self,
+        mv: &CreateMaterializedViewStatement,
+        bootstrap_now: bool,
+    ) -> Result<MaterializedViewDef, HyperbytedbError> {
+        require_mv_aliases(&mv.query)?;
         if self
             .metadata
             .get_materialized_view(&mv.database, &mv.name)
@@ -104,17 +118,39 @@ impl MaterializedViewService {
                 .unwrap_or_else(|_| "autogen".to_string()),
         };
 
-        self.bootstrap_sharded_measurements(
-            &source_db,
-            &source_rp,
-            &source_measurement,
-            &dest_db,
-            &dest_rp,
-            &dest_measurement,
-        )
-        .await?;
+        if bootstrap_now {
+            // The statement's own node, not a Raft apply: it may ask peers.
+            if let Some(ctx) = self.shard_routing.as_ref()
+                && let Some(meta) = scatter_measurement_meta(
+                    ctx,
+                    self.metadata.as_ref(),
+                    &source_db,
+                    &source_rp,
+                    &source_measurement,
+                )
+                .await?
+            {
+                self.ensure_source_measurement(&source_db, &source_rp, &meta)
+                    .await?;
+            }
+            self.bootstrap_sharded_measurements(
+                &source_db,
+                &source_rp,
+                &source_measurement,
+                &dest_db,
+                &dest_rp,
+                &dest_measurement,
+            )
+            .await?;
+        }
 
-        if mv.backfill_on_create && self.shard_routing.is_some() {
+        // Sharded history is rolled up once for the whole cluster: here on
+        // the statement's own node, or by the leader after a Raft apply (see
+        // `spawn_bootstrap_after_apply`). Every node applies the replicated
+        // CREATE, and each one backfilling counted the history once per node.
+        let sharded_backfill =
+            bootstrap_now && mv.backfill_on_create && self.shard_routing.is_some();
+        if sharded_backfill {
             self.run_sharded_backfill(
                 mv,
                 MeasurementShardRef {
@@ -132,9 +168,10 @@ impl MaterializedViewService {
         }
 
         let run_local_backfill = mv.backfill_on_create && self.shard_routing.is_none();
-        let sharded_backfill_done = mv.backfill_on_create && self.shard_routing.is_some();
-        // Sharded scatter backfill runs before DDL; do not drop the destination it just filled.
-        let reset_destination = !sharded_backfill_done;
+        // Sharded scatter backfill runs before DDL; do not drop the destination
+        // it just filled. Nor on a replicated apply: another node's backfill
+        // may already have written this node's share.
+        let reset_destination = bootstrap_now && !sharded_backfill;
         self.materialize_ddl(mv, reset_destination, run_local_backfill)
             .await?;
 
@@ -274,7 +311,12 @@ impl MaterializedViewService {
     pub async fn apply_replicated_definition(
         &self,
         definition: &MaterializedViewDef,
+        source_meta: Option<&MeasurementMeta>,
     ) -> Result<(), HyperbytedbError> {
+        if let Some(meta) = source_meta {
+            self.ensure_source_measurement(&definition.source_db, &definition.source_rp, meta)
+                .await?;
+        }
         if self
             .metadata
             .get_materialized_view(&definition.database, &definition.name)
@@ -291,8 +333,122 @@ impl MaterializedViewService {
             raw_query: definition.query_text.clone(),
             backfill_on_create: definition.backfill_on_create,
         };
-        self.create(&stmt).await?;
+        // Raft applies one entry at a time, and bootstrapping the shard spaces
+        // proposes new entries and waits for them: from inside this apply that
+        // waited on an entry this apply was holding up. On n3 every CREATE
+        // MATERIALIZED VIEW stalled the leader for the 5 s proposal timeout,
+        // lost the leadership, failed, and left the destination's space
+        // bootstrapped with no view. Bootstrap after the apply instead, once,
+        // from the leader; the view's local objects do not need the spaces.
+        let def = self.create_with(&stmt, false).await?;
+        self.spawn_bootstrap_after_apply(&def);
         Ok(())
+    }
+
+    /// With sharding a node has the source measurement only once rows for it
+    /// land there. Register it from the proposer's schema so the view exists
+    /// before this node's first row, which it would otherwise never roll up.
+    async fn ensure_source_measurement(
+        &self,
+        db: &str,
+        rp: &str,
+        meta: &MeasurementMeta,
+    ) -> Result<(), HyperbytedbError> {
+        if self
+            .metadata
+            .get_measurement(db, rp, &meta.name)
+            .await?
+            .is_some()
+        {
+            return Ok(());
+        }
+        self.metadata.register_measurement(db, rp, meta).await?;
+        self.points_sink
+            .ensure_measurement_schema(db, rp, meta)
+            .await
+    }
+
+    /// The history of a view created through Raft, rolled up once, by the
+    /// leader, after its own apply.
+    async fn backfill_replicated(&self, def: &MaterializedViewDef) -> Result<(), HyperbytedbError> {
+        let stmt = CreateMaterializedViewStatement {
+            name: def.name.clone(),
+            database: def.database.clone(),
+            query: parse_mv_select(&def.query_text)?,
+            raw_query: def.query_text.clone(),
+            backfill_on_create: true,
+        };
+        self.run_sharded_backfill(
+            &stmt,
+            MeasurementShardRef {
+                db: &def.source_db,
+                rp: &def.source_rp,
+                measurement: &def.source_measurement,
+            },
+            MeasurementShardRef {
+                db: &def.dest_db,
+                rp: &def.dest_rp,
+                measurement: &def.dest_measurement,
+            },
+        )
+        .await?;
+        tracing::info!(mv = %def.name, db = %def.database, "materialized view backfilled");
+        Ok(())
+    }
+
+    fn spawn_bootstrap_after_apply(&self, def: &MaterializedViewDef) {
+        let Some(ctx) = self.shard_routing.clone() else {
+            return;
+        };
+        if !self.is_raft_leader.as_ref().map(|f| f()).unwrap_or(true) {
+            return;
+        }
+        let leader_addr = self.raft_leader_addr.as_ref().and_then(|f| f());
+        let backfill = def.backfill_on_create.then(|| (self.clone(), def.clone()));
+        let spaces = [
+            (
+                def.source_db.clone(),
+                def.source_rp.clone(),
+                def.source_measurement.clone(),
+            ),
+            (
+                def.dest_db.clone(),
+                def.dest_rp.clone(),
+                def.dest_measurement.clone(),
+            ),
+        ];
+        tokio::spawn(async move {
+            for (db, rp, measurement) in spaces {
+                if let Err(e) = ensure_measurement_bootstrapped(
+                    &ctx,
+                    &db,
+                    &rp,
+                    &measurement,
+                    true,
+                    leader_addr.as_deref(),
+                )
+                .await
+                {
+                    tracing::warn!(
+                        db = %db,
+                        rp = %rp,
+                        measurement = %measurement,
+                        error = %e,
+                        "materialized view shard space bootstrap failed"
+                    );
+                }
+            }
+            if let Some((svc, def)) = backfill
+                && let Err(e) = svc.backfill_replicated(&def).await
+            {
+                tracing::error!(
+                    mv = %def.name,
+                    db = %def.database,
+                    error = %e,
+                    "materialized view backfill failed"
+                );
+            }
+        });
     }
 
     /// Idempotent drop of a replicated materialized view (metadata + chDB objects).
@@ -436,12 +592,19 @@ impl MaterializedViewService {
         let fact_mv_quoted = quoted_fact_mv_name(&mv.database, &dest_rp, &mv.name);
         let series_mv_quoted = quoted_series_mv_name(&mv.database, &dest_rp, &mv.name);
 
-        let select_sql = to_clickhouse::translate_materialized_view_select(
+        // Sharded: roll up only rows ingested on this node, so a row that
+        // every replica inserts is counted once across the cluster.
+        let source_filter = self
+            .shard_routing
+            .as_ref()
+            .map(|ctx| crate::application::shard_query::ingested_here_filter(ctx.node_id));
+        let select_sql = to_clickhouse::translate_materialized_view_select_with_source_filter(
             &effective_query,
             &source_fact,
             &source_series,
             &dest_measurement,
             &source_mapping,
+            source_filter.as_deref(),
         )?;
 
         let create_fact_mv =
@@ -784,10 +947,38 @@ fn parse_mv_select(
 ) -> Result<crate::timeseriesql::ast::SelectStatement, HyperbytedbError> {
     let stmts = crate::timeseriesql::parse(query_text)?;
     match stmts.into_iter().next() {
-        Some(crate::timeseriesql::ast::Statement::Select(s)) => Ok(s),
+        Some(crate::timeseriesql::ast::Statement::Select(mut s)) => {
+            fill_legacy_mv_aliases(&mut s);
+            Ok(s)
+        }
         _ => Err(HyperbytedbError::QueryParse(
             "MV body must be a SELECT statement".to_string(),
         )),
+    }
+}
+
+/// A materialized view's columns are stored under their names, so the names
+/// must not depend on defaults that can change: every column needs `AS`.
+fn require_mv_aliases(
+    stmt: &crate::timeseriesql::ast::SelectStatement,
+) -> Result<(), HyperbytedbError> {
+    if let Some(i) = stmt.fields.iter().position(|f| f.alias.is_none()) {
+        return Err(HyperbytedbError::QueryParse(format!(
+            "materialized view columns must be named: column {} has no AS \"<name>\" \
+             (e.g. mean(\"value\") AS \"mean_value\")",
+            i + 1
+        )));
+    }
+    Ok(())
+}
+
+/// Views stored before aliases were required named their columns
+/// `mean_value`-style; keep those names so their stored columns still match.
+fn fill_legacy_mv_aliases(stmt: &mut crate::timeseriesql::ast::SelectStatement) {
+    for field in &mut stmt.fields {
+        if field.alias.is_none() {
+            field.alias = crate::timeseriesql::to_clickhouse::legacy_field_alias(&field.expr);
+        }
     }
 }
 
@@ -869,4 +1060,28 @@ fn dest_measurement_meta(
         materialized: true,
         materialized_rp: None,
     })
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::parse_mv_select;
+
+    /// Views stored before AS was required keep the names their columns were
+    /// created under.
+    #[test]
+    fn a_stored_view_without_aliases_keeps_its_legacy_names() {
+        let stmt = parse_mv_select(
+            r#"SELECT mean("value"), sum("v") AS "total", count("x") INTO "d" FROM "cpu" GROUP BY time(1m)"#,
+        )
+        .unwrap();
+        let names: Vec<Option<String>> = stmt.fields.iter().map(|f| f.alias.clone()).collect();
+        assert_eq!(
+            names,
+            [
+                Some("mean_value".to_string()),
+                Some("total".to_string()),
+                Some("count_x".to_string())
+            ]
+        );
+    }
 }

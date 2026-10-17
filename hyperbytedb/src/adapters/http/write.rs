@@ -52,7 +52,7 @@ pub async fn handle_write(
         if let Some(node) = m.get_node(state.node_id) {
             use crate::domain::cluster::membership::NodeState;
             match node.state {
-                NodeState::Draining | NodeState::Leaving => {
+                NodeState::Draining | NodeState::Decommissioning | NodeState::Leaving => {
                     let active_peer = m
                         .active_peers(state.node_id)
                         .first()
@@ -74,7 +74,10 @@ pub async fn handle_write(
                 NodeState::Syncing | NodeState::Joining => {
                     return Ok(StatusCode::SERVICE_UNAVAILABLE.into_response());
                 }
-                _ => {}
+                // Listed explicitly rather than `_`: a catch-all here silently
+                // admits client writes for any state added later, which is how
+                // a node being removed kept accepting them.
+                NodeState::Active | NodeState::Disconnected => {}
             }
         }
     }
@@ -90,57 +93,67 @@ pub async fn handle_write(
     let rp = params.rp.clone();
     let precision = params.precision.clone();
     let auth_user = auth_user.map(|u| u.0);
+    let span = tracing::debug_span!(
+        target: crate::telemetry::TARGET,
+        "write",
+        db = %db_owned,
+        node = state.node_id,
+        bytes = body.len()
+    );
 
-    async {
-        if let Some(ref user) = auth_user
-            && !user.user.can_write(&db_owned)
-        {
-            return Ok((
-                StatusCode::FORBIDDEN,
-                format!(
-                    "user '{}' is not authorized to write to database '{}'",
-                    user.username, db_owned
-                ),
-            )
-                .into_response());
-        }
-
-        let decompressed = maybe_decompress_gzip(&headers, &body, state.max_body_size_bytes)?;
-        let payload: &[u8] = decompressed.as_deref().unwrap_or(&body);
-        histogram!("hyperbytedb_write_payload_bytes").record(payload.len() as f64);
-
-        #[cfg(not(feature = "columnar-ingest"))]
-        if ct_norm.eq_ignore_ascii_case(COLUMNAR_MSGPACK_V1_CT) {
-            return Ok((
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "columnar-ingest feature is not enabled for this build",
-            )
-                .into_response());
-        }
-
-        let result = state
-            .ingestion
-            .ingest(
-                &db_owned,
-                rp.as_deref(),
-                precision.as_deref(),
-                payload,
-                write_format,
-            )
-            .await;
-
-        match result {
-            Ok(()) => {
-                counter!("hyperbytedb_write_requests_total").increment(1);
-                Ok(StatusCode::NO_CONTENT.into_response())
+    tracing::Instrument::instrument(
+        async {
+            if let Some(ref user) = auth_user
+                && !user.user.can_write(&db_owned)
+            {
+                return Ok((
+                    StatusCode::FORBIDDEN,
+                    format!(
+                        "user '{}' is not authorized to write to database '{}'",
+                        user.username, db_owned
+                    ),
+                )
+                    .into_response());
             }
-            Err(e) => {
-                counter!("hyperbytedb_write_requests_total").increment(1);
-                counter!("hyperbytedb_write_errors_total").increment(1);
-                Err(e)
+
+            let decompressed = maybe_decompress_gzip(&headers, &body, state.max_body_size_bytes)?;
+            let payload: &[u8] = decompressed.as_deref().unwrap_or(&body);
+            histogram!("hyperbytedb_write_payload_bytes").record(payload.len() as f64);
+
+            #[cfg(not(feature = "columnar-ingest"))]
+            if ct_norm.eq_ignore_ascii_case(COLUMNAR_MSGPACK_V1_CT) {
+                return Ok((
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    "columnar-ingest feature is not enabled for this build",
+                )
+                    .into_response());
             }
-        }
-    }
+
+            let result = state
+                .ingestion
+                .ingest(
+                    &db_owned,
+                    rp.as_deref(),
+                    precision.as_deref(),
+                    payload,
+                    write_format,
+                )
+                .await;
+
+            match result {
+                Ok(()) => {
+                    counter!("hyperbytedb_write_requests_total").increment(1);
+                    Ok(StatusCode::NO_CONTENT.into_response())
+                }
+                Err(e) => {
+                    counter!("hyperbytedb_write_requests_total").increment(1);
+                    counter!("hyperbytedb_write_errors_total").increment(1);
+                    Err(e)
+                }
+            }
+        },
+        span,
+    )
     .await
 }
 

@@ -51,6 +51,10 @@ impl ReplicationLog {
         let cfs = vec![
             ColumnFamilyDescriptor::new(REPL_CF, cf_opts),
             ColumnFamilyDescriptor::new(HINTED_HANDOFF_CF, hh_opts),
+            ColumnFamilyDescriptor::new(
+                crate::adapters::cluster::forward_queue::FORWARD_QUEUE_CF,
+                Options::default(),
+            ),
         ];
 
         let db = Arc::new(DB::open_cf_descriptors(&opts, path, cfs).map_err(|e| {

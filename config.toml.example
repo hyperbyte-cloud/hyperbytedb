@@ -45,6 +45,11 @@ insert_max_threads = 4
 enabled = false
 # InfluxDB v1-style ?u=&p= on the query string (unsafe: may appear in logs/Referer)
 # allow_query_param_credentials = false
+# Clusters with auth on: the same token on every node (set from a secret).
+# cluster_token = ""
+# Admin created at startup if no user has this name.
+# admin_username = "admin"
+# admin_password = ""
 
 [cardinality]
 max_tag_values_per_measurement = 100000

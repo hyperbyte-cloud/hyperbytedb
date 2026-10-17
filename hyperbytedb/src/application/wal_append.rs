@@ -24,9 +24,11 @@ pub async fn append_points_with_prepared(
     if wal.arrow_wal_enabled()
         && let Some(sink) = sink
     {
-        match sink
-            .build_prepared_wal_slot(db, rp, origin_node_id, &points)
-            .await
+        match tracing::Instrument::instrument(
+            sink.build_prepared_wal_slot(db, rp, origin_node_id, &points),
+            tracing::debug_span!(target: crate::telemetry::TARGET, "build_wal_slot"),
+        )
+        .await
         {
             Ok(prepared) => {
                 histogram!("hyperbytedb_ingest_arrow_build_seconds")
@@ -37,12 +39,24 @@ pub async fn append_points_with_prepared(
                     points,
                     origin_node_id,
                 };
-                return wal
-                    .append_bundle(WalAppendBundle {
+                let append_start = std::time::Instant::now();
+                let seq = tracing::Instrument::instrument(
+                    wal.append_bundle(WalAppendBundle {
                         entry,
                         prepared: Some(prepared),
-                    })
-                    .await;
+                    }),
+                    tracing::debug_span!(
+                        target: crate::telemetry::TARGET,
+                        "wal_batcher",
+                        queued_ms = tracing::field::Empty,
+                        write_ms = tracing::field::Empty,
+                        batch_len = tracing::field::Empty
+                    ),
+                )
+                .await;
+                histogram!("hyperbytedb_wal_append_bundle_seconds")
+                    .record(append_start.elapsed().as_secs_f64());
+                return seq;
             }
             Err(e) => {
                 tracing::debug!(error = %e, "prepared WAL build failed; falling back");

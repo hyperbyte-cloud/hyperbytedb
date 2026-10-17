@@ -15,29 +15,43 @@ use super::TypeConfig;
 pub struct Network {
     client: reqwest::Client,
     default_timeout: Duration,
-}
-
-impl Default for Network {
-    fn default() -> Self {
-        Self::new(10)
-    }
+    /// `cluster.control_port`; `0` sends Raft RPCs to the main address only.
+    control_port: u16,
 }
 
 impl Network {
-    pub fn new(default_timeout_secs: u64) -> Self {
+    pub fn new(
+        default_timeout_secs: u64,
+        control_port: u16,
+        cluster_auth: &crate::adapters::cluster::cluster_auth::ClusterAuth,
+    ) -> Self {
+        use crate::ports::peer_http::PeerHttp;
         let default_timeout = Duration::from_secs(default_timeout_secs);
         Self {
             // `Client::builder().build()` only fails if TLS init is broken,
             // in which case `Client::new()` (same default config) would also
             // be unusable. Fall back to defaults so we don't panic on a path
             // that's exercised on the hot bootstrap line.
-            client: reqwest::Client::builder()
-                .timeout(default_timeout)
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+            client: cluster_auth.build(
+                cluster_auth
+                    .client_builder()
+                    .timeout(default_timeout)
+                    .dns_resolver(crate::adapters::cluster::dns_cache::CachingResolver::shared()),
+            ),
             default_timeout,
+            control_port,
         }
     }
+}
+
+/// A peer's control-listener address: its host on `control_port`, or `None`
+/// when the control listener is disabled.
+fn control_addr(addr: &str, control_port: u16) -> Option<String> {
+    if control_port == 0 {
+        return None;
+    }
+    let (host, _) = addr.rsplit_once(':')?;
+    Some(format!("{host}:{control_port}"))
 }
 
 impl RaftNetworkFactory<TypeConfig> for Network {
@@ -46,6 +60,7 @@ impl RaftNetworkFactory<TypeConfig> for Network {
     async fn new_client(&mut self, _target: u64, node: &BasicNode) -> Self::Network {
         NetworkConnection {
             addr: node.addr.clone(),
+            control_addr: control_addr(&node.addr, self.control_port),
             client: self.client.clone(),
             default_timeout: self.default_timeout,
         }
@@ -55,13 +70,43 @@ impl RaftNetworkFactory<TypeConfig> for Network {
 /// A connection to a single remote Raft node.
 pub struct NetworkConnection {
     addr: String,
+    /// The peer's control listener, tried first when configured.
+    control_addr: Option<String>,
     client: reqwest::Client,
     default_timeout: Duration,
 }
 
 impl NetworkConnection {
-    fn url(&self, path: &str) -> String {
-        format!("http://{}{}", self.addr, path)
+    /// POST `req` to the peer's control listener, falling back to its main
+    /// address when nothing accepts the connection there (a peer still on a
+    /// build without the control listener, mid-roll).
+    async fn send<Req: serde::Serialize>(
+        &self,
+        path: &str,
+        req: &Req,
+        timeout: Duration,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        if let Some(ctrl) = &self.control_addr {
+            match self
+                .client
+                .post(format!("http://{ctrl}{path}"))
+                .json(req)
+                .timeout(timeout)
+                .send()
+                .await
+            {
+                Err(e) if e.is_connect() => {
+                    metrics::counter!("hyperbytedb_raft_control_fallback_total").increment(1);
+                }
+                other => return other,
+            }
+        }
+        self.client
+            .post(format!("http://{}{path}", self.addr))
+            .json(req)
+            .timeout(timeout)
+            .send()
+            .await
     }
 
     fn effective_timeout(option: &RPCOption, default: Duration) -> Duration {
@@ -77,11 +122,7 @@ impl NetworkConnection {
     ) -> Result<Resp, RPCError<u64, BasicNode, RaftError<u64>>> {
         let timeout = Self::effective_timeout(option, self.default_timeout);
         let resp = self
-            .client
-            .post(self.url(path))
-            .json(req)
-            .timeout(timeout)
-            .send()
+            .send(path, req, timeout)
             .await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
 
@@ -110,11 +151,7 @@ impl NetworkConnection {
     {
         let timeout = Self::effective_timeout(option, self.default_timeout);
         let resp = self
-            .client
-            .post(self.url(path))
-            .json(req)
-            .timeout(timeout)
-            .send()
+            .send(path, req, timeout)
             .await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
 
@@ -167,7 +204,20 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::NetworkConnection;
+    use super::{NetworkConnection, control_addr};
+
+    #[test]
+    fn control_address_swaps_the_port_or_is_off() {
+        assert_eq!(
+            control_addr("hb-0.hb-headless.ns.svc:8086", 8087).as_deref(),
+            Some("hb-0.hb-headless.ns.svc:8087")
+        );
+        assert_eq!(
+            control_addr("[::1]:8086", 9000).as_deref(),
+            Some("[::1]:9000")
+        );
+        assert_eq!(control_addr("hb-0:8086", 0), None);
+    }
     use openraft::network::RPCOption;
     use std::time::Duration;
 

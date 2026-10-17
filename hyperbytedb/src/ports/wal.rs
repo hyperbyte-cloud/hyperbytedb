@@ -39,7 +39,11 @@ pub trait WalPort: Send + Sync {
         self.append(bundle.entry).await
     }
 
+    /// Like `read_range` with no entry limit; still one bounded page.
     async fn read_from(&self, sequence: u64) -> Result<Vec<(u64, WalEntry)>, HyperbytedbError>;
+    /// Read up to `max_entries` entries starting at `from`. A read may stop
+    /// early to bound memory, so a short page does not mean the end of the
+    /// log: only an empty result does.
     async fn read_range(
         &self,
         from: u64,
@@ -73,6 +77,20 @@ pub trait WalPort: Send + Sync {
 
     async fn truncate_before(&self, sequence: u64) -> Result<(), HyperbytedbError>;
     async fn last_sequence(&self) -> Result<u64, HyperbytedbError>;
+
+    /// Highest sequence whose entries are all in the local store, as the flush
+    /// last recorded it. 0 means unknown (nothing flushed since start), and a
+    /// reader must then treat every entry as possibly unflushed.
+    fn flushed_through(&self) -> u64;
+
+    /// Record that every entry up to `sequence` is in the local store.
+    fn set_flushed_through(&self, sequence: u64);
+
+    /// Where to truncate so that at most `max_bytes` of the entries up to
+    /// `through` stay: the highest sequence that may go. Entries whose size
+    /// is not known (written before this process started) count as over the
+    /// budget.
+    fn flushed_margin_start(&self, through: u64, max_bytes: u64) -> u64;
 
     /// Remove all durable and in-memory WAL entries for `database`.
     async fn purge_database(&self, database: &str) -> Result<(), HyperbytedbError> {

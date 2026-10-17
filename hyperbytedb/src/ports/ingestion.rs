@@ -26,4 +26,9 @@ pub trait IngestionPort: Send + Sync {
         body: &[u8],
         format: WritePayloadFormat,
     ) -> Result<(), HyperbytedbError>;
+
+    /// Acknowledged writes this node still owes to other region primaries.
+    /// A departing node must not retire while any remain. No default: zero
+    /// means "safe to retire", which an implementation must choose to say.
+    fn pending_forwards(&self) -> usize;
 }

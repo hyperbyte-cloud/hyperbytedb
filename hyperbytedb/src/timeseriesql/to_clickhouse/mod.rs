@@ -22,11 +22,13 @@ pub use materialized_view::{
     build_create_fact_materialized_view, build_create_series_materialized_view,
     cq_time_window_condition, prepare_cq_select, strip_time_predicates, translate_bounded_cq_into,
     translate_materialized_view_backfill, translate_materialized_view_select,
+    translate_materialized_view_select_with_source_filter,
     translate_materialized_view_series_select, translate_select_into, translate_select_into_native,
 };
 pub use select::{
-    select_has_true_aggregate, select_output_field_name, translate_native_table,
-    translate_with_source,
+    legacy_field_alias, select_has_true_aggregate, select_output_field_name,
+    translate_native_table, translate_native_table_unordered, translate_with_source,
+    with_output_names,
 };
 
 /// `SELECT ... INTO` requires `GROUP BY time(<interval>)` so results are bucketed

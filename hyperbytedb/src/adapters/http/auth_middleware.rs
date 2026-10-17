@@ -108,6 +108,13 @@ pub async fn internal_auth_layer(
     if !state.auth_enabled {
         return next.run(request).await;
     }
+    // A peer or the operator.
+    if let Some(token) = headers.get(crate::adapters::cluster::cluster_auth::HEADER) {
+        if state.cluster_auth.token_matches(token.as_bytes()) {
+            return next.run(request).await;
+        }
+        return (StatusCode::UNAUTHORIZED, "authorization failed").into_response();
+    }
 
     let credentials =
         extract_credentials(&headers, &query, state.auth_allow_query_param_credentials);
@@ -150,6 +157,139 @@ pub async fn rate_limit_write_layer(
         return rate_limit_response();
     }
     next.run(request).await
+}
+
+/// Admission control for `/write`: hold a permit for the whole request, or
+/// turn the request away at once with 503 and `Retry-After`.
+///
+/// Rejecting in microseconds is the point. Accepting every request past
+/// saturation starved Raft heartbeats and health probes on a CPU-limited
+/// node, which cost elections, liveness kills and 5s replication timeouts --
+/// throughput fell ~17x instead of levelling off.
+pub async fn write_admission_layer(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    admit(state.write_admission.as_ref(), "client", 1, request, next).await
+}
+
+/// Admission control for writes forwarded here as region primary, charged by
+/// body size in KiB. See `AppState::shard_write_admission`.
+///
+/// By size, not count: one client batch splits into a forward per region,
+/// each a few dozen points. A limit of N forwards rejected most of them on a
+/// node with CPU to spare -- 103k rejections on one node in one run -- while
+/// the client side barely rejected anything.
+pub async fn shard_write_admission_layer(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let kib = request
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(1, |len| len.div_ceil(1024).max(1));
+    admit(
+        state.shard_write_admission.as_ref(),
+        "shard",
+        kib,
+        request,
+        next,
+    )
+    .await
+}
+
+/// Permits a request of `cost` units takes from a budget of `total`: at least
+/// one, and never more than the whole budget, so an oversized request can
+/// still run alone instead of being refused forever.
+#[must_use]
+pub(crate) fn admission_cost(cost: u64, total: usize) -> u32 {
+    let cap = u32::try_from(total.max(1)).unwrap_or(u32::MAX);
+    u32::try_from(cost.max(1)).unwrap_or(u32::MAX).min(cap)
+}
+
+async fn admit(
+    admission: Option<&Arc<super::router::Admission>>,
+    kind: &'static str,
+    cost: u64,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let Some(admission) = admission else {
+        return next.run(request).await;
+    };
+    let permits = admission_cost(cost, admission.capacity());
+    match admission.sem.clone().try_acquire_many_owned(permits) {
+        Ok(permit) => {
+            let start = std::time::Instant::now();
+            let resp = next.run(request).await;
+            drop(permit);
+            metrics::histogram!("hyperbytedb_admitted_request_seconds", "kind" => kind)
+                .record(start.elapsed().as_secs_f64());
+            resp
+        }
+        Err(_) => {
+            metrics::counter!("hyperbytedb_write_admission_rejected_total", "kind" => kind)
+                .increment(1);
+            let drained = drain_refused_body(request).await;
+            metrics::counter!(
+                "hyperbytedb_write_admission_drained_total",
+                "kind" => kind,
+                "drained" => if drained { "yes" } else { "no" }
+            )
+            .increment(1);
+            let mut resp = (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "write capacity exhausted, retry shortly",
+            )
+                .into_response();
+            resp.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("1"),
+            );
+            if !drained {
+                resp.headers_mut().insert(
+                    axum::http::header::CONNECTION,
+                    axum::http::HeaderValue::from_static("close"),
+                );
+            }
+            resp
+        }
+    }
+}
+
+/// Most bytes and time spent reading a refused request's body.
+const REFUSED_DRAIN_MAX_BYTES: usize = 32 * 1024 * 1024;
+const REFUSED_DRAIN_MAX_TIME: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Read and discard the body of a request refused before its handler ran.
+///
+/// Admission refuses on headers alone. Closing a socket with the body still
+/// unread makes the kernel send a reset, and a reset discards whatever the
+/// peer has not read yet -- including the 503 -- so the sender saw
+/// "connection closed before message completed" instead of a retryable
+/// refusal. Returns false if the body was too large or too slow; the reply
+/// then asks the peer to close.
+async fn drain_refused_body(request: axum::extract::Request) -> bool {
+    use futures::StreamExt;
+    let mut body = request.into_body().into_data_stream();
+    let read = async {
+        let mut total = 0usize;
+        while let Some(chunk) = body.next().await {
+            let Ok(chunk) = chunk else { return false };
+            total += chunk.len();
+            if total > REFUSED_DRAIN_MAX_BYTES {
+                return false;
+            }
+        }
+        true
+    };
+    tokio::time::timeout(REFUSED_DRAIN_MAX_TIME, read)
+        .await
+        .unwrap_or(false)
 }
 
 /// Rate-limiting middleware for `/query`.
@@ -221,5 +361,19 @@ mod tests {
             extract_credentials(&headers, &query, false),
             Some(("admin".to_string(), "secret".to_string()))
         );
+    }
+}
+
+#[cfg(test)]
+mod admission_cost_tests {
+    use super::admission_cost;
+
+    #[test]
+    fn cost_is_at_least_one_and_at_most_the_budget() {
+        assert_eq!(admission_cost(0, 3072), 1);
+        assert_eq!(admission_cost(40, 3072), 40);
+        // Bigger than the whole budget: clamp so it can run alone.
+        assert_eq!(admission_cost(10_000, 3072), 3072);
+        assert_eq!(admission_cost(5, 0), 1);
     }
 }

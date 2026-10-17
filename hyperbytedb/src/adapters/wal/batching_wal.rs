@@ -22,7 +22,18 @@ struct BatchRequest {
     /// `None` => the writer encodes inline (e.g. ArrowIpc).
     pre_encoded: Option<Vec<u8>>,
     enqueued_at: Instant,
-    tx: oneshot::Sender<Result<u64, HyperbytedbError>>,
+    tx: oneshot::Sender<Result<(u64, BatchTiming), HyperbytedbError>>,
+}
+
+/// How one append fared in the writer, reported back to its caller so a
+/// traced request can tell queueing behind other batches from a slow write.
+#[derive(Debug, Clone, Copy)]
+struct BatchTiming {
+    /// Enqueue to the start of the batch's write.
+    queued: Duration,
+    /// The batch's RocksDB write.
+    write: Duration,
+    batch_len: usize,
 }
 
 pub struct BatchingWal {
@@ -112,10 +123,10 @@ impl BatchingWal {
             let batch_len = batch.len();
             let mut bundles = Vec::with_capacity(batch_len);
             let mut pre_encoded = Vec::with_capacity(batch_len);
-            let mut responses =
-                Vec::<(Instant, oneshot::Sender<Result<u64, HyperbytedbError>>)>::with_capacity(
-                    batch_len,
-                );
+            let mut responses = Vec::<(
+                Instant,
+                oneshot::Sender<Result<(u64, BatchTiming), HyperbytedbError>>,
+            )>::with_capacity(batch_len);
             for req in batch.drain(..) {
                 bundles.push(req.bundle);
                 pre_encoded.push(req.pre_encoded);
@@ -138,7 +149,12 @@ impl BatchingWal {
                     for ((enqueued_at, tx), seq) in responses.into_iter().zip(seqs) {
                         histogram!("hyperbytedb_wal_batcher_response_seconds")
                             .record(now.duration_since(enqueued_at).as_secs_f64());
-                        let _ = tx.send(Ok(seq));
+                        let timing = BatchTiming {
+                            queued: t_coalesce_end.saturating_duration_since(enqueued_at),
+                            write: write_elapsed,
+                            batch_len,
+                        };
+                        let _ = tx.send(Ok((seq, timing)));
                     }
                 }
                 Ok(Err(e)) => {
@@ -174,14 +190,20 @@ impl BatchingWal {
         // time, so this is safe and moves the per-point serialization cost off
         // the writer (the measured ingest bottleneck). ArrowIpc still encodes
         // inline because its payload is patched with the assigned seq.
-        let pre_encoded =
-            if self.inner.wal_format() == WalFormat::Bincode {
-                Some(bincode::serialize(&bundle.entry).map_err(|e| {
-                    HyperbytedbError::Wal(crate::error::ChainedError::from_error(e))
-                })?)
-            } else {
-                None
-            };
+        let encode_start = Instant::now();
+        let pre_encoded = if self.inner.wal_format() == WalFormat::Bincode {
+            let mut bytes = Vec::with_capacity(
+                64 + bundle.entry.points.len()
+                    * crate::application::line_protocol::POINT_ENCODED_SIZE_HINT,
+            );
+            crate::application::line_protocol::encode_bincode_into(&mut bytes, &bundle.entry)
+                .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
+            Some(bytes)
+        } else {
+            None
+        };
+        histogram!("hyperbytedb_wal_batcher_encode_seconds")
+            .record(encode_start.elapsed().as_secs_f64());
         let (tx, rx) = oneshot::channel();
         let req = BatchRequest {
             bundle,
@@ -209,11 +231,16 @@ impl BatchingWal {
             ))
         })?;
 
-        rx.await.map_err(|_| {
+        let (seq, timing) = rx.await.map_err(|_| {
             HyperbytedbError::Wal(crate::error::ChainedError::new(
                 "WAL batcher dropped response",
             ))
-        })?
+        })??;
+        let span = tracing::Span::current();
+        span.record("queued_ms", timing.queued.as_secs_f64() * 1000.0);
+        span.record("write_ms", timing.write.as_secs_f64() * 1000.0);
+        span.record("batch_len", timing.batch_len);
+        Ok(seq)
     }
 }
 
@@ -270,6 +297,18 @@ impl WalPort for BatchingWal {
         self.inner.last_sequence().await
     }
 
+    fn flushed_through(&self) -> u64 {
+        self.inner.flushed_through()
+    }
+
+    fn set_flushed_through(&self, sequence: u64) {
+        self.inner.set_flushed_through(sequence);
+    }
+
+    fn flushed_margin_start(&self, through: u64, max_bytes: u64) -> u64 {
+        self.inner.flushed_margin_start(through, max_bytes)
+    }
+
     async fn flush_wal(&self) -> Result<(), HyperbytedbError> {
         self.inner.flush_wal().await
     }
@@ -306,6 +345,7 @@ mod tests {
                 tags,
                 fields,
                 timestamp: 1_700_000_000_000_000_000,
+                series_id_cache: Default::default(),
             }],
             origin_node_id: 99,
         }

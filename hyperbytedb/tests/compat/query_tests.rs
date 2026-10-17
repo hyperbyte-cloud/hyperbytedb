@@ -525,6 +525,37 @@ async fn where_time_range() {
     );
 }
 
+/// InfluxQL takes time as RFC3339 or `YYYY-MM-DD HH:MM:SS` strings. Passed
+/// through as bare strings, chDB refused to compare them with the time column
+/// and the whole query failed.
+#[tokio::test]
+#[serial(chdb)]
+async fn where_time_accepts_date_time_strings() {
+    let ctx = TestContext::new().unwrap();
+    ctx.metadata.create_database("testdb").await.unwrap();
+    ctx.write_and_flush(
+        "testdb",
+        "cpu value=1.0 1000000000\ncpu value=2.0 2000000000\ncpu value=3.0 3000000000",
+    )
+    .await
+    .unwrap();
+
+    for q in [
+        "SELECT count(value) FROM cpu WHERE time >= '1970-01-01T00:00:02Z'",
+        "SELECT count(value) FROM cpu WHERE time >= '1970-01-01 00:00:02'",
+        "SELECT count(value) FROM cpu WHERE '1970-01-01T00:00:02Z' <= time",
+    ] {
+        let resp = ctx.query("testdb", q).await.unwrap();
+        assert!(
+            resp.results[0].error.is_none(),
+            "{q}: {:?}",
+            resp.results[0].error
+        );
+        let series = resp.results[0].series.as_ref().unwrap();
+        assert_eq!(series[0].values[0][1], serde_json::json!(2), "{q}");
+    }
+}
+
 #[tokio::test]
 #[serial(chdb)]
 async fn where_tag_condition() {
@@ -1065,4 +1096,78 @@ async fn partial_line_writes_coalesce_before_query() {
         (system - 1.0).abs() < 0.01,
         "usage_system should survive partial-line coalesce, got {system}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// InfluxQL column shape: names and the time column
+// ---------------------------------------------------------------------------
+
+/// Columns as InfluxDB names them, with the time InfluxDB reports:
+/// - a call is named after its function, repeats get `_1`, `_2`, an alias wins;
+/// - an aggregate without GROUP BY time() is stamped with epoch 0, whatever
+///   the WHERE range;
+/// - a lone FIRST/LAST/MAX/MIN reports its selected point's time.
+#[tokio::test]
+#[serial(chdb)]
+async fn columns_and_time_follow_influxql() {
+    let ctx = TestContext::new().unwrap();
+    ctx.metadata.create_database("testdb").await.unwrap();
+    ctx.write_and_flush(
+        "testdb",
+        "cpu,host=a v=1,w=10 10000000000\n\
+         cpu,host=a v=5,w=20 20000000000\n\
+         cpu,host=a v=3,w=30 30000000000",
+    )
+    .await
+    .unwrap();
+
+    let shape = |q: &'static str| {
+        let ctx = &ctx;
+        async move {
+            let resp = ctx.query("testdb", q).await.unwrap();
+            assert!(
+                resp.results[0].error.is_none(),
+                "{q}: {:?}",
+                resp.results[0].error
+            );
+            let s = resp.results[0].series.as_ref().unwrap()[0].clone();
+            (s.columns, s.values[0].clone())
+        }
+    };
+    use serde_json::json;
+
+    let (cols, row) = shape("SELECT count(v) FROM cpu").await;
+    assert_eq!(cols, ["time", "count"]);
+    assert_eq!(row, [json!("1970-01-01T00:00:00Z"), json!(3)]);
+
+    // With a time range the stamp is its lower bound, as in InfluxDB.
+    let (cols, row) = shape("SELECT count(v) FROM cpu WHERE time >= 15s").await;
+    assert_eq!(cols, ["time", "count"]);
+    assert_eq!(row, [json!("1970-01-01T00:00:15Z"), json!(2)]);
+
+    let (cols, row) = shape("SELECT mean(v), mean(w), sum(v) AS total FROM cpu").await;
+    assert_eq!(cols, ["time", "mean", "mean_1", "total"]);
+    assert_eq!(row[1], json!(3));
+    assert_eq!(row[2], json!(20));
+
+    let (cols, row) = shape("SELECT max(v) FROM cpu").await;
+    assert_eq!(cols, ["time", "max"]);
+    assert_eq!(row, [json!("1970-01-01T00:00:20Z"), json!(5)]);
+
+    let (_, row) = shape("SELECT min(v) FROM cpu").await;
+    assert_eq!(row, [json!("1970-01-01T00:00:10Z"), json!(1)]);
+
+    let (_, row) = shape("SELECT last(v) FROM cpu").await;
+    assert_eq!(row, [json!("1970-01-01T00:00:30Z"), json!(3)]);
+
+    let (_, row) = shape("SELECT first(v) FROM cpu").await;
+    assert_eq!(row, [json!("1970-01-01T00:00:10Z"), json!(1)]);
+
+    // Two selectors: no single point, so epoch 0.
+    let (cols, row) = shape("SELECT max(v), min(v) FROM cpu").await;
+    assert_eq!(cols, ["time", "max", "min"]);
+    assert_eq!(row[0], json!("1970-01-01T00:00:00Z"));
+
+    let (cols, _) = shape("SELECT v + w FROM cpu").await;
+    assert_eq!(cols, ["time", "v_w"]);
 }

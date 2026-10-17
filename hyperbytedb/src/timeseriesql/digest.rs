@@ -14,8 +14,11 @@ pub fn stmt_type(stmt: &Statement) -> &'static str {
         Statement::ShowSeries(_) => "SHOW",
         Statement::ShowRetentionPolicies(_) => "SHOW",
         Statement::ShowUsers => "SHOW",
+        Statement::ShowGrants(_) => "SHOW",
         Statement::ShowContinuousQueries => "SHOW",
         Statement::ShowMaterializedViews => "SHOW",
+        Statement::ShowSettings => "SHOW",
+        Statement::SetSetting { .. } => "SET",
         Statement::CreateDatabase(_) => "CREATE",
         Statement::CreateRetentionPolicyStmt { .. } => "CREATE",
         Statement::CreateUser { .. } => "CREATE",
@@ -131,8 +134,13 @@ fn normalize_statement(stmt: &Statement) -> String {
             write!(out, "show retention policies on {}", db).ok();
         }
         Statement::ShowUsers => out.push_str("show users"),
+        Statement::ShowGrants(_) => out.push_str("show grants for ?"),
         Statement::ShowContinuousQueries => out.push_str("show continuous queries"),
         Statement::ShowMaterializedViews => out.push_str("show materialized views"),
+        Statement::ShowSettings => out.push_str("show settings"),
+        Statement::SetSetting { name, .. } => {
+            write!(out, "set {name} = ?").ok();
+        }
         Statement::CreateDatabase(_) => out.push_str("create database ?"),
         Statement::DropDatabase(_) => out.push_str("drop database ?"),
         Statement::DropMeasurement { .. } => out.push_str("drop measurement ?"),
@@ -149,18 +157,28 @@ fn normalize_statement(stmt: &Statement) -> String {
         Statement::CreateUser { .. } => out.push_str("create user ?"),
         Statement::DropUser(_) => out.push_str("drop user ?"),
         Statement::SetPassword { .. } => out.push_str("set password ?"),
-        Statement::Grant { database, .. } => {
+        Statement::Grant {
+            database,
+            privilege,
+            ..
+        } => {
+            let p = privilege.as_str().to_ascii_lowercase();
             if database.is_some() {
-                out.push_str("grant all on ? to ?");
+                out.push_str(&format!("grant {p} on ? to ?"));
             } else {
-                out.push_str("grant all privileges to ?");
+                out.push_str(&format!("grant {p} to ?"));
             }
         }
-        Statement::Revoke { database, .. } => {
+        Statement::Revoke {
+            database,
+            privilege,
+            ..
+        } => {
+            let p = privilege.as_str().to_ascii_lowercase();
             if database.is_some() {
-                out.push_str("revoke all on ? from ?");
+                out.push_str(&format!("revoke {p} on ? from ?"));
             } else {
-                out.push_str("revoke all privileges from ?");
+                out.push_str(&format!("revoke {p} from ?"));
             }
         }
         Statement::Delete(del) => {

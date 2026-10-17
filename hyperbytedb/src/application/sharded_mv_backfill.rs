@@ -67,7 +67,14 @@ pub async fn scatter_mv_backfill(
             )
         })?;
 
-    for region in &space.regions {
+    // The serving view, not the raw snapshot: a staging region is in the map
+    // but must not be routed to, and its range is served by the donor.
+    let serving =
+        ctx.location_cache
+            .serving_regions(&map, source.db, source.rp, source.measurement);
+    let _ = space;
+
+    for region in &serving {
         let fact_sql = inject_region_series_id_predicate_with_alias(
             plan.fact_sql.to_string(),
             region.start,
@@ -112,9 +119,31 @@ pub async fn scatter_mv_backfill(
     Ok(())
 }
 
+/// How long a region waits for its peer to apply the CREATE.
+const BACKFILL_NOT_READY_RETRIES: u32 = 60;
+
 async fn execute_region_backfill(
     ctx: &ShardRoutingContext,
     job: RegionBackfillJob<'_>,
+) -> Result<(), HyperbytedbError> {
+    let mut attempt = 0;
+    loop {
+        match execute_region_backfill_once(ctx, &job).await {
+            Err(HyperbytedbError::ClusterUnavailable(why))
+                if attempt < BACKFILL_NOT_READY_RETRIES =>
+            {
+                attempt += 1;
+                tracing::debug!(region_id = job.region.region_id, %why, "backfill waits for the view");
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
+async fn execute_region_backfill_once(
+    ctx: &ShardRoutingContext,
+    job: &RegionBackfillJob<'_>,
 ) -> Result<(), HyperbytedbError> {
     let RegionBackfillJob {
         ports,
@@ -124,6 +153,7 @@ async fn execute_region_backfill(
         phase,
         sql,
     } = job;
+    let (ports, source, dest, region, phase) = (*ports, *source, *dest, *region, *phase);
 
     let req = ShardMvBackfillRequest {
         db: source.db.to_string(),
@@ -162,6 +192,11 @@ async fn execute_region_backfill(
                 if resp.status() == reqwest::StatusCode::CONFLICT {
                     return Err(HyperbytedbError::StaleShardEpoch { region_id });
                 }
+                if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                    return Err(HyperbytedbError::ClusterUnavailable(format!(
+                        "peer {peer_id} has not created the view yet"
+                    )));
+                }
                 if !resp.status().is_success() {
                     return Err(HyperbytedbError::PeerUnreachable(format!(
                         "shard mv-backfill to peer {peer_id} failed: {}",
@@ -181,14 +216,21 @@ pub async fn apply_mv_backfill_sql(
     query_port: &Arc<dyn QueryPort>,
     req: &ShardMvBackfillRequest,
 ) -> Result<(), HyperbytedbError> {
-    if let Some(dest_meta) = metadata
+    // The leader backfills right after its own Raft apply; this node may not
+    // have applied the CREATE yet. Say so instead of failing the INSERT, so
+    // the leader retries this region (nothing was written).
+    let Some(dest_meta) = metadata
         .get_measurement(&req.dest_db, &req.dest_rp, &req.dest_measurement)
         .await?
-    {
-        points_sink
-            .ensure_measurement_schema(&req.dest_db, &req.dest_rp, &dest_meta)
-            .await?;
-    }
+    else {
+        return Err(HyperbytedbError::ClusterUnavailable(format!(
+            "materialized view destination {}.{}.{} not created on this node yet",
+            req.dest_db, req.dest_rp, req.dest_measurement
+        )));
+    };
+    points_sink
+        .ensure_measurement_schema(&req.dest_db, &req.dest_rp, &dest_meta)
+        .await?;
 
     query_port.execute_sql(&req.sql).await?;
     Ok(())

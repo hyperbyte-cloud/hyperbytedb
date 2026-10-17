@@ -62,6 +62,10 @@ use crate::domain::field_type::{merge_field_type_map, widen_field_disc};
 use crate::domain::measurement::MeasurementMeta;
 use crate::domain::point::{FieldValue, Point};
 use crate::domain::series::series_id_for_point;
+
+/// Series ids are already well-mixed hashes; foldhash is far cheaper than
+/// std's SipHash for these per-point membership checks.
+type IdSet = HashSet<u64, foldhash::fast::FixedState>;
 use crate::error::HyperbytedbError;
 use crate::ports::metadata::MetadataPort;
 use crate::ports::points_sink::{PointsSinkPort, WriteAck};
@@ -125,10 +129,12 @@ fn table_schema_from_measurement_meta(
         TableSchema {
             columns: field_cols,
             materialized: false,
+            columns_verified: false,
         },
         TableSchema {
             columns: tag_cols,
             materialized: false,
+            columns_verified: false,
         },
     )
 }
@@ -157,6 +163,17 @@ struct TableSchema {
     /// so the first post-restart flush still issues `CREATE TABLE IF NOT
     /// EXISTS` and tag-type reconciliation `MODIFY`s.
     materialized: bool,
+    /// `true` once an engine probe (`DESCRIBE TABLE`) has been merged into
+    /// `columns`, so the cache holds every column the engine has. Paths that
+    /// mark a table materialized from partial knowledge -- the metadata warm
+    /// and engine sync at startup, MV destination DDL with summing columns --
+    /// leave it `false`, and `ensure_table` probes until it is set.
+    ///
+    /// Probing on every write cost ~0.5s per Arrow build under load; trusting
+    /// `materialized` alone instead broke MV rollups (a missing column shifts
+    /// the positional `INSERT ... SELECT *`, so values land in the wrong
+    /// columns).
+    columns_verified: bool,
 }
 
 impl TableSchema {
@@ -219,7 +236,9 @@ pub struct ChdbNativeAdapter {
     /// the dimension insert + metadata write. Loaded on startup by
     /// [`Self::warm_series_from_metadata`]. A lean `HashSet<u64>` — the
     /// authoritative `series_id → tags` map lives in the metadata layer.
-    known_series: Arc<RwLock<LruCache<TableKey, HashSet<u64>>>>,
+    known_series: Arc<RwLock<LruCache<TableKey, IdSet>>>,
+    /// `DESCRIBE TABLE` probes issued by `ensure_table`; see there.
+    engine_probes: Arc<std::sync::atomic::AtomicU64>,
     /// Per-table async mutex serialising DDL. Without this two
     /// concurrent flush tasks for the same measurement could each
     /// observe the cache miss, race on `ALTER TABLE`, and one could
@@ -269,6 +288,7 @@ impl ChdbNativeAdapter {
             schemas: Arc::new(RwLock::new(LruCache::new(cache_capacity))),
             series_schemas: Arc::new(RwLock::new(LruCache::new(cache_capacity))),
             known_series: Arc::new(RwLock::new(LruCache::new(cache_capacity))),
+            engine_probes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ddl_locks: Arc::new(tokio::sync::Mutex::new(LruCache::new(cache_capacity))),
             cache_capacity,
             use_arrow,
@@ -446,7 +466,7 @@ impl ChdbNativeAdapter {
                         rp: rp.name.clone(),
                         measurement: meas_name.clone(),
                     };
-                    let ids: HashSet<u64> = series.into_iter().collect();
+                    let ids: IdSet = series.into_iter().collect();
                     warmed += ids.len();
                     self.known_series.write().put(key, ids);
                 }
@@ -457,16 +477,46 @@ impl ChdbNativeAdapter {
 
     /// True if `series_id` is already registered (dimension row inserted +
     /// persisted) for this table.
+    /// How many times `ensure_table` has probed the engine's columns.
+    #[doc(hidden)]
+    pub fn engine_probe_count(&self) -> u64 {
+        self.engine_probes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn series_known(&self, key: &TableKey, sid: u64) -> bool {
         let map = self.known_series.read();
         map.peek(key).is_some_and(|s| s.contains(&sid))
+    }
+
+    /// The first point of each series in `sids` not yet registered for this
+    /// table. One lock and one table lookup for the batch: looking each point
+    /// up separately re-hashed the table key's three strings per point
+    /// (`series_known` was 6% of a node's CPU on n3).
+    fn unregistered_series<'p, P: Borrow<Point>>(
+        &self,
+        key: &TableKey,
+        points: &'p [P],
+        sids: &[u64],
+    ) -> Vec<(u64, &'p Point)> {
+        let map = self.known_series.read();
+        let known = map.peek(key);
+        let mut seen = IdSet::default();
+        let mut out = Vec::new();
+        for (i, &sid) in sids.iter().enumerate() {
+            if known.is_some_and(|s| s.contains(&sid)) || !seen.insert(sid) {
+                continue;
+            }
+            out.push((sid, points[i].borrow()));
+        }
+        out
     }
 
     /// Record `series_id`s as registered for this table.
     fn mark_series(&self, key: &TableKey, ids: impl IntoIterator<Item = u64>) {
         let mut map = self.known_series.write();
         if !map.contains(key) {
-            map.put(key.clone(), HashSet::new());
+            map.put(key.clone(), IdSet::default());
         }
         if let Some(set) = map.get_mut(key) {
             set.extend(ids);
@@ -639,12 +689,9 @@ impl ChdbNativeAdapter {
                     .as_deref()
                     .is_none_or(|mr| mr == key.rp)
             {
-                return Err(HyperbytedbError::QueryParse(format!(
-                    "cannot write directly to materialized view destination \"{0}\". \
-                     Data must be ingested into the source measurement and the \
-                     materialized view will propagate it automatically.",
-                    key.measurement,
-                )));
+                return Err(HyperbytedbError::WriteToMaterializedDestination(
+                    key.measurement.clone(),
+                ));
             }
             field_types = merge_field_type_map(&meas_meta.field_types, &field_types);
             for k in &meas_meta.tag_keys {
@@ -673,12 +720,26 @@ impl ChdbNativeAdapter {
                 merge_cached_field_column(&mut field_types, phys, *d);
             }
         }
-        // Always probe the engine when the table may already exist (e.g. evolved
-        // Telegraf `netstat` with 75 columns but sparse metadata). Relying only
-        // on `cached.materialized` misses tables not yet in the in-memory cache.
-        if let Ok(engine_cols) = self.engine_field_columns(&table).await {
-            for (phys, d) in engine_cols {
-                merge_cached_field_column(&mut field_types, &phys, d);
+        // Probe the engine when this process has not yet materialized the
+        // table: it may exist on disk with columns the in-memory cache lacks
+        // (e.g. an evolved Telegraf `netstat` with 75 columns but sparse
+        // metadata, after a restart). Once materialized, the cache holds every
+        // column this process created or altered, which is what the probe
+        // would add.
+        //
+        // Probing on EVERY batch was the write-path bottleneck at scale: a
+        // `DESCRIBE TABLE` through the chDB pool, which it shares with flush
+        // inserts that take seconds. Each write's Arrow build queued ~0.5s
+        // behind them, and six saturated nodes delivered 19k points/s.
+        let mut probed = false;
+        if !cached.columns_verified {
+            self.engine_probes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Ok(engine_cols) = self.engine_field_columns(&table).await {
+                for (phys, d) in engine_cols {
+                    merge_cached_field_column(&mut field_types, &phys, d);
+                }
+                probed = true;
             }
         }
 
@@ -729,6 +790,11 @@ impl ChdbNativeAdapter {
             && !tag_ddl_needed
             && missing_fields.is_empty()
         {
+            if probed {
+                // Nothing missing: the cache already holds every engine column.
+                let mut guard = self.schemas.write();
+                schema_cache_entry(&mut guard, key).columns_verified = true;
+            }
             return Ok(EnsuredTable {
                 table,
                 series_table,
@@ -795,6 +861,26 @@ impl ChdbNativeAdapter {
                 series_alters.extend(build_alter_reconcile_tag_strings(&series_table, &tag_phys));
             }
 
+            // A CREATE may be a no-op: another writer can plan its own CREATE
+            // while this one waits, and whichever runs first sets the columns
+            // (`IF NOT EXISTS`). The cache below records THIS plan's columns,
+            // so make sure the table has them. On n3 a series table created
+            // without `host` was cached with it, and every flush on two nodes
+            // failed until their WAL backlog got them OOM-killed.
+            if create_fact.is_some() {
+                fact_alters.extend(build_alter_add_field_columns(
+                    &table,
+                    &TableSchema::default(),
+                    &field_phys,
+                ));
+            }
+            if create_series.is_some() {
+                series_alters.extend(build_alter_add_series_columns(
+                    &series_table,
+                    &TableSchema::default(),
+                    &tag_phys,
+                ));
+            }
             fact_alters.append(&mut series_alters);
             (create_fact, create_series, fact_alters)
         };
@@ -822,6 +908,10 @@ impl ChdbNativeAdapter {
                     entry.columns.insert(phys.clone(), ColumnKind::Field(*d));
                 }
                 entry.materialized = true;
+                // `field_phys` includes what the probe found, so the cache
+                // now matches the engine. Without a probe it only matches
+                // if it already did.
+                entry.columns_verified |= probed;
             }
             {
                 let mut writers = self.series_schemas.write();
@@ -860,14 +950,7 @@ impl ChdbNativeAdapter {
         points: &[Point],
         sids: &[u64],
     ) -> Result<(), HyperbytedbError> {
-        let mut seen: HashSet<u64> = HashSet::new();
-        let mut new_series: Vec<(u64, &Point)> = Vec::new();
-        for (i, &sid) in sids.iter().enumerate() {
-            if self.series_known(key, sid) || !seen.insert(sid) {
-                continue;
-            }
-            new_series.push((sid, &points[i]));
-        }
+        let new_series = self.unregistered_series(key, points, sids);
         if new_series.is_empty() {
             return Ok(());
         }
@@ -1059,7 +1142,7 @@ impl ChdbNativeAdapter {
         }
 
         let ddl_lock = self.ddl_mutex(&key).await;
-        let (create_fact, create_series) = {
+        let (create_fact, create_series, ensure_columns) = {
             let _guard = ddl_lock.lock().await;
 
             let cached = {
@@ -1087,7 +1170,24 @@ impl ChdbNativeAdapter {
             } else {
                 None
             };
-            (create_fact, create_series)
+            // As in `ensure_table`: a CREATE may be a no-op against a table
+            // another writer created with fewer columns.
+            let mut ensure_columns = Vec::new();
+            if create_fact.is_some() {
+                ensure_columns.extend(build_alter_add_field_columns(
+                    &table,
+                    &TableSchema::default(),
+                    &field_phys,
+                ));
+            }
+            if create_series.is_some() {
+                ensure_columns.extend(build_alter_add_series_columns(
+                    &series_table,
+                    &TableSchema::default(),
+                    &tag_phys,
+                ));
+            }
+            (create_fact, create_series, ensure_columns)
         };
 
         if let Some(sql) = create_fact {
@@ -1097,6 +1197,9 @@ impl ChdbNativeAdapter {
         if let Some(sql) = create_series {
             tracing::debug!(table = %meta.name, "creating chDB native series table for MV destination");
             self.execute(sql).await?;
+        }
+        for stmt in ensure_columns {
+            self.execute(stmt).await?;
         }
 
         {
@@ -1108,6 +1211,9 @@ impl ChdbNativeAdapter {
                     entry.columns.insert(phys.clone(), ColumnKind::Field(*d));
                 }
                 entry.materialized = true;
+                // The CREATE also added summing columns that are not in
+                // `field_phys`; make the next write probe for them.
+                entry.columns_verified = false;
             }
             {
                 let mut writers = self.series_schemas.write();
@@ -1274,7 +1380,11 @@ impl ChdbNativeAdapter {
 
         use crate::domain::prepared_wal::PreparedMeasurementBatch;
 
+        let mut stage = crate::application::stage_timer::StageTimer::new(
+            "hyperbytedb_prepare_measurement_stage_seconds",
+        );
         let ensured = self.ensure_table(key, points).await?;
+        stage.lap("ensure_table");
         let origins = vec![origin_node_id; points.len()];
         let sids: Vec<u64> = points
             .iter()
@@ -1283,9 +1393,11 @@ impl ChdbNativeAdapter {
         let new_series_batch = self
             .build_new_series_batch(key, &ensured, points, &sids)
             .await?;
+        stage.lap("new_series");
 
         let (batch, min_time, max_time) =
             build_record_batch(&ensured, &origins, ingest_seq_base, points, &sids)?;
+        stage.lap("record_batch");
 
         Ok(PreparedMeasurementBatch {
             measurement: key.measurement.clone(),
@@ -1306,14 +1418,7 @@ impl ChdbNativeAdapter {
         points: &[P],
         sids: &[u64],
     ) -> Result<Option<Arc<RecordBatch>>, HyperbytedbError> {
-        let mut seen: HashSet<u64> = HashSet::new();
-        let mut new_series: Vec<(u64, &Point)> = Vec::new();
-        for (i, &sid) in sids.iter().enumerate() {
-            if self.series_known(key, sid) || !seen.insert(sid) {
-                continue;
-            }
-            new_series.push((sid, points[i].borrow()));
-        }
+        let new_series = self.unregistered_series(key, points, sids);
         if new_series.is_empty() {
             return Ok(None);
         }
@@ -1379,6 +1484,143 @@ struct EnsuredTable {
 #[async_trait]
 impl PointsSinkPort for ChdbNativeAdapter {
     async fn write_points(
+        &self,
+        db: &str,
+        rp: &str,
+        measurement: &str,
+        origins: &[u64],
+        ingest_seq_base: u64,
+        points: &[Point],
+    ) -> Result<WriteAck, HyperbytedbError> {
+        let out = self
+            .write_points_inner(db, rp, measurement, origins, ingest_seq_base, points)
+            .await;
+        self.forget_schema_on_missing_column(db, rp, measurement, &out);
+        out
+    }
+
+    async fn write_prepared_batch(
+        &self,
+        db: &str,
+        rp: &str,
+        batch: &crate::domain::prepared_wal::PreparedMeasurementBatch,
+    ) -> Result<WriteAck, HyperbytedbError> {
+        let out = self.write_prepared_batch_inner(db, rp, batch).await;
+        self.forget_schema_on_missing_column(db, rp, &batch.measurement, &out);
+        out
+    }
+
+    async fn build_prepared_wal_slot(
+        &self,
+        db: &str,
+        rp: &str,
+        origin_node_id: u64,
+        points: &[Point],
+    ) -> Result<crate::domain::prepared_wal::PreparedWalSlot, HyperbytedbError> {
+        self.build_prepared_wal_slot(db, rp, origin_node_id, points)
+            .await
+    }
+
+    #[cfg(feature = "columnar-ingest")]
+    async fn build_prepared_wal_slot_from_columnar(
+        &self,
+        db: &str,
+        rp: &str,
+        origin_node_id: u64,
+        wire: &crate::application::columnar_msgpack::ColumnarMsgpackBatch,
+        precision: Option<&str>,
+    ) -> Result<crate::domain::prepared_wal::PreparedWalSlot, HyperbytedbError> {
+        self.build_prepared_wal_slot_from_columnar(db, rp, origin_node_id, wire, precision)
+            .await
+    }
+
+    async fn ensure_measurement_schema(
+        &self,
+        db: &str,
+        rp: &str,
+        meta: &MeasurementMeta,
+    ) -> Result<(), HyperbytedbError> {
+        self.ensure_measurement_schema_impl(db, rp, meta).await
+    }
+
+    async fn refresh_schema_cache(&self) -> Result<(), HyperbytedbError> {
+        self.refresh_schemas_from_metadata().await?;
+        Ok(())
+    }
+
+    async fn delete_series_id_range(
+        &self,
+        db: &str,
+        rp: &str,
+        measurement: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<(), HyperbytedbError> {
+        use crate::domain::chdb_naming::{quoted_series_table_name, quoted_table_name};
+
+        let fact = quoted_table_name(db, rp, measurement);
+        let series = quoted_series_table_name(db, rp, measurement);
+        let range = if end == u64::MAX {
+            format!("series_id >= {start}")
+        } else {
+            format!("series_id >= {start} AND series_id < {end}")
+        };
+        self.execute(format!("ALTER TABLE {fact} DELETE WHERE {range}"))
+            .await?;
+        self.execute(format!("ALTER TABLE {series} DELETE WHERE {range}"))
+            .await?;
+        // The series rows are gone from the table, so `known_series` must stop
+        // claiming they are registered. `series_known` gates the dimension-row
+        // insert: leave the cache stale and the next write for one of these
+        // ids writes a FACT row with no SERIES row. Queries join fact -> series
+        // and return empty tags for it; region export sees a row whose series
+        // entry is missing and refuses the chunk.
+        //
+        // That is not hypothetical -- it is how a 6-node cluster ended up with
+        // 2575 of 4932 rows reading host='' after region churn, with
+        // hyperbytedb_shard_transfer_missing_series_total at 887.
+        //
+        // Evict the whole table key rather than the dropped range. The cache is
+        // a dedup optimisation, so over-invalidating costs a re-insert of rows
+        // that are still present, while under-invalidating loses tags.
+        // `drop_measurement` already does exactly this.
+        self.known_series.write().pop(&TableKey {
+            db: db.to_string(),
+            rp: rp.to_string(),
+            measurement: measurement.to_string(),
+        });
+        Ok(())
+    }
+
+    async fn drop_measurement(
+        &self,
+        db: &str,
+        rp: &str,
+        measurement: &str,
+    ) -> Result<(), HyperbytedbError> {
+        let key = TableKey {
+            db: db.to_string(),
+            rp: rp.to_string(),
+            measurement: measurement.to_string(),
+        };
+        let table = quoted_table_name(db, rp, measurement).as_str().to_string();
+        let series_table = quoted_series_table_name(db, rp, measurement)
+            .as_str()
+            .to_string();
+        self.execute(format!("DROP TABLE IF EXISTS {table}"))
+            .await?;
+        self.execute(format!("DROP TABLE IF EXISTS {series_table}"))
+            .await?;
+        self.schemas.write().pop(&key);
+        self.series_schemas.write().pop(&key);
+        self.known_series.write().pop(&key);
+        self.ddl_locks.lock().await.pop(&key);
+        Ok(())
+    }
+}
+
+impl ChdbNativeAdapter {
+    async fn write_points_inner(
         &self,
         db: &str,
         rp: &str,
@@ -1469,7 +1711,7 @@ impl PointsSinkPort for ChdbNativeAdapter {
         })
     }
 
-    async fn write_prepared_batch(
+    async fn write_prepared_batch_inner(
         &self,
         db: &str,
         rp: &str,
@@ -1533,92 +1775,36 @@ impl PointsSinkPort for ChdbNativeAdapter {
         })
     }
 
-    async fn build_prepared_wal_slot(
-        &self,
-        db: &str,
-        rp: &str,
-        origin_node_id: u64,
-        points: &[Point],
-    ) -> Result<crate::domain::prepared_wal::PreparedWalSlot, HyperbytedbError> {
-        self.build_prepared_wal_slot(db, rp, origin_node_id, points)
-            .await
-    }
-
-    #[cfg(feature = "columnar-ingest")]
-    async fn build_prepared_wal_slot_from_columnar(
-        &self,
-        db: &str,
-        rp: &str,
-        origin_node_id: u64,
-        wire: &crate::application::columnar_msgpack::ColumnarMsgpackBatch,
-        precision: Option<&str>,
-    ) -> Result<crate::domain::prepared_wal::PreparedWalSlot, HyperbytedbError> {
-        self.build_prepared_wal_slot_from_columnar(db, rp, origin_node_id, wire, precision)
-            .await
-    }
-
-    async fn ensure_measurement_schema(
-        &self,
-        db: &str,
-        rp: &str,
-        meta: &MeasurementMeta,
-    ) -> Result<(), HyperbytedbError> {
-        self.ensure_measurement_schema_impl(db, rp, meta).await
-    }
-
-    async fn refresh_schema_cache(&self) -> Result<(), HyperbytedbError> {
-        self.refresh_schemas_from_metadata().await?;
-        Ok(())
-    }
-
-    async fn delete_series_id_range(
+    /// Forget the cached schema of a table whose insert failed on a missing
+    /// column, so the next attempt re-plans it (CREATE IF NOT EXISTS, then
+    /// ADD COLUMN IF NOT EXISTS for every column it needs) instead of
+    /// retrying the same insert against the same wrong cache. A flush retries
+    /// forever, so a stale cache otherwise grows the WAL until the node OOMs.
+    fn forget_schema_on_missing_column<T>(
         &self,
         db: &str,
         rp: &str,
         measurement: &str,
-        start: u64,
-        end: u64,
-    ) -> Result<(), HyperbytedbError> {
-        use crate::domain::chdb_naming::{quoted_series_table_name, quoted_table_name};
-
-        let fact = quoted_table_name(db, rp, measurement);
-        let series = quoted_series_table_name(db, rp, measurement);
-        let range = if end == u64::MAX {
-            format!("series_id >= {start}")
-        } else {
-            format!("series_id >= {start} AND series_id < {end}")
-        };
-        self.execute(format!("ALTER TABLE {fact} DELETE WHERE {range}"))
-            .await?;
-        self.execute(format!("ALTER TABLE {series} DELETE WHERE {range}"))
-            .await?;
-        Ok(())
-    }
-
-    async fn drop_measurement(
-        &self,
-        db: &str,
-        rp: &str,
-        measurement: &str,
-    ) -> Result<(), HyperbytedbError> {
+        out: &Result<T, HyperbytedbError>,
+    ) {
+        let Err(e) = out else { return };
+        if !e.to_string().contains("NO_SUCH_COLUMN_IN_TABLE") {
+            return;
+        }
         let key = TableKey {
             db: db.to_string(),
             rp: rp.to_string(),
             measurement: measurement.to_string(),
         };
-        let table = quoted_table_name(db, rp, measurement).as_str().to_string();
-        let series_table = quoted_series_table_name(db, rp, measurement)
-            .as_str()
-            .to_string();
-        self.execute(format!("DROP TABLE IF EXISTS {table}"))
-            .await?;
-        self.execute(format!("DROP TABLE IF EXISTS {series_table}"))
-            .await?;
         self.schemas.write().pop(&key);
         self.series_schemas.write().pop(&key);
-        self.known_series.write().pop(&key);
-        self.ddl_locks.lock().await.pop(&key);
-        Ok(())
+        counter!("hyperbytedb_chdb_schema_cache_resets_total").increment(1);
+        tracing::warn!(
+            db,
+            rp,
+            measurement,
+            "insert hit a missing column; re-planning table schema"
+        );
     }
 }
 
@@ -2076,6 +2262,7 @@ fn columnar_representative_point(
         tags: wire.tags.clone(),
         fields,
         timestamp: ts.first().copied().unwrap_or(0),
+        series_id_cache: Default::default(),
     })
 }
 
@@ -2438,6 +2625,7 @@ mod tests {
             tags: tag_map,
             fields: field_map,
             timestamp: ts,
+            series_id_cache: Default::default(),
         }
     }
 
@@ -2665,6 +2853,7 @@ mod tests {
         let cached = TableSchema {
             columns: HashMap::from([("uptime".to_string(), ColumnKind::Field(1))]),
             materialized: true,
+            columns_verified: false,
         };
         let field_phys = vec![("uptime".to_string(), "uptime".to_string(), 2u8)];
         let alters = build_alter_reconcile_field_widening("`t`", &cached, &field_phys);
@@ -2777,6 +2966,34 @@ mod tests {
         assert_eq!(idle_col.value(0), 95.0);
         assert_eq!(user_col.value(0), 4.0);
         assert_eq!(system_col.value(0), 1.0);
+    }
+
+    /// One lookup per batch: each series not yet registered comes back once,
+    /// with its first point, and registered series are skipped.
+    #[test]
+    fn unregistered_series_lists_each_new_series_once() {
+        // Lazy session: this check never touches chDB, so no engine opens.
+        let session = crate::adapters::chdb::session::SharedSession::new("/nonexistent");
+        let adapter = ChdbNativeAdapter::new(session);
+        let key = TableKey {
+            db: "db".into(),
+            rp: "rp".into(),
+            measurement: "m".into(),
+        };
+        let a1 = make_point(1, &[("host", "a")], &[("v", FieldValue::Float(1.0))]);
+        let a2 = make_point(2, &[("host", "a")], &[("v", FieldValue::Float(2.0))]);
+        let b = make_point(3, &[("host", "b")], &[("v", FieldValue::Float(3.0))]);
+        let c = make_point(4, &[("host", "c")], &[("v", FieldValue::Float(4.0))]);
+        let points = [a1, a2, b, c];
+        let sids: Vec<u64> = points.iter().map(series_id_for_point).collect();
+        adapter.mark_series(&key, [sids[2]]);
+
+        let new: Vec<(u64, i64)> = adapter
+            .unregistered_series(&key, &points, &sids)
+            .into_iter()
+            .map(|(sid, p)| (sid, p.timestamp))
+            .collect();
+        assert_eq!(new, vec![(sids[0], 1), (sids[3], 4)]);
     }
 
     #[test]

@@ -15,6 +15,12 @@ pub enum TransferPhase {
     Ack,
 }
 
+/// Header of a raw transfer push (`/internal/shard/transfer/raw`): the
+/// [`ShardTransferPayload`] without its body, as base64 of its JSON. The
+/// body is the line protocol itself; in a JSON payload every byte of it was
+/// a number in an array, 3-4x the bytes to write, send and parse.
+pub const TRANSFER_PAYLOAD_HEADER: &str = "x-hyperbytedb-transfer";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShardTransferPayload {
@@ -161,10 +167,42 @@ pub struct ShardRehomeRequest {
     pub measurement: String,
     pub start: u64,
     pub end: u64,
+    /// Authoritative identity of the region to move.
+    ///
+    /// `start`/`end` alone cannot address a region under load: a child that
+    /// splits again before this request lands no longer has a region matching
+    /// that exact range, and the receiver answers 404. The id survives a
+    /// re-split -- `Split` keeps the parent's id on the LEFT child -- so the
+    /// receiver resolves by id and moves whatever range that region now spans,
+    /// leaving the rest to the grandchild's own transfer.
+    ///
+    /// `0` means "not supplied"; the receiver falls back to the range.
+    #[serde(default)]
+    pub region_id: u64,
     pub epoch: ShardEpoch,
     pub dest_primary: u64,
     #[serde(default)]
     pub drop_source: bool,
+    /// When true, the destination is not yet a committed peer (`AddPeer`
+    /// staging). Uses the stage transfer that skips dest ownership checks.
+    #[serde(default)]
+    pub stage: bool,
+    /// Pace the push to this many bytes per second (0 = unpaced). Set by the
+    /// leader for balance moves, which share `movement_budget_bytes_per_sec`.
+    #[serde(default)]
+    pub max_bytes_per_sec: u64,
+    /// Accepted and ignored. Retained only so a new binary can still decode a
+    /// payload from an older one: `ShardRehomeRequest` is
+    /// `deny_unknown_fields`, so removing the name would make the whole
+    /// request fail to parse mid-rolling-upgrade rather than defaulting it.
+    ///
+    /// It formerly skipped WAL entries at or below the destination's reported
+    /// watermark, comparing the learner's *node-wide* sequence against the
+    /// donor's — so a learner busy on any other region skipped its own
+    /// backfill and lost rows. Nothing reads it now; drop the field once no
+    /// supported version still sends it.
+    #[serde(default, skip_serializing)]
+    pub dest_skip_wal_through: u64,
 }
 
 #[cfg(test)]

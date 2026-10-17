@@ -71,3 +71,11 @@ spec:
       memory: 6Gi
   proxy:
     enabled: false
+  sharding:
+    enabled: true
+    replicationFactor: 2
+    regionSplitSeries: 100000
+    regionMaxSeries: 150000
+    regionMergeSeries: 50000
+    splitMergeIntervalSecs: 30
+    heartbeatIntervalSecs: 10

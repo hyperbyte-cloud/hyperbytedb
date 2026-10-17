@@ -91,6 +91,8 @@ END
 - `RESAMPLE EVERY 30m` — execute every 30 minutes (instead of every `resample_every_secs` default).
 - `FOR 2h` — look back 2 hours on each execution.
 
+Unaliased columns are written under their InfluxQL names (`mean("usage_idle")` → field `mean`), as in InfluxDB. Continuous queries created before this release keep writing the fields they always did (`mean_usage_idle`).
+
 ### Manage continuous queries
 
 ```sql
@@ -110,8 +112,10 @@ Materialized views downsample data incrementally using ClickHouse `MATERIALIZED 
 
 ```sql
 CREATE MATERIALIZED VIEW "mv_cpu_1h" ON "mydb"
-AS SELECT mean("usage_idle") INTO "cpu_1h" FROM "cpu" GROUP BY time(1h), *
+AS SELECT mean("usage_idle") AS "mean_usage_idle" INTO "cpu_1h" FROM "cpu" GROUP BY time(1h), *
 ```
+
+Every column must be named with `AS "<name>"`: the destination stores columns under these names, so they must not depend on defaults. Views created before this rule keep the names they were created with (`mean_usage_idle`).
 
 By default, `CREATE` installs the destination tables and ClickHouse materialized views only — rollups begin with the next write to the source. Historical backfill is **disabled by default** because it can scan the entire source measurement and take minutes on large datasets.
 
@@ -119,7 +123,7 @@ To also aggregate existing source history on create, add `WITH BACKFILL`:
 
 ```sql
 CREATE MATERIALIZED VIEW "mv_cpu_1h" ON "mydb" WITH BACKFILL
-AS SELECT mean("usage_idle") INTO "cpu_1h" FROM "cpu" GROUP BY time(1h), *
+AS SELECT mean("usage_idle") AS "mean_usage_idle" INTO "cpu_1h" FROM "cpu" GROUP BY time(1h), *
 ```
 
 A `WHERE time > ...` clause in the SELECT limits the backfill scan when `WITH BACKFILL` is used.

@@ -92,6 +92,12 @@ pub enum HyperbytedbError {
     #[error("error parsing query: {0}")]
     QueryParse(String),
 
+    /// A write to a materialized view destination, which only its view may
+    /// fill. Kept apart from `QueryParse` because no retry can succeed: the
+    /// flush drops such rows instead of holding the WAL for them.
+    #[error("error parsing query: cannot write directly to materialized view destination \"{0}\"")]
+    WriteToMaterializedDestination(String),
+
     #[error("authorization failed")]
     AuthFailed,
 
@@ -166,8 +172,8 @@ pub enum HyperbytedbError {
     /// A shard transfer/rehome endpoint answered with a non-success status.
     /// The status drives the reconciliation disposition (retryable vs
     /// re-resolve vs terminal).
-    #[error("shard transfer rejected with status {status}")]
-    TransferRejected { status: u16 },
+    #[error("shard transfer rejected with status {status}: {reason}")]
+    TransferRejected { status: u16, reason: Box<str> },
 
     /// The movement's source and destination collapsed to the same node
     /// mid-flight (e.g. ownership moved between resolution and execution).

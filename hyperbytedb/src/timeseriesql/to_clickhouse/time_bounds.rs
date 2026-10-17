@@ -115,13 +115,17 @@ fn bounds_from_comparison(be: &BinaryExpr) -> TimeBounds {
         }
     };
 
+    // Bounds are inclusive: a strict comparison excludes its own instant, so
+    // `time < 2m` must not reach the 2m bucket.
     let mut bounds = TimeBounds::default();
     match effective_op {
-        BinaryOp::Gte | BinaryOp::Gt | BinaryOp::Eq => bounds.min = Some(nanos),
+        BinaryOp::Gte | BinaryOp::Eq => bounds.min = Some(nanos),
+        BinaryOp::Gt => bounds.min = Some(nanos.saturating_add(1)),
         _ => {}
     }
     match effective_op {
-        BinaryOp::Lte | BinaryOp::Lt | BinaryOp::Eq => bounds.max = Some(nanos),
+        BinaryOp::Lte | BinaryOp::Eq => bounds.max = Some(nanos),
+        BinaryOp::Lt => bounds.max = Some(nanos.saturating_sub(1)),
         _ => {}
     }
     bounds
@@ -177,6 +181,18 @@ mod tests {
         );
         assert_eq!(min, Some(3_000_000_000));
         assert_eq!(max, Some(7_000_000_000));
+    }
+
+    #[test]
+    fn strict_bounds_exclude_their_instant() {
+        assert_eq!(
+            bounds("SELECT * FROM m WHERE time > 100 AND time < 500"),
+            (Some(101), Some(499))
+        );
+        assert_eq!(
+            bounds("SELECT * FROM m WHERE 500 > time AND 100 < time"),
+            (Some(101), Some(499))
+        );
     }
 
     #[test]

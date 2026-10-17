@@ -41,6 +41,8 @@ HYPERBYTEDB_REPLICAS=2
 HYPERBYTEDB_CR_NAME="hyperbytedb"
 HYPERBYTEDB_CR_MANIFEST=""
 SHARDED_MODE="${SHARDED_MODE:-false}"
+SHARDED_PROFILE="${SHARDED_PROFILE:-6node}"
+LINEARITY_MODE="${LINEARITY_MODE:-false}"
 SHARDED_SETTLE_SECS="${SHARDED_SETTLE_SECS:-60}"
 RAFT_JOIN_TIMEOUT_SECS="${RAFT_JOIN_TIMEOUT_SECS:-600}"
 
@@ -170,7 +172,17 @@ build_hyperbytedb_image() {
         err "hyperbytedb depends on it via a path dependency; clone it next to hyperbytedb/."
         exit 1
     fi
-    docker build -t "$HYPERBYTEDB_IMAGE" -f "$PROJECT_ROOT/Dockerfile" "$build_ctx"
+    # CARGO_BUILD_JOBS bounds build parallelism when set. Unset keeps cargo's
+    # default of one job per CPU. On a shared machine the release build spawns a
+    # rustc per core and can exhaust memory alongside everything else running --
+    # this build has been OOM-killed twice that way.
+    build_args=""
+    if [[ -n "${CARGO_BUILD_JOBS:-}" ]]; then
+        build_args="--build-arg CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}"
+        log "Limiting cargo to ${CARGO_BUILD_JOBS} parallel jobs"
+    fi
+    # shellcheck disable=SC2086
+    docker build $build_args -t "$HYPERBYTEDB_IMAGE" -f "$PROJECT_ROOT/Dockerfile" "$build_ctx"
     log "Image built: $HYPERBYTEDB_IMAGE"
 }
 
@@ -211,7 +223,11 @@ create_host_data_dirs() {
         mkdir -p /tmp/hyperbytedb-data/worker-3
     fi
     if [[ "$SHARDED_MODE" == true ]]; then
-        for i in 2 3 4 5; do
+        local max_worker=5
+        if [[ "$LINEARITY_MODE" == true ]]; then
+            max_worker=11
+        fi
+        for i in $(seq 2 "$max_worker"); do
             mkdir -p "/tmp/hyperbytedb-data/worker-$i"
         done
     fi
@@ -234,7 +250,9 @@ create_cluster() {
     header "Creating Kind cluster"
     create_host_data_dirs
     local kind_cfg="$SCRIPT_DIR/kind-config.yaml"
-    if [[ "$SHARDED_MODE" == true ]]; then
+    if [[ "$LINEARITY_MODE" == true ]]; then
+        kind_cfg="$SCRIPT_DIR/kind-config-12worker.yaml"
+    elif [[ "$SHARDED_MODE" == true ]]; then
         kind_cfg="$SCRIPT_DIR/kind-config-6worker.yaml"
     elif [[ "$PERF_MODE" == true ]]; then
         kind_cfg="$SCRIPT_DIR/kind-config-4worker.yaml"
@@ -492,8 +510,24 @@ resolve_hyperbytedb_cr() {
     HYPERBYTEDB_CR_MANIFEST="$MANIFESTS_DIR/hyperbytedb-cr.yaml"
     HYPERBYTEDB_REPLICAS=2
     if [[ "$SHARDED_MODE" == true ]]; then
-        HYPERBYTEDB_CR_MANIFEST="$MANIFESTS_DIR/hyperbytedb-cr-6node-sharded.yaml"
-        HYPERBYTEDB_REPLICAS=6
+        case "$SHARDED_PROFILE" in
+            1node)
+                HYPERBYTEDB_CR_MANIFEST="$MANIFESTS_DIR/hyperbytedb-cr-1node-sharded.yaml"
+                HYPERBYTEDB_REPLICAS=1
+                ;;
+            3node)
+                HYPERBYTEDB_CR_MANIFEST="$MANIFESTS_DIR/hyperbytedb-cr-3node-sharded.yaml"
+                HYPERBYTEDB_REPLICAS=3
+                ;;
+            linearity)
+                HYPERBYTEDB_CR_MANIFEST="$MANIFESTS_DIR/hyperbytedb-cr-linearity.yaml"
+                HYPERBYTEDB_REPLICAS=3
+                ;;
+            *)
+                HYPERBYTEDB_CR_MANIFEST="$MANIFESTS_DIR/hyperbytedb-cr-6node-sharded.yaml"
+                HYPERBYTEDB_REPLICAS=6
+                ;;
+        esac
     elif [[ "$PERF_MODE" == true ]]; then
         HYPERBYTEDB_CR_MANIFEST="$MANIFESTS_DIR/hyperbytedb-cr-perf-sharded.yaml"
         HYPERBYTEDB_REPLICAS=4
@@ -951,6 +985,25 @@ parse_global_flags() {
                 ;;
             --sharded)
                 SHARDED_MODE=true
+                SKIP_MONITORING=true
+                SKIP_PROXY=true
+                ;;
+            --scaleup-1)
+                SHARDED_MODE=true
+                SHARDED_PROFILE=1node
+                SKIP_MONITORING=true
+                SKIP_PROXY=true
+                ;;
+            --scaleup-3)
+                SHARDED_MODE=true
+                SHARDED_PROFILE=3node
+                SKIP_MONITORING=true
+                SKIP_PROXY=true
+                ;;
+            --linearity)
+                SHARDED_MODE=true
+                SHARDED_PROFILE=linearity
+                LINEARITY_MODE=true
                 SKIP_MONITORING=true
                 SKIP_PROXY=true
                 ;;

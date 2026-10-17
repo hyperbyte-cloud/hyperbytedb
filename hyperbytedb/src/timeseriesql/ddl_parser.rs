@@ -1,5 +1,6 @@
 //! Token-driven InfluxQL DDL/SHOW/auth parser (InfluxDB 1.x compatibility).
 
+use crate::domain::user::DatabasePrivilege;
 use crate::error::HyperbytedbError;
 use crate::timeseriesql::ast::*;
 use crate::timeseriesql::lexer::{
@@ -22,7 +23,7 @@ pub fn parse_ddl_statement(input: &str) -> Result<Statement, HyperbytedbError> {
             "DROP" => parse_drop(&mut cur),
             "ALTER" => parse_alter(&mut cur),
             "DELETE" => parse_delete(&mut cur),
-            "SET" => parse_set_password(&mut cur),
+            "SET" => parse_set(&mut cur),
             "GRANT" => parse_grant(&mut cur),
             "REVOKE" => parse_revoke(&mut cur),
             other => Err(HyperbytedbError::QueryParse(format!(
@@ -176,8 +177,74 @@ fn parse_show(cur: &mut TokenCursor<'_>) -> Result<Statement, HyperbytedbError> 
                 "unsupported SHOW: {k}"
             ))),
         },
+        // Not a keyword, so a measurement or database may still be named
+        // `settings`.
+        TokenKind::Ident(word) if word.eq_ignore_ascii_case("SETTINGS") => {
+            cur.bump();
+            Ok(Statement::ShowSettings)
+        }
+        TokenKind::Ident(word) if word.eq_ignore_ascii_case("GRANTS") => {
+            cur.bump();
+            cur.expect_keyword("FOR")?;
+            Ok(Statement::ShowGrants(cur.take_ident()?))
+        }
         _ => Err(HyperbytedbError::QueryParse("incomplete SHOW".to_string())),
     }
+}
+
+/// `SET PASSWORD ...` or `SET <setting> = <integer> | TRUE | FALSE | '<text>' | DEFAULT`.
+fn parse_set(cur: &mut TokenCursor<'_>) -> Result<Statement, HyperbytedbError> {
+    if matches!(
+        cur.tokens.get(cur.pos + 1).map(|t| &t.kind),
+        Some(TokenKind::Keyword(k)) if k == "PASSWORD"
+    ) {
+        return parse_set_password(cur);
+    }
+    cur.expect_keyword("SET")?;
+    let name = cur.take_ident()?.to_ascii_lowercase();
+    match cur.bump() {
+        Some(Token {
+            kind: TokenKind::Eq,
+            ..
+        }) => {}
+        other => {
+            return Err(HyperbytedbError::QueryParse(format!(
+                "expected '=' after SET {name}, found {:?}",
+                other.map(|t| t.kind)
+            )));
+        }
+    }
+    use crate::domain::setting::SettingValue;
+    let value = match cur.bump() {
+        Some(Token {
+            kind: TokenKind::Number(n),
+            ..
+        }) => Some(SettingValue::Int(n)),
+        Some(Token {
+            kind: TokenKind::StringLit(s),
+            ..
+        }) => Some(SettingValue::Text(s)),
+        Some(Token {
+            kind: TokenKind::Keyword(k) | TokenKind::Ident(k),
+            ..
+        }) => match k.to_ascii_uppercase().as_str() {
+            "DEFAULT" => None,
+            "TRUE" => Some(SettingValue::Bool(true)),
+            "FALSE" => Some(SettingValue::Bool(false)),
+            _ => {
+                return Err(HyperbytedbError::QueryParse(format!(
+                    "expected a value or DEFAULT for {name}, found {k}"
+                )));
+            }
+        },
+        other => {
+            return Err(HyperbytedbError::QueryParse(format!(
+                "expected a value or DEFAULT for {name}, found {:?}",
+                other.map(|t| t.kind)
+            )));
+        }
+    };
+    Ok(Statement::SetSetting { name, value })
 }
 
 fn parse_show_tail(
@@ -589,32 +656,69 @@ fn parse_set_password(cur: &mut TokenCursor<'_>) -> Result<Statement, Hyperbyted
     ))
 }
 
-fn parse_grant(cur: &mut TokenCursor<'_>) -> Result<Statement, HyperbytedbError> {
-    cur.expect_keyword("GRANT")?;
-    cur.expect_keyword("ALL")?;
-    let _ = cur.match_keyword("PRIVILEGES");
+/// `READ`, `WRITE` or `ALL [PRIVILEGES]`, then `[ON <db>]`. READ and WRITE
+/// are words, not keywords, so a field may still be called `read`.
+fn parse_privilege_on(
+    cur: &mut TokenCursor<'_>,
+    verb: &str,
+) -> Result<(DatabasePrivilege, Option<String>), HyperbytedbError> {
+    let word = match cur.peek() {
+        Some(Token {
+            kind: TokenKind::Keyword(k) | TokenKind::Ident(k),
+            ..
+        }) => k.to_ascii_uppercase(),
+        _ => String::new(),
+    };
+    let privilege = match word.as_str() {
+        "READ" => DatabasePrivilege::Read,
+        "WRITE" => DatabasePrivilege::Write,
+        "ALL" => DatabasePrivilege::All,
+        _ => {
+            return Err(HyperbytedbError::QueryParse(format!(
+                "expected READ, WRITE or ALL after {verb}"
+            )));
+        }
+    };
+    cur.bump();
+    if privilege == DatabasePrivilege::All {
+        let _ = cur.match_keyword("PRIVILEGES");
+    }
     let database = if cur.match_keyword("ON") {
         Some(cur.take_ident()?)
     } else {
         None
     };
+    if database.is_none() && privilege != DatabasePrivilege::All {
+        return Err(HyperbytedbError::QueryParse(format!(
+            "{verb} {} needs ON <database>",
+            privilege.as_str()
+        )));
+    }
+    Ok((privilege, database))
+}
+
+fn parse_grant(cur: &mut TokenCursor<'_>) -> Result<Statement, HyperbytedbError> {
+    cur.expect_keyword("GRANT")?;
+    let (privilege, database) = parse_privilege_on(cur, "GRANT")?;
     cur.expect_keyword("TO")?;
     let username = cur.take_ident()?;
-    Ok(Statement::Grant { username, database })
+    Ok(Statement::Grant {
+        username,
+        database,
+        privilege,
+    })
 }
 
 fn parse_revoke(cur: &mut TokenCursor<'_>) -> Result<Statement, HyperbytedbError> {
     cur.expect_keyword("REVOKE")?;
-    cur.expect_keyword("ALL")?;
-    let _ = cur.match_keyword("PRIVILEGES");
-    let database = if cur.match_keyword("ON") {
-        Some(cur.take_ident()?)
-    } else {
-        None
-    };
+    let (privilege, database) = parse_privilege_on(cur, "REVOKE")?;
     cur.expect_keyword("FROM")?;
     let username = cur.take_ident()?;
-    Ok(Statement::Revoke { username, database })
+    Ok(Statement::Revoke {
+        username,
+        database,
+        privilege,
+    })
 }
 
 fn parse_create_continuous_query(cur: &mut TokenCursor<'_>) -> Result<Statement, HyperbytedbError> {
@@ -1066,6 +1170,63 @@ mod tests {
     use super::*;
 
     #[test]
+    fn set_and_show_settings_parse() {
+        use crate::domain::setting::SettingValue;
+        for (q, name, value) in [
+            (
+                "SET query_pool_size = 8",
+                "query_pool_size",
+                Some(SettingValue::Int(8)),
+            ),
+            (
+                "set QUERY_POOL_SIZE = 4",
+                "query_pool_size",
+                Some(SettingValue::Int(4)),
+            ),
+            ("SET query_pool_size = DEFAULT", "query_pool_size", None),
+            (
+                "SET peer_heal_enabled = false",
+                "peer_heal_enabled",
+                Some(SettingValue::Bool(false)),
+            ),
+            (
+                "SET peer_heal_enabled = TRUE",
+                "peer_heal_enabled",
+                Some(SettingValue::Bool(true)),
+            ),
+            (
+                "SET log_level = 'hyperbytedb=debug'",
+                "log_level",
+                Some(SettingValue::Text("hyperbytedb=debug".into())),
+            ),
+        ] {
+            match parse_ddl_statement(q).unwrap() {
+                Statement::SetSetting { name: n, value: v } => {
+                    assert_eq!(n, name, "{q}");
+                    assert_eq!(v, value, "{q}");
+                }
+                other => panic!("{q}: expected SetSetting, got {other:?}"),
+            }
+        }
+        assert!(matches!(
+            parse_ddl_statement("SHOW SETTINGS").unwrap(),
+            Statement::ShowSettings
+        ));
+        for bad in [
+            "SET query_pool_size",
+            "SET query_pool_size = maybe",
+            "SET query_pool_size = 8 9",
+        ] {
+            assert!(parse_ddl_statement(bad).is_err(), "{bad}");
+        }
+        // SET PASSWORD still parses as before.
+        assert!(matches!(
+            parse_ddl_statement("SET PASSWORD FOR bob = 'pw'").unwrap(),
+            Statement::SetPassword { .. }
+        ));
+    }
+
+    #[test]
     fn set_password_for_with_eq() {
         let stmt = parse_ddl_statement(r#"SET PASSWORD FOR "alice" = 'secret'"#).unwrap();
         match stmt {
@@ -1192,6 +1353,66 @@ mod tests {
     fn drop_measurement_rejects_regex() {
         let result = parse_ddl_statement(r#"DROP MEASUREMENT /^server/"#);
         assert!(result.is_err());
+    }
+
+    /// Grafana's chained variables cast the tag: `"host"::tag = '...'`.
+    #[test]
+    fn show_tag_values_where_takes_a_tag_cast() {
+        match parse_ddl_statement(
+            r#"SHOW TAG VALUES FROM "cpu" WITH KEY = "cpu" WHERE "host"::tag = 'a' LIMIT 2 OFFSET 1"#,
+        )
+        .unwrap()
+        {
+            Statement::ShowTagValues(s) => {
+                assert!(s.condition.is_some());
+                assert_eq!((s.limit, s.offset), (Some(2), Some(1)));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn grant_and_revoke_take_read_write_or_all() {
+        use DatabasePrivilege::{All, Read, Write};
+        let grant = |q: &str| match parse_ddl_statement(q).unwrap() {
+            Statement::Grant {
+                username,
+                database,
+                privilege,
+            } => (privilege, database, username),
+            other => panic!("{q}: {other:?}"),
+        };
+        let revoke = |q: &str| match parse_ddl_statement(q).unwrap() {
+            Statement::Revoke {
+                username,
+                database,
+                privilege,
+            } => (privilege, database, username),
+            other => panic!("{q}: {other:?}"),
+        };
+        let on = |p, db: &str, u: &str| (p, Some(db.to_string()), u.to_string());
+        assert_eq!(grant(r#"GRANT READ ON "db" TO "u""#), on(Read, "db", "u"));
+        assert_eq!(grant("grant write on db to u"), on(Write, "db", "u"));
+        assert_eq!(grant("GRANT ALL ON db TO u"), on(All, "db", "u"));
+        assert_eq!(grant("GRANT ALL PRIVILEGES ON db TO u"), on(All, "db", "u"));
+        assert_eq!(
+            grant("GRANT ALL PRIVILEGES TO u"),
+            (All, None, "u".to_string())
+        );
+        assert_eq!(revoke("REVOKE READ ON db FROM u"), on(Read, "db", "u"));
+        assert_eq!(revoke("revoke write on db from u"), on(Write, "db", "u"));
+        assert_eq!(
+            revoke("REVOKE ALL PRIVILEGES FROM u"),
+            (All, None, "u".to_string())
+        );
+        for bad in [
+            "GRANT READ TO u",
+            "REVOKE WRITE FROM u",
+            "GRANT SELECT ON db TO u",
+            "GRANT ON db TO u",
+        ] {
+            assert!(parse_ddl_statement(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

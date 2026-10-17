@@ -5,6 +5,8 @@ use hyperbytedb::domain::series::series_id;
 use hyperbytedb::domain::sharding::{
     MeasurementKey, ShardEpoch, ShardMapOp, ShardRegion, ShardTransferPayload, TransferPhase,
 };
+use hyperbytedb::ports::metadata::MetadataPort;
+use hyperbytedb::ports::query::QueryPort;
 use hyperbytedb::ports::sharding::ShardMapPort;
 use serial_test::serial;
 use std::collections::BTreeMap;
@@ -30,6 +32,9 @@ async fn bootstrap_two_regions(nodes: &[ShardedTestNode], db: &str, rp: &str, me
         last_split_at: 0,
         transfer_verified: None,
         transfer_first_seen: None,
+        state: Default::default(),
+        staged_from: None,
+        staging_peers: Vec::new(),
     };
     let region_b = ShardRegion {
         region_id: 2,
@@ -44,6 +49,9 @@ async fn bootstrap_two_regions(nodes: &[ShardedTestNode], db: &str, rp: &str, me
         last_split_at: 0,
         transfer_verified: None,
         transfer_first_seen: None,
+        state: Default::default(),
+        staged_from: None,
+        staging_peers: Vec::new(),
     };
     let split = ShardMapOp::Split {
         key: MeasurementKey::new(db, rp, measurement),
@@ -64,8 +72,14 @@ fn host_tag(host: &str) -> BTreeMap<String, String> {
     BTreeMap::from([("host".into(), host.into())])
 }
 
+/// Ignored: these in-process nodes share one chDB (one data path per
+/// process), so they share one source table, which takes every replica's
+/// insert of a row, and one view, created with whichever node's filter
+/// applied first. A real cluster has a view per node that rolls up only the
+/// rows that node ingested (`ingested_here_filter`); that is checked on n3.
 #[tokio::test]
 #[serial(chdb)]
+#[ignore = "shared chDB cannot model per-node views; see doc comment"]
 async fn sharded_mv_incremental_rollup() {
     let dir = tempfile::tempdir().unwrap();
     let nodes =
@@ -92,9 +106,30 @@ async fn sharded_mv_incremental_rollup() {
         &format!("cpu,host=b value=20 {t}"),
     )
     .await;
-    flush_node(&nodes[0]).await;
-    flush_node(&nodes[1]).await;
-    flush_node(&nodes[2]).await;
+    // Every replica must hold the pre-create rows before the MV exists. The
+    // MV is a native chDB view: it rolls up whatever each node inserts into
+    // the source table after its creation. Replication is asynchronous, so
+    // a replica whose copy of these rows lands after CREATE rolls them into
+    // the destination and the post-create means come out wrong (seen as
+    // 22/32 for 30/40 once writes got fast enough to win that race).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        for node in &nodes {
+            flush_node(node).await;
+        }
+        let mut all = true;
+        for node in &nodes {
+            all &= chdb_row_count(node.query_port.as_ref(), "sharddb_autogen_cpu").await >= 2;
+        }
+        if all {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pre-create rows never reached every replica"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 
     let src = query_sql(
         &client,
@@ -114,7 +149,7 @@ async fn sharded_mv_incremental_rollup() {
         "source missing written points: {src_body}"
     );
 
-    let create_mv = r#"CREATE MATERIALIZED VIEW "mv_cpu_1m" ON "sharddb" AS SELECT mean("value") INTO "cpu_1m" FROM "cpu" GROUP BY time(1m), *"#;
+    let create_mv = r#"CREATE MATERIALIZED VIEW "mv_cpu_1m" ON "sharddb" AS SELECT mean("value") AS "mean_value" INTO "cpu_1m" FROM "cpu" GROUP BY time(1m), *"#;
     let resp = query_sql(&client, &nodes[0].url, "sharddb", create_mv).await;
     assert!(
         resp.status().is_success(),
@@ -190,7 +225,7 @@ async fn sharded_mv_drop() {
     .await;
     flush_node(&nodes[0]).await;
 
-    let create_mv = r#"CREATE MATERIALIZED VIEW "mv_cpu_1m" ON "sharddb" AS SELECT mean("value") INTO "cpu_1m" FROM "cpu" GROUP BY time(1m), *"#;
+    let create_mv = r#"CREATE MATERIALIZED VIEW "mv_cpu_1m" ON "sharddb" AS SELECT mean("value") AS "mean_value" INTO "cpu_1m" FROM "cpu" GROUP BY time(1m), *"#;
     let resp = query_sql(&client, &nodes[0].url, "sharddb", create_mv).await;
     assert!(resp.status().is_success());
 
@@ -248,6 +283,29 @@ async fn sharded_mv_with_backfill() {
     assert!(
         dest_rows >= 2,
         "backfill should populate dest rows, got {dest_rows}"
+    );
+    // The in-process nodes share one chDB, so one destination table holds
+    // every backfill: the history must be rolled up exactly once. Every
+    // node's apply of the replicated CREATE used to backfill it again.
+    for node in &nodes {
+        assert!(
+            wait_for_show_materialized_view(&client, &node.url, "sharddb", "mv_metrics").await,
+            "node {} has no view",
+            node.node_id
+        );
+    }
+    let total = nodes[0]
+        .query_port
+        .execute_sql(&format!(
+            "SELECT sum(`value`) AS s FROM `{dest_table}` FORMAT JSONEachRow"
+        ))
+        .await
+        .unwrap();
+    let total: serde_json::Value = serde_json::from_str(total.lines().next().unwrap()).unwrap();
+    assert_eq!(
+        total["s"].as_f64(),
+        Some(12.0),
+        "5 + 7 rolled up once; got {total}"
     );
 
     let q = query_sql(
@@ -344,7 +402,7 @@ async fn sharded_mv_raft_replicate() {
     flush_node(&nodes[0]).await;
     flush_node(&nodes[1]).await;
 
-    let create_mv = r#"CREATE MATERIALIZED VIEW "mv_cpu_1m" ON "sharddb" AS SELECT mean("value") INTO "cpu_1m" FROM "cpu" GROUP BY time(1m), *"#;
+    let create_mv = r#"CREATE MATERIALIZED VIEW "mv_cpu_1m" ON "sharddb" AS SELECT mean("value") AS "mean_value" INTO "cpu_1m" FROM "cpu" GROUP BY time(1m), *"#;
     let resp = query_sql(&client, &nodes[0].url, "sharddb", create_mv).await;
     assert!(
         resp.status().is_success(),
@@ -360,6 +418,105 @@ async fn sharded_mv_raft_replicate() {
         wait_for_chdb_mv_object(&client, &nodes[1].url, "mv_cpu_1m").await,
         "follower missing ClickHouse MV objects after replication"
     );
+}
+
+/// A node with no rows for the source yet has no measurement record for it.
+/// It must still create the view from the replicated CREATE, or it never
+/// rolls up the rows that land on it later. On n3 such a node failed the
+/// apply with "source measurement not found" and a third of the buckets
+/// were missing.
+#[tokio::test]
+#[serial(chdb)]
+async fn sharded_mv_replicates_to_node_without_source_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let nodes = start_sharded_pair_cluster(dir.path(), ShardedClusterOptions::default()).await;
+    // Only node 1 holds the region, so node 2 never sees a cpu row.
+    bootstrap_region_on_all_nodes(&nodes, "sharddb", "autogen", "cpu", vec![1], 1).await;
+
+    let client = reqwest::Client::new();
+    for node in &nodes {
+        create_db(&client, &node.url, "sharddb").await;
+    }
+    let t = MV_MINUTE_ALIGNED_NS;
+    write_line(
+        &client,
+        &nodes[0].url,
+        "sharddb",
+        &format!("cpu,host=a value=10 {t}"),
+    )
+    .await;
+    flush_node(&nodes[0]).await;
+    assert!(
+        nodes[1]
+            .metadata
+            .get_measurement("sharddb", "autogen", "cpu")
+            .await
+            .unwrap()
+            .is_none(),
+        "precondition: node 2 has no cpu measurement"
+    );
+
+    let create_mv = r#"CREATE MATERIALIZED VIEW "mv_cpu_1m" ON "sharddb" AS SELECT mean("value") AS "mean_value" INTO "cpu_1m" FROM "cpu" GROUP BY time(1m), *"#;
+    let resp = query_sql(&client, &nodes[0].url, "sharddb", create_mv).await;
+    assert!(
+        resp.status().is_success(),
+        "CREATE MV on leader failed: {}",
+        resp.text().await.unwrap_or_default()
+    );
+    assert!(
+        wait_for_show_materialized_view(&client, &nodes[1].url, "sharddb", "mv_cpu_1m").await,
+        "node 2 has no view: its apply failed without the source measurement"
+    );
+}
+
+/// The node that takes the CREATE may have no rows for the source either: it
+/// asks the region owners for the schema. On n3 the leader rejected such a
+/// CREATE after the other nodes had already applied it.
+#[tokio::test]
+#[serial(chdb)]
+async fn sharded_mv_create_on_node_without_source_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let nodes = start_sharded_pair_cluster(dir.path(), ShardedClusterOptions::default()).await;
+    // Only node 2 holds the region, so node 1 never sees a cpu row.
+    bootstrap_region_on_all_nodes(&nodes, "sharddb", "autogen", "cpu", vec![2], 2).await;
+
+    let client = reqwest::Client::new();
+    for node in &nodes {
+        create_db(&client, &node.url, "sharddb").await;
+    }
+    let t = MV_MINUTE_ALIGNED_NS;
+    write_line(
+        &client,
+        &nodes[1].url,
+        "sharddb",
+        &format!("cpu,host=a value=10 {t}"),
+    )
+    .await;
+    flush_node(&nodes[1]).await;
+    assert!(
+        nodes[0]
+            .metadata
+            .get_measurement("sharddb", "autogen", "cpu")
+            .await
+            .unwrap()
+            .is_none(),
+        "precondition: node 1 has no cpu measurement"
+    );
+
+    let create_mv = r#"CREATE MATERIALIZED VIEW "mv_cpu_1m" ON "sharddb" AS SELECT mean("value") AS "mean_value" INTO "cpu_1m" FROM "cpu" GROUP BY time(1m), *"#;
+    let resp = query_sql(&client, &nodes[0].url, "sharddb", create_mv).await;
+    let body = resp.text().await.unwrap_or_default();
+    assert!(
+        !body.contains("error"),
+        "CREATE MV on node 1 failed: {body}"
+    );
+    for node in &nodes {
+        assert!(
+            wait_for_show_materialized_view(&client, &node.url, "sharddb", "mv_cpu_1m").await,
+            "node {} has no view",
+            node.node_id
+        );
+    }
 }
 
 #[tokio::test]
@@ -451,9 +608,12 @@ async fn sharded_mv_transfer_purge_dest_partials() {
     )
     .await;
     assert!(q_a.status().is_success());
-    let body_a = q_a.text().await.unwrap();
+    let body_a: serde_json::Value = q_a.json().await.unwrap();
+    // Purged: no series, or a sum of null. (Not a substring check: the
+    // time column's own digits include a 4.)
+    let sum_a = &body_a["results"][0]["series"][0]["values"][0][1];
     assert!(
-        !body_a.contains("4"),
+        sum_a.is_null(),
         "host=a dest partials should be purged, got: {body_a}"
     );
 
@@ -470,4 +630,71 @@ async fn sharded_mv_transfer_purge_dest_partials() {
         body_b.contains("9"),
         "host=b dest partials should remain after ranged purge, got: {body_b}"
     );
+}
+
+/// A `SET` on one node reaches every node's stored settings.
+#[tokio::test]
+#[serial(chdb)]
+async fn a_setting_replicates_to_every_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let nodes = start_sharded_pair_cluster(dir.path(), ShardedClusterOptions::default()).await;
+    let client = reqwest::Client::new();
+    let resp = query_sql(&client, &nodes[0].url, "", "SET query_pool_size = 3").await;
+    assert!(
+        resp.status().is_success(),
+        "{}",
+        resp.text().await.unwrap_or_default()
+    );
+    let mut seen = false;
+    for _ in 0..50 {
+        if nodes[1]
+            .metadata
+            .get_setting("query_pool_size")
+            .await
+            .unwrap()
+            == Some(hyperbytedb::domain::setting::SettingValue::Int(3))
+        {
+            seen = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(seen, "node 2 never stored the SET");
+}
+
+/// `GRANT READ` / `REVOKE` reach every node through Raft with the privilege
+/// they named, not ALL.
+#[tokio::test]
+#[serial(chdb)]
+async fn a_grant_replicates_its_privilege_to_every_node() {
+    use hyperbytedb::domain::user::DatabasePrivilege;
+    let dir = tempfile::tempdir().unwrap();
+    let nodes = start_sharded_pair_cluster(dir.path(), ShardedClusterOptions::default()).await;
+    let client = reqwest::Client::new();
+    for q in [
+        r#"CREATE DATABASE "gdb""#,
+        r#"CREATE USER "reader" WITH PASSWORD 'pw'"#,
+        r#"GRANT ALL ON "gdb" TO "reader""#,
+        r#"REVOKE WRITE ON "gdb" FROM "reader""#,
+        // Neither may drop the grant on the other node.
+        r#"SET PASSWORD FOR "reader" = 'pw2'"#,
+        r#"GRANT ALL PRIVILEGES TO "reader""#,
+    ] {
+        let resp = query_sql(&client, &nodes[0].url, "", q).await;
+        assert!(resp.status().is_success(), "{q}");
+    }
+    let mut held = None;
+    for _ in 0..50 {
+        held = nodes[1]
+            .metadata
+            .get_user("reader")
+            .await
+            .unwrap()
+            .and_then(|u| u.privileges.get("gdb").copied());
+        if held == Some(DatabasePrivilege::Read) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(held, Some(DatabasePrivilege::Read), "node 2's privilege");
 }

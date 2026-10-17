@@ -314,6 +314,14 @@ pub trait MetadataPort: Send + Sync {
         password_hash: &str,
         admin: bool,
     ) -> Result<(), HyperbytedbError>;
+    /// Write `user` whole, privileges included. `create_user` writes a new
+    /// user with none, so updating an existing one through it wiped its
+    /// grants.
+    async fn put_user(
+        &self,
+        username: &str,
+        user: &crate::domain::user::StoredUser,
+    ) -> Result<(), HyperbytedbError>;
     async fn drop_user(&self, username: &str) -> Result<(), HyperbytedbError>;
     async fn get_user(&self, username: &str) -> Result<Option<StoredUser>, HyperbytedbError>;
     async fn list_users(&self) -> Result<Vec<String>, HyperbytedbError>;
@@ -355,6 +363,19 @@ pub trait MetadataPort: Send + Sync {
     async fn remove_tombstone(&self, db: &str, tombstone_id: &str) -> Result<(), HyperbytedbError>;
 
     // Continuous query management
+    /// A runtime setting override (`SET name = value`), if one is stored.
+    async fn get_setting(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::domain::setting::SettingValue>, HyperbytedbError>;
+
+    /// Store (`Some`) or remove (`None`) a runtime setting override.
+    async fn set_setting(
+        &self,
+        name: &str,
+        value: Option<crate::domain::setting::SettingValue>,
+    ) -> Result<(), HyperbytedbError>;
+
     async fn store_continuous_query(
         &self,
         db: &str,

@@ -71,14 +71,18 @@ fn setup(dir: &tempfile::TempDir) -> (Arc<AppState>, Arc<FlushServiceImpl>) {
         IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 10_000, 0),
     );
 
-    let query_service: Arc<dyn hyperbytedb::adapters::http::router::QueryService> =
-        Arc::new(QueryServiceImpl::new(
+    let runtime_settings =
+        Arc::new(hyperbytedb::application::runtime_settings::RuntimeSettings::default());
+    let query_service: Arc<dyn hyperbytedb::adapters::http::router::QueryService> = Arc::new(
+        QueryServiceImpl::new(
             chdb.clone(),
             metadata.clone(),
             wal.clone(),
             30,
             points_sink.clone(),
-        ));
+        )
+        .with_runtime_settings(runtime_settings.clone()),
+    );
 
     let flush_service = Arc::new(FlushServiceImpl::new(wal.clone(), 0, points_sink.clone()));
 
@@ -104,6 +108,8 @@ fn setup(dir: &tempfile::TempDir) -> (Arc<AppState>, Arc<FlushServiceImpl>) {
         drain_service: None,
         raft: None,
         auth_enabled: false,
+        runtime_settings,
+        cluster_auth: Default::default(),
         auth_allow_query_param_credentials: false,
         prometheus_handle: None,
         statement_summary: None,
@@ -118,6 +124,8 @@ fn setup(dir: &tempfile::TempDir) -> (Arc<AppState>, Arc<FlushServiceImpl>) {
         wal_batcher_alive: None,
         disk_read_only: None,
         rate_limiter: None,
+        write_admission: None,
+        shard_write_admission: None,
 
         sharding_enabled: false,
         shard_map: None,
@@ -198,6 +206,8 @@ async fn test_auth_blocks_unauthenticated() {
         drain_service: None,
         raft: None,
         auth_enabled: true,
+        runtime_settings: Default::default(),
+        cluster_auth: Default::default(),
         auth_allow_query_param_credentials: false,
         prometheus_handle: None,
         statement_summary: None,
@@ -212,6 +222,8 @@ async fn test_auth_blocks_unauthenticated() {
         wal_batcher_alive: None,
         disk_read_only: None,
         rate_limiter: None,
+        write_admission: None,
+        shard_write_admission: None,
 
         sharding_enabled: false,
         shard_map: None,
@@ -321,6 +333,8 @@ async fn test_cardinality_limit() {
         drain_service: None,
         raft: None,
         auth_enabled: false,
+        runtime_settings: Default::default(),
+        cluster_auth: Default::default(),
         auth_allow_query_param_credentials: false,
         prometheus_handle: None,
         statement_summary: None,
@@ -335,6 +349,8 @@ async fn test_cardinality_limit() {
         wal_batcher_alive: None,
         disk_read_only: None,
         rate_limiter: None,
+        write_admission: None,
+        shard_write_admission: None,
 
         sharding_enabled: false,
         shard_map: None,
@@ -479,6 +495,8 @@ async fn test_metrics_endpoint() {
         drain_service: None,
         raft: None,
         auth_enabled: false,
+        runtime_settings: Default::default(),
+        cluster_auth: Default::default(),
         auth_allow_query_param_credentials: false,
         prometheus_handle: Some(prometheus_handle),
         statement_summary: None,
@@ -493,6 +511,8 @@ async fn test_metrics_endpoint() {
         wal_batcher_alive: None,
         disk_read_only: None,
         rate_limiter: None,
+        write_admission: None,
+        shard_write_admission: None,
 
         sharding_enabled: false,
         shard_map: None,
@@ -773,6 +793,177 @@ fn walkdir_recursive(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     result
 }
 
+/// App state for the admission tests: everything default except the
+/// `/write` admission semaphore.
+async fn admission_app(permits: usize) -> (tempfile::TempDir, Arc<AppState>) {
+    let dir = tempfile::tempdir().unwrap();
+    let wal_dir = dir.path().join("wal_adm");
+    let meta_dir = dir.path().join("meta_adm");
+    let chdb_dir = dir.path().join("chdb_adm");
+    std::fs::create_dir_all(&wal_dir).unwrap();
+    std::fs::create_dir_all(&meta_dir).unwrap();
+    std::fs::create_dir_all(&chdb_dir).unwrap();
+
+    let wal = Arc::new(RocksDbWal::open(&wal_dir).unwrap());
+    let metadata = Arc::new(RocksDbMetadata::open(&meta_dir).unwrap());
+    let shared = SharedSession::new_eager(chdb_dir.to_str().unwrap(), 1).unwrap();
+    let chdb = Arc::new(ChdbQueryAdapter::from_shared(shared.clone(), 0));
+    let sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(shared));
+
+    let prometheus_handle = test_prometheus_handle();
+
+    let ingestion_service: Arc<dyn hyperbytedb::ports::ingestion::IngestionPort> = Arc::new(
+        IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 10_000, 0),
+    );
+    let query_service: Arc<dyn hyperbytedb::adapters::http::router::QueryService> =
+        Arc::new(QueryServiceImpl::new(
+            chdb.clone(),
+            metadata.clone(),
+            wal.clone(),
+            30,
+            sink.clone(),
+        ));
+
+    let _flush = FlushServiceImpl::new(wal.clone(), 0, sink.clone());
+
+    let app_state = Arc::new(AppState {
+        ingestion: ingestion_service,
+        query: query_service,
+        query_port: chdb.clone(),
+        metadata: metadata.clone(),
+        wal: wal.clone(),
+        points_sink: sink.clone(),
+        mv_service: test_mv_service(&(metadata.clone() as Arc<dyn MetadataPort>), &chdb, &sink),
+        auth: Arc::new(hyperbytedb::adapters::auth::MetadataAuthAdapter::new(
+            metadata.clone(),
+        )),
+        peer_client: None,
+        membership: None,
+        replication_log: None,
+        drain_service: None,
+        raft: None,
+        auth_enabled: false,
+        runtime_settings: Default::default(),
+        cluster_auth: Default::default(),
+        auth_allow_query_param_credentials: false,
+        prometheus_handle: Some(prometheus_handle),
+        statement_summary: None,
+        statement_summary_require_auth: true,
+        replication_apply: None,
+        chdb_session_data_path: chdb_dir.to_string_lossy().into_owned(),
+        node_id: 1,
+        max_body_size_bytes: 25 * 1024 * 1024,
+        replicate_body_limit_bytes: 32 * 1024 * 1024,
+        max_points_per_request: 0,
+        request_timeout_secs: 30,
+        rate_limiter: None,
+        write_admission: Some(Arc::new(
+            hyperbytedb::adapters::http::router::Admission::new(permits),
+        )),
+        shard_write_admission: None,
+        wal_batcher_alive: None,
+        disk_read_only: None,
+
+        sharding_enabled: false,
+        shard_map: None,
+        shard_location_cache: Arc::new(hyperbytedb::domain::sharding::ShardLocationCache::new()),
+        shard_routing: None,
+        shard_scheduler: None,
+        ingest_cardinality: IngestCardinalityLimits::default(),
+        ingest_schema_cache: Default::default(),
+        cluster_replication: ReplicationConfig::default(),
+    });
+
+    (dir, app_state)
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn write_admission_turns_excess_writes_away_at_once() {
+    // No permits: every write is over capacity and must be refused
+    // immediately with Retry-After, not accepted and timed out later.
+    let (_dir, app_state) = admission_app(0).await;
+    let (url, _handle) = start_server(app_state).await;
+    let client = reqwest::Client::new();
+    let started = std::time::Instant::now();
+    let resp = client
+        .post(format!("{url}/write?db=testdb"))
+        .body("cpu,host=a value=1 1700000000000000000")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        resp.headers()
+            .get("retry-after")
+            .map(|v| v.to_str().unwrap()),
+        Some("1")
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+}
+
+/// A write refused at capacity has its body read before the 503 goes out.
+/// Admission refuses on headers alone; closing the socket with the body
+/// unread makes the kernel send a reset, which discards the 503 before the
+/// sender reads it. On n3 (N=12, 10k-point batches) that turned 18k forward
+/// refusals into "connection closed before message completed" and 1,143
+/// client writes into non-retryable 500s.
+///
+/// A raw socket shows it on loopback: the whole body can be written, and the
+/// 503 read after it.
+#[tokio::test]
+#[serial(chdb)]
+async fn a_refused_write_is_read_to_the_end_before_the_503() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (_dir, app_state) = admission_app(0).await;
+    let (url, _handle) = start_server(app_state).await;
+    let addr = url.trim_start_matches("http://");
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let body = vec![b'x'; 16 * 1024 * 1024];
+    let head = format!(
+        "POST /write?db=testdb HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    sock.write_all(head.as_bytes()).await.unwrap();
+    for chunk in body.chunks(64 * 1024) {
+        sock.write_all(chunk)
+            .await
+            .expect("the server reads the refused body instead of resetting");
+    }
+    let mut resp = vec![0u8; 1024];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(5), sock.read(&mut resp))
+        .await
+        .unwrap()
+        .expect("the 503 survives");
+    let status = String::from_utf8_lossy(&resp[..n]);
+    assert!(status.starts_with("HTTP/1.1 503"), "got: {status}");
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn write_admission_admits_within_capacity() {
+    let (_dir, app_state) = admission_app(4).await;
+    let (url, _handle) = start_server(app_state).await;
+    let client = reqwest::Client::new();
+    client
+        .post(format!("{url}/query"))
+        .form(&[("q", "CREATE DATABASE testdb")])
+        .send()
+        .await
+        .unwrap();
+    for _ in 0..8 {
+        // Sequential: a released permit must be reusable.
+        let resp = client
+            .post(format!("{url}/write?db=testdb"))
+            .body("cpu,host=a value=1 1700000000000000000")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+}
+
 #[tokio::test]
 #[serial(chdb)]
 async fn test_rate_limiter_refills_and_denies() {
@@ -825,6 +1016,8 @@ async fn test_rate_limiter_refills_and_denies() {
         drain_service: None,
         raft: None,
         auth_enabled: false,
+        runtime_settings: Default::default(),
+        cluster_auth: Default::default(),
         auth_allow_query_param_credentials: false,
         prometheus_handle: Some(prometheus_handle),
         statement_summary: None,
@@ -837,6 +1030,8 @@ async fn test_rate_limiter_refills_and_denies() {
         max_points_per_request: 0,
         request_timeout_secs: 30,
         rate_limiter: Some(Arc::new(EndpointRateLimiters::new(5))),
+        write_admission: None,
+        shard_write_admission: None,
         wal_batcher_alive: None,
         disk_read_only: None,
 
@@ -991,6 +1186,8 @@ async fn test_cross_database_on_clause_requires_authorization() {
         drain_service: None,
         raft: None,
         auth_enabled: true,
+        runtime_settings: Default::default(),
+        cluster_auth: Default::default(),
         auth_allow_query_param_credentials: true,
         prometheus_handle: None,
         statement_summary: None,
@@ -1005,6 +1202,8 @@ async fn test_cross_database_on_clause_requires_authorization() {
         wal_batcher_alive: None,
         disk_read_only: None,
         rate_limiter: None,
+        write_admission: None,
+        shard_write_admission: None,
 
         sharding_enabled: false,
         shard_map: None,
@@ -1059,4 +1258,263 @@ async fn test_cross_database_on_clause_requires_authorization() {
         "same-database ON clause should still succeed: {}",
         allowed.text().await.unwrap_or_default()
     );
+}
+
+/// Wraps the query port and counts Arrow reads.
+struct CountingPort {
+    inner: Arc<dyn hyperbytedb::ports::query::QueryPort>,
+    arrow_calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl hyperbytedb::ports::query::QueryPort for CountingPort {
+    async fn execute_sql(&self, sql: &str) -> Result<String, hyperbytedb::error::HyperbytedbError> {
+        self.inner.execute_sql(sql).await
+    }
+
+    async fn execute_sql_arrow(
+        &self,
+        sql: &str,
+    ) -> Result<hyperbytedb::ports::query::ArrowBatchStream, hyperbytedb::error::HyperbytedbError>
+    {
+        self.arrow_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.execute_sql_arrow(sql).await
+    }
+}
+
+/// InfluxQL queries read their results through the Arrow stream.
+#[tokio::test]
+#[serial(chdb)]
+async fn queries_read_results_through_the_arrow_stream() {
+    use hyperbytedb::ports::query::QueryService as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (state, flush) = setup(&dir);
+    let (url, _handle) = start_server(state.clone()).await;
+    let client = reqwest::Client::new();
+    client
+        .get(format!("{url}/query"))
+        .query(&[("q", "CREATE DATABASE arrowdb")])
+        .send()
+        .await
+        .unwrap();
+    // 600 points, 7 s apart from a minute boundary; usage = i.
+    let base = 1_700_000_040_000_000_000i64;
+    let lines: Vec<String> = (0..600)
+        .map(|i| format!("cpu,host=h{} usage={i} {}", i % 3, base + i * 7_000_000_000))
+        .collect();
+    let resp = client
+        .post(format!("{url}/write"))
+        .query(&[("db", "arrowdb")])
+        .body(lines.join("\n"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    flush.flush().await.unwrap();
+
+    let port = Arc::new(CountingPort {
+        inner: state.query_port.clone(),
+        arrow_calls: Default::default(),
+    });
+    let svc = QueryServiceImpl::new(
+        port.clone(),
+        state.metadata.clone(),
+        state.wal.clone(),
+        30,
+        state.points_sink.clone(),
+    );
+    let query = |q: &'static str, epoch: Option<&'static str>| {
+        let svc = &svc;
+        async move {
+            let r = svc
+                .execute_query("arrowdb", q, epoch, None, None)
+                .await
+                .unwrap();
+            serde_json::to_value(&r).unwrap()["results"][0].clone()
+        }
+    };
+
+    let raw = query("SELECT usage FROM cpu", Some("ns")).await;
+    let rows = raw["series"][0]["values"].as_array().unwrap();
+    assert_eq!(rows.len(), 600);
+    assert_eq!(rows[0], serde_json::json!([base, 0]));
+    assert_eq!(
+        rows[599],
+        serde_json::json!([base + 599 * 7_000_000_000, 599])
+    );
+
+    // 60 s buckets of 7 s points: bucket k holds i in [ceil(60k/7), ceil(60(k+1)/7)).
+    let end = base + 600 * 7_000_000_000;
+    let q = Box::leak(
+        format!("SELECT count(usage), sum(usage) FROM cpu WHERE time >= {base} AND time < {end} GROUP BY time(1m)")
+            .into_boxed_str(),
+    );
+    let buckets = query(q, None).await;
+    let values = buckets["series"][0]["values"].as_array().unwrap();
+    assert_eq!(values[0][0], "2023-11-14T22:14:00Z");
+    assert_eq!(values[0][1], 9, "i = 0..=8 fall in the first minute");
+    assert_eq!(values[0][2], 36);
+
+    let by_host = query("SELECT count(usage) FROM cpu GROUP BY host", None).await;
+    let hosts: Vec<(String, i64)> = by_host["series"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            (
+                s["tags"]["host"].as_str().unwrap().to_string(),
+                s["values"][0][1].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(hosts.len(), 3);
+    assert!(hosts.iter().all(|(_, n)| *n == 200), "{hosts:?}");
+
+    let missing = query("SELECT usage FROM no_such_measurement", None).await;
+    assert!(missing.get("series").is_none() || missing["series"].as_array().unwrap().is_empty());
+
+    assert!(
+        port.arrow_calls.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+        "the query service reads results through the Arrow stream"
+    );
+}
+
+/// `SET query_pool_size` resizes the live query pool and is stored, `SHOW
+/// SETTINGS` reports it, and `DEFAULT` returns to the size without an
+/// override. Bad names and values are refused.
+#[tokio::test]
+#[serial(chdb)]
+async fn set_query_pool_size_resizes_the_pool() {
+    use hyperbytedb::application::runtime_settings as rs;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _flush) = setup(&dir);
+    let pool = SharedSession::new_eager(dir.path().join("chdb").to_str().unwrap(), 2)
+        .unwrap()
+        .pool()
+        .unwrap();
+    state.runtime_settings.set_fallback(
+        rs::QUERY_POOL_SIZE,
+        rs::SettingValue::Int(2),
+        rs::Source::Auto,
+    );
+    {
+        // Weak, as in bootstrap: a pool the registry kept alive would hold
+        // libchdb's one data path open for every later test in the process.
+        let pool = Arc::downgrade(&pool);
+        state.runtime_settings.register_applier(
+            rs::QUERY_POOL_SIZE,
+            rs::usize_applier(move |n| {
+                if let Some(pool) = pool.upgrade() {
+                    pool.resize(n).unwrap();
+                }
+            }),
+        );
+    }
+    let (url, _handle) = start_server(state.clone()).await;
+    let client = reqwest::Client::new();
+    let query = |q: &'static str| {
+        let client = client.clone();
+        let url = url.clone();
+        async move {
+            let resp = client
+                .post(format!("{url}/query"))
+                .form(&[("q", q)])
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{q}");
+            resp.json::<serde_json::Value>().await.unwrap()
+        }
+    };
+    // The query_pool_size row's name, value and source.
+    let settings = |body: serde_json::Value| {
+        let rows = body["results"][0]["series"][0]["values"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let row = rows.iter().find(|r| r[0] == "query_pool_size").unwrap();
+        serde_json::json!([[row[0], row[1], row[2]]])
+    };
+
+    let body = query("SET query_pool_size = 5").await;
+    assert!(body["results"][0]["error"].is_null(), "{body}");
+    assert_eq!(pool.pool_size(), 5);
+    assert_eq!(
+        state.metadata.get_setting("query_pool_size").await.unwrap(),
+        Some(rs::SettingValue::Int(5))
+    );
+    assert_eq!(
+        settings(query("SHOW SETTINGS").await),
+        serde_json::json!([["query_pool_size", 5, "set"]])
+    );
+
+    query("SET query_pool_size = DEFAULT").await;
+    assert_eq!(pool.pool_size(), 2);
+    assert_eq!(
+        state.metadata.get_setting("query_pool_size").await.unwrap(),
+        None
+    );
+    assert_eq!(
+        settings(query("SHOW SETTINGS").await),
+        serde_json::json!([["query_pool_size", 2, "auto"]])
+    );
+
+    for bad in [
+        "SET query_pool_size = 0",
+        "SET query_pool_size = 500",
+        "SET nope = 3",
+    ] {
+        let resp = client
+            .post(format!("{url}/query"))
+            .form(&[("q", bad)])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad}");
+    }
+    assert_eq!(pool.pool_size(), 2, "a refused SET changes nothing");
+}
+
+/// `/query` answers gzipped when the client asks, as InfluxDB v1 does, and
+/// plain otherwise. A 245-series Grafana panel was 11.4 MB uncompressed.
+#[tokio::test]
+#[serial(chdb)]
+async fn query_responses_are_gzipped_on_request() {
+    use std::io::Read;
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _flush) = setup(&dir);
+    let (url, _handle) = start_server(state).await;
+    // The CLI turns on reqwest's gzip feature in a workspace build, and the
+    // client would then decompress and drop Content-Encoding.
+    let client = reqwest::Client::builder().no_gzip().build().unwrap();
+    let get = |gzip: bool| {
+        let mut req = client
+            .get(format!("{url}/query"))
+            .query(&[("q", "SHOW DATABASES")]);
+        if gzip {
+            req = req.header("accept-encoding", "gzip");
+        }
+        async move { req.send().await.unwrap() }
+    };
+
+    let plain = get(false).await;
+    assert_eq!(plain.headers().get("content-encoding"), None);
+    let plain_body = plain.bytes().await.unwrap();
+
+    let gz = get(true).await;
+    assert_eq!(gz.status(), StatusCode::OK);
+    assert_eq!(
+        gz.headers()
+            .get("content-encoding")
+            .map(|v| v.to_str().unwrap()),
+        Some("gzip")
+    );
+    let mut decoded = Vec::new();
+    flate2::read::GzDecoder::new(&gz.bytes().await.unwrap()[..])
+        .read_to_end(&mut decoded)
+        .unwrap();
+    assert_eq!(decoded, plain_body);
 }

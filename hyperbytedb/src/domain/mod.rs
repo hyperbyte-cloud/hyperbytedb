@@ -14,6 +14,7 @@ pub mod prepared_wal;
 pub mod query_result;
 pub mod rollup;
 pub mod series;
+pub mod setting;
 pub mod sharding;
 pub mod user;
 pub mod wal;

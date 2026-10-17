@@ -41,6 +41,13 @@ struct MockQueryPort;
 
 #[async_trait]
 impl QueryPort for MockQueryPort {
+    async fn execute_sql_arrow(
+        &self,
+        _sql: &str,
+    ) -> Result<hyperbytedb::ports::query::ArrowBatchStream, HyperbytedbError> {
+        Ok(hyperbytedb::ports::query::empty_arrow_stream())
+    }
+
     async fn execute_sql(&self, sql: &str) -> Result<String, HyperbytedbError> {
         if sql.contains("system.tables") {
             return Ok("1".to_string());

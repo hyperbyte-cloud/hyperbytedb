@@ -75,7 +75,7 @@ Embedded ClickHouse (chDB) query engine settings.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `session_data_path` | string | `"./chdb_data"` | chDB session state directory |
-| `query_pool_size` | integer | `4` | chDB connections reserved for queries (`ChdbQueryAdapter`). Each connection has its own client mutex, so concurrent `spawn_blocking` query tasks overlap when > 1. Clamped to 1–128. For best overlap, set `server.max_concurrent_queries` ≥ `query_pool_size`. |
+| `query_pool_size` | integer | CPUs + 1 | chDB connections reserved for queries (`ChdbQueryAdapter`). Each connection has its own client mutex, so concurrent `spawn_blocking` query tasks overlap when > 1. Clamped to 1–128. For best overlap, set `server.max_concurrent_queries` ≥ `query_pool_size`. Change it at run time with `SET query_pool_size = <n>`. |
 | `write_pool_size` | integer | `4` | chDB connections reserved for ingest/flush (`ChdbNativeAdapter`), isolated from the query pool so heavy queries do not block inserts. Clamped to 1–128. |
 | `pool_size` | integer | `0` (unused) | **Legacy.** When non-zero and `query_pool_size` / `write_pool_size` are unset, applies the same size to both pools. Prefer explicit `query_pool_size` and `write_pool_size`. |
 | `schema_cache_max_entries` | integer | `10000` | Max `(db, rp, measurement)` entries in the chDB native adapter schema and series caches. Oldest entries are evicted (LRU). |
@@ -94,6 +94,8 @@ Authentication configuration.
 |-----|------|---------|-------------|
 | `enabled` | boolean | `false` | Enable authentication on `/write` and `/query` |
 | `allow_query_param_credentials` | boolean | `false` | Accept InfluxDB v1-style `?u=` / `?p=` credentials on the query string |
+| `cluster_token` | string | none | Shared secret nodes and the operator send on internal routes (`x-hyperbytedb-cluster-token`). **Required** for a cluster with auth on. Set it from a Secret (`HYPERBYTEDB__AUTH__CLUSTER_TOKEN`), not the config file. Printable ASCII, no spaces or newlines |
+| `admin_username` / `admin_password` | string | none | An admin user each node creates at startup if no user has that name. An existing user and its password are left alone |
 
 When enabled, `/write` and `/query` require valid credentials. By default, credentials must be sent via HTTP headers (`Authorization: Basic` or `Authorization: Token`); query-string passwords are disabled because they can leak into access logs, reverse-proxy logs, browser history, and `Referer` headers. Set `allow_query_param_credentials = true` only when you need InfluxDB v1 URL compatibility and accept that risk.
 
@@ -138,7 +140,7 @@ Master-master peer-to-peer clustering with Raft consensus for schema mutations.
 | `replicate_receiver_queue_depth` | integer | `1024` | Bounded apply queue on the replicate receiver |
 | `replicate_receiver_workers` | integer | `1` | **Ignored.** Receiver uses a single ordered worker |
 | `replication_truncate_stale_peer_multiplier` | integer | `2` | When >0, peers with ack 0 and stale heartbeats are omitted from truncate barrier (× heartbeat interval) |
-| `raft_heartbeat_interval_ms` | — | *unset* | Optional Raft heartbeat (ms); defaults to 1000 if omitted |
+| `raft_heartbeat_interval_ms` | — | *unset* | Raft heartbeat (ms); a third of `raft_election_timeout_ms` if omitted. Must be below it, or the node refuses to start |
 | `raft_election_timeout_ms` | — | *unset* | Optional Raft election timeout (ms) |
 | `raft_snapshot_threshold` | — | *unset* | Optional log entries before Raft snapshot |
 
@@ -323,6 +325,7 @@ Automatic `series_id` range sharding across cluster nodes (experimental). Requir
 | `region_split_series` | `100000` | Target series per region before split |
 | `region_max_series` | `150000` | Hard split threshold (~1.5× target) |
 | `region_merge_series` | `20000` | Merge when adjacent regions fall below |
+| `bootstrap_regions_per_node` | `0` | Regions per node a new measurement starts with; `0` is one region that splits as it grows. Also `SET bootstrap_regions_per_node` |
 | `split_merge_interval_secs` | `3600` | Cooldown between split/merge on a region |
 | `schedule_limit` | `4` | Max concurrent split/move/merge operators |
 | `heartbeat_interval_secs` | `10` | Region stats report interval |

@@ -162,6 +162,28 @@ The drain procedure:
 4. Notifies peers of departure.
 5. Sets state to `Leaving`.
 
+### Runtime settings
+
+Some settings change on a running cluster, applied on every node at once
+and kept across restarts (admin only):
+
+```sql
+SHOW SETTINGS                              -- every setting, its value and source
+SET query_pool_size = 8                    -- chDB query connections per node
+SET log_level = 'hyperbytedb=debug,info'   -- debug logs without a restart
+SET add_peer_proposals_enabled = FALSE     -- hold placement during an upgrade
+SET max_inflight_writes = 256              -- admit more concurrent writes
+SET query_pool_size = DEFAULT              -- back to each node's config
+```
+
+Pools, the query cap, write admission, the rate limit, the log filter and
+the scheduler's copy slots resize in place; the rest are read where they
+are used.
+
+See [API reference](reference.md#runtime-settings). For what scaling,
+restarts and scale-downs look like in practice, see
+[Operating a sharded cluster](operating-sharded-clusters.md).
+
 ### Cluster sync
 
 In cluster mode, the Raft leader periodically compares `/internal/sync/manifest` responses from peers and may mark peers as needing sync. New nodes pull metadata and WAL deltas via the sync APIs. See [Deep Dive: Clustering](../deep-dive/deep-dive-clustering.md).

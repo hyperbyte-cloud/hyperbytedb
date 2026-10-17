@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 use openraft::BasicNode;
 use openraft::error::ForwardToLeader;
@@ -10,13 +9,18 @@ use crate::adapters::cluster::raft::types::{ClusterRequest, ClusterResponse};
 use crate::application::materialized_view_service::def_from_statement;
 use crate::application::predicate_sql::build_predicate_sql;
 use crate::application::query_service::check_authorization;
+use crate::application::shard_metadata_scatter::scatter_measurement_meta;
+use crate::application::shard_routing::ShardRoutingContext;
 use crate::domain::cluster::membership::ClusterMembership;
 use crate::domain::cluster::types::MutationRequest;
 use crate::domain::database::{RetentionPolicy, retention_policy_from_create};
+use crate::domain::materialized_view::MaterializedViewDef;
+use crate::domain::measurement::MeasurementMeta;
 use crate::domain::query_result::{QueryResponse, StatementResult};
 use crate::error::HyperbytedbError;
 use crate::ports::metadata::ContinuousQueryDef;
 use crate::ports::metadata::MetadataPort;
+use crate::ports::peer_http::PeerHttp;
 use crate::ports::query::QueryService;
 use crate::ports::replication::ReplicationPort;
 use crate::timeseriesql::ast::{
@@ -35,16 +39,9 @@ pub struct PeerQueryService {
     replication_port: Arc<dyn ReplicationPort>,
     raft: std::sync::OnceLock<HyperbytedbRaft>,
     membership: std::sync::OnceLock<Arc<tokio::sync::RwLock<ClusterMembership>>>,
-}
-
-fn raft_http_client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
-    })
+    shard_routing: std::sync::OnceLock<Arc<ShardRoutingContext>>,
+    /// For schema mutations forwarded to the Raft leader.
+    raft_client: reqwest::Client,
 }
 
 impl PeerQueryService {
@@ -52,14 +49,27 @@ impl PeerQueryService {
         inner: Arc<dyn QueryService>,
         metadata: Arc<dyn MetadataPort>,
         replication_port: Arc<dyn ReplicationPort>,
+        peer_http: &dyn PeerHttp,
     ) -> Self {
         Self {
+            raft_client: peer_http.build(
+                peer_http
+                    .client_builder()
+                    .timeout(std::time::Duration::from_secs(10)),
+            ),
             inner,
             metadata,
             replication_port,
             raft: std::sync::OnceLock::new(),
             membership: std::sync::OnceLock::new(),
+            shard_routing: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Sharding context, for statements that need metadata held on other
+    /// nodes (CREATE MATERIALIZED VIEW's source schema).
+    pub fn set_shard_routing(&self, ctx: Arc<ShardRoutingContext>) {
+        let _ = self.shard_routing.set(ctx);
     }
 
     /// Set the Raft instance for consensus-based schema mutation replication.
@@ -138,7 +148,14 @@ impl PeerQueryService {
                             attempt,
                             "forwarding schema mutation to raft leader"
                         );
-                        match forward_client_write(forward, raft, self.membership.get(), &req).await
+                        match forward_client_write(
+                            &self.raft_client,
+                            forward,
+                            raft,
+                            self.membership.get(),
+                            &req,
+                        )
+                        .await
                         {
                             Ok(()) => return Ok(()),
                             Err(forward_err) => {
@@ -182,7 +199,9 @@ impl PeerQueryService {
                 error: Some(e.to_string()),
             });
         }
-        match mutation_request_from_statement(stmt, db, &self.metadata).await {
+        match mutation_request_from_statement(stmt, db, &self.metadata, self.shard_routing.get())
+            .await
+        {
             Ok(req) => {
                 self.replicate_mutation(req).await?;
                 Ok(StatementResult {
@@ -262,6 +281,7 @@ fn resolve_leader_addr_with_lookup(
 }
 
 async fn forward_client_write(
+    client: &reqwest::Client,
     forward: &ForwardToLeader<u64, BasicNode>,
     raft: &HyperbytedbRaft,
     membership: Option<&Arc<tokio::sync::RwLock<ClusterMembership>>>,
@@ -270,16 +290,11 @@ async fn forward_client_write(
     let leader_addr = resolve_forward_leader_addr(forward, raft, membership).await?;
 
     let url = format!("http://{leader_addr}/cluster/raft/client-write");
-    let resp = raft_http_client()
-        .post(&url)
-        .json(req)
-        .send()
-        .await
-        .map_err(|e| {
-            HyperbytedbError::Internal(
-                format!("raft replication failed: forward to leader {url}: {e}").into(),
-            )
-        })?;
+    let resp = client.post(&url).json(req).send().await.map_err(|e| {
+        HyperbytedbError::Internal(
+            format!("raft replication failed: forward to leader {url}: {e}").into(),
+        )
+    })?;
 
     let status = resp.status();
     let body_text = resp.text().await.map_err(|e| {
@@ -323,6 +338,22 @@ fn extract_mv_dest_rp(mv: &CreateMaterializedViewStatement) -> Option<String> {
         .into
         .as_ref()
         .and_then(|m| m.retention_policy.clone())
+}
+
+/// The source measurement's schema, sent with the CREATE so a node that has
+/// no rows for it yet can still create the view. With sharding this node may
+/// have none either, so it asks the source's region owners.
+async fn mv_source_meta(
+    metadata: &Arc<dyn MetadataPort>,
+    shard_routing: Option<&Arc<ShardRoutingContext>>,
+    def: &MaterializedViewDef,
+) -> Result<Option<Box<MeasurementMeta>>, HyperbytedbError> {
+    let (db, rp, m) = (&def.source_db, &def.source_rp, &def.source_measurement);
+    let meta = match shard_routing {
+        Some(ctx) => scatter_measurement_meta(ctx, metadata.as_ref(), db, rp, m).await?,
+        None => metadata.get_measurement(db, rp, m).await?,
+    };
+    Ok(meta.map(Box::new))
 }
 
 async fn resolve_mv_source_rp(
@@ -372,6 +403,7 @@ async fn mutation_request_from_statement(
     stmt: &Statement,
     db: &str,
     metadata: &Arc<dyn MetadataPort>,
+    shard_routing: Option<&Arc<ShardRoutingContext>>,
 ) -> Result<MutationRequest, HyperbytedbError> {
     match stmt {
         Statement::CreateDatabase(stmt) => Ok(MutationRequest::CreateDatabase {
@@ -412,10 +444,12 @@ async fn mutation_request_from_statement(
             let source_rp = resolve_mv_source_rp(metadata, mv).await?;
             let dest_rp = resolve_mv_dest_rp(metadata, mv).await?;
             let definition = def_from_statement(mv, &source_rp, &dest_rp)?;
+            let source_meta = mv_source_meta(metadata, shard_routing, &definition).await?;
             Ok(MutationRequest::CreateMaterializedView {
                 database: mv.database.clone(),
                 name: mv.name.clone(),
                 definition,
+                source_meta,
             })
         }
         Statement::DropMaterializedView { name, db: mv_db } => {
@@ -532,13 +566,27 @@ async fn mutation_request_from_statement(
                 name: name.clone(),
             })
         }
-        Statement::Grant { username, database } => Ok(MutationRequest::Grant {
+        Statement::Grant {
+            username,
+            database,
+            privilege,
+        } => Ok(MutationRequest::Grant {
             username: username.clone(),
             database: database.clone(),
+            privilege: *privilege,
         }),
-        Statement::Revoke { username, database } => Ok(MutationRequest::Revoke {
+        Statement::Revoke {
+            username,
+            database,
+            privilege,
+        } => Ok(MutationRequest::Revoke {
             username: username.clone(),
             database: database.clone(),
+            privilege: *privilege,
+        }),
+        Statement::SetSetting { name, value } => Ok(MutationRequest::SetSetting {
+            name: name.clone(),
+            value: crate::application::runtime_settings::validate(name, value.clone())?,
         }),
         _ => Err(HyperbytedbError::Internal(crate::error::ChainedError::new(
             "not a cluster mutation statement",
@@ -566,6 +614,7 @@ fn is_cluster_mutation(stmt: &Statement) -> bool {
             | Statement::DropMeasurement { .. }
             | Statement::Grant { .. }
             | Statement::Revoke { .. }
+            | Statement::SetSetting { .. }
     )
 }
 
@@ -758,10 +807,14 @@ impl QueryService for PeerQueryService {
                             }
                         };
                         if let Ok(def) = def_from_statement(mv, &source_rp, &dest_rp) {
+                            let source_meta =
+                                mv_source_meta(&self.metadata, self.shard_routing.get(), &def)
+                                    .await?;
                             self.replicate_mutation(MutationRequest::CreateMaterializedView {
                                 database: mv.database.clone(),
                                 name: mv.name.clone(),
                                 definition: def,
+                                source_meta,
                             })
                             .await?;
                         }
@@ -1041,6 +1094,7 @@ impl QueryService for PeerQueryService {
                 Statement::Grant {
                     ref username,
                     ref database,
+                    privilege,
                 } => {
                     let result = self
                         .execute_inner_statement(
@@ -1056,6 +1110,7 @@ impl QueryService for PeerQueryService {
                         self.replicate_mutation(MutationRequest::Grant {
                             username: username.clone(),
                             database: database.clone(),
+                            privilege,
                         })
                         .await?;
                     }
@@ -1064,6 +1119,7 @@ impl QueryService for PeerQueryService {
                 Statement::Revoke {
                     ref username,
                     ref database,
+                    privilege,
                 } => {
                     let result = self
                         .execute_inner_statement(
@@ -1079,6 +1135,33 @@ impl QueryService for PeerQueryService {
                         self.replicate_mutation(MutationRequest::Revoke {
                             username: username.clone(),
                             database: database.clone(),
+                            privilege,
+                        })
+                        .await?;
+                    }
+                    result
+                }
+                Statement::SetSetting {
+                    ref name,
+                    ref value,
+                } => {
+                    let result = self
+                        .execute_inner_statement(
+                            db,
+                            stmt_query,
+                            epoch,
+                            retention_policy,
+                            caller,
+                            statement_id,
+                        )
+                        .await;
+                    if result.error.is_none() {
+                        self.replicate_mutation(MutationRequest::SetSetting {
+                            name: name.clone(),
+                            value: crate::application::runtime_settings::validate(
+                                name,
+                                value.clone(),
+                            )?,
                         })
                         .await?;
                     }

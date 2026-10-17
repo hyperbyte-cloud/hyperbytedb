@@ -19,9 +19,9 @@ rules:
     verbs: ["get", "list"]
   - apiGroups: ["hyperbytedb.hyperbyte.cloud"]
     resources: ["hyperbytedbclusters"]
-    verbs: ["get", "list"]
+    verbs: ["get", "list", "patch"]
   - apiGroups: ["apps"]
-    resources: ["deployments"]
+    resources: ["deployments", "statefulsets"]
     verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

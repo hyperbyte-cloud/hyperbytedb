@@ -6,6 +6,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
+use metrics::counter;
+
 use super::router::AppState;
 use crate::domain::cluster::membership::NodeState;
 
@@ -93,6 +95,95 @@ fn maybe_promote_caught_up_voter(readiness: SelfReadiness, raft_serving: bool) -
     }
 }
 
+/// A decommissioning node owns its own `/health` state. The leader scheduler
+/// marks it `Leaving` in its local membership once regions are evacuated, but
+/// membership is not replicated — the departing pod must self-retire when its
+/// shard map no longer references it, or the operator gate never clears.
+async fn maybe_self_retire_after_evacuation(state: &AppState) {
+    let (Some(membership), Some(shard_map)) = (&state.membership, &state.shard_map) else {
+        return;
+    };
+    let is_decommissioning = {
+        let m = membership.read().await;
+        m.get_node(state.node_id)
+            .is_some_and(|n| n.state == NodeState::Decommissioning)
+    };
+    if !is_decommissioning {
+        return;
+    }
+    let Ok(map) = shard_map.snapshot().await else {
+        return;
+    };
+    // View destination regions never move, so counting them kept a node
+    // that held one from ever retiring (n3, 6 -> 3: three pods left
+    // `decommissioning` for good). Their rows leave by the rollup handoff;
+    // retire once it has emptied them here.
+    let Ok(dests) = crate::application::mv_handoff::destination_set(state.metadata.as_ref()).await
+    else {
+        return;
+    };
+    if crate::application::mv_handoff::holds_regions_to_evacuate(&map, state.node_id, &dests) {
+        return;
+    }
+    match crate::application::mv_handoff::local_rollups_empty(
+        state.metadata.as_ref(),
+        state.query_port.as_ref(),
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) if !rollup_wait_expired() => {
+            tracing::info!(
+                node_id = state.node_id,
+                "evacuated but view rollups not handed off yet; not retiring yet"
+            );
+            return;
+        }
+        Ok(false) => {
+            tracing::error!(
+                node_id = state.node_id,
+                "view rollups never handed off; retiring without them"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "could not check view rollups; not retiring yet");
+            return;
+        }
+    }
+    // Writes this node acknowledged but has not yet delivered to their
+    // primaries live only in its forward queue; retiring would let the pod
+    // be deleted with them.
+    let owed = state.ingestion.pending_forwards();
+    if owed > 0 {
+        tracing::info!(
+            node_id = state.node_id,
+            owed,
+            "evacuated but still delivering queued forwards; not retiring yet"
+        );
+        return;
+    }
+    let mut m = membership.write().await;
+    if m.transition(state.node_id, NodeState::Leaving) {
+        counter!("hyperbytedb_shard_decommission_completed_total").increment(1);
+        tracing::info!(
+            node_id = state.node_id,
+            "evacuation complete; node self-marked Leaving"
+        );
+    }
+}
+
+/// How long an evacuated node waits for its view rollups to be handed off
+/// before it retires anyway, matching the leader's give-up: a leader too old
+/// to ask for the handoff must not keep the node forever.
+const ROLLUP_HANDOFF_WAIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// True once this node has waited [`ROLLUP_HANDOFF_WAIT`] since it first
+/// found itself evacuated with rollups still here.
+fn rollup_wait_expired() -> bool {
+    static SINCE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    SINCE.get_or_init(std::time::Instant::now).elapsed() >= ROLLUP_HANDOFF_WAIT
+}
+
 /// GET /health - readiness check.
 /// Returns 200 when the node is Active (or standalone).
 /// Returns 503 when the node is Syncing, Joining, Draining, or Leaving
@@ -101,6 +192,7 @@ fn maybe_promote_caught_up_voter(readiness: SelfReadiness, raft_serving: bool) -
 /// Every response body carries the machine-readable `{state, needs_sync}`
 /// self-readiness fields used by cluster peers for membership convergence.
 pub async fn health(State(state): State<Arc<AppState>>) -> Response {
+    maybe_self_retire_after_evacuation(&state).await;
     let readiness =
         maybe_promote_caught_up_voter(self_readiness(&state).await, raft_is_serving(&state));
     if readiness.state == Some(NodeState::Active)

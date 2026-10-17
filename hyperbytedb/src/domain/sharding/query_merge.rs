@@ -1,3 +1,4 @@
+use indexmap::IndexMap;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
@@ -6,14 +7,17 @@ use serde_json::{Value, json};
 use crate::domain::measurement::MeasurementMeta;
 use crate::domain::query_result::{QueryResponse, SeriesResult};
 use crate::domain::rollup::{
-    MeanRollupField, RollupCombine, aggregate_source_field_name, mean_rollup_column_names,
-    rollup_combine_from_field,
+    MeanRollupField, RollupCombine, aggregate_source_field_name, rollup_combine_from_field,
 };
 use crate::error::HyperbytedbError;
-use crate::timeseriesql::ast::{BinaryExpr, BinaryOp, Expr, Field, FunctionCall, SelectStatement};
+use crate::timeseriesql::ast::{
+    BinaryExpr, BinaryOp, Dimension, DurationUnit, Expr, Field, FillOption, FunctionCall,
+    SelectStatement,
+};
 use crate::timeseriesql::to_clickhouse::{select_has_true_aggregate, select_output_field_name};
 
-const MULTI_REGION_UNSUPPORTED: &str = "aggregate is not supported across shard regions yet";
+/// Coordinator-side merge refuses unbounded DISTINCT / series fan-in.
+const SHARD_MERGE_MAX_DISTINCT_SERIES: usize = 500_000;
 
 /// Metadata for rewriting a sharded query into per-region partial aggregation
 /// and applying coordinator-side finalization.
@@ -32,6 +36,117 @@ pub struct ShardedQueryPlan {
     saved_offset: Option<u64>,
     saved_time_desc: Option<bool>,
     needs_global_sort: bool,
+    /// For a lone FIRST/LAST/MAX/MIN without GROUP BY time(): the partial
+    /// column carrying the selected point's time, reported as `time`.
+    point_time_col: Option<String>,
+    /// The response's time format (`epoch` query parameter), for times
+    /// promoted from partial columns.
+    pub epoch: Option<String>,
+    /// Regions skip ORDER BY; the coordinator's global sort orders the
+    /// result. See [`ShardedQueryPlan::move_fill_and_order_to_coordinator`].
+    pub region_unordered: bool,
+    /// `fill(null)` done here instead of in each region.
+    coordinator_fill: Option<CoordinatorFill>,
+}
+
+/// Buckets the coordinator adds as null rows: every `step_ns` from the
+/// bucket holding `min_ns` to the one holding `max_ns`, or between a
+/// series' own first and last bucket when the query has no bounds (as
+/// ClickHouse's WITH FILL without FROM/TO does).
+#[derive(Debug, Clone)]
+struct CoordinatorFill {
+    step_ns: i64,
+    bounds_ns: Option<(i64, i64)>,
+}
+
+/// More buckets than this per series and the region fills, as before.
+const COORDINATOR_FILL_MAX_BUCKETS: i64 = 1_000_000;
+
+/// Nanoseconds per unit of a numeric `epoch`, or `None` for RFC 3339 times.
+fn epoch_unit_nanos(epoch: Option<&str>) -> Option<i64> {
+    match epoch? {
+        "ns" | "n" => Some(1),
+        "u" | "us" => Some(1_000),
+        "ms" => Some(1_000_000),
+        "s" => Some(1_000_000_000),
+        _ => None,
+    }
+}
+
+impl ShardedQueryPlan {
+    /// Let regions skip ORDER BY and WITH FILL, and sort and fill the merged
+    /// result here instead. On n3 a region's ORDER BY (tags, then time, which
+    /// WITH FILL needs) was half of its query time, and the coordinator
+    /// sorts the merged rows again anyway.
+    ///
+    /// Only where the result is the same: a time-bucketed aggregate without
+    /// a region LIMIT or SLIMIT, and `fill(none)` or `fill(null)`; for
+    /// `fill(null)` also no offset or tz() (buckets are then plain multiples
+    /// of the interval from the epoch, as in ClickHouse's toStartOfInterval),
+    /// an interval of at most a minute, numeric `epoch` times and a bounded
+    /// number of buckets. Returns whether it did.
+    pub fn move_fill_and_order_to_coordinator(
+        &mut self,
+        stmt: &SelectStatement,
+        time_min: Option<i64>,
+        time_max: Option<i64>,
+    ) -> bool {
+        let Some(Dimension::Time { interval, offset }) =
+            stmt.group_by.as_ref().and_then(|gb| gb.time_dimension())
+        else {
+            return false;
+        };
+        if !self.needs_global_sort
+            || !select_has_true_aggregate(stmt)
+            || stmt.into.is_some()
+            || self.region_stmt.limit.is_some()
+            || self.region_stmt.offset.is_some()
+            || stmt.slimit.is_some()
+            || stmt.soffset.is_some()
+        {
+            return false;
+        }
+        match stmt.fill {
+            Some(FillOption::None) => {}
+            None | Some(FillOption::Null) => {
+                let step_ns = interval.to_nanos();
+                let Some(unit_ns) = epoch_unit_nanos(self.epoch.as_deref()) else {
+                    return false;
+                };
+                let small_unit = matches!(
+                    interval.unit,
+                    DurationUnit::Nanosecond
+                        | DurationUnit::Microsecond
+                        | DurationUnit::Millisecond
+                        | DurationUnit::Second
+                        | DurationUnit::Minute
+                );
+                if offset.is_some()
+                    || stmt.timezone.is_some()
+                    || !small_unit
+                    || step_ns <= 0
+                    || step_ns % unit_ns != 0
+                {
+                    return false;
+                }
+                let bounds_ns = match (time_min, time_max) {
+                    (Some(lo), Some(hi)) if lo <= hi => {
+                        let (lo, hi) = (lo.div_euclid(step_ns), hi.div_euclid(step_ns));
+                        if hi - lo >= COORDINATOR_FILL_MAX_BUCKETS {
+                            return false;
+                        }
+                        Some((lo * step_ns, hi * step_ns))
+                    }
+                    _ => None,
+                };
+                self.region_stmt.fill = Some(FillOption::None);
+                self.coordinator_fill = Some(CoordinatorFill { step_ns, bounds_ns });
+            }
+            _ => return false,
+        }
+        self.region_unordered = true;
+        true
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -59,9 +174,11 @@ pub fn prepare_sharded_region_query(
         saved_offset: None,
         saved_time_desc: None,
         needs_global_sort: false,
+        point_time_col: None,
+        epoch: None,
+        region_unordered: false,
+        coordinator_fill: None,
     };
-
-    validate_no_non_mergeable_aggs(stmt)?;
 
     let mut region_fields = Vec::new();
     for field in &stmt.fields {
@@ -69,6 +186,22 @@ pub fn prepare_sharded_region_query(
     }
     plan.region_stmt.fields = region_fields;
     plan.merge_rules = build_merge_rules(stmt, &plan);
+    if let Some((output, selector)) = lone_point_selector(stmt) {
+        let col = format!("{output}__sel_time");
+        // FIRST/LAST already carry min/max(time) under this name. A lone
+        // MAX/MIN region query returns its point time as `time`, renamed to
+        // this before merging; the winner's value picks the time.
+        match selector.as_str() {
+            "MAX" => {
+                plan.merge_rules.insert(col.clone(), ColumnMerge::TimeOfMax);
+            }
+            "MIN" => {
+                plan.merge_rules.insert(col.clone(), ColumnMerge::TimeOfMin);
+            }
+            _ => {}
+        }
+        plan.point_time_col = Some(col);
+    }
 
     if stmt.limit.is_some() || stmt.offset.is_some() {
         let offset = stmt.offset.unwrap_or(0);
@@ -82,19 +215,50 @@ pub fn prepare_sharded_region_query(
         plan.saved_offset = stmt.offset;
     }
 
-    if stmt.order_by.is_some()
-        || stmt
-            .group_by
-            .as_ref()
-            .is_some_and(|gb| gb.time_dimension().is_some())
-    {
+    let time_buckets = stmt
+        .group_by
+        .as_ref()
+        .is_some_and(|gb| gb.time_dimension().is_some());
+    if stmt.order_by.is_some() || time_buckets {
         plan.saved_time_desc = stmt.order_by.as_ref().map(|o| o.time_desc);
         plan.needs_global_sort = true;
         plan.region_stmt.order_by = None;
-        ensure_time_field_for_global_sort(&mut plan.region_stmt.fields);
+        // A time-bucketed query already returns each bucket as `time`, and an
+        // aggregate without buckets has one row per series; a bare `time`
+        // beside aggregates is an error in chDB.
+        if !time_buckets && !select_has_true_aggregate(stmt) {
+            ensure_time_field_for_global_sort(&mut plan.region_stmt.fields);
+        }
     }
 
     Ok(plan)
+}
+
+/// `(output, NAME)` when the statement's only call is a bare FIRST, LAST,
+/// MAX or MIN and there is no GROUP BY time().
+fn lone_point_selector(stmt: &SelectStatement) -> Option<(String, String)> {
+    if stmt
+        .group_by
+        .as_ref()
+        .is_some_and(|gb| gb.time_dimension().is_some())
+    {
+        return None;
+    }
+    let mut calls = stmt
+        .fields
+        .iter()
+        .filter(|f| !matches!(f.expr, Expr::Identifier(_) | Expr::FieldRef { .. }));
+    let field = calls.next()?;
+    if calls.next().is_some() {
+        return None;
+    }
+    let Expr::Call(func) = &field.expr else {
+        return None;
+    };
+    let name = func.name.to_uppercase();
+    matches!(name.as_str(), "FIRST" | "LAST" | "MAX" | "MIN")
+        .then(|| select_output_field_name(field).map(|o| (o, name)))
+        .flatten()
 }
 
 fn ensure_time_field_for_global_sort(fields: &mut Vec<Field>) {
@@ -111,20 +275,6 @@ fn ensure_time_field_for_global_sort(fields: &mut Vec<Field>) {
             },
         );
     }
-}
-
-fn validate_no_non_mergeable_aggs(stmt: &SelectStatement) -> Result<(), HyperbytedbError> {
-    for field in &stmt.fields {
-        if let Expr::Call(func) = &field.expr
-            && is_non_mergeable_agg(func)
-        {
-            return Err(HyperbytedbError::QueryParse(format!(
-                "{MULTI_REGION_UNSUPPORTED}: {}",
-                func.name.to_lowercase()
-            )));
-        }
-    }
-    Ok(())
 }
 
 fn is_non_mergeable_agg(func: &FunctionCall) -> bool {
@@ -146,7 +296,9 @@ fn rewrite_field_for_region(
         Expr::Call(func) => match func.name.to_uppercase().as_str() {
             "MEAN" => {
                 let source = aggregate_source_field_name(func)?;
-                let (sum_col, count_col) = mean_rollup_column_names(&source);
+                // Private names, keyed by output: `sum_{field}` would collide
+                // with the user's own `sum(field)` or `count(field)` beside it.
+                let (sum_col, count_col) = partial_names("mean", &output);
                 plan.mean_partials.insert(
                     output,
                     MeanRollupField {
@@ -179,9 +331,8 @@ fn rewrite_field_for_region(
             }
             "STDDEV" => {
                 let source = aggregate_source_field_name(func)?;
-                let sum_col = format!("stddev_sum_{source}");
-                let sumsq_col = format!("stddev_sumsq_{source}");
-                let count_col = format!("stddev_count_{source}");
+                let (sum_col, count_col) = partial_names("stddev", &output);
+                let sumsq_col = format!("__stddev_sumsq_{output}");
                 plan.stddev_partials.insert(
                     output,
                     StddevPartialCols {
@@ -221,6 +372,14 @@ fn rewrite_field_for_region(
         },
         _ => Ok(vec![field.clone()]),
     }
+}
+
+/// Sum and count partial columns for aggregate `kind` producing `output`.
+fn partial_names(kind: &str, output: &str) -> (String, String) {
+    (
+        format!("__{kind}_sum_{output}"),
+        format!("__{kind}_count_{output}"),
+    )
 }
 
 fn field_with_call(name: &str, source: &str, alias: Option<String>) -> Field {
@@ -268,11 +427,11 @@ fn build_merge_rules(
     }
     for (output, time_col) in &plan.first_partials {
         rules.insert(output.clone(), ColumnMerge::FirstByTime);
-        rules.insert(time_col.clone(), ColumnMerge::Min);
+        rules.insert(time_col.clone(), ColumnMerge::EarliestTime);
     }
     for (output, time_col) in &plan.last_partials {
         rules.insert(output.clone(), ColumnMerge::LastByTime);
-        rules.insert(time_col.clone(), ColumnMerge::Max);
+        rules.insert(time_col.clone(), ColumnMerge::LatestTime);
     }
     for partial in plan.stddev_partials.values() {
         rules.insert(partial.sum_col.clone(), ColumnMerge::Sum);
@@ -291,6 +450,10 @@ fn build_merge_rules(
             continue;
         };
         if rules.contains_key(&name) {
+            continue;
+        }
+        if matches!(&field.expr, Expr::Call(func) if is_non_mergeable_agg(func)) {
+            rules.insert(name, ColumnMerge::WholeGroupOnly);
             continue;
         }
         let merge = if let Ok(combine) = rollup_combine_from_field(field) {
@@ -319,16 +482,35 @@ fn build_merge_rules(
     rules
 }
 
+/// InfluxDB's series order: by name, then by tag set. Without the tag part,
+/// series of one measurement came out in hash order, different on every
+/// coordinator.
+fn series_order(a: &SeriesResult, b: &SeriesResult) -> std::cmp::Ordering {
+    let tags = |s: &SeriesResult| {
+        let mut pairs: Vec<(String, String)> = s
+            .tags
+            .iter()
+            .flatten()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        pairs.sort();
+        pairs
+    };
+    a.name.cmp(&b.name).then_with(|| tags(a).cmp(&tags(b)))
+}
+
 /// Merge multiple partial query responses into one, deduplicating series by name+tags.
-pub fn merge_query_results(mut parts: Vec<QueryResponse>) -> QueryResponse {
+pub fn merge_query_results(
+    mut parts: Vec<QueryResponse>,
+) -> Result<QueryResponse, HyperbytedbError> {
     if parts.is_empty() {
-        return QueryResponse::empty(0);
+        return Ok(QueryResponse::empty(0));
     }
     if parts.len() == 1 {
         if let Some(part) = parts.pop() {
-            return part;
+            return Ok(part);
         }
-        return QueryResponse::empty(0);
+        return Ok(QueryResponse::empty(0));
     }
 
     let statement_id = parts[0]
@@ -365,9 +547,14 @@ pub fn merge_query_results(mut parts: Vec<QueryResponse>) -> QueryResponse {
     }
 
     let mut series: Vec<SeriesResult> = merged.into_values().collect();
-    series.sort_by(|a, b| a.name.cmp(&b.name));
+    if series.len() > SHARD_MERGE_MAX_DISTINCT_SERIES {
+        return Err(HyperbytedbError::QueryParse(format!(
+            "shard merge would combine more than {SHARD_MERGE_MAX_DISTINCT_SERIES} distinct series; narrow the query"
+        )));
+    }
+    series.sort_by(series_order);
 
-    QueryResponse::single(statement_id, series)
+    Ok(QueryResponse::single(statement_id, series))
 }
 
 /// Merge sharded partial results, reducing global aggregates across regions.
@@ -377,7 +564,7 @@ pub fn merge_sharded_query_results(
     plan: Option<&ShardedQueryPlan>,
 ) -> Result<QueryResponse, HyperbytedbError> {
     let merged = if !select_has_true_aggregate(stmt) {
-        merge_query_results(parts)
+        merge_query_results(parts)?
     } else {
         merge_aggregate_parts(parts, stmt, plan)?
     };
@@ -400,11 +587,65 @@ pub fn apply_sharded_post_merge(
     } else {
         response
     };
+    if let Some(fill) = &plan.coordinator_fill {
+        resp = fill_missing_buckets(resp, fill, plan.epoch.as_deref());
+    }
 
     if plan.needs_global_sort || plan.saved_limit.is_some() || plan.saved_offset.is_some() {
         resp = apply_global_sort_limit_offset(resp, original, plan)?;
     }
     Ok(resp)
+}
+
+/// Add a null row for every bucket a series lacks; the global sort that
+/// follows puts them in place. Only called when [`epoch_unit_nanos`] knows
+/// the time format.
+fn fill_missing_buckets(
+    mut response: QueryResponse,
+    fill: &CoordinatorFill,
+    epoch: Option<&str>,
+) -> QueryResponse {
+    let Some(unit_ns) = epoch_unit_nanos(epoch) else {
+        return response;
+    };
+    for result in &mut response.results {
+        for series in result.series.iter_mut().flatten() {
+            let Some(ti) = series
+                .columns
+                .iter()
+                .position(|c| c == "time" || c == "__time")
+            else {
+                continue;
+            };
+            let present: HashSet<i64> = series
+                .values
+                .iter()
+                .filter_map(|row| row.get(ti).and_then(json_as_i64))
+                .map(|t| t.saturating_mul(unit_ns))
+                .collect();
+            let (lo, hi) = match fill.bounds_ns {
+                Some(b) => b,
+                None => match (present.iter().min(), present.iter().max()) {
+                    (Some(&lo), Some(&hi)) => (lo, hi),
+                    _ => continue,
+                },
+            };
+            let width = series.columns.len();
+            let mut t = lo;
+            while t <= hi {
+                if !present.contains(&t) {
+                    let mut row = vec![Value::Null; width];
+                    row[ti] = crate::domain::query_result::time_value_from_nanos(t, epoch);
+                    series.values.push(row);
+                }
+                t = t.saturating_add(fill.step_ns);
+                if fill.step_ns <= 0 {
+                    break;
+                }
+            }
+        }
+    }
+    response
 }
 
 /// Merge partial materialized-view destination rows from multiple shard regions.
@@ -456,59 +697,120 @@ fn merge_rows_with_rules(
     rules: &HashMap<String, ColumnMerge>,
     row_key_distinct_cols: &HashSet<String>,
 ) -> Result<QueryResponse, HyperbytedbError> {
-    let mut rows: HashMap<String, (SeriesResult, Vec<Value>)> = HashMap::new();
+    // Series by name and tag set; within each, rows by time (and any
+    // distinct columns). Each series' header is kept once. Keeping a clone
+    // of the whole series beside every row made this quadratic: 746 of
+    // 804 ms for 5 hosts x 1,441 buckets on n3, against 56 ms for the
+    // region queries themselves.
+    let mut merged: IndexMap<String, (SeriesResult, IndexMap<String, Vec<Value>>)> =
+        IndexMap::new();
 
+    // A series only one part returned has nothing to merge with (with
+    // GROUP BY on every tag, each series lives in one region): it is kept
+    // whole instead of keyed row by row.
+    let mut keyed: Vec<(String, SeriesResult)> = Vec::new();
     for part in parts {
         for stmt_result in part.results {
-            let Some(series_list) = stmt_result.series else {
-                continue;
+            keyed.extend(
+                stmt_result
+                    .series
+                    .into_iter()
+                    .flatten()
+                    .map(|s| (series_key(&s), s)),
+            );
+        }
+    }
+    let mut occurrences: HashMap<String, usize> = HashMap::new();
+    for (key, _) in &keyed {
+        *occurrences.entry(key.clone()).or_default() += 1;
+    }
+    let mut whole: Vec<SeriesResult> = Vec::new();
+    for (key, mut series) in keyed {
+        if occurrences.get(&key) == Some(&1) {
+            whole.push(series);
+            continue;
+        }
+        let values = std::mem::take(&mut series.values);
+        let time_idx = series
+            .columns
+            .iter()
+            .position(|c| c == "time" || c == "__time");
+        let distinct: Vec<(&String, usize)> = row_key_distinct_cols
+            .iter()
+            .filter_map(|c| series.columns.iter().position(|x| x == c).map(|i| (c, i)))
+            .collect();
+        let (header, rows) = merged
+            .entry(key)
+            .or_insert_with(|| (series.clone(), IndexMap::new()));
+        // Rows are merged in the first part's column order.
+        let remap: Option<Vec<usize>> = if header.columns == series.columns {
+            None
+        } else {
+            Some(
+                header
+                    .columns
+                    .iter()
+                    .map(|c| series.columns.iter().position(|x| x == c))
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(ragged_merge_row)?,
+            )
+        };
+        for row in values {
+            if row.len() != series.columns.len() {
+                return Err(ragged_merge_row());
+            }
+            let mut row_key = String::new();
+            if let Some(i) = time_idx {
+                row_key.push_str(&row[i].to_string());
+            }
+            for (col, i) in &distinct {
+                row_key.push('|');
+                row_key.push_str(col);
+                row_key.push('=');
+                row_key.push_str(&row[*i].to_string());
+            }
+            let row = match &remap {
+                None => row,
+                Some(map) => map.iter().map(|&i| row[i].clone()).collect(),
             };
-            for series in series_list {
-                for row in &series.values {
-                    let key = series_row_key(&series, row, row_key_distinct_cols)?;
-                    match rows.entry(key) {
-                        Entry::Occupied(mut e) => {
-                            let (existing_series, merged_row) = e.get_mut();
-                            *merged_row =
-                                merge_row(&existing_series.columns, rules, merged_row, row)?;
-                        }
-                        Entry::Vacant(e) => {
-                            e.insert((series.clone(), row.clone()));
-                        }
-                    }
+            match rows.entry(row_key) {
+                indexmap::map::Entry::Occupied(mut e) => {
+                    let merged_row = merge_row(&header.columns, rules, e.get(), &row)?;
+                    *e.get_mut() = merged_row;
+                }
+                indexmap::map::Entry::Vacant(e) => {
+                    e.insert(row);
                 }
             }
         }
     }
 
-    let mut by_series: HashMap<String, SeriesResult> = HashMap::new();
-    for (_, (series, row)) in rows {
-        let series_key = format!(
-            "{}:{:?}",
-            series.name,
-            series.tags.as_ref().map(|t| {
-                let mut pairs: Vec<_> = t.iter().collect();
-                pairs.sort_by_key(|(k, _)| *k);
-                pairs
-            })
-        );
-        match by_series.entry(series_key) {
-            Entry::Occupied(mut e) => e.get_mut().values.push(row),
-            Entry::Vacant(e) => {
-                e.insert(SeriesResult {
-                    name: series.name,
-                    tags: series.tags,
-                    columns: series.columns,
-                    values: vec![row],
-                    partial: series.partial,
-                });
-            }
+    let mut series: Vec<SeriesResult> = merged
+        .into_values()
+        .map(|(mut header, rows)| {
+            header.values = rows.into_values().collect();
+            header
+        })
+        .chain(whole)
+        .collect();
+    series.sort_by(series_order);
+    Ok(QueryResponse::single(statement_id, series))
+}
+
+/// A series' identity for merging: its name and sorted tag set.
+fn series_key(series: &SeriesResult) -> String {
+    let mut key = series.name.clone();
+    if let Some(tags) = &series.tags {
+        let mut pairs: Vec<_> = tags.iter().collect();
+        pairs.sort_by_key(|(k, _)| *k);
+        for (k, v) in pairs {
+            key.push('|');
+            key.push_str(k);
+            key.push('=');
+            key.push_str(v);
         }
     }
-
-    let mut series: Vec<SeriesResult> = by_series.into_values().collect();
-    series.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(QueryResponse::single(statement_id, series))
+    key
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -520,9 +822,21 @@ enum ColumnMerge {
     Last,
     FirstByTime,
     LastByTime,
+    /// Timestamps, compared as times and kept as given (an RFC 3339 string
+    /// or an epoch number): numeric Min/Max would turn them into floats.
+    EarliestTime,
+    LatestTime,
+    /// A point time beside a MAX/MIN: the time of the row whose value wins.
+    TimeOfMax,
+    TimeOfMin,
     DistinctKeep,
     Skip,
     Unsupported,
+    /// PERCENTILE/MEDIAN/MODE/SPREAD: exact only from one region's points.
+    /// A group (series and bucket) one region returned passes through; a
+    /// second region's value for it is an error, not a guess. A region with
+    /// no points for the group returns null and gives way.
+    WholeGroupOnly,
 }
 
 fn column_merge_rules(stmt: &SelectStatement) -> HashMap<String, ColumnMerge> {
@@ -557,43 +871,6 @@ fn column_merge_rules(stmt: &SelectStatement) -> HashMap<String, ColumnMerge> {
     rules
 }
 
-fn series_row_key(
-    series: &SeriesResult,
-    row: &[Value],
-    row_key_distinct_cols: &HashSet<String>,
-) -> Result<String, HyperbytedbError> {
-    let mut key = series.name.clone();
-    if let Some(tags) = &series.tags {
-        let mut pairs: Vec<_> = tags.iter().collect();
-        pairs.sort_by_key(|(k, _)| *k);
-        for (k, v) in pairs {
-            key.push('|');
-            key.push_str(k);
-            key.push('=');
-            key.push_str(v);
-        }
-    }
-    if let Some(idx) = series
-        .columns
-        .iter()
-        .position(|c| c == "time" || c == "__time")
-    {
-        let cell = row.get(idx).ok_or_else(ragged_merge_row)?;
-        key.push('|');
-        key.push_str(&cell.to_string());
-    }
-    for col in row_key_distinct_cols {
-        if let Some(idx) = series.columns.iter().position(|c| c == col) {
-            let cell = row.get(idx).ok_or_else(ragged_merge_row)?;
-            key.push('|');
-            key.push_str(col);
-            key.push('=');
-            key.push_str(&cell.to_string());
-        }
-    }
-    Ok(key)
-}
-
 fn json_as_f64(v: &Value) -> Option<f64> {
     v.as_f64()
         .or_else(|| v.as_i64().map(|i| i as f64))
@@ -613,6 +890,26 @@ fn json_as_count(v: &Value) -> i64 {
         .filter(|f| f.is_finite())
         .map(|f| f as i64)
         .unwrap_or(0)
+}
+
+/// A time cell as nanoseconds (or the epoch unit it was given in), None when
+/// null or unparsable.
+fn json_time_nanos(v: &Value) -> Option<i64> {
+    if v.is_null() {
+        return None;
+    }
+    if let Some(n) = json_as_i64(v) {
+        return Some(n);
+    }
+    let s = v.as_str()?;
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .and_then(|dt| dt.timestamp_nanos_opt())
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+                .ok()
+                .and_then(|t| t.and_utc().timestamp_nanos_opt())
+        })
 }
 
 fn json_sortable_time(v: &Value) -> i64 {
@@ -661,6 +958,15 @@ fn merge_values(
     right_row: &[Value],
 ) -> Result<Value, HyperbytedbError> {
     match rule {
+        ColumnMerge::WholeGroupOnly => match (left.is_null(), right.is_null()) {
+            (_, true) => Ok(left.clone()),
+            (true, false) => Ok(right.clone()),
+            (false, false) => Err(HyperbytedbError::QueryParse(format!(
+                "{} needs each group's points in one region, and one group here spans \
+                 several: filter to single series or GROUP BY every tag",
+                columns.get(col_idx).map_or("aggregate", String::as_str)
+            ))),
+        },
         ColumnMerge::DistinctKeep | ColumnMerge::Skip | ColumnMerge::Unsupported => {
             Ok(left.clone())
         }
@@ -697,7 +1003,48 @@ fn merge_values(
             let time_col = format!("{col}__sel_time");
             pick_by_time(left, right, left_row, right_row, columns, &time_col, false)
         }
+        ColumnMerge::EarliestTime | ColumnMerge::LatestTime => {
+            let (l, r) = (json_sortable_time(left), json_sortable_time(right));
+            let right_wins = match rule {
+                ColumnMerge::EarliestTime => r < l,
+                _ => r > l,
+            };
+            Ok(if left.is_null() || (right_wins && !right.is_null()) {
+                right.clone()
+            } else {
+                left.clone()
+            })
+        }
+        ColumnMerge::TimeOfMax | ColumnMerge::TimeOfMin => {
+            let col = columns.get(col_idx).ok_or_else(ragged_merge_row)?;
+            let value_col = col
+                .strip_suffix("__sel_time")
+                .ok_or_else(ragged_merge_row)?;
+            let vi = columns
+                .iter()
+                .position(|c| c == value_col)
+                .ok_or_else(ragged_merge_row)?;
+            let l = left_row.get(vi).and_then(json_as_f64);
+            let r = right_row.get(vi).and_then(json_as_f64);
+            let right_wins = match (l, r) {
+                (None, Some(_)) => true,
+                (Some(a), Some(b)) if a == b => {
+                    json_sortable_time(right) < json_sortable_time(left)
+                }
+                (Some(a), Some(b)) => (rule_is_max(rule) && b > a) || (!rule_is_max(rule) && b < a),
+                _ => false,
+            };
+            Ok(if right_wins {
+                right.clone()
+            } else {
+                left.clone()
+            })
+        }
     }
+}
+
+fn rule_is_max(rule: ColumnMerge) -> bool {
+    matches!(rule, ColumnMerge::TimeOfMax)
 }
 
 fn pick_by_time(
@@ -712,8 +1059,10 @@ fn pick_by_time(
     let Some(time_idx) = columns.iter().position(|c| c == time_col) else {
         return Ok(left.clone());
     };
-    let lt = json_as_i64(left_row.get(time_idx).ok_or_else(ragged_merge_row)?);
-    let rt = json_as_i64(right_row.get(time_idx).ok_or_else(ragged_merge_row)?);
+    // Selection times arrive as chDB DateTime64 text, not numbers: compared
+    // with json_as_i64 every pick kept the left region's value.
+    let lt = json_time_nanos(left_row.get(time_idx).ok_or_else(ragged_merge_row)?);
+    let rt = json_time_nanos(right_row.get(time_idx).ok_or_else(ragged_merge_row)?);
     Ok(match (lt, rt) {
         (Some(a), Some(b)) if a == b => left.clone(),
         (Some(a), Some(b)) if pick_min && a <= b => left.clone(),
@@ -743,10 +1092,33 @@ fn merge_row(
 }
 
 fn merge_aggregate_parts(
-    parts: Vec<QueryResponse>,
+    mut parts: Vec<QueryResponse>,
     stmt: &SelectStatement,
     plan: Option<&ShardedQueryPlan>,
 ) -> Result<QueryResponse, HyperbytedbError> {
+    // A lone MAX/MIN region returns its point's time as `time`. As a row key
+    // it would keep each region's row apart; carry it as the selector's
+    // partial instead, merged by the winning value.
+    if let Some(col) = plan.and_then(|p| {
+        p.point_time_col.as_ref().filter(|c| {
+            matches!(
+                p.merge_rules.get(*c),
+                Some(ColumnMerge::TimeOfMax | ColumnMerge::TimeOfMin)
+            )
+        })
+    }) {
+        for part in &mut parts {
+            for result in &mut part.results {
+                for series in result.series.iter_mut().flatten() {
+                    if !series.columns.iter().any(|c| c == col)
+                        && let Some(t) = series.columns.iter().position(|c| c == "time")
+                    {
+                        series.columns[t] = col.clone();
+                    }
+                }
+            }
+        }
+    }
     if parts.is_empty() {
         return Ok(QueryResponse::empty(0));
     }
@@ -784,7 +1156,29 @@ fn finalize_sharded_aggregates(
     };
 
     let mut finalized = Vec::with_capacity(series_list.len());
-    for series in series_list {
+    for mut series in series_list {
+        if let Some(col) = &plan.point_time_col
+            && !series.columns.iter().any(|c| c == "time")
+            && let Some(idx) = series.columns.iter().position(|c| c == col)
+        {
+            // The partial is a plain column (chDB's DateTime64 text, or a
+            // time a region already formatted); report it as a time.
+            series.columns.insert(0, "time".to_string());
+            for row in &mut series.values {
+                // A number is a region's time already in the epoch unit.
+                let t = match row.get(idx) {
+                    Some(Value::String(text)) => {
+                        crate::domain::query_result::time_value_from_nanos(
+                            json_sortable_time(&Value::String(text.clone())),
+                            plan.epoch.as_deref(),
+                        )
+                    }
+                    Some(v) => v.clone(),
+                    None => Value::Null,
+                };
+                row.insert(0, t);
+            }
+        }
         finalized.push(finalize_series_aggregates(series, plan)?);
     }
 
@@ -828,6 +1222,7 @@ fn finalize_series_aggregates(
                 .values()
                 .flat_map(|p| [p.sum_col.clone(), p.sumsq_col.clone(), p.count_col.clone()]),
         )
+        .chain(plan.point_time_col.iter().cloned())
         .collect();
 
     let mut new_columns = Vec::new();
@@ -1072,17 +1467,17 @@ fn apply_global_sort_limit_offset(
         }
     }
 
-    flat.sort_by(|a, b| {
-        if let Some(ti) = time_idx {
-            let at = a.1.get(ti).map(json_sortable_time).unwrap_or(0);
-            let bt = b.1.get(ti).map(json_sortable_time).unwrap_or(0);
-            if time_desc { bt.cmp(&at) } else { at.cmp(&bt) }
-        } else {
-            let av = a.1.first().map(|v| v.to_string()).unwrap_or_default();
-            let bv = b.1.first().map(|v| v.to_string()).unwrap_or_default();
-            if time_desc { bv.cmp(&av) } else { av.cmp(&bv) }
-        }
-    });
+    // Each row's sort key is computed once (an RFC 3339 time is parsed),
+    // not on every comparison. Stable, so equal keys keep their order.
+    use std::cmp::Reverse;
+    let time = |row: &[Value]| time_idx.and_then(|ti| row.get(ti)).map(json_sortable_time);
+    let first = |row: &[Value]| row.first().map(|v| v.to_string()).unwrap_or_default();
+    match (time_idx.is_some(), time_desc) {
+        (true, false) => flat.sort_by_cached_key(|(_, r)| time(r).unwrap_or(0)),
+        (true, true) => flat.sort_by_cached_key(|(_, r)| Reverse(time(r).unwrap_or(0))),
+        (false, false) => flat.sort_by_cached_key(|(_, r)| first(r)),
+        (false, true) => flat.sort_by_cached_key(|(_, r)| Reverse(first(r))),
+    }
 
     let offset = plan.saved_offset.unwrap_or(0) as usize;
     if offset > 0 {
@@ -1142,7 +1537,7 @@ mod tests {
                 partial: None,
             }],
         );
-        let merged = merge_query_results(vec![a, b]);
+        let merged = merge_query_results(vec![a, b]).unwrap();
         assert_eq!(merged.results[0].series.as_ref().unwrap().len(), 2);
     }
 
@@ -1175,7 +1570,7 @@ mod tests {
                 vec![SeriesResult {
                     name: "metrics".into(),
                     tags: None,
-                    columns: vec!["count_value".into()],
+                    columns: vec!["count".into()],
                     values: vec![vec![json!(n)]],
                     partial: None,
                 }],
@@ -1227,7 +1622,7 @@ mod tests {
                 vec![SeriesResult {
                     name: "metrics".into(),
                     tags: None,
-                    columns: vec!["time".into(), "count_value".into()],
+                    columns: vec!["time".into(), "count".into()],
                     values: vec![vec![json!(1000), json!(n)]],
                     partial: None,
                 }],
@@ -1240,6 +1635,38 @@ mod tests {
         assert_eq!(series.len(), 1);
         assert_eq!(series[0].values.len(), 1);
         assert_eq!(series[0].values[0][1], json!(10));
+    }
+
+    #[test]
+    fn merged_series_are_ordered_by_name_then_tags() {
+        let part = |hosts: &[&str]| {
+            QueryResponse::single(
+                0,
+                hosts
+                    .iter()
+                    .map(|h| SeriesResult {
+                        name: "cpu".into(),
+                        tags: Some(HashMap::from([("host".to_string(), h.to_string())])),
+                        columns: vec!["time".into(), "value".into()],
+                        values: vec![vec![json!(1), json!(1)]],
+                        partial: None,
+                    })
+                    .collect(),
+            )
+        };
+        let merged = merge_query_results(vec![
+            part(&["h6", "h1", "h4", "h3"]),
+            part(&["h0", "h7", "h2", "h5"]),
+        ])
+        .unwrap();
+        let hosts: Vec<String> = merged.results[0]
+            .series
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|s| s.tags.as_ref().unwrap()["host"].clone())
+            .collect();
+        assert_eq!(hosts, ["h0", "h1", "h2", "h3", "h4", "h5", "h6", "h7"]);
     }
 
     #[test]
@@ -1273,6 +1700,7 @@ mod tests {
             timezone: None,
         };
         let plan = prepare_sharded_region_query(&stmt).unwrap();
+        let cols = plan.mean_partials.values().next().unwrap().clone();
 
         let partial = |sum: i64, count: i64| {
             QueryResponse::single(
@@ -1280,7 +1708,7 @@ mod tests {
                 vec![SeriesResult {
                     name: "metrics".into(),
                     tags: None,
-                    columns: vec!["time".into(), "sum_value".into(), "count_value".into()],
+                    columns: vec!["time".into(), cols.sum_col.clone(), cols.count_col.clone()],
                     values: vec![vec![json!(1000), json!(sum), json!(count)]],
                     partial: None,
                 }],
@@ -1293,6 +1721,274 @@ mod tests {
         let row = &merged.results[0].series.as_ref().unwrap()[0].values[0];
         assert_eq!(row[0], json!(1000));
         assert_eq!(row[1], json!(6.0));
+    }
+
+    fn mean_by_time_and_host() -> SelectStatement {
+        SelectStatement {
+            fields: vec![Field {
+                expr: Expr::Call(FunctionCall {
+                    name: "mean".into(),
+                    args: vec![Expr::Identifier("usage_idle".into())],
+                }),
+                alias: None,
+            }],
+            into: None,
+            from: vec![],
+            condition: None,
+            group_by: Some(GroupBy {
+                dimensions: vec![
+                    Dimension::Time {
+                        interval: Duration {
+                            value: 30,
+                            unit: DurationUnit::Second,
+                        },
+                        offset: None,
+                    },
+                    Dimension::Tag("host".into()),
+                ],
+            }),
+            order_by: None,
+            limit: None,
+            offset: None,
+            slimit: None,
+            soffset: None,
+            fill: None,
+            timezone: None,
+        }
+    }
+
+    /// The UAT dashboard's query: 10 regions each returning 5 hosts x 1,441
+    /// buckets. Means come from every region's sums and counts, and a part
+    /// whose columns arrive in another order is merged by name. The merge
+    /// used to copy a whole series per new row (746 ms on n3, seconds in a
+    /// debug build); the bound only catches that, not normal variation.
+    #[test]
+    fn a_wide_time_and_tag_merge_is_linear_and_exact() {
+        let stmt = mean_by_time_and_host();
+        let plan = prepare_sharded_region_query(&stmt).unwrap();
+        let cols = plan.mean_partials.values().next().unwrap().clone();
+        let (regions, hosts, buckets) = (10_i64, 5, 1_441_i64);
+        let part = |region: i64| {
+            let swapped = region == 3;
+            let columns = if swapped {
+                vec!["time".into(), cols.count_col.clone(), cols.sum_col.clone()]
+            } else {
+                vec!["time".into(), cols.sum_col.clone(), cols.count_col.clone()]
+            };
+            let series = (0..hosts)
+                .map(|h| SeriesResult {
+                    name: "cpu".into(),
+                    tags: Some(HashMap::from([("host".into(), format!("h{h}"))])),
+                    columns: columns.clone(),
+                    values: (0..buckets)
+                        .map(|b| {
+                            // Each region holds one point of value `region` per bucket.
+                            let (sum, count) = (json!(region), json!(1));
+                            if swapped {
+                                vec![json!(b * 30_000), count, sum]
+                            } else {
+                                vec![json!(b * 30_000), sum, count]
+                            }
+                        })
+                        .collect(),
+                    partial: None,
+                })
+                .collect();
+            QueryResponse::single(0, series)
+        };
+        let parts: Vec<_> = (0..regions).map(part).collect();
+
+        let start = std::time::Instant::now();
+        let merged = merge_sharded_query_results(parts, &stmt, Some(&plan)).unwrap();
+        let took = start.elapsed();
+
+        let series = merged.results[0].series.as_ref().unwrap();
+        assert_eq!(series.len(), 5);
+        let want_mean = (0..regions).sum::<i64>() as f64 / regions as f64;
+        for s in series {
+            assert_eq!(s.values.len(), buckets as usize);
+            let times: Vec<i64> = s.values.iter().map(|r| r[0].as_i64().unwrap()).collect();
+            assert!(times.windows(2).all(|w| w[0] < w[1]), "time order");
+            for row in &s.values {
+                assert_eq!(row[1], json!(want_mean), "{row:?}");
+            }
+        }
+        assert!(
+            took < std::time::Duration::from_secs(2),
+            "merge took {took:?}"
+        );
+    }
+
+    /// GROUP BY on every tag: each series comes from one region and is kept
+    /// whole, but its mean is still finalized from the sum and count.
+    #[test]
+    fn a_series_from_one_region_is_kept_whole_and_finalized() {
+        let stmt = mean_by_time_and_host();
+        let plan = prepare_sharded_region_query(&stmt).unwrap();
+        let cols = plan.mean_partials.values().next().unwrap().clone();
+        let part = |host: &str, sum: i64| {
+            QueryResponse::single(
+                0,
+                vec![SeriesResult {
+                    name: "cpu".into(),
+                    tags: Some(HashMap::from([("host".into(), host.into())])),
+                    columns: vec!["time".into(), cols.sum_col.clone(), cols.count_col.clone()],
+                    values: vec![
+                        vec![json!(30_000), json!(sum), json!(4)],
+                        vec![json!(0), json!(sum * 2), json!(4)],
+                    ],
+                    partial: None,
+                }],
+            )
+        };
+        let merged =
+            merge_sharded_query_results(vec![part("b", 8), part("a", 4)], &stmt, Some(&plan))
+                .unwrap();
+        let series = merged.results[0].series.as_ref().unwrap();
+        let got: Vec<_> = series
+            .iter()
+            .map(|s| (s.tags.as_ref().unwrap()["host"].clone(), s.values.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "a".to_string(),
+                    vec![vec![json!(0), json!(2.0)], vec![json!(30_000), json!(1.0)]]
+                ),
+                (
+                    "b".to_string(),
+                    vec![vec![json!(0), json!(4.0)], vec![json!(30_000), json!(2.0)]]
+                ),
+            ]
+        );
+    }
+
+    /// When the coordinator takes over fill and order, and when it must not.
+    #[test]
+    fn fill_and_order_move_to_the_coordinator_only_when_the_answer_is_the_same() {
+        let moved =
+            |stmt: &SelectStatement, epoch: Option<&str>, bounds: (Option<i64>, Option<i64>)| {
+                let mut plan = prepare_sharded_region_query(stmt).unwrap();
+                plan.epoch = epoch.map(str::to_string);
+                let did = plan.move_fill_and_order_to_coordinator(stmt, bounds.0, bounds.1);
+                (did, plan)
+            };
+        let day = (Some(0), Some(86_400_000_000_000));
+        let stmt = mean_by_time_and_host();
+        let (did, plan) = moved(&stmt, Some("ms"), day);
+        assert!(did && plan.region_unordered);
+        assert!(matches!(plan.region_stmt.fill, Some(FillOption::None)));
+
+        let with = |f: &dyn Fn(&mut SelectStatement)| {
+            let mut s = mean_by_time_and_host();
+            f(&mut s);
+            s
+        };
+        // fill(none): nothing to fill, but the order still moves.
+        let none = with(&|s| s.fill = Some(FillOption::None));
+        assert!(moved(&none, None, day).0);
+        for (why, stmt, epoch, bounds) in [
+            ("RFC 3339 times", stmt.clone(), None, day),
+            (
+                "tz()",
+                with(&|s| s.timezone = Some("Europe/Paris".into())),
+                Some("ms"),
+                day,
+            ),
+            (
+                "fill(previous)",
+                with(&|s| s.fill = Some(FillOption::Previous)),
+                Some("ms"),
+                day,
+            ),
+            (
+                "fill(0)",
+                with(&|s| s.fill = Some(FillOption::Value(0.0))),
+                Some("ms"),
+                day,
+            ),
+            (
+                "region LIMIT",
+                with(&|s| s.limit = Some(10)),
+                Some("ms"),
+                day,
+            ),
+            ("SLIMIT", with(&|s| s.slimit = Some(2)), Some("ms"), day),
+            (
+                "too many buckets",
+                stmt.clone(),
+                Some("ms"),
+                (Some(0), Some(i64::MAX / 2)),
+            ),
+            (
+                "1 h buckets",
+                with(&|s| {
+                    if let Some(Dimension::Time { interval, .. }) =
+                        s.group_by.as_mut().unwrap().dimensions.get_mut(0)
+                    {
+                        interval.unit = DurationUnit::Hour;
+                        interval.value = 1;
+                    }
+                }),
+                Some("ms"),
+                day,
+            ),
+        ] {
+            let (did, plan) = moved(&stmt, epoch, bounds);
+            assert!(!did, "{why}");
+            assert!(!plan.region_unordered, "{why}");
+            assert!(plan.coordinator_fill.is_none(), "{why}");
+        }
+    }
+
+    /// Missing buckets become null rows, from the bucket holding the lower
+    /// bound to the one holding the upper bound, as ClickHouse's WITH FILL
+    /// FROM .. TO did in each region.
+    #[test]
+    fn missing_buckets_are_filled_with_nulls_between_the_bounds() {
+        let fill = CoordinatorFill {
+            step_ns: 30_000_000_000,
+            bounds_ns: Some((0, 120_000_000_000)),
+        };
+        let series = SeriesResult {
+            name: "cpu".into(),
+            tags: None,
+            columns: vec!["time".into(), "mean".into()],
+            values: vec![
+                vec![json!(30_000), json!(1.5)],
+                vec![json!(90_000), json!(2.5)],
+            ],
+            partial: None,
+        };
+        let out = fill_missing_buckets(
+            QueryResponse::single(0, vec![series.clone()]),
+            &fill,
+            Some("ms"),
+        );
+        let mut rows = out.results[0].series.as_ref().unwrap()[0].values.clone();
+        rows.sort_by_key(|r| r[0].as_i64().unwrap());
+        assert_eq!(
+            rows,
+            vec![
+                vec![json!(0), Value::Null],
+                vec![json!(30_000), json!(1.5)],
+                vec![json!(60_000), Value::Null],
+                vec![json!(90_000), json!(2.5)],
+                vec![json!(120_000), Value::Null],
+            ]
+        );
+        // Without bounds: only the gaps between a series' own buckets.
+        let unbounded = CoordinatorFill {
+            bounds_ns: None,
+            ..fill
+        };
+        let out = fill_missing_buckets(
+            QueryResponse::single(0, vec![series]),
+            &unbounded,
+            Some("ms"),
+        );
+        assert_eq!(out.results[0].series.as_ref().unwrap()[0].values.len(), 3);
     }
 
     #[test]
@@ -1333,11 +2029,7 @@ mod tests {
                 vec![SeriesResult {
                     name: "metrics".into(),
                     tags: None,
-                    columns: vec![
-                        "time".into(),
-                        "first_value".into(),
-                        "first_value__sel_time".into(),
-                    ],
+                    columns: vec!["time".into(), "first".into(), "first__sel_time".into()],
                     values: vec![vec![json!(1000), json!(value), json!(sel_time)]],
                     partial: None,
                 }],
@@ -1384,7 +2076,7 @@ mod tests {
                 vec![SeriesResult {
                     name: "metrics".into(),
                     tags: None,
-                    columns: vec!["last_value".into(), "last_value__sel_time".into()],
+                    columns: vec!["last".into(), "last__sel_time".into()],
                     values: vec![vec![json!(value), json!(sel_time)]],
                     partial: None,
                 }],
@@ -1397,34 +2089,76 @@ mod tests {
             Some(&plan),
         )
         .expect("merge");
-        let row = &merged.results[0].series.as_ref().unwrap()[0].values[0];
-        assert_eq!(row[0], json!(99));
+        let series = &merged.results[0].series.as_ref().unwrap()[0];
+        // A lone LAST reports the selected point's time, as InfluxDB does.
+        assert_eq!(series.columns, ["time", "last"]);
+        assert_eq!(series.values[0], [json!(5000), json!(99)]);
     }
 
+    /// PERCENTILE across regions: exact when each group comes from one
+    /// region (a region without points gives null and gives way), an error
+    /// when two regions both have points for one group.
     #[test]
-    fn rejects_percentile_on_multi_region() {
-        let stmt = SelectStatement {
-            fields: vec![Field {
-                expr: Expr::Call(FunctionCall {
-                    name: "percentile".into(),
-                    args: vec![Expr::Identifier("value".into()), Expr::IntegerLiteral(95)],
-                }),
-                alias: None,
-            }],
-            into: None,
-            from: vec![],
-            condition: None,
-            group_by: None,
-            order_by: None,
-            limit: None,
-            offset: None,
-            slimit: None,
-            soffset: None,
-            fill: None,
-            timezone: None,
+    fn percentile_merges_only_whole_groups() {
+        let mut stmt = mean_by_time_and_host();
+        stmt.fields = vec![Field {
+            expr: Expr::Call(FunctionCall {
+                name: "percentile".into(),
+                args: vec![
+                    Expr::Identifier("usage_idle".into()),
+                    Expr::IntegerLiteral(95),
+                ],
+            }),
+            alias: None,
+        }];
+        let plan = prepare_sharded_region_query(&stmt).unwrap();
+        let part = |host: &str, rows: Vec<Vec<Value>>| {
+            QueryResponse::single(
+                0,
+                vec![SeriesResult {
+                    name: "cpu".into(),
+                    tags: Some(HashMap::from([("host".into(), host.into())])),
+                    columns: vec!["time".into(), "percentile".into()],
+                    values: rows,
+                    partial: None,
+                }],
+            )
         };
-        let err = prepare_sharded_region_query(&stmt).unwrap_err();
-        assert!(err.to_string().contains(MULTI_REGION_UNSUPPORTED));
+        let merged = merge_sharded_query_results(
+            vec![
+                part("a", vec![vec![json!(0), json!(90.5)]]),
+                part("b", vec![vec![json!(0), json!(80.0)]]),
+                part("a", vec![vec![json!(0), Value::Null]]),
+            ],
+            &stmt,
+            Some(&plan),
+        )
+        .unwrap();
+        let got: Vec<_> = merged.results[0]
+            .series
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|s| s.values.clone())
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                vec![vec![json!(0), json!(90.5)]],
+                vec![vec![json!(0), json!(80.0)]]
+            ]
+        );
+
+        let err = merge_sharded_query_results(
+            vec![
+                part("a", vec![vec![json!(0), json!(90.5)]]),
+                part("a", vec![vec![json!(0), json!(70.0)]]),
+            ],
+            &stmt,
+            Some(&plan),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("spans"), "{err}");
     }
 
     #[test]
@@ -1450,6 +2184,7 @@ mod tests {
             timezone: None,
         };
         let plan = prepare_sharded_region_query(&stmt).unwrap();
+        let cols = plan.stddev_partials.values().next().unwrap().clone();
 
         // Region A: values 2,4 -> sum=6, sumsq=20, count=2
         // Region B: value 6 -> sum=6, sumsq=36, count=1
@@ -1461,9 +2196,9 @@ mod tests {
                     name: "metrics".into(),
                     tags: None,
                     columns: vec![
-                        "stddev_sum_value".into(),
-                        "stddev_sumsq_value".into(),
-                        "stddev_count_value".into(),
+                        cols.sum_col.clone(),
+                        cols.sumsq_col.clone(),
+                        cols.count_col.clone(),
                     ],
                     values: vec![vec![json!(sum), json!(sumsq), json!(count)]],
                     partial: None,

@@ -38,7 +38,7 @@ metadata:
 spec:
   replicas: 5
   image: hyperbytedb:latest
-  version: "0.8.3"
+  version: "0.9.1-beta"
   server:
     port: 8086
     requestTimeoutSecs: 60
@@ -84,7 +84,7 @@ spec:
     heartbeatIntervalSecs: 1
     heartbeatMissThreshold: 3
     replicationMaxRetries: 10
-    raftHeartbeatIntervalMs: 1000
+    raftHeartbeatIntervalMs: 200
     raftElectionTimeoutMs: 800
     raftSnapshotThreshold: 500
     replication:
@@ -132,7 +132,7 @@ metadata:
 spec:
   replicas: 3
   image: hyperbytedb:latest
-  version: "0.8.3"
+  version: "0.9.1-beta"
   server:
     port: 8086
     tls:
@@ -233,14 +233,40 @@ HyperbyteDB stores WAL, metadata, Raft state, and chDB session data on the per-r
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `sessionDataPath` | string | | chDB session data directory (embedded MergeTree storage) |
-| `poolSize` | int32 | `1` | Number of chDB connections to the same session data path. Clamped to 1–32. Set `server.maxConcurrentQueries` ≥ `poolSize` for best overlap. |
+| `queryPoolSize` | int32 | | chDB connections for queries. Unset on HyperbyteDB 0.9.0-beta and later: the database uses one per CPU of the pod's limit, plus one, and `SET query_pool_size = <n>` changes it at run time. |
+| `writePoolSize` | int32 | `1` when no pool field is set | chDB connections for ingest and flush. |
+| `poolSize` | int32 | | Legacy: one size for both pools, when the other two are unset. HyperbyteDB 0.8.x has only this one (the operator writes `poolSize`, else `queryPoolSize`, else 1). |
+
+Set `server.maxConcurrentQueries` ≥ the query pool for best overlap. A
+larger query pool is not always faster: each query also runs threads of its
+own, and on 3-CPU pods 12 connections were 10-40% slower than 4.
 
 ### `auth`
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | `false` | Enable authentication for the HTTP API |
-| `credentialsSecretName` | string | | Secret containing auth credentials |
+| `credentialsSecretName` | string | `<cluster>-auth` | Secret holding the cluster token and the bootstrap admin login |
+
+With `enabled: true` (HyperbyteDB 0.9.1-beta and later) the operator:
+
+- creates the Secret if it is missing, and fills in any key it lacks:
+  `cluster-token` (random), `admin-username` (`admin`) and `admin-password`
+  (random). Values already there are kept, so you can choose the admin
+  password yourself. A Secret it names `<cluster>-auth` is owned by the
+  cluster and deleted with it; one you name in `credentialsSecretName` is
+  kept.
+- passes the three keys to every pod as `HYPERBYTEDB__AUTH__CLUSTER_TOKEN`,
+  `HYPERBYTEDB__AUTH__ADMIN_USERNAME` and `HYPERBYTEDB__AUTH__ADMIN_PASSWORD`.
+  Each node creates the admin at startup if it is missing.
+- sends the token on its own calls (membership, decommission, leader) and in
+  the pods' drain hook.
+
+Read the admin login with
+`kubectl get secret <cluster>-auth -o jsonpath='{.data.admin-password}' | base64 -d`.
+Changing the token in the Secret takes effect as pods restart; restart them
+all together, since nodes with different tokens cannot talk to each other.
+Turning auth on for a running cluster rolls its pods once.
 
 ### `logging`
 
@@ -302,7 +328,7 @@ Tuning parameters for multi-replica cluster behavior. These only take effect whe
 | `replicationMaxCoalesceBodyBytes` | int64 | `8388608` | Max bytes for coalescing consecutive WAL batches |
 | `replicateReceiverQueueDepth` | int32 | `1024` | Bounded apply queue on the replicate receiver |
 | `replicationTruncateStalePeerMultiplier` | int64 | `2` | Omit stale peers from WAL truncate barrier |
-| `raftHeartbeatIntervalMs` | int32 | `1000` | Raft leader heartbeat interval |
+| `raftHeartbeatIntervalMs` | int32 | `300` | Raft leader heartbeat interval; must be below `raftElectionTimeoutMs` (the CRD rejects it otherwise) |
 | `raftElectionTimeoutMs` | int32 | `1000` | Raft election timeout |
 | `raftSnapshotThreshold` | int32 | `1000` | Log entries before Raft snapshot |
 | `replication.mode` | string | `async` | `async` or `sync_quorum` |
@@ -408,6 +434,33 @@ kubectl get hyperbytedbcluster hyperbytedb-cluster -o jsonpath='{.status}' | jq
 ```
 
 ---
+
+## Annotations and versions
+
+Opt-in behaviour is set with annotations on the `HyperbytedbCluster`:
+
+| Annotation | Effect | HyperbyteDB |
+|---|---|---|
+| `hyperbytedb.hyperbyte.cloud/parallel-pods: "true"` | `Parallel` pod management: pods start and restart together (the operator recreates the StatefulSet once, keeping the pods). Recommended for clusters; under `OrderedReady` a scale-down can leave a deleted pod uncreated. | any |
+| `hyperbytedb.hyperbyte.cloud/evacuate-together: "true"` | A scale-down decommissions every departing node at once instead of one at a time. | 0.9.0-beta+ |
+| `hyperbytedb.hyperbyte.cloud/control-listener: "true"` | Liveness and Raft on a separate listener (server port + 1), so a write-saturated node still answers. | 0.9.0-beta+ |
+| `hyperbytedb.hyperbyte.cloud/database-version: "<version>"` | The HyperbyteDB version to render for, when neither `version` nor the image tag is one (a locally built image, say). | any |
+
+**Versions.** The operator (v0.2.0 and later) works out which HyperbyteDB
+version each cluster runs (the `database-version` annotation, else `version`,
+else the image tag; if none is a version, the newest it knows) and renders
+only what that version accepts: HyperbyteDB 0.9 rejects config keys it does
+not know, and 0.8 silently ignores them. On 0.8.x it writes `pool_size`
+only, no `[sharding]` section, and ignores the `evacuate-together` and
+`control-listener` annotations. The `DatabaseVersion` status condition says
+which version was used, where it came from, and what was left out:
+
+```bash
+kubectl get hyperbytedbcluster my-cluster \
+  -o jsonpath='{.status.conditions[?(@.type=="DatabaseVersion")].message}'
+```
+
+The full matrix is in the operator repository's `docs/compatibility.md`.
 
 ## Operations
 

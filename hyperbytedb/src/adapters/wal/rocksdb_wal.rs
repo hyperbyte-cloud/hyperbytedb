@@ -17,6 +17,10 @@ use crate::ports::wal::{WalAppendBundle, WalEntry, WalFormat, WalPort};
 const WAL_CF: &str = "wal";
 const WAL_META_CF: &str = "wal_meta";
 const LAST_SEQ_KEY: &[u8] = b"last_seq";
+/// Encoded bytes one `read_range` call may decode. Entries expand several-fold
+/// once decoded, so an entry-count limit alone let a restart's first flush
+/// decode thousands of large write batches at once and OOM the pod.
+const READ_MAX_BYTES: usize = 32 << 20;
 
 fn u64_to_be_bytes(n: u64) -> [u8; 8] {
     n.to_be_bytes()
@@ -31,6 +35,10 @@ fn be_bytes_to_u64(bytes: &[u8]) -> u64 {
 pub struct RocksDbWal {
     db: Arc<DB>,
     seq: Arc<AtomicU64>,
+    flushed_through: AtomicU64,
+    /// `(seq, encoded bytes)` of entries written by this process and not yet
+    /// truncated, oldest first: what a byte-bounded margin is measured in.
+    sizes: Arc<std::sync::Mutex<std::collections::VecDeque<(u64, u64)>>>,
     arrow_cache: Arc<WalArrowCache>,
     wal_format: WalFormat,
     arrow_wal_enabled: bool,
@@ -90,13 +98,14 @@ impl RocksDbWal {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
+        // Compressed, though WAL entries live only until the next flush: the
+        // bytes written are what a node is bound by on a shared disk. With
+        // no compression (ec65682, to save the ~9% of CPU ZSTD compaction
+        // took) n3's NVMe ran 69-75% busy at 490-540 MB/s for 6 nodes and
+        // writes fell to 0.72-1.02M points/s with ~1M forwards refused at
+        // capacity per run; compressed, 32-34% busy at 320-340 MB/s and
+        // 1.47-1.51M points/s (interleaved A/B, fresh 6-node clusters).
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-        // Bottommost level is rewritten by leveled compaction once L0/L1
-        // pressure clears; using zstd there gives us ~2x the compression
-        // ratio of LZ4 at the cost of CPU we have available off the hot
-        // write path. WAL data is short-lived, so this only matters
-        // during sustained backlog scenarios where compaction has time
-        // to rewrite SSTs into the bottommost level.
         opts.set_bottommost_compression_type(rocksdb::DBCompressionType::Zstd);
         opts.set_block_based_table_factory(&block_opts);
         // 64 MiB memtable × 4 = 256 MiB worst-case footprint. The bigger
@@ -205,6 +214,8 @@ impl RocksDbWal {
         Ok(Self {
             db,
             seq: Arc::new(AtomicU64::new(seq)),
+            flushed_through: AtomicU64::new(0),
+            sizes: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             arrow_cache: Arc::new(WalArrowCache::new()),
             wal_format: options.wal_format,
             arrow_wal_enabled: options.arrow_wal_enabled,
@@ -230,10 +241,29 @@ impl RocksDbWal {
     /// layout first; on failure we decode the legacy 3-field shape, append
     /// `origin_node_id: 0`, re-serialize, and overwrite the key in-place.
     /// After this runs every entry matches the current schema.
+    ///
+    /// Only the oldest entry is checked before scanning: the format only moves
+    /// forward, so if it is current, so is everything after it. Scanning and
+    /// decoding every entry on every open took longer than the 10-minute
+    /// startup probe on n3 (a 72 GB WAL), and the pod restarted forever.
     fn migrate_legacy_entries(db: &DB) -> Result<(), HyperbytedbError> {
         let wal_cf = db
             .cf_handle(WAL_CF)
             .ok_or_else(|| HyperbytedbError::Wal("wal column family not found".into()))?;
+        let current = |value: &[u8]| {
+            (value.len() >= 4 && &value[..4] == b"HBWA")
+                || bincode::deserialize::<WalEntry>(value).is_ok()
+        };
+        match db.iterator_cf(&wal_cf, IteratorMode::Start).next() {
+            None => return Ok(()),
+            Some(Ok((_, value))) if current(&value) => return Ok(()),
+            Some(Err(e)) => {
+                return Err(HyperbytedbError::Wal(
+                    crate::error::ChainedError::from_error(e),
+                ));
+            }
+            Some(Ok(_)) => {}
+        }
 
         #[derive(serde::Deserialize)]
         struct LegacyWalEntry {
@@ -255,10 +285,7 @@ impl RocksDbWal {
             let (key, value) =
                 item.map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
 
-            if bincode::deserialize::<WalEntry>(&value).is_ok() {
-                continue;
-            }
-            if value.len() >= 4 && &value[..4] == b"HBWA" {
+            if current(&value) {
                 continue;
             }
 
@@ -332,6 +359,7 @@ impl RocksDbWal {
         write_bundle_batch(
             &self.db,
             &self.seq,
+            &self.sizes,
             &self.arrow_cache,
             self.wal_format,
             self.arrow_wal_enabled,
@@ -341,9 +369,13 @@ impl RocksDbWal {
     }
 }
 
+type EntrySizes = std::sync::Mutex<std::collections::VecDeque<(u64, u64)>>;
+
+#[allow(clippy::too_many_arguments)]
 fn write_bundle_batch(
     db: &DB,
     seq: &Arc<AtomicU64>,
+    sizes: &EntrySizes,
     arrow_cache: &WalArrowCache,
     wal_format: WalFormat,
     arrow_wal_enabled: bool,
@@ -362,6 +394,7 @@ fn write_bundle_batch(
 
     let mut wb = WriteBatch::default();
     let mut seqs = Vec::with_capacity(bundles.len());
+    let mut lens = Vec::with_capacity(bundles.len());
     let mut prepared_slots = Vec::with_capacity(bundles.len());
 
     for (i, bundle) in bundles.iter_mut().enumerate() {
@@ -384,6 +417,7 @@ fn write_bundle_batch(
             Some(bytes) => bytes,
             None => wal_ipc::encode_wal_value(wal_format, bundle.prepared.as_ref(), &bundle.entry)?,
         };
+        lens.push(value.len() as u64);
         wb.put_cf(&wal_cf, u64_to_be_bytes(wal_seq), value);
         seqs.push(wal_seq);
         prepared_slots.push(bundle.prepared.take());
@@ -391,6 +425,9 @@ fn write_bundle_batch(
 
     db.write(wb)
         .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
+    if let Ok(mut sizes) = sizes.lock() {
+        sizes.extend(seqs.iter().copied().zip(lens));
+    }
 
     if arrow_wal_enabled {
         for (wal_seq, slot) in seqs.iter().zip(prepared_slots) {
@@ -416,6 +453,7 @@ impl WalPort for RocksDbWal {
     async fn append_bundle(&self, bundle: WalAppendBundle) -> Result<u64, HyperbytedbError> {
         let db = Arc::clone(&self.db);
         let seq = Arc::clone(&self.seq);
+        let sizes = Arc::clone(&self.sizes);
         let arrow_cache = Arc::clone(&self.arrow_cache);
         let wal_format = self.wal_format;
         let arrow_wal_enabled = self.arrow_wal_enabled;
@@ -424,6 +462,7 @@ impl WalPort for RocksDbWal {
             write_bundle_batch(
                 &db,
                 &seq,
+                &sizes,
                 &arrow_cache,
                 wal_format,
                 arrow_wal_enabled,
@@ -502,13 +541,14 @@ impl WalPort for RocksDbWal {
                 .ok_or_else(|| HyperbytedbError::Wal("wal column family not found".into()))?;
 
             let mut results = Vec::new();
+            let mut read_bytes = 0usize;
             let start_key = u64_to_be_bytes(from);
             let mode = IteratorMode::From(&start_key, Direction::Forward);
 
             let iter = db.iterator_cf_opt(&wal_cf, rocksdb::ReadOptions::default(), mode);
 
             for item in iter {
-                if results.len() >= max_entries {
+                if results.len() >= max_entries || read_bytes >= READ_MAX_BYTES {
                     break;
                 }
                 let (key, value) = item.map_err(|e| {
@@ -519,6 +559,7 @@ impl WalPort for RocksDbWal {
                         format!("invalid WAL key length: expected 8, got {}", key.len()).into(),
                     ));
                 }
+                read_bytes += value.len();
                 let seq = be_bytes_to_u64(&key);
                 let (prepared, entry) = wal_ipc::decode_wal_value(wal_format, &value)?;
                 if arrow_wal_enabled && let Some(slot) = prepared {
@@ -540,6 +581,11 @@ impl WalPort for RocksDbWal {
 
     async fn truncate_before(&self, sequence: u64) -> Result<(), HyperbytedbError> {
         self.arrow_cache.truncate_before(sequence);
+        if let Ok(mut sizes) = self.sizes.lock() {
+            while sizes.front().is_some_and(|(s, _)| *s < sequence) {
+                sizes.pop_front();
+            }
+        }
         let db = self.db.clone();
         // Snapshot the high-water-mark *before* the delete so a fully-
         // truncated WAL CF can still recover the last assigned seq from
@@ -574,6 +620,31 @@ impl WalPort for RocksDbWal {
 
     async fn last_sequence(&self) -> Result<u64, HyperbytedbError> {
         Ok(self.seq.load(Ordering::Relaxed))
+    }
+
+    fn flushed_through(&self) -> u64 {
+        self.flushed_through.load(Ordering::Acquire)
+    }
+
+    fn set_flushed_through(&self, sequence: u64) {
+        self.flushed_through.store(sequence, Ordering::Release);
+    }
+
+    fn flushed_margin_start(&self, through: u64, max_bytes: u64) -> u64 {
+        let Ok(sizes) = self.sizes.lock() else {
+            return through;
+        };
+        let mut kept = 0u64;
+        let mut start = through;
+        for &(seq, len) in sizes.iter().rev().skip_while(|(s, _)| *s > through) {
+            if kept + len > max_bytes {
+                return seq;
+            }
+            kept += len;
+            start = seq.saturating_sub(1);
+        }
+        // Every entry this process wrote fits; older ones, of unknown size, go.
+        start
     }
 
     async fn flush_wal(&self) -> Result<(), HyperbytedbError> {
@@ -649,6 +720,70 @@ mod tests {
     use super::*;
     use crate::domain::point::{FieldValue, Point};
 
+    fn cpu_entry(points: usize) -> WalEntry {
+        WalEntry {
+            database: "db".into(),
+            retention_policy: "autogen".into(),
+            points: (0..points)
+                .map(|i| Point {
+                    measurement: "cpu".into(),
+                    tags: [("host".to_string(), format!("h{i}"))].into(),
+                    fields: [("v".to_string(), FieldValue::Float(1.0))].into(),
+                    timestamp: i as i64,
+                    series_id_cache: Default::default(),
+                })
+                .collect(),
+            origin_node_id: 0,
+        }
+    }
+
+    /// Opening a WAL looks at its oldest entry, not at every entry: decoding a
+    /// 72 GB WAL on open outran a pod's startup probe, so it never started.
+    /// An undecodable entry behind a current oldest one proves it: a full
+    /// scan reports it as corrupt.
+    #[tokio::test]
+    async fn opening_a_wal_does_not_decode_every_entry() {
+        let dir = TempDir::new().unwrap();
+        {
+            let wal = RocksDbWal::open(dir.path()).unwrap();
+            wal.append(cpu_entry(3)).await.unwrap();
+            let cf = wal.db.cf_handle(WAL_CF).unwrap();
+            wal.db
+                .put_cf(&cf, u64_to_be_bytes(1_000), b"not a wal entry")
+                .unwrap();
+        }
+        RocksDbWal::open(dir.path()).expect("open must not decode every entry");
+    }
+
+    /// A WAL whose oldest entry predates `origin_node_id` is still migrated.
+    #[tokio::test]
+    async fn a_legacy_wal_is_still_migrated() {
+        #[derive(serde::Serialize)]
+        struct LegacyWalEntry {
+            database: String,
+            retention_policy: String,
+            points: Vec<Point>,
+        }
+        let dir = TempDir::new().unwrap();
+        {
+            let wal = RocksDbWal::open(dir.path()).unwrap();
+            let entry = cpu_entry(2);
+            let legacy = bincode::serialize(&LegacyWalEntry {
+                database: entry.database,
+                retention_policy: entry.retention_policy,
+                points: entry.points,
+            })
+            .unwrap();
+            let cf = wal.db.cf_handle(WAL_CF).unwrap();
+            wal.db.put_cf(&cf, u64_to_be_bytes(1), legacy).unwrap();
+        }
+        let wal = RocksDbWal::open(dir.path()).unwrap();
+        let entries = wal.read_range(1, 8).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1.points.len(), 2);
+        assert_eq!(entries[0].1.origin_node_id, 0);
+    }
+
     fn seq_only_batch(n: usize) -> Arc<RecordBatch> {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "ingest_seq",
@@ -697,6 +832,7 @@ mod tests {
                 tags: BTreeMap::new(),
                 fields,
                 timestamp: 1,
+                series_id_cache: Default::default(),
             }],
             origin_node_id: 0,
         }
@@ -744,6 +880,30 @@ mod tests {
         taken
     }
 
+    /// Uncompressed WAL SSTs cost n3 ~40% of its write throughput at 6 nodes
+    /// on a shared disk; see the comment at the compression settings.
+    #[test]
+    fn the_wal_column_family_is_compressed() {
+        let tmp = TempDir::new().unwrap();
+        drop(RocksDbWal::open(tmp.path()).unwrap());
+        let options = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("OPTIONS-"))
+            .max_by_key(|e| e.file_name())
+            .map(|e| std::fs::read_to_string(e.path()).unwrap())
+            .expect("RocksDB writes an OPTIONS file");
+        let wal = options
+            .split("[CFOptions \"")
+            .find(|section| section.starts_with("wal\""))
+            .expect("wal column family section");
+        // Whole lines: "compression=..." is a substring of
+        // "bottommost_compression=...".
+        let set = |line: &str| wal.lines().any(|l| l.trim() == line);
+        assert!(set("compression=kLZ4Compression"), "{wal}");
+        assert!(set("bottommost_compression=kZSTD"), "{wal}");
+    }
+
     #[tokio::test]
     async fn bincode_slots_get_absolute_seqs_exactly_once_at_take() {
         let tmp = TempDir::new().unwrap();
@@ -764,6 +924,39 @@ mod tests {
         )
         .unwrap();
         assert_absolute_seqs(&append_and_take(&wal).await);
+    }
+
+    #[tokio::test]
+    async fn a_large_backlog_is_read_a_bounded_page_at_a_time() {
+        let tmp = TempDir::new().unwrap();
+        let wal = RocksDbWal::open(tmp.path()).unwrap();
+        // 1 MiB per entry, so the backlog is twice the per-read budget.
+        let entries = 2 * READ_MAX_BYTES / (1 << 20);
+        for _ in 0..entries {
+            let mut entry = test_entry();
+            entry.points[0]
+                .fields
+                .insert("blob".into(), FieldValue::String("x".repeat(1 << 20)));
+            wal.append(entry).await.unwrap();
+        }
+
+        let first = wal.read_range(1, usize::MAX).await.unwrap();
+        assert!(
+            !first.is_empty() && first.len() < entries,
+            "got {}",
+            first.len()
+        );
+
+        // Paging until an empty read still returns every entry exactly once.
+        let mut seen = first.len();
+        let mut next = first.last().unwrap().0 + 1;
+        loop {
+            let page = wal.read_range(next, usize::MAX).await.unwrap();
+            let Some((last, _)) = page.last() else { break };
+            next = last + 1;
+            seen += page.len();
+        }
+        assert_eq!(seen, entries);
     }
 
     #[tokio::test]

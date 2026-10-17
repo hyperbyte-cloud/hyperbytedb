@@ -9,7 +9,7 @@ use super::aggregates::{
     expr_contains_aggregate, expr_contains_raw_transform, translate_aggregate_call,
     translate_binary_expr,
 };
-use super::coalesce::build_coalesced_fact_view;
+use super::coalesce::build_coalesced_fact_view_filtered;
 use super::conditions::{
     format_float, nanos_to_ch_timestamp, quote_identifier, quote_phys_identifier, quote_string,
     translate_expr,
@@ -25,6 +25,21 @@ pub fn translate_native_table(
     translate_inner(stmt, table_source, mapping, series, time_bounds)
 }
 
+/// [`translate_native_table`] without ORDER BY, for a sharded region's
+/// partial when the coordinator sorts (and fills) the merged result. Sorting
+/// ~35k region rows by tag and time was half of each region query on n3.
+/// The caller must have removed fill and any region LIMIT, which need the
+/// order.
+pub fn translate_native_table_unordered(
+    stmt: &SelectStatement,
+    table_source: &str,
+    mapping: Option<&ColumnMapping>,
+    series: Option<SeriesJoin<'_>>,
+    time_bounds: Option<(Option<i64>, Option<i64>)>,
+) -> Result<String, HyperbytedbError> {
+    translate_inner_ordered(stmt, table_source, mapping, series, time_bounds, false)
+}
+
 pub(super) fn translate_inner(
     stmt: &SelectStatement,
     from_source: &str,
@@ -32,6 +47,21 @@ pub(super) fn translate_inner(
     series: Option<SeriesJoin<'_>>,
     time_bounds: Option<(Option<i64>, Option<i64>)>,
 ) -> Result<String, HyperbytedbError> {
+    translate_inner_ordered(stmt, from_source, mapping, series, time_bounds, true)
+}
+
+fn translate_inner_ordered(
+    stmt: &SelectStatement,
+    from_source: &str,
+    mapping: Option<&ColumnMapping>,
+    series: Option<SeriesJoin<'_>>,
+    time_bounds: Option<(Option<i64>, Option<i64>)>,
+    ordered: bool,
+) -> Result<String, HyperbytedbError> {
+    // Every computed column gets its InfluxQL name before anything reads it,
+    // so `mean(a), mean(b)` is `mean`, `mean_1` in the SQL and the merge alike.
+    let named = with_output_names(stmt);
+    let stmt = &named;
     let mut out = String::new();
 
     // InfluxQL treats a GROUP BY time() query without an explicit fill() as
@@ -117,6 +147,11 @@ pub(super) fn translate_inner(
     if projects_point_time {
         select_parts.insert(0, quote_phys_identifier("time"));
     }
+    // A lone selector reports the selected point's own time, like InfluxDB;
+    // other aggregates without GROUP BY time() get theirs from the caller.
+    if !has_group_by_time && let Some(point_time) = lone_selector_time_sql(stmt, mapping)? {
+        select_parts.insert(0, format!("{point_time} AS __time"));
+    }
 
     let field_strs: Vec<String> = stmt
         .fields
@@ -135,11 +170,11 @@ pub(super) fn translate_inner(
     write!(out, "{}", select_parts.join(", "))?;
 
     // FROM <source> — wrapped in the tag-rejoin inline view when needed.
-    let from = build_from_source(from_source, series, mapping, stmt);
-    write!(out, "\nFROM {}", from)?;
+    let source = build_from_source(from_source, series, mapping, stmt);
+    write!(out, "\nFROM {}", source.from)?;
 
     // WHERE
-    if let Some(ref cond) = stmt.condition {
+    if let Some(ref cond) = source.outer_condition {
         write!(out, "\nWHERE ")?;
         translate_expr(cond, &mut out, true, mapping)?;
     }
@@ -185,10 +220,10 @@ pub(super) fn translate_inner(
     // to sort on: GROUP BY time() buckets, raw per-point selects (incl. `*`), or
     // bare window transforms (which are per-point and project raw `time`).
     // Aggregates without GROUP BY time() collapse to one row and need no ordering.
-    let has_orderable_time =
-        time_col.is_some() || (!has_aggregate && !has_group_by_time) || projects_point_time;
+    let has_orderable_time = ordered
+        && (time_col.is_some() || (!has_aggregate && !has_group_by_time) || projects_point_time);
     let time_desc = stmt.order_by.as_ref().is_some_and(|o| o.time_desc);
-    let do_fill = needs_with_fill && time_col.is_some();
+    let do_fill = ordered && needs_with_fill && time_col.is_some();
     // ClickHouse WITH FILL on a DESC-ordered column never matches the ascending
     // FROM/TO anchors we emit, so no fill rows are generated. Fill ascending in
     // this (inner) SELECT and re-order descending in a wrapper below.
@@ -409,18 +444,45 @@ pub(super) fn build_from_source(
     series: Option<SeriesJoin<'_>>,
     mapping: Option<&ColumnMapping>,
     stmt: &SelectStatement,
-) -> String {
+) -> FromSource {
+    let pushed = mapping.map(|m| pushdown_filter(stmt, m, series.as_ref()));
+    let unchanged = |from: String| FromSource {
+        from,
+        outer_condition: stmt.condition.clone(),
+    };
     let fact = match mapping {
-        Some(m) => {
-            build_coalesced_fact_view(&QuotedTableName::new_quoted(fact_table.to_string()), m)
-        }
+        Some(m) => build_coalesced_fact_view_filtered(
+            &QuotedTableName::new_quoted(fact_table.to_string()),
+            m,
+            pushed.as_ref().and_then(|p| p.fact.as_deref()),
+        ),
         None => fact_table.to_string(),
     };
     let (Some(sj), Some(m)) = (series, mapping) else {
-        return fact;
+        return unchanged(fact);
     };
     if !sj.force && !query_references_tag(stmt, m) {
-        return fact;
+        return unchanged(fact);
+    }
+    // Every tag the query uses was pushed into the fact filter as a series
+    // lookup, and none is output or grouped by: the join would only add
+    // columns nobody reads. On n3 data it was 20 of a one-series last()'s
+    // 33 ms. The pushed terms leave the outer WHERE with it, since their
+    // columns are not there; the series lookup already applied them exactly.
+    if let Some(p) = pushed.as_ref().filter(|p| !p.tag_terms.is_empty())
+        && !sj.force
+        && !output_references_tag(stmt, m)
+    {
+        let remaining = condition_without_terms(stmt.condition.as_ref(), &p.tag_terms);
+        if !remaining
+            .as_ref()
+            .is_some_and(|c| expr_references_tag(c, m))
+        {
+            return FromSource {
+                from: fact,
+                outer_condition: remaining,
+            };
+        }
     }
     let mut tag_cols: Vec<String> = m
         .tag_keys
@@ -428,7 +490,7 @@ pub(super) fn build_from_source(
         .map(|t| m.physical_tag_column_name(t))
         .collect();
     if tag_cols.is_empty() {
-        return fact;
+        return unchanged(fact);
     }
     // Only project tag columns that actually exist in the series table.
     // MV destinations may have a subset of source tags (GROUP BY columns only).
@@ -436,7 +498,7 @@ pub(super) fn build_from_source(
         tag_cols.retain(|c| sj.tag_columns.contains(c));
     }
     if tag_cols.is_empty() {
-        return fact;
+        return unchanged(fact);
     }
     tag_cols.sort();
     let projected = tag_cols
@@ -444,11 +506,218 @@ pub(super) fn build_from_source(
         .map(|c| format!("s.{}", quote_phys_identifier(c)))
         .collect::<Vec<_>>()
         .join(", ");
-    format!(
-        "(SELECT t.*, {projected} FROM {fact} AS t ANY LEFT JOIN {series} AS s ON t.`series_id` = s.`series_id`)",
-        series = sj.table,
-    )
+    // With a tag selector pushed, every result row satisfies it, so the join
+    // needs only the selected series. Joining the whole series table built a
+    // hash of every series on the node for each region query: ~110 ms of CPU
+    // for a one-series last() on n3.
+    let series_side = match pushed.as_ref().and_then(|p| p.series.as_deref()) {
+        Some(selector) => format!("(SELECT * FROM {} WHERE {selector})", sj.table),
+        None => sj.table.to_string(),
+    };
+    unchanged(format!(
+        "(SELECT t.*, {projected} FROM {fact} AS t ANY LEFT JOIN {series_side} AS s ON t.`series_id` = s.`series_id`)",
+    ))
 }
+
+/// The FROM source and the condition the outer WHERE should apply to it.
+pub(super) struct FromSource {
+    pub from: String,
+    pub outer_condition: Option<Expr>,
+}
+
+/// Whether the query outputs or groups by a tag (`SELECT *` includes tags).
+fn output_references_tag(stmt: &SelectStatement, m: &ColumnMapping) -> bool {
+    stmt.group_by
+        .as_ref()
+        .is_some_and(|gb| gb.references_tags())
+        || stmt.fields.iter().any(|f| {
+            matches!(f.expr, Expr::Star | Expr::Wildcard) || expr_references_tag(&f.expr, m)
+        })
+}
+
+/// `cond` without its top-level AND terms at `drop` (indices in
+/// [`and_terms`] order), or None when nothing is left.
+fn condition_without_terms(cond: Option<&Expr>, drop: &[usize]) -> Option<Expr> {
+    let mut terms = Vec::new();
+    and_terms(cond?, &mut terms);
+    terms
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !drop.contains(i))
+        .map(|(_, t)| t.clone())
+        .reduce(|left, right| {
+            Expr::BinaryExpr(Box::new(BinaryExpr {
+                left,
+                op: BinaryOp::And,
+                right,
+            }))
+        })
+}
+
+/// Filters [`pushdown_filter`] moves ahead of the coalesce and the join.
+struct Pushdown {
+    /// For the fact rows, before they are grouped.
+    fact: Option<String>,
+    /// The pushed tag selectors, for the series table.
+    series: Option<String>,
+    /// Indices (in [`and_terms`] order) of the condition terms the series
+    /// lookup applies exactly.
+    tag_terms: Vec<usize>,
+}
+/// The part of the WHERE clause that can run on fact rows before they are
+/// coalesced: top-level AND terms on `time` alone, and tag selectors (see
+/// [`tag_selector`]), turned into a `series_id` lookup in the series table.
+///
+/// Without this every query coalesced the whole fact table and joined every
+/// series before applying its WHERE: one series' `last` took as long as a
+/// count over 90M points (~1.2 s on n3). The outer WHERE still applies in
+/// full, so pushing a subset of terms never changes the result. Only
+/// selectors that cannot match '' are pushed: a fact row whose series row is
+/// missing reads its tags as '' through the LEFT JOIN, which `host = ''` or
+/// `host != 'x'` would match but a series-table lookup would not.
+fn pushdown_filter(
+    stmt: &SelectStatement,
+    m: &ColumnMapping,
+    series: Option<&SeriesJoin<'_>>,
+) -> Pushdown {
+    let Some(cond) = stmt.condition.as_ref() else {
+        return Pushdown {
+            fact: None,
+            series: None,
+            tag_terms: Vec::new(),
+        };
+    };
+    let mut terms = Vec::new();
+    and_terms(cond, &mut terms);
+    let mut time_parts = Vec::new();
+    let mut tag_parts = Vec::new();
+    let mut tag_terms = Vec::new();
+    for (index, term) in terms.into_iter().enumerate() {
+        let mut sql = String::new();
+        if is_time_only_comparison(term) {
+            if translate_expr(term, &mut sql, true, Some(m)).is_ok() {
+                time_parts.push(sql);
+            }
+        } else if let Some(sj) = series {
+            let mut tags = Vec::new();
+            if tag_selector(term, m, &mut tags)
+                && tags.iter().all(|t| {
+                    sj.tag_columns.is_empty()
+                        || sj.tag_columns.contains(&m.physical_tag_column_name(t))
+                })
+                && translate_expr(term, &mut sql, true, Some(m)).is_ok()
+            {
+                tag_parts.push(sql);
+                tag_terms.push(index);
+            }
+        }
+    }
+    let selector = (!tag_parts.is_empty()).then(|| tag_parts.join(" AND "));
+    if let (Some(sj), Some(sel)) = (series, &selector) {
+        time_parts.push(format!(
+            "`series_id` IN (SELECT `series_id` FROM {} WHERE {sel})",
+            sj.table
+        ));
+    }
+    Pushdown {
+        fact: (!time_parts.is_empty()).then(|| time_parts.join(" AND ")),
+        series: selector,
+        tag_terms,
+    }
+}
+
+/// Flatten top-level `AND`s into their terms.
+fn and_terms<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
+    match e {
+        Expr::BinaryExpr(be) if be.op == BinaryOp::And => {
+            and_terms(&be.left, out);
+            and_terms(&be.right, out);
+        }
+        other => out.push(other),
+    }
+}
+
+/// A comparison whose only column is `time`, e.g. `time >= now() - 1h`.
+fn is_time_only_comparison(e: &Expr) -> bool {
+    fn constant_or_time(e: &Expr, saw_time: &mut bool) -> bool {
+        match e {
+            Expr::Identifier(n) | Expr::FieldRef { name: n, .. } => {
+                let is_time = n.eq_ignore_ascii_case("time");
+                *saw_time |= is_time;
+                is_time
+            }
+            Expr::StringLiteral(_)
+            | Expr::IntegerLiteral(_)
+            | Expr::FloatLiteral(_)
+            | Expr::DurationLiteral(_)
+            | Expr::TimeLiteral(_)
+            | Expr::Now => true,
+            Expr::UnaryExpr(UnaryOp::Neg, inner) => constant_or_time(inner, saw_time),
+            Expr::BinaryExpr(be) if matches!(be.op, BinaryOp::Add | BinaryOp::Sub) => {
+                constant_or_time(&be.left, saw_time) && constant_or_time(&be.right, saw_time)
+            }
+            _ => false,
+        }
+    }
+    let Expr::BinaryExpr(be) = e else {
+        return false;
+    };
+    if !matches!(
+        be.op,
+        BinaryOp::Eq | BinaryOp::Lt | BinaryOp::Lte | BinaryOp::Gt | BinaryOp::Gte
+    ) {
+        return false;
+    }
+    let mut saw_time = false;
+    constant_or_time(&be.left, &mut saw_time)
+        && constant_or_time(&be.right, &mut saw_time)
+        && saw_time
+}
+
+/// Whether `e` selects series by tag values alone, matching no series whose
+/// tags are all '' (how a fact row with a missing series row reads through
+/// the LEFT JOIN): `tag = '<non-empty>'`, `tag =~ /re/` for a regex that
+/// cannot match '', or an OR of those. Grafana's multi-value variables send
+/// `host =~ /^(a|b|c)$/`. Pushes the names of the tags involved onto `tags`.
+fn tag_selector<'e>(e: &'e Expr, m: &ColumnMapping, tags: &mut Vec<&'e str>) -> bool {
+    let Expr::BinaryExpr(be) = e else {
+        return false;
+    };
+    let tag_name = |x: &'e Expr| match x {
+        Expr::Identifier(n)
+        | Expr::FieldRef {
+            name: n,
+            typ: None | Some(FieldType::Tag),
+        } if m.tag_keys.contains(n) && !m.field_names.contains(n) => Some(n.as_str()),
+        _ => None,
+    };
+    match be.op {
+        BinaryOp::Or => tag_selector(&be.left, m, tags) && tag_selector(&be.right, m, tags),
+        BinaryOp::Eq => {
+            let non_empty = |x: &Expr| matches!(x, Expr::StringLiteral(v) if !v.is_empty());
+            let tag = match (tag_name(&be.left), tag_name(&be.right)) {
+                (Some(t), None) if non_empty(&be.right) => t,
+                (None, Some(t)) if non_empty(&be.left) => t,
+                _ => return false,
+            };
+            tags.push(tag);
+            true
+        }
+        BinaryOp::RegexMatch => {
+            let (Some(tag), Expr::Regex(pattern)) = (tag_name(&be.left), &be.right) else {
+                return false;
+            };
+            // Unparseable here: do not risk it.
+            if !regex::Regex::new(pattern).is_ok_and(|r| !r.is_match("")) {
+                return false;
+            }
+            tags.push(tag);
+            true
+        }
+        _ => false,
+    }
+}
+
 pub(super) fn group_by_tag_sql(
     tag: &str,
     mapping: Option<&ColumnMapping>,
@@ -537,23 +806,139 @@ pub fn select_output_field_name(field: &Field) -> Option<String> {
         .or_else(|| default_field_alias(&field.expr))
 }
 
-/// Generate a default column alias matching InfluxDB conventions.
-/// Single-arg aggregates include the field name for uniqueness:
-/// `mean("usage_idle")` → `"mean_usage_idle"`, `count("x")` → `"count_x"`.
-/// No-arg calls use just the function name: `count()` → `"count"`.
-/// Non-call expressions get no alias.
+/// InfluxQL's name for a field without an alias (`Field.Name()` in InfluxDB):
+/// a call is named after its function (`mean("v")` → `mean`), an expression
+/// after the fields and calls in it joined by `_` (`"a" + "b"` → `a_b`,
+/// `mean("v") * 2` → `mean`), a field reference after the field.
+///
+/// A bare field reference gets no alias: its column already has that name.
 pub(super) fn default_field_alias(expr: &Expr) -> Option<String> {
+    if matches!(expr, Expr::Identifier(_) | Expr::FieldRef { .. }) {
+        return None;
+    }
+    influxql_name(expr)
+}
+
+fn influxql_name(expr: &Expr) -> Option<String> {
+    let mut names = Vec::new();
+    expr_name_parts(expr, &mut names);
+    (!names.is_empty()).then(|| names.join("_"))
+}
+
+fn expr_name_parts(expr: &Expr, names: &mut Vec<String>) {
+    match expr {
+        Expr::Call(func) => names.push(func.name.to_lowercase()),
+        Expr::Identifier(name) | Expr::FieldRef { name, .. } => names.push(name.clone()),
+        Expr::BinaryExpr(be) => {
+            expr_name_parts(&be.left, names);
+            expr_name_parts(&be.right, names);
+        }
+        Expr::UnaryExpr(_, inner) => expr_name_parts(inner, names),
+        _ => {}
+    }
+}
+
+/// The pre-InfluxQL default column name: `mean("v")` → `mean_v`. Only for
+/// materialized views stored before aliases were required, whose columns were
+/// created under these names.
+#[must_use]
+pub fn legacy_field_alias(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Call(func) => {
             let base = func.name.to_lowercase();
             if let Some(Expr::Identifier(field_name)) = func.args.first() {
-                Some(format!("{}_{}", base, field_name))
+                Some(format!("{base}_{field_name}"))
             } else {
                 Some(base)
             }
         }
         _ => None,
     }
+}
+
+/// `stmt` with InfluxQL column names on every computed field, as InfluxDB's
+/// `SelectStatement.ColumnNames`: aliases are kept; other fields take their
+/// default name, and a name already taken gets `_1`, `_2`, ...
+///
+/// Plain field references keep no alias (their column is the field itself)
+/// but still take their name. Idempotent.
+#[must_use]
+pub fn with_output_names(stmt: &SelectStatement) -> SelectStatement {
+    let mut out = stmt.clone();
+    let mut taken: std::collections::HashMap<String, usize> = out
+        .fields
+        .iter()
+        .filter_map(|f| f.alias.clone())
+        .map(|a| (a, 1))
+        .collect();
+    for field in &mut out.fields {
+        if field.alias.is_some() {
+            continue;
+        }
+        let Some(name) = influxql_name(&field.expr) else {
+            continue;
+        };
+        let plain = matches!(field.expr, Expr::Identifier(_) | Expr::FieldRef { .. });
+        let resolved = match taken.get(&name).copied() {
+            None => name.clone(),
+            Some(mut n) => loop {
+                let candidate = format!("{name}_{n}");
+                if !taken.contains_key(&candidate) {
+                    taken.insert(name.clone(), n + 1);
+                    break candidate;
+                }
+                n += 1;
+            },
+        };
+        *taken.entry(resolved.clone()).or_insert(0) += 1;
+        if !plain || resolved != name {
+            field.alias = Some(resolved);
+        }
+    }
+    out
+}
+
+/// Selectors whose result is one stored point, so InfluxDB reports its time.
+fn point_selector(name: &str) -> bool {
+    matches!(
+        name.to_uppercase().as_str(),
+        "FIRST" | "LAST" | "MAX" | "MIN"
+    )
+}
+
+/// The selected point's time for a statement whose only call is a bare
+/// FIRST/LAST/MAX/MIN, or None.
+fn lone_selector_time_sql(
+    stmt: &SelectStatement,
+    mapping: Option<&ColumnMapping>,
+) -> Result<Option<String>, HyperbytedbError> {
+    let calls: Vec<&FunctionCall> = stmt
+        .fields
+        .iter()
+        .filter(|f| expr_contains_call(&f.expr))
+        .filter_map(|f| match &f.expr {
+            Expr::Call(c) => Some(c),
+            _ => None,
+        })
+        .collect();
+    let call_fields = stmt
+        .fields
+        .iter()
+        .filter(|f| expr_contains_call(&f.expr))
+        .count();
+    let [func] = calls.as_slice() else {
+        return Ok(None);
+    };
+    if call_fields != 1 || !point_selector(&func.name) || func.args.len() != 1 {
+        return Ok(None);
+    }
+    let arg = super::aggregates::translate_aggregate_arg(&func.args[0], mapping)?;
+    Ok(Some(match func.name.to_uppercase().as_str() {
+        "FIRST" => "min(time)".to_string(),
+        "LAST" => "max(time)".to_string(),
+        "MAX" => format!("argMax(time, {arg})"),
+        _ => format!("argMin(time, {arg})"),
+    }))
 }
 
 /// Whether an expression tree contains a function call (aggregate, selector, or

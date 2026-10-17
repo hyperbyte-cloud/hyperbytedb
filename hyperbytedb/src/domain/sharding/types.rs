@@ -23,6 +23,53 @@ impl ShardEpoch {
             ..self
         }
     }
+
+    /// True when `self` is an earlier state of the region that `other`
+    /// describes: no counter ahead and at least one behind. A node whose map
+    /// has not applied the latest op yet holds such an epoch.
+    #[must_use]
+    pub fn is_behind(self, other: Self) -> bool {
+        self != other && self.conf_ver <= other.conf_ver && self.version <= other.version
+    }
+}
+
+#[cfg(test)]
+mod epoch_tests {
+    use super::ShardEpoch;
+
+    #[test]
+    fn an_epoch_is_behind_only_a_strictly_later_one() {
+        let e = |conf_ver, version| ShardEpoch { conf_ver, version };
+        assert!(e(1, 0).is_behind(e(2, 0)));
+        assert!(e(1, 0).is_behind(e(1, 1)));
+        assert!(!e(1, 0).is_behind(e(1, 0)), "equal is not behind");
+        assert!(!e(2, 0).is_behind(e(1, 0)), "ahead is not behind");
+        assert!(!e(2, 0).is_behind(e(1, 1)), "diverged is not behind");
+    }
+}
+
+/// Whether a region may serve reads and writes.
+///
+/// A split creates its child `Staging`: the region exists in the map with a
+/// primary and peers and is being filled, but the donor still physically holds
+/// its rows, so readers must not be sent to it. Publishing a child before its
+/// data has moved is not a slow answer -- a scatter read returns zero rows
+/// *successfully*, and nothing in the read path can tell that from a correct
+/// empty result.
+///
+/// Cutover flips the child to `Serving` in one committed op, which every
+/// node's location cache applies atomically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegionState {
+    /// Routable. The default, so every region in an already-serialized map
+    /// deserializes as serving -- which is correct: anything published today
+    /// is serving.
+    #[default]
+    Serving,
+    /// Present in the map but not routable; reads and writes for its range go
+    /// to [`ShardRegion::staged_from`] until cutover.
+    Staging,
 }
 
 /// Contiguous `[start, end)` range over `series_id` for one measurement.
@@ -50,9 +97,45 @@ pub struct ShardRegion {
     /// be reset by failover.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transfer_first_seen: Option<i64>,
+    /// Whether this region may serve reads and writes. See [`RegionState`].
+    #[serde(default)]
+    pub state: RegionState,
+    /// While [`Self::state`] is `Staging`, the region whose primary still holds
+    /// this range and must serve it. Cleared at cutover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_from: Option<u64>,
+    /// Members of [`Self::peers`] that must NOT serve reads yet.
+    ///
+    /// The learner set. A peer is committed into `peers` BEFORE its data is
+    /// copied, so replication starts flowing to it immediately and no write can
+    /// slip through the gap -- this is TiKV's `AddLearner` ordering. Until it is
+    /// promoted it must not answer reads, because it holds only a prefix of the
+    /// range and scatter cannot tell a partial answer from a correct one.
+    ///
+    /// Copying first and committing afterwards (the obvious alternative) leaves
+    /// exactly that gap: writes landing between the snapshot and the commit
+    /// reach the primary alone, and a later primary transfer strands them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub staging_peers: Vec<u64>,
 }
 
 impl ShardRegion {
+    /// True when this region may be routed to.
+    #[must_use]
+    pub fn is_serving(&self) -> bool {
+        matches!(self.state, RegionState::Serving)
+    }
+
+    /// True when `peer` is a member that may serve reads.
+    ///
+    /// A learner in [`Self::staging_peers`] is a member -- it receives
+    /// replicated writes -- but holds only a prefix of the range until its
+    /// copy finishes, so it must not answer.
+    #[must_use]
+    pub fn is_serving_peer(&self, peer: u64) -> bool {
+        self.peers.contains(&peer) && !self.staging_peers.contains(&peer)
+    }
+
     pub fn contains(&self, series_id: u64) -> bool {
         series_id >= self.start && series_id < self.end
     }
@@ -217,6 +300,20 @@ impl From<&ShardMap> for ShardMapJson {
     }
 }
 
+impl From<ShardMapJson> for ShardMap {
+    fn from(json: ShardMapJson) -> Self {
+        let mut spaces = HashMap::new();
+        for space in json.spaces {
+            spaces.insert(space.key.clone(), space);
+        }
+        Self {
+            map_version: json.map_version,
+            next_region_id: json.next_region_id,
+            spaces,
+        }
+    }
+}
+
 #[cfg(test)]
 mod locate_tests {
     use super::*;
@@ -232,6 +329,9 @@ mod locate_tests {
             last_split_at: 0,
             transfer_verified: None,
             transfer_first_seen: None,
+            state: Default::default(),
+            staged_from: None,
+            staging_peers: Vec::new(),
         }
     }
 
@@ -274,6 +374,22 @@ mod locate_tests {
     }
 }
 
+/// Header on region heartbeats listing what the reporting build supports.
+/// A header, not a heartbeat field: `RegionHeartbeat` refuses unknown fields,
+/// so a leader on an older build would have rejected every report.
+pub const NODE_FEATURES_HEADER: &str = "x-hyperbytedb-features";
+/// The node applies a `Merge` whose two regions are at different epochs
+/// (`right_epoch`). Proposed only once every node reports it: an older node
+/// would refuse such a merge that the others apply.
+pub const FEATURE_CROSS_EPOCH_MERGE: &str = "cross-epoch-merge";
+
+/// Request header asking `/internal/shard/rehome` to stream progress: a
+/// newline every few seconds while copying, then the result JSON with its
+/// status in `"status"`. A header, not a body field, because the request is
+/// `deny_unknown_fields` and an older node would refuse the whole request;
+/// an older node ignores the header and answers as before.
+pub const REHOME_PROGRESS_HEADER: &str = "x-hyperbytedb-rehome-progress";
+
 /// Per-region stats reported by store nodes to the Raft leader (PD-lite).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -287,6 +403,14 @@ pub struct RegionHeartbeat {
     pub write_qps: u64,
     #[serde(default)]
     pub epoch: ShardEpoch,
+    /// The reporter's median series id in the region, sent only once the
+    /// region is big enough to split. The leader used its OWN index for this,
+    /// which is complete only where the leader is a region peer; elsewhere
+    /// it held a skewed handful of series, the "median" landed just above the
+    /// range start, and a region split into dozens of near-empty slivers
+    /// while the heavy half kept every series (seen at N=6 on n3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_key_hint: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -298,6 +422,37 @@ pub struct ShardWriteRequest {
     pub epoch: ShardEpoch,
     pub region_id: u64,
     pub body: Vec<u8>,
+}
+
+/// Several regions' forwarded writes for one primary node, in one request.
+///
+/// Forwarding one request per region made the cost of a client batch grow
+/// with the region count: at 32 regions a 1,000-point batch became ~30
+/// forwards of ~30 points, and six saturated nodes managed 21k points/s. One
+/// request per destination node bounds the fan-out at N-1 whatever the
+/// region count. Nothing waits to fill a batch: it is one client write,
+/// grouped. Sent bincode-encoded to `/internal/shard/write-batch`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShardWriteBatch {
+    pub parts: Vec<ShardWriteRequest>,
+}
+
+/// The outcome of one part of a [`ShardWriteBatch`]: the HTTP status the
+/// single-region endpoint would have returned for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShardWritePartResult {
+    pub region_id: u64,
+    pub status: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShardWriteBatchResponse {
+    pub results: Vec<ShardWritePartResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -321,6 +476,11 @@ pub struct ShardQueryRequest {
     pub series_id_start: u64,
     pub series_id_end: u64,
     pub select_sql: String,
+    /// Run on this node's local tables without the region checks: a
+    /// materialized view destination's partials are per node, not per
+    /// region. Omitted when false, so older nodes still accept the rest.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub node_local: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -338,8 +498,13 @@ pub struct ShardMetadataRequest {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ShardMetadataKind {
     TagKeys,
-    TagValues { tag_key: String },
+    TagValues {
+        tag_key: String,
+    },
     Series,
+    FieldKeys,
+    /// The whole `MeasurementMeta`, or null when the node has none.
+    Measurement,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

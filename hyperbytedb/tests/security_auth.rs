@@ -33,6 +33,13 @@ struct AuthClusterNode {
 }
 
 async fn start_auth_cluster_node(dir: &std::path::Path) -> AuthClusterNode {
+    start_auth_cluster_node_with(dir, Default::default()).await
+}
+
+async fn start_auth_cluster_node_with(
+    dir: &std::path::Path,
+    cluster_auth: hyperbytedb::adapters::cluster::cluster_auth::ClusterAuth,
+) -> AuthClusterNode {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let listener_addr = listener.local_addr().unwrap();
     let url = format!("http://{}", listener_addr);
@@ -80,6 +87,7 @@ async fn start_auth_cluster_node(dir: &std::path::Path) -> AuthClusterNode {
         joined_at: now,
         last_heartbeat: now,
         needs_sync: false,
+        consecutive_misses: 0,
     });
     let shared_membership = new_shared(membership);
 
@@ -92,6 +100,7 @@ async fn start_auth_cluster_node(dir: &std::path::Path) -> AuthClusterNode {
         8192,
         8,
         8 * 1024 * 1024,
+        cluster_auth.clone(),
     ));
 
     let replication_apply = Some(ReplicationApplyQueue::with_workers_and_sink(
@@ -125,9 +134,13 @@ async fn start_auth_cluster_node(dir: &std::path::Path) -> AuthClusterNode {
             IngestCardinalityLimits::default(),
         ));
 
-    let query_service: Arc<dyn hyperbytedb::adapters::http::router::QueryService> = Arc::new(
-        PeerQueryService::new(base_query_service, metadata.clone(), peer_client.clone()),
-    );
+    let query_service: Arc<dyn hyperbytedb::adapters::http::router::QueryService> =
+        Arc::new(PeerQueryService::new(
+            base_query_service,
+            metadata.clone(),
+            peer_client.clone(),
+            peer_client.cluster_auth(),
+        ));
 
     let app_state = Arc::new(AppState {
         ingestion: ingestion_service,
@@ -150,6 +163,8 @@ async fn start_auth_cluster_node(dir: &std::path::Path) -> AuthClusterNode {
         drain_service: None,
         raft: None,
         auth_enabled: true,
+        runtime_settings: Default::default(),
+        cluster_auth: cluster_auth.clone(),
         auth_allow_query_param_credentials: true,
         prometheus_handle: None,
         statement_summary: Some(Arc::new(StatementSummary::new(100))),
@@ -162,6 +177,8 @@ async fn start_auth_cluster_node(dir: &std::path::Path) -> AuthClusterNode {
         max_points_per_request: 0,
         request_timeout_secs: 30,
         rate_limiter: None,
+        write_admission: None,
+        shard_write_admission: None,
         wal_batcher_alive: None,
         disk_read_only: None,
 
@@ -445,4 +462,238 @@ async fn grant_revoke_controls_query_access() {
         .await
         .unwrap();
     assert_eq!(denied_otherdb.status(), StatusCode::FORBIDDEN);
+}
+
+/// Nodes and the operator carry no user: the cluster token stands in for
+/// one on internal routes, and only there. Clients for peers send it.
+#[tokio::test]
+#[serial(chdb)]
+async fn the_cluster_token_opens_internal_routes_only() {
+    use hyperbytedb::adapters::cluster::cluster_auth::{self, ClusterAuth};
+    use hyperbytedb::ports::peer_http::PeerHttp;
+
+    let dir = tempfile::tempdir().unwrap();
+    let auth = ClusterAuth::new(Some("cluster-s3cret")).unwrap();
+    let node = start_auth_cluster_node_with(dir.path(), auth.clone()).await;
+    let plain = reqwest::Client::new();
+    let peer = auth.client_builder().build().unwrap();
+    let membership = format!("{}/internal/membership", node.url);
+
+    let status = |r: reqwest::Response| r.status();
+    assert_eq!(
+        status(plain.get(&membership).send().await.unwrap()),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        status(
+            plain
+                .get(&membership)
+                .header(cluster_auth::HEADER, "wrong")
+                .query(&[("u", "admin"), ("p", "adminpw")])
+                .send()
+                .await
+                .unwrap()
+        ),
+        StatusCode::UNAUTHORIZED,
+        "a wrong token is refused even alongside an admin login"
+    );
+    assert_eq!(
+        status(peer.get(&membership).send().await.unwrap()),
+        StatusCode::OK
+    );
+    assert_eq!(
+        status(
+            peer.post(format!("{}/write", node.url))
+                .query(&[("db", "mydb")])
+                .body("cpu,host=a value=1")
+                .send()
+                .await
+                .unwrap()
+        ),
+        StatusCode::UNAUTHORIZED,
+        "the token is not a user"
+    );
+    let other_cluster = ClusterAuth::new(Some("another-cluster"))
+        .unwrap()
+        .client_builder()
+        .build()
+        .unwrap();
+    assert_eq!(
+        status(other_cluster.get(&membership).send().await.unwrap()),
+        StatusCode::UNAUTHORIZED,
+        "another cluster's peers are refused"
+    );
+}
+
+/// The configured admin is created once and never overwritten, so a
+/// `SET PASSWORD` survives a restart.
+#[tokio::test]
+async fn the_configured_admin_is_created_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let metadata = RocksDbMetadata::open(dir.path()).unwrap();
+    let mut auth = hyperbytedb::config::HyperbytedbConfig::load(None)
+        .unwrap()
+        .auth;
+    hyperbytedb::bootstrap::ensure_admin(&metadata, &auth)
+        .await
+        .unwrap();
+    assert!(metadata.list_users().await.unwrap().is_empty());
+
+    auth.admin_username = Some("root".into());
+    auth.admin_password = Some("first".into());
+    hyperbytedb::bootstrap::ensure_admin(&metadata, &auth)
+        .await
+        .unwrap();
+    let first = metadata.get_user("root").await.unwrap().unwrap();
+    assert!(first.admin);
+
+    auth.admin_password = Some("second".into());
+    hyperbytedb::bootstrap::ensure_admin(&metadata, &auth)
+        .await
+        .unwrap();
+    let again = metadata.get_user("root").await.unwrap().unwrap();
+    assert_eq!(again.password_hash, first.password_hash);
+}
+
+/// `GRANT READ` reads but can't write, `GRANT WRITE` the reverse, and
+/// `REVOKE READ` from ALL leaves WRITE (InfluxDB v1 semantics).
+#[tokio::test]
+#[serial(chdb)]
+async fn grant_read_write_and_partial_revoke() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = start_auth_cluster_node(dir.path()).await;
+    let client = reqwest::Client::new();
+    metadata_create_db(&node.url, &client).await;
+
+    let admin = |q: &'static str| {
+        let req = client.get(format!("{}/query", node.url)).query(&[
+            ("db", "mydb"),
+            ("q", q),
+            ("u", "admin"),
+            ("p", "adminpw"),
+        ]);
+        async move {
+            let resp = req.send().await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{q}");
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert!(body["results"][0]["error"].is_null(), "{q}: {body}");
+        }
+    };
+    let can_write = || {
+        let req = client
+            .post(format!("{}/write", node.url))
+            .query(&[("db", "mydb"), ("u", "writer"), ("p", "writerpw")])
+            .body("cpu,host=a value=1");
+        async move { req.send().await.unwrap().status() == StatusCode::NO_CONTENT }
+    };
+    let can_read = || {
+        let req = client.get(format!("{}/query", node.url)).query(&[
+            ("db", "mydb"),
+            ("q", r#"SELECT * FROM "cpu""#),
+            ("u", "writer"),
+            ("p", "writerpw"),
+        ]);
+        async move { req.send().await.unwrap().status() == StatusCode::OK }
+    };
+    assert_eq!((can_read().await, can_write().await), (false, false));
+
+    admin(r#"GRANT READ ON "mydb" TO "writer""#).await;
+    assert_eq!((can_read().await, can_write().await), (true, false), "READ");
+
+    admin(r#"grant write on mydb to writer"#).await;
+    assert_eq!(
+        (can_read().await, can_write().await),
+        (false, true),
+        "WRITE replaces READ"
+    );
+
+    admin(r#"GRANT ALL ON "mydb" TO "writer""#).await;
+    assert_eq!((can_read().await, can_write().await), (true, true), "ALL");
+
+    admin(r#"REVOKE READ ON "mydb" FROM "writer""#).await;
+    assert_eq!(
+        (can_read().await, can_write().await),
+        (false, true),
+        "ALL less READ"
+    );
+    let grants = |u: &'static str, p: &'static str| {
+        let req = client.get(format!("{}/query", node.url)).query(&[
+            ("q", r#"SHOW GRANTS FOR "writer""#),
+            ("u", u),
+            ("p", p),
+        ]);
+        async move { req.send().await.unwrap() }
+    };
+    let body: serde_json::Value = grants("admin", "adminpw").await.json().await.unwrap();
+    assert_eq!(
+        body["results"][0]["series"][0]["values"],
+        serde_json::json!([["mydb", "WRITE"]]),
+        "{body}"
+    );
+    assert_eq!(
+        grants("writer", "writerpw").await.status(),
+        StatusCode::FORBIDDEN,
+        "SHOW GRANTS is admin only"
+    );
+
+    admin(r#"REVOKE READ ON "mydb" FROM "writer""#).await;
+    assert_eq!(
+        (can_read().await, can_write().await),
+        (false, true),
+        "revoking what isn't held"
+    );
+
+    admin(r#"REVOKE WRITE ON "mydb" FROM "writer""#).await;
+    assert_eq!(
+        (can_read().await, can_write().await),
+        (false, false),
+        "nothing left"
+    );
+}
+
+/// Changing a user never drops its grants: SET PASSWORD, making it admin and
+/// back, and CREATE USER again all used to rewrite the user without them.
+#[tokio::test]
+#[serial(chdb)]
+async fn updating_a_user_keeps_its_grants() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = start_auth_cluster_node(dir.path()).await;
+    let client = reqwest::Client::new();
+    metadata_create_db(&node.url, &client).await;
+    let admin = |q: &'static str| {
+        let req = client.get(format!("{}/query", node.url)).query(&[
+            ("db", "mydb"),
+            ("q", q),
+            ("u", "admin"),
+            ("p", "adminpw"),
+        ]);
+        async move {
+            let body: serde_json::Value = req.send().await.unwrap().json().await.unwrap();
+            assert!(body["results"][0]["error"].is_null(), "{q}: {body}");
+            body
+        }
+    };
+    admin(r#"GRANT WRITE ON "mydb" TO "writer""#).await;
+    for q in [
+        r#"SET PASSWORD FOR "writer" = 'newpw'"#,
+        r#"GRANT ALL PRIVILEGES TO "writer""#,
+        r#"REVOKE ALL PRIVILEGES FROM "writer""#,
+        r#"CREATE USER "writer" WITH PASSWORD 'newpw'"#,
+    ] {
+        admin(q).await;
+        let body = admin(r#"SHOW GRANTS FOR "writer""#).await;
+        assert_eq!(
+            body["results"][0]["series"][0]["values"],
+            serde_json::json!([["mydb", "WRITE"]]),
+            "after {q}"
+        );
+    }
+    let write = client
+        .post(format!("{}/write", node.url))
+        .query(&[("db", "mydb"), ("u", "writer"), ("p", "newpw")])
+        .body("cpu,host=a value=1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(write.status(), StatusCode::NO_CONTENT);
 }

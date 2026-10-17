@@ -179,6 +179,7 @@ pub fn columnar_batch_to_points(
             tags: wire.tags.clone(),
             fields,
             timestamp: ts_ns_vec[i],
+            series_id_cache: Default::default(),
         });
     }
 

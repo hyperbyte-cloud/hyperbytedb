@@ -5,7 +5,7 @@ use chdb_rust::format::OutputFormat;
 
 use crate::adapters::chdb::session::{SharedSession, execute_connection};
 use crate::error::HyperbytedbError;
-use crate::ports::query::QueryPort;
+use crate::ports::query::{ArrowBatchStream, QueryPort};
 
 /// Multi-connection chDB query adapter.
 ///
@@ -16,7 +16,9 @@ use crate::ports::query::QueryPort;
 /// blocking pool.
 pub struct ChdbQueryAdapter {
     session: SharedSession,
-    concurrency_limit: Option<Arc<tokio::sync::Semaphore>>,
+    /// Replaced whole by `SET max_concurrent_queries`: queries holding the
+    /// old one's permits finish under it.
+    concurrency_limit: parking_lot::RwLock<Option<Arc<tokio::sync::Semaphore>>>,
 }
 
 impl ChdbQueryAdapter {
@@ -30,7 +32,7 @@ impl ChdbQueryAdapter {
         tracing::info!(path = %data_path, "chDB connection pool will be built lazily on first query");
         Ok(Self {
             session: SharedSession::new(data_path),
-            concurrency_limit: None,
+            concurrency_limit: parking_lot::RwLock::new(None),
         })
     }
 
@@ -49,16 +51,33 @@ impl ChdbQueryAdapter {
     /// Used by [`crate::bootstrap`] so the read adapter and (when enabled) the
     /// native-write adapter point at the same pool.
     pub fn from_shared(session: SharedSession, max_concurrent: usize) -> Self {
-        let concurrency_limit = if max_concurrent > 0 {
+        let adapter = Self {
+            session,
+            concurrency_limit: parking_lot::RwLock::new(None),
+        };
+        adapter.set_concurrency_limit(max_concurrent);
+        adapter
+    }
+
+    /// Cap concurrent queries at `max_concurrent` (`0` removes the cap).
+    pub fn set_concurrency_limit(&self, max_concurrent: usize) {
+        let limit = if max_concurrent > 0 {
             tracing::info!(limit = max_concurrent, "chDB concurrency cap enabled");
             Some(Arc::new(tokio::sync::Semaphore::new(max_concurrent)))
         } else {
             tracing::info!("chDB concurrency cap disabled (unbounded)");
             None
         };
-        Self {
-            session,
-            concurrency_limit,
+        *self.concurrency_limit.write() = limit;
+    }
+
+    async fn acquire(&self) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, HyperbytedbError> {
+        let sem = self.concurrency_limit.read().clone();
+        match sem {
+            Some(sem) => sem.acquire_owned().await.map(Some).map_err(|_| {
+                HyperbytedbError::Internal("chDB concurrency semaphore closed".into())
+            }),
+            None => Ok(None),
         }
     }
 }
@@ -80,12 +99,7 @@ impl QueryPort for ChdbQueryAdapter {
     }
 
     async fn execute_sql(&self, sql: &str) -> Result<String, HyperbytedbError> {
-        let _permit = match self.concurrency_limit {
-            Some(ref sem) => Some(Arc::clone(sem).acquire_owned().await.map_err(|_| {
-                HyperbytedbError::Internal("chDB concurrency semaphore closed".into())
-            })?),
-            None => None,
-        };
+        let _permit = self.acquire().await?;
 
         tracing::debug!(sql = sql, "executing chDB query");
 
@@ -102,12 +116,7 @@ impl QueryPort for ChdbQueryAdapter {
                         .map_err(|e| HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e))),
                     Err(e) => {
                         let msg = e.to_string();
-                        if msg.contains("CANNOT_EXTRACT_TABLE_STRUCTURE")
-                            || msg.contains("no files with provided path")
-                            || msg.contains("CANNOT_STAT")
-                            || msg.contains("UNKNOWN_TABLE")
-                            || msg.contains("Code: 60")
-                        {
+                        if is_missing_table_error(&msg) {
                             tracing::warn!(error = %msg, "chDB missing-table error, treating as empty result");
                             Ok(String::new())
                         } else {
@@ -123,4 +132,68 @@ impl QueryPort for ChdbQueryAdapter {
         tracing::debug!(result_len = result.len(), "chDB query completed");
         Ok(result)
     }
+
+    /// Arrow streaming read: no text is formatted or parsed, and only the
+    /// batches in flight are held.
+    async fn execute_sql_arrow(&self, sql: &str) -> Result<ArrowBatchStream, HyperbytedbError> {
+        let permit = self.acquire().await?;
+        tracing::debug!(sql = sql, "executing chDB query (arrow stream)");
+        let pool = self.session.pool()?;
+        let sql_owned = sql.to_string();
+        let (tx, rx) = tokio::sync::mpsc::channel(ARROW_STREAM_DEPTH);
+        // The connection and the concurrency permit are held until the
+        // stream ends or the receiver is dropped, which cancels the query.
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            pool.with_connection_mut(|conn| {
+                let mut stream = match conn.query_stream_arrow(&sql_owned) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        send_stream_error(&tx, &e.to_string());
+                        return;
+                    }
+                };
+                loop {
+                    match stream.next_batch() {
+                        Ok(Some(batch)) => {
+                            if tx.blocking_send(Ok(batch)).is_err() {
+                                stream.cancel();
+                                return;
+                            }
+                        }
+                        Ok(None) => return,
+                        Err(e) => {
+                            send_stream_error(&tx, &e.to_string());
+                            return;
+                        }
+                    }
+                }
+            });
+        });
+        Ok(rx)
+    }
+}
+
+/// Batches buffered between chDB and the consumer.
+const ARROW_STREAM_DEPTH: usize = 2;
+
+/// Errors that mean "the table is not there (yet)": a query on a measurement
+/// that has never been flushed. Treated as an empty result.
+fn is_missing_table_error(msg: &str) -> bool {
+    msg.contains("CANNOT_EXTRACT_TABLE_STRUCTURE")
+        || msg.contains("no files with provided path")
+        || msg.contains("CANNOT_STAT")
+        || msg.contains("UNKNOWN_TABLE")
+        || msg.contains("Code: 60")
+}
+
+fn send_stream_error(
+    tx: &tokio::sync::mpsc::Sender<Result<arrow::record_batch::RecordBatch, HyperbytedbError>>,
+    msg: &str,
+) {
+    if is_missing_table_error(msg) {
+        tracing::warn!(error = %msg, "chDB missing-table error, treating as empty result");
+        return;
+    }
+    let _ = tx.blocking_send(Err(HyperbytedbError::Chdb(msg.to_string().into())));
 }
