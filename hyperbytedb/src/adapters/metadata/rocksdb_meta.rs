@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::domain::database::{Database, RetentionPolicy};
 use crate::domain::point::FieldValue;
@@ -87,7 +87,14 @@ fn bump_tag_count_cache(
     *counts.entry(ck).or_insert(0) += delta;
 }
 
-fn bump_tag_counts_from_storage_keys(counts: &mut HashMap<String, usize>, storage_keys: &[String]) {
+/// Adds newly stored tag values to their counts. Before the counts are
+/// warmed, a count not in the cache is left out: it is computed from storage
+/// when first asked for, and starting it here would cache a partial count.
+fn bump_tag_counts_from_storage_keys(
+    counts: &mut HashMap<String, usize>,
+    storage_keys: &[String],
+    warmed: bool,
+) {
     let mut per_key: HashMap<String, usize> = HashMap::new();
     for key in storage_keys {
         if let Some((db, rp, meas, tag_key)) = parse_tag_val_storage_key(key) {
@@ -96,7 +103,11 @@ fn bump_tag_counts_from_storage_keys(counts: &mut HashMap<String, usize>, storag
         }
     }
     for (ck, delta) in per_key {
-        *counts.entry(ck).or_insert(0) += delta;
+        if warmed {
+            *counts.entry(ck).or_insert(0) += delta;
+        } else if let Some(n) = counts.get_mut(&ck) {
+            *n += delta;
+        }
     }
 }
 
@@ -185,6 +196,32 @@ impl SeriesIndex {
     }
 }
 
+/// Adds to `batch` the tag values among `keys` that storage does not hold,
+/// and returns them: the cache said all of them were new, but it may have
+/// been cold (after a restart) or raced by another writer. Call under
+/// `tag_write_lock` and write `batch` before releasing it, so each value is
+/// found new, and counted, once.
+fn stage_new_tag_values(
+    rdb: &rocksdb::DB,
+    cf: &impl rocksdb::AsColumnFamilyRef,
+    batch: &mut rocksdb::WriteBatch,
+    keys: &[String],
+) -> Result<Vec<String>, HyperbytedbError> {
+    let mut new = Vec::new();
+    for (key, stored) in keys
+        .iter()
+        .zip(rdb.multi_get_cf(keys.iter().map(|k| (cf, k.as_bytes()))))
+    {
+        let stored = stored
+            .map_err(|e| HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e)))?;
+        if stored.is_none() {
+            batch.put_cf(cf, key.as_bytes(), b"1");
+            new.push(key.clone());
+        }
+    }
+    Ok(new)
+}
+
 /// Parse `series:{db}:{rp}:{measurement}:{id_hex}`. Assumes db/rp/measurement are
 /// `:`-free (same assumption as [`parse_tag_val_storage_key`]).
 fn parse_series_storage_key(key: &str) -> Option<(String, String, String, u64)> {
@@ -224,9 +261,15 @@ pub struct RocksDbMetadata {
     generation: AtomicU64,
     db_cache: RwLock<HashMap<String, Database>>,
     meas_cache: RwLock<HashMap<String, MeasurementMeta>>,
+    /// Storage keys of tag values already persisted. Warmed with the counts
+    /// by `warm_tag_value_counts`; a miss is checked against storage.
     tag_known: RwLock<HashSet<String>>,
     /// `(db, measurement, tag_key)` → distinct tag value count.
     tag_count_cache: RwLock<HashMap<String, usize>>,
+    /// Whether `tag_count_cache` was warmed, so a count it lacks is zero.
+    tag_counts_warmed: AtomicBool,
+    /// Held while finding which tag values are new and writing them.
+    tag_write_lock: Arc<parking_lot::Mutex<()>>,
     /// Storage-key strings of series already persisted, for O(1) dedup on the
     /// flush path, with each measurement's count for SHOW SERIES CARDINALITY.
     /// Mirrors `tag_known`. Warmed by `warm_series`.
@@ -322,6 +365,8 @@ impl RocksDbMetadata {
             meas_cache: RwLock::new(HashMap::new()),
             tag_known: RwLock::new(HashSet::new()),
             tag_count_cache: RwLock::new(HashMap::new()),
+            tag_counts_warmed: AtomicBool::new(false),
+            tag_write_lock: Arc::new(parking_lot::Mutex::new(())),
             series_known: RwLock::new(SeriesIndex::default()),
             series_warmed: std::sync::atomic::AtomicBool::new(false),
             user_cache: RwLock::new(HashMap::new()),
@@ -1383,6 +1428,7 @@ impl MetadataPort for RocksDbMetadata {
                 IteratorMode::From(prefix, rocksdb::Direction::Forward),
             );
             let mut counts: HashMap<String, usize> = HashMap::new();
+            let mut known: HashSet<String> = HashSet::new();
             for item in iter {
                 let (key, _) = item.map_err(|e| {
                     HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
@@ -1395,9 +1441,10 @@ impl MetadataPort for RocksDbMetadata {
                 };
                 if let Some((db, rp, meas, tag_key)) = parse_tag_val_storage_key(s) {
                     bump_tag_count_cache(&mut counts, &db, &rp, &meas, 1, &tag_key);
+                    known.insert(s.to_string());
                 }
             }
-            Ok::<HashMap<String, usize>, HyperbytedbError>(counts)
+            Ok::<_, HyperbytedbError>((counts, known))
         })
         .await
         .map_err(|e| {
@@ -1407,8 +1454,11 @@ impl MetadataPort for RocksDbMetadata {
             ))
         })??;
 
+        let (counts, known) = counts;
         let warmed = counts.len();
+        self.tag_known.write().extend(known);
         *self.tag_count_cache.write() = counts;
+        self.tag_counts_warmed.store(true, Ordering::Release);
         Ok(warmed)
     }
 
@@ -1658,19 +1708,19 @@ impl MetadataPort for RocksDbMetadata {
             return Ok(());
         }
         let rdb = self.db.clone();
+        let lock = self.tag_write_lock.clone();
         let keys = novel.clone();
-        tokio::task::spawn_blocking(move || {
+        let created = tokio::task::spawn_blocking(move || {
             let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
                 HyperbytedbError::Metadata("metadata column family not found".into())
             })?;
+            let _held = lock.lock();
             let mut batch = rocksdb::WriteBatch::default();
-            for key in &keys {
-                batch.put_cf(&cf, key.as_bytes(), b"1");
-            }
+            let created = stage_new_tag_values(&rdb, &cf, &mut batch, &keys)?;
             rdb.write(batch).map_err(|e| {
                 HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
             })?;
-            Ok::<(), HyperbytedbError>(())
+            Ok::<Vec<String>, HyperbytedbError>(created)
         })
         .await
         .map_err(|e| {
@@ -1687,7 +1737,8 @@ impl MetadataPort for RocksDbMetadata {
         }
         {
             let mut counts = self.tag_count_cache.write();
-            bump_tag_counts_from_storage_keys(&mut counts, &novel);
+            let warmed = self.tag_counts_warmed.load(Ordering::Acquire);
+            bump_tag_counts_from_storage_keys(&mut counts, &created, warmed);
         }
         Ok(())
     }
@@ -1769,8 +1820,9 @@ impl MetadataPort for RocksDbMetadata {
             .map(|(_, value, m)| (meas_key(db, rp, &m.name), value.clone()))
             .collect();
         let tag_keys = novel_tags.clone();
+        let lock = self.tag_write_lock.clone();
 
-        tokio::task::spawn_blocking(move || {
+        let created_tags = tokio::task::spawn_blocking(move || {
             let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
                 HyperbytedbError::Metadata("metadata column family not found".into())
             })?;
@@ -1778,13 +1830,12 @@ impl MetadataPort for RocksDbMetadata {
             for (key, value) in &meas_keys {
                 batch.put_cf(&cf, key, value);
             }
-            for key in &tag_keys {
-                batch.put_cf(&cf, key.as_bytes(), b"1");
-            }
+            let _held = (!tag_keys.is_empty()).then(|| lock.lock());
+            let created = stage_new_tag_values(&rdb, &cf, &mut batch, &tag_keys)?;
             rdb.write(batch).map_err(|e| {
                 HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
             })?;
-            Ok::<(), HyperbytedbError>(())
+            Ok::<Vec<String>, HyperbytedbError>(created)
         })
         .await
         .map_err(|e| {
@@ -1810,7 +1861,8 @@ impl MetadataPort for RocksDbMetadata {
                 cache.insert(k.clone());
             }
             let mut counts = self.tag_count_cache.write();
-            bump_tag_counts_from_storage_keys(&mut counts, &novel_tags);
+            let warmed = self.tag_counts_warmed.load(Ordering::Acquire);
+            bump_tag_counts_from_storage_keys(&mut counts, &created_tags, warmed);
         }
 
         Ok(())
@@ -2559,6 +2611,96 @@ impl MetadataPort for RocksDbMetadata {
 #[cfg(test)]
 mod series_range_tests {
     use super::*;
+
+    /// A tag value already on disk is not new after a restart: rewriting
+    /// host=a after one counted it again (SHOW TAG VALUES CARDINALITY 3 for
+    /// a and b) and made it look new to the cardinality limit.
+    #[tokio::test]
+    async fn rewriting_a_known_tag_value_after_restart_does_not_count_it() {
+        async fn write(meta: &RocksDbMetadata, host: &str, batch: bool) {
+            let tags = vec![("host".to_string(), host.to_string())];
+            if batch {
+                meta.register_metadata_batch("db", "autogen", &[], &[("m".to_string(), tags)])
+                    .await
+                    .unwrap();
+            } else {
+                meta.store_tag_values_batch("db", "autogen", "m", &tags)
+                    .await
+                    .unwrap();
+            }
+        }
+        async fn count(meta: &RocksDbMetadata) -> usize {
+            meta.count_tag_values("db", "autogen", "host", Some("m"))
+                .await
+                .unwrap()
+        }
+        for batch in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let meta = RocksDbMetadata::open(dir.path()).unwrap();
+            meta.warm_tag_value_counts().await.unwrap();
+            write(&meta, "a", batch).await;
+            write(&meta, "b", batch).await;
+            write(&meta, "a", batch).await;
+            assert_eq!(count(&meta).await, 2, "batch={batch}: before restart");
+
+            drop(meta);
+            let meta = RocksDbMetadata::open(dir.path()).unwrap();
+            meta.warm_tag_value_counts().await.unwrap();
+            assert_eq!(count(&meta).await, 2, "batch={batch}: after restart");
+            assert!(
+                meta.tag_value_is_known("db", "autogen", "m", "host", "a")
+                    .await
+                    .unwrap(),
+                "batch={batch}: a value on disk is known after a restart"
+            );
+            write(&meta, "a", batch).await;
+            write(&meta, "c", batch).await;
+            assert_eq!(
+                count(&meta).await,
+                3,
+                "batch={batch}: a rewrite after restart"
+            );
+
+            // Not warmed (warm failed): a rewrite is still not counted, and a
+            // new value does not start a partial count.
+            drop(meta);
+            let meta = RocksDbMetadata::open(dir.path()).unwrap();
+            write(&meta, "b", batch).await;
+            write(&meta, "d", batch).await;
+            assert_eq!(count(&meta).await, 4, "batch={batch}: unwarmed");
+        }
+    }
+
+    /// Two writers that both see a value as new count it once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writers_of_a_new_tag_value_count_it_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = Arc::new(RocksDbMetadata::open(dir.path()).unwrap());
+        meta.warm_tag_value_counts().await.unwrap();
+        for round in 0..50 {
+            let value = format!("h{round}");
+            let writers: Vec<_> = (0..8)
+                .map(|_| {
+                    let meta = meta.clone();
+                    let tags = vec![("host".to_string(), value.clone())];
+                    tokio::spawn(async move {
+                        meta.store_tag_values_batch("db", "autogen", "m", &tags)
+                            .await
+                            .unwrap();
+                    })
+                })
+                .collect();
+            for w in writers {
+                w.await.unwrap();
+            }
+        }
+        assert_eq!(
+            meta.count_tag_values("db", "autogen", "host", Some("m"))
+                .await
+                .unwrap(),
+            50
+        );
+    }
 
     #[test]
     fn series_index_counts_follow_every_mutation() {
