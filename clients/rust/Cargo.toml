@@ -1,0 +1,23 @@
+[package]
+name = "hyperbytedb-client"
+version = "0.9.3-beta"
+edition = "2021"
+rust-version = "1.75"
+description = "Async client for HyperbyteDB's InfluxDB v1 API"
+license = "Apache-2.0"
+repository = "https://github.com/hyperbyte-cloud/hyperbytedb"
+readme = "README.md"
+keywords = ["hyperbytedb", "influxdb", "timeseries", "client"]
+categories = ["database"]
+
+[dependencies]
+flate2 = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["time"] }
+
+[dev-dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
