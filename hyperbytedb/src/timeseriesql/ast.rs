@@ -9,6 +9,9 @@ pub enum Statement {
     ShowTagValues(ShowTagValuesStatement),
     ShowFieldKeys(ShowFieldKeysStatement),
     ShowSeries(ShowSeriesStatement),
+    /// `SHOW SERIES | MEASUREMENT | TAG KEY | TAG VALUES | FIELD KEY [EXACT]
+    /// CARDINALITY`, as in InfluxDB 1.x.
+    ShowCardinality(ShowCardinalityStatement),
     CreateDatabase(CreateDatabaseStatement),
     DropDatabase(String),
     DropMeasurement {
@@ -173,6 +176,33 @@ pub enum TagKeySelector {
 pub struct ShowFieldKeysStatement {
     pub database: Option<String>,
     pub from: Option<Measurement>,
+}
+
+/// What a `SHOW ... CARDINALITY` counts.
+#[derive(Debug, Clone)]
+pub enum CardinalityKind {
+    Series,
+    Measurement,
+    TagKey,
+    /// `SHOW TAG VALUES CARDINALITY WITH KEY ...`.
+    TagValues(TagKeySelector),
+    FieldKey,
+}
+
+#[derive(Debug, Clone)]
+pub struct ShowCardinalityStatement {
+    pub kind: CardinalityKind,
+    /// `EXACT`. The counts are exact either way; without it InfluxDB reports
+    /// series and measurement cardinality as an estimate, under another
+    /// column name, which is kept for clients that read it.
+    pub exact: bool,
+    pub database: Option<String>,
+    pub from: Option<Measurement>,
+    /// `SHOW MEASUREMENT CARDINALITY WITH MEASUREMENT ...`.
+    pub measurement_filter: Option<TagKeySelector>,
+    pub condition: Option<Expr>,
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
 }
 
 #[derive(Debug, Clone)]

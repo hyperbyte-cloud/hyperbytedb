@@ -2858,6 +2858,81 @@ async fn show_tag_values_where_spans_regions() {
     assert_eq!(got, want_h0, "{body}");
 }
 
+/// SHOW SERIES [EXACT] CARDINALITY and SHOW SERIES across regions on
+/// different nodes: every node reports every series once (a region's series
+/// counted by a peer that holds it, from its series index), and SHOW SERIES
+/// lists InfluxDB series keys, not ids.
+#[tokio::test]
+#[serial(chdb)]
+async fn series_cardinality_spans_regions() {
+    let dir = tempfile::tempdir().unwrap();
+    let nodes =
+        start_sharded_three_node_cluster(dir.path(), ShardedClusterOptions::default()).await;
+    let client = reqwest::Client::new();
+    create_db(&client, &nodes[0].url, "cdb").await;
+    bootstrap_two_regions(&nodes, "cdb", "autogen", "cpu").await;
+    let mut lines = Vec::new();
+    let mut want_keys = std::collections::BTreeSet::new();
+    let mut sides = std::collections::BTreeSet::new();
+    for h in 0..3 {
+        for c in 0..4 {
+            lines.push(format!("cpu,host=h{h},cpu=cpu{c} v=1 1000000000"));
+            want_keys.insert(format!("cpu,cpu=cpu{c},host=h{h}"));
+            let tags = BTreeMap::from([
+                ("host".to_string(), format!("h{h}")),
+                ("cpu".to_string(), format!("cpu{c}")),
+            ]);
+            sides.insert(series_id("cpu", &tags) < u64::MAX / 2);
+        }
+    }
+    assert_eq!(sides.len(), 2, "the series must span both regions");
+    let resp = write_line(&client, &nodes[0].url, "cdb", &lines.join("\n")).await;
+    assert!(resp.status().is_success(), "{}", resp.status());
+    for n in &nodes {
+        flush_node(n).await;
+    }
+    for (i, node) in nodes.iter().enumerate() {
+        let ask = |q: &'static str| {
+            let client = client.clone();
+            let url = node.url.clone();
+            async move {
+                let resp = query_sql(&client, &url, "cdb", q).await;
+                resp.json::<serde_json::Value>().await.unwrap()
+            }
+        };
+        let body = ask("SHOW SERIES CARDINALITY").await;
+        let s = &body["results"][0]["series"][0];
+        assert_eq!(
+            s["columns"],
+            serde_json::json!(["cardinality estimation"]),
+            "node {i}: {body}"
+        );
+        assert_eq!(s["values"], serde_json::json!([[12]]), "node {i}: {body}");
+
+        let body = ask("SHOW SERIES EXACT CARDINALITY FROM cpu").await;
+        let s = &body["results"][0]["series"][0];
+        assert_eq!(s["name"], "cpu", "node {i}: {body}");
+        assert_eq!(s["values"], serde_json::json!([[12]]), "node {i}: {body}");
+
+        let body = ask(r#"SHOW SERIES CARDINALITY WHERE "host" = 'h1'"#).await;
+        assert_eq!(
+            body["results"][0]["series"][0]["values"],
+            serde_json::json!([[4]]),
+            "node {i}: {body}"
+        );
+
+        let body = ask("SHOW SERIES").await;
+        let got: std::collections::BTreeSet<String> = body["results"][0]["series"][0]["values"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|r| r[0].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(got, want_keys, "node {i}");
+    }
+}
+
 /// PERCENTILE/MEDIAN on a sharded measurement: exact when every group is
 /// one series (in one region), refused when a group spans regions. They
 /// were refused outright, though Grafana's "p95 by host" pins one series per

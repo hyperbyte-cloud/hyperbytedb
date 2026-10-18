@@ -11,6 +11,7 @@ use crate::application::shard_routing::{
     ShardRoutingContext, reload_region, scatter_to_region_peers,
 };
 use crate::domain::point::FieldValue;
+use crate::domain::series::SeriesKey;
 use crate::domain::sharding::{ShardMetadataKind, ShardMetadataRequest, ShardRegion};
 use crate::error::HyperbytedbError;
 use crate::ports::metadata::{MeasurementMeta, MetadataPort};
@@ -376,6 +377,10 @@ pub async fn scatter_tag_values(
     Ok(values.into_iter().collect())
 }
 
+/// Every series' key (`measurement,tag=value,...`, as SHOW SERIES prints it)
+/// across the cluster, each once: this node's own, and one peer's for each
+/// serving region it does not hold. A peer on an older build sends no tags;
+/// its keys are passed through as it formats them.
 pub async fn scatter_series_keys(
     ctx: &ShardRoutingContext,
     metadata: &dyn MetadataPort,
@@ -383,6 +388,8 @@ pub async fn scatter_series_keys(
     rp: &str,
     measurement: &str,
 ) -> Result<Vec<String>, HyperbytedbError> {
+    let canonical =
+        |tags: &BTreeMap<String, String>| SeriesKey::new(measurement, tags).to_canonical();
     let map = ctx.shard_map.snapshot().await?;
     // The serving view, not the raw snapshot: a snapshot contains staging
     // regions, which are in the map but must not be routed to -- the donor
@@ -390,21 +397,10 @@ pub async fn scatter_series_keys(
     let serving = ctx
         .location_cache
         .serving_regions(&map, db, rp, measurement);
-    if serving.is_empty() {
-        let series = metadata.list_series(db, rp, measurement).await?;
-        return Ok(series
-            .into_iter()
-            .map(|(id, tags)| format!("{id}:{tags:?}"))
-            .collect());
-    }
-
     let mut keys = BTreeSet::new();
-    let has_local_peer = serving
-        .iter()
-        .any(|region| region.peers.contains(&ctx.node_id));
-    if has_local_peer {
-        for (id, tags) in metadata.list_series(db, rp, measurement).await? {
-            keys.insert(format!("{id}:{tags:?}"));
+    if serving.is_empty() || serving.iter().any(|r| r.peers.contains(&ctx.node_id)) {
+        for (_, tags) in metadata.list_series(db, rp, measurement).await? {
+            keys.insert(canonical(&tags));
         }
     }
 
@@ -423,15 +419,112 @@ pub async fn scatter_series_keys(
     )
     .await?;
     for part in remote_parts {
-        if let Some(arr) = part.get("series").and_then(|v| v.as_array()) {
-            for s in arr {
-                if let Some(k) = s.as_str() {
-                    keys.insert(k.to_string());
+        if let Some(tagged) = part.get("tagged").and_then(|v| v.as_array()) {
+            for s in tagged {
+                if let Ok(tags) =
+                    serde_json::from_value::<BTreeMap<String, String>>(s["tags"].clone())
+                {
+                    keys.insert(canonical(&tags));
                 }
             }
+        } else if let Some(arr) = part.get("series").and_then(|v| v.as_array()) {
+            keys.extend(arr.iter().filter_map(|k| k.as_str().map(str::to_string)));
         }
     }
     Ok(keys.into_iter().collect())
+}
+
+/// How many series the measurement has across the cluster: the sum, over
+/// its serving regions, of each region's series in its own range. Ranges do
+/// not overlap, so a series counts once however many nodes hold it (replicas,
+/// or a copy a node kept after handing a region over). This node counts its
+/// own regions from its series index; each other region's peer is asked for
+/// its count, and a peer on an older build for its series, counted here.
+pub async fn scatter_series_count(
+    ctx: &ShardRoutingContext,
+    metadata: &dyn MetadataPort,
+    db: &str,
+    rp: &str,
+    measurement: &str,
+) -> Result<u64, HyperbytedbError> {
+    let map = ctx.shard_map.snapshot().await?;
+    let serving = ctx
+        .location_cache
+        .serving_regions(&map, db, rp, measurement);
+    if serving.is_empty() {
+        return metadata
+            .count_series_ids_in_range(db, rp, measurement, 0, u64::MAX)
+            .await;
+    }
+    let mut total = 0u64;
+    let mut remote = Vec::new();
+    for region in serving {
+        if region.peers.contains(&ctx.node_id) {
+            total += metadata
+                .count_series_ids_in_range(db, rp, measurement, region.start, region.end)
+                .await?;
+        } else {
+            remote.push(region.clone());
+        }
+    }
+    for chunk in remote.chunks(METADATA_SCATTER_CONCURRENCY) {
+        let counts = try_join_all(chunk.iter().map(|region| async move {
+            match fetch_remote_metadata(
+                ctx,
+                db,
+                rp,
+                measurement,
+                region,
+                ShardMetadataKind::SeriesCount,
+            )
+            .await
+            {
+                Ok(part) if part.get("count").is_some() => {
+                    part["count"].as_u64().ok_or_else(|| {
+                        HyperbytedbError::Internal("series count is not a number".into())
+                    })
+                }
+                // An older peer: count its series in the region's range.
+                _ => {
+                    let part = fetch_remote_metadata(
+                        ctx,
+                        db,
+                        rp,
+                        measurement,
+                        region,
+                        ShardMetadataKind::Series,
+                    )
+                    .await?;
+                    Ok(series_ids_of(&part)
+                        .into_iter()
+                        .filter(|id| *id >= region.start && *id < region.end)
+                        .count() as u64)
+                }
+            }
+        }))
+        .await?;
+        total += counts.into_iter().sum::<u64>();
+    }
+    Ok(total)
+}
+
+/// The series ids in a `Series` metadata reply: from `tagged`, else from the
+/// `<id>:<tags>` strings of a build without it.
+fn series_ids_of(part: &serde_json::Value) -> Vec<u64> {
+    if let Some(tagged) = part.get("tagged").and_then(|v| v.as_array()) {
+        return tagged
+            .iter()
+            .filter_map(|t| t.get("id")?.as_u64())
+            .collect();
+    }
+    part.get("series")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.as_str()?.split(':').next()?.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Every series' tags for the measurement across the cluster, each series

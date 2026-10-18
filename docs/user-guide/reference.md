@@ -274,10 +274,49 @@ SHOW TAG VALUES [FROM <measurement>] WITH KEY IN ("<key1>", "<key2>")
                                       -- with or without ::tag; time is ignored
 SHOW FIELD KEYS [FROM <measurement>]
 SHOW SERIES [FROM <measurement>]
+SHOW SERIES [EXACT] CARDINALITY [ON <db>] [FROM <measurement>] [WHERE <tag condition>]
+  [LIMIT n] [OFFSET n]
+SHOW MEASUREMENT [EXACT] CARDINALITY [ON <db>] [FROM <measurement>]
+  [WITH MEASUREMENT <op> <name|/regex/>]
+  [WHERE <tag condition>]
+SHOW TAG KEY [EXACT] CARDINALITY [ON <db>] [FROM <measurement>] [WHERE <tag condition>]
+SHOW TAG VALUES [EXACT] CARDINALITY [ON <db>] [FROM <measurement>] [WITH KEY <op> <key>]
+  [WHERE <tag condition>]
+SHOW FIELD KEY [EXACT] CARDINALITY [ON <db>] [FROM <measurement>]
 SHOW RETENTION POLICIES [ON <database>]
 SHOW USERS
 SHOW GRANTS FOR <user>                -- admin; database, privilege
 SHOW CONTINUOUS QUERIES
+```
+
+#### Cardinality
+
+The `CARDINALITY` statements count what the matching `SHOW` would list, and
+the counts are always exact. Without a `WHERE`, they come from the metadata
+caches without scanning anything: the series index (on a sharded cluster, each
+region's peer counts its own range, so a replicated series counts once), the
+tag value counts, and the measurement metadata. A `WHERE` is matched against
+each series' tags, like `SHOW TAG VALUES ... WHERE`.
+
+The output follows InfluxDB 1.x. `SHOW SERIES CARDINALITY` with no `FROM` or
+`WHERE`, and `SHOW MEASUREMENT CARDINALITY` with no `FROM`, `WITH` or `WHERE`, return
+one row under `cardinality estimation`. InfluxDB reports an estimate there;
+HyperbyteDB reports the exact count. `EXACT`, or any filter, returns `count`
+instead, with one series per measurement, and measurements with a count of
+zero are left out. `SHOW FIELD KEY CARDINALITY` refuses `WHERE`, because
+fields aren't indexed by tag.
+
+```sql
+> SHOW SERIES CARDINALITY ON telegraf
+cardinality estimation
+----------------------
+1520
+
+> SHOW SERIES EXACT CARDINALITY ON telegraf FROM cpu
+name: cpu
+count
+-----
+304
 ```
 
 ### DDL Statements

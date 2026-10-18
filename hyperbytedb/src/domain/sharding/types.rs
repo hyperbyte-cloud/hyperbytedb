@@ -502,6 +502,10 @@ pub enum ShardMetadataKind {
         tag_key: String,
     },
     Series,
+    /// How many series the node holds in the region's range: for SHOW SERIES
+    /// CARDINALITY, from the node's series index. A node on an older build
+    /// rejects it and is asked for `Series` instead.
+    SeriesCount,
     FieldKeys,
     /// The whole `MeasurementMeta`, or null when the node has none.
     Measurement,
