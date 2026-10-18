@@ -1,6 +1,6 @@
 [package]
 name = "hyperbytedb-proxy"
-version = "0.9.1-beta"
+version = "0.9.2-beta"
 edition = "2024"
 description = "Health-aware HTTP reverse proxy for hyperbytedb. Provides connection draining, request hold-and-retry across rolling restarts, and per-backend health gating"
 license = "Apache-2.0"
