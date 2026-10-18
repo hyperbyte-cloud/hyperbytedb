@@ -222,9 +222,15 @@ async fn ping_returns_204_with_version_header() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    assert!(
-        resp.headers().contains_key("x-influxdb-version"),
-        "Ping should return X-Influxdb-Version header"
+    assert_eq!(
+        resp.headers()["x-hyperbytedb-version"],
+        env!("CARGO_PKG_VERSION"),
+        "Ping should return the bare version in X-Hyperbytedb-Version"
+    );
+    // Kept for InfluxDB clients.
+    assert_eq!(
+        resp.headers()["x-influxdb-version"],
+        concat!("HyperbyteDB-", env!("CARGO_PKG_VERSION"))
     );
 }
 
@@ -785,8 +791,9 @@ async fn query_response_has_version_header() {
     let ctx = HttpTestContext::new().await;
     let resp = ctx.query_raw(&[("q", "SHOW DATABASES")]).await;
     assert!(
-        resp.headers().contains_key("x-influxdb-version"),
-        "Query responses should include X-Influxdb-Version header"
+        resp.headers().contains_key("x-hyperbytedb-version")
+            && resp.headers().contains_key("x-influxdb-version"),
+        "Query responses should include both version headers"
     );
 }
 

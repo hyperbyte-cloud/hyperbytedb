@@ -142,6 +142,16 @@ def test_query_results_and_errors(fake):
         client(url).query("SELEC", "db")
 
 
+def test_ping_prefers_hyperbytedb_version_header(fake):
+    f, url = fake
+    f.script = [
+        (204, {"X-Hyperbytedb-Version": "0.9.3-beta", "X-Influxdb-Version": "HyperbyteDB-0.9.3-beta"}, b""),
+        (204, {"X-Influxdb-Version": "HyperbyteDB-0.9.2-beta"}, b""),
+    ]
+    assert client(url).ping() == "0.9.3-beta"
+    assert client(url).ping() == "0.9.2-beta", "a server before 0.9.3"
+
+
 def test_health_answers_503_without_retrying(fake):
     f, url = fake
     f.script = [(503, {"Content-Type": "application/json"}, b'{"status":"draining"}')]

@@ -155,11 +155,18 @@ class HyperbyteDBClient:
 
     # -- health ------------------------------------------------------------
     def ping(self) -> str:
-        """The server's version (``X-Influxdb-Version``); raises if down."""
+        """The server's version, e.g. ``0.9.3-beta``; raises if down.
+
+        From ``X-Hyperbytedb-Version``, else (servers before 0.9.3) from
+        ``X-Influxdb-Version`` without its ``HyperbyteDB-`` prefix."""
         status, headers, payload = self._request("GET", "/ping")
         if status >= 300:
             raise ServerError(status, _error_text(payload))
-        return headers.get("X-Influxdb-Version", "")
+        version = headers.get("X-Hyperbytedb-Version")
+        if version:
+            return version
+        legacy = headers.get("X-Influxdb-Version", "")
+        return legacy[len("HyperbyteDB-"):] if legacy.startswith("HyperbyteDB-") else legacy
 
     def health(self) -> Dict[str, Any]:
         """``/health``: the node's state, as JSON."""
