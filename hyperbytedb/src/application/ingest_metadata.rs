@@ -9,7 +9,7 @@ use parking_lot::RwLock;
 use crate::domain::chdb_naming::quote_backticks;
 use crate::domain::column_mapping::ColumnMapping;
 use crate::domain::field_type::merge_field_type_map;
-use crate::domain::point::Point;
+use crate::domain::point::{FieldValue, Point};
 use crate::domain::series::series_id_for_point;
 use crate::error::HyperbytedbError;
 use crate::ports::metadata::{MeasurementMeta, MetadataPort};
@@ -675,9 +675,20 @@ pub async fn prepare_batch_metadata(
             let disc = v.type_discriminant();
             match entry.0.get_mut(k) {
                 Some(existing) => {
-                    if let Some(w) = crate::domain::field_type::widen_field_disc(*existing, disc) {
-                        *existing = w;
-                    }
+                    // Two types the batch cannot hold together: refused, as a
+                    // conflict with the stored type is. Keeping the first
+                    // type stored the other values as null.
+                    let Some(w) = crate::domain::field_type::widen_field_disc(*existing, disc)
+                    else {
+                        return Err(HyperbytedbError::FieldTypeConflict {
+                            field: k.clone(),
+                            measurement: point.measurement.clone(),
+                            got: FieldValue::type_name_from_discriminant(disc).to_string(),
+                            expected: FieldValue::type_name_from_discriminant(*existing)
+                                .to_string(),
+                        });
+                    };
+                    *existing = w;
                 }
                 None => {
                     entry.0.insert(k.clone(), disc);
@@ -806,9 +817,10 @@ pub async fn prepare_batch_metadata(
             }
         }
 
-        let merged_fields = merged_field_types(metadata, db, rp, meas_name, field_types).await?;
+        // The batch's own types, not merged with the stored ones: the merge
+        // keeps the stored type on a conflict, so it always passed.
         let field_tuples: Vec<(String, u8)> =
-            merged_fields.iter().map(|(k, v)| (k.clone(), *v)).collect();
+            field_types.iter().map(|(k, v)| (k.clone(), *v)).collect();
         metadata
             .check_field_types(db, rp, meas_name, &field_tuples)
             .await?;

@@ -777,6 +777,73 @@ async fn error_response_is_json_with_error_field() {
 }
 
 // ---------------------------------------------------------------------------
+// Field type conflicts
+// ---------------------------------------------------------------------------
+
+/// A field written as a float then as a string is refused, as InfluxDB does.
+/// The conflicting value was accepted (204) and stored as null: the check
+/// compared the stored type with the batch merged into it, which kept the
+/// stored type.
+#[tokio::test]
+async fn field_type_conflicts_are_refused_not_nulled() {
+    let ctx = HttpTestContext::new().await;
+    ctx.create_db("db").await;
+    assert_eq!(
+        ctx.write("db", "m v=1 1000000000").await.status(),
+        StatusCode::NO_CONTENT
+    );
+
+    let resp = ctx.write("db", r#"m v="text" 2000000000"#).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a later write of another type"
+    );
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("field type conflict"), "{body}");
+
+    // Within one batch, on a measurement with no stored types yet.
+    let resp = ctx
+        .write("db", "n v=1 1000000000\nn v=\"text\" 2000000000")
+        .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a conflict within one batch"
+    );
+
+    // Compatible types still widen: integer into float, integer into unsigned.
+    assert_eq!(
+        ctx.write("db", "m v=2i 3000000000").await.status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        ctx.write("db", "u c=1i 1000000000\nu c=2u 2000000000")
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+
+    // The refused writes left no metadata: v is still a float, and n was
+    // not created.
+    let doc = ctx
+        .query_json(&[("db", "db"), ("q", "SHOW FIELD KEYS FROM m")])
+        .await;
+    assert_eq!(
+        doc["results"][0]["series"][0]["values"],
+        serde_json::json!([["v", "float"]]),
+        "{doc}"
+    );
+    let doc = ctx
+        .query_json(&[("db", "db"), ("q", "SHOW MEASUREMENTS")])
+        .await;
+    assert!(
+        !doc.to_string().contains("\"n\""),
+        "the refused batch created n: {doc}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Version headers
 // ---------------------------------------------------------------------------
 

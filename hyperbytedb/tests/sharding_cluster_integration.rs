@@ -2933,6 +2933,43 @@ async fn series_cardinality_spans_regions() {
     }
 }
 
+/// A field type conflict is refused with a 400 whichever node takes the
+/// write, including one that forwards it to the region's primary.
+///
+/// Fails today: field types are known only to the nodes that hold the
+/// measurement's data, so a node that holds none checks against nothing,
+/// writes its own region's points with the other type, and reports the
+/// primaries' refusals (422) as a 500, "write partially applied".
+#[tokio::test]
+#[serial(chdb)]
+#[ignore = "field types are not known cluster-wide; see the doc comment"]
+async fn field_type_conflicts_are_refused_on_every_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let nodes =
+        start_sharded_three_node_cluster(dir.path(), ShardedClusterOptions::default()).await;
+    let client = reqwest::Client::new();
+    create_db(&client, &nodes[0].url, "fdb").await;
+    bootstrap_two_regions(&nodes, "fdb", "autogen", "cpu").await;
+    let lines: Vec<String> = (0..8)
+        .map(|h| format!("cpu,host=h{h} v=1 1000000000"))
+        .collect();
+    let resp = write_line(&client, &nodes[0].url, "fdb", &lines.join("\n")).await;
+    assert!(resp.status().is_success(), "{}", resp.status());
+    for n in &nodes {
+        flush_node(n).await;
+    }
+    for (i, node) in nodes.iter().enumerate() {
+        let lines: Vec<String> = (0..8)
+            .map(|h| format!("cpu,host=h{h} v=\"text\" 2000000000"))
+            .collect();
+        let resp = write_line(&client, &node.url, "fdb", &lines.join("\n")).await;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "node {i}: {body}");
+        assert!(body.contains("field type conflict"), "node {i}: {body}");
+    }
+}
+
 /// PERCENTILE/MEDIAN on a sharded measurement: exact when every group is
 /// one series (in one region), refused when a group spans regions. They
 /// were refused outright, though Grafana's "p95 by host" pins one series per
