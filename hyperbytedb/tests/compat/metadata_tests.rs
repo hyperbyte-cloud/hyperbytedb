@@ -719,6 +719,15 @@ async fn show_measurement_cardinality() {
         cardinality_rows(&ctx, "SHOW MEASUREMENT CARDINALITY WITH MEASUREMENT = cpu").await,
         vec![count("", 1)]
     );
+    // FROM filters, so the count is no longer the database-wide estimate.
+    assert_eq!(
+        cardinality_rows(&ctx, "SHOW MEASUREMENT CARDINALITY FROM cpu").await,
+        vec![count("", 1)]
+    );
+    assert_eq!(
+        cardinality_rows(&ctx, "SHOW MEASUREMENT CARDINALITY FROM nope").await,
+        vec![count("", 0)]
+    );
     assert_eq!(
         cardinality_rows(&ctx, r#"SHOW MEASUREMENT CARDINALITY WHERE "cpu" = 'cpu0'"#).await,
         vec![count("", 1)]

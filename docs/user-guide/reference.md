@@ -276,7 +276,8 @@ SHOW FIELD KEYS [FROM <measurement>]
 SHOW SERIES [FROM <measurement>]
 SHOW SERIES [EXACT] CARDINALITY [ON <db>] [FROM <measurement>] [WHERE <tag condition>]
   [LIMIT n] [OFFSET n]
-SHOW MEASUREMENT [EXACT] CARDINALITY [ON <db>] [WITH MEASUREMENT <op> <name|/regex/>]
+SHOW MEASUREMENT [EXACT] CARDINALITY [ON <db>] [FROM <measurement>]
+  [WITH MEASUREMENT <op> <name|/regex/>]
   [WHERE <tag condition>]
 SHOW TAG KEY [EXACT] CARDINALITY [ON <db>] [FROM <measurement>] [WHERE <tag condition>]
 SHOW TAG VALUES [EXACT] CARDINALITY [ON <db>] [FROM <measurement>] [WITH KEY <op> <key>]
@@ -298,7 +299,7 @@ tag value counts, and the measurement metadata. A `WHERE` is matched against
 each series' tags, like `SHOW TAG VALUES ... WHERE`.
 
 The output follows InfluxDB 1.x. `SHOW SERIES CARDINALITY` with no `FROM` or
-`WHERE`, and `SHOW MEASUREMENT CARDINALITY` with no `WITH` or `WHERE`, return
+`WHERE`, and `SHOW MEASUREMENT CARDINALITY` with no `FROM`, `WITH` or `WHERE`, return
 one row under `cardinality estimation`. InfluxDB reports an estimate there;
 HyperbyteDB reports the exact count. `EXACT`, or any filter, returns `count`
 instead, with one series per measurement, and measurements with a count of

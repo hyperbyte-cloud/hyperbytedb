@@ -2942,7 +2942,8 @@ async fn execute_local_measurement_query(
 ///
 /// The counts are exact. Without EXACT, series cardinality with no FROM or
 /// WHERE, and measurement cardinality with no WITH or WHERE, are reported the
-/// way InfluxDB 1.x reports its estimate: one `cardinality estimation` row.
+/// way InfluxDB 1.x reports its estimate: one `cardinality estimation` row
+/// (measurement cardinality also needs no FROM).
 /// Everything else is one `count` row per measurement, as InfluxDB 1.x does.
 async fn execute_show_cardinality(
     svc: &QueryServiceImpl,
@@ -3009,6 +3010,15 @@ async fn execute_show_cardinality(
     if let CardinalityKind::Measurement = s.kind {
         let names = list_measurements_for_rp(svc, db, rp).await?;
         let mut names = filter_names_by_selector(&names, s.measurement_filter.as_ref());
+        // FROM names the measurements to count, as WITH MEASUREMENT does.
+        match s.from.as_ref().map(|m| &m.name) {
+            Some(MeasurementName::Name(n)) => names.retain(|m| m == n),
+            Some(MeasurementName::Regex(pattern)) => {
+                let matches = regex_pattern_matches(pattern);
+                names.retain(|m| matches(m));
+            }
+            None => {}
+        }
         if predicate.is_some() {
             let with_match: Vec<String> = stream::iter(names)
                 .map(matching_series)
@@ -3018,7 +3028,8 @@ async fn execute_show_cardinality(
                 .await?;
             names = with_match;
         }
-        let estimate = !s.exact && s.measurement_filter.is_none() && s.condition.is_none();
+        let estimate =
+            !s.exact && s.from.is_none() && s.measurement_filter.is_none() && s.condition.is_none();
         return Ok(cardinality_total(
             statement_id,
             estimate,
