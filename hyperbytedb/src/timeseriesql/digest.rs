@@ -12,6 +12,7 @@ pub fn stmt_type(stmt: &Statement) -> &'static str {
         Statement::ShowTagValues(_) => "SHOW",
         Statement::ShowFieldKeys(_) => "SHOW",
         Statement::ShowSeries(_) => "SHOW",
+        Statement::ShowCardinality(_) => "SHOW",
         Statement::ShowRetentionPolicies(_) => "SHOW",
         Statement::ShowUsers => "SHOW",
         Statement::ShowGrants(_) => "SHOW",
@@ -127,6 +128,32 @@ fn normalize_statement(stmt: &Statement) -> String {
             if let Some(ref m) = s.from {
                 out.push_str(" from ");
                 normalize_measurement(&mut out, m);
+            }
+            normalize_show_tail(&mut out, &s.condition, &s.limit, &s.offset);
+        }
+        Statement::ShowCardinality(s) => {
+            out.push_str(match &s.kind {
+                CardinalityKind::Series => "show series",
+                CardinalityKind::Measurement => "show measurement",
+                CardinalityKind::TagKey => "show tag key",
+                CardinalityKind::TagValues(_) => "show tag values",
+                CardinalityKind::FieldKey => "show field key",
+            });
+            out.push_str(if s.exact {
+                " exact cardinality"
+            } else {
+                " cardinality"
+            });
+            normalize_on_db(&mut out, &s.database);
+            if let Some(ref m) = s.from {
+                out.push_str(" from ");
+                normalize_measurement(&mut out, m);
+            }
+            if let Some(filter) = &s.measurement_filter {
+                normalize_key_selector(&mut out, "measurement", filter);
+            }
+            if let CardinalityKind::TagValues(key) = &s.kind {
+                normalize_key_selector(&mut out, "key", key);
             }
             normalize_show_tail(&mut out, &s.condition, &s.limit, &s.offset);
         }

@@ -88,10 +88,43 @@ fn parse_show(cur: &mut TokenCursor<'_>) -> Result<Statement, HyperbytedbError> 
                 )?;
                 Ok(Statement::ShowMeasurements(stmt))
             }
+            // Singular: only `SHOW MEASUREMENT [EXACT] CARDINALITY`.
+            "MEASUREMENT" => {
+                cur.bump();
+                let exact = expect_cardinality(cur, "SHOW MEASUREMENT")?;
+                parse_cardinality_tail(cur, CardinalityKind::Measurement, exact)
+            }
             "TAG" => {
                 cur.bump();
                 let sub = cur.take_ident()?;
                 match sub.to_uppercase().as_str() {
+                    "KEY" => {
+                        let exact = expect_cardinality(cur, "SHOW TAG KEY")?;
+                        parse_cardinality_tail(cur, CardinalityKind::TagKey, exact)
+                    }
+                    "VALUES" if peek_cardinality(cur) => {
+                        let exact = expect_cardinality(cur, "SHOW TAG VALUES")?;
+                        let (database, from) = parse_show_on_from(cur)?;
+                        let tag_key = parse_with_key(cur)?;
+                        let mut stmt = ShowCardinalityStatement {
+                            kind: CardinalityKind::TagValues(tag_key),
+                            exact,
+                            database,
+                            from,
+                            measurement_filter: None,
+                            condition: None,
+                            limit: None,
+                            offset: None,
+                        };
+                        parse_show_tail(
+                            cur,
+                            &mut stmt.database,
+                            &mut stmt.condition,
+                            &mut stmt.limit,
+                            &mut stmt.offset,
+                        )?;
+                        Ok(Statement::ShowCardinality(stmt))
+                    }
                     "KEYS" => {
                         let (mut database, from) = parse_show_on_from(cur)?;
                         let mut condition = None;
@@ -141,6 +174,11 @@ fn parse_show(cur: &mut TokenCursor<'_>) -> Result<Statement, HyperbytedbError> 
             }
             "FIELD" => {
                 cur.bump();
+                if matches!(cur.peek(), Some(t) if token_word(t).as_deref() == Some("KEY")) {
+                    cur.bump();
+                    let exact = expect_cardinality(cur, "SHOW FIELD KEY")?;
+                    return parse_cardinality_tail(cur, CardinalityKind::FieldKey, exact);
+                }
                 cur.expect_keyword("KEYS")?;
                 let (database, from) = parse_show_on_from(cur)?;
                 Ok(Statement::ShowFieldKeys(ShowFieldKeysStatement {
@@ -150,6 +188,9 @@ fn parse_show(cur: &mut TokenCursor<'_>) -> Result<Statement, HyperbytedbError> 
             }
             "SERIES" => {
                 cur.bump();
+                if let Some(exact) = parse_cardinality(cur) {
+                    return parse_cardinality_tail(cur, CardinalityKind::Series, exact);
+                }
                 let (mut database, from) = parse_show_on_from(cur)?;
                 let mut condition = None;
                 let mut limit = None;
@@ -245,6 +286,78 @@ fn parse_set(cur: &mut TokenCursor<'_>) -> Result<Statement, HyperbytedbError> {
         }
     };
     Ok(Statement::SetSetting { name, value })
+}
+
+/// An unquoted word's uppercase spelling: `EXACT` and `CARDINALITY` lex as
+/// identifiers, `KEY` as either.
+fn token_word(t: &Token) -> Option<String> {
+    match &t.kind {
+        TokenKind::Keyword(k) | TokenKind::Ident(k) => Some(k.to_ascii_uppercase()),
+        _ => None,
+    }
+}
+
+fn word_at(cur: &TokenCursor<'_>, offset: usize) -> Option<String> {
+    cur.tokens.get(cur.pos + offset).and_then(token_word)
+}
+
+/// Whether `[EXACT] CARDINALITY` comes next.
+fn peek_cardinality(cur: &TokenCursor<'_>) -> bool {
+    match word_at(cur, 0).as_deref() {
+        Some("CARDINALITY") => true,
+        Some("EXACT") => word_at(cur, 1).as_deref() == Some("CARDINALITY"),
+        _ => false,
+    }
+}
+
+/// Consumes `[EXACT] CARDINALITY` when it comes next: `Some(exact)`.
+fn parse_cardinality(cur: &mut TokenCursor<'_>) -> Option<bool> {
+    if !peek_cardinality(cur) {
+        return None;
+    }
+    let exact = word_at(cur, 0).as_deref() == Some("EXACT");
+    cur.bump();
+    if exact {
+        cur.bump();
+    }
+    Some(exact)
+}
+
+fn expect_cardinality(cur: &mut TokenCursor<'_>, what: &str) -> Result<bool, HyperbytedbError> {
+    parse_cardinality(cur).ok_or_else(|| {
+        HyperbytedbError::QueryParse(format!("expected [EXACT] CARDINALITY after {what}"))
+    })
+}
+
+/// `[ON db] [FROM m | WITH MEASUREMENT ...] [WHERE ...] [LIMIT n] [OFFSET n]`
+/// after `SHOW <noun> [EXACT] CARDINALITY`.
+fn parse_cardinality_tail(
+    cur: &mut TokenCursor<'_>,
+    kind: CardinalityKind,
+    exact: bool,
+) -> Result<Statement, HyperbytedbError> {
+    let (database, from) = parse_show_on_from(cur)?;
+    let mut stmt = ShowCardinalityStatement {
+        kind,
+        exact,
+        database,
+        from,
+        measurement_filter: None,
+        condition: None,
+        limit: None,
+        offset: None,
+    };
+    if matches!(stmt.kind, CardinalityKind::Measurement) {
+        stmt.measurement_filter = parse_with_measurement(cur)?;
+    }
+    parse_show_tail(
+        cur,
+        &mut stmt.database,
+        &mut stmt.condition,
+        &mut stmt.limit,
+        &mut stmt.offset,
+    )?;
+    Ok(Statement::ShowCardinality(stmt))
 }
 
 fn parse_show_tail(
@@ -1275,6 +1388,107 @@ mod tests {
         match stmt {
             Statement::ShowSeries(s) => assert_eq!(s.limit, Some(0)),
             other => panic!("expected ShowSeries, got {other:?}"),
+        }
+    }
+
+    fn cardinality(q: &str) -> ShowCardinalityStatement {
+        match parse_ddl_statement(q) {
+            Ok(Statement::ShowCardinality(s)) => s,
+            other => panic!("{q}: expected ShowCardinality, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn show_cardinality_forms() {
+        let s = cardinality("SHOW SERIES CARDINALITY");
+        assert!(matches!(s.kind, CardinalityKind::Series));
+        assert!(!s.exact);
+        assert!(s.database.is_none() && s.from.is_none() && s.condition.is_none());
+
+        let s = cardinality(
+            r#"show series exact cardinality on telegraf from "cpu" where "host" = 'a' limit 2 offset 1"#,
+        );
+        assert!(matches!(s.kind, CardinalityKind::Series));
+        assert!(s.exact);
+        assert_eq!(s.database.as_deref(), Some("telegraf"));
+        assert_eq!(s.from.as_ref().and_then(|m| m.name_str()), Some("cpu"));
+        assert!(s.condition.is_some());
+        assert_eq!((s.limit, s.offset), (Some(2), Some(1)));
+
+        let s = cardinality("SHOW MEASUREMENT CARDINALITY ON telegraf");
+        assert!(matches!(s.kind, CardinalityKind::Measurement));
+        assert_eq!(s.database.as_deref(), Some("telegraf"));
+
+        let s = cardinality("SHOW MEASUREMENT EXACT CARDINALITY WITH MEASUREMENT =~ /cpu.*/");
+        assert!(matches!(s.kind, CardinalityKind::Measurement));
+        assert!(s.exact);
+        assert!(matches!(
+            s.measurement_filter,
+            Some(TagKeySelector::Regex(_))
+        ));
+
+        let s = cardinality("SHOW TAG KEY CARDINALITY FROM cpu");
+        assert!(matches!(s.kind, CardinalityKind::TagKey));
+        assert_eq!(s.from.as_ref().and_then(|m| m.name_str()), Some("cpu"));
+
+        let s = cardinality(
+            r#"SHOW TAG VALUES EXACT CARDINALITY FROM cpu WITH KEY = "host" WHERE "dc" = 'x'"#,
+        );
+        assert!(s.exact);
+        assert!(
+            matches!(&s.kind, CardinalityKind::TagValues(TagKeySelector::Eq(k)) if k == "host")
+        );
+        assert!(s.condition.is_some());
+
+        // Without WITH KEY, every key, as plain SHOW TAG VALUES here.
+        let s = cardinality("SHOW TAG VALUES CARDINALITY");
+        assert!(matches!(
+            &s.kind,
+            CardinalityKind::TagValues(TagKeySelector::All)
+        ));
+
+        let s = cardinality("SHOW TAG VALUES CARDINALITY WITH KEY IN (host, cpu)");
+        assert!(
+            matches!(&s.kind, CardinalityKind::TagValues(TagKeySelector::In(k)) if k.len() == 2)
+        );
+
+        let s = cardinality("SHOW FIELD KEY EXACT CARDINALITY ON telegraf");
+        assert!(matches!(s.kind, CardinalityKind::FieldKey));
+        assert!(s.exact);
+    }
+
+    #[test]
+    fn show_cardinality_does_not_change_the_plain_shows() {
+        assert!(matches!(
+            parse_ddl_statement("SHOW SERIES FROM cpu"),
+            Ok(Statement::ShowSeries(_))
+        ));
+        assert!(matches!(
+            parse_ddl_statement("SHOW TAG VALUES WITH KEY = host"),
+            Ok(Statement::ShowTagValues(_))
+        ));
+        assert!(matches!(
+            parse_ddl_statement("SHOW FIELD KEYS"),
+            Ok(Statement::ShowFieldKeys(_))
+        ));
+        // A measurement named like the word is still a FROM target.
+        assert!(matches!(
+            parse_ddl_statement(r#"SHOW SERIES FROM "cardinality""#),
+            Ok(Statement::ShowSeries(_))
+        ));
+    }
+
+    #[test]
+    fn show_cardinality_rejects_malformed() {
+        for q in [
+            "SHOW MEASUREMENT",
+            "SHOW MEASUREMENT EXACT",
+            "SHOW TAG KEY",
+            "SHOW FIELD KEY",
+            "SHOW SERIES EXACT",
+            "SHOW TAG VALUES CARDINALITY WITH",
+        ] {
+            assert!(parse_ddl_statement(q).is_err(), "{q} should not parse");
         }
     }
 

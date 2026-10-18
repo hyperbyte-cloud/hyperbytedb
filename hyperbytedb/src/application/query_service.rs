@@ -495,6 +495,13 @@ fn statement_auth_targets(stmt: &Statement, request_db: &str) -> StatementAuthTa
                 s.database.as_deref().unwrap_or(request_db),
             );
         }
+        Statement::ShowCardinality(s) => {
+            let from_db = s.from.as_ref().and_then(|m| m.database.as_deref());
+            push_db_unique(
+                &mut targets.read,
+                from_db.or(s.database.as_deref()).unwrap_or(request_db),
+            );
+        }
         Statement::ShowDatabases
         | Statement::ShowUsers
         | Statement::ShowContinuousQueries
@@ -577,6 +584,7 @@ fn is_mutating_statement(stmt: &Statement) -> bool {
         | Statement::ShowTagValues(_)
         | Statement::ShowFieldKeys(_)
         | Statement::ShowSeries(_)
+        | Statement::ShowCardinality(_)
         | Statement::ShowRetentionPolicies(_)
         | Statement::ShowUsers
         | Statement::ShowGrants(_)
@@ -1206,6 +1214,9 @@ async fn execute_statement(
                 series: Some(all_series),
                 error: None,
             })
+        }
+        Statement::ShowCardinality(s) => {
+            execute_show_cardinality(svc, db, s, query_rp, statement_id).await
         }
         Statement::ShowSeries(s) => {
             use crate::domain::series::SeriesKey;
@@ -2923,6 +2934,228 @@ async fn execute_local_measurement_query(
 }
 
 /// A SHOW's OFFSET then LIMIT over its rows (they were ignored).
+/// `SHOW ... CARDINALITY`. Without a WHERE every count comes from a metadata
+/// cache: the series index (per region range when sharded, each peer
+/// counting its own), the tag value counts, and the measurement metadata for
+/// tag and field keys. A WHERE is matched against each series' tags, so it
+/// reads the series list, as SHOW TAG VALUES ... WHERE does.
+///
+/// The counts are exact. Without EXACT, series cardinality with no FROM or
+/// WHERE, and measurement cardinality with no WITH or WHERE, are reported the
+/// way InfluxDB 1.x reports its estimate: one `cardinality estimation` row.
+/// Everything else is one `count` row per measurement, as InfluxDB 1.x does.
+async fn execute_show_cardinality(
+    svc: &QueryServiceImpl,
+    db: &str,
+    s: &ShowCardinalityStatement,
+    query_rp: Option<&str>,
+    statement_id: u32,
+) -> Result<StatementResult, HyperbytedbError> {
+    use crate::application::shard_metadata_scatter::{
+        local_field_keys, scatter_field_keys, scatter_series_count, scatter_series_tags,
+    };
+    use crate::application::tag_condition::TagPredicate;
+    use futures::stream::{self, StreamExt, TryStreamExt};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let from_db = s.from.as_ref().and_then(|m| m.database.as_deref());
+    let db = from_db.or(s.database.as_deref()).unwrap_or(db);
+    if db.is_empty() {
+        return Ok(StatementResult {
+            statement_id,
+            series: Some(vec![]),
+            error: Some("database is required".to_string()),
+        });
+    }
+    if matches!(s.kind, CardinalityKind::FieldKey) && s.condition.is_some() {
+        return Err(HyperbytedbError::QueryParse(
+            "SHOW FIELD KEY CARDINALITY does not support WHERE: fields are not indexed by tag"
+                .to_string(),
+        ));
+    }
+    let from_rp = s.from.as_ref().and_then(|m| m.retention_policy.as_deref());
+    let rp =
+        resolve_retention_policy_for_select(svc.metadata.as_ref(), db, from_rp, query_rp).await?;
+    let rp = rp.as_str();
+    let predicate = s
+        .condition
+        .as_ref()
+        .map(TagPredicate::compile)
+        .transpose()?;
+    let shard = svc.shard_routing.as_ref();
+    let metadata = svc.metadata.as_ref();
+
+    // The tags of the measurement's series that match the WHERE.
+    let matching_series = |m: String| {
+        let predicate = predicate.as_ref();
+        async move {
+            let all: Vec<BTreeMap<String, String>> = match shard {
+                Some(ctx) => scatter_series_tags(ctx, metadata, db, rp, &m).await?,
+                None => metadata
+                    .list_series(db, rp, &m)
+                    .await?
+                    .into_iter()
+                    .map(|(_, tags)| tags)
+                    .collect(),
+            };
+            let matching: Vec<_> = all
+                .into_iter()
+                .filter(|t| predicate.is_none_or(|p| p.matches(t)))
+                .collect();
+            Ok::<_, HyperbytedbError>((m, matching))
+        }
+    };
+
+    if let CardinalityKind::Measurement = s.kind {
+        let names = list_measurements_for_rp(svc, db, rp).await?;
+        let mut names = filter_names_by_selector(&names, s.measurement_filter.as_ref());
+        if predicate.is_some() {
+            let with_match: Vec<String> = stream::iter(names)
+                .map(matching_series)
+                .buffered(CARDINALITY_CONCURRENCY)
+                .try_filter_map(|(m, series)| async move { Ok((!series.is_empty()).then_some(m)) })
+                .try_collect()
+                .await?;
+            names = with_match;
+        }
+        let estimate = !s.exact && s.measurement_filter.is_none() && s.condition.is_none();
+        return Ok(cardinality_total(
+            statement_id,
+            estimate,
+            names.len() as u64,
+        ));
+    }
+
+    let measurements: Vec<String> = match s.from.as_ref().map(|m| &m.name) {
+        Some(MeasurementName::Name(n)) => vec![n.clone()],
+        Some(MeasurementName::Regex(pattern)) => {
+            let all = metadata.list_measurements(db).await?;
+            let matches = regex_pattern_matches(pattern);
+            all.into_iter().filter(|m| matches(m)).collect()
+        }
+        None => metadata.list_measurements(db).await?,
+    };
+
+    let tag_keys = |m: String| async move {
+        let keys = match shard {
+            Some(ctx) => scatter_tag_keys(ctx, metadata, db, rp, &m).await?,
+            None => metadata.list_tag_keys(db, rp, Some(&m)).await?,
+        };
+        Ok::<_, HyperbytedbError>(keys)
+    };
+
+    let has_predicate = predicate.is_some();
+    let count_one = |m: String| async move {
+        let n: u64 = match (&s.kind, has_predicate) {
+            (CardinalityKind::Series, false) => match shard {
+                Some(ctx) => scatter_series_count(ctx, metadata, db, rp, &m).await?,
+                None => {
+                    metadata
+                        .count_series_ids_in_range(db, rp, &m, 0, u64::MAX)
+                        .await?
+                }
+            },
+            (CardinalityKind::Series, true) => matching_series(m.clone()).await?.1.len() as u64,
+            (CardinalityKind::TagKey, false) => tag_keys(m.clone()).await?.len() as u64,
+            (CardinalityKind::TagKey, true) => {
+                let (_, series) = matching_series(m.clone()).await?;
+                let keys: BTreeSet<&String> = series.iter().flat_map(|t| t.keys()).collect();
+                keys.len() as u64
+            }
+            (CardinalityKind::TagValues(selector), false) => {
+                let keys = filter_names_by_selector(&tag_keys(m.clone()).await?, Some(selector));
+                let mut n = 0u64;
+                for key in &keys {
+                    n += match shard {
+                        Some(ctx) => scatter_tag_values(ctx, metadata, db, rp, &m, key)
+                            .await?
+                            .len() as u64,
+                        None => metadata.count_tag_values(db, rp, key, Some(&m)).await? as u64,
+                    };
+                }
+                n
+            }
+            (CardinalityKind::TagValues(selector), true) => {
+                let (_, series) = matching_series(m.clone()).await?;
+                let mut pairs = BTreeSet::new();
+                for tags in &series {
+                    let keys: Vec<String> = tags.keys().cloned().collect();
+                    for key in filter_names_by_selector(&keys, Some(selector)) {
+                        let value = &tags[&key];
+                        pairs.insert((key, value.clone()));
+                    }
+                }
+                pairs.len() as u64
+            }
+            (CardinalityKind::FieldKey, _) => {
+                match shard {
+                    Some(ctx) => scatter_field_keys(ctx, metadata, db, rp, &m).await?.len() as u64,
+                    None => local_field_keys(metadata.get_measurement(db, rp, &m).await?.as_ref())
+                        .len() as u64,
+                }
+            }
+            (CardinalityKind::Measurement, _) => unreachable!("handled above"),
+        };
+        Ok::<_, HyperbytedbError>((m, n))
+    };
+
+    let counts: Vec<(String, u64)> = stream::iter(measurements)
+        .map(count_one)
+        .buffered(CARDINALITY_CONCURRENCY)
+        .try_collect()
+        .await?;
+
+    if matches!(s.kind, CardinalityKind::Series)
+        && !s.exact
+        && s.from.is_none()
+        && s.condition.is_none()
+    {
+        let total = counts.iter().map(|(_, n)| n).sum();
+        return Ok(cardinality_total(statement_id, true, total));
+    }
+    let series = counts
+        .into_iter()
+        .filter(|(_, n)| *n > 0)
+        .map(|(m, n)| SeriesResult {
+            name: m,
+            tags: None,
+            columns: vec!["count".to_string()],
+            values: vec![vec![serde_json::json!(n)]],
+            partial: None,
+        })
+        .collect();
+    Ok(StatementResult {
+        statement_id,
+        series: Some(limit_offset(series, s.limit, s.offset)),
+        error: None,
+    })
+}
+
+/// Measurements counted at once by SHOW ... CARDINALITY. Each may scatter
+/// to every region's peer when sharded.
+const CARDINALITY_CONCURRENCY: usize = 8;
+
+/// One total: under `cardinality estimation` where InfluxDB 1.x reports an
+/// estimate, else `count`.
+fn cardinality_total(statement_id: u32, estimate: bool, total: u64) -> StatementResult {
+    let column = if estimate {
+        "cardinality estimation"
+    } else {
+        "count"
+    };
+    StatementResult {
+        statement_id,
+        series: Some(vec![SeriesResult {
+            name: String::new(),
+            tags: None,
+            columns: vec![column.to_string()],
+            values: vec![vec![serde_json::json!(total)]],
+            partial: None,
+        }]),
+        error: None,
+    }
+}
+
 fn limit_offset<T>(rows: Vec<T>, limit: Option<u64>, offset: Option<u64>) -> Vec<T> {
     let skip = usize::try_from(offset.unwrap_or(0)).unwrap_or(usize::MAX);
     let take = limit.map_or(usize::MAX, |l| usize::try_from(l).unwrap_or(usize::MAX));

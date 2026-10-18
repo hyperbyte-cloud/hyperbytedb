@@ -594,6 +594,204 @@ async fn show_series_canonical_format() {
 }
 
 // ---------------------------------------------------------------------------
+// SHOW ... CARDINALITY
+// ---------------------------------------------------------------------------
+
+/// Two measurements, Telegraf-shaped: cpu has 3 hosts x 2 cpus, mem 2 hosts.
+async fn cardinality_ctx() -> TestContext {
+    let ctx = TestContext::new_no_chdb().unwrap();
+    ctx.metadata.create_database("testdb").await.unwrap();
+    // Counts come from the series index once it is warmed, as at startup;
+    // the writes below then go through it.
+    ctx.metadata.warm_series().await.unwrap();
+    let mut lp = String::new();
+    for host in ["a", "b", "c"] {
+        for cpu in ["cpu0", "cpu1"] {
+            lp.push_str(&format!(
+                "cpu,host={host},cpu={cpu},dc=x usage_idle=1,usage_user=2 1000000000\n"
+            ));
+        }
+    }
+    lp.push_str("mem,host=a used=1 1000000000\nmem,host=b used=1 1000000000\n");
+    // A second write of a series must not count it twice.
+    lp.push_str("cpu,host=a,cpu=cpu0,dc=x usage_idle=3,usage_user=4 2000000000\n");
+    ctx.ingestion
+        .ingest(
+            "testdb",
+            None,
+            None,
+            lp.as_bytes(),
+            WritePayloadFormat::LineProtocol,
+        )
+        .await
+        .unwrap();
+    ctx
+}
+
+/// `(series name, columns, single value)` of each result series.
+async fn cardinality_rows(ctx: &TestContext, q: &str) -> Vec<(String, Vec<String>, u64)> {
+    let resp = ctx.query("testdb", q).await.unwrap();
+    let result = &resp.results[0];
+    assert!(result.error.is_none(), "{q}: {:?}", result.error);
+    result
+        .series
+        .as_ref()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            assert_eq!(s.values.len(), 1, "{q}: one row per series");
+            (
+                s.name.clone(),
+                s.columns.clone(),
+                s.values[0][0].as_u64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+fn count(name: &str, n: u64) -> (String, Vec<String>, u64) {
+    (name.to_string(), vec!["count".to_string()], n)
+}
+
+fn estimate(n: u64) -> (String, Vec<String>, u64) {
+    (String::new(), vec!["cardinality estimation".to_string()], n)
+}
+
+#[tokio::test]
+async fn show_series_cardinality() {
+    let ctx = cardinality_ctx().await;
+    assert_eq!(
+        cardinality_rows(&ctx, "SHOW SERIES CARDINALITY").await,
+        vec![estimate(8)]
+    );
+    assert_eq!(
+        cardinality_rows(&ctx, "SHOW SERIES CARDINALITY ON testdb").await,
+        vec![estimate(8)]
+    );
+    assert_eq!(
+        cardinality_rows(&ctx, "SHOW SERIES EXACT CARDINALITY").await,
+        vec![count("cpu", 6), count("mem", 2)]
+    );
+    assert_eq!(
+        cardinality_rows(&ctx, "SHOW SERIES CARDINALITY FROM cpu").await,
+        vec![count("cpu", 6)]
+    );
+    assert_eq!(
+        cardinality_rows(&ctx, r#"SHOW SERIES CARDINALITY WHERE "host" = 'a'"#).await,
+        vec![count("cpu", 2), count("mem", 1)]
+    );
+    // A measurement with no matching series has no row, as in InfluxDB.
+    assert_eq!(
+        cardinality_rows(&ctx, r#"SHOW SERIES CARDINALITY WHERE "cpu" = 'cpu1'"#).await,
+        vec![count("cpu", 3)]
+    );
+    assert_eq!(
+        cardinality_rows(&ctx, "SHOW SERIES EXACT CARDINALITY LIMIT 1 OFFSET 1").await,
+        vec![count("mem", 2)]
+    );
+
+    // The same numbers as counting SHOW SERIES.
+    let resp = ctx.query("testdb", "SHOW SERIES").await.unwrap();
+    let listed = resp.results[0].series.as_ref().unwrap()[0].values.len();
+    assert_eq!(listed, 8);
+
+    ctx.query("testdb", r#"DROP SERIES FROM "mem""#)
+        .await
+        .unwrap();
+    assert_eq!(
+        cardinality_rows(&ctx, "SHOW SERIES CARDINALITY").await,
+        vec![estimate(6)]
+    );
+}
+
+#[tokio::test]
+async fn show_measurement_cardinality() {
+    let ctx = cardinality_ctx().await;
+    assert_eq!(
+        cardinality_rows(&ctx, "SHOW MEASUREMENT CARDINALITY").await,
+        vec![estimate(2)]
+    );
+    assert_eq!(
+        cardinality_rows(&ctx, "SHOW MEASUREMENT EXACT CARDINALITY").await,
+        vec![count("", 2)]
+    );
+    assert_eq!(
+        cardinality_rows(&ctx, "SHOW MEASUREMENT CARDINALITY WITH MEASUREMENT = cpu").await,
+        vec![count("", 1)]
+    );
+    assert_eq!(
+        cardinality_rows(&ctx, r#"SHOW MEASUREMENT CARDINALITY WHERE "cpu" = 'cpu0'"#).await,
+        vec![count("", 1)]
+    );
+}
+
+#[tokio::test]
+async fn show_tag_and_field_key_cardinality() {
+    let ctx = cardinality_ctx().await;
+    assert_eq!(
+        cardinality_rows(&ctx, "SHOW TAG KEY CARDINALITY").await,
+        vec![count("cpu", 3), count("mem", 1)]
+    );
+    assert_eq!(
+        cardinality_rows(&ctx, "SHOW TAG KEY EXACT CARDINALITY FROM cpu").await,
+        vec![count("cpu", 3)]
+    );
+    assert_eq!(
+        cardinality_rows(&ctx, r#"SHOW TAG KEY CARDINALITY WHERE "host" = 'b'"#).await,
+        vec![count("cpu", 3), count("mem", 1)]
+    );
+    assert_eq!(
+        cardinality_rows(&ctx, "SHOW FIELD KEY CARDINALITY").await,
+        vec![count("cpu", 2), count("mem", 1)]
+    );
+    let resp = ctx
+        .query("testdb", r#"SHOW FIELD KEY CARDINALITY WHERE "host" = 'a'"#)
+        .await;
+    let rejected = match resp {
+        Err(_) => true,
+        Ok(r) => r.results[0].error.is_some(),
+    };
+    assert!(
+        rejected,
+        "a WHERE on field key cardinality is refused, not ignored"
+    );
+}
+
+#[tokio::test]
+async fn show_tag_values_cardinality() {
+    let ctx = cardinality_ctx().await;
+    assert_eq!(
+        cardinality_rows(&ctx, r#"SHOW TAG VALUES CARDINALITY WITH KEY = "host""#).await,
+        vec![count("cpu", 3), count("mem", 2)]
+    );
+    assert_eq!(
+        cardinality_rows(
+            &ctx,
+            r#"SHOW TAG VALUES EXACT CARDINALITY FROM cpu WITH KEY IN ("host", "cpu")"#
+        )
+        .await,
+        vec![count("cpu", 5)]
+    );
+    assert_eq!(
+        cardinality_rows(
+            &ctx,
+            r#"SHOW TAG VALUES CARDINALITY FROM cpu WITH KEY = "cpu" WHERE "host" = 'a'"#
+        )
+        .await,
+        vec![count("cpu", 2)]
+    );
+    // The same number as counting SHOW TAG VALUES.
+    let resp = ctx
+        .query(
+            "testdb",
+            r#"SHOW TAG VALUES FROM cpu WITH KEY IN ("host", "cpu")"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.results[0].series.as_ref().unwrap()[0].values.len(), 5);
+}
+
+// ---------------------------------------------------------------------------
 // SHOW RETENTION POLICIES
 // ---------------------------------------------------------------------------
 

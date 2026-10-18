@@ -111,6 +111,80 @@ fn series_prefix(db: &str, rp: &str, measurement: &str) -> String {
     format!("series:{db}:{rp}:{measurement}:")
 }
 
+/// The storage keys of the series this node has persisted, and how many each
+/// measurement has. One structure so the counts cannot drift from the keys:
+/// every insert, removal and reload goes through it. The API mirrors the
+/// `HashSet` it replaces.
+#[derive(Default)]
+struct SeriesIndex {
+    keys: HashSet<String>,
+    /// `series_prefix(db, rp, measurement)` → keys with it.
+    counts: HashMap<String, u64>,
+}
+
+impl SeriesIndex {
+    /// The key's measurement prefix: everything up to its last `:` (the id
+    /// is fixed-width hex, so it holds none).
+    fn prefix_of(key: &str) -> &str {
+        key.rfind(':').map_or(key, |i| &key[..=i])
+    }
+
+    fn contains(&self, key: &str) -> bool {
+        self.keys.contains(key)
+    }
+
+    fn insert(&mut self, key: String) -> bool {
+        let prefix = Self::prefix_of(&key).to_string();
+        if !self.keys.insert(key) {
+            return false;
+        }
+        *self.counts.entry(prefix).or_default() += 1;
+        true
+    }
+
+    fn remove(&mut self, key: &str) -> bool {
+        if !self.keys.remove(key) {
+            return false;
+        }
+        Self::decrement(&mut self.counts, Self::prefix_of(key));
+        true
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&String) -> bool) {
+        let counts = &mut self.counts;
+        self.keys.retain(|k| {
+            let kept = keep(k);
+            if !kept {
+                Self::decrement(counts, Self::prefix_of(k));
+            }
+            kept
+        });
+    }
+
+    fn replace(&mut self, keys: HashSet<String>) {
+        let mut counts: HashMap<String, u64> = HashMap::new();
+        for k in &keys {
+            *counts.entry(Self::prefix_of(k).to_string()).or_default() += 1;
+        }
+        self.keys = keys;
+        self.counts = counts;
+    }
+
+    /// Series of the measurement whose prefix is `prefix`.
+    fn count(&self, prefix: &str) -> u64 {
+        self.counts.get(prefix).copied().unwrap_or(0)
+    }
+
+    fn decrement(counts: &mut HashMap<String, u64>, prefix: &str) {
+        if let Some(n) = counts.get_mut(prefix) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                counts.remove(prefix);
+            }
+        }
+    }
+}
+
 /// Parse `series:{db}:{rp}:{measurement}:{id_hex}`. Assumes db/rp/measurement are
 /// `:`-free (same assumption as [`parse_tag_val_storage_key`]).
 fn parse_series_storage_key(key: &str) -> Option<(String, String, String, u64)> {
@@ -154,8 +228,12 @@ pub struct RocksDbMetadata {
     /// `(db, measurement, tag_key)` → distinct tag value count.
     tag_count_cache: RwLock<HashMap<String, usize>>,
     /// Storage-key strings of series already persisted, for O(1) dedup on the
-    /// flush path. Mirrors `tag_known`. Warmed by `warm_series`.
-    series_known: RwLock<HashSet<String>>,
+    /// flush path, with each measurement's count for SHOW SERIES CARDINALITY.
+    /// Mirrors `tag_known`. Warmed by `warm_series`.
+    series_known: RwLock<SeriesIndex>,
+    /// Whether `series_known` was warmed from storage, so it holds every
+    /// series and its counts can stand in for a scan.
+    series_warmed: std::sync::atomic::AtomicBool,
     /// User record cache: `username → StoredUser`.
     user_cache: RwLock<HashMap<String, StoredUser>>,
     /// Generation-gated measurement list: `db → (generation, names)`.
@@ -244,7 +322,8 @@ impl RocksDbMetadata {
             meas_cache: RwLock::new(HashMap::new()),
             tag_known: RwLock::new(HashSet::new()),
             tag_count_cache: RwLock::new(HashMap::new()),
-            series_known: RwLock::new(HashSet::new()),
+            series_known: RwLock::new(SeriesIndex::default()),
+            series_warmed: std::sync::atomic::AtomicBool::new(false),
             user_cache: RwLock::new(HashMap::new()),
             meas_list_cache: RwLock::new(HashMap::new()),
             tombstone_cache: RwLock::new(HashMap::new()),
@@ -1464,6 +1543,13 @@ impl MetadataPort for RocksDbMetadata {
         end: u64,
     ) -> Result<u64, HyperbytedbError> {
         if start == 0 && end == u64::MAX {
+            // The whole measurement: the warmed index has its count.
+            if self.series_warmed.load(Ordering::Acquire) {
+                return Ok(self
+                    .series_known
+                    .read()
+                    .count(&series_prefix(db, rp, measurement)));
+            }
             return self
                 .list_series_ids(db, rp, measurement)
                 .await
@@ -1526,7 +1612,8 @@ impl MetadataPort for RocksDbMetadata {
         })??;
 
         let warmed = keys.len();
-        *self.series_known.write() = keys;
+        self.series_known.write().replace(keys);
+        self.series_warmed.store(true, Ordering::Release);
         Ok(warmed)
     }
 
@@ -2472,6 +2559,109 @@ impl MetadataPort for RocksDbMetadata {
 #[cfg(test)]
 mod series_range_tests {
     use super::*;
+
+    #[test]
+    fn series_index_counts_follow_every_mutation() {
+        let key = |m: &str, id: u64| format!("{}{id:016x}", series_prefix("db", "rp", m));
+        let cpu = series_prefix("db", "rp", "cpu");
+        let mem = series_prefix("db", "rp", "mem");
+        let mut idx = SeriesIndex::default();
+        for id in 0..10 {
+            assert!(idx.insert(key("cpu", id)));
+        }
+        assert!(
+            !idx.insert(key("cpu", 3)),
+            "a duplicate is not counted twice"
+        );
+        idx.insert(key("mem", 1));
+        assert_eq!((idx.count(&cpu), idx.count(&mem)), (10, 1));
+
+        assert!(idx.remove(&key("cpu", 0)));
+        assert!(
+            !idx.remove(&key("cpu", 0)),
+            "an absent key is not counted down"
+        );
+        assert_eq!(idx.count(&cpu), 9);
+
+        idx.retain(|k| !k.starts_with(&cpu) || k.ends_with('9'));
+        assert_eq!((idx.count(&cpu), idx.count(&mem)), (1, 1));
+
+        idx.retain(|k| !k.starts_with(&mem));
+        assert_eq!(idx.count(&mem), 0);
+        assert!(
+            !idx.counts.contains_key(&mem),
+            "an emptied prefix is dropped"
+        );
+
+        idx.replace([key("mem", 5), key("mem", 6)].into());
+        assert_eq!((idx.count(&cpu), idx.count(&mem)), (0, 2));
+    }
+
+    /// The full-range count is answered from the series index once it is
+    /// warmed, and must agree with the series on disk after every kind of
+    /// series delete.
+    #[tokio::test]
+    async fn series_count_matches_disk_through_deletes() {
+        async fn assert_counts(meta: &RocksDbMetadata, step: &str) {
+            for m in ["cpu", "mem"] {
+                let on_disk = meta
+                    .list_series_ids("db", "autogen", m)
+                    .await
+                    .unwrap()
+                    .len() as u64;
+                let counted = meta
+                    .count_series_ids_in_range("db", "autogen", m, 0, u64::MAX)
+                    .await
+                    .unwrap();
+                assert_eq!(counted, on_disk, "{step}: {m}");
+            }
+        }
+        async fn register(meta: &RocksDbMetadata, m: &str, ids: std::ops::Range<u64>) {
+            let series: Vec<(u64, BTreeMap<String, String>)> = ids
+                .map(|id| (id, [("host".to_string(), format!("h{id}"))].into()))
+                .collect();
+            meta.register_series_batch("db", "autogen", m, &series)
+                .await
+                .unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let meta = RocksDbMetadata::open(dir.path()).unwrap();
+        meta.create_database("db").await.unwrap();
+        register(&meta, "cpu", 0..40).await;
+        assert!(!meta.series_warmed.load(Ordering::Acquire));
+        assert_counts(&meta, "before warm").await;
+
+        meta.warm_series().await.unwrap();
+        assert_eq!(
+            meta.count_series_ids_in_range("db", "autogen", "cpu", 0, u64::MAX)
+                .await
+                .unwrap(),
+            40
+        );
+        register(&meta, "cpu", 30..60).await;
+        register(&meta, "mem", 0..5).await;
+        assert_counts(&meta, "after overlapping writes").await;
+
+        meta.delete_series_in_range("db", "autogen", "cpu", 10, 20)
+            .await
+            .unwrap();
+        assert_counts(&meta, "after range delete").await;
+
+        meta.delete_series_matching("db", "autogen", Some("mem"), "")
+            .await
+            .unwrap();
+        assert_counts(&meta, "after DROP SERIES FROM mem").await;
+
+        register(&meta, "mem", 0..3).await;
+        meta.delete_measurement("db", "autogen", "cpu")
+            .await
+            .unwrap();
+        assert_counts(&meta, "after DROP MEASUREMENT").await;
+
+        meta.drop_database("db").await.unwrap();
+        assert_counts(&meta, "after DROP DATABASE").await;
+    }
 
     /// Dropping a database removes its own metadata and nothing of a database
     /// whose name it prefixes. "db:{name}" was matched as a prefix, so

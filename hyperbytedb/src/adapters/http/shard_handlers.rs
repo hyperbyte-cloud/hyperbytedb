@@ -1557,6 +1557,26 @@ pub async fn handle_shard_metadata(
                     .into_response(),
             }
         }
+        ShardMetadataKind::SeriesCount => {
+            match state
+                .metadata
+                .count_series_ids_in_range(
+                    &req.db,
+                    &req.rp,
+                    &req.measurement,
+                    region.start,
+                    region.end,
+                )
+                .await
+            {
+                Ok(count) => Json(serde_json::json!({"count": count})).into_response(),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+                    .into_response(),
+            }
+        }
         ShardMetadataKind::Series => {
             match state
                 .metadata
