@@ -780,66 +780,81 @@ async fn error_response_is_json_with_error_field() {
 // Field type conflicts
 // ---------------------------------------------------------------------------
 
-/// A field written as a float then as a string is refused, as InfluxDB does.
-/// The conflicting value was accepted (204) and stored as null: the check
-/// compared the stored type with the batch merged into it, which kept the
-/// stored type.
+/// A point with a field of another type than the stored one (a string into a
+/// float) is dropped and the rest of the write stored, as by InfluxDB: 400
+/// `partial write: field type conflict: ... dropped=N`. Such points used to be
+/// accepted (204) with the field stored as null: the check compared the stored
+/// types with the batch merged into them, which kept the stored type.
 #[tokio::test]
-async fn field_type_conflicts_are_refused_not_nulled() {
+async fn field_type_conflicts_are_a_partial_write_not_null() {
     let ctx = HttpTestContext::new().await;
     ctx.create_db("db").await;
-    assert_eq!(
-        ctx.write("db", "m v=1 1000000000").await.status(),
-        StatusCode::NO_CONTENT
-    );
+    let status = |resp: &reqwest::Response| resp.status();
+    let resp = ctx.write("db", "m v=1 1000000000").await;
+    assert_eq!(status(&resp), StatusCode::NO_CONTENT);
 
     let resp = ctx.write("db", r#"m v="text" 2000000000"#).await;
     assert_eq!(
-        resp.status(),
+        status(&resp),
         StatusCode::BAD_REQUEST,
         "a later write of another type"
     );
     let body = resp.text().await.unwrap();
-    assert!(body.contains("field type conflict"), "{body}");
+    assert!(
+        body.contains("partial write: field type conflict") && body.contains("dropped=1"),
+        "{body}"
+    );
 
-    // Within one batch, on a measurement with no stored types yet.
+    // Mixed: the conflicting point is dropped, the others kept.
+    let resp = ctx
+        .write(
+            "db",
+            "m v=3 3000000000\nm v=\"x\" 4000000000\nm v=4 5000000000\nm w=\"s\" 6000000000",
+        )
+        .await;
+    assert_eq!(status(&resp), StatusCode::BAD_REQUEST);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("dropped=1"), "{body}");
+
+    // Within one batch, on a measurement with no stored types: the first
+    // type wins, as in InfluxDB.
     let resp = ctx
         .write("db", "n v=1 1000000000\nn v=\"text\" 2000000000")
         .await;
     assert_eq!(
-        resp.status(),
+        status(&resp),
         StatusCode::BAD_REQUEST,
         "a conflict within one batch"
     );
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("dropped=1"), "{body}");
 
     // Compatible types still widen: integer into float, integer into unsigned.
     assert_eq!(
-        ctx.write("db", "m v=2i 3000000000").await.status(),
+        status(&ctx.write("db", "m v=2i 7000000000").await),
         StatusCode::NO_CONTENT
     );
-    assert_eq!(
-        ctx.write("db", "u c=1i 1000000000\nu c=2u 2000000000")
-            .await
-            .status(),
-        StatusCode::NO_CONTENT
-    );
+    let resp = ctx
+        .write("db", "u c=1i 1000000000\nu c=2u 2000000000")
+        .await;
+    assert_eq!(status(&resp), StatusCode::NO_CONTENT);
 
-    // The refused writes left no metadata: v is still a float, and n was
-    // not created.
+    // The kept points registered their types; the dropped ones nothing.
     let doc = ctx
         .query_json(&[("db", "db"), ("q", "SHOW FIELD KEYS FROM m")])
         .await;
     assert_eq!(
         doc["results"][0]["series"][0]["values"],
-        serde_json::json!([["v", "float"]]),
+        serde_json::json!([["v", "float"], ["w", "string"]]),
         "{doc}"
     );
     let doc = ctx
-        .query_json(&[("db", "db"), ("q", "SHOW MEASUREMENTS")])
+        .query_json(&[("db", "db"), ("q", "SHOW FIELD KEYS FROM n")])
         .await;
-    assert!(
-        !doc.to_string().contains("\"n\""),
-        "the refused batch created n: {doc}"
+    assert_eq!(
+        doc["results"][0]["series"][0]["values"],
+        serde_json::json!([["v", "float"]]),
+        "{doc}"
     );
 }
 

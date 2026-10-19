@@ -629,6 +629,75 @@ async fn register_series_entries(
 }
 
 /// Register measurements, validate field types, enforce cardinality, persist tag values (batched).
+/// The points whose fields fit the measurement's stored types, and the error
+/// for the rest. A point with a field of a type that cannot be widened to the
+/// stored one (a string into a float), or to the type an earlier point of the
+/// batch gave it, is dropped whole, as InfluxDB drops it; integers still widen
+/// into floats and into unsigned. `None` when nothing was dropped.
+///
+/// Callers write what is kept and then return the error: the client is told
+/// `partial write: field type conflict: ... dropped=N` (400), as by InfluxDB.
+pub async fn split_field_type_conflicts(
+    metadata: &Arc<dyn MetadataPort>,
+    db: &str,
+    rp: &str,
+    points: Vec<Point>,
+) -> Result<(Vec<Point>, Option<HyperbytedbError>), HyperbytedbError> {
+    // Per measurement: the type each field has so far, stored or batch.
+    let mut types: HashMap<String, HashMap<String, u8>> = HashMap::new();
+    let mut kept = Vec::with_capacity(points.len());
+    let mut dropped = 0usize;
+    let mut first: Option<HyperbytedbError> = None;
+    for point in points {
+        if !types.contains_key(&point.measurement) {
+            let stored = metadata
+                .get_measurement(db, rp, &point.measurement)
+                .await?
+                .map(|m| m.field_types)
+                .unwrap_or_default();
+            types.insert(point.measurement.clone(), stored);
+        }
+        let Some(known) = types.get_mut(&point.measurement) else {
+            continue;
+        };
+        let conflict = point.fields.iter().find_map(|(k, v)| {
+            let disc = v.type_discriminant();
+            let have = *known.get(k)?;
+            crate::domain::field_type::widen_field_disc(have, disc)
+                .is_none()
+                .then(|| HyperbytedbError::FieldTypeConflict {
+                    field: k.clone(),
+                    measurement: point.measurement.clone(),
+                    got: FieldValue::type_name_from_discriminant(disc).to_string(),
+                    expected: FieldValue::type_name_from_discriminant(have).to_string(),
+                })
+        });
+        if let Some(e) = conflict {
+            dropped += 1;
+            first.get_or_insert(e);
+            continue;
+        }
+        for (k, v) in &point.fields {
+            let disc = v.type_discriminant();
+            let widened = known
+                .get(k)
+                .and_then(|have| crate::domain::field_type::widen_field_disc(*have, disc))
+                .unwrap_or(disc);
+            known.insert(k.clone(), widened);
+        }
+        kept.push(point);
+    }
+    if dropped > 0 {
+        metrics::counter!("hyperbytedb_ingest_field_type_conflict_points_total")
+            .increment(dropped as u64);
+    }
+    let partial = first.map(|e| HyperbytedbError::PartialWrite {
+        reason: e.to_string(),
+        dropped,
+    });
+    Ok((kept, partial))
+}
+
 pub async fn prepare_batch_metadata(
     metadata: &Arc<dyn MetadataPort>,
     db: &str,
@@ -898,6 +967,63 @@ mod tests {
             timestamp: ts,
             series_id_cache: Default::default(),
         }
+    }
+
+    /// Conflicting points are split off; compatible types widen; within a
+    /// batch the first type of a new field wins, as in InfluxDB.
+    #[tokio::test]
+    async fn field_type_conflicts_are_split_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta: Arc<dyn MetadataPort> = Arc::new(RocksDbMetadata::open(dir.path()).unwrap());
+        meta.create_database("db").await.unwrap();
+        meta.register_measurement(
+            "db",
+            "autogen",
+            &MeasurementMeta {
+                name: "m".into(),
+                field_types: HashMap::from([("v".to_string(), 0u8)]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let points = vec![
+            point("m", &[("v", FieldValue::Integer(1))], 1), // widens into float
+            point("m", &[("v", FieldValue::String("x".into()))], 2),
+            point("m", &[("w", FieldValue::Boolean(true))], 3), // new field
+            point("m", &[("w", FieldValue::Float(1.0))], 4),    // w is a bool now
+            point(
+                "m",
+                &[
+                    ("v", FieldValue::Float(2.0)),
+                    ("w", FieldValue::Boolean(false)),
+                ],
+                5,
+            ),
+            point("n", &[("c", FieldValue::Integer(1))], 6),
+            point("n", &[("c", FieldValue::UInteger(2))], 7), // widens into unsigned
+        ];
+        let (kept, err) = split_field_type_conflicts(&meta, "db", "autogen", points)
+            .await
+            .unwrap();
+        let kept: Vec<i64> = kept.iter().map(|p| p.timestamp).collect();
+        assert_eq!(kept, [1, 3, 5, 6, 7]);
+        let Some(HyperbytedbError::PartialWrite { reason, dropped }) = err else {
+            panic!("expected a partial write, got {err:?}");
+        };
+        assert_eq!(dropped, 2);
+        assert!(
+            reason.contains(
+                r#"field "v" on measurement "m" is type string, already exists as type float"#
+            ),
+            "{reason}"
+        );
+
+        let ok = vec![point("m", &[("v", FieldValue::Float(3.0))], 8)];
+        let (kept, err) = split_field_type_conflicts(&meta, "db", "autogen", ok)
+            .await
+            .unwrap();
+        assert_eq!((kept.len(), err.is_none()), (1, true));
     }
 
     /// A SET changes the client-facing limits (every clone of them) and

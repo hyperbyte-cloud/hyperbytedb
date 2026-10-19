@@ -699,6 +699,14 @@ pub async fn forward_shard_writes_by_node(
         };
         for part in parsed {
             match part_outcome(node, &part) {
+                // A refused part drops every point the coordinator sent in it.
+                PartOutcome::Done(Err(HyperbytedbError::PartialWrite { reason, .. })) => {
+                    let dropped = forward.get(&part.region_id).map_or(0, Vec::len);
+                    results.push((
+                        part.region_id,
+                        Err(HyperbytedbError::PartialWrite { reason, dropped }),
+                    ));
+                }
                 PartOutcome::Done(r) => results.push((part.region_id, r)),
                 PartOutcome::Retry => {
                     if let Some(points) = forward.get(&part.region_id)
@@ -764,6 +772,13 @@ pub(crate) fn part_outcome(
             "region {} primary {node} is at write capacity",
             part.region_id
         )))),
+        // The primary refused the points (a field type conflict, a
+        // cardinality limit): a partial write, not a node to retry. The
+        // caller sets how many points that was.
+        400 | 422 => PartOutcome::Done(Err(HyperbytedbError::PartialWrite {
+            reason: part.error.clone().unwrap_or_default(),
+            dropped: 0,
+        })),
         s => PartOutcome::Done(Err(HyperbytedbError::PeerUnreachable(format!(
             "forward write for region {} to node {node} failed: {s} {}",
             part.region_id,
@@ -812,6 +827,7 @@ async fn try_forward_shard_write_to_region(
     if points.is_empty() {
         return Ok(());
     }
+    let point_count = points.len();
 
     let sid = series_id_for_point(&points[0]);
     let map = ctx.shard_map.snapshot().await?;
@@ -892,6 +908,17 @@ async fn try_forward_shard_write_to_region(
                     return Err(HyperbytedbError::ClusterUnavailable(format!(
                         "region {region_id} primary {peer_id} is at write capacity"
                     )));
+                }
+                if matches!(resp.status().as_u16(), 400 | 422) {
+                    let body = resp.text().await.unwrap_or_default();
+                    let reason = serde_json::from_str::<serde_json::Value>(&body)
+                        .ok()
+                        .and_then(|v| v["error"].as_str().map(str::to_owned))
+                        .unwrap_or(body);
+                    return Err(HyperbytedbError::PartialWrite {
+                        reason,
+                        dropped: point_count,
+                    });
                 }
                 if !resp.status().is_success() {
                     return Err(HyperbytedbError::PeerUnreachable(format!(
@@ -1807,6 +1834,13 @@ mod forward_batch_tests {
             part_outcome(2, &part(500)),
             PartOutcome::Done(Err(HyperbytedbError::PeerUnreachable(_)))
         ));
+        // The primary refused the points: a partial write, not a node down.
+        for status in [400, 422] {
+            assert!(matches!(
+                part_outcome(2, &part(status)),
+                PartOutcome::Done(Err(HyperbytedbError::PartialWrite { .. }))
+            ));
+        }
     }
 }
 

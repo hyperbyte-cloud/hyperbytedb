@@ -77,6 +77,12 @@ pub enum HyperbytedbError {
         expected: String,
     },
 
+    /// Some points were written and `dropped` were not, as InfluxDB's
+    /// `partial write`: a field type conflict, or a refusal by a region's
+    /// primary. Not worth retrying.
+    #[error("partial write: {reason} dropped={dropped}")]
+    PartialWrite { reason: String, dropped: usize },
+
     #[error("unable to parse '{line}': {reason}")]
     LineProtocolParse { line: String, reason: String },
 

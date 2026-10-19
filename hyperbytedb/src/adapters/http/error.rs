@@ -24,6 +24,7 @@ fn error_to_status_and_message(err: &HyperbytedbError) -> (StatusCode, String) {
         | HyperbytedbError::MsgpackParse { .. }
         | HyperbytedbError::ColumnarMsgpackParse { .. }
         | HyperbytedbError::FieldTypeConflict { .. }
+        | HyperbytedbError::PartialWrite { .. }
         | HyperbytedbError::WallClockTimestampUnavailable => StatusCode::BAD_REQUEST,
         HyperbytedbError::AuthFailed => StatusCode::UNAUTHORIZED,
         HyperbytedbError::Forbidden(_) => StatusCode::FORBIDDEN,

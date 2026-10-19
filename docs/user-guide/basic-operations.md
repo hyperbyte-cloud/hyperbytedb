@@ -92,7 +92,7 @@ gzip -c data.txt | curl -sS -XPOST 'http://localhost:8086/write?db=mydb' \
 | Code | Meaning |
 |------|---------|
 | 204 | Success (no body) |
-| 400 | Parse error or field type conflict |
+| 400 | Parse error, or `partial write` (points with a field type conflict dropped, the rest stored) |
 | 404 | Database not found |
 | 422 | Cardinality limit exceeded |
 

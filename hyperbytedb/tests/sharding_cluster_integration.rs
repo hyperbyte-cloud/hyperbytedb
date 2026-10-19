@@ -727,6 +727,10 @@ async fn coalesced_forwards_land_every_point() {
     let dir = tempfile::tempdir().unwrap();
     let mut opts = ShardedClusterOptions::default();
     opts.sharding.forward_coalesce = true;
+    // The server's default. These writes are the measurement's first, and
+    // creating its tables made them take about 500 ms with libchdb 26.9:
+    // the suite's 500 ms failed them now and then on main.
+    opts.sharding.scatter_peer_timeout_ms = 5_000;
     let nodes = start_sharded_three_node_cluster(dir.path(), opts).await;
     bootstrap_two_regions(&nodes, "sharddb", "autogen", "cpu").await;
     let client = reqwest::Client::new();
@@ -2497,6 +2501,97 @@ async fn a_queued_forward_follows_its_region_to_a_new_primary() {
     assert!(queue.is_empty());
 }
 
+/// Two nodes; only node 2 holds `qdb.mem`, so node 1 knows no field types
+/// and only the primary can find a conflict.
+async fn coordinator_without_types(dir: &std::path::Path, queue: bool) -> [ShardedTestNode; 2] {
+    let mut opts = ShardedClusterOptions {
+        forward_queue: queue,
+        ..Default::default()
+    };
+    opts.sharding.async_forward = queue;
+    let nodes = start_sharded_pair_cluster(dir, opts).await;
+    let client = reqwest::Client::new();
+    for node in &nodes {
+        create_db(&client, &node.url, "qdb").await;
+    }
+    let op = ShardMapOp::BootstrapMeasurement {
+        key: MeasurementKey::new("qdb", "autogen", "mem"),
+        region: ShardRegion {
+            region_id: 2,
+            start: 0,
+            end: u64::MAX,
+            epoch: ShardEpoch::default(),
+            peers: vec![2],
+            primary: 2,
+            last_split_at: 0,
+            transfer_verified: None,
+            transfer_first_seen: None,
+            state: Default::default(),
+            staged_from: None,
+            staging_peers: Vec::new(),
+        },
+    };
+    for node in &nodes {
+        node.shard_map.apply_op(op.clone()).await.unwrap();
+        let snap = node.shard_map.snapshot().await.unwrap();
+        node.location_cache.refresh_from_map(&snap);
+    }
+    nodes
+}
+
+/// A conflict only the primary can see reaches the client as the primary's
+/// partial write (400), not as a 500.
+#[tokio::test]
+#[serial(chdb)]
+async fn a_conflict_the_primary_finds_is_a_partial_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let [n1, _n2] = coordinator_without_types(dir.path(), false).await;
+    let client = reqwest::Client::new();
+    let resp = write_line(&client, &n1.url, "qdb", "mem,host=a used=1 1000000000").await;
+    assert_eq!(resp.status(), 204);
+    let resp = write_line(&client, &n1.url, "qdb", "mem,host=a used=\"x\" 2000000000").await;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.contains("partial write") && body.contains("dropped=1"),
+        "{body}"
+    );
+}
+
+/// A queued forward its primary refuses (a field type conflict the
+/// coordinator could not see) is dropped, not retried: 100 attempts kept it
+/// in the queue for over a minute, and its age pushed every other write back
+/// to synchronous forwarding.
+#[tokio::test]
+#[serial(chdb)]
+async fn a_queued_forward_the_primary_refuses_is_not_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let [n1, _n2] = coordinator_without_types(dir.path(), true).await;
+    let client = reqwest::Client::new();
+    let queue = n1.forward_queue.as_ref().unwrap();
+    let drained = || async {
+        for _ in 0..60 {
+            if queue.len() == 0 {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
+    };
+    let resp = write_line(&client, &n1.url, "qdb", "mem,host=a used=1 1000000000").await;
+    assert_eq!(resp.status(), 204);
+    assert!(drained().await, "the first write is delivered");
+
+    // Acknowledged when queued; node 2 refuses it on delivery.
+    let resp = write_line(&client, &n1.url, "qdb", "mem,host=a used=\"x\" 2000000000").await;
+    assert_eq!(resp.status(), 204);
+    assert!(
+        drained().await,
+        "a refused forward leaves the queue within 3 s"
+    );
+}
+
 /// A decommissioning node that has evacuated its regions must not retire
 /// (report Leaving, which lets the operator delete it) while it still owes
 /// queued forwards.
@@ -2933,17 +3028,17 @@ async fn series_cardinality_spans_regions() {
     }
 }
 
-/// A field type conflict is refused with a 400 whichever node takes the
-/// write, including one that forwards it to the region's primary.
+/// A field type conflict is a partial write (400) whichever node takes the
+/// write: the conflicting points are dropped, the rest stored. A node that
+/// holds no region forwards everything, and the primaries' refusals reach the
+/// client as that 400, not as a 500 "write partially applied".
 ///
-/// Fails today: field types are known only to the nodes that hold the
-/// measurement's data, so a node that holds none checks against nothing,
-/// writes its own region's points with the other type, and reports the
-/// primaries' refusals (422) as a 500, "write partially applied".
+/// Field types are known per node, from the data it holds (as InfluxDB knows
+/// them per shard): a region whose primary has never seen the field would
+/// still take another type for it.
 #[tokio::test]
 #[serial(chdb)]
-#[ignore = "field types are not known cluster-wide; see the doc comment"]
-async fn field_type_conflicts_are_refused_on_every_node() {
+async fn field_type_conflicts_are_a_partial_write_on_every_node() {
     let dir = tempfile::tempdir().unwrap();
     let nodes =
         start_sharded_three_node_cluster(dir.path(), ShardedClusterOptions::default()).await;
@@ -2954,7 +3049,12 @@ async fn field_type_conflicts_are_refused_on_every_node() {
         .map(|h| format!("cpu,host=h{h} v=1 1000000000"))
         .collect();
     let resp = write_line(&client, &nodes[0].url, "fdb", &lines.join("\n")).await;
-    assert!(resp.status().is_success(), "{}", resp.status());
+    let status = resp.status();
+    assert!(
+        status.is_success(),
+        "{status}: {}",
+        resp.text().await.unwrap_or_default()
+    );
     for n in &nodes {
         flush_node(n).await;
     }
@@ -2966,8 +3066,31 @@ async fn field_type_conflicts_are_refused_on_every_node() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "node {i}: {body}");
-        assert!(body.contains("field type conflict"), "node {i}: {body}");
+        assert!(
+            body.contains("partial write") && body.contains("field type conflict"),
+            "node {i}: {body}"
+        );
     }
+    // Mixed, through the node that holds no region: the good points land.
+    let lines: Vec<String> = (0..8)
+        .flat_map(|h| {
+            [
+                format!("cpu,host=h{h} v=2 3000000000"),
+                format!("cpu,host=h{h} v=\"bad\" 4000000000"),
+            ]
+        })
+        .collect();
+    let resp = write_line(&client, &nodes[2].url, "fdb", &lines.join("\n")).await;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("dropped=8"), "{body}");
+    for n in &nodes {
+        flush_node(n).await;
+    }
+    let resp = query_sql(&client, &nodes[0].url, "fdb", "SELECT count(v) FROM cpu").await;
+    let doc: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(doc["results"][0]["series"][0]["values"][0][1], 16, "{doc}");
 }
 
 /// PERCENTILE/MEDIAN on a sharded measurement: exact when every group is
