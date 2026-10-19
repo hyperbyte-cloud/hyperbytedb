@@ -213,3 +213,94 @@ async fn an_insert_missing_a_column_repairs_the_table_on_retry() {
         .await
         .expect("the retry re-plans the table and adds the column back");
 }
+
+/// Writes to a new measurement with different fields and tags, flushed
+/// together through prepared Arrow batches: every value stays under its own
+/// field and tag. The batches were stacked by position, so `free`'s values
+/// were stored under `used` (and `region`'s under `host`).
+#[tokio::test]
+#[serial(chdb)]
+async fn writes_with_different_fields_flushed_together_keep_their_columns() {
+    use hyperbytedb::adapters::chdb::query_adapter::ChdbQueryAdapter;
+    use hyperbytedb::adapters::wal::rocksdb_wal::RocksDbWal;
+    use hyperbytedb::application::flush_service::FlushServiceImpl;
+    use hyperbytedb::application::ingest_metadata::IngestCardinalityLimits;
+    use hyperbytedb::application::ingestion_service::IngestionServiceImpl;
+    use hyperbytedb::application::query_service::QueryServiceImpl;
+    use hyperbytedb::ports::ingestion::{IngestionPort, WritePayloadFormat};
+    use hyperbytedb::ports::points_sink::PointsSinkPort;
+    use hyperbytedb::ports::query::{QueryPort, QueryService};
+    use std::sync::Arc;
+
+    let tmpdir = tempfile::tempdir().unwrap();
+    let dir = |d: &str| {
+        let p = tmpdir.path().join(d);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    };
+    let wal = Arc::new(RocksDbWal::open(dir("wal")).unwrap());
+    let metadata = Arc::new(RocksDbMetadata::open(dir("meta")).unwrap());
+    metadata.create_database("db").await.unwrap();
+    let shared = SharedSession::new_eager(dir("chdb").to_str().unwrap(), 1).unwrap();
+    let sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::with_metadata(
+        shared.clone(),
+        Some(metadata.clone()),
+    ));
+    let query_port: Arc<dyn QueryPort> = Arc::new(ChdbQueryAdapter::from_shared(shared, 0));
+    let ingestion = IngestionServiceImpl::with_sink(
+        wal.clone(),
+        Some(sink.clone()),
+        metadata.clone(),
+        IngestCardinalityLimits::default(),
+        0,
+    );
+    let flush = FlushServiceImpl::new(wal.clone(), 0, sink.clone());
+    let queries = QueryServiceImpl::new(query_port, metadata, wal, 30, sink);
+
+    for body in [
+        "m,host=a used=1 1000000000",
+        "m,host=a free=2 2000000000",
+        "m,region=x free=3 3000000000",
+    ] {
+        ingestion
+            .ingest(
+                "db",
+                None,
+                None,
+                body.as_bytes(),
+                WritePayloadFormat::LineProtocol,
+            )
+            .await
+            .unwrap();
+    }
+    flush.flush().await.unwrap();
+
+    let resp = queries
+        .execute_query("db", "SELECT * FROM m", Some("s"), None, None)
+        .await
+        .unwrap();
+    let series = &resp.results[0].series.as_ref().unwrap()[0];
+    let rows: Vec<serde_json::Value> = series
+        .values
+        .iter()
+        .map(|v| {
+            serde_json::Value::Object(
+                series
+                    .columns
+                    .iter()
+                    .cloned()
+                    .zip(v.iter().cloned())
+                    .collect(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        serde_json::Value::Array(rows),
+        // A series without a tag reads as ""; a whole float is written `1`.
+        serde_json::json!([
+            {"time": 1, "free": null, "host": "a", "region": "", "used": 1},
+            {"time": 2, "free": 2, "host": "a", "region": "", "used": null},
+            {"time": 3, "free": 3, "host": "", "region": "x", "used": null},
+        ])
+    );
+}
