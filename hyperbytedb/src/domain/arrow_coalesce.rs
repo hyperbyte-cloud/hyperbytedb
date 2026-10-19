@@ -147,15 +147,17 @@ pub(crate) fn concat_by_name(
     concat_batches(&schema, &aligned)
 }
 
-/// The type a column takes when batches disagree, as ingest widens a field:
-/// float over integer, unsigned over signed, a plain string over a
-/// dictionary-encoded one. Anything else keeps the first type; the other
-/// batch's values are cast to it, and those that cannot be become null.
+/// The type a column takes when batches disagree, as ingest widens a field
+/// (`widen_field_disc`): float over signed integer, unsigned over signed, and
+/// a plain string over a dictionary-encoded one. Anything else (float and
+/// unsigned included, which ingest does not widen) keeps the first type; the
+/// other batch's values are cast to it, and those that cannot be become null.
+/// The insert then casts to the table's type, which decides.
 fn wider_type(a: &DataType, b: &DataType) -> DataType {
     use DataType::*;
     match (a, b) {
         _ if a == b => a.clone(),
-        (Float64, Int64 | UInt64) | (Int64 | UInt64, Float64) => Float64,
+        (Float64, Int64) | (Int64, Float64) => Float64,
         (Int64, UInt64) | (UInt64, Int64) => UInt64,
         (Dictionary(_, _) | Utf8, Dictionary(_, _) | Utf8) => Utf8,
         _ => a.clone(),
@@ -336,6 +338,28 @@ mod tests {
             .downcast_ref::<Float64Array>()
             .unwrap();
         assert_eq!(v, &Float64Array::from(vec![1.0, 2.5]));
+    }
+
+    /// Float and unsigned are not widened into each other, as at ingest: the
+    /// first type stays and the table's type decides at insert.
+    #[test]
+    fn float_and_unsigned_keep_the_first_type() {
+        assert_eq!(
+            wider_type(&DataType::Float64, &DataType::UInt64),
+            DataType::Float64
+        );
+        assert_eq!(
+            wider_type(&DataType::UInt64, &DataType::Float64),
+            DataType::UInt64
+        );
+        assert_eq!(
+            wider_type(&DataType::Int64, &DataType::Float64),
+            DataType::Float64
+        );
+        assert_eq!(
+            wider_type(&DataType::Int64, &DataType::UInt64),
+            DataType::UInt64
+        );
     }
 
     /// New series with different tags, flushed together: each tag value

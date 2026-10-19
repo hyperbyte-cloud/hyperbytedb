@@ -2064,13 +2064,28 @@ fn pad_record_batch_to_ensured(
         columns.push(batch.column(idx).clone());
     }
 
+    // Each field column in the table's type, which decides: a prepared
+    // batch may hold a narrower one (built before the field widened, or
+    // merged from batches that disagreed), and a column of another type
+    // failed the whole batch, so the flush retried it forever. Values that
+    // cannot be cast become null, as at insert time.
+    let safe = arrow::compute::CastOptions {
+        safe: true,
+        ..Default::default()
+    };
     for (_, phys, disc) in &ensured.field_phys {
-        fields.push(Field::new(phys, field_arrow_type(*disc), true));
-        columns.push(if let Ok(idx) = schema.index_of(phys) {
-            batch.column(idx).clone()
-        } else {
-            new_null_array(&field_arrow_type(*disc), n)
-        });
+        let ty = field_arrow_type(*disc);
+        let column = match schema.index_of(phys) {
+            Ok(idx) if batch.column(idx).data_type() == &ty => batch.column(idx).clone(),
+            Ok(idx) => {
+                arrow::compute::cast_with_options(batch.column(idx), &ty, &safe).map_err(|e| {
+                    HyperbytedbError::Internal(format!("cast prepared column {phys}: {e}").into())
+                })?
+            }
+            Err(_) => new_null_array(&ty, n),
+        };
+        fields.push(Field::new(phys, ty, true));
+        columns.push(column);
     }
 
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
@@ -3099,6 +3114,47 @@ mod tests {
         assert!(sql.contains("(`series_id`, `host`)"));
         assert!(sql.contains(&format!("({}, 'a')", id1)));
         assert!(sql.contains(&format!("({}, 'b')", id2)));
+    }
+
+    #[test]
+    fn a_prepared_column_is_cast_to_the_tables_type() {
+        // Prepared as an integer, the field is a float in the table now: the
+        // padded batch casts it, where a mismatch failed the whole batch.
+        let ensured = EnsuredTable {
+            table: "`t`".to_string(),
+            series_table: "`t_series`".to_string(),
+            tag_phys: vec![],
+            field_phys: vec![("v".to_string(), "v".to_string(), 0)],
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "time",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("origin_node_id", DataType::UInt64, false),
+            Field::new("ingest_seq", DataType::UInt64, false),
+            Field::new("series_id", DataType::UInt64, false),
+            Field::new("v", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![1i64]).with_timezone("UTC")),
+                Arc::new(UInt64Array::from(vec![0u64])),
+                Arc::new(UInt64Array::from(vec![0u64])),
+                Arc::new(UInt64Array::from(vec![7u64])),
+                Arc::new(arrow::array::Int64Array::from(vec![3i64])),
+            ],
+        )
+        .unwrap();
+        let padded = pad_record_batch_to_ensured(&batch, &ensured).expect("padded");
+        let v = padded
+            .column(4)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .expect("float");
+        assert_eq!(v.value(0), 3.0);
     }
 
     #[test]
