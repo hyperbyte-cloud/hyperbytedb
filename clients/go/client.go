@@ -244,7 +244,8 @@ func (c *Client) Write(ctx context.Context, database string, points []Point, opt
 }
 
 // WriteLines writes ready-made line protocol, one line per element (blank
-// ones skipped), batched like Write.
+// ones skipped), batched like Write. On an error the count is the lines
+// written before it, including half of a batch split after a 413.
 func (c *Client) WriteLines(ctx context.Context, database string, lines []string, opts WriteOptions) (int, error) {
 	if _, err := opts.Precision.divisor(); err != nil {
 		return 0, err
@@ -263,10 +264,11 @@ func (c *Client) WriteLines(ctx context.Context, database string, lines []string
 		if len(batch) == 0 {
 			return nil
 		}
-		if err := c.writeBatch(ctx, batch, q); err != nil {
+		n, err := c.writeBatch(ctx, batch, q)
+		sent += n
+		if err != nil {
 			return err
 		}
-		sent += len(batch)
 		batch, size = nil, 0
 		return nil
 	}
@@ -285,7 +287,9 @@ func (c *Client) WriteLines(ctx context.Context, database string, lines []string
 	return sent, flush()
 }
 
-func (c *Client) writeBatch(ctx context.Context, batch []string, q url.Values) error {
+// writeBatch returns how many of batch's lines were written, also on an
+// error: after a 413 one half may land and the other fail.
+func (c *Client) writeBatch(ctx context.Context, batch []string, q url.Values) (int, error) {
 	body := []byte(strings.Join(batch, "\n"))
 	header := http.Header{"Content-Type": {"text/plain; charset=utf-8"}}
 	if !c.opts.DisableGzip {
@@ -293,26 +297,28 @@ func (c *Client) writeBatch(ctx context.Context, batch []string, q url.Values) e
 		zw, _ := gzip.NewWriterLevel(&buf, gzip.BestSpeed)
 		_, _ = zw.Write(body)
 		if err := zw.Close(); err != nil {
-			return err
+			return 0, err
 		}
 		body = buf.Bytes()
 		header.Set("Content-Encoding", "gzip")
 	}
 	resp, err := c.do(ctx, http.MethodPost, "/write", q, body, header)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if resp.status == 200 || resp.status == 204 {
-		return nil
+		return len(batch), nil
 	}
 	if resp.status == 413 && len(batch) > 1 {
 		half := len(batch) / 2
-		if err := c.writeBatch(ctx, batch[:half], q); err != nil {
-			return err
+		first, err := c.writeBatch(ctx, batch[:half], q)
+		if err != nil {
+			return first, err
 		}
-		return c.writeBatch(ctx, batch[half:], q)
+		second, err := c.writeBatch(ctx, batch[half:], q)
+		return first + second, err
 	}
-	return statusError(resp.status, errorText(resp.body), true)
+	return 0, statusError(resp.status, errorText(resp.body), true)
 }
 
 func statusError(status int, message string, write bool) error {

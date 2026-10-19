@@ -32,6 +32,15 @@ pub enum Error {
     /// A response that is not what the API returns.
     #[error("decoding the response: {0}")]
     Decode(String),
+    /// A write that failed after `written` of its lines were stored (earlier
+    /// batches, or half of a batch split after a 413). Sending the whole
+    /// write again would store those twice.
+    #[error("{source} (after {written} lines were written)")]
+    WriteInterrupted {
+        written: usize,
+        #[source]
+        source: Box<Error>,
+    },
 }
 
 impl Error {
@@ -41,6 +50,7 @@ impl Error {
         match self {
             Error::Connection { .. } => true,
             Error::Server { status, .. } => crate::client::retryable(*status),
+            Error::WriteInterrupted { source, .. } => source.is_retryable(),
             _ => false,
         }
     }
@@ -51,7 +61,17 @@ impl Error {
             Error::Server { status, .. }
             | Error::Auth { status, .. }
             | Error::Write { status, .. } => Some(*status),
+            Error::WriteInterrupted { source, .. } => source.status(),
             _ => None,
+        }
+    }
+
+    /// Lines stored before a write failed: non-zero only for
+    /// [`Error::WriteInterrupted`].
+    pub fn written(&self) -> usize {
+        match self {
+            Error::WriteInterrupted { written, .. } => *written,
+            _ => 0,
         }
     }
 }

@@ -30,6 +30,7 @@ test("Date times follow the precision", () => {
   assert.equal(encodePoint(p, "ms"), "m v=1.5 1791806400500");
   assert.equal(encodePoint(p, "s"), "m v=1.5 1791806400");
   assert.equal(encodePoint({ ...p, time: 1791806400500000001n }), "m v=1.5 1791806400500000001", "a bigint keeps every digit");
+  assert.equal(encodePoint({ ...p, time: new Date(-1500) }, "s"), "m v=1.5 -2", "before 1970, floored");
 });
 
 test("newlines, bad precisions and fractional times are refused", () => {

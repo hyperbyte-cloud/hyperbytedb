@@ -71,6 +71,10 @@ func TestTimesFollowThePrecision(t *testing.T) {
 	if got := mustEncode(t, p, Second); got != "m v=1.5 1791806400" {
 		t.Fatal(got)
 	}
+	before := Point{Measurement: "m", Fields: map[string]any{"v": 1.5}, Time: time.Unix(0, 0).Add(-1500 * time.Millisecond)}
+	if got := mustEncode(t, before, Second); got != "m v=1.5 -2" {
+		t.Fatalf("before 1970, floored: %s", got)
+	}
 	if _, _, err := EncodePoint(p, "minutes"); err == nil {
 		t.Fatal("a bad precision must be refused")
 	}

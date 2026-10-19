@@ -32,7 +32,8 @@ which also stops retries.
 - **Errors.** A refused write is a `*WriteError`, and a 401/403 is an
   `*AuthError`. Anything else after the last retry is a `*ServerError`.
   Use `errors.As` to tell them apart. `IsRetryable(err)` reports whether
-  trying later may help. Batches before the failed one have been written.
+  trying later may help. On an error the returned count is the lines
+  written before it: earlier batches, or half of a batch split after a 413.
 - **Fields** may be any float, signed or unsigned integer (sent as an
   integer), bool or string. Nil, NaN and ±Inf fields are dropped. A point
   with no fields left is skipped. A field keeps its first type, so write

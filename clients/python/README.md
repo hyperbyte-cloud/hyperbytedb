@@ -30,7 +30,8 @@ next to your code: it has no dependencies.
 - **Too large.** A batch refused with 413 is split in half until it fits.
 - **Errors.** A 400 (bad line protocol, field type conflict) raises
   `WriteError` with the server's message and is not retried. 401/403 raise
-  `AuthError`. Batches before the failed one have been written.
+  `AuthError`. The error's `written` is how many lines were stored before
+  it: earlier batches, or half of a batch split after a 413.
 
 `Point(measurement, fields, tags, time)` details:
 

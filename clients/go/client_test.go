@@ -141,6 +141,15 @@ func Test413SplitsTheBatch(t *testing.T) {
 	}
 }
 
+func TestA413SplitThatFailsHalfwayCountsWhatLanded(t *testing.T) {
+	_, u := newFake(t, reply{413, nil, "too big"}, reply{204, nil, ""}, reply{400, nil, `{"error":"bad"}`})
+	n, err := testClient(u, Options{}).WriteLines(ctx, "db", []string{"m v=1", "m v=2", "m v=3", "m v=4"}, WriteOptions{})
+	var we *WriteError
+	if !errors.As(err, &we) || n != 2 {
+		t.Fatalf("WriteLines = %d, %v; want 2 written and a WriteError", n, err)
+	}
+}
+
 func TestBadWritesAndAuthAreNotRetried(t *testing.T) {
 	f, u := newFake(t, reply{400, nil, `{"error":"field type conflict"}`}, reply{401, nil, "authorization failed"})
 	c := testClient(u, Options{})

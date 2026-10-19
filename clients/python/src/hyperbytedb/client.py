@@ -187,8 +187,11 @@ class HyperbyteDBClient:
             params["rp"] = retention_policy
         sent = 0
         for batch in self._batches(lines):
-            self._write_batch(batch, params)
-            sent += len(batch)
+            try:
+                sent += self._write_batch(batch, params)
+            except HyperbyteDBError as e:
+                e.written += sent
+                raise
         return sent
 
     def _batches(self, lines: Sequence[str]) -> Iterator[List[str]]:
@@ -203,7 +206,9 @@ class HyperbyteDBClient:
         if batch:
             yield batch
 
-    def _write_batch(self, batch: List[str], params: Mapping[str, str]) -> None:
+    def _write_batch(self, batch: List[str], params: Mapping[str, str]) -> int:
+        """How many of ``batch``'s lines were written; an error carries the
+        count of those before it in ``written``."""
         body = "\n".join(batch).encode()
         headers = {"Content-Type": "text/plain; charset=utf-8"}
         if self.gzip_writes:
@@ -211,13 +216,16 @@ class HyperbyteDBClient:
             headers["Content-Encoding"] = "gzip"
         status, _, payload = self._request("POST", "/write", params, body, headers)
         if status in (200, 204):
-            return
+            return len(batch)
         message = _error_text(payload)
         if status == 413 and len(batch) > 1:
             half = len(batch) // 2
-            self._write_batch(batch[:half], params)
-            self._write_batch(batch[half:], params)
-            return
+            first = self._write_batch(batch[:half], params)
+            try:
+                return first + self._write_batch(batch[half:], params)
+            except HyperbyteDBError as e:
+                e.written += first
+                raise
         if status in (401, 403):
             raise AuthError(status, message)
         if status >= 500 or status == 429:

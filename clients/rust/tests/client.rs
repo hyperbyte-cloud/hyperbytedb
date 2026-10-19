@@ -207,6 +207,49 @@ async fn a_413_splits_the_batch() {
 }
 
 #[tokio::test]
+async fn a_413_split_that_fails_halfway_says_how_many_lines_landed() {
+    let (_, url) = fake(vec![
+        Reply(413, vec![], "too big"),
+        Reply(204, vec![], ""),
+        Reply(400, vec![], r#"{"error":"bad"}"#),
+    ])
+    .await;
+    let err = client(&url, Options::default())
+        .write_lines(
+            "db",
+            ["m v=1", "m v=2", "m v=3", "m v=4"],
+            &WriteOptions::default(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.written(), 2, "{err}");
+    assert!(
+        matches!(&err, Error::WriteInterrupted { source, .. } if matches!(**source, Error::Write { .. }))
+    );
+    assert_eq!(err.status(), Some(400));
+}
+
+#[tokio::test]
+async fn an_error_after_earlier_batches_counts_them() {
+    let (_, url) = fake(vec![
+        Reply(204, vec![], ""),
+        Reply(400, vec![], r#"{"error":"bad"}"#),
+    ])
+    .await;
+    let err = client(
+        &url,
+        Options {
+            batch_points: 2,
+            ..Default::default()
+        },
+    )
+    .write_lines("db", ["m v=1", "m v=2", "m v=3"], &WriteOptions::default())
+    .await
+    .unwrap_err();
+    assert_eq!(err.written(), 2, "{err}");
+}
+
+#[tokio::test]
 async fn bad_writes_and_auth_failures_are_not_retried() {
     let (f, url) = fake(vec![
         Reply(400, vec![], r#"{"error":"field type conflict"}"#),

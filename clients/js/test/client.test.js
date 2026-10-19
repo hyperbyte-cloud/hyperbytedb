@@ -72,6 +72,16 @@ describe("client", () => {
     assert.deepEqual(requests.map((r) => r.body), ["m v=1\nm v=2\nm v=3\nm v=4", "m v=1\nm v=2", "m v=3\nm v=4"]);
   });
 
+  test("a 413 split that fails halfway says how many lines landed", async () => {
+    script = [[413, {}, "too big"], [204, {}, ""], [400, {}, '{"error":"bad"}']];
+    await assert.rejects(client().write(["m v=1", "m v=2", "m v=3", "m v=4"], "db"), (e) => e instanceof WriteError && e.written === 2);
+  });
+
+  test("an error after earlier batches counts them", async () => {
+    script = [[204, {}, ""], [400, {}, '{"error":"bad"}']];
+    await assert.rejects(client({ batchPoints: 2 }).write(["m v=1", "m v=2", "m v=3"], "db"), (e) => e instanceof WriteError && e.written === 2);
+  });
+
   test("bad writes and auth failures are not retried", async () => {
     script = [[400, {}, '{"error":"field type conflict"}'], [401, {}, "authorization failed"]];
     await assert.rejects(client().write("m v=1", "db"), (e) => e instanceof WriteError && /field type conflict/.test(e.message));

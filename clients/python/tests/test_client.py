@@ -104,6 +104,22 @@ def test_413_splits_the_batch(fake):
     assert bodies == ["m v=1\nm v=2\nm v=3\nm v=4", "m v=1\nm v=2", "m v=3\nm v=4"]
 
 
+def test_a_413_split_that_fails_halfway_says_how_many_lines_landed(fake):
+    f, url = fake
+    f.script = [(413, {}, b"too big"), (204, {}, b""), (400, {}, b'{"error":"bad"}')]
+    with pytest.raises(WriteError) as e:
+        client(url).write(["m v=1", "m v=2", "m v=3", "m v=4"], "db")
+    assert e.value.written == 2
+
+
+def test_an_error_after_earlier_batches_counts_them(fake):
+    f, url = fake
+    f.script = [(204, {}, b""), (400, {}, b'{"error":"bad"}')]
+    with pytest.raises(WriteError) as e:
+        client(url, batch_points=2).write(["m v=1", "m v=2", "m v=3"], "db")
+    assert e.value.written == 2
+
+
 def test_bad_writes_and_auth_are_not_retried(fake):
     f, url = fake
     f.script = [(400, {}, b'{"error":"field type conflict"}')]

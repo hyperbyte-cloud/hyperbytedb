@@ -36,8 +36,10 @@ for TLS roots or proxies.
 - **Errors.** A refused write is `Error::Write`, and a 401/403 is
   `Error::Auth`. Anything else after the last retry is `Error::Server`, or
   `Error::Connection` when the server can't be reached.
-  `Error::is_retryable()` reports whether trying later may help. Batches
-  before the failed one have been written.
+  `Error::is_retryable()` reports whether trying later may help. An error
+  after some lines were stored (earlier batches, or half of a batch split
+  after a 413) is `Error::WriteInterrupted`, and `Error::written()` gives
+  how many lines were stored.
 - **Fields.** `f64`/`f32` become floats, and signed and unsigned integers
   become integers. `bool` and `&str`/`String` are supported too. A field
   keeps its first type, so write `1.0`, not `1`, for a float field. NaN and

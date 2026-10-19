@@ -62,13 +62,19 @@ function fieldValue(v: FieldValue): string | undefined {
 function timestamp(t: Date | number | bigint, precision: Precision): string {
   if (t instanceof Date) {
     const ms = BigInt(t.getTime());
-    return String(precision === "s" ? ms / 1000n : ms * PER_MS[precision]);
+    return String(precision === "s" ? floorDiv(ms, 1000n) : ms * PER_MS[precision]);
   }
   if (typeof t === "number") {
     if (!Number.isInteger(t)) throw new TypeError(`timestamp must be an integer: ${t}`);
     return BigInt(t).toString();
   }
   return t.toString();
+}
+
+/** Rounds down, so a time before 1970 falls in its own second (-1.5 s → -2). */
+function floorDiv(a: bigint, b: bigint): bigint {
+  const q = a / b;
+  return a % b !== 0n && a < 0n ? q - 1n : q;
 }
 
 export function checkPrecision(precision: string): asserts precision is Precision {

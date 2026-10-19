@@ -175,9 +175,19 @@ func EncodePoint(p Point, precision Precision) (string, bool, error) {
 	b.WriteString(fields.String())
 	if !p.Time.IsZero() {
 		b.WriteByte(' ')
-		b.WriteString(strconv.FormatInt(p.Time.UnixNano()/div, 10))
+		b.WriteString(strconv.FormatInt(floorDiv(p.Time.UnixNano(), div), 10))
 	}
 	return b.String(), true, nil
+}
+
+// floorDiv rounds down, so a time before 1970 falls in the unit it is in:
+// 1.5 s before the epoch is -2 s, not -1.
+func floorDiv(a, b int64) int64 {
+	q := a / b
+	if a%b != 0 && a < 0 {
+		q--
+	}
+	return q
 }
 
 // Encode returns the points as line protocol, one per line. Points with no

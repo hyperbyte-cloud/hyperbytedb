@@ -363,8 +363,10 @@ impl Client {
                 && (batch.len() >= self.opts.batch_points
                     || size + line.len() + 1 > self.opts.batch_bytes)
             {
-                self.write_batch(&batch, &query).await?;
-                sent += batch.len();
+                sent += self
+                    .write_batch(&batch, &query)
+                    .await
+                    .map_err(|e| interrupted(e, sent))?;
                 batch.clear();
                 size = 0;
             }
@@ -372,13 +374,18 @@ impl Client {
             batch.push(line.to_owned());
         }
         if !batch.is_empty() {
-            self.write_batch(&batch, &query).await?;
-            sent += batch.len();
+            sent += self
+                .write_batch(&batch, &query)
+                .await
+                .map_err(|e| interrupted(e, sent))?;
         }
         Ok(sent)
     }
 
-    async fn write_batch(&self, batch: &[String], query: &[(&str, &str)]) -> Result<()> {
+    /// How many of `batch`'s lines were written; an error that comes after
+    /// some of them (a 413 split) is [`Error::WriteInterrupted`].
+    async fn write_batch(&self, batch: &[String], query: &[(&str, &str)]) -> Result<usize> {
+        let mut written = 0;
         let mut stack = vec![batch];
         while let Some(part) = stack.pop() {
             let mut body = part.join("\n").into_bytes();
@@ -396,9 +403,10 @@ impl Client {
             }
             let r = self
                 .request(Method::POST, "/write", query, Some(body), headers, &[])
-                .await?;
+                .await
+                .map_err(|e| interrupted(e, written))?;
             match r.status {
-                200 | 204 => {}
+                200 | 204 => written += part.len(),
                 413 if part.len() > 1 => {
                     let (a, b) = part.split_at(part.len() / 2);
                     // Pushed in reverse, so the first half is written first.
@@ -407,15 +415,16 @@ impl Client {
                 }
                 status => {
                     let message = error_text(&r.body);
-                    return Err(match status {
+                    let e = match status {
                         401 | 403 => Error::Auth { status, message },
                         s if s >= 500 || s == 429 => Error::Server { status, message },
                         _ => Error::Write { status, message },
-                    });
+                    };
+                    return Err(interrupted(e, written));
                 }
             }
         }
-        Ok(())
+        Ok(written)
     }
 
     /// Runs InfluxQL; one [`QueryResult`] per statement.
@@ -530,6 +539,22 @@ impl Client {
             .flat_map(QueryResult::rows)
             .filter_map(|row| row.get("name").and_then(Value::as_str).map(str::to_owned))
             .collect())
+    }
+}
+
+/// `e` after `before` lines were written: [`Error::WriteInterrupted`] when
+/// any were, counting those it already carries.
+fn interrupted(e: Error, before: usize) -> Error {
+    match e {
+        _ if before == 0 => e,
+        Error::WriteInterrupted { written, source } => Error::WriteInterrupted {
+            written: before + written,
+            source,
+        },
+        e => Error::WriteInterrupted {
+            written: before,
+            source: Box::new(e),
+        },
     }
 }
 

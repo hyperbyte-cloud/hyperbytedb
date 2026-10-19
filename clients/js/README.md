@@ -27,8 +27,9 @@ a line-protocol string, or a list of lines.
   `backoff` and `maxBackoff` (in ms).
 - **Errors.** A refused write throws `WriteError`, and a 401/403 throws
   `AuthError`. Anything else after the last retry throws `ServerError`. All
-  of them extend `HyperbyteDBError`. Batches before the failed one have been
-  written.
+  of them extend `HyperbyteDBError`. `error.written` is how many lines were
+  stored before the error: earlier batches, or half of a batch split after
+  a 413.
 - **Fields.** A `number` is written as a float and a `bigint` as an integer
   (`8n` → `8i`). A field keeps the type it was first written with.
   `null`, `undefined`, NaN and ±Infinity are dropped.

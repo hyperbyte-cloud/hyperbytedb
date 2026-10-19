@@ -190,8 +190,11 @@ export class HyperbyteDBClient {
     if (options.retentionPolicy) query.rp = options.retentionPolicy;
     let sent = 0;
     for (const batch of this.batches(lines)) {
-      await this.writeBatch(batch, query, options.signal);
-      sent += batch.length;
+      try {
+        sent += await this.writeBatch(batch, query, options.signal);
+      } catch (e) {
+        throw withWritten(e, sent);
+      }
     }
     return sent;
   }
@@ -212,7 +215,8 @@ export class HyperbyteDBClient {
     if (batch.length) yield batch;
   }
 
-  private async writeBatch(batch: string[], query: Record<string, string>, signal?: AbortSignal): Promise<void> {
+  /** How many of `batch`'s lines were written; an error carries the count in `written`. */
+  private async writeBatch(batch: string[], query: Record<string, string>, signal?: AbortSignal): Promise<number> {
     let body: BodyInit = batch.join("\n");
     const headers: Record<string, string> = { "Content-Type": "text/plain; charset=utf-8" };
     if (this.opts.gzipWrites && typeof CompressionStream !== "undefined") {
@@ -220,12 +224,15 @@ export class HyperbyteDBClient {
       headers["Content-Encoding"] = "gzip";
     }
     const r = await this.request("POST", "/write", { query, body, headers, signal });
-    if (r.status === 200 || r.status === 204) return;
+    if (r.status === 200 || r.status === 204) return batch.length;
     if (r.status === 413 && batch.length > 1) {
       const half = batch.length >> 1;
-      await this.writeBatch(batch.slice(0, half), query, signal);
-      await this.writeBatch(batch.slice(half), query, signal);
-      return;
+      const first = await this.writeBatch(batch.slice(0, half), query, signal);
+      try {
+        return first + (await this.writeBatch(batch.slice(half), query, signal));
+      } catch (e) {
+        throw withWritten(e, first);
+      }
     }
     const message = errorText(r.body);
     if (r.status === 401 || r.status === 403) throw new AuthError(r.status, message);
@@ -308,6 +315,12 @@ function* asLines(data: Point | Iterable<Point | string> | string, precision: Pr
       throw new TypeError(`expected a Point or a string, not ${typeof item}`);
     }
   }
+}
+
+/** `e` with `before` more lines counted as written before it. */
+function withWritten(e: unknown, before: number): unknown {
+  if (e instanceof HyperbyteDBError) e.written = before + (e.written ?? 0);
+  return e;
 }
 
 function isPoint(x: unknown): x is Point {

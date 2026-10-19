@@ -1,5 +1,11 @@
 /** Base class; also thrown when the server cannot be reached. */
 export class HyperbyteDBError extends Error {
+  /**
+   * On an error from `write()`: how many lines were written before it
+   * (earlier batches, or half of a batch split after a 413).
+   */
+  written?: number;
+
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, options);
     this.name = new.target.name;
