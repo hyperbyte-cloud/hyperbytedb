@@ -699,13 +699,9 @@ pub async fn forward_shard_writes_by_node(
         };
         for part in parsed {
             match part_outcome(node, &part) {
-                // A refused part drops every point the coordinator sent in it.
                 PartOutcome::Done(Err(HyperbytedbError::PartialWrite { reason, .. })) => {
-                    let dropped = forward.get(&part.region_id).map_or(0, Vec::len);
-                    results.push((
-                        part.region_id,
-                        Err(HyperbytedbError::PartialWrite { reason, dropped }),
-                    ));
+                    let points = forward.get(&part.region_id).map_or(0, Vec::len);
+                    results.push((part.region_id, Err(refused(&reason, points))));
                 }
                 PartOutcome::Done(r) => results.push((part.region_id, r)),
                 PartOutcome::Retry => {
@@ -737,6 +733,31 @@ pub async fn forward_shard_writes_by_node(
         .await;
     results.append(&mut rest);
     results
+}
+
+/// A primary's refusal of a forwarded part of `points` points, as a partial
+/// write. The primary's message may come as `{"error": "..."}`. When it is
+/// itself a partial write (`partial write: <reason> dropped=N`, the rest of
+/// the part written) its reason and count are kept; any other refusal (a
+/// cardinality limit) dropped the whole part.
+pub(crate) fn refused(message: &str, points: usize) -> HyperbytedbError {
+    let message = serde_json::from_str::<serde_json::Value>(message)
+        .ok()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_owned))
+        .unwrap_or_else(|| message.trim().to_owned());
+    if let Some(inner) = message.strip_prefix("partial write: ")
+        && let Some((reason, n)) = inner.rsplit_once(" dropped=")
+        && let Ok(dropped) = n.parse()
+    {
+        return HyperbytedbError::PartialWrite {
+            reason: reason.to_owned(),
+            dropped,
+        };
+    }
+    HyperbytedbError::PartialWrite {
+        reason: message,
+        dropped: points,
+    }
 }
 
 /// What to do with one part of a batch response.
@@ -911,14 +932,7 @@ async fn try_forward_shard_write_to_region(
                 }
                 if matches!(resp.status().as_u16(), 400 | 422) {
                     let body = resp.text().await.unwrap_or_default();
-                    let reason = serde_json::from_str::<serde_json::Value>(&body)
-                        .ok()
-                        .and_then(|v| v["error"].as_str().map(str::to_owned))
-                        .unwrap_or(body);
-                    return Err(HyperbytedbError::PartialWrite {
-                        reason,
-                        dropped: point_count,
-                    });
+                    return Err(refused(&body, point_count));
                 }
                 if !resp.status().is_success() {
                     return Err(HyperbytedbError::PeerUnreachable(format!(
@@ -1750,7 +1764,7 @@ mod scatter_tests {
 
 #[cfg(test)]
 mod forward_batch_tests {
-    use super::{PartOutcome, group_forwards_by_primary, part_outcome};
+    use super::{PartOutcome, group_forwards_by_primary, part_outcome, refused};
     use crate::domain::cluster::membership::{ClusterMembership, NodeInfo, NodeState};
     use crate::domain::sharding::{ShardEpoch, ShardRegion, ShardWritePartResult};
     use crate::error::HyperbytedbError;
@@ -1833,6 +1847,30 @@ mod forward_batch_tests {
         assert!(matches!(
             part_outcome(2, &part(500)),
             PartOutcome::Done(Err(HyperbytedbError::PeerUnreachable(_)))
+        ));
+    }
+
+    /// A primary's message comes wrapped as `{"error": ...}`; a partial
+    /// write keeps its own count, any other refusal drops the whole part.
+    #[test]
+    fn a_primary_refusal_reads_its_message_and_count() {
+        let partial = serde_json::json!({
+            "error": "partial write: field type conflict: input field \"v\" dropped=3"
+        })
+        .to_string();
+        assert!(matches!(
+            refused(&partial, 10),
+            HyperbytedbError::PartialWrite { ref reason, dropped: 3 }
+                if reason == "field type conflict: input field \"v\""
+        ));
+        let limit = serde_json::json!({"error": "cardinality limit exceeded"}).to_string();
+        assert!(matches!(
+            refused(&limit, 10),
+            HyperbytedbError::PartialWrite { ref reason, dropped: 10 } if reason == "cardinality limit exceeded"
+        ));
+        assert!(matches!(
+            refused("plain text", 4),
+            HyperbytedbError::PartialWrite { dropped: 4, .. }
         ));
         // The primary refused the points: a partial write, not a node down.
         for status in [400, 422] {

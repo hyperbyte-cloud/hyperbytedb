@@ -2545,7 +2545,7 @@ async fn coordinator_without_types(dir: &std::path::Path, queue: bool) -> [Shard
 #[serial(chdb)]
 async fn a_conflict_the_primary_finds_is_a_partial_write() {
     let dir = tempfile::tempdir().unwrap();
-    let [n1, _n2] = coordinator_without_types(dir.path(), false).await;
+    let [n1, n2] = coordinator_without_types(dir.path(), false).await;
     let client = reqwest::Client::new();
     let resp = write_line(&client, &n1.url, "qdb", "mem,host=a used=1 1000000000").await;
     assert_eq!(resp.status(), 204);
@@ -2557,6 +2557,31 @@ async fn a_conflict_the_primary_finds_is_a_partial_write() {
         body.contains("partial write") && body.contains("dropped=1"),
         "{body}"
     );
+
+    // Mixed, and consistent within itself, so node 1 (no stored types) can
+    // drop nothing: the primary drops only the conflicting point and stores
+    // the rest; the client gets the primary's message, not its JSON.
+    let mixed = "mem,host=a free=2 3000000000\n\
+                 mem,host=b used=\"x\" 4000000000\n\
+                 mem,host=c free=3 5000000000";
+    // Flushed apart from the first write: one flush of both used to stack
+    // `free` under `used` (the prepared-batch coalesce bug, fixed apart).
+    flush_node(&n2).await;
+    let resp = write_line(&client, &n1.url, "qdb", mixed).await;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{body}");
+    let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let error = doc["error"].as_str().unwrap();
+    assert!(
+        error.starts_with("partial write: field type conflict: input field \"used\"")
+            && error.ends_with(" dropped=1"),
+        "{error}"
+    );
+    flush_node(&n2).await;
+    let resp = query_sql(&client, &n2.url, "qdb", "SELECT count(free) FROM mem").await;
+    let doc: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(doc["results"][0]["series"][0]["values"][0][1], 2, "{doc}");
 }
 
 /// A queued forward its primary refuses (a field type conflict the
