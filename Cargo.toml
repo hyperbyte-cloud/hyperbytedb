@@ -1,5 +1,7 @@
 [workspace]
 members = ["hyperbytedb", "hyperbytedb-proxy", "hyperbytedb-cli"]
+# Clients are published on their own, outside the server workspace.
+exclude = ["clients/rust"]
 resolver = "2"
 
 [profile.release]

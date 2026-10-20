@@ -1,0 +1,26 @@
+{
+  "name": "hyperbytedb",
+  "version": "0.9.3-beta",
+  "description": "Client for HyperbyteDB's InfluxDB v1 API, for Node.js and browsers",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "README.md"],
+  "engines": { "node": ">=18" },
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc && node --test test/",
+    "test:integration": "tsc && node --test test/integration.test.js"
+  },
+  "devDependencies": {
+    "typescript": "5.6.3"
+  }
+}

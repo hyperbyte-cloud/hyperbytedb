@@ -4,7 +4,13 @@ from __future__ import annotations
 
 
 class HyperbyteDBError(Exception):
-    """Base class; also raised when the server cannot be reached."""
+    """Base class; also raised when the server cannot be reached.
+
+    On an error from ``write()``, ``written`` is how many lines were stored
+    before it (earlier batches, or half of a batch split after a 413).
+    """
+
+    written: int = 0
 
 
 class ServerError(HyperbyteDBError):
