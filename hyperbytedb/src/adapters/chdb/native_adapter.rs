@@ -1437,6 +1437,7 @@ impl ChdbNativeAdapter {
     ) -> Result<(), HyperbytedbError> {
         let pool = self.session.pool()?;
         let series_table = ensured.series_table.clone();
+        let series_batch = &pad_series_batch_to_ensured(series_batch, ensured)?;
         let batch = series_batch.clone();
         let insert_options = self.insert_options.clone();
         tokio::task::spawn_blocking(move || {
@@ -2063,17 +2064,74 @@ fn pad_record_batch_to_ensured(
         columns.push(batch.column(idx).clone());
     }
 
+    // Each field column in the table's type, which decides: a prepared
+    // batch may hold a narrower one (built before the field widened, or
+    // merged from batches that disagreed), and a column of another type
+    // failed the whole batch, so the flush retried it forever. Values that
+    // cannot be cast become null, as at insert time.
+    let safe = arrow::compute::CastOptions {
+        safe: true,
+        ..Default::default()
+    };
     for (_, phys, disc) in &ensured.field_phys {
-        fields.push(Field::new(phys, field_arrow_type(*disc), true));
-        columns.push(if let Ok(idx) = schema.index_of(phys) {
-            batch.column(idx).clone()
-        } else {
-            new_null_array(&field_arrow_type(*disc), n)
-        });
+        let ty = field_arrow_type(*disc);
+        let column = match schema.index_of(phys) {
+            Ok(idx) if batch.column(idx).data_type() == &ty => batch.column(idx).clone(),
+            Ok(idx) => {
+                arrow::compute::cast_with_options(batch.column(idx), &ty, &safe).map_err(|e| {
+                    HyperbytedbError::Internal(format!("cast prepared column {phys}: {e}").into())
+                })?
+            }
+            Err(_) => new_null_array(&ty, n),
+        };
+        fields.push(Field::new(phys, ty, true));
+        columns.push(column);
     }
 
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map_err(|e| HyperbytedbError::Internal(format!("pad prepared RecordBatch: {e}").into()))
+}
+
+/// A prepared series batch with every tag column of `ensured`, in its order
+/// and types, then any other tag columns the batch has: a tag the batch
+/// lacks is "", as for a series without it. The
+/// batch may have been built before the table gained a tag, or merged from
+/// series with other tags; the same is done for fact batches in
+/// [`pad_record_batch_to_ensured`].
+fn pad_series_batch_to_ensured(
+    batch: &RecordBatch,
+    ensured: &EnsuredTable,
+) -> Result<RecordBatch, HyperbytedbError> {
+    let n = batch.num_rows();
+    let schema = batch.schema();
+    let err = |e: arrow::error::ArrowError| {
+        HyperbytedbError::Internal(format!("pad prepared series batch: {e}").into())
+    };
+    let sid = schema.index_of("series_id").map_err(err)?;
+    let mut fields = vec![schema.field(sid).clone()];
+    let mut columns: Vec<ArrayRef> = vec![batch.column(sid).clone()];
+    for (_, phys, kind) in &ensured.tag_phys {
+        let ty = tag_arrow_type(*kind);
+        let column = match schema.index_of(phys) {
+            Ok(i) if batch.column(i).data_type() == &ty => batch.column(i).clone(),
+            Ok(i) => arrow::compute::cast(batch.column(i), &ty).map_err(err)?,
+            Err(_) => {
+                let empty: ArrayRef = Arc::new(StringArray::from(vec![""; n]));
+                arrow::compute::cast(&empty, &ty).map_err(err)?
+            }
+        };
+        fields.push(Field::new(phys, ty, false));
+        columns.push(column);
+    }
+    // Tags `ensured` does not list are kept: on the prepared path it is
+    // planned without points, from metadata that may not have them yet.
+    for (i, field) in schema.fields().iter().enumerate() {
+        if i != sid && !fields.iter().any(|f| f.name() == field.name()) {
+            fields.push(field.as_ref().clone());
+            columns.push(batch.column(i).clone());
+        }
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(err)
 }
 
 /// Arrow logical type for a tag column, aligned with [`ColumnKind::ch_column_type`].
@@ -3056,6 +3114,104 @@ mod tests {
         assert!(sql.contains("(`series_id`, `host`)"));
         assert!(sql.contains(&format!("({}, 'a')", id1)));
         assert!(sql.contains(&format!("({}, 'b')", id2)));
+    }
+
+    #[test]
+    fn a_prepared_column_is_cast_to_the_tables_type() {
+        // Prepared as an integer, the field is a float in the table now: the
+        // padded batch casts it, where a mismatch failed the whole batch.
+        let ensured = EnsuredTable {
+            table: "`t`".to_string(),
+            series_table: "`t_series`".to_string(),
+            tag_phys: vec![],
+            field_phys: vec![("v".to_string(), "v".to_string(), 0)],
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "time",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("origin_node_id", DataType::UInt64, false),
+            Field::new("ingest_seq", DataType::UInt64, false),
+            Field::new("series_id", DataType::UInt64, false),
+            Field::new("v", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![1i64]).with_timezone("UTC")),
+                Arc::new(UInt64Array::from(vec![0u64])),
+                Arc::new(UInt64Array::from(vec![0u64])),
+                Arc::new(UInt64Array::from(vec![7u64])),
+                Arc::new(arrow::array::Int64Array::from(vec![3i64])),
+            ],
+        )
+        .unwrap();
+        let padded = pad_record_batch_to_ensured(&batch, &ensured).expect("padded");
+        let v = padded
+            .column(4)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .expect("float");
+        assert_eq!(v.value(0), 3.0);
+    }
+
+    #[test]
+    fn a_series_batch_is_padded_to_the_tables_tags() {
+        // Prepared before the table had `host` (or merged from series
+        // without it): `host` is filled with "", the columns come in the
+        // table's order, and its metadata entries can be read.
+        let ensured = EnsuredTable {
+            table: "`db_rp_m`".to_string(),
+            series_table: "`db_rp_m_series`".to_string(),
+            tag_phys: vec![
+                (
+                    "host".to_string(),
+                    "host".to_string(),
+                    ColumnKind::TagLowCardinality,
+                ),
+                (
+                    "region".to_string(),
+                    "region".to_string(),
+                    ColumnKind::TagString,
+                ),
+            ],
+            field_phys: vec![],
+        };
+        let older = EnsuredTable {
+            table: String::new(),
+            series_table: String::new(),
+            tag_phys: vec![(
+                "region".to_string(),
+                "region".to_string(),
+                ColumnKind::TagString,
+            )],
+            field_phys: vec![],
+        };
+        let p = make_point(0, &[("region", "us")], &[]);
+        let batch = build_series_record_batch(&older, &[(1u64, &p)]).expect("batch");
+        let padded = pad_series_batch_to_ensured(&batch, &ensured).expect("padded");
+        let schema = padded.schema();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, ["series_id", "host", "region"]);
+
+        // A tag the table plan does not list yet is kept, not dropped.
+        let unplanned = EnsuredTable {
+            tag_phys: vec![],
+            ..older
+        };
+        let kept = pad_series_batch_to_ensured(&batch, &unplanned).expect("kept");
+        let schema = kept.schema();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, ["series_id", "region"]);
+        assert_eq!(
+            padded.column(1).data_type(),
+            &tag_arrow_type(ColumnKind::TagLowCardinality)
+        );
+        let entries = series_entries_from_batch(&padded, &ensured.tag_phys).expect("entries");
+        assert_eq!(entries[0].1.get("region"), Some(&"us".to_string()));
+        assert!(entries[0].1.get("host").is_none_or(|h| h.is_empty()));
     }
 
     #[test]
