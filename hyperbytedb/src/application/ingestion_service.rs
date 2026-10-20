@@ -197,6 +197,19 @@ impl IngestionPort for IngestionServiceImpl {
             validate_point_count(points.len(), self.max_points_per_request)?;
         }
 
+        // Points whose fields conflict with a stored type are dropped and the
+        // rest written, as InfluxDB does; the error says how many.
+        let (points, partial) = crate::application::ingest_metadata::split_field_type_conflicts(
+            &self.metadata,
+            db,
+            &retention_policy,
+            points,
+        )
+        .await?;
+        if points.is_empty() {
+            return partial.map_or(Ok(()), Err);
+        }
+
         let t2 = std::time::Instant::now();
         histogram!("hyperbytedb_ingest_parse_seconds").record((t2 - t1).as_secs_f64());
 
@@ -244,7 +257,7 @@ impl IngestionPort for IngestionServiceImpl {
             .increment(point_count);
         counter!("hyperbytedb_wal_appends_total").increment(1);
 
-        Ok(())
+        partial.map_or(Ok(()), Err)
     }
 
     /// This service writes only locally, so it never owes another node.

@@ -8,7 +8,7 @@ use axum::response::IntoResponse;
 use metrics::counter;
 
 use crate::adapters::cluster::raft::types::ClusterRequest;
-use crate::application::ingest_metadata::prepare_batch_metadata;
+use crate::application::ingest_metadata::{prepare_batch_metadata, split_field_type_conflicts};
 use crate::application::line_protocol::parse_line_body_to_points_limited;
 use crate::application::replication_dispatch::dispatch_outbound_replication;
 use crate::application::shard_peer_resolution::active_region_peer_targets;
@@ -359,6 +359,25 @@ struct ReadyPart {
     req: ShardWriteRequest,
     region: ShardRegion,
     point_count: u64,
+    /// The partial write to report once the kept points are written.
+    partial: Option<String>,
+}
+
+/// Drops a forwarded part's points whose fields conflict with this node's
+/// stored types, which the coordinator may not know. When any are dropped
+/// the kept points replace the part's body, so replicas get what was
+/// written here, not the part as sent.
+async fn split_forwarded_conflicts(
+    state: &AppState,
+    req: &mut ShardWriteRequest,
+    points: Vec<Point>,
+) -> Result<(Vec<Point>, Option<String>), HyperbytedbError> {
+    let (kept, partial) =
+        split_field_type_conflicts(&state.metadata, &req.db, &req.rp, points).await?;
+    if partial.is_some() && !kept.is_empty() {
+        req.body = crate::application::line_protocol::encode_points_binary(&kept)?;
+    }
+    Ok((kept, partial.map(|e| e.to_string())))
 }
 
 /// Forwarded parts for one (db, rp) that will share a WAL append.
@@ -429,12 +448,35 @@ async fn apply_shard_write_batch(
                 continue;
             }
         };
+        let mut req = req;
+        let (points, partial) = match split_forwarded_conflicts(state, &mut req, points).await {
+            Ok(split) => split,
+            Err(e) => {
+                results[index] = Some(part_result(
+                    req.region_id,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Some(e.to_string()),
+                ));
+                continue;
+            }
+        };
+        if points.is_empty()
+            && let Some(msg) = partial
+        {
+            results[index] = Some(part_result(
+                req.region_id,
+                StatusCode::BAD_REQUEST,
+                Some(msg),
+            ));
+            continue;
+        }
         let point_count = points.len() as u64;
         let ready = ReadyPart {
             index,
             req,
             region,
             point_count,
+            partial,
         };
         // Keep a group within one request's point limit (0 means the
         // default, as in `validate_point_count`).
@@ -488,6 +530,7 @@ async fn apply_shard_write_batch(
             let state = state.clone();
             async move {
                 let region_id = m.req.region_id;
+                let partial = m.partial;
                 let result = replicate_forwarded_part(&state, m.req, &m.region, wal_seq).await;
                 if result.is_ok() {
                     if let Some(ctx) = state.shard_routing.as_ref() {
@@ -495,7 +538,7 @@ async fn apply_shard_write_batch(
                     }
                     counter!("hyperbytedb_shard_forwarded_writes_applied_total").increment(1);
                 }
-                (m.index, region_id, result)
+                (m.index, region_id, result, partial)
             }
         });
         let replicated = tracing::Instrument::instrument(
@@ -504,8 +547,12 @@ async fn apply_shard_write_batch(
         )
         .await;
         stage.lap("replicate");
-        for (index, region_id, result) in replicated {
+        for (index, region_id, result, partial) in replicated {
             results[index] = Some(match result {
+                // Written, less the points that conflicted.
+                Ok(()) if partial.is_some() => {
+                    part_result(region_id, StatusCode::BAD_REQUEST, partial)
+                }
                 Ok(()) => part_result(region_id, StatusCode::NO_CONTENT, None),
                 Err(e) => part_result(
                     region_id,
@@ -663,6 +710,27 @@ async fn apply_shard_write(
         }
     };
 
+    let mut req = req;
+    let (points, partial) = match split_forwarded_conflicts(&state, &mut req, points).await {
+        Ok(split) => split,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    if points.is_empty()
+        && let Some(msg) = partial
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": msg})),
+        )
+            .into_response();
+    }
+
     if let Err(e) = prepare_batch_metadata(
         &state.metadata,
         &req.db,
@@ -737,6 +805,14 @@ async fn apply_shard_write(
     }
 
     counter!("hyperbytedb_shard_forwarded_writes_applied_total").increment(1);
+    // Written, less the points that conflicted.
+    if let Some(msg) = partial {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": msg})),
+        )
+            .into_response();
+    }
     (StatusCode::NO_CONTENT, ()).into_response()
 }
 

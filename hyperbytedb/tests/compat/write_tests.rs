@@ -622,3 +622,74 @@ async fn write_blank_lines_do_not_count_as_points() {
         "blank lines should produce no WAL entries"
     );
 }
+
+/// Conflicting points are dropped and the rest stored: only the kept points
+/// reach the WAL, and the error counts the dropped ones.
+#[tokio::test]
+async fn field_type_conflicts_keep_the_other_points() {
+    let ctx = TestContext::new_no_chdb().unwrap();
+    ctx.metadata.create_database("testdb").await.unwrap();
+    ctx.ingestion
+        .ingest(
+            "testdb",
+            None,
+            None,
+            b"m v=1 1000000000",
+            WritePayloadFormat::LineProtocol,
+        )
+        .await
+        .unwrap();
+    let err = ctx
+        .ingestion
+        .ingest(
+            "testdb",
+            None,
+            None,
+            b"m v=2 2000000000\nm v=\"x\" 3000000000\nm v=3 4000000000\nm v=true 5000000000",
+            WritePayloadFormat::LineProtocol,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            hyperbytedb::error::HyperbytedbError::PartialWrite { dropped: 2, .. }
+        ),
+        "{err}"
+    );
+    let stored: Vec<_> = ctx
+        .wal
+        .read_from(1)
+        .await
+        .unwrap()
+        .into_iter()
+        .flat_map(|(_, e)| e.points)
+        .map(|p| (p.timestamp, p.fields["v"].clone()))
+        .collect();
+    assert_eq!(
+        stored,
+        [
+            (1_000_000_000, FieldValue::Float(1.0)),
+            (2_000_000_000, FieldValue::Float(2.0)),
+            (4_000_000_000, FieldValue::Float(3.0)),
+        ]
+    );
+
+    // A write with nothing left to store is the same error, and stores nothing.
+    let err = ctx
+        .ingestion
+        .ingest(
+            "testdb",
+            None,
+            None,
+            b"m v=\"y\" 6000000000",
+            WritePayloadFormat::LineProtocol,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        hyperbytedb::error::HyperbytedbError::PartialWrite { dropped: 1, .. }
+    ));
+    assert_eq!(ctx.wal.read_from(1).await.unwrap().len(), 2);
+}

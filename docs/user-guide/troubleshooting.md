@@ -164,11 +164,25 @@ Data must be flushed from the WAL into chDB MergeTree tables before it becomes q
 
 ## Field Type Conflict
 
-**Symptom:** Writes return HTTP 400 with `field type conflict`.
+**Symptom:** a write returns HTTP 400 with
+`partial write: field type conflict: input field "v" on measurement "m" is type string, already exists as type float dropped=N`.
 
-**Cause:** A field was previously registered with one type (e.g., float) and a new write sends a different type (e.g., integer) for the same field name.
+**Cause:** a field keeps the type it was first written with. A point that
+sends a type the field can't take is dropped. The other points of the write
+are stored, as in InfluxDB 1.x, and `dropped` counts the dropped points. An
+integer widens into a float, and integer and unsigned widen into unsigned, so
+those don't conflict. A string or boolean into a number field does, and so
+does the reverse. Within one write, the first type a new field gets wins.
 
-**Fix:** Ensure all writes use the same type for each field. If the original type was wrong, you need to drop the measurement and recreate it:
+Before 0.9.3 such points were accepted (204), and the conflicting value was
+stored as null.
+
+**On a sharded cluster** each region's primary checks against the types it
+knows. A primary that has never stored the field accepts any type for its own
+region, much as InfluxDB checks types per shard.
+
+**Fix:** send one type per field. If the stored type is wrong, drop the
+measurement and write it again:
 ```sql
 DROP MEASUREMENT "problematic_measurement"
 ```

@@ -8,7 +8,8 @@ use metrics::{counter, histogram};
 #[cfg(feature = "columnar-ingest")]
 use crate::application::ingest_metadata::prepare_columnar_metadata;
 use crate::application::ingest_metadata::{
-    IngestCardinalityLimits, IngestSchemaCache, prepare_batch_metadata, validate_point_count,
+    IngestCardinalityLimits, IngestSchemaCache, prepare_batch_metadata, split_field_type_conflicts,
+    validate_point_count,
 };
 use crate::application::line_protocol::{
     encode_points_to_line_protocol, parse_line_body_to_points_limited,
@@ -317,6 +318,10 @@ impl PeerIngestionService {
             forward_results.into_iter().map(|(_, r)| r).collect();
         let mut forward_failures = 0usize;
         let mut first_forward_error: Option<HyperbytedbError> = None;
+        // Points a primary refused (a type conflict it knows, a cardinality
+        // limit): the client is told a partial write, not a failure to retry.
+        let mut refused_points = 0usize;
+        let mut all_refused = true;
         // Every failure was a primary shedding load: the client should back
         // off and retry, not treat the batch as lost.
         let mut all_capacity = true;
@@ -324,6 +329,10 @@ impl PeerIngestionService {
             if let Err(e) = result {
                 forward_failures += 1;
                 all_capacity &= matches!(e, HyperbytedbError::ClusterUnavailable(_));
+                match &e {
+                    HyperbytedbError::PartialWrite { dropped, .. } => refused_points += dropped,
+                    _ => all_refused = false,
+                }
                 // Classify before deciding anything about retries. A forward
                 // targets the region's primary only (`RegionTargetRole::Write`
                 // resolves to it alone), so the interesting question is whether
@@ -337,6 +346,7 @@ impl PeerIngestionService {
                     HyperbytedbError::TransferRejected { .. } => "rejected",
                     HyperbytedbError::ShardMap(_) => "shard_map",
                     HyperbytedbError::ClusterUnavailable(_) => "capacity",
+                    HyperbytedbError::PartialWrite { .. } => "refused",
                     _ => "other",
                 };
                 counter!(
@@ -359,6 +369,12 @@ impl PeerIngestionService {
         // suite could not, and read the difference as duplication.
         if let Some(err) = first_forward_error {
             counter!("hyperbytedb_shard_ingest_partial_total").increment(1);
+            if all_refused && let HyperbytedbError::PartialWrite { reason, .. } = err {
+                return Err(HyperbytedbError::PartialWrite {
+                    reason,
+                    dropped: refused_points,
+                });
+            }
             // A capacity-only failure makes the client resend the whole
             // batch, including every region that did land.
             if all_capacity {
@@ -648,6 +664,14 @@ impl PeerIngestionService {
         for (region_id, result) in results {
             match result {
                 Ok(()) => delivered += 1,
+                // Refused by the primary: sending it again cannot help.
+                Err(HyperbytedbError::PartialWrite { reason, dropped }) => {
+                    tracing::warn!(region_id, dropped, %reason, "queued forward refused by primary; dropping");
+                    counter!("hyperbytedb_forward_queue_dropped_total", "reason" => "refused")
+                        .increment(1);
+                    metrics::counter!("hyperbytedb_forward_queue_dropped_points_total")
+                        .increment(dropped as u64);
+                }
                 Err(_) => {
                     if let Some(p) = buckets.forward.get(&region_id) {
                         failed.extend(p.iter().cloned());
@@ -906,9 +930,21 @@ impl IngestionPort for PeerIngestionService {
             validate_point_count(points.len(), self.max_points_per_request)?;
         }
 
+        // Points whose fields conflict with a stored type are dropped and the
+        // rest written, as InfluxDB does; the error says how many.
+        let (points, partial) =
+            split_field_type_conflicts(&self.metadata, db, &retention_policy, points).await?;
+        if points.is_empty() {
+            return partial.map_or(Ok(()), Err);
+        }
+
         let precision_val = Precision::from_str_opt(precision);
         let replication_body = match format {
-            WritePayloadFormat::LineProtocol => body.to_vec(),
+            // The request as sent, unless points were dropped from it.
+            WritePayloadFormat::LineProtocol if partial.is_none() => body.to_vec(),
+            WritePayloadFormat::LineProtocol => {
+                encode_points_to_line_protocol(&points, precision_val)?
+            }
             WritePayloadFormat::Msgpack => encode_points_to_line_protocol(&points, precision_val)?,
             #[cfg(feature = "columnar-ingest")]
             WritePayloadFormat::ColumnarMsgpack => {
@@ -922,9 +958,10 @@ impl IngestionPort for PeerIngestionService {
         histogram!("hyperbytedb_ingest_parse_seconds").record((t2 - t1).as_secs_f64());
 
         if self.shard_routing.is_some() {
-            return self
+            let result = self
                 .ingest_sharded_points(db, &retention_policy, precision, points)
                 .await;
+            return with_dropped(result, partial);
         }
 
         prepare_batch_metadata(
@@ -989,7 +1026,28 @@ impl IngestionPort for PeerIngestionService {
             target_node_ids: None,
             region_id: None,
         })
-        .await
+        .await?;
+        partial.map_or(Ok(()), Err)
+    }
+}
+
+/// A write's result with the points dropped before it was sent added: a
+/// success becomes the partial write, and a partial write counts both.
+fn with_dropped(
+    result: Result<(), HyperbytedbError>,
+    partial: Option<HyperbytedbError>,
+) -> Result<(), HyperbytedbError> {
+    match (result, partial) {
+        (Ok(()), None) => Ok(()),
+        (Ok(()), Some(p)) => Err(p),
+        (
+            Err(HyperbytedbError::PartialWrite { dropped: later, .. }),
+            Some(HyperbytedbError::PartialWrite { reason, dropped }),
+        ) => Err(HyperbytedbError::PartialWrite {
+            reason,
+            dropped: dropped + later,
+        }),
+        (Err(e), _) => Err(e),
     }
 }
 
@@ -1070,8 +1128,36 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod partial_write_error_tests {
-    use super::partial_write_error;
+    use super::{partial_write_error, with_dropped};
     use crate::error::HyperbytedbError;
+
+    fn partial(dropped: usize) -> HyperbytedbError {
+        HyperbytedbError::PartialWrite {
+            reason: "field type conflict".into(),
+            dropped,
+        }
+    }
+
+    #[test]
+    fn points_dropped_before_sending_are_reported_and_added_up() {
+        assert!(with_dropped(Ok(()), None).is_ok());
+        assert!(matches!(
+            with_dropped(Ok(()), Some(partial(2))),
+            Err(HyperbytedbError::PartialWrite { dropped: 2, .. })
+        ));
+        assert!(matches!(
+            with_dropped(Err(partial(3)), Some(partial(2))),
+            Err(HyperbytedbError::PartialWrite { dropped: 5, .. })
+        ));
+        // Any other failure wins: the write did not just drop points.
+        assert!(matches!(
+            with_dropped(
+                Err(HyperbytedbError::PeerUnreachable("x".into())),
+                Some(partial(2))
+            ),
+            Err(HyperbytedbError::PeerUnreachable(_))
+        ));
+    }
 
     #[test]
     fn capacity_only_failures_are_retryable_everything_else_is_not() {
