@@ -112,11 +112,7 @@ impl HttpBackend {
                 }
                 let resp = http_req.send().await?;
                 let status = resp.status().as_u16();
-                let version = resp
-                    .headers()
-                    .get("X-Influxdb-Version")
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_string);
+                let version = server_version(resp.headers());
                 let build = resp
                     .headers()
                     .get("X-Influxdb-Build")
@@ -141,11 +137,7 @@ impl HttpBackend {
                 let hyper_req = builder.body(payload)?;
                 let resp = client.request(hyper_req).await?;
                 let status = resp.status().as_u16();
-                let version = resp
-                    .headers()
-                    .get("X-Influxdb-Version")
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_string);
+                let version = server_version(resp.headers());
                 let build = resp
                     .headers()
                     .get("X-Influxdb-Build")
@@ -163,9 +155,47 @@ impl HttpBackend {
     }
 }
 
+/// The server's version: `X-Hyperbytedb-Version`, else the InfluxDB-style
+/// `X-Influxdb-Version` of servers before 0.9.3 (`HyperbyteDB-<version>`).
+fn server_version(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    if let Some(v) = headers
+        .get("X-Hyperbytedb-Version")
+        .and_then(|v| v.to_str().ok())
+    {
+        return Some(format!("HyperbyteDB-{v}"));
+    }
+    headers
+        .get("X-Influxdb-Version")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn server_version_prefers_hyperbytedb_header() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            "X-Influxdb-Version",
+            HeaderValue::from_static("HyperbyteDB-0.9.2-beta"),
+        );
+        assert_eq!(
+            server_version(&h).as_deref(),
+            Some("HyperbyteDB-0.9.2-beta")
+        );
+        h.insert(
+            "X-Hyperbytedb-Version",
+            HeaderValue::from_static("0.9.3-beta"),
+        );
+        assert_eq!(
+            server_version(&h).as_deref(),
+            Some("HyperbyteDB-0.9.3-beta")
+        );
+        assert_eq!(server_version(&HeaderMap::new()), None);
+    }
 
     #[test]
     fn reqwest_client_has_timeouts() {

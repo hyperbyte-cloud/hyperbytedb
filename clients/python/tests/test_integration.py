@@ -41,7 +41,7 @@ def wait_rows(client, q, database, n, timeout=15.0):
 
 def test_ping_and_health():
     client = HyperbyteDBClient(URL)
-    assert client.ping().startswith("HyperbyteDB")
+    assert client.ping()[0].isdigit(), client.ping()  # e.g. 0.9.3-beta
     assert "status" in client.health() or client.health()
 
 

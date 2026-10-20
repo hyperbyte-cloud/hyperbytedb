@@ -6,12 +6,13 @@ Core HTTP routes for writes, queries, and health, plus TimeseriesQL. **Authentic
 
 ## HTTP API
 
-All endpoints return InfluxDB v1-compatible response headers:
+Every response carries these headers:
 
 | Header | Value |
 |--------|-------|
-| `X-Influxdb-Version` | `HyperbyteDB-0.8.3` |
-| `X-Influxdb-Build` | `OSS` |
+| `X-Hyperbytedb-Version` | The version, e.g. `0.9.3-beta` (from 0.9.3) |
+| `X-Influxdb-Version` | `HyperbyteDB-<version>`, for InfluxDB clients and tools |
+| `X-Influxdb-Build` | `OSS`, for InfluxDB clients and tools |
 | `Request-Id` | UUID per request |
 | `X-Request-Id` | Same UUID |
 
