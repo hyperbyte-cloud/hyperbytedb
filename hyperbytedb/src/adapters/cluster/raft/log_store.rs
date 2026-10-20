@@ -89,6 +89,38 @@ pub(crate) fn merge_snapshot_membership(
     }
 }
 
+/// Merge the state machine's persisted membership into the live one at
+/// startup. Persisted operator states win (a node restarted mid-decommission
+/// stays `Decommissioning`), but the Active/Syncing/Joining axis is
+/// self-reported: a persisted value there never overrides what is live.
+///
+/// This replaced the whole live membership, this node's own record included.
+/// The state machine still held the state a node had when it was added
+/// (learners start `Syncing`), so a node that had just finished its startup
+/// sync went back to `Syncing`, its `/health` said so, and its peers -- which
+/// readmit a node only on a ready self-report -- kept it out: no writes, no
+/// replication, until it restarted again.
+pub(crate) fn merge_persisted_membership(
+    shared: &mut crate::domain::cluster::membership::ClusterMembership,
+    persisted: crate::domain::cluster::membership::ClusterMembership,
+) {
+    use crate::domain::cluster::membership::NodeState::{Active, Joining, Syncing};
+    shared.version = shared.version.max(persisted.version);
+    for (id, info) in persisted.nodes {
+        match shared.nodes.get_mut(&id) {
+            Some(existing) => {
+                existing.addr = info.addr;
+                let self_reported = matches!(existing.state, Active | Syncing | Joining)
+                    && matches!(info.state, Active | Syncing | Joining);
+                if !self_reported {
+                    existing.state = info.state;
+                }
+            }
+            None => shared.add_node(info),
+        }
+    }
+}
+
 fn raft_cf<'a>(
     db: &'a DB,
     name: &'static str,
@@ -248,11 +280,11 @@ impl RaftStore {
 
         let mut shared = self.shared_membership.write().await;
 
-        // Start from the persisted app-level state to retain operator-set
-        // states (Draining/Leaving/Disconnected), then overlay openraft
-        // topology on top so any voter we forgot about gets re-added.
+        // Merge the persisted app-level state to retain operator-set states
+        // (Draining/Leaving/Disconnected), then overlay openraft topology on
+        // top so any voter we forgot about gets re-added.
         if !self.sm.cluster_membership.nodes.is_empty() {
-            *shared = self.sm.cluster_membership.clone();
+            merge_persisted_membership(&mut shared, self.sm.cluster_membership.clone());
         }
 
         let now = chrono::Utc::now().timestamp();
@@ -1092,7 +1124,7 @@ mod schema_drop_tests {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-    use super::merge_snapshot_membership;
+    use super::{merge_persisted_membership, merge_snapshot_membership};
     use openraft::{BasicNode, LeaderId, LogId, Membership, StoredMembership};
     use rocksdb::{DB, Options};
     use tempfile::TempDir;
@@ -1225,6 +1257,44 @@ mod tests {
             "hydrate must preserve Draining state"
         );
         assert_eq!(g.nodes.get(&1).unwrap().state, NodeState::Active);
+    }
+
+    #[test]
+    fn merge_persisted_membership_keeps_live_sync_state_and_operator_states() {
+        let node = |id: u64, state: NodeState| NodeInfo {
+            node_id: id,
+            addr: format!("10.0.0.{id}:8086"),
+            state,
+            joined_at: 1,
+            last_heartbeat: 1,
+            needs_sync: false,
+            consecutive_misses: 0,
+        };
+        // Live: this node (2) finished its startup sync; node 4 restarted
+        // while being decommissioned.
+        let mut shared = ClusterMembership::new();
+        shared.add_node(node(2, NodeState::Active));
+        shared.add_node(node(4, NodeState::Active));
+        // Persisted: 2 as added (a learner, `Syncing`), 4 `Decommissioning`,
+        // and a node 5 this process has not seen.
+        let mut persisted = ClusterMembership::new();
+        persisted.add_node(node(2, NodeState::Syncing));
+        persisted.add_node(node(4, NodeState::Decommissioning));
+        persisted.add_node(node(5, NodeState::Draining));
+
+        merge_persisted_membership(&mut shared, persisted);
+
+        assert_eq!(
+            shared.nodes[&2].state,
+            NodeState::Active,
+            "self-reported sync state is live"
+        );
+        assert_eq!(
+            shared.nodes[&4].state,
+            NodeState::Decommissioning,
+            "operator state persists"
+        );
+        assert_eq!(shared.nodes[&5].state, NodeState::Draining);
     }
 
     #[test]

@@ -47,5 +47,7 @@ pub trait ReplicationPort: Send + Sync {
         req: MutationRequest,
     ) -> Result<(), HyperbytedbError>;
 
-    async fn active_peer_count(&self, self_node_id: u64) -> usize;
+    /// Peers a write replicates to (members not leaving), which a
+    /// `sync_quorum` write counts its required acks against.
+    async fn replication_peer_count(&self, self_node_id: u64) -> usize;
 }

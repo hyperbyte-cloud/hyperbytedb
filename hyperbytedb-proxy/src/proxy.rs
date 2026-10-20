@@ -24,7 +24,7 @@ use futures::StreamExt;
 use futures::ready;
 use http_body_util::BodyExt;
 
-use crate::backend::InflightGuard;
+use crate::backend::{Health, InflightGuard};
 use crate::pool::BackendPool;
 
 /// Headers that hop-by-hop semantics (RFC 7230 §6.1) say we must not forward.
@@ -148,7 +148,22 @@ pub async fn handle(State(state): State<ProxyState>, req: Request) -> Response {
                     .record(started.elapsed().as_secs_f64());
                 return attach_inflight_guard(resp, guard);
             }
-            ForwardOutcome::Retryable { status, msg } => {
+            ForwardOutcome::Retryable { status, msg, mark } => {
+                // Take it out of rotation now. Its health probe only notices
+                // on its next run, about a second later, and until then the
+                // pick below handed the same dead backend straight back
+                // (always, in a one-backend pool): every retry failed within
+                // milliseconds and the client got 503 instead of being held
+                // for `hold_timeout`. The probe restores it once it answers.
+                if let Some(health) = mark
+                    && current.set_health(health).is_some()
+                {
+                    tracing::info!(
+                        backend = %current.addr,
+                        to = health.as_str(),
+                        "backend taken out of rotation after a failed forward"
+                    );
+                }
                 tracing::info!(
                     attempt,
                     backend = %current.addr,
@@ -213,6 +228,9 @@ enum ForwardOutcome {
     Retryable {
         status: Option<StatusCode>,
         msg: Option<String>,
+        /// What the failure says about the backend's health, applied at once
+        /// rather than at its next probe.
+        mark: Option<Health>,
     },
     /// Don't retry: the failure is the client's fault (4xx) and shouldn't be
     /// blamed on backend health.
@@ -243,9 +261,12 @@ async fn forward_once(
     let resp = match rb.send().await {
         Ok(r) => r,
         Err(e) => {
-            // Transport error → backend candidate failed; retry elsewhere.
+            // Transport error → backend candidate failed; retry elsewhere. A
+            // refused or reset connection means the backend is gone (a pod
+            // stopping); a timeout may be a slow request on a live one.
             return ForwardOutcome::Retryable {
                 status: None,
+                mark: (!e.is_timeout()).then_some(Health::Down),
                 msg: Some(e.to_string()),
             };
         }
@@ -260,6 +281,7 @@ async fn forward_once(
     if matches!(upstream_status.as_u16(), 502 | 504,) {
         return ForwardOutcome::Retryable {
             status: Some(upstream_status),
+            mark: None,
             msg: Some("backend returned bad-gateway/timeout".into()),
         };
     }
@@ -273,6 +295,7 @@ async fn forward_once(
             Err(e) => {
                 return ForwardOutcome::Retryable {
                     status: Some(upstream_status),
+                    mark: None,
                     msg: Some(format!("response body read: {e}")),
                 };
             }
@@ -280,6 +303,7 @@ async fn forward_once(
         if looks_like_drain(&body_bytes) {
             return ForwardOutcome::Retryable {
                 status: Some(upstream_status),
+                mark: Some(Health::Draining),
                 msg: Some("backend reports draining/syncing".into()),
             };
         }
@@ -298,6 +322,7 @@ async fn forward_once(
             Err(e) => {
                 return ForwardOutcome::Retryable {
                     status: Some(upstream_status),
+                    mark: None,
                     msg: Some(format!("response body read: {e}")),
                 };
             }

@@ -18,7 +18,7 @@ pub async fn dispatch_outbound_replication(
             let peer_count = if let Some(ref targets) = batch.target_node_ids {
                 targets.len()
             } else {
-                replication.active_peer_count(node_id).await
+                replication.replication_peer_count(node_id).await
             };
             let min_acks: SyncQuorumMinAcks = replication_config.sync_quorum.min_acks;
             let required = min_acks.resolve(peer_count);

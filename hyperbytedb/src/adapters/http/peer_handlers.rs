@@ -895,6 +895,7 @@ pub async fn handle_sync_trigger(State(state): State<Arc<AppState>>) -> impl Int
     let mv_service = state.mv_service.clone();
     let max_points_per_request = state.max_points_per_request;
     let shard_map = state.shard_map.clone();
+    let sharded = state.shard_routing.is_some();
     let cluster_auth = state.cluster_auth.clone();
     let runtime_settings = state.runtime_settings.clone();
 
@@ -926,7 +927,13 @@ pub async fn handle_sync_trigger(State(state): State<Arc<AppState>>) -> impl Int
             &cluster_auth,
         );
         sync_client = sync_client.with_runtime_settings(runtime_settings);
-        if let Some(ref map) = shard_map {
+        // Only a sharded node syncs a shard map. `state.shard_map` is a
+        // `DisabledShardMap` otherwise, never `None`: attaching it made a
+        // replicated node take the sharded reconnect path, which skips WAL
+        // catch-up and fetches a shard map its peers answer with 404. The sync
+        // then always failed, `needs_sync` stayed set, peers never readmitted
+        // the node, and writes stopped reaching it.
+        if sharded && let Some(ref map) = shard_map {
             let sm: Arc<dyn crate::ports::sharding::ShardMapPort> = map.clone();
             sync_client = sync_client.with_shard_map(sm);
         }

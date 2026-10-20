@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use metrics::{counter, histogram};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{Semaphore, oneshot};
@@ -40,6 +40,42 @@ pub struct PeerClient {
     outbound_started: AtomicBool,
     batch_semaphore: Arc<Semaphore>,
     max_coalesce_body_bytes: usize,
+    /// Writes queued or being sent to peers. Shutdown waits for them: a
+    /// `sync_quorum` write returns once enough peers acked, and its sends to
+    /// the others ran on in spawned tasks that the exit simply dropped, so
+    /// those peers never got the write, nor a hint for it.
+    inflight: Arc<InFlight>,
+}
+
+/// A count of replication work not yet done, and a wake-up when it is all done.
+#[derive(Default)]
+struct InFlight {
+    count: AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+/// Holds `n` units of [`InFlight`] until dropped.
+struct InFlightGuard {
+    inflight: Arc<InFlight>,
+    n: usize,
+}
+
+impl InFlight {
+    fn track(self: &Arc<Self>, n: usize) -> InFlightGuard {
+        self.count.fetch_add(n, Ordering::SeqCst);
+        InFlightGuard {
+            inflight: Arc::clone(self),
+            n,
+        }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if self.n > 0 && self.inflight.count.fetch_sub(self.n, Ordering::SeqCst) == self.n {
+            self.inflight.idle.notify_waiters();
+        }
+    }
 }
 
 /// The HTTP client for peer traffic.
@@ -98,6 +134,7 @@ impl PeerClient {
             outbound_started: AtomicBool::new(false),
             batch_semaphore: Arc::new(Semaphore::new(inflight)),
             max_coalesce_body_bytes: max_coalesce_body_bytes.max(1024),
+            inflight: Arc::default(),
         }
     }
 
@@ -177,6 +214,8 @@ impl PeerClient {
         mut rx: tokio::sync::mpsc::Receiver<OutboundReplicationBatch>,
     ) {
         while let Some(first) = rx.recv().await {
+            // Each job was counted when queued; this round's guard releases
+            // them once sent (or hinted).
             // Take everything already queued, up to one request's worth.
             let mut bytes = first.body.len();
             let mut jobs = vec![first];
@@ -189,6 +228,10 @@ impl PeerClient {
                     Err(_) => break,
                 }
             }
+            let queued = InFlightGuard {
+                inflight: Arc::clone(&self.inflight),
+                n: jobs.len(),
+            };
             let jobs = coalesce_jobs(jobs, self.max_coalesce_body_bytes);
 
             let permit = match self.batch_semaphore.clone().acquire_owned().await {
@@ -199,6 +242,7 @@ impl PeerClient {
             tokio::spawn(async move {
                 this.replicate_round(jobs).await;
                 drop(permit);
+                drop(queued);
             });
         }
     }
@@ -401,6 +445,24 @@ impl PeerClient {
         futures::future::join_all(sends).await;
     }
 
+    /// Wait, up to `timeout`, for every queued or in-flight send to a peer to
+    /// finish: delivered, or hinted. Returns how many were still pending.
+    /// Shutdown calls it so writes this node acknowledged reach every peer
+    /// it owes them to, or that peer's hints.
+    pub async fn wait_for_inflight(&self, timeout: Duration) -> usize {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let idle = self.inflight.idle.notified();
+            let pending = self.inflight.count.load(Ordering::SeqCst);
+            if pending == 0 {
+                return 0;
+            }
+            if tokio::time::timeout_at(deadline, idle).await.is_err() {
+                return self.inflight.count.load(Ordering::SeqCst);
+            }
+        }
+    }
+
     pub fn node_addr(&self) -> &str {
         &self.node_addr
     }
@@ -421,9 +483,17 @@ impl PeerClient {
         batch: OutboundReplicationBatch,
     ) -> Result<(), HyperbytedbError> {
         self.start_outbound_processor();
+        // Counted before it is queued: the processor may take it at once.
+        // Released by the round that sends it ([`Self::outbound_loop`]).
+        std::mem::forget(self.inflight.track(1));
         match self.outbound_tx.try_send(batch) {
             Ok(()) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Full(batch)) => {
+                // Not queued after all: held instead until it is hinted.
+                let queued = InFlightGuard {
+                    inflight: Arc::clone(&self.inflight),
+                    n: 1,
+                };
                 counter!("hyperbytedb_replication_queue_full_total").increment(1);
                 if self.hinted_handoff.is_none() {
                     return Err(HyperbytedbError::Internal(
@@ -440,10 +510,15 @@ impl PeerClient {
                         );
                         counter!("hyperbytedb_replication_queue_drops_total").increment(1);
                     }
+                    drop(queued);
                 });
                 Ok(())
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                drop(InFlightGuard {
+                    inflight: Arc::clone(&self.inflight),
+                    n: 1,
+                });
                 tracing::error!("replication outbound queue closed; dropping batch");
                 counter!("hyperbytedb_replication_queue_drops_total").increment(1);
                 Err(HyperbytedbError::Internal(
@@ -569,9 +644,13 @@ impl PeerClient {
                 /* sync = */ true,
                 batch.region_id,
             );
+            // Held until this peer acks or its hint is written, which may be
+            // after this write has returned to the client.
+            let sending = self.inflight.track(1);
             tokio::spawn(async move {
                 let res = ctx.run().await;
                 let _ = tx.send(res);
+                drop(sending);
             });
         }
 
@@ -915,9 +994,13 @@ impl ReplicationPort for PeerClient {
         PeerClient::replicate_mutation_sync(&self, req).await
     }
 
-    async fn active_peer_count(&self, self_node_id: u64) -> usize {
+    /// The peers a `sync_quorum` write counts its acks against: the ones it
+    /// replicates to, not only the `Active` ones. Counting only `Active` peers
+    /// shrank the quorum while peers restarted: with both peers `Syncing`,
+    /// "majority" of zero peers acknowledged a write held by this node alone.
+    async fn replication_peer_count(&self, self_node_id: u64) -> usize {
         let m = self.membership.read().await;
-        m.active_peers(self_node_id).len()
+        m.replication_peers(self_node_id).len()
     }
 }
 
