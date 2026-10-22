@@ -62,8 +62,13 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 # ---------------------------------------------------------------------------
 FROM debian:bookworm-slim
 
+# CVE-2026-111943: fail the build if the CA bundle still trusts the
+# compromised eMudhra emSign ECC Root CA - G3 (dropped in Debian
+# ca-certificates 20250419~deb12u2). Changing this step also keeps a cached
+# layer from carrying an older bundle into the image.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    && test ! -e /etc/ssl/certs/emSign_ECC_Root_CA_-_G3.pem \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /artifacts/hyperbytedb-proxy /usr/local/bin/hyperbytedb-proxy
