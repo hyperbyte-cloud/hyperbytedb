@@ -2445,7 +2445,8 @@ async fn a_queued_forward_is_acknowledged_and_reaches_its_primary() {
 
 /// With the primary down the write is still acknowledged and stays queued;
 /// once the queue is older than the lag limit, new writes forward
-/// synchronously again and report the failure.
+/// synchronously again -- and, the primary being down, are held in the
+/// queue too rather than failed (they used to report the failure, 500).
 #[tokio::test]
 #[serial(chdb)]
 async fn a_lagging_queue_sends_new_writes_back_to_synchronous_forwarding() {
@@ -2461,14 +2462,12 @@ async fn a_lagging_queue_sends_new_writes_back_to_synchronous_forwarding() {
 
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     let second = write_line(&client, &n1.url, "sharddb", "mem,host=b used=2 1000000000").await;
-    assert!(
-        !second.status().is_success(),
-        "past the lag limit a write forwards synchronously and sees the failure"
+    assert_eq!(
+        second.status(),
+        204,
+        "past the lag limit a write forwards synchronously, fails, and is held"
     );
-    assert!(
-        !queue.is_empty(),
-        "the first write is still owed, not dropped"
-    );
+    assert_eq!(queue.len(), 2, "both writes are owed, none dropped");
 }
 
 /// A queued forward is routed against the shard map at delivery: when its
@@ -2499,6 +2498,59 @@ async fn a_queued_forward_follows_its_region_to_a_new_primary() {
     }
     assert_eq!(landed, vec!["mem".to_string()]);
     assert!(queue.is_empty());
+}
+
+/// A write whose region's primary is down (restarting) is held in the
+/// coordinator's forward queue and acknowledged, not failed with 500 "write
+/// partially applied" -- which during a rolling restart was about 60% of
+/// writes for 6 minutes. Synchronous forwarding (the default) is on here.
+#[tokio::test]
+#[serial(chdb)]
+async fn a_write_for_a_down_primary_is_held_not_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = ShardedClusterOptions {
+        forward_queue: true,
+        ..Default::default()
+    };
+    assert!(
+        !opts.sharding.async_forward,
+        "the default: forwards are synchronous"
+    );
+    let [n1, mut n2] = start_sharded_pair_cluster(dir.path(), opts).await;
+    let client = reqwest::Client::new();
+    for node in [&n1, &n2] {
+        create_db(&client, &node.url, "hdb").await;
+    }
+    // Only node 2 holds the measurement, so node 1 forwards every point.
+    let op = ShardMapOp::BootstrapMeasurement {
+        key: MeasurementKey::new("hdb", "autogen", "mem"),
+        region: ShardRegion {
+            region_id: 2,
+            start: 0,
+            end: u64::MAX,
+            epoch: ShardEpoch::default(),
+            peers: vec![2],
+            primary: 2,
+            last_split_at: 0,
+            transfer_verified: None,
+            transfer_first_seen: None,
+            state: Default::default(),
+            staged_from: None,
+            staging_peers: Vec::new(),
+        },
+    };
+    for node in [&n1, &n2] {
+        node.shard_map.apply_op(op.clone()).await.unwrap();
+        let snap = node.shard_map.snapshot().await.unwrap();
+        node.location_cache.refresh_from_map(&snap);
+    }
+    stop_node(&mut n2);
+    let resp = write_line(&client, &n1.url, "hdb", "mem,host=a used=1 1000000000").await;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(status, 204, "{body}");
+    let queue = n1.forward_queue.as_ref().unwrap();
+    assert_eq!(queue.len(), 1, "held for the primary until it is back");
 }
 
 /// Two nodes; only node 2 holds `qdb.mem`, so node 1 knows no field types

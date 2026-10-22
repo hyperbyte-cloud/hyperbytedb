@@ -256,8 +256,15 @@ impl DrainService {
         Ok(())
     }
 
+    /// Wait for every active peer to ack this node's schema mutations.
+    ///
+    /// Writes are not waited for here. Peers never record WAL acks (nothing
+    /// sets them), and a peer's WAL sequence is not comparable to this node's
+    /// anyway, so the wait on them always ran its full 90 s whenever this node
+    /// had written anything -- every restart of a replicated node. Writes are
+    /// settled at shutdown instead: each is acked by its peers, or hinted for
+    /// them (`PeerClient::wait_for_inflight`).
     async fn wait_for_replication_acks(&self) -> Result<(), HyperbytedbError> {
-        let local_wal_seq = self.wal.last_sequence().await?;
         let local_mutation_seq = self.replication_log.last_mutation_seq();
         let max_wait = Duration::from_secs(90);
         let start = std::time::Instant::now();
@@ -280,9 +287,7 @@ impl DrainService {
 
             let mut all_acked = true;
             for peer_id in &peers {
-                let wal_ack = self.replication_log.get_wal_ack(*peer_id)?;
-                let mutation_ack = self.replication_log.get_mutation_ack(*peer_id)?;
-                if wal_ack < local_wal_seq || mutation_ack < local_mutation_seq {
+                if self.replication_log.get_mutation_ack(*peer_id)? < local_mutation_seq {
                     all_acked = false;
                 }
             }

@@ -269,9 +269,12 @@ impl FlushServiceImpl {
                 Vec::new()
             }
         } else if let Some(ref m) = self.membership {
+            // Every peer still owed this node's writes, not only `Active`
+            // ones: a restarting (`Syncing`) peer catches up from this WAL,
+            // and truncating past its ack left it short for good.
             let membership = m.read().await;
             membership
-                .active_peers(self.node_id)
+                .replication_peers(self.node_id)
                 .into_iter()
                 .map(|n| n.node_id)
                 .collect()

@@ -571,6 +571,20 @@ async fn serve_inner(
         }
     }
 
+    // Writes acknowledged before the API stopped may still be on their way
+    // to peers (a `sync_quorum` write returns once enough peers acked);
+    // let them land, or become hints, before the process exits. Retries
+    // stop backing off now, so this covers one request (10 s timeout) and
+    // the hint.
+    if let Some(ref pc) = peer_client {
+        let pending = pc.wait_for_inflight(Duration::from_secs(15)).await;
+        if pending > 0 {
+            tracing::warn!(pending, "replication sends still pending at shutdown");
+        } else {
+            tracing::info!("replication sends settled");
+        }
+    }
+
     // ── Phase 3: Stop remaining background services ─────────────────────
     tracing::info!("stopping remaining background services");
 

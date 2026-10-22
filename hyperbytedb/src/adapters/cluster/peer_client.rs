@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use metrics::{counter, histogram};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{Semaphore, oneshot};
@@ -40,6 +40,60 @@ pub struct PeerClient {
     outbound_started: AtomicBool,
     batch_semaphore: Arc<Semaphore>,
     max_coalesce_body_bytes: usize,
+    /// Writes queued or being sent to peers. Shutdown waits for them: a
+    /// `sync_quorum` write returns once enough peers acked, and its sends to
+    /// the others ran on in spawned tasks that the exit simply dropped, so
+    /// those peers never got the write, nor a hint for it.
+    inflight: Arc<InFlight>,
+}
+
+/// A count of replication work not yet done, and a wake-up when it is all done.
+#[derive(Default)]
+struct InFlight {
+    count: AtomicUsize,
+    idle: tokio::sync::Notify,
+    /// Set once shutdown waits on the sends: a send that fails then hints
+    /// at once instead of backing off (1 s, 2 s, 4 s, 8 s) past the wait.
+    stopping: AtomicBool,
+    stop: tokio::sync::Notify,
+}
+
+/// Holds `n` units of [`InFlight`] until dropped.
+struct InFlightGuard {
+    inflight: Arc<InFlight>,
+    n: usize,
+}
+
+impl InFlight {
+    /// Sleep `delay` before the next retry. False, at once, when shutdown
+    /// has begun or begins meanwhile: hint now rather than retry.
+    async fn backoff(&self, delay: Duration) -> bool {
+        // Created before the check, so a stop between the two still wakes it.
+        let stop = self.stop.notified();
+        if self.stopping.load(Ordering::SeqCst) {
+            return false;
+        }
+        tokio::select! {
+            () = tokio::time::sleep(delay) => true,
+            () = stop => false,
+        }
+    }
+
+    fn track(self: &Arc<Self>, n: usize) -> InFlightGuard {
+        self.count.fetch_add(n, Ordering::SeqCst);
+        InFlightGuard {
+            inflight: Arc::clone(self),
+            n,
+        }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if self.n > 0 && self.inflight.count.fetch_sub(self.n, Ordering::SeqCst) == self.n {
+            self.inflight.idle.notify_waiters();
+        }
+    }
 }
 
 /// The HTTP client for peer traffic.
@@ -98,6 +152,7 @@ impl PeerClient {
             outbound_started: AtomicBool::new(false),
             batch_semaphore: Arc::new(Semaphore::new(inflight)),
             max_coalesce_body_bytes: max_coalesce_body_bytes.max(1024),
+            inflight: Arc::default(),
         }
     }
 
@@ -177,6 +232,8 @@ impl PeerClient {
         mut rx: tokio::sync::mpsc::Receiver<OutboundReplicationBatch>,
     ) {
         while let Some(first) = rx.recv().await {
+            // Each job was counted when queued; this round's guard releases
+            // them once sent (or hinted).
             // Take everything already queued, up to one request's worth.
             let mut bytes = first.body.len();
             let mut jobs = vec![first];
@@ -189,6 +246,10 @@ impl PeerClient {
                     Err(_) => break,
                 }
             }
+            let queued = InFlightGuard {
+                inflight: Arc::clone(&self.inflight),
+                n: jobs.len(),
+            };
             let jobs = coalesce_jobs(jobs, self.max_coalesce_body_bytes);
 
             let permit = match self.batch_semaphore.clone().acquire_owned().await {
@@ -199,6 +260,7 @@ impl PeerClient {
             tokio::spawn(async move {
                 this.replicate_round(jobs).await;
                 drop(permit);
+                drop(queued);
             });
         }
     }
@@ -335,10 +397,9 @@ impl PeerClient {
                         .increment(1);
                 }
             }
-            if attempts >= self.max_retries {
+            if attempts >= self.max_retries || !self.inflight.backoff(delay).await {
                 break;
             }
-            tokio::time::sleep(delay).await;
             delay = (delay * 2).min(Duration::from_secs(30));
         }
 
@@ -401,6 +462,28 @@ impl PeerClient {
         futures::future::join_all(sends).await;
     }
 
+    /// Wait, up to `timeout`, for every queued or in-flight send to a peer to
+    /// finish: delivered, or hinted. Returns how many were still pending.
+    /// Shutdown calls it so writes this node acknowledged reach every peer
+    /// it owes them to, or that peer's hints. From here on a failed send
+    /// hints at once instead of backing off, so `timeout` need only cover
+    /// one request.
+    pub async fn wait_for_inflight(&self, timeout: Duration) -> usize {
+        self.inflight.stopping.store(true, Ordering::SeqCst);
+        self.inflight.stop.notify_waiters();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let idle = self.inflight.idle.notified();
+            let pending = self.inflight.count.load(Ordering::SeqCst);
+            if pending == 0 {
+                return 0;
+            }
+            if tokio::time::timeout_at(deadline, idle).await.is_err() {
+                return self.inflight.count.load(Ordering::SeqCst);
+            }
+        }
+    }
+
     pub fn node_addr(&self) -> &str {
         &self.node_addr
     }
@@ -421,9 +504,17 @@ impl PeerClient {
         batch: OutboundReplicationBatch,
     ) -> Result<(), HyperbytedbError> {
         self.start_outbound_processor();
+        // Counted before it is queued: the processor may take it at once.
+        // Released by the round that sends it ([`Self::outbound_loop`]).
+        std::mem::forget(self.inflight.track(1));
         match self.outbound_tx.try_send(batch) {
             Ok(()) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Full(batch)) => {
+                // Not queued after all: held instead until it is hinted.
+                let queued = InFlightGuard {
+                    inflight: Arc::clone(&self.inflight),
+                    n: 1,
+                };
                 counter!("hyperbytedb_replication_queue_full_total").increment(1);
                 if self.hinted_handoff.is_none() {
                     return Err(HyperbytedbError::Internal(
@@ -440,10 +531,15 @@ impl PeerClient {
                         );
                         counter!("hyperbytedb_replication_queue_drops_total").increment(1);
                     }
+                    drop(queued);
                 });
                 Ok(())
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                drop(InFlightGuard {
+                    inflight: Arc::clone(&self.inflight),
+                    n: 1,
+                });
                 tracing::error!("replication outbound queue closed; dropping batch");
                 counter!("hyperbytedb_replication_queue_drops_total").increment(1);
                 Err(HyperbytedbError::Internal(
@@ -569,9 +665,13 @@ impl PeerClient {
                 /* sync = */ true,
                 batch.region_id,
             );
+            // Held until this peer acks or its hint is written, which may be
+            // after this write has returned to the client.
+            let sending = self.inflight.track(1);
             tokio::spawn(async move {
                 let res = ctx.run().await;
                 let _ = tx.send(res);
+                drop(sending);
             });
         }
 
@@ -666,6 +766,7 @@ impl PeerClient {
             sync,
             region_id,
             max_attempts: self.max_retries,
+            inflight: Arc::clone(&self.inflight),
         }
     }
 
@@ -915,9 +1016,13 @@ impl ReplicationPort for PeerClient {
         PeerClient::replicate_mutation_sync(&self, req).await
     }
 
-    async fn active_peer_count(&self, self_node_id: u64) -> usize {
+    /// The peers a `sync_quorum` write counts its acks against: the ones it
+    /// replicates to, not only the `Active` ones. Counting only `Active` peers
+    /// shrank the quorum while peers restarted: with both peers `Syncing`,
+    /// "majority" of zero peers acknowledged a write held by this node alone.
+    async fn replication_peer_count(&self, self_node_id: u64) -> usize {
         let m = self.membership.read().await;
-        m.active_peers(self_node_id).len()
+        m.replication_peers(self_node_id).len()
     }
 }
 
@@ -1032,6 +1137,7 @@ struct PeerReplicateCtx {
     /// on-disk hint record predates the region being carried.
     region_id: Option<u64>,
     max_attempts: u32,
+    inflight: Arc<InFlight>,
 }
 
 impl PeerReplicateCtx {
@@ -1127,31 +1233,31 @@ impl PeerReplicateCtx {
                 }
             }
 
-            if attempts >= self.max_attempts {
-                if let Some(ref hh) = self.hinted_handoff {
-                    if let Err(e) = hh.enqueue_hint(self.peer_id, &self.hint_payload) {
-                        tracing::error!(
-                            peer_id = self.peer_id,
-                            error = %e,
-                            "failed to enqueue hinted handoff"
-                        );
-                    } else {
-                        tracing::warn!(
-                            peer_id = self.peer_id,
-                            "replication failed, write queued for hinted handoff"
-                        );
-                    }
-                } else {
+            if attempts < self.max_attempts && self.inflight.backoff(delay).await {
+                delay = (delay * 2).min(Duration::from_secs(30));
+                continue;
+            }
+            if let Some(ref hh) = self.hinted_handoff {
+                if let Err(e) = hh.enqueue_hint(self.peer_id, &self.hint_payload) {
                     tracing::error!(
-                        peer = %self.url,
-                        "giving up replication after {} attempts (no hinted handoff)",
-                        self.max_attempts
+                        peer_id = self.peer_id,
+                        error = %e,
+                        "failed to enqueue hinted handoff"
+                    );
+                } else {
+                    tracing::warn!(
+                        peer_id = self.peer_id,
+                        "replication failed, write queued for hinted handoff"
                     );
                 }
-                return Err(last_error.unwrap_or_else(|| "unknown error".to_string()));
+            } else {
+                tracing::error!(
+                    peer = %self.url,
+                    "giving up replication after {} attempts (no hinted handoff)",
+                    attempts
+                );
             }
-            tokio::time::sleep(delay).await;
-            delay = (delay * 2).min(Duration::from_secs(30));
+            return Err(last_error.unwrap_or_else(|| "unknown error".to_string()));
         }
     }
 }
@@ -1455,6 +1561,60 @@ mod replicate_batch_tests {
         assert_eq!(hh.pending_count(3).unwrap(), 1, "the region's replica");
         assert_eq!(hh.pending_count(2).unwrap(), 0, "not a replica of region 2");
         assert_eq!(hh.pending_count(4).unwrap(), 0, "not a replica of region 2");
+    }
+
+    /// Shutdown waits on sends to a down peer. Backing off 1 s, 2 s, 4 s,
+    /// 8 s before the hint outlasted that wait, and the process exited with
+    /// the acknowledged write neither delivered nor hinted. Node 2 refuses
+    /// connections (the batch path); node 3 predates replicate-batch and
+    /// answers 503 (the per-part path).
+    #[tokio::test]
+    async fn shutdown_hints_a_failing_send_instead_of_backing_off() {
+        let legacy_failing = serve(
+            axum::Router::new()
+                .route(
+                    "/internal/replicate-batch",
+                    axum::routing::post(|| async { axum::http::StatusCode::NOT_FOUND }),
+                )
+                .route(
+                    "/internal/replicate",
+                    axum::routing::post(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+                ),
+        )
+        .await;
+        let mut m = ClusterMembership::new();
+        m.add_node(node(2, "127.0.0.1:1"));
+        m.add_node(node(3, &legacy_failing));
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(ReplicationLog::open(dir.path()).unwrap());
+        let hh = Arc::new(HintedHandoff::new(log.db().clone(), 100).unwrap());
+        let pc = Arc::new(
+            PeerClient::new(
+                1,
+                "127.0.0.1:1".into(),
+                crate::domain::cluster::membership::new_shared(m),
+                log,
+                5,
+                64,
+                2,
+                1 << 20,
+                Default::default(),
+            )
+            .with_hinted_handoff(hh.clone()),
+        );
+        PeerClient::replicate_write(&pc, job(1, vec![2, 3])).unwrap();
+        // Both first attempts fail; both sends are now backing off.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let started = std::time::Instant::now();
+        assert_eq!(pc.wait_for_inflight(Duration::from_secs(5)).await, 0);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(hh.pending_count(2).unwrap(), 1);
+        assert_eq!(hh.pending_count(3).unwrap(), 1);
     }
 }
 

@@ -89,8 +89,11 @@ const FORWARD_DRAIN_CONCURRENCY: usize = 8;
 /// of seconds, and most writes fell back to synchronous forwarding.
 const FORWARD_DRAIN_MAX_ENTRIES: usize = 16;
 const FORWARD_DRAIN_MAX_BYTES: u64 = 1024 * 1024;
-/// Delivery attempts before a queued forward is dropped.
-const FORWARD_MAX_ATTEMPTS: u32 = 100;
+/// How long a queued forward is retried before it is dropped. By age, not
+/// attempts: 100 attempts at the 1 s cap was ~95 s, shorter than a restart
+/// under load, so forwards held for a restarting primary were dropped. Same
+/// as hinted handoff's default `max_hint_age_secs`.
+const FORWARD_MAX_AGE_MS: u64 = 3_600_000;
 
 /// Retry delay. Capped well under the lag limit: a retry keeps its original
 /// timestamp, so a long backoff alone would hold the queue's age over the
@@ -314,6 +317,15 @@ impl PeerIngestionService {
             &mut forward_results,
         )
         .await;
+        self.hold_failed_forwards(
+            ctx,
+            db,
+            rp,
+            precision,
+            &buckets.forward,
+            &mut forward_results,
+        )
+        .await;
         let forward_results: Vec<Result<(), HyperbytedbError>> =
             forward_results.into_iter().map(|(_, r)| r).collect();
         let mut forward_failures = 0usize;
@@ -426,36 +438,68 @@ impl PeerIngestionService {
                 .increment(1);
             return false;
         }
-        // Frames concatenate, so each region's points encode on their own.
-        let mut body = Vec::new();
-        for points in forward.values() {
-            match crate::application::line_protocol::encode_points_binary(points) {
-                Ok(frame) => body.extend_from_slice(&frame),
-                Err(e) => {
-                    tracing::warn!(error = %e, "could not encode forwards for the queue");
-                    return false;
-                }
-            }
-        }
-        let entry = ForwardEntry {
-            db: db.to_string(),
-            rp: rp.to_string(),
-            precision: precision.map(str::to_string),
-            enqueued_ms: now,
-            not_before_ms: 0,
-            attempts: 0,
-            body,
+        enqueue_forwards(queue.as_ref(), db, rp, precision, forward, now, 0).await
+    }
+
+    /// Hold the regions whose synchronous forward failed for a reason that
+    /// passes -- the primary unreachable (restarting), or at capacity after
+    /// its retries -- in the forward queue, and say which were held. The
+    /// drainer delivers them to whichever node is then the primary.
+    ///
+    /// A sharded write used to fail with 500 "write partially applied" for as
+    /// long as any primary it touched was restarting (about 60% of writes
+    /// over 6 minutes of a rolling restart), and clients resent the regions
+    /// that had landed. Only the byte cap applies here: these are not the
+    /// writes `async_forward` would queue, but ones that would fail.
+    async fn hold_failed_forwards(
+        &self,
+        ctx: &ShardRoutingContext,
+        db: &str,
+        rp: &str,
+        precision: Option<&str>,
+        forward: &std::collections::HashMap<u64, Vec<crate::domain::point::Point>>,
+        results: &mut [(u64, Result<(), HyperbytedbError>)],
+    ) {
+        let Some(queue) = self.forward_queue.as_ref() else {
+            return;
         };
-        match queue.enqueue(entry).await {
-            Ok(_) => {
-                counter!("hyperbytedb_forward_queue_enqueued_total").increment(1);
-                true
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "forward queue enqueue failed; forwarding synchronously");
-                counter!("hyperbytedb_forward_queue_sync_fallback_total", "reason" => "error")
-                    .increment(1);
-                false
+        let held: std::collections::HashMap<u64, Vec<crate::domain::point::Point>> = results
+            .iter()
+            .filter(|(_, r)| {
+                matches!(
+                    r,
+                    Err(HyperbytedbError::PeerUnreachable(_)
+                        | HyperbytedbError::ClusterUnavailable(_))
+                )
+            })
+            .filter_map(|(id, _)| forward.get(id).map(|p| (*id, p.clone())))
+            .collect();
+        if held.is_empty() {
+            return;
+        }
+        if queue.bytes() > ctx.config.async_forward_max_bytes {
+            counter!("hyperbytedb_forward_queue_hold_refused_total", "reason" => "bytes")
+                .increment(1);
+            return;
+        }
+        let now = now_ms();
+        // Not before the first backoff: the primary just failed.
+        if enqueue_forwards(
+            queue.as_ref(),
+            db,
+            rp,
+            precision,
+            &held,
+            now,
+            now + forward_backoff_ms(0),
+        )
+        .await
+        {
+            counter!("hyperbytedb_shard_forward_held_regions_total").increment(held.len() as u64);
+            for (id, r) in results.iter_mut() {
+                if held.contains_key(id) {
+                    *r = Ok(());
+                }
             }
         }
     }
@@ -1082,20 +1126,64 @@ fn partial_write_error(
 /// The entry that retries `failed` (points of `head`'s entries that did not
 /// land), or `None` once they have used up their attempts or cannot be
 /// encoded; either way they are dropped and counted.
+/// Queue `forward`'s points as one entry. False when they could not be.
+async fn enqueue_forwards(
+    queue: &dyn ForwardQueuePort,
+    db: &str,
+    rp: &str,
+    precision: Option<&str>,
+    forward: &std::collections::HashMap<u64, Vec<crate::domain::point::Point>>,
+    now: u64,
+    not_before_ms: u64,
+) -> bool {
+    // Frames concatenate, so each region's points encode on their own.
+    let mut body = Vec::new();
+    for points in forward.values() {
+        match crate::application::line_protocol::encode_points_binary(points) {
+            Ok(frame) => body.extend_from_slice(&frame),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not encode forwards for the queue");
+                return false;
+            }
+        }
+    }
+    let entry = ForwardEntry {
+        db: db.to_string(),
+        rp: rp.to_string(),
+        precision: precision.map(str::to_string),
+        enqueued_ms: now,
+        not_before_ms,
+        attempts: 0,
+        body,
+    };
+    match queue.enqueue(entry).await {
+        Ok(_) => {
+            counter!("hyperbytedb_forward_queue_enqueued_total").increment(1);
+            true
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "forward queue enqueue failed");
+            counter!("hyperbytedb_forward_queue_sync_fallback_total", "reason" => "error")
+                .increment(1);
+            false
+        }
+    }
+}
+
 fn retry_forwards(
     head: &ForwardEntry,
     failed: &[crate::domain::point::Point],
     now: u64,
 ) -> Option<ForwardEntry> {
     let attempts = head.attempts + 1;
-    if attempts >= FORWARD_MAX_ATTEMPTS {
+    if now.saturating_sub(head.enqueued_ms) > FORWARD_MAX_AGE_MS {
         tracing::error!(
             points = failed.len(),
             attempts,
             db = %head.db,
-            "dropping queued forward after repeated delivery failures"
+            "dropping queued forward undelivered for an hour"
         );
-        counter!("hyperbytedb_forward_queue_dropped_total", "reason" => "attempts").increment(1);
+        counter!("hyperbytedb_forward_queue_dropped_total", "reason" => "age").increment(1);
         metrics::counter!("hyperbytedb_forward_queue_dropped_points_total")
             .increment(failed.len() as u64);
         return None;
