@@ -71,9 +71,16 @@ pub async fn handle_write(
                     }
                     return Ok(resp);
                 }
-                NodeState::Syncing | NodeState::Joining => {
+                // As `/health`: a node Raft already serves as a voter is
+                // Active even while its own record still says Syncing (it
+                // converges a few seconds later). Refusing here made the
+                // first writes after `/health` turned 200 fail with 503.
+                NodeState::Syncing | NodeState::Joining
+                    if !super::ping::raft_is_serving(&state) =>
+                {
                     return Ok(StatusCode::SERVICE_UNAVAILABLE.into_response());
                 }
+                NodeState::Syncing | NodeState::Joining => {}
                 // Listed explicitly rather than `_`: a catch-all here silently
                 // admits client writes for any state added later, which is how
                 // a node being removed kept accepting them.

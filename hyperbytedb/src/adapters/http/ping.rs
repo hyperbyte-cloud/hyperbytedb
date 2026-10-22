@@ -66,7 +66,7 @@ fn json_response(code: StatusCode, body: String) -> Response {
 /// were still a learner) must not keep `/health` on 503 — that deadlocks
 /// StatefulSet OrderedReady and, via self-echoed `/health` bodies, the
 /// peer heartbeat that would otherwise promote us.
-fn raft_is_serving(state: &AppState) -> bool {
+pub(crate) fn raft_is_serving(state: &AppState) -> bool {
     let Some(raft) = state.raft.as_ref() else {
         return false;
     };
