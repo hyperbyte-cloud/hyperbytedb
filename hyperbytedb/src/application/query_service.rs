@@ -2221,7 +2221,11 @@ async fn execute_select_from_source(
                 select_with_expanded_group_by(select_stmt, &sub_tag_keys);
 
             if svc.shard_routing.is_some() {
-                let inner = execute_measurement_query(
+                // Times in nanoseconds, so the outer query gets a real `time`
+                // column back; it saw only the JSON's `__time` (a string or
+                // the client's epoch unit), and failed on every subquery
+                // that filters or buckets by time.
+                let mut inner = execute_measurement_query(
                     svc,
                     query_db,
                     &rp,
@@ -2229,26 +2233,27 @@ async fn execute_select_from_source(
                     sub_stmt,
                     time_min,
                     time_max,
-                    epoch,
+                    Some("ns"),
                     group_by_tags,
                 )
                 .await?;
                 if inner.is_empty() {
                     return Ok(vec![]);
                 }
+                stamp_aggregate_time(sub_stmt, &mut inner, Some("ns"), time_min);
                 let inner_json = series_results_to_json_each_row(&inner)?;
                 let escaped = escape_clickhouse_string_literal(&inner_json);
-                let sub_source_sql = format!("(SELECT * FROM format(JSONEachRow, '{escaped}'))");
+                let sub_source_sql = format!(
+                    "(SELECT * EXCEPT (`__time`), fromUnixTimestamp64Nano(toInt64(`__time`)) AS `time` FROM format(JSONEachRow, '{escaped}'))"
+                );
                 let outer_sql =
                     to_clickhouse::translate_with_source(&select_stmt_expanded, &sub_source_sql)?;
-                return run_series_query(
-                    svc,
-                    &outer_sql,
-                    sub_source,
-                    epoch,
-                    &resolved_group_by_tags,
-                )
-                .await;
+                let series =
+                    run_series_query(svc, &outer_sql, sub_source, epoch, &resolved_group_by_tags)
+                        .await?;
+                return Ok(crate::domain::sharding::multi_selector::strip_hidden(
+                    series,
+                ));
             }
 
             let sub_sql = to_clickhouse::translate_native_table(
@@ -2258,15 +2263,21 @@ async fn execute_select_from_source(
                 sub_series_join,
                 Some((time_min, time_max)),
             )?;
-            // A GROUP BY time() inner query exposes its bucket column under the
-            // internal `__time` alias; as a FROM source it must expose `time`
-            // so the outer query's bucketing/ordering can reference it.
-            let sub_sql = to_clickhouse::rename_time_bucket_alias(&sub_sql);
-            let outer_sql = to_clickhouse::translate_with_source(
-                &select_stmt_expanded,
-                &format!("({sub_sql})"),
+            let sub_source_sql = to_clickhouse::subquery_source(
+                &sub_stmt_expanded,
+                &sub_sql,
+                time_min,
+                sub_effective_mapping.as_ref(),
             )?;
-            run_series_query(svc, &outer_sql, sub_source, epoch, &resolved_group_by_tags).await
+            let outer_sql =
+                to_clickhouse::translate_with_source(&select_stmt_expanded, &sub_source_sql)?;
+            let series =
+                run_series_query(svc, &outer_sql, sub_source, epoch, &resolved_group_by_tags)
+                    .await?;
+            // An outer TOP/BOTTOM/SAMPLE's ranking columns.
+            Ok(crate::domain::sharding::multi_selector::strip_hidden(
+                series,
+            ))
         }
     }
 }
@@ -2284,6 +2295,44 @@ async fn execute_measurement_query(
     epoch: Option<&str>,
     group_by_tags: &[String],
 ) -> Result<Vec<SeriesResult>, HyperbytedbError> {
+    // TOP/BOTTOM/SAMPLE rows carry hidden ranking columns; a sharded result
+    // is also ranked again over every region's rows.
+    if let Some(sel) = to_clickhouse::multi_selector(stmt)? {
+        let named = to_clickhouse::with_output_names(stmt);
+        if let Some(ctx) = &svc.shard_routing {
+            let series = execute_sharded_measurement_query(
+                svc,
+                ctx,
+                db,
+                rp,
+                measurement,
+                stmt,
+                time_min,
+                time_max,
+                epoch,
+                group_by_tags,
+            )
+            .await?;
+            return Ok(crate::domain::sharding::multi_selector::rerank(
+                &sel, &named, series,
+            ));
+        }
+        let series = execute_local_measurement_query(
+            svc,
+            db,
+            rp,
+            measurement,
+            stmt,
+            time_min,
+            time_max,
+            epoch,
+            group_by_tags,
+        )
+        .await?;
+        return Ok(crate::domain::sharding::multi_selector::strip_hidden(
+            series,
+        ));
+    }
     if let Some(ctx) = &svc.shard_routing {
         return execute_sharded_measurement_query(
             svc,
@@ -2697,7 +2746,18 @@ async fn execute_sharded_measurement_query(
             &effective_stmt,
         )
     };
-    let is_global_aggregate = !is_materialized_dest && select_has_true_aggregate(&effective_stmt);
+    // TOP/BOTTOM/SAMPLE: each region returns its own N per group and the
+    // caller ranks the union again, then applies LIMIT and OFFSET. A region
+    // LIMIT would cut its points by time before they are ranked.
+    let multi_selector = to_clickhouse::multi_selector(&effective_stmt)?.is_some();
+    let multi_stmt = multi_selector.then(|| {
+        let mut s = effective_stmt.clone();
+        s.limit = None;
+        s.offset = None;
+        s
+    });
+    let is_global_aggregate =
+        !is_materialized_dest && !multi_selector && select_has_true_aggregate(&effective_stmt);
     let selected_regions: Vec<ShardRegion> = region_selection
         .regions(space)
         .into_iter()
@@ -2707,6 +2767,7 @@ async fn execute_sharded_measurement_query(
     metrics::histogram!("hyperbytedb_query_regions").record(selected_regions.len() as f64);
     stage.lap("route");
     let sharded_plan = if !is_materialized_dest
+        && !multi_selector
         && (selected_regions.len() > 1 || (space.regions.len() > 1 && is_global_aggregate))
     {
         let mut plan = prepare_sharded_region_query(&effective_stmt)?;
@@ -2719,6 +2780,7 @@ async fn execute_sharded_measurement_query(
     let translate_stmt = sharded_plan
         .as_ref()
         .map(|plan| &plan.region_stmt)
+        .or(multi_stmt.as_ref())
         .unwrap_or(&effective_stmt);
 
     let translate = if sharded_plan.as_ref().is_some_and(|p| p.region_unordered) {
@@ -2837,6 +2899,9 @@ async fn execute_sharded_measurement_query(
 
     if parts.is_empty() {
         return Ok(Vec::new());
+    }
+    if multi_selector && !is_materialized_dest {
+        return Ok(parts.into_iter().flat_map(first_statement_series).collect());
     }
     if parts.len() == 1 && !is_materialized_dest && sharded_plan.is_none() {
         let Some(part) = parts.pop() else {

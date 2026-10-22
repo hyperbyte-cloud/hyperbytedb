@@ -8,12 +8,14 @@ mod conditions;
 mod materialized_view;
 mod rename;
 mod select;
+mod selectors;
 mod time_bounds;
 
 #[cfg(test)]
 mod tests;
 
 pub use rename::rename_time_bucket_alias;
+pub use selectors::{BUCKET_COL, MultiSelector, SelectorKind, TIME_NS_COL, multi_selector};
 pub use time_bounds::extract_time_bounds;
 
 pub use coalesce::{build_coalesced_fact_view, build_coalesced_fact_view_with_row_meta};
@@ -26,7 +28,7 @@ pub use materialized_view::{
     translate_materialized_view_series_select, translate_select_into, translate_select_into_native,
 };
 pub use select::{
-    legacy_field_alias, select_has_true_aggregate, select_output_field_name,
+    legacy_field_alias, select_has_true_aggregate, select_output_field_name, subquery_source,
     translate_native_table, translate_native_table_unordered, translate_with_source,
     with_output_names,
 };

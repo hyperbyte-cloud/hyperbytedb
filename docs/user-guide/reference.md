@@ -243,6 +243,22 @@ SELECT <field_expression>[, ...] FROM <measurement>
 | `MODE(field)` | Most frequent value |
 | `DISTINCT(field)` | Unique values |
 
+### Selector Functions
+
+These return up to N stored points per group (each `GROUP BY time()` bucket
+and tag set), each at its own time, in time order.
+
+| Function | Description |
+|----------|-------------|
+| `TOP(field, N)` | The N largest values; the earliest point wins a tie |
+| `TOP(field, tag[, tag...], N)` | The N largest values, at most one per tag-value combination; the tags are returned as columns |
+| `BOTTOM(field, N)` / `BOTTOM(field, tag[, tag...], N)` | The N smallest values, likewise |
+| `SAMPLE(field, N)` | N points picked at random |
+
+Other fields and tags may be selected beside them (`SELECT top("value", 3), "host"`), taken from the same points, but not other functions. `LIMIT` and `OFFSET` apply to the points returned.
+
+A raw field cannot be grouped by time: `SELECT "value" ... GROUP BY time(1m)` fails with `GROUP BY requires at least one aggregate function`, as in InfluxDB.
+
 ### Transform Functions
 
 | Function | Description |

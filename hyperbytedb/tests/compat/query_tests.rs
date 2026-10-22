@@ -1171,3 +1171,266 @@ async fn columns_and_time_follow_influxql() {
     let (cols, _) = shape("SELECT v + w FROM cpu").await;
     assert_eq!(cols, ["time", "v_w"]);
 }
+
+// ---------------------------------------------------------------------------
+// Subqueries over aggregates; TOP, BOTTOM and SAMPLE
+// ---------------------------------------------------------------------------
+
+/// 60 s of points for hosts a and b: `usage` = base + (7s mod 23) + 0.5,
+/// base 0 for a and 100 for b, so b's maximum, 122.5, is at s = 13, 36 and
+/// 59, and each host's minimum at s = 0, 23 and 46. Starts at
+/// 2001-09-09T01:46:40Z (10^9 s).
+async fn two_hosts() -> TestContext {
+    let ctx = TestContext::new().unwrap();
+    ctx.metadata.create_database("testdb").await.unwrap();
+    let mut lines = Vec::new();
+    for (host, base) in [("a", 0), ("b", 100)] {
+        for s in 0..60i64 {
+            lines.push(format!(
+                "cpu,host={host} usage={}.5,n={s}i {}",
+                base + (s * 7) % 23,
+                (1_000_000_000 + s) * 1_000_000_000
+            ));
+        }
+    }
+    ctx.write_and_flush("testdb", &lines.join("\n"))
+        .await
+        .unwrap();
+    ctx
+}
+
+const RANGE: &str = "time >= 1000000000s AND time < 1000000060s";
+
+/// The statement's series, failing on any error.
+async fn series_of(
+    ctx: &TestContext,
+    q: &str,
+) -> Vec<hyperbytedb::domain::query_result::SeriesResult> {
+    let resp = ctx
+        .query("testdb", q)
+        .await
+        .unwrap_or_else(|e| panic!("{q}: {e}"));
+    assert!(
+        resp.results[0].error.is_none(),
+        "{q}: {:?}",
+        resp.results[0].error
+    );
+    resp.results[0].series.clone().unwrap_or_default()
+}
+
+/// The error a statement fails with, as a client sees it.
+async fn error_of(ctx: &TestContext, q: &str) -> String {
+    match ctx.query("testdb", q).await {
+        Err(e) => e.to_string(),
+        Ok(resp) => resp.results[0]
+            .error
+            .clone()
+            .unwrap_or_else(|| panic!("{q} should fail")),
+    }
+}
+
+fn rows(s: &hyperbytedb::domain::query_result::SeriesResult) -> Vec<Vec<serde_json::Value>> {
+    s.values.clone()
+}
+
+/// (time, value) for a series whose first two columns are those; JSON `112`
+/// and `112.0` compare unequal as values.
+fn points(s: &hyperbytedb::domain::query_result::SeriesResult) -> Vec<(String, f64)> {
+    s.values
+        .iter()
+        .map(|r| (r[0].as_str().unwrap().to_string(), r[1].as_f64().unwrap()))
+        .collect()
+}
+
+/// A subquery over a GROUP BY time() aggregate: renaming its bucket to
+/// `time` inside its own SQL made ClickHouse read `time` in its GROUP BY as
+/// the bucket, and every such query failed with NOT_AN_AGGREGATE.
+#[tokio::test]
+#[serial(chdb)]
+async fn subquery_over_time_buckets() {
+    let ctx = two_hosts().await;
+    let q = format!(
+        "SELECT max(m) FROM (SELECT mean(usage) AS m FROM cpu WHERE {RANGE} GROUP BY time(10s), host) WHERE {RANGE} GROUP BY time(30s)"
+    );
+    let series = series_of(&ctx, &q).await;
+    assert_eq!(series[0].columns, ["time", "max"]);
+    // Host b's 10 s means are 111.3, 112.3 | 111, 112, 110.7 | 111.7; the
+    // 30 s buckets start at :30, :00 and :30.
+    assert_eq!(
+        points(&series[0]),
+        [
+            ("2001-09-09T01:46:30Z".to_string(), 112.3),
+            ("2001-09-09T01:47:00Z".to_string(), 112.0),
+            ("2001-09-09T01:47:30Z".to_string(), 111.7),
+        ]
+    );
+}
+
+/// A subquery over an aggregate without buckets had no `time` column at all.
+/// Its points take the query's lower time bound, as in InfluxDB.
+#[tokio::test]
+#[serial(chdb)]
+async fn subquery_over_an_aggregate_without_buckets() {
+    let ctx = two_hosts().await;
+    let q = format!(
+        "SELECT max(m) FROM (SELECT mean(usage) AS m FROM cpu WHERE {RANGE} GROUP BY host) WHERE {RANGE}"
+    );
+    let series = series_of(&ctx, &q).await;
+    assert_eq!(
+        rows(&series[0]),
+        vec![vec![
+            serde_json::json!("2001-09-09T01:46:40Z"),
+            serde_json::json!(111.5)
+        ]]
+    );
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn a_raw_field_cannot_be_grouped_by_time() {
+    let ctx = two_hosts().await;
+    for q in [
+        format!("SELECT usage FROM cpu WHERE {RANGE} GROUP BY time(20s)"),
+        format!("SELECT * FROM cpu WHERE {RANGE} GROUP BY time(20s)"),
+    ] {
+        let err = error_of(&ctx, &q).await;
+        assert!(
+            err.contains("GROUP BY requires at least one aggregate function"),
+            "{q}: {err}"
+        );
+    }
+}
+
+/// TOP keeps the largest points at their own times, earliest first on ties,
+/// in time order.
+#[tokio::test]
+#[serial(chdb)]
+async fn top_returns_the_largest_points() {
+    let ctx = two_hosts().await;
+    let series = series_of(
+        &ctx,
+        &format!("SELECT top(usage, 2) FROM cpu WHERE {RANGE}"),
+    )
+    .await;
+    assert_eq!(series[0].columns, ["time", "top"]);
+    assert_eq!(
+        rows(&series[0]),
+        vec![
+            vec![
+                serde_json::json!("2001-09-09T01:46:53Z"),
+                serde_json::json!(122.5)
+            ],
+            vec![
+                serde_json::json!("2001-09-09T01:47:16Z"),
+                serde_json::json!(122.5)
+            ],
+        ]
+    );
+
+    // With a tag argument, one point per host; with another field beside
+    // it, that field from the same point.
+    let series = series_of(
+        &ctx,
+        &format!("SELECT top(usage, host, 2), n FROM cpu WHERE {RANGE}"),
+    )
+    .await;
+    assert_eq!(series[0].columns, ["time", "top", "n", "host"]);
+    let got: Vec<(f64, i64, String)> = series[0]
+        .values
+        .iter()
+        .map(|r| {
+            (
+                r[1].as_f64().unwrap(),
+                r[2].as_i64().unwrap(),
+                r[3].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(got, [(122.5, 13, "b".into()), (22.5, 13, "a".into())]);
+}
+
+/// Per GROUP BY time() bucket and per series.
+#[tokio::test]
+#[serial(chdb)]
+async fn bottom_and_sample_per_bucket() {
+    let ctx = two_hosts().await;
+    let series = series_of(
+        &ctx,
+        &format!("SELECT bottom(usage, 1) FROM cpu WHERE {RANGE} GROUP BY time(20s), host"),
+    )
+    .await;
+    assert_eq!(series.len(), 2);
+    for (s, min) in series.iter().zip([0.5, 100.5]) {
+        let times: Vec<&str> = s.values.iter().map(|r| r[0].as_str().unwrap()).collect();
+        assert_eq!(
+            times,
+            [
+                "2001-09-09T01:46:40Z",
+                "2001-09-09T01:47:03Z",
+                "2001-09-09T01:47:26Z"
+            ],
+            "{s:?}"
+        );
+        assert!(s.values.iter().all(|r| r[1].as_f64() == Some(min)), "{s:?}");
+    }
+
+    // 30 s buckets from :30: 20 + 30 + 10 points, two picked from each.
+    let series = series_of(
+        &ctx,
+        &format!("SELECT sample(usage, 2) FROM cpu WHERE {RANGE} GROUP BY time(30s)"),
+    )
+    .await;
+    assert_eq!(series[0].columns, ["time", "sample"]);
+    assert_eq!(series[0].values.len(), 6);
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn top_cannot_be_combined_with_other_functions() {
+    let ctx = two_hosts().await;
+    let err = error_of(
+        &ctx,
+        &format!("SELECT top(usage, 2), mean(usage) FROM cpu WHERE {RANGE}"),
+    )
+    .await;
+    assert!(
+        err.contains("selector function top() cannot be combined"),
+        "{err}"
+    );
+    let err = error_of(
+        &ctx,
+        &format!("SELECT top(usage, 0) FROM cpu WHERE {RANGE}"),
+    )
+    .await;
+    assert!(err.contains("must be at least 1"), "{err}");
+}
+
+/// TOP over a subquery, and an aggregate over a TOP subquery.
+#[tokio::test]
+#[serial(chdb)]
+async fn top_and_subqueries() {
+    let ctx = two_hosts().await;
+    let series = series_of(
+        &ctx,
+        &format!(
+            "SELECT top(m, 1) FROM (SELECT mean(usage) AS m FROM cpu WHERE {RANGE} GROUP BY time(10s)) WHERE {RANGE}"
+        ),
+    )
+    .await;
+    assert_eq!(series[0].columns, ["time", "top"], "no ranking columns");
+    assert_eq!(
+        rows(&series[0]),
+        vec![vec![
+            serde_json::json!("2001-09-09T01:46:50Z"),
+            serde_json::json!(62.3)
+        ]]
+    );
+    let series = series_of(
+        &ctx,
+        &format!(
+            "SELECT mean(top) FROM (SELECT top(usage, 3) FROM cpu WHERE {RANGE}) WHERE {RANGE}"
+        ),
+    )
+    .await;
+    assert_eq!(series[0].values[0][1], serde_json::json!(122.5));
+}

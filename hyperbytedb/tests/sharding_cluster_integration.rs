@@ -638,6 +638,188 @@ async fn multi_region_group_by_time_merges_buckets() {
     }
 }
 
+/// TOP, BOTTOM and SAMPLE across two regions: each region returns its own
+/// N per group and the coordinator ranks the union again, so the result is
+/// the global N, not N per region.
+#[tokio::test]
+#[serial(chdb)]
+async fn multi_region_top_bottom_and_sample() {
+    let dir = tempfile::tempdir().unwrap();
+    let nodes =
+        start_sharded_three_node_cluster(dir.path(), ShardedClusterOptions::default()).await;
+    bootstrap_two_regions(&nodes, "sharddb", "autogen", "cpu").await;
+    let client = reqwest::Client::new();
+    for node in &nodes {
+        create_db(&client, &node.url, "sharddb").await;
+    }
+    let (low, high) = hosts_for_region_split("cpu", u64::MAX / 2);
+    let s = 1_000_000_000u64;
+    // Low region: 10 @0s, 20 @30s, 25 @50s. High region: 30 @10s, 40 @70s,
+    // 5 @80s.
+    let body = format!(
+        "cpu,host={low} value=10 0\n\
+         cpu,host={low} value=20 {}\n\
+         cpu,host={low} value=25 {}\n\
+         cpu,host={high} value=30 {}\n\
+         cpu,host={high} value=40 {}\n\
+         cpu,host={high} value=5 {}",
+        30 * s,
+        50 * s,
+        10 * s,
+        70 * s,
+        80 * s
+    );
+    let resp = write_line(&client, &nodes[0].url, "sharddb", &body).await;
+    assert!(resp.status().is_success(), "write: {}", resp.status());
+    for node in &nodes {
+        flush_node(node).await;
+    }
+    let range = format!("time >= 0 AND time < {}", 120 * s);
+    let values = |resp: &QueryResponse| -> Vec<Vec<f64>> {
+        let result = &resp.results[0];
+        assert!(result.error.is_none(), "{:?}", result.error);
+        result
+            .series
+            .as_ref()
+            .expect("series")
+            .iter()
+            .map(|series| {
+                assert!(
+                    !series.columns.iter().any(|c| c.starts_with("__")),
+                    "{:?}",
+                    series.columns
+                );
+                series
+                    .values
+                    .iter()
+                    .map(|r| r[1].as_f64().unwrap())
+                    .collect()
+            })
+            .collect()
+    };
+    for node in &nodes {
+        let resp = query_parsed(
+            &client,
+            &node.url,
+            "sharddb",
+            &format!("SELECT top(value, 2) FROM cpu WHERE {range}"),
+        )
+        .await;
+        assert_eq!(
+            values(&resp),
+            [vec![30.0, 40.0]],
+            "{}: global top 2, time order",
+            node.url
+        );
+
+        let resp = query_parsed(
+            &client,
+            &node.url,
+            "sharddb",
+            &format!("SELECT top(value, 1) FROM cpu WHERE {range} GROUP BY time(1m)"),
+        )
+        .await;
+        assert_eq!(
+            values(&resp),
+            [vec![30.0, 40.0]],
+            "{}: per minute",
+            node.url
+        );
+
+        let resp = query_parsed(
+            &client,
+            &node.url,
+            "sharddb",
+            &format!("SELECT bottom(value, 1) FROM cpu WHERE {range} GROUP BY host"),
+        )
+        .await;
+        let mut per_host = values(&resp);
+        per_host.sort_by(|a, b| a[0].total_cmp(&b[0]));
+        assert_eq!(per_host, [vec![5.0], vec![10.0]], "{}: per host", node.url);
+
+        let resp = query_parsed(
+            &client,
+            &node.url,
+            "sharddb",
+            &format!("SELECT top(value, 3) FROM cpu WHERE {range} LIMIT 1 OFFSET 1"),
+        )
+        .await;
+        assert_eq!(
+            values(&resp),
+            [vec![25.0]],
+            "{}: LIMIT/OFFSET after ranking",
+            node.url
+        );
+
+        let resp = query_parsed(
+            &client,
+            &node.url,
+            "sharddb",
+            &format!("SELECT sample(value, 2) FROM cpu WHERE {range}"),
+        )
+        .await;
+        assert_eq!(
+            values(&resp)[0].len(),
+            2,
+            "{}: two points overall",
+            node.url
+        );
+    }
+}
+
+/// A subquery over time buckets on a sharded measurement: the inner result
+/// is gathered from the regions and the outer query runs over it.
+#[tokio::test]
+#[serial(chdb)]
+async fn multi_region_subquery_over_time_buckets() {
+    let dir = tempfile::tempdir().unwrap();
+    let nodes =
+        start_sharded_three_node_cluster(dir.path(), ShardedClusterOptions::default()).await;
+    bootstrap_two_regions(&nodes, "sharddb", "autogen", "cpu").await;
+    let client = reqwest::Client::new();
+    for node in &nodes {
+        create_db(&client, &node.url, "sharddb").await;
+    }
+    let (low, high) = hosts_for_region_split("cpu", u64::MAX / 2);
+    let s = 1_000_000_000u64;
+    let body = format!(
+        "cpu,host={low} value=10 0\n\
+         cpu,host={low} value=20 {}\n\
+         cpu,host={high} value=30 {}\n\
+         cpu,host={high} value=40 {}",
+        30 * s,
+        70 * s,
+        100 * s
+    );
+    let resp = write_line(&client, &nodes[0].url, "sharddb", &body).await;
+    assert!(resp.status().is_success(), "write: {}", resp.status());
+    for node in &nodes {
+        flush_node(node).await;
+    }
+    let range = format!("time >= 0 AND time < {}", 120 * s);
+    for node in &nodes {
+        let resp = query_parsed(
+            &client,
+            &node.url,
+            "sharddb",
+            &format!(
+                "SELECT max(m) FROM (SELECT mean(value) AS m FROM cpu WHERE {range} GROUP BY time(1m), host) WHERE {range} GROUP BY time(2m)"
+            ),
+        )
+        .await;
+        let result = &resp.results[0];
+        assert!(result.error.is_none(), "{}: {:?}", node.url, result.error);
+        let series = result.series.as_ref().expect("series");
+        let maxes: Vec<f64> = series[0]
+            .values
+            .iter()
+            .map(|r| r[1].as_f64().unwrap())
+            .collect();
+        // Per minute and host: 15 (low, :00), 35 (high, :01): one 2 m bucket.
+        assert_eq!(maxes, [35.0], "{}", node.url);
+    }
+}
+
 /// Across regions, a lone selector reports the winning point's time and a
 /// plain aggregate epoch 0, as on one node. The winners sit in
 /// different regions: max and last in one, min and first in the other.

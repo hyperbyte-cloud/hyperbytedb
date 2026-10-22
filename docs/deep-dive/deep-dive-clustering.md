@@ -780,6 +780,7 @@ Multi-region fan-out rewrites SELECT into per-region partial aggregations, then 
 | `first` / `last` | Carry bucket time; pick min/max time across regions |
 | `distinct`, `count(distinct)`, `stddev` | Set / moment partial merge |
 | `percentile`, `median`, `mode`, `spread` | **Error** — not supported across regions yet |
+| `top`, `bottom`, `sample` | Each region returns its own N points per group; the coordinator ranks the union again (exact for `top`/`bottom`), then applies `LIMIT`/`OFFSET` |
 
 Global **LIMIT**, **OFFSET**, and **ORDER BY** apply on the coordinator after merging (per-region SQL fetches `limit+offset` rows).
 
