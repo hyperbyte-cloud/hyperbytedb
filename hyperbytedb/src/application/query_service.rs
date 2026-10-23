@@ -2300,13 +2300,19 @@ async fn execute_measurement_query(
     if let Some(sel) = to_clickhouse::multi_selector(stmt)? {
         let named = to_clickhouse::with_output_names(stmt);
         if let Some(ctx) = &svc.shard_routing {
+            // `rerank` applies LIMIT and OFFSET, so nothing below may: the
+            // regions, and also the local table a measurement without a
+            // shard space falls back to, which applied them a second time.
+            let mut unlimited = stmt.clone();
+            unlimited.limit = None;
+            unlimited.offset = None;
             let series = execute_sharded_measurement_query(
                 svc,
                 ctx,
                 db,
                 rp,
                 measurement,
-                stmt,
+                &unlimited,
                 time_min,
                 time_max,
                 epoch,
@@ -2747,15 +2753,9 @@ async fn execute_sharded_measurement_query(
         )
     };
     // TOP/BOTTOM/SAMPLE: each region returns its own N per group and the
-    // caller ranks the union again, then applies LIMIT and OFFSET. A region
-    // LIMIT would cut its points by time before they are ranked.
+    // caller ranks the union again, then applies LIMIT and OFFSET (it passes
+    // the statement without them).
     let multi_selector = to_clickhouse::multi_selector(&effective_stmt)?.is_some();
-    let multi_stmt = multi_selector.then(|| {
-        let mut s = effective_stmt.clone();
-        s.limit = None;
-        s.offset = None;
-        s
-    });
     let is_global_aggregate =
         !is_materialized_dest && !multi_selector && select_has_true_aggregate(&effective_stmt);
     let selected_regions: Vec<ShardRegion> = region_selection
@@ -2780,7 +2780,6 @@ async fn execute_sharded_measurement_query(
     let translate_stmt = sharded_plan
         .as_ref()
         .map(|plan| &plan.region_stmt)
-        .or(multi_stmt.as_ref())
         .unwrap_or(&effective_stmt);
 
     let translate = if sharded_plan.as_ref().is_some_and(|p| p.region_unordered) {

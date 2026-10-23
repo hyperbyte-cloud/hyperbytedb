@@ -767,6 +767,60 @@ async fn multi_region_top_bottom_and_sample() {
     }
 }
 
+/// A sharded node queries a measurement it has no shard space for (here the
+/// space is dropped from the map, the rows stay) from its own table. That
+/// local SQL applied LIMIT and OFFSET, and the coordinator's re-rank applied
+/// them again: `top(v, 3) LIMIT 1 OFFSET 1` returned nothing.
+#[tokio::test]
+#[serial(chdb)]
+async fn top_limit_offset_on_the_local_fallback_applies_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = start_sharded_single_node(dir.path(), ShardedClusterOptions::default()).await;
+    let client = reqwest::Client::new();
+    create_db(&client, &node.url, "fdb").await;
+    let s = 1_000_000_000u64;
+    let body = format!(
+        "cpu,host=a value=10 {}\ncpu,host=a value=30 {}\ncpu,host=a value=20 {}",
+        s,
+        2 * s,
+        3 * s
+    );
+    let resp = write_line(&client, &node.url, "fdb", &body).await;
+    assert!(resp.status().is_success(), "write: {}", resp.status());
+    flush_node(&node).await;
+    node.shard_map
+        .apply_op(ShardMapOp::DropSpace {
+            db: "fdb".into(),
+            rp: Some("autogen".into()),
+            measurement: Some("cpu".into()),
+        })
+        .await
+        .unwrap();
+    let snap = node.shard_map.snapshot().await.unwrap();
+    node.location_cache.refresh_from_map(&snap);
+
+    let resp = query_parsed(
+        &client,
+        &node.url,
+        "fdb",
+        "SELECT top(value, 3) FROM cpu WHERE time >= 0 AND time < 10s LIMIT 1 OFFSET 1",
+    )
+    .await;
+    let result = &resp.results[0];
+    assert!(result.error.is_none(), "{:?}", result.error);
+    let series = result.series.as_ref().expect("one point, not none");
+    let values: Vec<f64> = series[0]
+        .values
+        .iter()
+        .map(|r| r[1].as_f64().unwrap())
+        .collect();
+    assert_eq!(
+        values,
+        [30.0],
+        "top 3 in time order is 10, 30, 20; OFFSET 1 LIMIT 1 is 30"
+    );
+}
+
 /// A subquery over time buckets on a sharded measurement: the inner result
 /// is gathered from the regions and the outer query runs over it.
 #[tokio::test]
