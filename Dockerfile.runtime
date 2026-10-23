@@ -20,8 +20,13 @@ FROM debian:bookworm-slim
 # which staging subdirectory to copy from.
 ARG TARGETARCH
 
+# CVE-2026-111943: fail the build if the CA bundle still trusts the
+# compromised eMudhra emSign ECC Root CA - G3 (dropped in Debian
+# ca-certificates 20250419~deb12u2). Changing this step also keeps a cached
+# layer from carrying an older bundle into the image.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates libstdc++6 curl \
+    && test ! -e /etc/ssl/certs/emSign_ECC_Root_CA_-_G3.pem \
     && rm -rf /var/lib/apt/lists/*
 
 COPY ${TARGETARCH}/libchdb.so /usr/local/lib/libchdb.so
