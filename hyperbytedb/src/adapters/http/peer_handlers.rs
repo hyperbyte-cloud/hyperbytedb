@@ -945,7 +945,18 @@ pub async fn handle_sync_trigger(State(state): State<Arc<AppState>>) -> impl Int
             .unwrap_or(false);
         let wal_seq = wal.last_sequence().await.unwrap_or(0);
 
-        let result = if !has_data && wal_seq == 0 {
+        // A node that already synced (Active, nothing flagged) holds no data
+        // only because the cluster has none yet. Re-joining it flipped it to
+        // Syncing, so the first writes after `/health` turned 200 got 503s;
+        // a reconnect stays Active for a small gap. A node the operator
+        // brought up knowing no peers starts flagged `needs_sync` and still
+        // joins.
+        let synced_before = {
+            let m = membership_clone.read().await;
+            m.get_node(node_id)
+                .is_some_and(|n| n.state == NodeState::Active && !n.needs_sync)
+        };
+        let result = if !has_data && wal_seq == 0 && !synced_before {
             tracing::info!("sync trigger: new node, running join_and_sync");
             {
                 let mut m = membership_clone.write().await;
