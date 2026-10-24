@@ -86,8 +86,6 @@ runs 0.9.3-beta.
   not retry a 400, so it does not write them twice.
 - The Python client's `ping()` returns the bare version (`0.9.3-beta`, was
   `HyperbyteDB-0.9.2-beta`).
-- Build images without the Docker layer cache, or the build stops at the
-  CA bundle check.
 
 ## Known limits
 
