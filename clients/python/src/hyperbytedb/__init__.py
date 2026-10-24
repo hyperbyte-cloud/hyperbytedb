@@ -8,7 +8,7 @@
             print(row)
 """
 
-__version__ = "0.9.1b0"
+__version__ = "0.9.3b0"
 
 from .client import HyperbyteDBClient, Result, Series  # noqa: E402
 from .errors import (  # noqa: E402
