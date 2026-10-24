@@ -62,6 +62,15 @@ fn translate_inner_ordered(
     // so `mean(a), mean(b)` is `mean`, `mean_1` in the SQL and the merge alike.
     let named = with_output_names(stmt);
     let stmt = &named;
+    if let Some(sel) = super::selectors::multi_selector(stmt)? {
+        return super::selectors::translate_multi_selector(
+            stmt,
+            &sel,
+            from_source,
+            mapping,
+            series,
+        );
+    }
     let mut out = String::new();
 
     // InfluxQL treats a GROUP BY time() query without an explicit fill() as
@@ -129,6 +138,13 @@ fn translate_inner_ordered(
         .fields
         .iter()
         .any(|f| matches!(f.expr, Expr::Star | Expr::Wildcard));
+    // As InfluxDB: raw points cannot be bucketed. ClickHouse would reject the
+    // SQL with NOT_AN_AGGREGATE, which surfaced as a chDB error.
+    if has_group_by_time && !has_aggregate {
+        return Err(HyperbytedbError::QueryParse(
+            "GROUP BY requires at least one aggregate function".to_string(),
+        ));
+    }
     // True aggregates collapse rows; bare window transforms (difference("v"),
     // moving_average("v", n), ...) stay per-point and must keep the raw `time`
     // column and per-point ordering like raw selects.
@@ -391,6 +407,47 @@ pub fn translate_with_source(
     source: &str,
 ) -> Result<String, HyperbytedbError> {
     translate_inner(stmt, source, None, None, None)
+}
+
+/// `sub_sql` (the translation of `sub`) as an outer query's FROM source,
+/// with a `time` column as InfluxDB gives a subquery's points: the bucket
+/// for GROUP BY time(), the selected point's time for a lone selector, else
+/// the WHERE clause's lower bound (`time_min`, epoch 0 without one).
+///
+/// Renaming the `__time` alias to `time` inside `sub_sql` made ClickHouse
+/// read `time` in its GROUP BY as the bucket, not the column, so every
+/// subquery over an aggregate failed (NOT_AN_AGGREGATE, or no `time`).
+pub fn subquery_source(
+    sub: &SelectStatement,
+    sub_sql: &str,
+    time_min: Option<i64>,
+    mapping: Option<&ColumnMapping>,
+) -> Result<String, HyperbytedbError> {
+    let named = with_output_names(sub);
+    let has_group_by_time = named
+        .group_by
+        .as_ref()
+        .and_then(|gb| gb.time_dimension())
+        .is_some();
+    let has_star = named
+        .fields
+        .iter()
+        .any(|f| matches!(f.expr, Expr::Star | Expr::Wildcard));
+    // TOP/BOTTOM/SAMPLE keep their points' own `time`.
+    if super::selectors::multi_selector(&named)?.is_some() {
+        return Ok(format!("({sub_sql})"));
+    }
+    if has_group_by_time || lone_selector_time_sql(&named, mapping)?.is_some() {
+        return Ok(format!(
+            "(SELECT * EXCEPT (`__time`), `__time` AS `time` FROM ({sub_sql}))"
+        ));
+    }
+    if select_has_true_aggregate(&named) && !has_star {
+        let stamp = nanos_to_ch_timestamp(time_min.unwrap_or(0));
+        return Ok(format!("(SELECT *, {stamp} AS `time` FROM ({sub_sql}))"));
+    }
+    // Raw points (and per-point transforms) carry their own `time`.
+    Ok(format!("({sub_sql})"))
 }
 pub(super) fn expr_references_tag(expr: &Expr, m: &ColumnMapping) -> bool {
     match expr {

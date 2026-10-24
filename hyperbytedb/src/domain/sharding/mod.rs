@@ -1,4 +1,5 @@
 pub mod location_cache;
+pub mod multi_selector;
 pub mod ops;
 pub mod placement;
 pub mod query_merge;
