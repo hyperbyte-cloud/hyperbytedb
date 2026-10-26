@@ -106,6 +106,7 @@ nav:
       - Troubleshooting: user-guide/troubleshooting.md
       - API & TimeseriesQL Reference: user-guide/reference.md
       - Release notes:
+          - 0.9.4-beta: user-guide/release-notes-0.9.4-beta.md
           - 0.9.3-beta: user-guide/release-notes-0.9.3-beta.md
           - 0.9.2-beta: user-guide/release-notes-0.9.2-beta.md
           - 0.9.1-beta: user-guide/release-notes-0.9.1-beta.md
