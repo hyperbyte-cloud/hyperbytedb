@@ -32,10 +32,22 @@ fn be_bytes_to_u64(bytes: &[u8]) -> u64 {
     u64::from_be_bytes(arr)
 }
 
+/// A truncation of at most this many entries uses point deletes; more take
+/// one range delete. See [`WalPort::truncate_before`] on [`RocksDbWal`].
+const TRUNCATE_POINT_DELETES_MAX: u64 = 1024;
+
+/// Range deletes the WAL CF's memtable may hold before it is flushed.
+const RANGE_DELETES_PER_MEMTABLE: u64 = 64;
+
 pub struct RocksDbWal {
     db: Arc<DB>,
     seq: Arc<AtomicU64>,
     flushed_through: AtomicU64,
+    /// Every entry below this sequence has been deleted (or never existed):
+    /// where the next truncation starts. See [`WalPort::truncate_before`].
+    truncated_through: Arc<AtomicU64>,
+    /// Range deletes written to the WAL CF since its memtable last flushed.
+    range_deletes_unflushed: Arc<AtomicU64>,
     /// `(seq, encoded bytes)` of entries written by this process and not yet
     /// truncated, oldest first: what a byte-bounded margin is measured in.
     sizes: Arc<std::sync::Mutex<std::collections::VecDeque<(u64, u64)>>>,
@@ -211,10 +223,29 @@ impl RocksDbWal {
             }
         };
 
+        // The oldest entry left, or past the last one: no entry below it.
+        let first = {
+            let wal_cf = db
+                .cf_handle(WAL_CF)
+                .ok_or_else(|| HyperbytedbError::Wal("wal column family not found".into()))?;
+            let mut iter = db.iterator_cf(&wal_cf, IteratorMode::Start);
+            match iter.next() {
+                Some(Ok((key, _))) if key.len() == 8 => be_bytes_to_u64(&key),
+                Some(Err(e)) => {
+                    return Err(HyperbytedbError::Wal(
+                        crate::error::ChainedError::from_error(e),
+                    ));
+                }
+                _ => seq.saturating_add(1),
+            }
+        };
+
         Ok(Self {
             db,
             seq: Arc::new(AtomicU64::new(seq)),
             flushed_through: AtomicU64::new(0),
+            truncated_through: Arc::new(AtomicU64::new(first)),
+            range_deletes_unflushed: Arc::new(AtomicU64::new(0)),
             sizes: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             arrow_cache: Arc::new(WalArrowCache::new()),
             wal_format: options.wal_format,
@@ -591,6 +622,8 @@ impl WalPort for RocksDbWal {
         // truncated WAL CF can still recover the last assigned seq from
         // wal_meta on the next open.
         let last_seq = self.seq.load(Ordering::Relaxed);
+        let truncated_through = Arc::clone(&self.truncated_through);
+        let range_deletes_unflushed = Arc::clone(&self.range_deletes_unflushed);
 
         tokio::task::spawn_blocking(move || {
             let wal_cf = db
@@ -600,13 +633,42 @@ impl WalPort for RocksDbWal {
                 .cf_handle(WAL_META_CF)
                 .ok_or_else(|| HyperbytedbError::Wal("wal_meta column family not found".into()))?;
 
-            let from = u64_to_be_bytes(0);
-            let to = u64_to_be_bytes(sequence);
+            // Only what is new since the last truncation. Every flush used to
+            // write a range delete over [0, sequence): on a quiet node the
+            // memtable never fills, so a week of flushes left thousands of
+            // overlapping range deletes in it, and replaying them on the next
+            // open takes time and memory quadratic in their number (5,000:
+            // 10 s and 1.8 GB; n3's shared pool needed 11 GiB and was
+            // OOM-killed at 4 GiB for 19 hours). A few entries take point
+            // deletes, which cost nothing to replay; a range delete is kept
+            // for many, and the memtable is flushed before range deletes
+            // pile up in it.
+            let from = truncated_through.load(Ordering::Acquire);
+            if sequence <= from {
+                return Ok(());
+            }
             let mut batch = WriteBatch::default();
-            batch.delete_range_cf(&wal_cf, &from, &to);
+            let ranged = sequence - from > TRUNCATE_POINT_DELETES_MAX;
+            if ranged {
+                batch.delete_range_cf(&wal_cf, u64_to_be_bytes(from), u64_to_be_bytes(sequence));
+            } else {
+                for s in from..sequence {
+                    batch.delete_cf(&wal_cf, u64_to_be_bytes(s));
+                }
+            }
             batch.put_cf(&wal_meta_cf, LAST_SEQ_KEY, u64_to_be_bytes(last_seq));
             db.write(batch)
                 .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
+            truncated_through.fetch_max(sequence, Ordering::AcqRel);
+            if ranged
+                && range_deletes_unflushed.fetch_add(1, Ordering::AcqRel) + 1
+                    >= RANGE_DELETES_PER_MEMTABLE
+            {
+                db.flush_cf(&wal_cf).map_err(|e| {
+                    HyperbytedbError::Wal(crate::error::ChainedError::from_error(e))
+                })?;
+                range_deletes_unflushed.store(0, Ordering::Release);
+            }
             Ok(())
         })
         .await
@@ -735,6 +797,104 @@ mod tests {
                 .collect(),
             origin_node_id: 0,
         }
+    }
+
+    fn memtable_counts(wal: &RocksDbWal) -> (u64, u64) {
+        let cf = wal.db.cf_handle(WAL_CF).unwrap();
+        let get = |p: &str| wal.db.property_int_value_cf(&cf, p).unwrap().unwrap();
+        (
+            get("rocksdb.num-entries-active-mem-table"),
+            get("rocksdb.num-deletes-active-mem-table"),
+        )
+    }
+
+    /// A quiet node flushes a few entries at a time. Each truncation used to
+    /// add a range delete over [0, seq) to a memtable that never filled; a
+    /// week of them took 11 GiB and minutes to replay on open (n3's shared
+    /// pool, OOM-killed for 19 hours). Small truncations are point deletes.
+    #[tokio::test]
+    async fn small_truncations_leave_no_range_deletes() {
+        let dir = TempDir::new().unwrap();
+        let wal = RocksDbWal::open(dir.path()).unwrap();
+        let n = 2_000;
+        for _ in 0..n {
+            let seq = wal.append(cpu_entry(1)).await.unwrap();
+            wal.truncate_before(seq + 1).await.unwrap();
+        }
+        // Nothing flushed: the memtable holds the n appends, n point deletes
+        // and, were there any, the range deletes.
+        let (entries, deletes) = memtable_counts(&wal);
+        assert_eq!(deletes, n);
+        assert_eq!(entries - deletes - n, 0, "range deletes in the memtable");
+        assert!(wal.read_from(0).await.unwrap().is_empty());
+    }
+
+    /// A truncation of many entries is one range delete, and the memtable is
+    /// flushed before they pile up.
+    #[tokio::test]
+    async fn range_deletes_are_bounded_in_the_memtable() {
+        let dir = TempDir::new().unwrap();
+        let wal = RocksDbWal::open(dir.path()).unwrap();
+        let many = TRUNCATE_POINT_DELETES_MAX + 1;
+        let rounds = RANGE_DELETES_PER_MEMTABLE * 2 + 5;
+        for _ in 0..rounds {
+            let entries = (0..many).map(|_| cpu_entry(1)).collect();
+            let seqs = wal.append_batch_sync(entries).unwrap();
+            wal.truncate_before(seqs.last().unwrap() + 1).await.unwrap();
+            assert!(
+                wal.range_deletes_unflushed.load(Ordering::Acquire) < RANGE_DELETES_PER_MEMTABLE
+            );
+        }
+        // Flushed twice: the memtable holds only the last 5 rounds.
+        let (entries, deletes) = memtable_counts(&wal);
+        assert_eq!(deletes, 0, "no point deletes for large truncations");
+        assert_eq!(
+            entries,
+            5 * many + 5,
+            "5 rounds of appends and their range deletes"
+        );
+        assert!(wal.read_from(0).await.unwrap().is_empty());
+    }
+
+    /// Truncation deletes exactly the entries below the sequence, also after
+    /// a reopen, when it starts from the oldest entry left.
+    #[tokio::test]
+    async fn truncation_keeps_entries_at_and_above_the_sequence() {
+        let dir = TempDir::new().unwrap();
+        {
+            let wal = RocksDbWal::open(dir.path()).unwrap();
+            for _ in 0..10 {
+                wal.append(cpu_entry(1)).await.unwrap();
+            }
+            wal.truncate_before(4).await.unwrap();
+            wal.truncate_before(2).await.unwrap(); // behind: a no-op
+            let left: Vec<u64> = wal
+                .read_from(0)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(s, _)| s)
+                .collect();
+            assert_eq!(left, (4..=10).collect::<Vec<_>>());
+        }
+        let wal = RocksDbWal::open(dir.path()).unwrap();
+        assert_eq!(wal.truncated_through.load(Ordering::Acquire), 4);
+        wal.truncate_before(8).await.unwrap();
+        let left: Vec<u64> = wal
+            .read_from(0)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        assert_eq!(left, (8..=10).collect::<Vec<_>>());
+        wal.truncate_before(11).await.unwrap();
+        assert!(wal.read_from(0).await.unwrap().is_empty());
+        drop(wal);
+        // Empty: the next truncation starts past the last sequence.
+        let wal = RocksDbWal::open(dir.path()).unwrap();
+        assert_eq!(wal.last_sequence().await.unwrap(), 10);
+        assert_eq!(wal.truncated_through.load(Ordering::Acquire), 11);
     }
 
     /// Opening a WAL looks at its oldest entry, not at every entry: decoding a
