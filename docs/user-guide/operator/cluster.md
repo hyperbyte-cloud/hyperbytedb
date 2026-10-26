@@ -38,7 +38,7 @@ metadata:
 spec:
   replicas: 5
   image: hyperbytedb:latest
-  version: "0.9.3-beta"
+  version: "0.9.4-beta"
   server:
     port: 8086
     requestTimeoutSecs: 60
@@ -132,7 +132,7 @@ metadata:
 spec:
   replicas: 3
   image: hyperbytedb:latest
-  version: "0.9.3-beta"
+  version: "0.9.4-beta"
   server:
     port: 8086
     tls:
