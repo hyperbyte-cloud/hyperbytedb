@@ -693,3 +693,56 @@ async fn field_type_conflicts_keep_the_other_points() {
     ));
     assert_eq!(ctx.wal.read_from(1).await.unwrap().len(), 2);
 }
+
+/// `cpu.load` and `cpu_load` are one table (`.` becomes `_`), and database
+/// `a` with retention policy `b_c` is database `a_b` with policy `c`: the
+/// second name of each pair read and overwrote the first one's points. The
+/// write path refuses it before the WAL.
+#[tokio::test]
+async fn names_that_share_storage_are_refused() {
+    use hyperbytedb::error::HyperbytedbError;
+    let ctx = TestContext::new_no_chdb().unwrap();
+    ctx.metadata.create_database("db").await.unwrap();
+    let write = |db: &'static str, rp: Option<&'static str>, body: &'static str| {
+        ctx.ingestion.ingest(
+            db,
+            rp,
+            None,
+            body.as_bytes(),
+            WritePayloadFormat::LineProtocol,
+        )
+    };
+    write("db", None, "cpu.load,host=a v=1 1").await.unwrap();
+    let err = write("db", None, "cpu_load,host=a v=2 2")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HyperbytedbError::NameCollision(_)), "{err:?}");
+    // The owner still writes; a field sharing a column is refused too.
+    write("db", None, "cpu.load,host=a v=3 3").await.unwrap();
+    let err = write("db", None, "cpu.load,host=a v.=4,v_=5 4")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HyperbytedbError::NameCollision(_)), "{err:?}");
+
+    ctx.metadata.create_database("a_b").await.unwrap();
+    ctx.metadata.create_database("a").await.unwrap();
+    ctx.query(
+        "a_b",
+        "CREATE RETENTION POLICY c ON a_b DURATION 1d REPLICATION 1",
+    )
+    .await
+    .unwrap();
+    ctx.query(
+        "a",
+        "CREATE RETENTION POLICY b_c ON a DURATION 1d REPLICATION 1",
+    )
+    .await
+    .unwrap();
+    write("a_b", Some("c"), "m,host=x secret=42 1")
+        .await
+        .unwrap();
+    let err = write("a", Some("b_c"), "m,host=x secret=999 1")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HyperbytedbError::NameCollision(_)), "{err:?}");
+}

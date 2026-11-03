@@ -93,6 +93,26 @@ pub trait PointsSinkPort: Send + Sync {
         Ok(())
     }
 
+    /// Delete the flushed fact rows that `predicate` selects (see
+    /// [`crate::application::predicate_sql::build_delete_predicate`]), and
+    /// only those that exist now: rows inserted later are kept.
+    /// Whether [`Self::delete_rows`] deletes anything: the default sink
+    /// stores no rows, so a delete need not wait for the WAL to flush to it.
+    fn deletes_rows(&self) -> bool {
+        false
+    }
+
+    async fn delete_rows(
+        &self,
+        db: &str,
+        rp: &str,
+        measurement: &str,
+        predicate: &str,
+    ) -> Result<(), HyperbytedbError> {
+        let _ = (db, rp, measurement, predicate);
+        Ok(())
+    }
+
     /// Delete flushed fact and series rows whose `series_id` lies in `[start, end)`.
     async fn delete_series_id_range(
         &self,

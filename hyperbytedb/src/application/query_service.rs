@@ -1294,7 +1294,8 @@ async fn execute_statement(
             };
             svc.metadata.delete_measurement(db, &rp, name).await?;
             if let Some(ctx) = svc.shard_routing.as_ref() {
-                scatter_delete_to_regions(ctx, svc.metadata.as_ref(), db, &rp, name, "").await?;
+                scatter_delete_to_regions(ctx, svc.metadata.as_ref(), None, db, &rp, name, "")
+                    .await?;
             }
             if let Err(e) = svc.points_sink.drop_measurement(db, &rp, name).await {
                 tracing::warn!(
@@ -1320,27 +1321,36 @@ async fn execute_statement(
                     .await
                     .unwrap_or_else(|_| "autogen".to_string())
             };
-            let predicate_sql = if let Some(ref cond) = del.condition {
-                crate::application::predicate_sql::build_predicate_sql(
-                    &svc.metadata,
-                    db,
-                    &del_rp,
-                    &del.from,
-                    cond,
-                )
-                .await?
-            } else {
-                String::new()
-            };
-
-            svc.metadata
-                .store_tombstone(db, &del_rp, &del.from, &predicate_sql)
-                .await?;
+            // The rows are deleted, as in InfluxDB: points written after the
+            // DELETE stay. It used to store a tombstone that every later query
+            // applied, hiding later points too.
+            let predicate_sql = crate::application::predicate_sql::build_delete_predicate(
+                &svc.metadata,
+                db,
+                &del_rp,
+                &del.from,
+                del.condition.as_ref(),
+            )
+            .await?;
 
             if let Some(ctx) = svc.shard_routing.as_ref() {
                 scatter_delete_to_regions(
                     ctx,
                     svc.metadata.as_ref(),
+                    Some(crate::application::predicate_sql::LocalRows {
+                        wal: Some(svc.wal.as_ref()),
+                        sink: svc.points_sink.as_ref(),
+                    }),
+                    db,
+                    &del_rp,
+                    &del.from,
+                    &predicate_sql,
+                )
+                .await?;
+            } else {
+                crate::application::predicate_sql::delete_rows(
+                    Some(svc.wal.as_ref()),
+                    svc.points_sink.as_ref(),
                     db,
                     &del_rp,
                     &del.from,
@@ -1353,7 +1363,7 @@ async fn execute_statement(
                 db = db,
                 measurement = %del.from,
                 predicate = %predicate_sql,
-                "DELETE tombstone stored"
+                "DELETE applied"
             );
 
             Ok(StatementResult {
@@ -1786,40 +1796,63 @@ async fn execute_statement(
                 String::new()
             };
             if measurement.is_some() || !predicate_sql.is_empty() {
-                if let Some(ref meas) = measurement
-                    && !predicate_sql.is_empty()
-                {
-                    svc.metadata
-                        .store_tombstone(target_db, &rp, meas, &predicate_sql)
-                        .await?;
-                }
                 svc.metadata
                     .delete_series_matching(target_db, &rp, measurement.as_deref(), &predicate_sql)
                     .await?;
-                if let Some(ctx) = svc.shard_routing.as_ref() {
-                    if let Some(ref meas) = measurement {
+                // The series' rows are deleted; points written to them later
+                // stay. A tombstone used to hide those too.
+                let mut targets: Vec<(String, String)> = Vec::new();
+                if let Some(ref meas) = measurement {
+                    let pred = crate::application::predicate_sql::build_delete_predicate(
+                        &svc.metadata,
+                        target_db,
+                        &rp,
+                        meas,
+                        s.condition.as_ref(),
+                    )
+                    .await?;
+                    targets.push((meas.clone(), pred));
+                } else if svc.shard_routing.is_some() {
+                    // Every measurement that has the condition's tags.
+                    for meas in svc.metadata.list_measurements(target_db).await? {
+                        if let Ok(pred) = crate::application::predicate_sql::build_delete_predicate(
+                            &svc.metadata,
+                            target_db,
+                            &rp,
+                            &meas,
+                            s.condition.as_ref(),
+                        )
+                        .await
+                        {
+                            targets.push((meas, pred));
+                        }
+                    }
+                }
+                for (meas, pred) in targets {
+                    if let Some(ctx) = svc.shard_routing.as_ref() {
                         scatter_delete_to_regions(
                             ctx,
                             svc.metadata.as_ref(),
+                            Some(crate::application::predicate_sql::LocalRows {
+                                wal: Some(svc.wal.as_ref()),
+                                sink: svc.points_sink.as_ref(),
+                            }),
                             target_db,
                             &rp,
-                            meas,
-                            &predicate_sql,
+                            &meas,
+                            &pred,
                         )
                         .await?;
                     } else {
-                        let measurements = svc.metadata.list_measurements(target_db).await?;
-                        for meas in measurements {
-                            scatter_delete_to_regions(
-                                ctx,
-                                svc.metadata.as_ref(),
-                                target_db,
-                                &rp,
-                                &meas,
-                                &predicate_sql,
-                            )
-                            .await?;
-                        }
+                        crate::application::predicate_sql::delete_rows(
+                            Some(svc.wal.as_ref()),
+                            svc.points_sink.as_ref(),
+                            target_db,
+                            &rp,
+                            &meas,
+                            &pred,
+                        )
+                        .await?;
                     }
                 }
             }

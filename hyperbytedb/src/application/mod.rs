@@ -16,6 +16,7 @@ pub mod msgpack_limits;
 pub mod mv_handoff;
 pub mod peer_ingestion_service;
 pub mod peer_query_service;
+pub mod physical_names;
 pub mod predicate_sql;
 pub mod query_arrow_series;
 pub mod query_service;
