@@ -104,6 +104,11 @@ pub enum HyperbytedbError {
     #[error("error parsing query: cannot write directly to materialized view destination \"{0}\"")]
     WriteToMaterializedDestination(String),
 
+    /// A new measurement, field or tag key whose sanitised name is another
+    /// one's, so both would be stored in one table or column.
+    #[error("name collision: {0}")]
+    NameCollision(String),
+
     #[error("authorization failed")]
     AuthFailed,
 

@@ -1723,11 +1723,31 @@ pub async fn handle_shard_delete(
     }
 
     let predicate = req.predicate.as_deref().unwrap_or("");
+    // Delete the rows; points written after the delete stay. A coordinator
+    // older than this node sends tag names, which the fact table lacks: that
+    // condition is kept as a tombstone, as before.
     if !predicate.is_empty()
-        && let Err(e) = state
-            .metadata
-            .store_tombstone(&req.db, &req.rp, &req.measurement, predicate)
-            .await
+        && let Err(e) = match crate::application::predicate_sql::delete_rows(
+            Some(state.wal.as_ref()),
+            state.points_sink.as_ref(),
+            &req.db,
+            &req.rp,
+            &req.measurement,
+            predicate,
+        )
+        .await
+        {
+            Err(e)
+                if crate::application::schema_mutation_apply::is_unknown_column(&e.to_string()) =>
+            {
+                state
+                    .metadata
+                    .store_tombstone(&req.db, &req.rp, &req.measurement, predicate)
+                    .await
+                    .map(|_| ())
+            }
+            other => other,
+        }
     {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,

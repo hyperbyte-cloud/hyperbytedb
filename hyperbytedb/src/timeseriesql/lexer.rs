@@ -213,6 +213,51 @@ pub fn parse_duration_text(input: &str) -> Result<Option<i64>, HyperbytedbError>
     Ok(Some(total))
 }
 
+/// Byte length of the longest prefix of `rest` that [`parse_duration_text`]
+/// accepts and that has a unit, with the whitespace after it; `None` when
+/// there is none.
+///
+/// One pass over the terms (`[+-]digits unit`, whitespace between). Trying
+/// each prefix in turn instead re-parsed the input once per byte, quadratic
+/// in its length, and sliced it inside multi-byte characters (`5温`
+/// panicked).
+fn longest_duration_prefix(rest: &str) -> Option<usize> {
+    const UNITS: [&str; 10] = ["ns", "us", "µs", "u", "ms", "s", "m", "h", "d", "w"];
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    let mut best = None;
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let term = i;
+        if i < bytes.len() && (bytes[i] == b'-' || bytes[i] == b'+') {
+            i += 1;
+        }
+        let digits = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == digits {
+            break;
+        }
+        match rest[term..i].parse::<i64>() {
+            Ok(v) if v >= 0 => {}
+            _ => break,
+        }
+        let Some(unit) = UNITS.iter().find(|u| rest[i..].starts_with(*u)) else {
+            break;
+        };
+        i += unit.len();
+        let mut end = i;
+        while end < bytes.len() && bytes[end].is_ascii_whitespace() {
+            end += 1;
+        }
+        best = Some(end);
+    }
+    best
+}
+
 /// Convert nanoseconds to a single-term AST Duration (largest exact unit).
 pub fn nanos_to_ast_duration(nanos: i64) -> Duration {
     const H: i64 = 3_600 * 1_000_000_000;
@@ -682,21 +727,13 @@ impl<'a> Lexer<'a> {
 
     fn read_number_or_duration(&mut self, start: usize) -> Result<Token, HyperbytedbError> {
         let rest = &self.input[start..];
-        let mut best: Option<(Option<i64>, usize)> = None;
-        for end in 1..=rest.len() {
-            if let Ok(nanos) = parse_duration_text(&rest[..end]) {
-                let slice = rest[..end].trim();
-                // Only a unit-bearing literal (e.g. `0s`, `1h30m`, `5µs`) is a
-                // duration here. A bare integer — including `0` — is a Number;
-                // the "0 == infinite" rule is applied where a duration is
-                // grammatically expected (see ddl_parser::parse_duration_token),
-                // so `LIMIT 0`/`OFFSET 0` still get a real number token.
-                let is_duration = slice.chars().any(|c| c.is_ascii_alphabetic() || c == 'µ');
-                if is_duration {
-                    best = Some((nanos, end));
-                }
-            }
-        }
+        // Only a unit-bearing literal (e.g. `0s`, `1h30m`, `5µs`) is a
+        // duration here. A bare integer — including `0` — is a Number; the
+        // "0 == infinite" rule is applied where a duration is grammatically
+        // expected (see ddl_parser::parse_duration_token), so `LIMIT 0` /
+        // `OFFSET 0` still get a real number token.
+        let best = longest_duration_prefix(rest)
+            .and_then(|end| parse_duration_text(&rest[..end]).ok().map(|n| (n, end)));
         if let Some((nanos, consumed)) = best {
             let byte_end = start + consumed;
             while self.pos < self.chars.len() && self.chars[self.pos].0 < byte_end {
@@ -847,6 +884,66 @@ fn is_keyword(word: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The scan `longest_duration_prefix` replaced: every prefix in turn,
+    /// on character boundaries.
+    fn longest_duration_prefix_slow(rest: &str) -> Option<usize> {
+        let mut best = None;
+        for (end, _) in rest.char_indices().skip(1).chain([(rest.len(), ' ')]) {
+            if parse_duration_text(&rest[..end]).is_ok()
+                && rest[..end]
+                    .chars()
+                    .any(|c| c.is_ascii_alphabetic() || c == 'µ')
+            {
+                best = Some(end);
+            }
+        }
+        best
+    }
+
+    #[test]
+    fn duration_prefix_matches_the_per_prefix_scan() {
+        let alphabet: Vec<char> = "0123456789 nsuµmhdwx+-.温".chars().collect();
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        for _ in 0..50_000 {
+            let mut s = String::from("1");
+            let len = (state >> 59) as usize;
+            for _ in 0..len {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                s.push(alphabet[(state % alphabet.len() as u64) as usize]);
+            }
+            assert_eq!(
+                longest_duration_prefix(&s),
+                longest_duration_prefix_slow(&s),
+                "{s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn number_before_a_multibyte_char_does_not_panic() {
+        for q in ["SELECT 5温 FROM cpu", "SELECT 5µ FROM cpu", "5温"] {
+            assert!(std::panic::catch_unwind(|| tokenize(q)).is_ok(), "{q:?}");
+        }
+        assert_eq!(
+            kinds("5µs"),
+            vec![TokenKind::Duration { nanos: Some(5_000) }]
+        );
+    }
+
+    #[test]
+    fn long_number_runs_lex_in_linear_time() {
+        let q = format!("SELECT {} FROM cpu", "1h".repeat(200_000));
+        let t = std::time::Instant::now();
+        let _ = tokenize(&q);
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            t.elapsed()
+        );
+    }
 
     fn kinds(input: &str) -> Vec<TokenKind> {
         tokenize(input)

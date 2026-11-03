@@ -9,6 +9,7 @@ use crate::application::ingest_metadata::{
 };
 use crate::application::line_protocol::parse_line_body_to_points_limited;
 use crate::application::msgpack_ingest::parse_msgpack_body_to_points_limited;
+use crate::application::physical_names::PhysicalNameGuard;
 use crate::application::wal_append::{
     ColumnarWalAppend, append_columnar_with_prepared, append_points_with_prepared,
 };
@@ -25,6 +26,7 @@ pub struct IngestionServiceImpl {
     limits: IngestCardinalityLimits,
     max_points_per_request: usize,
     schema_cache: IngestSchemaCache,
+    name_guard: PhysicalNameGuard,
 }
 
 impl IngestionServiceImpl {
@@ -58,6 +60,7 @@ impl IngestionServiceImpl {
             limits,
             max_points_per_request,
             schema_cache: IngestSchemaCache::new(),
+            name_guard: PhysicalNameGuard::new(),
         }
     }
 
@@ -120,6 +123,16 @@ impl IngestionPort for IngestionServiceImpl {
             let t2 = std::time::Instant::now();
             histogram!("hyperbytedb_ingest_parse_seconds").record((t2 - t1).as_secs_f64());
 
+            self.name_guard
+                .check_columnar(
+                    &self.metadata,
+                    db,
+                    &retention_policy,
+                    &wire.measurement,
+                    &wire.field,
+                    wire.tags.keys().map(String::as_str),
+                )
+                .await?;
             prepare_columnar_metadata(
                 &self.metadata,
                 db,
@@ -213,6 +226,9 @@ impl IngestionPort for IngestionServiceImpl {
         let t2 = std::time::Instant::now();
         histogram!("hyperbytedb_ingest_parse_seconds").record((t2 - t1).as_secs_f64());
 
+        self.name_guard
+            .check_points(&self.metadata, db, &retention_policy, &points)
+            .await?;
         prepare_batch_metadata(
             &self.metadata,
             db,

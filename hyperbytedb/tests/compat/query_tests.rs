@@ -1434,3 +1434,32 @@ async fn top_and_subqueries() {
     .await;
     assert_eq!(series[0].values[0][1], serde_json::json!(122.5));
 }
+
+/// A WHERE clause of 4000 `OR` terms nested one level per term and overflowed
+/// the stack while parsing; chDB's signal handler took the fault and shut the
+/// query engine down for good. It must run, and later queries with it.
+#[tokio::test]
+#[serial(chdb)]
+async fn where_clause_with_thousands_of_or_terms() {
+    let ctx = TestContext::new().unwrap();
+    ctx.metadata.create_database("testdb").await.unwrap();
+    ctx.write_and_flush("testdb", "cpu,host=a usage=5.0 1000000000")
+        .await
+        .unwrap();
+    let q = format!(
+        "SELECT usage FROM cpu WHERE usage > 100{} OR usage > 1",
+        " OR usage > 100".repeat(4000)
+    );
+    let resp = ctx.query("testdb", &q).await.unwrap();
+    let stmt = &resp.results[0];
+    assert!(stmt.error.is_none(), "{:?}", stmt.error);
+    assert_eq!(stmt.series.as_ref().unwrap()[0].values.len(), 1);
+
+    let resp = ctx.query("testdb", "SELECT usage FROM cpu").await.unwrap();
+    assert!(
+        resp.results[0].error.is_none(),
+        "{:?}",
+        resp.results[0].error
+    );
+    assert!(!hyperbytedb::adapters::chdb::engine_failed());
+}
