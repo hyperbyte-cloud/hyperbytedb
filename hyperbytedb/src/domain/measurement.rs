@@ -27,10 +27,44 @@ pub struct MeasurementMeta {
 }
 
 impl MeasurementMeta {
+    /// Whether a raw write to this measurement in `rp` is refused: it is a
+    /// materialized-view destination there, which only its view fills.
+    /// `materialized_rp: None` (entries from before it was recorded) refuses
+    /// every retention policy.
+    #[must_use]
+    pub fn refuses_raw_writes(&self, rp: &str) -> bool {
+        self.materialized && self.materialized_rp.as_deref().is_none_or(|mr| mr == rp)
+    }
+
     pub fn field_types_as_tuples(&self) -> Vec<(String, u8)> {
         self.field_types
             .iter()
             .map(|(k, v)| (k.clone(), *v))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refuses_raw_writes_only_for_its_own_rp() {
+        let plain = MeasurementMeta::default();
+        assert!(!plain.refuses_raw_writes("autogen"));
+        let dest = MeasurementMeta {
+            materialized: true,
+            materialized_rp: Some("rollup".into()),
+            ..Default::default()
+        };
+        assert!(dest.refuses_raw_writes("rollup"));
+        assert!(!dest.refuses_raw_writes("autogen"));
+        let legacy = MeasurementMeta {
+            materialized: true,
+            materialized_rp: None,
+            ..Default::default()
+        };
+        assert!(legacy.refuses_raw_writes("autogen"));
+        assert!(legacy.refuses_raw_writes("rollup"));
     }
 }

@@ -225,8 +225,7 @@ impl PeerIngestionService {
         // flush pipeline cannot serve (stuck-flush liveness gaps).
         for meas in &measurements {
             if let Some(meta) = self.metadata.get_measurement(db, rp, meas).await?
-                && meta.materialized
-                && meta.materialized_rp.as_deref().is_none_or(|mr| mr == rp)
+                && meta.refuses_raw_writes(rp)
             {
                 return Err(HyperbytedbError::WriteToMaterializedDestination(
                     meas.clone(),
@@ -893,11 +892,7 @@ impl IngestionPort for PeerIngestionService {
                 .metadata
                 .get_measurement(db, &retention_policy, &wire.measurement)
                 .await?
-                && meta.materialized
-                && meta
-                    .materialized_rp
-                    .as_deref()
-                    .is_none_or(|mr| mr == retention_policy)
+                && meta.refuses_raw_writes(&retention_policy)
             {
                 return Err(HyperbytedbError::WriteToMaterializedDestination(
                     wire.measurement.clone(),
@@ -1043,11 +1038,7 @@ impl IngestionPort for PeerIngestionService {
                     .metadata
                     .get_measurement(db, &retention_policy, &point.measurement)
                     .await?
-                && meta.materialized
-                && meta
-                    .materialized_rp
-                    .as_deref()
-                    .is_none_or(|mr| mr == retention_policy)
+                && meta.refuses_raw_writes(&retention_policy)
             {
                 return Err(HyperbytedbError::WriteToMaterializedDestination(
                     point.measurement.clone(),
