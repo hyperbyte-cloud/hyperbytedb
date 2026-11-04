@@ -8,5 +8,6 @@ pub mod peer_http;
 pub mod points_sink;
 pub mod query;
 pub mod replication;
+pub mod replication_acks;
 pub mod sharding;
 pub mod wal;
