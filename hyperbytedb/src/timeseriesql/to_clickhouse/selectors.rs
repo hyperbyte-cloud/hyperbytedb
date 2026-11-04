@@ -20,31 +20,7 @@ use super::select::{
     build_from_source, select_output_field_name, select_tag_column_sql, time_bucket_expr,
     translate_field, with_output_names,
 };
-
-/// Each row's group bucket, in nanoseconds (0 without GROUP BY time()).
-pub const BUCKET_COL: &str = "__bucket";
-/// Each row's point time, in nanoseconds.
-pub const TIME_NS_COL: &str = "__tns";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SelectorKind {
-    Top,
-    Bottom,
-    Sample,
-}
-
-/// A statement's TOP, BOTTOM or SAMPLE call, parsed.
-#[derive(Debug, Clone)]
-pub struct MultiSelector {
-    pub kind: SelectorKind,
-    /// Output column of the selected values (`top` unless aliased).
-    pub output: String,
-    /// The field ranked.
-    pub field: String,
-    /// TOP/BOTTOM's tag arguments: at most one point per combination.
-    pub tags: Vec<String>,
-    pub n: u64,
-}
+pub use crate::timeseriesql::analysis::{BUCKET_COL, MultiSelector, SelectorKind, TIME_NS_COL};
 
 fn kind_of(name: &str) -> Option<SelectorKind> {
     match name.to_ascii_uppercase().as_str() {
