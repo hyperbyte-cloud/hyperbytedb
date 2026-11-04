@@ -31,6 +31,10 @@ pub struct ShardRoutingContext {
     pub config: ShardingConfig,
     pub node_id: u64,
     pub peer_client: Arc<PeerClient>,
+    /// Calls to peers (replaces direct HTTP through `peer_client`).
+    pub peer_rpc: crate::ports::peer_rpc::SharedPeerRpc,
+    /// Cluster membership, for resolving node addresses.
+    pub membership: crate::domain::cluster::membership::SharedMembership,
     pub region_write_stats: Arc<RegionWriteStats>,
     /// Shares one request per destination node among concurrent writes.
     pub forward_coalescer: Arc<crate::application::forward_coalescer::ForwardCoalescer>,
@@ -1249,6 +1253,10 @@ mod scatter_tests {
             location_cache: Arc::new(ShardLocationCache::new()),
             config,
             node_id,
+            peer_rpc: Arc::new(crate::adapters::cluster::http_peer_rpc::HttpPeerRpc::new(
+                peer_client.clone(),
+            )),
+            membership: peer_client.membership().clone(),
             peer_client,
             region_write_stats: Arc::new(RegionWriteStats::new()),
             forward_coalescer: Default::default(),
