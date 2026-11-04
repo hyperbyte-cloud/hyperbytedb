@@ -9,12 +9,12 @@ use reqwest::StatusCode;
 use tokio::sync::watch;
 
 use crate::adapters::cluster::peer_client::PeerClient;
-use crate::adapters::cluster::raft::HyperbytedbRaft;
 use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
 use crate::application::runtime::RegionWriteStats;
 use crate::domain::chdb_naming::unquoted_table_name;
 use crate::domain::cluster::membership::SharedMembership;
 use crate::domain::sharding::{RegionHeartbeat, ShardMap, ShardRegion};
+use crate::ports::leadership::LeadershipPort;
 use crate::ports::metadata::MetadataPort;
 use crate::ports::query::QueryPort;
 use crate::ports::sharding::ShardMapPort;
@@ -40,7 +40,7 @@ pub async fn run_region_heartbeat_reporter(
     peer_client: Arc<PeerClient>,
     membership: SharedMembership,
     shard_map: Arc<RocksDbShardMap>,
-    raft: HyperbytedbRaft,
+    leadership: Arc<dyn LeadershipPort>,
     metadata: Arc<dyn MetadataPort>,
     query_port: Arc<dyn QueryPort>,
     region_write_stats: Arc<RegionWriteStats>,
@@ -61,7 +61,7 @@ pub async fn run_region_heartbeat_reporter(
                     &peer_client,
                     &membership,
                     &shard_map,
-                    &raft,
+                    leadership.as_ref(),
                     metadata.as_ref(),
                     query_port.as_ref(),
                     region_write_stats.as_ref(),
@@ -87,7 +87,7 @@ async fn report_once(
     peer_client: &PeerClient,
     membership: &SharedMembership,
     shard_map: &RocksDbShardMap,
-    raft: &HyperbytedbRaft,
+    leadership: &dyn LeadershipPort,
     metadata: &dyn MetadataPort,
     query_port: &dyn QueryPort,
     region_write_stats: &RegionWriteStats,
@@ -96,10 +96,8 @@ async fn report_once(
     byte_estimates: &mut ByteEstimateCache,
 ) -> Result<(), String> {
     let map = shard_map.snapshot().await.map_err(|e| e.to_string())?;
-    let leader_id = raft
-        .metrics()
-        .borrow()
-        .current_leader
+    let leader_id = leadership
+        .current_leader()
         .ok_or_else(|| "no raft leader".to_string())?;
 
     let leader_addr = {

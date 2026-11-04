@@ -2,16 +2,16 @@ use metrics::counter;
 use std::sync::Arc;
 use tokio::sync::watch;
 
-use crate::adapters::cluster::raft::HyperbytedbRaft;
 use crate::domain::cq_schedule::should_run;
 use crate::error::HyperbytedbError;
+use crate::ports::leadership::LeadershipPort;
 use crate::ports::metadata::MetadataPort;
 use crate::ports::query::QueryService;
 
 pub struct ContinuousQueryService {
     metadata: Arc<dyn MetadataPort>,
     query_service: Arc<dyn QueryService>,
-    raft: Option<HyperbytedbRaft>,
+    leadership: Option<Arc<dyn LeadershipPort>>,
     node_id: u64,
 }
 
@@ -19,25 +19,19 @@ impl ContinuousQueryService {
     pub fn new(
         metadata: Arc<dyn MetadataPort>,
         query_service: Arc<dyn QueryService>,
-        raft: Option<HyperbytedbRaft>,
+        leadership: Option<Arc<dyn LeadershipPort>>,
         node_id: u64,
     ) -> Self {
         Self {
             metadata,
             query_service,
-            raft,
+            leadership,
             node_id,
         }
     }
 
     fn is_raft_leader(&self) -> bool {
-        match &self.raft {
-            Some(raft) => {
-                let metrics = raft.metrics().borrow().clone();
-                metrics.current_leader == Some(self.node_id)
-            }
-            None => true,
-        }
+        crate::ports::leadership::may_run(self.leadership.as_deref(), self.node_id)
     }
 
     pub async fn run(
@@ -50,7 +44,7 @@ impl ContinuousQueryService {
 
         tracing::info!(
             check_interval = ?check_interval,
-            raft_gated = self.raft.is_some(),
+            raft_gated = self.leadership.is_some(),
             node_id = self.node_id,
             "continuous query service started"
         );

@@ -309,7 +309,7 @@ async fn serve_inner(
                             pc,
                             m,
                             map,
-                            raft,
+                            Arc::new(raft),
                             meta,
                             query_port,
                             region_write_stats,
@@ -339,7 +339,10 @@ async fn serve_inner(
         let cq_service = Arc::new(ContinuousQueryService::new(
             app_state.metadata.clone(),
             app_state.query.clone(),
-            app_state.raft.clone(),
+            app_state
+                .raft
+                .clone()
+                .map(|r| Arc::new(r) as Arc<dyn crate::ports::leadership::LeadershipPort>),
             config.cluster.node_id,
         ));
         let rx = service_shutdown_rx.clone();
@@ -365,7 +368,10 @@ async fn serve_inner(
             RetentionService::new(
                 app_state.metadata.clone(),
                 app_state.query_port.clone(),
-                app_state.raft.clone(),
+                app_state
+                    .raft
+                    .clone()
+                    .map(|r| Arc::new(r) as Arc<dyn crate::ports::leadership::LeadershipPort>),
                 config.cluster.node_id,
             )
             .with_sharding(config.sharding.enabled, app_state.shard_map.clone()),
