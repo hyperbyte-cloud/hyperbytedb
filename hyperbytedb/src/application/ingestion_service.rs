@@ -149,11 +149,7 @@ impl IngestionPort for IngestionServiceImpl {
                 .metadata
                 .get_measurement(db, &retention_policy, &wire.measurement)
                 .await?
-                && meta.materialized
-                && meta
-                    .materialized_rp
-                    .as_deref()
-                    .is_none_or(|mr| mr == retention_policy)
+                && meta.refuses_raw_writes(&retention_policy)
             {
                 return Err(HyperbytedbError::WriteToMaterializedDestination(
                     wire.measurement.clone(),
@@ -248,11 +244,7 @@ impl IngestionPort for IngestionServiceImpl {
                     .metadata
                     .get_measurement(db, &retention_policy, &point.measurement)
                     .await?
-                && meta.materialized
-                && meta
-                    .materialized_rp
-                    .as_deref()
-                    .is_none_or(|mr| mr == retention_policy)
+                && meta.refuses_raw_writes(&retention_policy)
             {
                 return Err(HyperbytedbError::WriteToMaterializedDestination(
                     point.measurement.clone(),

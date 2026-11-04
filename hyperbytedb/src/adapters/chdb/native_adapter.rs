@@ -682,12 +682,7 @@ impl ChdbNativeAdapter {
                 .await?
         {
             // Reject raw ingestion into materialized view destinations.
-            if meas_meta.materialized
-                && meas_meta
-                    .materialized_rp
-                    .as_deref()
-                    .is_none_or(|mr| mr == key.rp)
-            {
+            if meas_meta.refuses_raw_writes(&key.rp) {
                 return Err(HyperbytedbError::WriteToMaterializedDestination(
                     key.measurement.clone(),
                 ));
