@@ -22,4 +22,3 @@ openraft::declare_raft_types!(
 );
 
 pub type HyperbytedbRaft = openraft::Raft<TypeConfig>;
-pub type RaftAdaptor = openraft::storage::Adaptor<TypeConfig, log_store::RaftStore>;

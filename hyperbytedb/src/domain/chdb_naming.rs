@@ -23,12 +23,6 @@ use crate::error::HyperbytedbError;
 pub struct SanitizedIdent(String);
 
 impl SanitizedIdent {
-    /// Sanitize arbitrary input into a valid ClickHouse identifier.
-    #[must_use]
-    pub fn sanitize(input: &str) -> Self {
-        Self(sanitise_ident(input))
-    }
-
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0

@@ -153,15 +153,6 @@ fn estimate_points_capacity(body: &[u8]) -> usize {
     count.max(1)
 }
 
-/// Like [`parse_line_body_to_points`] with an explicit capacity hint for the points vector.
-pub fn parse_line_body_to_points_with_capacity(
-    body: &[u8],
-    precision: Option<&str>,
-    points_capacity: usize,
-) -> Result<Vec<Point>, HyperbytedbError> {
-    parse_line_body_inner(body, precision, points_capacity, None)
-}
-
 fn parse_line_body_inner(
     body: &[u8],
     precision: Option<&str>,

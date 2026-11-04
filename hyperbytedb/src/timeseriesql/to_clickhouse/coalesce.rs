@@ -21,15 +21,6 @@ pub(super) fn build_coalesced_fact_view_filtered(
     build_coalesced_fact_view_impl(fact_table, mapping, false, filter)
 }
 
-/// Like [`build_coalesced_fact_view`], but preserves `ingest_seq` / `origin_node_id` for
-/// downstream aggregates (materialized view source dedup).
-pub fn build_coalesced_fact_view_with_row_meta(
-    fact_table: &QuotedTableName,
-    mapping: &ColumnMapping,
-) -> String {
-    build_coalesced_fact_view_impl(fact_table, mapping, true, None)
-}
-
 pub(super) fn build_coalesced_fact_view_impl(
     fact_table: &QuotedTableName,
     mapping: &ColumnMapping,

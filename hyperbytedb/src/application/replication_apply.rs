@@ -180,27 +180,6 @@ impl ReplicationApplyQueue {
         Arc::new(Self { tx })
     }
 
-    pub fn with_workers(
-        depth: usize,
-        num_workers: usize,
-        metadata: Arc<dyn crate::ports::metadata::MetadataPort>,
-        wal: Arc<dyn WalPort>,
-        limits: IngestCardinalityLimits,
-    ) -> Arc<Self> {
-        Self::with_workers_and_sink(
-            depth,
-            num_workers,
-            metadata,
-            wal,
-            None,
-            limits,
-            0,
-            false,
-            0,
-            None,
-        )
-    }
-
     pub fn with_defaults(
         metadata: Arc<dyn crate::ports::metadata::MetadataPort>,
         wal: Arc<dyn WalPort>,

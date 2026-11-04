@@ -18,7 +18,7 @@ pub use rename::rename_time_bucket_alias;
 pub use selectors::{BUCKET_COL, MultiSelector, SelectorKind, TIME_NS_COL, multi_selector};
 pub use time_bounds::extract_time_bounds;
 
-pub use coalesce::{build_coalesced_fact_view, build_coalesced_fact_view_with_row_meta};
+pub use coalesce::build_coalesced_fact_view;
 pub use conditions::translate_condition;
 pub use materialized_view::{
     build_create_fact_materialized_view, build_create_series_materialized_view,

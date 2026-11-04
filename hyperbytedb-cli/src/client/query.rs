@@ -243,10 +243,6 @@ impl QueryResponse {
         self.results.iter().any(|r| r.error.is_some())
     }
 
-    pub fn first_error(&self) -> Option<&str> {
-        self.results.iter().find_map(|r| r.error.as_deref())
-    }
-
     pub fn format_errors(&self) -> String {
         let errors: Vec<String> = self
             .results
