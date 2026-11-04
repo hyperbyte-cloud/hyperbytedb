@@ -2,6 +2,7 @@ pub mod auth;
 pub mod flush;
 pub mod forward_queue;
 pub mod ingestion;
+pub mod leadership;
 pub mod metadata;
 pub mod peer_http;
 pub mod points_sink;
