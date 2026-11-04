@@ -733,13 +733,20 @@ pub async fn split_field_type_conflicts(
             first.get_or_insert(e);
             continue;
         }
+        // Update in place: cloning every field key of every point (to
+        // re-insert it) cost ~4x this loop on a Telegraf-shaped batch.
         for (k, v) in &point.fields {
             let disc = v.type_discriminant();
-            let widened = known
-                .get(k)
-                .and_then(|have| crate::domain::field_type::widen_field_disc(*have, disc))
-                .unwrap_or(disc);
-            known.insert(k.clone(), widened);
+            match known.get_mut(k) {
+                Some(have) => {
+                    if let Some(w) = crate::domain::field_type::widen_field_disc(*have, disc) {
+                        *have = w;
+                    }
+                }
+                None => {
+                    known.insert(k.clone(), disc);
+                }
+            }
         }
         kept.push(point);
     }
@@ -1057,6 +1064,32 @@ mod tests {
         assert!(matches!(
             parse_write_body(b"", None, WritePayloadFormat::ColumnarMsgpack, 1),
             Err(HyperbytedbError::Internal(_))
+        ));
+    }
+
+    /// A field that widens (integer, then float) and then conflicts (a
+    /// string) within one batch: the widening point is kept and the
+    /// conflicting one dropped, before any type was stored.
+    #[tokio::test]
+    async fn field_widens_then_conflicts_within_one_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta: Arc<dyn MetadataPort> = Arc::new(RocksDbMetadata::open(dir.path()).unwrap());
+        meta.create_database("db").await.unwrap();
+        let points = vec![
+            point("m", &[("f", FieldValue::Integer(1))], 1),
+            point("m", &[("f", FieldValue::Float(2.0))], 2),
+            point("m", &[("f", FieldValue::String("x".into()))], 3),
+        ];
+        let (kept, partial) = split_field_type_conflicts(&meta, "db", "autogen", points)
+            .await
+            .unwrap();
+        assert_eq!(
+            kept.iter().map(|p| p.timestamp).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(matches!(
+            partial,
+            Some(HyperbytedbError::PartialWrite { dropped: 1, .. })
         ));
     }
 
