@@ -401,7 +401,7 @@ pub(super) fn quote_phys_identifier(name: &str) -> String {
 }
 
 pub(super) fn quote_string(s: &str) -> String {
-    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
+    crate::domain::chdb_naming::string_literal(s)
 }
 
 pub(super) fn format_float(f: f64) -> String {
