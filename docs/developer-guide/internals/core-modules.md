@@ -61,7 +61,7 @@ Hexagonal architecture interfaces. Each trait is `Send + Sync` with `#[async_tra
 | `peer_ingestion_service.rs` | `PeerIngestionService` | Cluster ingest: local WAL + `ReplicationPort` fan-out. |
 | `line_protocol.rs` | parse/encode helpers | Line protocol parsing and encoding. |
 | `msgpack_ingest.rs` | `parse_msgpack_body_to_points` | MessagePack array-of-points ingest. |
-| `columnar_msgpack.rs` | `ColumnarMsgpackBatch` | Feature-gated columnar MessagePack ingest. |
+| `columnar_msgpack.rs` | decode helpers | Feature-gated columnar MessagePack ingest; the batch type `ColumnarMsgpackBatch` lives in `domain/columnar_batch.rs`. |
 | `ingest_metadata.rs` | `IngestCardinalityLimits`, `IngestSchemaCache` | Hot-path schema/tag caching and cardinality enforcement. |
 | `query_service.rs` | `QueryServiceImpl` | Full TimeseriesQL execution: parse → dispatch → translate → chDB → format. |
 | `peer_query_service.rs` | `PeerQueryService` | Cluster query: schema mutations via Raft or `ReplicationPort`. |

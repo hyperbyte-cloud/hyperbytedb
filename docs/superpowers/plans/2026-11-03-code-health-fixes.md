@@ -29,7 +29,7 @@ None of these changes behaviour, apart from the bug fix.
 - The gate for every task, in CI order: `cargo fmt --check`, then `cargo clippy --all-targets -- -D warnings`, then `cargo test --lib`, then `cargo test --no-fail-fast --test '*'`, then `cargo test -p hyperbytedb-cli`.
 - Raft log and HTTP wire formats must not change:
   - moving a type must keep its serde representation;
-  - `ShardMapOp::ClearVerified`, the `transfer_verified` fields and the `[sharding] transfer_clear_proposals_enabled` config key (`config.rs:108`) **stay**. Query routing and placement still read them.
+  - `ShardMapOp::ClearVerified`, the `transfer_verified` fields and the `[sharding] transfer_clear_proposals_enabled` config key (`config.rs:108`) **stay**. Placement, split/merge refusal and `AddPeer` apply still read them.
 - Do not touch the three bugs still open from the 2026-11-02 review: `delete_series_matching` ignoring its predicate, `DROP SERIES` without `FROM`, and `ingest_seq` ordering. They have their own work.
 
 ## Review Focus

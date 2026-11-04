@@ -122,7 +122,7 @@ pub struct NodeInfo {
 
 ## 3. Cluster Bootstrap
 
-**File:** `src/application/cluster/bootstrap.rs`
+**File:** `src/composition/bootstrap.rs`
 
 ### `ClusterBootstrap::init(config)`
 
@@ -236,10 +236,10 @@ pub type HyperbytedbRaft = openraft::Raft<TypeConfig>;
 ### Cluster request types
 
 ```rust
-// src/adapters/cluster/raft/types.rs
+// src/domain/cluster/raft_request.rs (re-exported by src/adapters/cluster/raft/types.rs)
 pub enum ClusterRequest {
     SetNodeState { node_id: u64, state: NodeState },
-    SchemaMutation(MutationRequest),
+    SchemaMutation(Box<MutationRequest>),
     ShardMapMutation(Box<ShardMapOp>),  // when [sharding] enabled
 }
 
@@ -708,15 +708,18 @@ The scheduler holds a **per-region operator lock** while split/merge/rebalance/f
 Splits are metadata-only: a split child keeps its parent's primary and peers,
 so no rows move and no transfer is owed. The `transfer_verified` and
 `transfer_first_seen` fields on a region, and the `ClearVerified` shard-map op,
-remain for three reasons:
+remain because:
 
-- query routing and placement still read `transfer_verified`;
-- splits and merges are refused while either region carries a flag;
+- placement skips a flagged region, splits and merges refuse one, and
+  applying `AddPeer` checks the flag;
 - nodes must keep decoding older Raft logs that contain `ClearVerified`.
 
+Nothing sets the flag any more, and nothing clears it: the post-commit
+reconciliation queue that retried flagged transfers and proposed
+`ClearVerified` has been removed. A region flagged by an older version stays
+flagged, so placement, splits and merges keep skipping it.
 `[sharding] transfer_clear_proposals_enabled` is still accepted in config
-files. The post-commit reconciliation queue that used to retry flagged
-transfers has been removed.
+files and has no effect.
 
 ### Membership self-truth (`/health` body)
 
