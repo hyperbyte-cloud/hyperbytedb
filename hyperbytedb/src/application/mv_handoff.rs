@@ -32,13 +32,7 @@ pub const HANDOFF_CHUNK_ROWS: u64 = 50_000;
 /// handoff sends, so every retried range is recognised.
 const DEDUP_WINDOW: u64 = 100_000;
 
-/// `POST /internal/mv/handoff`, to the departing node.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MvHandoffRequest {
-    /// The node that keeps the rollups (`host:port`).
-    pub to_addr: String,
-}
+pub use crate::domain::sharding::types::MvHandoffRequest;
 
 /// `POST /internal/mv/handoff-chunk`, to the receiving node: one range of
 /// one destination table.
