@@ -95,6 +95,43 @@ pub fn validate_point_count(count: usize, max_points: usize) -> Result<(), Hyper
     Ok(())
 }
 
+/// Parse a `/write` body into points. Line protocol is limited inside its
+/// parser; the other formats are counted here against `max_points`.
+///
+/// # Errors
+/// A parse error, `RequestPointLimitExceeded`, or `Internal` for a
+/// columnar batch (which has its own path).
+pub fn parse_write_body(
+    body: &[u8],
+    precision: Option<&str>,
+    format: crate::ports::ingestion::WritePayloadFormat,
+    max_points: usize,
+) -> Result<Vec<Point>, HyperbytedbError> {
+    use crate::ports::ingestion::WritePayloadFormat;
+    let points = match format {
+        WritePayloadFormat::LineProtocol => {
+            crate::application::line_protocol::parse_line_body_to_points_limited(
+                body, precision, max_points,
+            )?
+        }
+        WritePayloadFormat::Msgpack => {
+            crate::application::msgpack_ingest::parse_msgpack_body_to_points_limited(
+                body, precision, max_points,
+            )?
+        }
+        #[cfg(feature = "columnar-ingest")]
+        WritePayloadFormat::ColumnarMsgpack => {
+            return Err(HyperbytedbError::Internal(
+                "columnar ingest fell through fast path".into(),
+            ));
+        }
+    };
+    if !matches!(format, WritePayloadFormat::LineProtocol) {
+        validate_point_count(points.len(), max_points)?;
+    }
+    Ok(points)
+}
+
 /// Maximum number of cached tag-value hashes. Beyond this the set is
 /// evicted to prevent unbounded memory growth under high cardinality.
 /// Cache misses are harmless (fall back to a RocksDB lookup).
@@ -989,6 +1026,38 @@ mod tests {
             timestamp: ts,
             series_id_cache: Default::default(),
         }
+    }
+
+    #[test]
+    fn parse_write_body_refuses_bodies_over_the_limit() {
+        use crate::ports::ingestion::WritePayloadFormat;
+        // Line protocol is limited inside its parser; msgpack is counted
+        // after parsing. Both refuse a body over the limit.
+        let lp = b"cpu v=1 1\ncpu v=2 2";
+        assert_eq!(
+            parse_write_body(lp, None, WritePayloadFormat::LineProtocol, 2)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(matches!(
+            parse_write_body(lp, None, WritePayloadFormat::LineProtocol, 1),
+            Err(HyperbytedbError::RequestPointLimitExceeded { .. })
+        ));
+        let mp = rmp_serde::to_vec_named(&vec![
+            point("cpu", &[("v", FieldValue::Float(1.0))], 1),
+            point("cpu", &[("v", FieldValue::Float(2.0))], 2),
+        ])
+        .unwrap();
+        assert!(matches!(
+            parse_write_body(&mp, None, WritePayloadFormat::Msgpack, 1),
+            Err(HyperbytedbError::RequestPointLimitExceeded { .. })
+        ));
+        #[cfg(feature = "columnar-ingest")]
+        assert!(matches!(
+            parse_write_body(b"", None, WritePayloadFormat::ColumnarMsgpack, 1),
+            Err(HyperbytedbError::Internal(_))
+        ));
     }
 
     /// Conflicting points are split off; compatible types widen; within a
