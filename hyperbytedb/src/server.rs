@@ -234,7 +234,6 @@ async fn serve_inner(
                 app_state.metadata.clone(),
                 app_state.wal.clone(),
                 Some(app_state.query_port.clone()),
-                Some(app_state.points_sink.clone()),
                 config.cluster.node_id,
                 config.sharding.clone(),
                 config.server.max_points_per_request,
