@@ -2489,7 +2489,7 @@ impl ShardScheduler {
             sink.lock().unwrap().push(op);
             return Ok(());
         }
-        use crate::adapters::cluster::raft::types::ClusterRequest;
+        use crate::domain::cluster::raft_request::ClusterRequest;
         let req = ClusterRequest::ShardMapMutation(Box::new(op));
         let resp = self
             .raft

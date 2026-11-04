@@ -5,13 +5,13 @@ use openraft::BasicNode;
 use openraft::error::ForwardToLeader;
 
 use crate::adapters::cluster::raft::HyperbytedbRaft;
-use crate::adapters::cluster::raft::types::{ClusterRequest, ClusterResponse};
 use crate::application::materialized_view_service::def_from_statement;
 use crate::application::predicate_sql::build_predicate_sql;
 use crate::application::query_service::check_authorization;
 use crate::application::shard_metadata_scatter::scatter_measurement_meta;
 use crate::application::shard_routing::ShardRoutingContext;
 use crate::domain::cluster::membership::ClusterMembership;
+use crate::domain::cluster::raft_request::{ClusterRequest, ClusterResponse};
 use crate::domain::cluster::types::MutationRequest;
 use crate::domain::database::{RetentionPolicy, retention_policy_from_create};
 use crate::domain::materialized_view::MaterializedViewDef;
