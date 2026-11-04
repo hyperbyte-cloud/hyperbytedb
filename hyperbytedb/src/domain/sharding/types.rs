@@ -556,3 +556,11 @@ pub struct ShardMvBackfillRequest {
     pub dest_rp: String,
     pub dest_measurement: String,
 }
+
+/// `POST /internal/mv/handoff`, to the departing node.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MvHandoffRequest {
+    /// The node that keeps the rollups (`host:port`).
+    pub to_addr: String,
+}
