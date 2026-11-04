@@ -186,6 +186,7 @@ impl PeerQueryService {
     async fn execute_raft_mutation(
         &self,
         db: &str,
+        retention_policy: Option<&str>,
         caller: Option<&crate::domain::user::StoredUser>,
         statement_id: u32,
         stmt: &Statement,
@@ -199,8 +200,14 @@ impl PeerQueryService {
                 error: Some(e.to_string()),
             });
         }
-        match mutation_request_from_statement(stmt, db, &self.metadata, self.shard_routing.get())
-            .await
+        match mutation_request_from_statement(
+            stmt,
+            db,
+            retention_policy,
+            &self.metadata,
+            self.shard_routing.get(),
+        )
+        .await
         {
             Ok(req) => {
                 self.replicate_mutation(req).await?;
@@ -402,6 +409,7 @@ async fn resolve_mv_dest_rp(
 async fn mutation_request_from_statement(
     stmt: &Statement,
     db: &str,
+    retention_policy: Option<&str>,
     metadata: &Arc<dyn MetadataPort>,
     shard_routing: Option<&Arc<ShardRoutingContext>>,
 ) -> Result<MutationRequest, HyperbytedbError> {
@@ -412,7 +420,10 @@ async fn mutation_request_from_statement(
         }),
         Statement::DropDatabase(name) => Ok(MutationRequest::DropDatabase(name.clone())),
         Statement::Delete(del) => {
-            let del_rp = metadata.get_default_rp(db).await?;
+            let del_rp = match retention_policy {
+                Some(rp) => rp.to_string(),
+                None => metadata.get_default_rp(db).await?,
+            };
             let predicate_sql = crate::application::predicate_sql::build_delete_predicate(
                 metadata,
                 db,
@@ -543,7 +554,10 @@ async fn mutation_request_from_statement(
                 MeasurementName::Name(n) => Some(n.clone()),
                 MeasurementName::Regex(_) => None,
             });
-            let drop_rp = metadata.get_default_rp(target_db).await?;
+            let drop_rp = match retention_policy {
+                Some(rp) => rp.to_string(),
+                None => metadata.get_default_rp(target_db).await?,
+            };
             let predicate_sql = match (measurement.as_deref(), s.condition.as_ref()) {
                 // Replicas delete the rows this selects.
                 (Some(meas), cond) => {
@@ -659,7 +673,7 @@ impl QueryService for PeerQueryService {
             let stmt_query = stmt_queries.get(i).map(String::as_str).unwrap_or(query);
             if use_raft && is_cluster_mutation(&stmt) {
                 results.push(
-                    self.execute_raft_mutation(db, caller, statement_id, &stmt)
+                    self.execute_raft_mutation(db, retention_policy, caller, statement_id, &stmt)
                         .await?,
                 );
                 continue;
@@ -702,7 +716,7 @@ impl QueryService for PeerQueryService {
                     }
                     result
                 }
-                Statement::Delete(ref del) => {
+                Statement::Delete(_) => {
                     let result = self
                         .execute_inner_statement(
                             db,
@@ -714,27 +728,15 @@ impl QueryService for PeerQueryService {
                         )
                         .await;
                     if result.error.is_none() {
-                        let del_rp = if let Some(rp) = retention_policy {
-                            rp.to_string()
-                        } else {
-                            self.metadata.get_default_rp(db).await?
-                        };
-                        let predicate_sql =
-                            crate::application::predicate_sql::build_delete_predicate(
-                                &self.metadata,
-                                db,
-                                &del_rp,
-                                &del.from,
-                                del.condition.as_ref(),
-                            )
-                            .await?;
-                        self.replicate_mutation(MutationRequest::Delete {
-                            database: db.to_string(),
-                            rp: del_rp,
-                            measurement: del.from.clone(),
-                            predicate_sql,
-                        })
+                        let req = mutation_request_from_statement(
+                            &stmt,
+                            db,
+                            retention_policy,
+                            &self.metadata,
+                            self.shard_routing.get(),
+                        )
                         .await?;
+                        self.replicate_mutation(req).await?;
                     }
                     result
                 }
@@ -1036,7 +1038,7 @@ impl QueryService for PeerQueryService {
                     }
                     result
                 }
-                Statement::DropSeries(ref s) => {
+                Statement::DropSeries(_) => {
                     let result = self
                         .execute_inner_statement(
                             db,
@@ -1048,41 +1050,15 @@ impl QueryService for PeerQueryService {
                         )
                         .await;
                     if result.error.is_none() {
-                        let target_db = s.database.as_deref().unwrap_or(db);
-                        let measurement = s.from.as_ref().and_then(|n| match n {
-                            MeasurementName::Name(n) => Some(n.clone()),
-                            MeasurementName::Regex(_) => None,
-                        });
-                        let ds_rp = if let Some(rp) = retention_policy {
-                            rp.to_string()
-                        } else {
-                            self.metadata.get_default_rp(target_db).await?
-                        };
-                        let predicate_sql = match (measurement.as_deref(), s.condition.as_ref()) {
-                            // Replicas delete the rows this selects.
-                            (Some(meas), cond) => {
-                                crate::application::predicate_sql::build_delete_predicate(
-                                    &self.metadata,
-                                    target_db,
-                                    &ds_rp,
-                                    meas,
-                                    cond,
-                                )
-                                .await?
-                            }
-                            (None, Some(cond)) => {
-                                build_predicate_sql(&self.metadata, target_db, &ds_rp, "", cond)
-                                    .await?
-                            }
-                            (None, None) => String::new(),
-                        };
-                        self.replicate_mutation(MutationRequest::DropSeries {
-                            database: target_db.to_string(),
-                            rp: ds_rp,
-                            measurement,
-                            predicate_sql,
-                        })
+                        let req = mutation_request_from_statement(
+                            &stmt,
+                            db,
+                            retention_policy,
+                            &self.metadata,
+                            self.shard_routing.get(),
+                        )
                         .await?;
+                        self.replicate_mutation(req).await?;
                     }
                     result
                 }
@@ -1244,6 +1220,51 @@ fn execute_or_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// In Raft mode a DELETE / DROP SERIES built its mutation with the
+    /// database's default retention policy, ignoring `?rp=`: a delete on
+    /// `week` removed rows from `autogen` instead.
+    #[tokio::test]
+    async fn raft_delete_uses_the_requested_retention_policy() {
+        use crate::adapters::metadata::rocksdb_meta::RocksDbMetadata;
+        let dir = tempfile::tempdir().unwrap();
+        let meta: Arc<dyn MetadataPort> = Arc::new(RocksDbMetadata::open(dir.path()).unwrap());
+        meta.create_database("db").await.unwrap();
+        let mut week = RetentionPolicy::autogen();
+        week.name = "week".to_string();
+        week.is_default = false;
+        meta.create_retention_policy("db", week).await.unwrap();
+        meta.register_measurement(
+            "db",
+            "week",
+            &crate::domain::measurement::MeasurementMeta {
+                name: "cpu".into(),
+                tag_keys: vec!["host".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let rp_of = |req: MutationRequest| match req {
+            MutationRequest::Delete { rp, .. } | MutationRequest::DropSeries { rp, .. } => rp,
+            other => panic!("unexpected {other:?}"),
+        };
+        for q in [
+            "DELETE FROM cpu WHERE host='a'",
+            "DROP SERIES FROM cpu WHERE host='a'",
+        ] {
+            let stmt = &crate::timeseriesql::parse(q).unwrap()[0];
+            let req = mutation_request_from_statement(stmt, "db", Some("week"), &meta, None)
+                .await
+                .unwrap();
+            assert_eq!(rp_of(req), "week", "{q}");
+            let req = mutation_request_from_statement(stmt, "db", None, &meta, None)
+                .await
+                .unwrap();
+            assert_eq!(rp_of(req), "autogen", "{q}");
+        }
+    }
 
     #[test]
     fn resolve_leader_addr_prefers_forward_node() {
