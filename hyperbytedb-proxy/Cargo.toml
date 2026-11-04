@@ -20,7 +20,6 @@ harness = false
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
-tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "http2"] }
@@ -38,7 +37,6 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
 
 anyhow = "1"
-thiserror = "2"
 futures = "0.3"
 
 [dev-dependencies]
