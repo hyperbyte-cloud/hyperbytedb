@@ -30,15 +30,6 @@ impl WalArrowCache {
         gauge!(ENTRIES_GAUGE).set(map.len() as f64);
     }
 
-    pub fn insert_batch(&self, seqs: &[u64], slots: Vec<PreparedWalSlot>) {
-        debug_assert_eq!(seqs.len(), slots.len());
-        let mut map = self.entries.write();
-        for (seq, slot) in seqs.iter().zip(slots) {
-            map.insert(*seq, slot);
-        }
-        gauge!(ENTRIES_GAUGE).set(map.len() as f64);
-    }
-
     /// Move up to `max_entries` contiguous prepared slots from `from` through
     /// `to_inclusive`.
     ///

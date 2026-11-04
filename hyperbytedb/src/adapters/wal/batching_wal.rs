@@ -194,9 +194,9 @@ impl BatchingWal {
         let pre_encoded = if self.inner.wal_format() == WalFormat::Bincode {
             let mut bytes = Vec::with_capacity(
                 64 + bundle.entry.points.len()
-                    * crate::application::line_protocol::POINT_ENCODED_SIZE_HINT,
+                    * crate::domain::point_codec::POINT_ENCODED_SIZE_HINT,
             );
-            crate::application::line_protocol::encode_bincode_into(&mut bytes, &bundle.entry)
+            crate::domain::point_codec::encode_bincode_into(&mut bytes, &bundle.entry)
                 .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
             Some(bytes)
         } else {

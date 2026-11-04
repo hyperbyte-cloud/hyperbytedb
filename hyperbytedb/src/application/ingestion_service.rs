@@ -5,10 +5,8 @@ use std::sync::Arc;
 #[cfg(feature = "columnar-ingest")]
 use crate::application::ingest_metadata::prepare_columnar_metadata;
 use crate::application::ingest_metadata::{
-    IngestCardinalityLimits, IngestSchemaCache, prepare_batch_metadata, validate_point_count,
+    IngestCardinalityLimits, IngestSchemaCache, validate_point_count,
 };
-use crate::application::line_protocol::parse_line_body_to_points_limited;
-use crate::application::msgpack_ingest::parse_msgpack_body_to_points_limited;
 use crate::application::physical_names::PhysicalNameGuard;
 use crate::application::wal_append::{
     ColumnarWalAppend, append_columnar_with_prepared, append_points_with_prepared,
@@ -149,11 +147,7 @@ impl IngestionPort for IngestionServiceImpl {
                 .metadata
                 .get_measurement(db, &retention_policy, &wire.measurement)
                 .await?
-                && meta.materialized
-                && meta
-                    .materialized_rp
-                    .as_deref()
-                    .is_none_or(|mr| mr == retention_policy)
+                && meta.refuses_raw_writes(&retention_policy)
             {
                 return Err(HyperbytedbError::WriteToMaterializedDestination(
                     wire.measurement.clone(),
@@ -189,25 +183,14 @@ impl IngestionPort for IngestionServiceImpl {
             return Ok(());
         }
 
-        let points = match format {
-            WritePayloadFormat::LineProtocol => {
-                parse_line_body_to_points_limited(body, precision, self.max_points_per_request)?
-            }
-            WritePayloadFormat::Msgpack => {
-                parse_msgpack_body_to_points_limited(body, precision, self.max_points_per_request)?
-            }
-            #[cfg(feature = "columnar-ingest")]
-            WritePayloadFormat::ColumnarMsgpack => {
-                return Err(HyperbytedbError::Internal(
-                    "columnar ingest fell through fast path".into(),
-                ));
-            }
-        };
+        let points = crate::application::ingest_metadata::parse_write_body(
+            body,
+            precision,
+            format,
+            self.max_points_per_request,
+        )?;
         if points.is_empty() {
             return Ok(());
-        }
-        if !matches!(format, WritePayloadFormat::LineProtocol) {
-            validate_point_count(points.len(), self.max_points_per_request)?;
         }
 
         // Points whose fields conflict with a stored type are dropped and the
@@ -226,14 +209,18 @@ impl IngestionPort for IngestionServiceImpl {
         let t2 = std::time::Instant::now();
         histogram!("hyperbytedb_ingest_parse_seconds").record((t2 - t1).as_secs_f64());
 
+        // Built once: the name guard and the metadata registration both
+        // need each measurement's names.
+        let schema = crate::application::ingest_metadata::BatchSchema::from_points(&points)?;
         self.name_guard
-            .check_points(&self.metadata, db, &retention_policy, &points)
+            .check_schema(&self.metadata, db, &retention_policy, &schema)
             .await?;
-        prepare_batch_metadata(
+        crate::application::ingest_metadata::prepare_batch_metadata_with_schema(
             &self.metadata,
             db,
             &retention_policy,
             &points,
+            &schema,
             &self.limits,
             Some(&self.schema_cache),
         )
@@ -248,11 +235,7 @@ impl IngestionPort for IngestionServiceImpl {
                     .metadata
                     .get_measurement(db, &retention_policy, &point.measurement)
                     .await?
-                && meta.materialized
-                && meta
-                    .materialized_rp
-                    .as_deref()
-                    .is_none_or(|mr| mr == retention_policy)
+                && meta.refuses_raw_writes(&retention_policy)
             {
                 return Err(HyperbytedbError::WriteToMaterializedDestination(
                     point.measurement.clone(),

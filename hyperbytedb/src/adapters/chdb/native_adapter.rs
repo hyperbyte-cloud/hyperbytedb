@@ -302,12 +302,6 @@ impl ChdbNativeAdapter {
         }
     }
 
-    /// Override the insert path (Arrow vs SQL `VALUES`). Defaults to Arrow.
-    pub fn with_arrow_inserts(mut self, enabled: bool) -> Self {
-        self.use_arrow = enabled;
-        self
-    }
-
     /// Re-warm schema caches from metadata (e.g. after peer metadata sync).
     pub async fn refresh_schemas_from_metadata(&self) -> Result<usize, HyperbytedbError> {
         let warmed = self.warm_schemas_from_metadata().await?;
@@ -688,12 +682,7 @@ impl ChdbNativeAdapter {
                 .await?
         {
             // Reject raw ingestion into materialized view destinations.
-            if meas_meta.materialized
-                && meas_meta
-                    .materialized_rp
-                    .as_deref()
-                    .is_none_or(|mr| mr == key.rp)
-            {
+            if meas_meta.refuses_raw_writes(&key.rp) {
                 return Err(HyperbytedbError::WriteToMaterializedDestination(
                     key.measurement.clone(),
                 ));
@@ -1293,7 +1282,7 @@ impl ChdbNativeAdapter {
         db: &str,
         rp: &str,
         origin_node_id: u64,
-        wire: &crate::application::columnar_msgpack::ColumnarMsgpackBatch,
+        wire: &crate::domain::columnar_batch::ColumnarMsgpackBatch,
         precision: Option<&str>,
     ) -> Result<crate::domain::prepared_wal::PreparedWalSlot, HyperbytedbError> {
         use crate::application::columnar_msgpack::columnar_timestamps_ns;
@@ -1533,7 +1522,7 @@ impl PointsSinkPort for ChdbNativeAdapter {
         db: &str,
         rp: &str,
         origin_node_id: u64,
-        wire: &crate::application::columnar_msgpack::ColumnarMsgpackBatch,
+        wire: &crate::domain::columnar_batch::ColumnarMsgpackBatch,
         precision: Option<&str>,
     ) -> Result<crate::domain::prepared_wal::PreparedWalSlot, HyperbytedbError> {
         self.build_prepared_wal_slot_from_columnar(db, rp, origin_node_id, wire, precision)
@@ -2348,7 +2337,7 @@ fn build_field_column<P: Borrow<Point>>(points: &[P], logical: &str, disc: u8) -
 /// (nullable). Returns the batch plus the observed `(min_time, max_time)`.
 #[cfg(feature = "columnar-ingest")]
 fn columnar_representative_point(
-    wire: &crate::application::columnar_msgpack::ColumnarMsgpackBatch,
+    wire: &crate::domain::columnar_batch::ColumnarMsgpackBatch,
     precision: Option<&str>,
 ) -> Result<Point, HyperbytedbError> {
     use crate::application::columnar_msgpack::columnar_timestamps_ns;
@@ -2648,19 +2637,7 @@ fn build_series_insert_sql(ensured: &EnsuredTable, new_series: &[(u64, &Point)])
 /// Quote a string for ClickHouse: wrap in single quotes; escape `\` and `'`.
 fn append_quoted_string(out: &mut String, s: &str) {
     out.push('\'');
-    for ch in s.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '\'' => out.push_str("\\'"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                let _ = write!(out, "\\x{:02x}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
+    crate::domain::chdb_naming::push_string_literal_body(out, s);
     out.push('\'');
 }
 

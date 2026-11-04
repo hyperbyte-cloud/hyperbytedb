@@ -2,9 +2,9 @@ use metrics::counter;
 use std::sync::Arc;
 use tokio::sync::watch;
 
-use crate::adapters::cluster::raft::HyperbytedbRaft;
 use crate::domain::chdb_naming::{quoted_series_table_name, quoted_table_name};
 use crate::error::HyperbytedbError;
+use crate::ports::leadership::LeadershipPort;
 use crate::ports::metadata::MetadataPort;
 use crate::ports::query::QueryPort;
 use crate::ports::sharding::ShardMapPort;
@@ -12,7 +12,7 @@ use crate::ports::sharding::ShardMapPort;
 pub struct RetentionService {
     metadata: Arc<dyn MetadataPort>,
     query: Arc<dyn QueryPort>,
-    raft: Option<HyperbytedbRaft>,
+    leadership: Option<Arc<dyn LeadershipPort>>,
     sharding_enabled: bool,
     shard_map: Option<Arc<dyn ShardMapPort>>,
     node_id: u64,
@@ -22,13 +22,13 @@ impl RetentionService {
     pub fn new(
         metadata: Arc<dyn MetadataPort>,
         query: Arc<dyn QueryPort>,
-        raft: Option<HyperbytedbRaft>,
+        leadership: Option<Arc<dyn LeadershipPort>>,
         node_id: u64,
     ) -> Self {
         Self {
             metadata,
             query,
-            raft,
+            leadership,
             sharding_enabled: false,
             shard_map: None,
             node_id,
@@ -46,13 +46,7 @@ impl RetentionService {
     }
 
     fn is_raft_leader(&self) -> bool {
-        match &self.raft {
-            Some(raft) => {
-                let metrics = raft.metrics().borrow().clone();
-                metrics.current_leader == Some(self.node_id)
-            }
-            None => true,
-        }
+        crate::ports::leadership::may_run(self.leadership.as_deref(), self.node_id)
     }
 
     pub async fn run(&self, interval: std::time::Duration, mut shutdown_rx: watch::Receiver<bool>) {
@@ -61,7 +55,7 @@ impl RetentionService {
 
         tracing::info!(
             interval = ?interval,
-            raft_gated = self.raft.is_some(),
+            raft_gated = self.leadership.is_some(),
             node_id = self.node_id,
             "retention service started"
         );

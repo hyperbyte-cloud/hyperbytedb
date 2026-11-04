@@ -8,7 +8,6 @@ foldhash = "0.2"
 # HTTP
 axum = { version = "0.8", features = ["macros", "http2"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
-tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors", "set-header", "timeout", "compression-gzip"] }
 
 # Async runtime (`full` pulls in unused extras like `process` and `io-std`)
@@ -92,7 +91,6 @@ regex = "1"
 
 # Crypto / checksums
 sha2 = "0.10"
-crc32fast = "1"
 
 # Raft consensus
 openraft = { version = "0.9", features = ["serde"] }
@@ -103,9 +101,6 @@ uuid = { version = "1", features = ["v4"] }
 futures = "0.3"
 async-trait = "0.1"
 indexmap = "2.13.0"
-comfy-table = "7.2.2"
-colored = "3.1.1"
-simd-json = { version = "0.17.0", features = ["serde_impl"] }
 humantime = "2"
 lru = "0.12"
 opentelemetry = { version = "0.33.0", optional = true }

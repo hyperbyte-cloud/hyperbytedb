@@ -12,9 +12,7 @@ use chdb_rust::connection::Connection;
 use chdb_rust::format::OutputFormat;
 use chdb_rust::query_result::QueryResult;
 
-use crate::adapters::chdb::connection_pool::{
-    ChdbConnectionPool, DEFAULT_POOL_SIZE, MIN_POOL_SIZE, clamp_pool_size,
-};
+use crate::adapters::chdb::connection_pool::{ChdbConnectionPool, MIN_POOL_SIZE, clamp_pool_size};
 use crate::error::HyperbytedbError;
 
 /// Execute SQL on a connection with an explicit output format.
@@ -68,11 +66,6 @@ impl SharedSession {
             pool_size,
             pool: Arc::new(cell),
         })
-    }
-
-    /// Default production pool size when not configured otherwise.
-    pub fn default_pool_size() -> usize {
-        DEFAULT_POOL_SIZE
     }
 
     pub fn data_path(&self) -> &str {

@@ -11,16 +11,6 @@ pub enum FieldValue {
 }
 
 impl FieldValue {
-    pub fn type_name(&self) -> &'static str {
-        match self {
-            FieldValue::Float(_) => "float",
-            FieldValue::Integer(_) => "integer",
-            FieldValue::UInteger(_) => "unsigned",
-            FieldValue::String(_) => "string",
-            FieldValue::Boolean(_) => "boolean",
-        }
-    }
-
     pub fn type_discriminant(&self) -> u8 {
         match self {
             FieldValue::Float(_) => 0,

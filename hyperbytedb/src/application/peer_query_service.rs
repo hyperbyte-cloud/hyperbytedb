@@ -5,13 +5,13 @@ use openraft::BasicNode;
 use openraft::error::ForwardToLeader;
 
 use crate::adapters::cluster::raft::HyperbytedbRaft;
-use crate::adapters::cluster::raft::types::{ClusterRequest, ClusterResponse};
 use crate::application::materialized_view_service::def_from_statement;
 use crate::application::predicate_sql::build_predicate_sql;
 use crate::application::query_service::check_authorization;
 use crate::application::shard_metadata_scatter::scatter_measurement_meta;
 use crate::application::shard_routing::ShardRoutingContext;
 use crate::domain::cluster::membership::ClusterMembership;
+use crate::domain::cluster::raft_request::{ClusterRequest, ClusterResponse};
 use crate::domain::cluster::types::MutationRequest;
 use crate::domain::database::{RetentionPolicy, retention_policy_from_create};
 use crate::domain::materialized_view::MaterializedViewDef;
@@ -186,6 +186,7 @@ impl PeerQueryService {
     async fn execute_raft_mutation(
         &self,
         db: &str,
+        retention_policy: Option<&str>,
         caller: Option<&crate::domain::user::StoredUser>,
         statement_id: u32,
         stmt: &Statement,
@@ -199,8 +200,14 @@ impl PeerQueryService {
                 error: Some(e.to_string()),
             });
         }
-        match mutation_request_from_statement(stmt, db, &self.metadata, self.shard_routing.get())
-            .await
+        match mutation_request_from_statement(
+            stmt,
+            db,
+            retention_policy,
+            &self.metadata,
+            self.shard_routing.get(),
+        )
+        .await
         {
             Ok(req) => {
                 self.replicate_mutation(req).await?;
@@ -402,6 +409,7 @@ async fn resolve_mv_dest_rp(
 async fn mutation_request_from_statement(
     stmt: &Statement,
     db: &str,
+    retention_policy: Option<&str>,
     metadata: &Arc<dyn MetadataPort>,
     shard_routing: Option<&Arc<ShardRoutingContext>>,
 ) -> Result<MutationRequest, HyperbytedbError> {
@@ -412,7 +420,10 @@ async fn mutation_request_from_statement(
         }),
         Statement::DropDatabase(name) => Ok(MutationRequest::DropDatabase(name.clone())),
         Statement::Delete(del) => {
-            let del_rp = metadata.get_default_rp(db).await?;
+            let del_rp = match retention_policy {
+                Some(rp) => rp.to_string(),
+                None => metadata.get_default_rp(db).await?,
+            };
             let predicate_sql = crate::application::predicate_sql::build_delete_predicate(
                 metadata,
                 db,
@@ -543,7 +554,10 @@ async fn mutation_request_from_statement(
                 MeasurementName::Name(n) => Some(n.clone()),
                 MeasurementName::Regex(_) => None,
             });
-            let drop_rp = metadata.get_default_rp(target_db).await?;
+            let drop_rp = match retention_policy {
+                Some(rp) => rp.to_string(),
+                None => metadata.get_default_rp(target_db).await?,
+            };
             let predicate_sql = match (measurement.as_deref(), s.condition.as_ref()) {
                 // Replicas delete the rows this selects.
                 (Some(meas), cond) => {
@@ -659,7 +673,7 @@ impl QueryService for PeerQueryService {
             let stmt_query = stmt_queries.get(i).map(String::as_str).unwrap_or(query);
             if use_raft && is_cluster_mutation(&stmt) {
                 results.push(
-                    self.execute_raft_mutation(db, caller, statement_id, &stmt)
+                    self.execute_raft_mutation(db, retention_policy, caller, statement_id, &stmt)
                         .await?,
                 );
                 continue;
@@ -702,7 +716,7 @@ impl QueryService for PeerQueryService {
                     }
                     result
                 }
-                Statement::Delete(ref del) => {
+                Statement::Delete(_) => {
                     let result = self
                         .execute_inner_statement(
                             db,
@@ -714,27 +728,15 @@ impl QueryService for PeerQueryService {
                         )
                         .await;
                     if result.error.is_none() {
-                        let del_rp = if let Some(rp) = retention_policy {
-                            rp.to_string()
-                        } else {
-                            self.metadata.get_default_rp(db).await?
-                        };
-                        let predicate_sql =
-                            crate::application::predicate_sql::build_delete_predicate(
-                                &self.metadata,
-                                db,
-                                &del_rp,
-                                &del.from,
-                                del.condition.as_ref(),
-                            )
-                            .await?;
-                        self.replicate_mutation(MutationRequest::Delete {
-                            database: db.to_string(),
-                            rp: del_rp,
-                            measurement: del.from.clone(),
-                            predicate_sql,
-                        })
+                        let req = mutation_request_from_statement(
+                            &stmt,
+                            db,
+                            retention_policy,
+                            &self.metadata,
+                            self.shard_routing.get(),
+                        )
                         .await?;
+                        self.replicate_mutation(req).await?;
                     }
                     result
                 }
@@ -1036,7 +1038,7 @@ impl QueryService for PeerQueryService {
                     }
                     result
                 }
-                Statement::DropSeries(ref s) => {
+                Statement::DropSeries(_) => {
                     let result = self
                         .execute_inner_statement(
                             db,
@@ -1048,41 +1050,15 @@ impl QueryService for PeerQueryService {
                         )
                         .await;
                     if result.error.is_none() {
-                        let target_db = s.database.as_deref().unwrap_or(db);
-                        let measurement = s.from.as_ref().and_then(|n| match n {
-                            MeasurementName::Name(n) => Some(n.clone()),
-                            MeasurementName::Regex(_) => None,
-                        });
-                        let ds_rp = if let Some(rp) = retention_policy {
-                            rp.to_string()
-                        } else {
-                            self.metadata.get_default_rp(target_db).await?
-                        };
-                        let predicate_sql = match (measurement.as_deref(), s.condition.as_ref()) {
-                            // Replicas delete the rows this selects.
-                            (Some(meas), cond) => {
-                                crate::application::predicate_sql::build_delete_predicate(
-                                    &self.metadata,
-                                    target_db,
-                                    &ds_rp,
-                                    meas,
-                                    cond,
-                                )
-                                .await?
-                            }
-                            (None, Some(cond)) => {
-                                build_predicate_sql(&self.metadata, target_db, &ds_rp, "", cond)
-                                    .await?
-                            }
-                            (None, None) => String::new(),
-                        };
-                        self.replicate_mutation(MutationRequest::DropSeries {
-                            database: target_db.to_string(),
-                            rp: ds_rp,
-                            measurement,
-                            predicate_sql,
-                        })
+                        let req = mutation_request_from_statement(
+                            &stmt,
+                            db,
+                            retention_policy,
+                            &self.metadata,
+                            self.shard_routing.get(),
+                        )
                         .await?;
+                        self.replicate_mutation(req).await?;
                     }
                     result
                 }
@@ -1219,7 +1195,7 @@ impl QueryService for PeerQueryService {
 }
 
 fn hash_password_for_replication(password: &str) -> Result<String, HyperbytedbError> {
-    crate::adapters::http::auth_middleware::hash_password(password)
+    crate::domain::user::hash_password(password)
         .map_err(|e| HyperbytedbError::Internal(crate::error::ChainedError::from_error(e)))
 }
 
@@ -1244,6 +1220,234 @@ fn execute_or_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// In Raft mode a DELETE / DROP SERIES built its mutation with the
+    /// database's default retention policy, ignoring `?rp=`: a delete on
+    /// `week` removed rows from `autogen` instead.
+    #[tokio::test]
+    async fn raft_delete_uses_the_requested_retention_policy() {
+        use crate::adapters::metadata::rocksdb_meta::RocksDbMetadata;
+        let dir = tempfile::tempdir().unwrap();
+        let meta: Arc<dyn MetadataPort> = Arc::new(RocksDbMetadata::open(dir.path()).unwrap());
+        meta.create_database("db").await.unwrap();
+        let mut week = RetentionPolicy::autogen();
+        week.name = "week".to_string();
+        week.is_default = false;
+        meta.create_retention_policy("db", week).await.unwrap();
+        meta.register_measurement(
+            "db",
+            "week",
+            &crate::domain::measurement::MeasurementMeta {
+                name: "cpu".into(),
+                tag_keys: vec!["host".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let rp_of = |req: MutationRequest| match req {
+            MutationRequest::Delete { rp, .. } | MutationRequest::DropSeries { rp, .. } => rp,
+            other => panic!("unexpected {other:?}"),
+        };
+        for q in [
+            "DELETE FROM cpu WHERE host='a'",
+            "DROP SERIES FROM cpu WHERE host='a'",
+        ] {
+            let stmt = &crate::timeseriesql::parse(q).unwrap()[0];
+            let req = mutation_request_from_statement(stmt, "db", Some("week"), &meta, None)
+                .await
+                .unwrap();
+            assert_eq!(rp_of(req), "week", "{q}");
+            let req = mutation_request_from_statement(stmt, "db", None, &meta, None)
+                .await
+                .unwrap();
+            assert_eq!(rp_of(req), "autogen", "{q}");
+        }
+    }
+
+    /// A replication port that does nothing: the Raft path below never
+    /// uses it.
+    struct NoReplication;
+    #[async_trait::async_trait]
+    impl ReplicationPort for NoReplication {
+        fn replicate_write(
+            self: Arc<Self>,
+            _batch: crate::ports::replication::OutboundReplicationBatch,
+        ) -> Result<(), HyperbytedbError> {
+            Ok(())
+        }
+        async fn replicate_write_sync(
+            self: Arc<Self>,
+            _batch: crate::ports::replication::OutboundReplicationBatch,
+            _required_acks: usize,
+            _timeout: std::time::Duration,
+        ) -> Result<(), HyperbytedbError> {
+            Ok(())
+        }
+        fn replicate_mutation(self: Arc<Self>, _req: MutationRequest, _targets: Option<Vec<u64>>) {}
+        async fn replicate_mutation_sync(
+            self: Arc<Self>,
+            _req: MutationRequest,
+        ) -> Result<(), HyperbytedbError> {
+            Ok(())
+        }
+        async fn replication_peer_count(&self, _self_node_id: u64) -> usize {
+            0
+        }
+    }
+
+    /// The Raft-mode DELETE wiring end to end: `?rp=week` must reach the
+    /// mutation through `execute_query` and `execute_raft_mutation`, and the
+    /// state machine must delete the rows in `week`, not in `autogen`.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn raft_delete_with_rp_deletes_from_that_rp() {
+        use crate::adapters::chdb::native_adapter::ChdbNativeAdapter;
+        use crate::adapters::chdb::query_adapter::ChdbQueryAdapter;
+        use crate::adapters::chdb::session::SharedSession;
+        use crate::adapters::metadata::rocksdb_meta::RocksDbMetadata;
+        use crate::adapters::wal::rocksdb_wal::RocksDbWal;
+        use crate::application::flush_service::FlushServiceImpl;
+        use crate::application::ingestion_service::IngestionServiceImpl;
+        use crate::application::materialized_view_service::MaterializedViewService;
+        use crate::application::query_service::QueryServiceImpl;
+        use crate::composition::bootstrap::ClusterBootstrap;
+        use crate::ports::ingestion::{IngestionPort, WritePayloadFormat};
+        use crate::ports::points_sink::PointsSinkPort;
+        use crate::ports::query::QueryPort;
+        use crate::ports::wal::WalPort;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (meta_dir, wal_dir, chdb_dir) = (
+            dir.path().join("meta"),
+            dir.path().join("wal"),
+            dir.path().join("chdb"),
+        );
+        for p in [&meta_dir, &wal_dir, &chdb_dir] {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        let chdb = SharedSession::new_eager(chdb_dir.to_str().unwrap(), 1).unwrap();
+        let query_port: Arc<dyn QueryPort> =
+            Arc::new(ChdbQueryAdapter::from_shared(chdb.clone(), 0));
+        let sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(chdb));
+        let wal: Arc<dyn WalPort> = Arc::new(RocksDbWal::open(&wal_dir).unwrap());
+        let metadata: Arc<dyn MetadataPort> = Arc::new(RocksDbMetadata::open(&meta_dir).unwrap());
+        let mv_service = Arc::new(MaterializedViewService::new(
+            metadata.clone(),
+            query_port.clone(),
+            sink.clone(),
+        ));
+
+        metadata.create_database("db").await.unwrap();
+        let mut week = RetentionPolicy::autogen();
+        week.name = "week".to_string();
+        week.is_default = false;
+        metadata.create_retention_policy("db", week).await.unwrap();
+        let ingestion = IngestionServiceImpl::with_sink(
+            wal.clone(),
+            None,
+            metadata.clone(),
+            Default::default(),
+            0,
+        );
+        for rp in ["autogen", "week"] {
+            ingestion
+                .ingest(
+                    "db",
+                    Some(rp),
+                    None,
+                    b"cpu,host=a v=1 1000000000",
+                    WritePayloadFormat::LineProtocol,
+                )
+                .await
+                .unwrap();
+        }
+        FlushServiceImpl::new(wal.clone(), 0, sink.clone())
+            .flush()
+            .await
+            .unwrap();
+
+        let mut cluster_cfg = crate::config::HyperbytedbConfig::load(None)
+            .unwrap()
+            .cluster;
+        cluster_cfg.enabled = true;
+        cluster_cfg.node_id = 1;
+        cluster_cfg.cluster_addr = "127.0.0.1:18087".into();
+        cluster_cfg.replication_log_dir = dir.path().join("repl").to_string_lossy().into();
+        cluster_cfg.raft_dir = dir.path().join("raft").to_string_lossy().into();
+        cluster_cfg.raft_heartbeat_interval_ms = Some(200);
+        cluster_cfg.raft_election_timeout_ms = Some(500);
+        let bootstrap =
+            ClusterBootstrap::init(&cluster_cfg, 1000, Default::default(), Default::default())
+                .unwrap();
+        let raft = bootstrap
+            .start_raft(
+                &cluster_cfg,
+                metadata.clone(),
+                mv_service,
+                sink.clone(),
+                wal.clone(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        for _ in 0..50 {
+            if raft.metrics().borrow().current_leader == Some(1) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        let base: Arc<dyn QueryService> = Arc::new(QueryServiceImpl::new(
+            query_port,
+            metadata.clone(),
+            wal,
+            30,
+            sink,
+        ));
+        let peer = PeerQueryService::new(
+            base.clone(),
+            metadata.clone(),
+            Arc::new(NoReplication),
+            &crate::adapters::cluster::cluster_auth::ClusterAuth::new(None).unwrap(),
+        );
+        peer.set_raft(raft);
+
+        let resp = peer
+            .execute_query(
+                "db",
+                "DELETE FROM cpu WHERE host='a'",
+                None,
+                Some("week"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            resp.results[0].error.is_none(),
+            "{:?}",
+            resp.results[0].error
+        );
+
+        let rows = |rp: &'static str| {
+            let base = base.clone();
+            async move {
+                let q = format!(r#"SELECT v FROM "{rp}"."cpu""#);
+                let resp = base
+                    .execute_query("db", &q, None, None, None)
+                    .await
+                    .unwrap();
+                resp.results[0]
+                    .series
+                    .as_ref()
+                    .map_or(0, |s| s.iter().map(|s| s.values.len()).sum::<usize>())
+            }
+        };
+        assert_eq!(rows("week").await, 0, "the DELETE named ?rp=week");
+        assert_eq!(rows("autogen").await, 1, "autogen must be untouched");
+    }
 
     #[test]
     fn resolve_leader_addr_prefers_forward_node() {

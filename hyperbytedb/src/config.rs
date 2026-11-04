@@ -102,9 +102,9 @@ pub struct ShardingConfig {
     /// (replica-set healing). Disable to manage replica sets manually.
     #[serde(default = "default_peer_heal_enabled")]
     pub peer_heal_enabled: bool,
-    /// Propose `ClearVerified` shard-map ops once split-transfer movement
-    /// verifies. Disable on mixed-version clusters: nodes running builds
-    /// older than the `ClearVerified` op cannot decode it from the Raft log.
+    /// No effect: it gated `ClearVerified` proposals from the split-transfer
+    /// reconciliation, which has been removed. Still accepted so existing
+    /// config files load.
     #[serde(default = "default_transfer_clear_proposals_enabled")]
     pub transfer_clear_proposals_enabled: bool,
     /// Propose `AddPeer` shard-map ops to place a joiner as a region replica.
@@ -1604,5 +1604,23 @@ mod admission_tests {
             6 * INFLIGHT_WRITES_PER_CPU
         );
         assert_eq!(resolve_max_inflight_writes(0, 0), INFLIGHT_WRITES_PER_CPU);
+    }
+}
+
+#[cfg(test)]
+mod legacy_config_tests {
+    /// The split-transfer reconciliation that read this key is gone, but
+    /// existing config files still set it and must keep loading.
+    #[test]
+    fn old_config_with_transfer_clear_proposals_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[sharding]\ntransfer_clear_proposals_enabled = false\n",
+        )
+        .unwrap();
+        let cfg = super::HyperbytedbConfig::load(Some(path.to_str().unwrap())).unwrap();
+        assert!(!cfg.sharding.transfer_clear_proposals_enabled);
     }
 }

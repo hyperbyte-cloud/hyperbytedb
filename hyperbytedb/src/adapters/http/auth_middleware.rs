@@ -306,17 +306,7 @@ pub async fn rate_limit_query_layer(
     next.run(request).await
 }
 
-pub fn hash_password(password: &str) -> Result<String, crate::error::HyperbytedbError> {
-    use argon2::Argon2;
-    use argon2::password_hash::{PasswordHasher, SaltString};
-    let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
-    let hash = Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .map_err(|e| {
-            crate::error::HyperbytedbError::Internal(format!("password hash failed: {e}").into())
-        })?;
-    Ok(hash.to_string())
-}
+pub use crate::domain::user::hash_password;
 
 #[cfg(test)]
 mod tests {
