@@ -427,9 +427,39 @@ fn bench_split_field_types(c: &mut Criterion) {
     group.finish();
 }
 
+/// The client write path's name-collision guard on a steady-state batch
+/// (every name already checked).
+fn bench_name_guard(c: &mut Criterion) {
+    use hyperbytedb::application::physical_names::PhysicalNameGuard;
+    let body = telegraf_cpu_body(5000);
+    let points = parse_line_body_to_points(&body, None).expect("parse");
+    let rt = Runtime::new().expect("runtime");
+    let tmpdir = tempfile::tempdir().expect("tmpdir");
+    let metadata: Arc<dyn MetadataPort> =
+        Arc::new(RocksDbMetadata::open(tmpdir.path()).expect("meta"));
+    rt.block_on(metadata.create_database("benchdb")).unwrap();
+    let guard = PhysicalNameGuard::new();
+    // The request builds the batch schema once for metadata registration;
+    // the guard's own cost is checking it.
+    let schema = hyperbytedb::application::ingest_metadata::BatchSchema::from_points(&points)
+        .expect("schema");
+    rt.block_on(guard.check_schema(&metadata, "benchdb", "autogen", &schema))
+        .expect("guard");
+    let mut group = c.benchmark_group("line_protocol_name_guard");
+    group.throughput(Throughput::Elements(5000));
+    group.bench_function("name_guard_5000x10", |b| {
+        b.iter(|| {
+            rt.block_on(guard.check_schema(&metadata, "benchdb", "autogen", black_box(&schema)))
+                .expect("guard")
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_split_field_types,
+    bench_name_guard,
     bench_parse,
     bench_metadata,
     bench_wal,

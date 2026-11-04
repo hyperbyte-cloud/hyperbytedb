@@ -5,7 +5,7 @@ use std::sync::Arc;
 #[cfg(feature = "columnar-ingest")]
 use crate::application::ingest_metadata::prepare_columnar_metadata;
 use crate::application::ingest_metadata::{
-    IngestCardinalityLimits, IngestSchemaCache, prepare_batch_metadata, validate_point_count,
+    IngestCardinalityLimits, IngestSchemaCache, validate_point_count,
 };
 use crate::application::physical_names::PhysicalNameGuard;
 use crate::application::wal_append::{
@@ -209,14 +209,18 @@ impl IngestionPort for IngestionServiceImpl {
         let t2 = std::time::Instant::now();
         histogram!("hyperbytedb_ingest_parse_seconds").record((t2 - t1).as_secs_f64());
 
+        // Built once: the name guard and the metadata registration both
+        // need each measurement's names.
+        let schema = crate::application::ingest_metadata::BatchSchema::from_points(&points)?;
         self.name_guard
-            .check_points(&self.metadata, db, &retention_policy, &points)
+            .check_schema(&self.metadata, db, &retention_policy, &schema)
             .await?;
-        prepare_batch_metadata(
+        crate::application::ingest_metadata::prepare_batch_metadata_with_schema(
             &self.metadata,
             db,
             &retention_policy,
             &points,
+            &schema,
             &self.limits,
             Some(&self.schema_cache),
         )
