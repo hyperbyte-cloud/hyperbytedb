@@ -8,7 +8,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use metrics::{counter, histogram};
 
 use crate::adapters::cluster::peer_client::PeerClient;
-use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
 use crate::application::runtime::RegionWriteStats;
 use crate::application::shard_peer_resolution::{
     RegionTargetRole, ScatterKind, active_region_peer_targets, is_serving_node, peer_addr,
@@ -27,7 +26,7 @@ use crate::ports::metadata::MetadataPort;
 use crate::ports::sharding::ShardMapPort;
 
 pub struct ShardRoutingContext {
-    pub shard_map: Arc<RocksDbShardMap>,
+    pub shard_map: Arc<dyn ShardMapPort>,
     pub location_cache: Arc<ShardLocationCache>,
     pub config: ShardingConfig,
     pub node_id: u64,

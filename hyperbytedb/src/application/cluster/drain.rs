@@ -15,7 +15,6 @@ use crate::ports::flush::FlushPort;
 use crate::ports::metadata::MetadataPort;
 use crate::ports::points_sink::PointsSinkPort;
 use crate::ports::query::QueryPort;
-use crate::ports::sharding::ShardMapPort;
 use crate::ports::wal::WalPort;
 
 /// Runs the two node-lifecycle procedures that hand off this node's primary

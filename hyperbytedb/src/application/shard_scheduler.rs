@@ -7,7 +7,6 @@ use tokio::sync::watch;
 
 use crate::adapters::cluster::peer_client::PeerClient;
 use crate::adapters::cluster::raft::HyperbytedbRaft;
-use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
 use crate::application::runtime_settings as rs;
 use crate::application::shard_peer_resolution::is_active_peer;
 use crate::application::shard_routing::effective_replication_factor;
@@ -252,7 +251,7 @@ fn max_region_peer_heartbeat_bytes(hb: &[RegionHeartbeatRow], region: &ShardRegi
 pub struct ShardScheduler {
     /// This node's runtime settings: `SET` overrides for the gates below.
     runtime_settings: Arc<rs::RuntimeSettings>,
-    shard_map: Arc<RocksDbShardMap>,
+    shard_map: Arc<dyn ShardMapPort>,
     membership: SharedMembership,
     raft: HyperbytedbRaft,
     peer_client: Option<Arc<PeerClient>>,
@@ -345,7 +344,7 @@ pub struct ShardScheduler {
 impl ShardScheduler {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        shard_map: Arc<RocksDbShardMap>,
+        shard_map: Arc<dyn ShardMapPort>,
         membership: SharedMembership,
         raft: HyperbytedbRaft,
         peer_client: Option<Arc<PeerClient>>,

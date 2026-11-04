@@ -37,7 +37,6 @@ use crate::error::HyperbytedbError;
 use crate::ports::metadata::MetadataPort;
 use crate::ports::query::{CqRunResult, QueryPort, QueryService};
 use crate::ports::replication::{OutboundReplicationBatch, ReplicationPort};
-use crate::ports::sharding::ShardMapPort;
 use crate::timeseriesql::ast::*;
 use crate::timeseriesql::to_clickhouse;
 use crate::timeseriesql::to_clickhouse::select_has_true_aggregate;
