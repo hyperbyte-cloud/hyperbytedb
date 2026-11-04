@@ -1091,8 +1091,8 @@ fn coalesce_ok(
     }
     // A merged body is one encoding or the other: frames and line protocol
     // cannot share a body.
-    if crate::application::line_protocol::is_binary_points(&a.body)
-        != crate::application::line_protocol::is_binary_points(&b.body)
+    if crate::domain::point_codec::is_binary_points(&a.body)
+        != crate::domain::point_codec::is_binary_points(&b.body)
     {
         return false;
     }

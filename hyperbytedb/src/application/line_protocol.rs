@@ -4,6 +4,9 @@ use influxdb_line_protocol::{FieldValue as LpFieldValue, parse_lines};
 
 use crate::domain::database::Precision;
 use crate::domain::point::{FieldValue, Point};
+pub use crate::domain::point_codec::{
+    POINT_ENCODED_SIZE_HINT, POINTS_FRAME_MAGIC, encode_bincode_into, is_binary_points,
+};
 use crate::error::HyperbytedbError;
 
 const PARSE_ERROR_SNIPPET_LEN: usize = 200;
@@ -43,16 +46,6 @@ pub fn parse_line_body_to_points_limited(
     parse_line_body_inner(body, precision, cap, Some(limit))
 }
 
-/// Start of a binary points frame. Line protocol never starts with NUL, so a
-/// body is binary exactly when it starts with this.
-pub const POINTS_FRAME_MAGIC: &[u8; 4] = b"\0HBP";
-
-/// Whether `body` is binary points frames rather than line protocol.
-#[must_use]
-pub fn is_binary_points(body: &[u8]) -> bool {
-    body.starts_with(POINTS_FRAME_MAGIC)
-}
-
 /// Encode points for node-to-node forwarding and replication: one frame,
 /// `magic | u32 LE length | bincode(Vec<Point>)`.
 ///
@@ -75,19 +68,6 @@ pub fn encode_points_binary(points: &[Point]) -> Result<Vec<u8>, HyperbytedbErro
         .map_err(|_| HyperbytedbError::PayloadTooLarge("points frame over 4 GiB".into()))?;
     out[4..8].copy_from_slice(&len.to_le_bytes());
     Ok(out)
-}
-
-/// Starting buffer size per point for one-pass bincode encoding: a point with
-/// a few short tags and one field. Only a hint; the buffer grows as needed.
-pub const POINT_ENCODED_SIZE_HINT: usize = 96;
-
-/// Append `value`'s bincode encoding to `out` in one pass. Same bytes as
-/// `bincode::serialize`, without its separate sizing pass.
-pub fn encode_bincode_into<T: serde::Serialize + ?Sized>(
-    out: &mut Vec<u8>,
-    value: &T,
-) -> Result<(), bincode::Error> {
-    bincode::serialize_into(out, value)
 }
 
 /// Decode one or more frames. Whitespace between frames is skipped, so the
