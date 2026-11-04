@@ -17,8 +17,8 @@ use indexmap::IndexMap;
 use serde_json::Value;
 
 use crate::domain::query_result::SeriesResult;
+use crate::timeseriesql::analysis::{BUCKET_COL, MultiSelector, SelectorKind, TIME_NS_COL};
 use crate::timeseriesql::ast::SelectStatement;
-use crate::timeseriesql::to_clickhouse::{BUCKET_COL, MultiSelector, SelectorKind, TIME_NS_COL};
 
 /// Remove the hidden ranking columns.
 #[must_use]

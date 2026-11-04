@@ -1,3 +1,4 @@
+pub mod analysis;
 pub mod ast;
 pub mod ddl_parser;
 pub mod digest;
