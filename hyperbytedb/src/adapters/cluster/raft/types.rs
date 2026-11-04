@@ -1,38 +1,4 @@
-use serde::{Deserialize, Serialize};
+//! Raft request types; they live in the domain
+//! ([`crate::domain::cluster::raft_request`]).
 
-use crate::domain::cluster::membership::NodeState;
-use crate::domain::cluster::types::MutationRequest;
-use crate::domain::sharding::ShardMapOp;
-
-/// Application-level request that goes through Raft consensus.
-/// Only cluster coordination and schema DDL use Raft -- high-throughput
-/// time-series writes stay on the existing fan-out data plane.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ClusterRequest {
-    SetNodeState { node_id: u64, state: NodeState },
-    SchemaMutation(Box<MutationRequest>),
-    ShardMapMutation(Box<ShardMapOp>),
-}
-
-/// Response returned after a ClusterRequest is committed and applied.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClusterResponse {
-    pub ok: bool,
-    pub message: Option<String>,
-}
-
-impl ClusterResponse {
-    pub fn success() -> Self {
-        Self {
-            ok: true,
-            message: None,
-        }
-    }
-
-    pub fn error(msg: impl Into<String>) -> Self {
-        Self {
-            ok: false,
-            message: Some(msg.into()),
-        }
-    }
-}
+pub use crate::domain::cluster::raft_request::{ClusterRequest, ClusterResponse};

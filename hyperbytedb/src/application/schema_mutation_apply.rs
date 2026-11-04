@@ -49,6 +49,21 @@ pub fn drop_space_for(
 }
 
 /// Dependencies required to apply schema mutations with full local side effects.
+/// Apply CREATE DATABASE locally (idempotent, honors WITH retention policy on peers).
+pub async fn apply_create_database(
+    metadata: &Arc<dyn MetadataPort>,
+    name: &str,
+    rp: Option<crate::domain::database::RetentionPolicy>,
+) -> Result<(), crate::error::HyperbytedbError> {
+    if let Some(rp) = rp {
+        let stmt =
+            crate::domain::database::create_database_statement_from_rp(name.to_string(), &rp);
+        metadata.create_database_with(&stmt).await
+    } else {
+        metadata.create_database(name).await
+    }
+}
+
 pub struct SchemaMutationDeps<'a> {
     pub metadata: &'a Arc<dyn MetadataPort>,
     pub mv_service: Option<&'a MaterializedViewService>,
@@ -167,10 +182,7 @@ async fn apply_schema_mutation_inner(
     } = deps;
     match mutation {
         MutationRequest::CreateDatabase { name, rp } => {
-            crate::adapters::cluster::raft::state_machine::apply_create_database(
-                metadata, &name, rp,
-            )
-            .await
+            apply_create_database(metadata, &name, rp).await
         }
         MutationRequest::DropDatabase(name) => {
             let sink = points_sink.or_else(|| mv_service.map(|mv| mv.points_sink()));

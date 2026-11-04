@@ -242,7 +242,7 @@ impl DrainService {
                 .await?;
             }
 
-            use crate::adapters::cluster::raft::types::ClusterRequest;
+            use crate::domain::cluster::raft_request::ClusterRequest;
             let tp = ShardMapOp::TransferPrimary {
                 key: key.clone(),
                 region_id: region.region_id,
