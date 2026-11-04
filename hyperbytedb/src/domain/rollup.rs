@@ -92,7 +92,7 @@ type FieldRollupsResult = Result<
 
 /// Build rollup metadata for an MV destination from its SELECT fields.
 pub fn field_rollups_from_mv_select(fields: &[Field]) -> FieldRollupsResult {
-    use crate::timeseriesql::to_clickhouse::select_output_field_name;
+    use crate::timeseriesql::analysis::select_output_field_name;
 
     let mut field_types = HashMap::new();
     let mut field_rollups = HashMap::new();
