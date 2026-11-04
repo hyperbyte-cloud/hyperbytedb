@@ -1266,6 +1266,189 @@ mod tests {
         }
     }
 
+    /// A replication port that does nothing: the Raft path below never
+    /// uses it.
+    struct NoReplication;
+    #[async_trait::async_trait]
+    impl ReplicationPort for NoReplication {
+        fn replicate_write(
+            self: Arc<Self>,
+            _batch: crate::ports::replication::OutboundReplicationBatch,
+        ) -> Result<(), HyperbytedbError> {
+            Ok(())
+        }
+        async fn replicate_write_sync(
+            self: Arc<Self>,
+            _batch: crate::ports::replication::OutboundReplicationBatch,
+            _required_acks: usize,
+            _timeout: std::time::Duration,
+        ) -> Result<(), HyperbytedbError> {
+            Ok(())
+        }
+        fn replicate_mutation(self: Arc<Self>, _req: MutationRequest, _targets: Option<Vec<u64>>) {}
+        async fn replicate_mutation_sync(
+            self: Arc<Self>,
+            _req: MutationRequest,
+        ) -> Result<(), HyperbytedbError> {
+            Ok(())
+        }
+        async fn replication_peer_count(&self, _self_node_id: u64) -> usize {
+            0
+        }
+    }
+
+    /// The Raft-mode DELETE wiring end to end: `?rp=week` must reach the
+    /// mutation through `execute_query` and `execute_raft_mutation`, and the
+    /// state machine must delete the rows in `week`, not in `autogen`.
+    #[tokio::test]
+    #[serial_test::serial(chdb)]
+    async fn raft_delete_with_rp_deletes_from_that_rp() {
+        use crate::adapters::chdb::native_adapter::ChdbNativeAdapter;
+        use crate::adapters::chdb::query_adapter::ChdbQueryAdapter;
+        use crate::adapters::chdb::session::SharedSession;
+        use crate::adapters::metadata::rocksdb_meta::RocksDbMetadata;
+        use crate::adapters::wal::rocksdb_wal::RocksDbWal;
+        use crate::application::flush_service::FlushServiceImpl;
+        use crate::application::ingestion_service::IngestionServiceImpl;
+        use crate::application::materialized_view_service::MaterializedViewService;
+        use crate::application::query_service::QueryServiceImpl;
+        use crate::composition::bootstrap::ClusterBootstrap;
+        use crate::ports::ingestion::{IngestionPort, WritePayloadFormat};
+        use crate::ports::points_sink::PointsSinkPort;
+        use crate::ports::query::QueryPort;
+        use crate::ports::wal::WalPort;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (meta_dir, wal_dir, chdb_dir) = (
+            dir.path().join("meta"),
+            dir.path().join("wal"),
+            dir.path().join("chdb"),
+        );
+        for p in [&meta_dir, &wal_dir, &chdb_dir] {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        let chdb = SharedSession::new_eager(chdb_dir.to_str().unwrap(), 1).unwrap();
+        let query_port: Arc<dyn QueryPort> =
+            Arc::new(ChdbQueryAdapter::from_shared(chdb.clone(), 0));
+        let sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::new(chdb));
+        let wal: Arc<dyn WalPort> = Arc::new(RocksDbWal::open(&wal_dir).unwrap());
+        let metadata: Arc<dyn MetadataPort> = Arc::new(RocksDbMetadata::open(&meta_dir).unwrap());
+        let mv_service = Arc::new(MaterializedViewService::new(
+            metadata.clone(),
+            query_port.clone(),
+            sink.clone(),
+        ));
+
+        metadata.create_database("db").await.unwrap();
+        let mut week = RetentionPolicy::autogen();
+        week.name = "week".to_string();
+        week.is_default = false;
+        metadata.create_retention_policy("db", week).await.unwrap();
+        let ingestion = IngestionServiceImpl::with_sink(
+            wal.clone(),
+            None,
+            metadata.clone(),
+            Default::default(),
+            0,
+        );
+        for rp in ["autogen", "week"] {
+            ingestion
+                .ingest(
+                    "db",
+                    Some(rp),
+                    None,
+                    b"cpu,host=a v=1 1000000000",
+                    WritePayloadFormat::LineProtocol,
+                )
+                .await
+                .unwrap();
+        }
+        FlushServiceImpl::new(wal.clone(), 0, sink.clone())
+            .flush()
+            .await
+            .unwrap();
+
+        let mut cluster_cfg = crate::config::HyperbytedbConfig::load(None)
+            .unwrap()
+            .cluster;
+        cluster_cfg.enabled = true;
+        cluster_cfg.node_id = 1;
+        cluster_cfg.cluster_addr = "127.0.0.1:18087".into();
+        cluster_cfg.replication_log_dir = dir.path().join("repl").to_string_lossy().into();
+        cluster_cfg.raft_dir = dir.path().join("raft").to_string_lossy().into();
+        cluster_cfg.raft_heartbeat_interval_ms = Some(200);
+        cluster_cfg.raft_election_timeout_ms = Some(500);
+        let bootstrap =
+            ClusterBootstrap::init(&cluster_cfg, 1000, Default::default(), Default::default())
+                .unwrap();
+        let raft = bootstrap
+            .start_raft(
+                &cluster_cfg,
+                metadata.clone(),
+                mv_service,
+                sink.clone(),
+                wal.clone(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        for _ in 0..50 {
+            if raft.metrics().borrow().current_leader == Some(1) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        let base: Arc<dyn QueryService> = Arc::new(QueryServiceImpl::new(
+            query_port,
+            metadata.clone(),
+            wal,
+            30,
+            sink,
+        ));
+        let peer = PeerQueryService::new(
+            base.clone(),
+            metadata.clone(),
+            Arc::new(NoReplication),
+            &crate::adapters::cluster::cluster_auth::ClusterAuth::new(None).unwrap(),
+        );
+        peer.set_raft(raft);
+
+        let resp = peer
+            .execute_query(
+                "db",
+                "DELETE FROM cpu WHERE host='a'",
+                None,
+                Some("week"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            resp.results[0].error.is_none(),
+            "{:?}",
+            resp.results[0].error
+        );
+
+        let rows = |rp: &'static str| {
+            let base = base.clone();
+            async move {
+                let q = format!(r#"SELECT v FROM "{rp}"."cpu""#);
+                let resp = base
+                    .execute_query("db", &q, None, None, None)
+                    .await
+                    .unwrap();
+                resp.results[0]
+                    .series
+                    .as_ref()
+                    .map_or(0, |s| s.iter().map(|s| s.values.len()).sum::<usize>())
+            }
+        };
+        assert_eq!(rows("week").await, 0, "the DELETE named ?rp=week");
+        assert_eq!(rows("autogen").await, 1, "autogen must be untouched");
+    }
+
     #[test]
     fn resolve_leader_addr_prefers_forward_node() {
         let forward = ForwardToLeader {

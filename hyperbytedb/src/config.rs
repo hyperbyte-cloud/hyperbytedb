@@ -102,9 +102,9 @@ pub struct ShardingConfig {
     /// (replica-set healing). Disable to manage replica sets manually.
     #[serde(default = "default_peer_heal_enabled")]
     pub peer_heal_enabled: bool,
-    /// Propose `ClearVerified` shard-map ops once split-transfer movement
-    /// verifies. Disable on mixed-version clusters: nodes running builds
-    /// older than the `ClearVerified` op cannot decode it from the Raft log.
+    /// No effect: it gated `ClearVerified` proposals from the split-transfer
+    /// reconciliation, which has been removed. Still accepted so existing
+    /// config files load.
     #[serde(default = "default_transfer_clear_proposals_enabled")]
     pub transfer_clear_proposals_enabled: bool,
     /// Propose `AddPeer` shard-map ops to place a joiner as a region replica.

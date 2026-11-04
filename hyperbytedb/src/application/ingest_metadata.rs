@@ -1160,6 +1160,9 @@ mod tests {
             point("m", &[("f", FieldValue::Integer(1))], 1),
             point("m", &[("f", FieldValue::Float(2.0))], 2),
             point("m", &[("f", FieldValue::String("x".into()))], 3),
+            // Unsigned widens from integer but not from float: dropped only
+            // if the widening to float above was kept.
+            point("m", &[("f", FieldValue::UInteger(4))], 4),
         ];
         let (kept, partial) = split_field_type_conflicts(&meta, "db", "autogen", points)
             .await
@@ -1170,7 +1173,7 @@ mod tests {
         );
         assert!(matches!(
             partial,
-            Some(HyperbytedbError::PartialWrite { dropped: 1, .. })
+            Some(HyperbytedbError::PartialWrite { dropped: 2, .. })
         ));
     }
 
