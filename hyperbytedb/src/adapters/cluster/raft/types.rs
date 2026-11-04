@@ -29,13 +29,6 @@ impl ClusterResponse {
         }
     }
 
-    pub fn with_message(msg: impl Into<String>) -> Self {
-        Self {
-            ok: true,
-            message: Some(msg.into()),
-        }
-    }
-
     pub fn error(msg: impl Into<String>) -> Self {
         Self {
             ok: false,

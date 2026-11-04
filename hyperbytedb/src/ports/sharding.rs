@@ -93,5 +93,3 @@ impl ShardMapPort for DisabledShardMap {
         Ok(true)
     }
 }
-
-pub type SharedShardMapPort = Arc<dyn ShardMapPort>;

@@ -1,4 +1,3 @@
-pub mod arrow_ingest;
 pub mod backup;
 pub mod cluster;
 pub mod columnar_msgpack;

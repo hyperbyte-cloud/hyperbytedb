@@ -51,12 +51,6 @@ pub fn merge_field_type_map(
     out
 }
 
-/// Widen a single incoming discriminant into `stored`, returning the new value.
-#[must_use]
-pub fn merge_field_disc(stored: u8, incoming: u8) -> u8 {
-    widen_field_disc(stored, incoming).unwrap_or(stored)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

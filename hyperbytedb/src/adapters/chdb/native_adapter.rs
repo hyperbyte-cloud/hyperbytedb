@@ -302,12 +302,6 @@ impl ChdbNativeAdapter {
         }
     }
 
-    /// Override the insert path (Arrow vs SQL `VALUES`). Defaults to Arrow.
-    pub fn with_arrow_inserts(mut self, enabled: bool) -> Self {
-        self.use_arrow = enabled;
-        self
-    }
-
     /// Re-warm schema caches from metadata (e.g. after peer metadata sync).
     pub async fn refresh_schemas_from_metadata(&self) -> Result<usize, HyperbytedbError> {
         let warmed = self.warm_schemas_from_metadata().await?;
