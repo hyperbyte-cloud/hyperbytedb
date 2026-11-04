@@ -15,7 +15,6 @@ use crate::domain::series::SeriesKey;
 use crate::domain::sharding::{ShardMetadataKind, ShardMetadataRequest, ShardRegion};
 use crate::error::HyperbytedbError;
 use crate::ports::metadata::{MeasurementMeta, MetadataPort};
-use crate::ports::sharding::ShardMapPort;
 
 async fn fetch_remote_metadata(
     ctx: &ShardRoutingContext,

@@ -9,7 +9,6 @@ use reqwest::StatusCode;
 use tokio::sync::watch;
 
 use crate::adapters::cluster::peer_client::PeerClient;
-use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
 use crate::application::runtime::RegionWriteStats;
 use crate::domain::chdb_naming::unquoted_table_name;
 use crate::domain::cluster::membership::SharedMembership;
@@ -39,7 +38,7 @@ pub async fn run_region_heartbeat_reporter(
     node_id: u64,
     peer_client: Arc<PeerClient>,
     membership: SharedMembership,
-    shard_map: Arc<RocksDbShardMap>,
+    shard_map: Arc<dyn ShardMapPort>,
     leadership: Arc<dyn LeadershipPort>,
     metadata: Arc<dyn MetadataPort>,
     query_port: Arc<dyn QueryPort>,
@@ -60,7 +59,7 @@ pub async fn run_region_heartbeat_reporter(
                     node_id,
                     &peer_client,
                     &membership,
-                    &shard_map,
+                    shard_map.as_ref(),
                     leadership.as_ref(),
                     metadata.as_ref(),
                     query_port.as_ref(),
@@ -86,7 +85,7 @@ async fn report_once(
     node_id: u64,
     peer_client: &PeerClient,
     membership: &SharedMembership,
-    shard_map: &RocksDbShardMap,
+    shard_map: &dyn ShardMapPort,
     leadership: &dyn LeadershipPort,
     metadata: &dyn MetadataPort,
     query_port: &dyn QueryPort,

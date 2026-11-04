@@ -26,7 +26,6 @@ use crate::error::HyperbytedbError;
 use crate::ports::ingestion::{IngestionPort, WritePayloadFormat};
 use crate::ports::points_sink::PointsSinkPort;
 use crate::ports::replication::{OutboundReplicationBatch, ReplicationPort};
-use crate::ports::sharding::ShardMapPort;
 use crate::ports::wal::WalPort;
 
 /// Ingestion service for clustered (master-master) mode. Writes are always

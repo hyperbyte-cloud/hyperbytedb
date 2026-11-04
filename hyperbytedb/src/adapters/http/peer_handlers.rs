@@ -22,7 +22,6 @@ use crate::domain::cluster::sync::{
 };
 use crate::domain::cluster::types::{MutationReplicateRequest, MutationRequest};
 use crate::ports::metadata::MetadataPort;
-use crate::ports::sharding::ShardMapPort as _;
 
 use super::router::AppState;
 

@@ -28,7 +28,6 @@ use crate::domain::sharding::{
 };
 use crate::error::HyperbytedbError;
 use crate::ports::replication::OutboundReplicationBatch;
-use crate::ports::sharding::ShardMapPort;
 
 use super::router::AppState;
 
