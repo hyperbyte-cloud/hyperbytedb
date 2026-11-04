@@ -2637,19 +2637,7 @@ fn build_series_insert_sql(ensured: &EnsuredTable, new_series: &[(u64, &Point)])
 /// Quote a string for ClickHouse: wrap in single quotes; escape `\` and `'`.
 fn append_quoted_string(out: &mut String, s: &str) {
     out.push('\'');
-    for ch in s.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '\'' => out.push_str("\\'"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                let _ = write!(out, "\\x{:02x}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
+    crate::domain::chdb_naming::push_string_literal_body(out, s);
     out.push('\'');
 }
 

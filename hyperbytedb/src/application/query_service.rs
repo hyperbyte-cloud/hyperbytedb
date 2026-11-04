@@ -2002,10 +2002,6 @@ fn series_results_to_json_each_row(series: &[SeriesResult]) -> Result<String, Hy
     Ok(lines.join("\n"))
 }
 
-fn escape_clickhouse_string_literal(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\'', "\\'")
-}
-
 fn inject_tombstone_predicates(sql: String, tombstones: &[(String, String)]) -> String {
     if tombstones.is_empty() {
         return sql;
@@ -2275,7 +2271,8 @@ async fn execute_select_from_source(
                 }
                 stamp_aggregate_time(sub_stmt, &mut inner, Some("ns"), time_min);
                 let inner_json = series_results_to_json_each_row(&inner)?;
-                let escaped = escape_clickhouse_string_literal(&inner_json);
+                let mut escaped = String::with_capacity(inner_json.len());
+                crate::domain::chdb_naming::push_string_literal_body(&mut escaped, &inner_json);
                 let sub_source_sql = format!(
                     "(SELECT * EXCEPT (`__time`), fromUnixTimestamp64Nano(toInt64(`__time`)) AS `time` FROM format(JSONEachRow, '{escaped}'))"
                 );
