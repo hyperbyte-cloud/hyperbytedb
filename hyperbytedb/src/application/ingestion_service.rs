@@ -7,8 +7,6 @@ use crate::application::ingest_metadata::prepare_columnar_metadata;
 use crate::application::ingest_metadata::{
     IngestCardinalityLimits, IngestSchemaCache, prepare_batch_metadata, validate_point_count,
 };
-use crate::application::line_protocol::parse_line_body_to_points_limited;
-use crate::application::msgpack_ingest::parse_msgpack_body_to_points_limited;
 use crate::application::physical_names::PhysicalNameGuard;
 use crate::application::wal_append::{
     ColumnarWalAppend, append_columnar_with_prepared, append_points_with_prepared,
@@ -185,25 +183,14 @@ impl IngestionPort for IngestionServiceImpl {
             return Ok(());
         }
 
-        let points = match format {
-            WritePayloadFormat::LineProtocol => {
-                parse_line_body_to_points_limited(body, precision, self.max_points_per_request)?
-            }
-            WritePayloadFormat::Msgpack => {
-                parse_msgpack_body_to_points_limited(body, precision, self.max_points_per_request)?
-            }
-            #[cfg(feature = "columnar-ingest")]
-            WritePayloadFormat::ColumnarMsgpack => {
-                return Err(HyperbytedbError::Internal(
-                    "columnar ingest fell through fast path".into(),
-                ));
-            }
-        };
+        let points = crate::application::ingest_metadata::parse_write_body(
+            body,
+            precision,
+            format,
+            self.max_points_per_request,
+        )?;
         if points.is_empty() {
             return Ok(());
-        }
-        if !matches!(format, WritePayloadFormat::LineProtocol) {
-            validate_point_count(points.len(), self.max_points_per_request)?;
         }
 
         // Points whose fields conflict with a stored type are dropped and the

@@ -11,10 +11,7 @@ use crate::application::ingest_metadata::{
     IngestCardinalityLimits, IngestSchemaCache, prepare_batch_metadata, split_field_type_conflicts,
     validate_point_count,
 };
-use crate::application::line_protocol::{
-    encode_points_to_line_protocol, parse_line_body_to_points_limited,
-};
-use crate::application::msgpack_ingest::parse_msgpack_body_to_points_limited;
+use crate::application::line_protocol::encode_points_to_line_protocol;
 use crate::application::replication_dispatch::dispatch_outbound_replication;
 use crate::application::shard_routing::{
     ShardRoutingContext, ensure_measurement_bootstrapped, forward_shard_writes_by_node,
@@ -960,25 +957,14 @@ impl IngestionPort for PeerIngestionService {
             return result;
         }
 
-        let points = match format {
-            WritePayloadFormat::LineProtocol => {
-                parse_line_body_to_points_limited(body, precision, self.max_points_per_request)?
-            }
-            WritePayloadFormat::Msgpack => {
-                parse_msgpack_body_to_points_limited(body, precision, self.max_points_per_request)?
-            }
-            #[cfg(feature = "columnar-ingest")]
-            WritePayloadFormat::ColumnarMsgpack => {
-                return Err(HyperbytedbError::Internal(
-                    "columnar ingest fell through fast path".into(),
-                ));
-            }
-        };
+        let points = crate::application::ingest_metadata::parse_write_body(
+            body,
+            precision,
+            format,
+            self.max_points_per_request,
+        )?;
         if points.is_empty() {
             return Ok(());
-        }
-        if !matches!(format, WritePayloadFormat::LineProtocol) {
-            validate_point_count(points.len(), self.max_points_per_request)?;
         }
 
         // Points whose fields conflict with a stored type are dropped and the
