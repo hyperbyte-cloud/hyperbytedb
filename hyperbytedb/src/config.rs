@@ -1606,3 +1606,21 @@ mod admission_tests {
         assert_eq!(resolve_max_inflight_writes(0, 0), INFLIGHT_WRITES_PER_CPU);
     }
 }
+
+#[cfg(test)]
+mod legacy_config_tests {
+    /// The split-transfer reconciliation that read this key is gone, but
+    /// existing config files still set it and must keep loading.
+    #[test]
+    fn old_config_with_transfer_clear_proposals_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[sharding]\ntransfer_clear_proposals_enabled = false\n",
+        )
+        .unwrap();
+        let cfg = super::HyperbytedbConfig::load(Some(path.to_str().unwrap())).unwrap();
+        assert!(!cfg.sharding.transfer_clear_proposals_enabled);
+    }
+}

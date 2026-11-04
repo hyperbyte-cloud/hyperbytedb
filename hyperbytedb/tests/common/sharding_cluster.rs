@@ -276,7 +276,6 @@ pub async fn start_sharded_node(
                 metadata.clone(),
                 wal.clone(),
                 Some(chdb_adapter.clone() as Arc<dyn QueryPort>),
-                Some(sink.clone()),
                 node_id,
                 opts.sharding.clone(),
                 0,
