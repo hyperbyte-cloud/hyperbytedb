@@ -974,8 +974,11 @@ impl IngestionPort for PeerIngestionService {
             return partial.map_or(Ok(()), Err);
         }
 
+        // Built once: the name guard and the metadata registration both
+        // need each measurement's names.
+        let schema = crate::application::ingest_metadata::BatchSchema::from_points(&points)?;
         self.name_guard
-            .check_points(&self.metadata, db, &retention_policy, &points)
+            .check_schema(&self.metadata, db, &retention_policy, &schema)
             .await?;
 
         let precision_val = Precision::from_str_opt(precision);
@@ -1004,11 +1007,12 @@ impl IngestionPort for PeerIngestionService {
             return with_dropped(result, partial);
         }
 
-        prepare_batch_metadata(
+        crate::application::ingest_metadata::prepare_batch_metadata_with_schema(
             &self.metadata,
             db,
             &retention_policy,
             &points,
+            &schema,
             &self.limits,
             Some(&self.schema_cache),
         )

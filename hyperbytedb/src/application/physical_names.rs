@@ -16,12 +16,13 @@
 //! flushed. Replication and shard transfers do not check: they carry data
 //! an entry node already accepted.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
 
+use crate::application::ingest_metadata::BatchSchema;
 use crate::domain::chdb_naming::{
     field_column_name, tag_column_name, unquoted_series_table_name, unquoted_table_name,
 };
@@ -62,12 +63,34 @@ impl PhysicalNameGuard {
         Self::default()
     }
 
-    /// Refuse `points` if any of their names maps onto storage that another
+    /// Refuse the batch if any of its names maps onto storage that another
     /// name already owns.
     ///
     /// # Errors
     /// [`HyperbytedbError::NameCollision`] for a colliding name, or a
     /// metadata error.
+    pub async fn check_schema(
+        &self,
+        metadata: &Arc<dyn MetadataPort>,
+        db: &str,
+        rp: &str,
+        schema: &BatchSchema,
+    ) -> Result<(), HyperbytedbError> {
+        for (measurement, (fields, tags)) in &schema.measurements {
+            let names = BatchNames {
+                fields: fields.keys().map(String::as_str).collect(),
+                tags: tags.iter().map(String::as_str).collect(),
+            };
+            self.check_measurement(metadata, db, rp, measurement, &names)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// [`Self::check_schema`] for points whose schema is not built yet.
+    ///
+    /// # Errors
+    /// As [`Self::check_schema`], plus an in-batch `FieldTypeConflict`.
     pub async fn check_points(
         &self,
         metadata: &Arc<dyn MetadataPort>,
@@ -75,33 +98,8 @@ impl PhysicalNameGuard {
         rp: &str,
         points: &[Point],
     ) -> Result<(), HyperbytedbError> {
-        let mut by_meas: BTreeMap<&str, BatchNames<'_>> = BTreeMap::new();
-        let mut last: Option<&str> = None;
-        for p in points {
-            // Batches are mostly runs of one measurement.
-            if last != Some(p.measurement.as_str()) {
-                by_meas.entry(p.measurement.as_str()).or_default();
-                last = Some(p.measurement.as_str());
-            }
-            let Some(names) = by_meas.get_mut(p.measurement.as_str()) else {
-                continue;
-            };
-            for k in p.fields.keys() {
-                if !names.fields.contains(k.as_str()) {
-                    names.fields.insert(k);
-                }
-            }
-            for k in p.tags.keys() {
-                if !names.tags.contains(k.as_str()) {
-                    names.tags.insert(k);
-                }
-            }
-        }
-        for (measurement, names) in &by_meas {
-            self.check_measurement(metadata, db, rp, measurement, names)
-                .await?;
-        }
-        Ok(())
+        let schema = BatchSchema::from_points(points)?;
+        self.check_schema(metadata, db, rp, &schema).await
     }
 
     /// [`Self::check_points`] for a columnar batch: one measurement, one
@@ -156,7 +154,11 @@ impl PhysicalNameGuard {
         {
             self.checked.write().clear();
         }
-        if hashes.iter().all(|h| self.checked.read().contains(h)) {
+        let all_checked = {
+            let checked = self.checked.read();
+            hashes.iter().all(|h| checked.contains(h))
+        };
+        if all_checked {
             return Ok(());
         }
 
@@ -287,6 +289,7 @@ mod tests {
     use crate::domain::database::RetentionPolicy;
     use crate::domain::measurement::MeasurementMeta;
     use crate::domain::point::FieldValue;
+    use std::collections::BTreeMap;
 
     fn point(meas: &str, field: &str, tag: &str) -> Point {
         Point {

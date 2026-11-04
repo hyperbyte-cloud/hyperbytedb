@@ -761,11 +761,96 @@ pub async fn split_field_type_conflicts(
     Ok((kept, partial))
 }
 
+/// The names and field types one batch writes, per measurement: field
+/// types (widened across the batch) and tag keys. Built once per request
+/// and shared by the name guard and [`prepare_batch_metadata_with_schema`].
+#[derive(Debug, Default)]
+pub struct BatchSchema {
+    pub measurements: HashMap<String, (HashMap<String, u8>, BTreeSet<String>)>,
+}
+
+impl BatchSchema {
+    /// # Errors
+    /// `FieldTypeConflict` for a field given two types the batch cannot
+    /// hold together.
+    pub fn from_points(points: &[Point]) -> Result<Self, HyperbytedbError> {
+        let mut measurements: HashMap<String, (HashMap<String, u8>, BTreeSet<String>)> =
+            HashMap::new();
+        for point in points {
+            // Clone a name only the first time it is seen: this loop runs per
+            // point, and cloning the measurement and every tag key on every
+            // point was most of prepare_batch_metadata's own time.
+            if !measurements.contains_key(&point.measurement) {
+                measurements.insert(point.measurement.clone(), (HashMap::new(), BTreeSet::new()));
+            }
+            let Some(entry) = measurements.get_mut(&point.measurement) else {
+                continue;
+            };
+            for (k, v) in &point.fields {
+                let disc = v.type_discriminant();
+                match entry.0.get_mut(k) {
+                    Some(existing) => {
+                        // Two types the batch cannot hold together: refused, as a
+                        // conflict with the stored type is. Keeping the first
+                        // type stored the other values as null.
+                        let Some(w) = crate::domain::field_type::widen_field_disc(*existing, disc)
+                        else {
+                            return Err(HyperbytedbError::FieldTypeConflict {
+                                field: k.clone(),
+                                measurement: point.measurement.clone(),
+                                got: FieldValue::type_name_from_discriminant(disc).to_string(),
+                                expected: FieldValue::type_name_from_discriminant(*existing)
+                                    .to_string(),
+                            });
+                        };
+                        *existing = w;
+                    }
+                    None => {
+                        entry.0.insert(k.clone(), disc);
+                    }
+                }
+            }
+            for k in point.tags.keys() {
+                if !entry.1.contains(k) {
+                    entry.1.insert(k.clone());
+                }
+            }
+        }
+        Ok(Self { measurements })
+    }
+}
+
 pub async fn prepare_batch_metadata(
     metadata: &Arc<dyn MetadataPort>,
     db: &str,
     rp: &str,
     points: &[Point],
+    limits: &IngestCardinalityLimits,
+    schema_cache: Option<&IngestSchemaCache>,
+) -> Result<(), HyperbytedbError> {
+    prepare_batch_metadata_inner(metadata, db, rp, points, None, limits, schema_cache).await
+}
+
+/// [`prepare_batch_metadata`] with the batch's schema already built (the
+/// client write paths build it once for the name guard too).
+pub async fn prepare_batch_metadata_with_schema(
+    metadata: &Arc<dyn MetadataPort>,
+    db: &str,
+    rp: &str,
+    points: &[Point],
+    schema: &BatchSchema,
+    limits: &IngestCardinalityLimits,
+    schema_cache: Option<&IngestSchemaCache>,
+) -> Result<(), HyperbytedbError> {
+    prepare_batch_metadata_inner(metadata, db, rp, points, Some(schema), limits, schema_cache).await
+}
+
+async fn prepare_batch_metadata_inner(
+    metadata: &Arc<dyn MetadataPort>,
+    db: &str,
+    rp: &str,
+    points: &[Point],
+    schema: Option<&BatchSchema>,
     limits: &IngestCardinalityLimits,
     schema_cache: Option<&IngestSchemaCache>,
 ) -> Result<(), HyperbytedbError> {
@@ -794,48 +879,15 @@ pub async fn prepare_batch_metadata(
         None => register_series_from_points(metadata, db, rp, points).await?,
     }
 
-    let mut measurements: HashMap<String, (HashMap<String, u8>, BTreeSet<String>)> = HashMap::new();
-
-    for point in points {
-        // Clone a name only the first time it is seen: this loop runs per
-        // point, and cloning the measurement and every tag key on every
-        // point was most of prepare_batch_metadata's own time.
-        if !measurements.contains_key(&point.measurement) {
-            measurements.insert(point.measurement.clone(), (HashMap::new(), BTreeSet::new()));
+    let built;
+    let schema = match schema {
+        Some(schema) => schema,
+        None => {
+            built = BatchSchema::from_points(points)?;
+            &built
         }
-        let Some(entry) = measurements.get_mut(&point.measurement) else {
-            continue;
-        };
-        for (k, v) in &point.fields {
-            let disc = v.type_discriminant();
-            match entry.0.get_mut(k) {
-                Some(existing) => {
-                    // Two types the batch cannot hold together: refused, as a
-                    // conflict with the stored type is. Keeping the first
-                    // type stored the other values as null.
-                    let Some(w) = crate::domain::field_type::widen_field_disc(*existing, disc)
-                    else {
-                        return Err(HyperbytedbError::FieldTypeConflict {
-                            field: k.clone(),
-                            measurement: point.measurement.clone(),
-                            got: FieldValue::type_name_from_discriminant(disc).to_string(),
-                            expected: FieldValue::type_name_from_discriminant(*existing)
-                                .to_string(),
-                        });
-                    };
-                    *existing = w;
-                }
-                None => {
-                    entry.0.insert(k.clone(), disc);
-                }
-            }
-        }
-        for k in point.tags.keys() {
-            if !entry.1.contains(k) {
-                entry.1.insert(k.clone());
-            }
-        }
-    }
+    };
+    let measurements = &schema.measurements;
 
     if let Some(sc) = schema_cache {
         let all_schemas_known = measurements
@@ -920,7 +972,7 @@ pub async fn prepare_batch_metadata(
         }
     }
 
-    for (meas_name, (field_types, tag_keys)) in &measurements {
+    for (meas_name, (field_types, tag_keys)) in measurements {
         if limits.max_tag_values_per_measurement > 0 {
             for tag_key in tag_keys.iter() {
                 let count = metadata
@@ -964,7 +1016,7 @@ pub async fn prepare_batch_metadata(
     let mut all_metas: Vec<MeasurementMeta> = Vec::with_capacity(measurements.len());
     let mut all_tags: Vec<(String, Vec<(String, String)>)> = Vec::with_capacity(measurements.len());
 
-    for (meas_name, (field_types, _tag_keys)) in &measurements {
+    for (meas_name, (field_types, _tag_keys)) in measurements {
         let merged_fields = merged_field_types(metadata, db, rp, meas_name, field_types).await?;
         let merged =
             merged_tag_keys(metadata, db, rp, meas_name, &measurements[meas_name].1).await?;
@@ -994,7 +1046,7 @@ pub async fn prepare_batch_metadata(
         .await?;
 
     if let Some(sc) = schema_cache {
-        for (name, (fields, tags)) in &measurements {
+        for (name, (fields, tags)) in measurements {
             let merged_fields = merged_field_types(metadata, db, rp, name, fields).await?;
             let merged = merged_tag_keys(metadata, db, rp, name, tags).await?;
             sc.mark_schema(db, rp, name, &merged_fields, &merged);
@@ -1064,6 +1116,35 @@ mod tests {
         assert!(matches!(
             parse_write_body(b"", None, WritePayloadFormat::ColumnarMsgpack, 1),
             Err(HyperbytedbError::Internal(_))
+        ));
+    }
+
+    #[test]
+    fn batch_schema_matches_prepare_batch_metadata() {
+        let mut p = point("m", &[("f", FieldValue::Integer(1))], 1);
+        p.tags.insert("dc".into(), "x".into());
+        let points = vec![
+            p,
+            point("m", &[("f", FieldValue::Float(2.0))], 2),
+            point("n", &[("g", FieldValue::Boolean(true))], 3),
+        ];
+        let schema = BatchSchema::from_points(&points).unwrap();
+        let (m_fields, m_tags) = &schema.measurements["m"];
+        assert_eq!(m_fields["f"], FieldValue::Float(0.0).type_discriminant());
+        assert_eq!(
+            m_tags.iter().cloned().collect::<Vec<_>>(),
+            vec!["dc".to_string(), "host".to_string()]
+        );
+        let (n_fields, _) = &schema.measurements["n"];
+        assert_eq!(n_fields["g"], FieldValue::Boolean(true).type_discriminant());
+        // Two types the batch cannot hold together are refused, as before.
+        let clash = vec![
+            point("m", &[("f", FieldValue::Float(1.0))], 1),
+            point("m", &[("f", FieldValue::String("x".into()))], 2),
+        ];
+        assert!(matches!(
+            BatchSchema::from_points(&clash),
+            Err(HyperbytedbError::FieldTypeConflict { .. })
         ));
     }
 
