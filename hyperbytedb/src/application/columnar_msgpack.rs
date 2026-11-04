@@ -2,7 +2,6 @@
 //!
 //! See [docs/benchmarks.md § Columnar MessagePack](../../../../docs/benchmarks.md#columnar-messagepack-write-format-v1).
 
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
@@ -16,16 +15,7 @@ use crate::error::HyperbytedbError;
 /// `Content-Type` for columnar msgpack v1 writes.
 pub const CONTENT_TYPE: &str = "application/vnd.hyperbytedb.columnar-msgpack.v1";
 
-/// Wire map for columnar msgpack v1 (MessagePack map, not a row array).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ColumnarMsgpackBatch {
-    pub measurement: String,
-    #[serde(default)]
-    pub tags: BTreeMap<String, String>,
-    pub field: String,
-    pub values: Vec<f64>,
-    pub timestamps: Option<Vec<i64>>,
-}
+pub use crate::domain::columnar_batch::ColumnarMsgpackBatch;
 
 /// Decode the wire format from raw bytes.
 pub fn decode_columnar_batch(body: &[u8]) -> Result<ColumnarMsgpackBatch, HyperbytedbError> {

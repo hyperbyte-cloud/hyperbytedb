@@ -1282,7 +1282,7 @@ impl ChdbNativeAdapter {
         db: &str,
         rp: &str,
         origin_node_id: u64,
-        wire: &crate::application::columnar_msgpack::ColumnarMsgpackBatch,
+        wire: &crate::domain::columnar_batch::ColumnarMsgpackBatch,
         precision: Option<&str>,
     ) -> Result<crate::domain::prepared_wal::PreparedWalSlot, HyperbytedbError> {
         use crate::application::columnar_msgpack::columnar_timestamps_ns;
@@ -1522,7 +1522,7 @@ impl PointsSinkPort for ChdbNativeAdapter {
         db: &str,
         rp: &str,
         origin_node_id: u64,
-        wire: &crate::application::columnar_msgpack::ColumnarMsgpackBatch,
+        wire: &crate::domain::columnar_batch::ColumnarMsgpackBatch,
         precision: Option<&str>,
     ) -> Result<crate::domain::prepared_wal::PreparedWalSlot, HyperbytedbError> {
         self.build_prepared_wal_slot_from_columnar(db, rp, origin_node_id, wire, precision)
@@ -2337,7 +2337,7 @@ fn build_field_column<P: Borrow<Point>>(points: &[P], logical: &str, disc: u8) -
 /// (nullable). Returns the batch plus the observed `(min_time, max_time)`.
 #[cfg(feature = "columnar-ingest")]
 fn columnar_representative_point(
-    wire: &crate::application::columnar_msgpack::ColumnarMsgpackBatch,
+    wire: &crate::domain::columnar_batch::ColumnarMsgpackBatch,
     precision: Option<&str>,
 ) -> Result<Point, HyperbytedbError> {
     use crate::application::columnar_msgpack::columnar_timestamps_ns;

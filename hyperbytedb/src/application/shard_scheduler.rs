@@ -3174,8 +3174,8 @@ mod tests {
         use crate::adapters::metadata::rocksdb_meta::RocksDbMetadata;
         use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
         use crate::adapters::wal::rocksdb_wal::RocksDbWal;
-        use crate::application::cluster::bootstrap::ClusterBootstrap;
         use crate::application::materialized_view_service::MaterializedViewService;
+        use crate::composition::bootstrap::ClusterBootstrap;
         use crate::domain::sharding::{MeasurementKey, ShardLocationCache, ShardMapOp};
         use crate::ports::points_sink::PointsSinkPort;
 
@@ -3332,8 +3332,8 @@ mod tests {
         use crate::adapters::metadata::rocksdb_meta::RocksDbMetadata;
         use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
         use crate::adapters::wal::rocksdb_wal::RocksDbWal;
-        use crate::application::cluster::bootstrap::ClusterBootstrap;
         use crate::application::materialized_view_service::MaterializedViewService;
+        use crate::composition::bootstrap::ClusterBootstrap;
         use crate::domain::sharding::{MeasurementKey, ShardLocationCache, ShardMapOp};
         use crate::ports::points_sink::PointsSinkPort;
 
@@ -3471,8 +3471,8 @@ mod tests {
         use crate::adapters::metadata::rocksdb_meta::RocksDbMetadata;
         use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
         use crate::adapters::wal::rocksdb_wal::RocksDbWal;
-        use crate::application::cluster::bootstrap::ClusterBootstrap;
         use crate::application::materialized_view_service::MaterializedViewService;
+        use crate::composition::bootstrap::ClusterBootstrap;
         use crate::domain::sharding::{MeasurementKey, ShardLocationCache, ShardMapOp};
         use crate::ports::points_sink::PointsSinkPort;
 
@@ -3897,8 +3897,8 @@ mod tests {
             use crate::adapters::cluster::replication_log::ReplicationLog;
             use crate::adapters::metadata::rocksdb_meta::RocksDbMetadata;
             use crate::adapters::wal::rocksdb_wal::RocksDbWal;
-            use crate::application::cluster::bootstrap::ClusterBootstrap;
             use crate::application::materialized_view_service::MaterializedViewService;
+            use crate::composition::bootstrap::ClusterBootstrap;
             use crate::ports::points_sink::PointsSinkPort;
 
             let dir = tempfile::tempdir().unwrap();
@@ -4440,8 +4440,8 @@ mod tests {
             use crate::adapters::chdb::session::SharedSession;
             use crate::adapters::metadata::rocksdb_meta::RocksDbMetadata;
             use crate::adapters::wal::rocksdb_wal::RocksDbWal;
-            use crate::application::cluster::bootstrap::ClusterBootstrap;
             use crate::application::materialized_view_service::MaterializedViewService;
+            use crate::composition::bootstrap::ClusterBootstrap;
             use crate::ports::points_sink::PointsSinkPort;
 
             let dir = tempfile::tempdir().unwrap();
