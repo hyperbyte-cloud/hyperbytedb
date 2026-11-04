@@ -114,40 +114,18 @@ impl NetworkConnection {
         if ttl.is_zero() { default } else { ttl }
     }
 
-    async fn post_json<Req: serde::Serialize, Resp: serde::de::DeserializeOwned>(
+    /// POST `req` as JSON and decode the JSON reply. Every RPC shares it;
+    /// `E` is the RPC's own Raft error type.
+    async fn post_json<Req, Resp, E>(
         &self,
         path: &str,
         req: &Req,
         option: &RPCOption,
-    ) -> Result<Resp, RPCError<u64, BasicNode, RaftError<u64>>> {
-        let timeout = Self::effective_timeout(option, self.default_timeout);
-        let resp = self
-            .send(path, req, timeout)
-            .await
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-
-        let status = resp.status();
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-
-        if !status.is_success() {
-            let msg = String::from_utf8_lossy(&body).to_string();
-            return Err(RPCError::Network(NetworkError::new(
-                &std::io::Error::other(format!("HTTP {}: {}", status, msg)),
-            )));
-        }
-
-        serde_json::from_slice(&body).map_err(|e| RPCError::Network(NetworkError::new(&e)))
-    }
-
-    async fn post_json_snapshot<Req: serde::Serialize, Resp: serde::de::DeserializeOwned>(
-        &self,
-        path: &str,
-        req: &Req,
-        option: &RPCOption,
-    ) -> Result<Resp, RPCError<u64, BasicNode, RaftError<u64, openraft::error::InstallSnapshotError>>>
+    ) -> Result<Resp, RPCError<u64, BasicNode, E>>
+    where
+        Req: serde::Serialize,
+        Resp: serde::de::DeserializeOwned,
+        E: std::error::Error,
     {
         let timeout = Self::effective_timeout(option, self.default_timeout);
         let resp = self
@@ -189,7 +167,7 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
         InstallSnapshotResponse<u64>,
         RPCError<u64, BasicNode, RaftError<u64, openraft::error::InstallSnapshotError>>,
     > {
-        self.post_json_snapshot("/internal/raft/snapshot", &rpc, &option)
+        self.post_json("/internal/raft/snapshot", &rpc, &option)
             .await
     }
 
