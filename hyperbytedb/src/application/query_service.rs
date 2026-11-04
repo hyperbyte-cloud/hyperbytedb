@@ -1699,10 +1699,9 @@ async fn execute_statement(
             password,
             admin,
         } => {
-            let password_hash = crate::adapters::http::auth_middleware::hash_password(password)
-                .map_err(|e| {
-                    HyperbytedbError::Internal(crate::error::ChainedError::from_error(e))
-                })?;
+            let password_hash = crate::domain::user::hash_password(password).map_err(|e| {
+                HyperbytedbError::Internal(crate::error::ChainedError::from_error(e))
+            })?;
             crate::application::schema_mutation_apply::create_user(
                 svc.metadata.as_ref(),
                 username,
@@ -1725,10 +1724,9 @@ async fn execute_statement(
             })
         }
         Statement::SetPassword { username, password } => {
-            let password_hash = crate::adapters::http::auth_middleware::hash_password(password)
-                .map_err(|e| {
-                    HyperbytedbError::Internal(crate::error::ChainedError::from_error(e))
-                })?;
+            let password_hash = crate::domain::user::hash_password(password).map_err(|e| {
+                HyperbytedbError::Internal(crate::error::ChainedError::from_error(e))
+            })?;
             crate::application::schema_mutation_apply::set_password(
                 svc.metadata.as_ref(),
                 username,

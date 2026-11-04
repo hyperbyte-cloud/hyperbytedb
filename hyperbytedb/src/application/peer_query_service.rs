@@ -1195,7 +1195,7 @@ impl QueryService for PeerQueryService {
 }
 
 fn hash_password_for_replication(password: &str) -> Result<String, HyperbytedbError> {
-    crate::adapters::http::auth_middleware::hash_password(password)
+    crate::domain::user::hash_password(password)
         .map_err(|e| HyperbytedbError::Internal(crate::error::ChainedError::from_error(e)))
 }
 
