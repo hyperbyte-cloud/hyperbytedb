@@ -5,7 +5,6 @@ use std::time::Duration;
 
 use crate::adapters::cluster::peer_client::PeerClient;
 use crate::adapters::cluster::raft::HyperbytedbRaft;
-use crate::adapters::cluster::replication_log::ReplicationLog;
 use crate::application::shard_routing::ShardRoutingContext;
 use crate::application::shard_transfer::run_region_transfer;
 use crate::domain::cluster::membership::{NodeState, SharedMembership};
@@ -15,6 +14,7 @@ use crate::ports::flush::FlushPort;
 use crate::ports::metadata::MetadataPort;
 use crate::ports::points_sink::PointsSinkPort;
 use crate::ports::query::QueryPort;
+use crate::ports::replication_acks::ReplicationAcks;
 use crate::ports::wal::WalPort;
 
 /// Runs the two node-lifecycle procedures that hand off this node's primary
@@ -26,7 +26,7 @@ pub struct DrainService {
     node_id: u64,
     membership: SharedMembership,
     flush_service: Arc<dyn FlushPort>,
-    replication_log: Arc<ReplicationLog>,
+    replication_log: Arc<dyn ReplicationAcks>,
     wal: Arc<dyn WalPort>,
     shard_routing: Option<Arc<ShardRoutingContext>>,
     peer_client: Option<Arc<PeerClient>>,
@@ -50,7 +50,7 @@ impl DrainService {
         node_id: u64,
         membership: SharedMembership,
         flush_service: Arc<dyn FlushPort>,
-        replication_log: Arc<ReplicationLog>,
+        replication_log: Arc<dyn ReplicationAcks>,
         wal: Arc<dyn WalPort>,
     ) -> Self {
         Self {
@@ -432,8 +432,10 @@ mod tests {
         }
 
         let wal = RocksDbWal::open(dir.path().join("wal")).expect("open test wal");
-        let replication_log =
-            ReplicationLog::open(dir.path().join("repl")).expect("open test replication log");
+        let replication_log = crate::adapters::cluster::replication_log::ReplicationLog::open(
+            dir.path().join("repl"),
+        )
+        .expect("open test replication log");
 
         DrainService::new(
             1,

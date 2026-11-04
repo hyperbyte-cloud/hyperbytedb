@@ -436,6 +436,27 @@ impl ReplicationLog {
     }
 }
 
+impl crate::ports::replication_acks::ReplicationAcks for ReplicationLog {
+    fn get_wal_ack(&self, peer_id: u64) -> Result<u64, HyperbytedbError> {
+        ReplicationLog::get_wal_ack(self, peer_id)
+    }
+    fn min_max_wal_ack_for_peers(&self, peer_ids: &[u64]) -> Result<(u64, u64), HyperbytedbError> {
+        ReplicationLog::min_max_wal_ack_for_peers(self, peer_ids)
+    }
+    fn get_mutation_ack(&self, peer_id: u64) -> Result<u64, HyperbytedbError> {
+        ReplicationLog::get_mutation_ack(self, peer_id)
+    }
+    fn last_mutation_seq(&self) -> u64 {
+        ReplicationLog::last_mutation_seq(self)
+    }
+    fn min_mutation_ack(&self) -> Result<Option<u64>, HyperbytedbError> {
+        ReplicationLog::min_mutation_ack(self)
+    }
+    fn truncate_mutations_before(&self, seq: u64) -> Result<(), HyperbytedbError> {
+        ReplicationLog::truncate_mutations_before(self, seq)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
