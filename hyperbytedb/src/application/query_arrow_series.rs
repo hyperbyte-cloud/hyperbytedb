@@ -323,19 +323,21 @@ fn cell(col: &ArrayRef, row: usize, is_time: bool, epoch: Option<&str>) -> Value
 /// Decode a peer's `/internal/shard/query` response, an Arrow IPC stream,
 /// into series as its chunks arrive. An empty body is an empty result.
 pub async fn series_from_ipc_response(
-    mut resp: reqwest::Response,
+    mut stream: futures::stream::BoxStream<
+        'static,
+        Result<bytes::Bytes, crate::domain::cluster::peer_rpc::PeerRpcError>,
+    >,
     measurement: &str,
     epoch: Option<&str>,
     group_by_tags: &[String],
 ) -> Result<Vec<SeriesResult>, HyperbytedbError> {
+    use futures::StreamExt as _;
     let mut decoder = arrow::ipc::reader::StreamDecoder::new();
     let mut builder = SeriesBuilder::new(measurement, epoch, group_by_tags);
     let mut received = false;
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .map_err(|e| HyperbytedbError::PeerUnreachable(format!("shard query stream: {e}")))?
-    {
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk
+            .map_err(|e| HyperbytedbError::PeerUnreachable(format!("shard query stream: {e}")))?;
         received = true;
         let mut buf = arrow::buffer::Buffer::from_vec(chunk.to_vec());
         while !buf.is_empty() {
@@ -392,6 +394,69 @@ mod tests {
             batches += 1;
         }
         (b.finish(), batches)
+    }
+
+    /// A peer's Arrow IPC reply decodes the same however its bytes are
+    /// chunked on the wire: here whole, and split into 3-byte chunks.
+    #[tokio::test]
+    async fn shard_query_decodes_a_multi_chunk_stream() {
+        use arrow::array::{Float64Array, TimestampNanosecondArray};
+        use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+        use arrow::record_batch::RecordBatch;
+        let schema = std::sync::Arc::new(Schema::new(vec![
+            Field::new(
+                "__time",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("v", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                std::sync::Arc::new(
+                    TimestampNanosecondArray::from(vec![1_000_000_000i64, 2_000_000_000])
+                        .with_timezone("UTC"),
+                ),
+                std::sync::Arc::new(Float64Array::from(vec![1.5, 2.5])),
+            ],
+        )
+        .unwrap();
+        let mut ipc = Vec::new();
+        {
+            let mut w = arrow::ipc::writer::StreamWriter::try_new(&mut ipc, &schema).unwrap();
+            w.write(&batch).unwrap();
+            w.finish().unwrap();
+        }
+        let stream_of = |chunks: Vec<bytes::Bytes>| {
+            Box::pin(futures::stream::iter(
+                chunks
+                    .into_iter()
+                    .map(Ok::<_, crate::domain::cluster::peer_rpc::PeerRpcError>),
+            )) as futures::stream::BoxStream<'static, _>
+        };
+        let whole = series_from_ipc_response(
+            stream_of(vec![bytes::Bytes::from(ipc.clone())]),
+            "m",
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+        let split = series_from_ipc_response(
+            stream_of(ipc.chunks(3).map(bytes::Bytes::copy_from_slice).collect()),
+            "m",
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(whole.len(), 1);
+        assert_eq!(whole[0].values.len(), 2);
+        assert_eq!(
+            serde_json::to_string(&whole).unwrap(),
+            serde_json::to_string(&split).unwrap()
+        );
     }
 
     const VALUES: &str = "SELECT toDateTime64('2026-01-02 03:04:05.123456789', 9, 'UTC') + toIntervalSecond(number) AS __time, \

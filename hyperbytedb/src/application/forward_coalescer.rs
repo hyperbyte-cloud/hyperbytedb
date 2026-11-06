@@ -19,9 +19,8 @@ use std::time::{Duration, Instant};
 use metrics::{counter, histogram};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
-use crate::domain::sharding::{
-    ShardWriteBatch, ShardWriteBatchResponse, ShardWritePartResult, ShardWriteRequest,
-};
+use crate::domain::sharding::{ShardWriteBatch, ShardWritePartResult, ShardWriteRequest};
+use crate::ports::peer_rpc::{PeerRpc, SharedPeerRpc};
 
 /// What a destination said about one write's parts.
 #[derive(Debug, Clone)]
@@ -88,7 +87,7 @@ impl ForwardCoalescer {
     /// writes' parts for that node.
     pub async fn send(
         &self,
-        client: &reqwest::Client,
+        rpc: &SharedPeerRpc,
         addr: &str,
         timeout: Duration,
         parts: Vec<ShardWriteRequest>,
@@ -100,10 +99,10 @@ impl ForwardCoalescer {
             bytes,
             reply,
         };
-        if let Err(mpsc::error::SendError(job)) = self.lane(client, addr, timeout).send(job) {
+        if let Err(mpsc::error::SendError(job)) = self.lane(rpc, addr, timeout).send(job) {
             // The lane's loop has gone; start a new one.
             self.lanes.lock().remove(addr);
-            if self.lane(client, addr, timeout).send(job).is_err() {
+            if self.lane(rpc, addr, timeout).send(job).is_err() {
                 return NodeSendOutcome::Failed(format!("forward lane to {addr} closed"));
             }
         }
@@ -113,7 +112,7 @@ impl ForwardCoalescer {
 
     fn lane(
         &self,
-        client: &reqwest::Client,
+        rpc: &SharedPeerRpc,
         addr: &str,
         timeout: Duration,
     ) -> mpsc::UnboundedSender<Job> {
@@ -126,7 +125,7 @@ impl ForwardCoalescer {
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(lane_loop(
             rx,
-            client.clone(),
+            rpc.clone(),
             addr.to_string(),
             timeout,
             self.limits,
@@ -138,7 +137,7 @@ impl ForwardCoalescer {
 
 async fn lane_loop(
     mut rx: mpsc::UnboundedReceiver<Job>,
-    client: reqwest::Client,
+    rpc: SharedPeerRpc,
     addr: String,
     timeout: Duration,
     limits: Limits,
@@ -176,16 +175,16 @@ async fn lane_loop(
                 Err(_) => break,
             }
         }
-        let client = client.clone();
+        let rpc = rpc.clone();
         let addr = addr.clone();
         tokio::spawn(async move {
-            send_jobs(&client, &addr, timeout, jobs).await;
+            send_jobs(rpc.as_ref(), &addr, timeout, jobs).await;
             drop(permit);
         });
     }
 }
 
-async fn send_jobs(client: &reqwest::Client, addr: &str, timeout: Duration, jobs: Vec<Job>) {
+async fn send_jobs(rpc: &dyn PeerRpc, addr: &str, timeout: Duration, jobs: Vec<Job>) {
     let counts: Vec<usize> = jobs.iter().map(|j| j.parts.len()).collect();
     let mut replies = Vec::with_capacity(jobs.len());
     let mut parts = Vec::with_capacity(counts.iter().sum());
@@ -196,7 +195,7 @@ async fn send_jobs(client: &reqwest::Client, addr: &str, timeout: Duration, jobs
     histogram!("hyperbytedb_shard_forward_writes_per_request").record(replies.len() as f64);
     counter!("hyperbytedb_shard_forward_requests_total").increment(1);
 
-    let outcome = post_batch(client, addr, timeout, parts).await;
+    let outcome = post_batch(rpc, addr, timeout, parts).await;
     match outcome {
         NodeSendOutcome::Results(results) if results.len() == counts.iter().sum::<usize>() => {
             let mut results = results.into_iter();
@@ -225,13 +224,13 @@ async fn send_jobs(client: &reqwest::Client, addr: &str, timeout: Duration, jobs
 /// Send `parts` to the node at `addr` in a request of their own: the path
 /// when `sharding.forward_coalesce` is off.
 pub async fn send_direct(
-    client: &reqwest::Client,
+    rpc: &dyn PeerRpc,
     addr: &str,
     timeout: Duration,
     parts: Vec<ShardWriteRequest>,
 ) -> NodeSendOutcome {
     let n = parts.len();
-    match post_batch(client, addr, timeout, parts).await {
+    match post_batch(rpc, addr, timeout, parts).await {
         NodeSendOutcome::Results(results) if results.len() != n => {
             NodeSendOutcome::Failed(format!(
                 "forward batch to {addr}: {} results for {n} parts",
@@ -243,46 +242,28 @@ pub async fn send_direct(
 }
 
 async fn post_batch(
-    client: &reqwest::Client,
+    rpc: &dyn PeerRpc,
     addr: &str,
     timeout: Duration,
     parts: Vec<ShardWriteRequest>,
 ) -> NodeSendOutcome {
+    use crate::domain::cluster::peer_rpc::PeerRpcError;
     let body = match bincode::serialize(&ShardWriteBatch { parts }) {
         Ok(b) => b,
         Err(e) => return NodeSendOutcome::Failed(format!("encode forward batch: {e}")),
     };
     let start = Instant::now();
-    let resp = crate::telemetry::inject(
-        client
-            .post(format!("http://{addr}/internal/shard/write-batch"))
-            .header("Content-Type", "application/octet-stream"),
-    )
-    .body(body)
-    .timeout(timeout)
-    .send()
-    .await;
-    let outcome = match resp {
-        Err(e) => NodeSendOutcome::Failed(crate::application::shard_routing::error_chain(&e)),
-        Ok(r) => {
-            let status = r.status();
-            if status == reqwest::StatusCode::NOT_FOUND
-                || status == reqwest::StatusCode::METHOD_NOT_ALLOWED
-            {
-                NodeSendOutcome::Unsupported
-            } else if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-                || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-            {
-                NodeSendOutcome::Capacity
-            } else if status.is_success() {
-                match r.json::<ShardWriteBatchResponse>().await {
-                    Ok(parsed) => NodeSendOutcome::Results(parsed.results),
-                    Err(e) => NodeSendOutcome::Failed(format!("{status}: {e}")),
-                }
-            } else {
-                NodeSendOutcome::Failed(status.to_string())
-            }
-        }
+    let outcome = match rpc.shard_write_batch(addr, body.into(), timeout).await {
+        Ok(parsed) => NodeSendOutcome::Results(parsed.results),
+        // An older build without the batch endpoint.
+        Err(PeerRpcError::Status {
+            code: 404 | 405, ..
+        }) => NodeSendOutcome::Unsupported,
+        Err(PeerRpcError::Status {
+            code: 503 | 429, ..
+        }) => NodeSendOutcome::Capacity,
+        Err(PeerRpcError::Status { code, .. }) => NodeSendOutcome::Failed(format!("HTTP {code}")),
+        Err(PeerRpcError::Unreachable(e)) => NodeSendOutcome::Failed(e),
     };
     let label = match &outcome {
         NodeSendOutcome::Results(_) => "ok",
@@ -298,6 +279,7 @@ async fn post_batch(
 mod tests {
     use super::*;
     use crate::domain::sharding::ShardEpoch;
+    use crate::domain::sharding::types::ShardWriteBatchResponse;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn part(region_id: u64) -> ShardWriteRequest {
@@ -355,7 +337,11 @@ mod tests {
     async fn concurrent_writes_share_requests_and_get_their_own_results() {
         let (addr, requests) = mock_node(Duration::from_millis(100), false).await;
         let coalescer = Arc::new(ForwardCoalescer::new(2, 512 * 1024, 256));
-        let client = reqwest::Client::new();
+        let client: SharedPeerRpc = Arc::new(
+            crate::adapters::cluster::http_peer_rpc::HttpPeerRpc::with_client(
+                reqwest::Client::new(),
+            ),
+        );
         let writes = (0..40u64).map(|w| {
             let coalescer = coalescer.clone();
             let client = client.clone();
@@ -391,7 +377,11 @@ mod tests {
     async fn a_refused_request_is_capacity_for_every_write_in_it() {
         let (addr, _) = mock_node(Duration::from_millis(50), true).await;
         let coalescer = Arc::new(ForwardCoalescer::new(1, 512 * 1024, 256));
-        let client = reqwest::Client::new();
+        let client: SharedPeerRpc = Arc::new(
+            crate::adapters::cluster::http_peer_rpc::HttpPeerRpc::with_client(
+                reqwest::Client::new(),
+            ),
+        );
         let writes = (0..8u64).map(|w| {
             let coalescer = coalescer.clone();
             let client = client.clone();
