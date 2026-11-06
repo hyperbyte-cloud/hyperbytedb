@@ -2508,28 +2508,23 @@ async fn try_query_sharded_region(
             let req = req.clone();
             let addr = addr.to_string();
             async move {
-                let url = format!("http://{addr}/internal/shard/query");
-                let resp = ctx
-                    .peer_client
-                    .http_client()
-                    .post(&url)
-                    .json(&req)
-                    .timeout(timeout)
-                    .send()
-                    .await
-                    .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
-                let status = resp.status();
-                if status == reqwest::StatusCode::CONFLICT {
-                    return Err(HyperbytedbError::StaleShardEpoch { region_id });
-                }
-                if !status.is_success() {
-                    let body = resp.text().await.unwrap_or_default();
-                    return Err(HyperbytedbError::PeerUnreachable(format!(
-                        "shard query to peer {peer_id} failed: {status} {body}"
-                    )));
-                }
+                use crate::domain::cluster::peer_rpc::PeerRpcError;
+                let stream = match ctx.peer_rpc.shard_query(&addr, &req, timeout).await {
+                    Ok(stream) => stream,
+                    Err(PeerRpcError::Status { code: 409, .. }) => {
+                        return Err(HyperbytedbError::StaleShardEpoch { region_id });
+                    }
+                    Err(PeerRpcError::Status { code, body }) => {
+                        return Err(HyperbytedbError::PeerUnreachable(format!(
+                            "shard query to peer {peer_id} failed: {code} {body}"
+                        )));
+                    }
+                    Err(PeerRpcError::Unreachable(e)) => {
+                        return Err(HyperbytedbError::PeerUnreachable(e));
+                    }
+                };
                 crate::application::query_arrow_series::series_from_ipc_response(
-                    resp,
+                    stream,
                     measurement,
                     epoch,
                     resolved_group_by_tags,
@@ -2593,23 +2588,22 @@ async fn query_materialized_dest_node(
             &ctx.config,
             crate::application::shard_peer_resolution::ScatterKind::Query,
         );
-        let resp = ctx
-            .peer_client
-            .http_client()
-            .post(format!("http://{addr}/internal/shard/query"))
-            .json(&req)
-            .timeout(timeout)
-            .send()
+        let stream = ctx
+            .peer_rpc
+            .shard_query(addr, &req, timeout)
             .await
-            .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
-        if !resp.status().is_success() {
-            return Err(HyperbytedbError::PeerUnreachable(format!(
-                "materialized query to node {node_id} failed: {}",
-                resp.status()
-            )));
-        }
+            .map_err(|e| match e {
+                crate::domain::cluster::peer_rpc::PeerRpcError::Status { code, .. } => {
+                    HyperbytedbError::PeerUnreachable(format!(
+                        "materialized query to node {node_id} failed: {code}"
+                    ))
+                }
+                crate::domain::cluster::peer_rpc::PeerRpcError::Unreachable(e) => {
+                    HyperbytedbError::PeerUnreachable(e)
+                }
+            })?;
         crate::application::query_arrow_series::series_from_ipc_response(
-            resp,
+            stream,
             measurement,
             epoch,
             resolved_group_by_tags,

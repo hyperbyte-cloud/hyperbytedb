@@ -6,6 +6,17 @@ use std::fmt;
 
 use crate::error::HyperbytedbError;
 
+/// Where a forwarded `/internal/shard/write` goes: the headers it carries.
+#[derive(Debug, Clone)]
+pub struct ShardWriteTarget {
+    pub db: String,
+    pub rp: String,
+    pub region_id: u64,
+    /// The region epoch, JSON-encoded, as the receiver parses it.
+    pub epoch_json: String,
+    pub precision: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerRpcError {
     /// The peer answered with a non-success status.

@@ -231,6 +231,19 @@ impl From<bincode::Error> for HyperbytedbError {
     }
 }
 
+/// `e` and its causes, joined: reqwest's own message ("error sending request
+/// for url ...") hides whether the peer refused, reset or timed out.
+pub fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut cause = e.source();
+    while let Some(c) = cause {
+        out.push_str(": ");
+        out.push_str(&c.to_string());
+        cause = c.source();
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ChainedError, HyperbytedbError};

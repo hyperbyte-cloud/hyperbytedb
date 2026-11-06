@@ -45,27 +45,22 @@ async fn fetch_remote_metadata(
                 let req = req.clone();
                 let addr = addr.to_string();
                 async move {
-                    let url = format!("http://{addr}/internal/shard/metadata");
-                    let resp = ctx
-                        .peer_client
-                        .http_client()
-                        .post(&url)
-                        .json(&req)
-                        .timeout(timeout)
-                        .send()
-                        .await
-                        .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
-                    if resp.status() == reqwest::StatusCode::CONFLICT {
-                        return Err(HyperbytedbError::StaleShardEpoch { region_id });
-                    }
-                    if !resp.status().is_success() {
-                        return Err(HyperbytedbError::PeerUnreachable(format!(
-                            "metadata scatter to peer {peer_id} failed: {}",
-                            resp.status()
-                        )));
-                    }
-                    resp.json()
-                        .await
+                    use crate::domain::cluster::peer_rpc::PeerRpcError;
+                    let body = match ctx.peer_rpc.shard_metadata(&addr, &req, timeout).await {
+                        Ok(body) => body,
+                        Err(PeerRpcError::Status { code: 409, .. }) => {
+                            return Err(HyperbytedbError::StaleShardEpoch { region_id });
+                        }
+                        Err(PeerRpcError::Status { code, .. }) => {
+                            return Err(HyperbytedbError::PeerUnreachable(format!(
+                                "metadata scatter to peer {peer_id} failed: {code}"
+                            )));
+                        }
+                        Err(PeerRpcError::Unreachable(e)) => {
+                            return Err(HyperbytedbError::PeerUnreachable(e));
+                        }
+                    };
+                    serde_json::from_slice(&body)
                         .map_err(|e| HyperbytedbError::Internal(e.to_string().into()))
                 }
             },
