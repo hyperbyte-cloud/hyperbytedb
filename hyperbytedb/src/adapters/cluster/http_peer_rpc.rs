@@ -7,7 +7,7 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use crate::adapters::cluster::peer_client::PeerClient;
-use crate::domain::cluster::peer_rpc::{PeerRpcError, ShardWriteTarget};
+use crate::domain::cluster::peer_rpc::{PeerRpcError, ProbeReply, ShardWriteTarget};
 use crate::domain::sharding::transfer::{
     ShardRehomeRequest, ShardTransferPayload, TRANSFER_PAYLOAD_HEADER,
 };
@@ -358,6 +358,27 @@ impl PeerRpc for HttpPeerRpc {
             .map_err(|e| PeerRpcError::Unreachable(format!("parse shard map: {e}")))?;
         Ok(crate::domain::sharding::ShardMap::from(json))
     }
+
+    async fn probe(&self, addr: &str, timeout: Duration) -> ProbeReply {
+        let get = |path: &str| {
+            self.client()
+                .get(format!("http://{addr}{path}"))
+                .timeout(timeout)
+                .send()
+        };
+        match get("/health").await {
+            Ok(resp) => ProbeReply::Health {
+                ok: resp.status().is_success(),
+                body: resp.text().await.unwrap_or_default(),
+            },
+            // No answer from `/health`: a live `/ping` keeps a
+            // reachable-but-unhealthy peer from being taken for crashed.
+            Err(_) => match get("/ping").await {
+                Ok(_) => ProbeReply::AliveOnly,
+                Err(_) => ProbeReply::Unreachable,
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -379,6 +400,72 @@ mod tests {
             Default::default(),
         );
         HttpPeerRpc::new(Arc::new(pc))
+    }
+
+    /// A 503 with a body is still a health answer (the body carries the
+    /// peer's self-reported state); a peer with no `/health` but a live
+    /// `/ping` is alive only; no listener at all is unreachable.
+    #[tokio::test]
+    async fn probe_reports_health_body() {
+        let serve = |app: axum::Router| async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            addr
+        };
+        let health = serve(axum::Router::new().route(
+            "/health",
+            axum::routing::get(|| async {
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    r#"{"state":"syncing"}"#,
+                )
+            }),
+        ))
+        .await;
+        let ping_only = serve(axum::Router::new().route(
+            "/ping",
+            axum::routing::get(|| async { axum::http::StatusCode::NO_CONTENT }),
+        ))
+        .await;
+        let slow_health = serve(
+            axum::Router::new()
+                .route(
+                    "/health",
+                    axum::routing::get(|| async {
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                        "late"
+                    }),
+                )
+                .route(
+                    "/ping",
+                    axum::routing::get(|| async { axum::http::StatusCode::NO_CONTENT }),
+                ),
+        )
+        .await;
+
+        let rpc = HttpPeerRpc::with_client(reqwest::Client::new());
+        assert_eq!(
+            rpc.probe(&slow_health, Duration::from_millis(500)).await,
+            ProbeReply::AliveOnly
+        );
+        let t = Duration::from_secs(5);
+        assert_eq!(
+            rpc.probe(&health, t).await,
+            ProbeReply::Health {
+                ok: false,
+                body: r#"{"state":"syncing"}"#.into()
+            }
+        );
+        // `/health` 404s here: an answer, so no `/ping` fallback.
+        assert!(matches!(
+            rpc.probe(&ping_only, t).await,
+            ProbeReply::Health { ok: false, .. }
+        ));
+        assert_eq!(
+            rpc.probe("127.0.0.1:1", Duration::from_millis(500)).await,
+            ProbeReply::Unreachable
+        );
     }
 
     /// "Answered 503" (back-pressure, retried) and "unreachable" must stay
