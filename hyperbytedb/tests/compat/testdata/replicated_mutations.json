@@ -1,0 +1,355 @@
+[
+  {
+    "errors": [
+      null
+    ],
+    "replicated": [
+      {
+        "CreateDatabase": {
+          "name": "mydb",
+          "rp": null
+        }
+      }
+    ],
+    "statement": "CREATE DATABASE mydb"
+  },
+  {
+    "errors": [
+      null
+    ],
+    "replicated": [
+      {
+        "CreateDatabase": {
+          "name": "otherdb",
+          "rp": null
+        }
+      }
+    ],
+    "statement": "CREATE DATABASE otherdb"
+  },
+  {
+    "errors": [
+      null
+    ],
+    "replicated": [
+      {
+        "CreateRetentionPolicy": {
+          "db": "mydb",
+          "rp": {
+            "duration": 604800,
+            "is_default": false,
+            "name": "week",
+            "replication_factor": 1,
+            "shard_group_duration": 86400
+          }
+        }
+      }
+    ],
+    "statement": "CREATE RETENTION POLICY week ON mydb DURATION 7d REPLICATION 1"
+  },
+  {
+    "errors": [
+      null
+    ],
+    "replicated": [
+      {
+        "CreateRetentionPolicy": {
+          "db": "otherdb",
+          "rp": {
+            "duration": 86400,
+            "is_default": false,
+            "name": "r",
+            "replication_factor": 1,
+            "shard_group_duration": 3600
+          }
+        }
+      }
+    ],
+    "statement": "CREATE RETENTION POLICY r ON otherdb DURATION 1d REPLICATION 1"
+  },
+  {
+    "errors": [
+      null
+    ],
+    "replicated": [
+      {
+        "AlterRetentionPolicy": {
+          "change": {
+            "duration": {
+              "unit": "Week",
+              "value": 2
+            },
+            "is_default": null,
+            "replication": null,
+            "shard_duration": null
+          },
+          "db": "mydb",
+          "name": "week"
+        }
+      }
+    ],
+    "statement": "ALTER RETENTION POLICY week ON mydb DURATION 14d"
+  },
+  {
+    "errors": [
+      null
+    ],
+    "replicated": [
+      {
+        "CreateUser": {
+          "admin": false,
+          "password_hash": "<hash>",
+          "username": "bob"
+        }
+      }
+    ],
+    "statement": "CREATE USER bob WITH PASSWORD 'secret-one'"
+  },
+  {
+    "errors": [
+      null
+    ],
+    "replicated": [
+      {
+        "SetPassword": {
+          "password_hash": "<hash>",
+          "username": "bob"
+        }
+      }
+    ],
+    "statement": "SET PASSWORD FOR bob = 'secret-two'"
+  },
+  {
+    "errors": [
+      null
+    ],
+    "replicated": [
+      {
+        "Grant": {
+          "database": "mydb",
+          "privilege": "Read",
+          "username": "bob"
+        }
+      }
+    ],
+    "statement": "GRANT READ ON mydb TO bob"
+  },
+  {
+    "errors": [
+      null
+    ],
+    "replicated": [
+      {
+        "Revoke": {
+          "database": "mydb",
+          "privilege": "Read",
+          "username": "bob"
+        }
+      }
+    ],
+    "statement": "REVOKE READ ON mydb FROM bob"
+  },
+  {
+    "errors": [
+      null
+    ],
+    "replicated": [
+      {
+        "CreateContinuousQuery": {
+          "database": "mydb",
+          "definition": {
+            "coverage_interval_secs": 60,
+            "created_at": "<time>",
+            "database": "mydb",
+            "execution_interval_secs": 60,
+            "group_by_interval_secs": 60,
+            "group_by_offset_secs": 0,
+            "influxql_names": true,
+            "is_advanced": false,
+            "last_run_at": null,
+            "name": "cq1",
+            "query_text": "SELECT mean(v) INTO cpu_1m FROM cpu GROUP BY time(1m)",
+            "resample_every_secs": null,
+            "resample_for_secs": null
+          },
+          "name": "cq1"
+        }
+      }
+    ],
+    "statement": "CREATE CONTINUOUS QUERY cq1 ON mydb BEGIN SELECT mean(v) INTO cpu_1m FROM cpu GROUP BY time(1m) END"
+  },
+  {
+    "errors": [
+      null
+    ],
+    "replicated": [
+      {
+        "DropContinuousQuery": {
+          "database": "mydb",
+          "name": "cq1"
+        }
+      }
+    ],
+    "statement": "DROP CONTINUOUS QUERY cq1 ON mydb"
+  },
+  {
+    "errors": [
+      null
+    ],
+    "replicated": [
+      {
+        "CreateMaterializedView": {
+          "database": "mydb",
+          "definition": {
+            "backfill_on_create": false,
+            "ch_fact_mv_name": "mydb_autogen_mv1_mv",
+            "ch_series_mv_name": "mydb_autogen_mv1_series_mv",
+            "created_at": "<time>",
+            "database": "mydb",
+            "dest_db": "mydb",
+            "dest_measurement": "cpu_5m",
+            "dest_rp": "autogen",
+            "name": "mv1",
+            "query_text": "SELECT mean(\"v\") AS \"mean_v\" INTO \"cpu_5m\" FROM \"cpu\" GROUP BY time(5m), *",
+            "source_db": "mydb",
+            "source_measurement": "cpu",
+            "source_rp": "autogen"
+          },
+          "name": "mv1",
+          "source_meta": {
+            "field_rollups": {},
+            "field_types": {
+              "v": 0
+            },
+            "materialized": false,
+            "materialized_rp": null,
+            "mean_fields": {},
+            "name": "cpu",
+            "tag_keys": [
+              "host"
+            ]
+          }
+        }
+      }
+    ],
+    "statement": "CREATE MATERIALIZED VIEW \"mv1\" ON \"mydb\" AS SELECT mean(\"v\") AS \"mean_v\" INTO \"cpu_5m\" FROM \"cpu\" GROUP BY time(5m), *"
+  },
+  {
+    "errors": [
+      null
+    ],
+    "replicated": [
+      {
+        "DropMaterializedView": {
+          "database": "mydb",
+          "name": "mv1"
+        }
+      }
+    ],
+    "statement": "DROP MATERIALIZED VIEW \"mv1\" ON \"mydb\""
+  },
+  {
+    "errors": [
+      null
+    ],
+    "replicated": [
+      {
+        "Delete": {
+          "database": "mydb",
+          "measurement": "cpu",
+          "predicate_sql": "`series_id` IN (SELECT `series_id` FROM `mydb_autogen_cpu_series` WHERE (\"host\" = 'a'))",
+          "rp": "autogen"
+        }
+      }
+    ],
+    "statement": "DELETE FROM cpu WHERE host = 'a'"
+  },
+  {
+    "errors": [
+      null
+    ],
+    "replicated": [
+      {
+        "DropSeries": {
+          "database": "mydb",
+          "measurement": "cpu",
+          "predicate_sql": "`series_id` IN (SELECT `series_id` FROM `mydb_autogen_cpu_series` WHERE (\"host\" = 'b'))",
+          "rp": "autogen"
+        }
+      }
+    ],
+    "statement": "DROP SERIES FROM cpu WHERE host = 'b'"
+  },
+  {
+    "errors": [
+      null
+    ],
+    "replicated": [
+      {
+        "DropMeasurement": {
+          "database": "mydb",
+          "name": "cpu",
+          "rp": "autogen"
+        }
+      }
+    ],
+    "statement": "DROP MEASUREMENT cpu"
+  },
+  {
+    "errors": [
+      null
+    ],
+    "replicated": [
+      {
+        "SetSetting": {
+          "name": "query_pool_size",
+          "value": 5
+        }
+      }
+    ],
+    "statement": "SET query_pool_size = 5"
+  },
+  {
+    "errors": [
+      "error parsing query: query_pool_size takes an integer from 1 to 128, got 0"
+    ],
+    "replicated": [],
+    "statement": "SET query_pool_size = 0"
+  },
+  {
+    "errors": [
+      null
+    ],
+    "replicated": [
+      {
+        "DropUser": "bob"
+      }
+    ],
+    "statement": "DROP USER bob"
+  },
+  {
+    "errors": [
+      null
+    ],
+    "replicated": [
+      {
+        "DropRetentionPolicy": {
+          "db": "mydb",
+          "name": "week"
+        }
+      }
+    ],
+    "statement": "DROP RETENTION POLICY week ON mydb"
+  },
+  {
+    "errors": [
+      null
+    ],
+    "replicated": [
+      {
+        "DropDatabase": "otherdb"
+      }
+    ],
+    "statement": "DROP DATABASE otherdb"
+  }
+]
