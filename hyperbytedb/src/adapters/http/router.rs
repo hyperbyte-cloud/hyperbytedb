@@ -202,7 +202,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/chdb",
             post(chdb::handle_chdb).layer(axum::middleware::from_fn_with_state(
-                auth_state.clone(),
+                auth_state,
                 auth_middleware::auth_layer,
             )),
         );

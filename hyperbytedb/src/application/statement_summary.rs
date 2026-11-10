@@ -153,6 +153,8 @@ impl StatementSummary {
             })
             .map(|e| e.to_summary())
             .collect();
+        // Sort without the lock, so recording statements is not held up.
+        drop(map);
 
         entries.sort_by(|a, b| {
             let cmp = match sort_by {

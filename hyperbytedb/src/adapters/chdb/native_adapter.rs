@@ -778,16 +778,11 @@ impl ChdbNativeAdapter {
         let tag_ddl_needed = tag_phys
             .iter()
             .any(|(_, phys, kind)| series_cached.columns.get(phys).copied() != Some(*kind));
-        let missing_fields: Vec<&(String, String, u8)> = field_phys
+        let fields_missing = field_phys
             .iter()
-            .filter(|(_, phys, d)| !cached.knows(phys, ColumnKind::Field(*d)))
-            .collect();
+            .any(|(_, phys, d)| !cached.knows(phys, ColumnKind::Field(*d)));
 
-        if cached.materialized
-            && series_cached.materialized
-            && !tag_ddl_needed
-            && missing_fields.is_empty()
-        {
+        if cached.materialized && series_cached.materialized && !tag_ddl_needed && !fields_missing {
             if probed {
                 // Nothing missing: the cache already holds every engine column.
                 let mut guard = self.schemas.write();
@@ -1357,7 +1352,7 @@ impl ChdbNativeAdapter {
             measurements: vec![PreparedMeasurementBatch {
                 measurement: wire.measurement.clone(),
                 table_name: ensured.table.clone(),
-                series_table_name: ensured.series_table.clone(),
+                series_table_name: ensured.series_table,
                 batch: Arc::new(batch),
                 row_count: n,
                 min_time,

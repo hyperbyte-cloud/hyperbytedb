@@ -13,7 +13,7 @@ pub(super) fn apply_bootstrap_measurement_presplit(
         return Err(ShardMapApplyError::SpaceExists {
             db: key.db.clone(),
             rp: key.rp.clone(),
-            measurement: key.measurement.clone(),
+            measurement: key.measurement,
         });
     }
     let mut ids = std::collections::HashSet::new();
@@ -51,7 +51,7 @@ pub(super) fn apply_bootstrap_measurement(
         return Err(ShardMapApplyError::SpaceExists {
             db: key.db.clone(),
             rp: key.rp.clone(),
-            measurement: key.measurement.clone(),
+            measurement: key.measurement,
         });
     }
     if map.spaces.values().any(|space| {

@@ -19,14 +19,20 @@ impl RegionWriteStats {
             return;
         }
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = guard.entry(region_id).or_insert((0, Instant::now()));
+        let entry = guard
+            .entry(region_id)
+            .or_insert_with(|| (0, Instant::now()));
         entry.0 = entry.0.saturating_add(points);
     }
 
     /// Returns writes-per-second over the elapsed window and resets the counter.
     pub fn take_qps(&self, region_id: u64, window: Duration) -> u64 {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let Some((count, started)) = guard.remove(&region_id) else {
+        let removed = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&region_id);
+        let Some((count, started)) = removed else {
             return 0;
         };
         let secs = started.elapsed().max(window).as_secs_f64();

@@ -321,9 +321,11 @@ impl ClusterBootstrap {
         // write tasks under saturation, and heartbeats arrived late enough
         // to trigger elections (~70 in a one-minute run on n3).
         let node_id = config.node_id;
-        let raft = crate::application::runtime::control::on_control(async move {
-            HyperbytedbRaft::new(node_id, raft_config, network, log_store, state_machine).await
-        })
+        let raft = Box::pin(crate::application::runtime::control::on_control(
+            async move {
+                HyperbytedbRaft::new(node_id, raft_config, network, log_store, state_machine).await
+            },
+        ))
         .await
         .map_err(|e| anyhow::anyhow!("failed to initialize raft: {e}"))?;
 
