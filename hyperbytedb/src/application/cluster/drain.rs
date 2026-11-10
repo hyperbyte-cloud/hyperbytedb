@@ -384,7 +384,7 @@ mod tests {
                 },
             );
         }
-        let dests = std::collections::HashSet::from([dest.clone()]);
+        let dests = std::collections::HashSet::from([dest]);
         let mut got: Vec<(String, u64, bool)> = primaries_to_hand_off(&map, 1, &dests)
             .into_iter()
             .map(|(k, r, copy)| (k.measurement.clone(), r.region_id, copy))

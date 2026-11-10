@@ -2999,7 +2999,7 @@ mod tests {
             "DDL must sort field columns by physical name, got: {ddl}"
         );
 
-        let mut sorted = field_phys.clone();
+        let mut sorted = field_phys;
         sorted.sort_by(|a, b| a.1.cmp(&b.1));
         let ensured = EnsuredTable {
             table: "`db_rp_cpu`".to_string(),

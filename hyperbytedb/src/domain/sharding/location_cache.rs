@@ -466,7 +466,7 @@ mod tests {
         apply_shard_map_op(
             &mut map,
             ShardMapOp::BootstrapMeasurement {
-                key: key.clone(),
+                key,
                 region: sample_region(1, 0, u64::MAX),
             },
         )
@@ -485,7 +485,7 @@ mod tests {
         apply_shard_map_op(
             &mut map,
             ShardMapOp::BootstrapMeasurement {
-                key: key.clone(),
+                key,
                 region: sample_region(1, 0, u64::MAX),
             },
         )
@@ -526,7 +526,7 @@ mod tests {
         apply_shard_map_op(
             &mut map,
             ShardMapOp::Split {
-                key: key.clone(),
+                key,
                 region_id: 1,
                 split_key,
                 epoch: ShardEpoch::default(),
@@ -573,7 +573,7 @@ mod tests {
         apply_shard_map_op(
             &mut map_b,
             ShardMapOp::BootstrapMeasurement {
-                key: key_b.clone(),
+                key: key_b,
                 region: sample_region(2, 0, u64::MAX),
             },
         )
