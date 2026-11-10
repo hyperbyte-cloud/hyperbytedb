@@ -362,7 +362,6 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
                 location_cache: shard_location_cache.clone(),
                 config: config.sharding.clone(),
                 node_id: config.cluster.node_id,
-                peer_client: pc.clone(),
                 peer_rpc: Arc::new(crate::adapters::cluster::http_peer_rpc::HttpPeerRpc::new(
                     pc.clone(),
                 )),

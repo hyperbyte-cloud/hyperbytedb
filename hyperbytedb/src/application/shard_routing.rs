@@ -7,7 +7,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use metrics::{counter, histogram};
 
-use crate::adapters::cluster::peer_client::PeerClient;
 use crate::application::runtime::RegionWriteStats;
 use crate::application::shard_peer_resolution::{
     RegionTargetRole, ScatterKind, active_region_peer_targets, is_serving_node, peer_addr,
@@ -30,8 +29,7 @@ pub struct ShardRoutingContext {
     pub location_cache: Arc<ShardLocationCache>,
     pub config: ShardingConfig,
     pub node_id: u64,
-    pub peer_client: Arc<PeerClient>,
-    /// Calls to peers (replaces direct HTTP through `peer_client`).
+    /// Calls to peers.
     pub peer_rpc: crate::ports::peer_rpc::SharedPeerRpc,
     /// Cluster membership, for resolving node addresses.
     pub membership: crate::domain::cluster::membership::SharedMembership,
@@ -93,7 +91,7 @@ where
     F: FnMut(u64, &str, Duration) -> Fut,
     Fut: Future<Output = Result<T, HyperbytedbError>>,
 {
-    let membership = ctx.peer_client.membership().read().await;
+    let membership = ctx.membership.read().await;
     let mut candidates = resolve_region_peers(region, ctx.node_id, &membership, role);
     candidates.retain(|id| *id != ctx.node_id);
 
@@ -339,7 +337,7 @@ pub async fn build_bootstrap_op(
 /// Every active node (and this one), sorted: the candidates a new
 /// measurement's regions are placed over.
 async fn bootstrap_candidates(ctx: &ShardRoutingContext) -> Vec<u64> {
-    let membership = ctx.peer_client.membership().read().await;
+    let membership = ctx.membership.read().await;
     placeable_members(&membership, ctx.node_id)
 }
 
@@ -476,7 +474,7 @@ async fn select_bootstrap_peers(
     rp: &str,
     measurement: &str,
 ) -> Result<Vec<u64>, HyperbytedbError> {
-    let membership = ctx.peer_client.membership().read().await;
+    let membership = ctx.membership.read().await;
     let peers = placeable_members(&membership, ctx.node_id);
     drop(membership);
     let member_count = peers.len();
@@ -604,7 +602,7 @@ pub async fn forward_shard_writes_by_node(
     };
 
     let (by_node, unrouted, addrs) = {
-        let membership = ctx.peer_client.membership().read().await;
+        let membership = ctx.membership.read().await;
         let (by_node, unrouted) = group_forwards_by_primary(&regions, ctx.node_id, &membership);
         let addrs: HashMap<u64, String> = by_node
             .keys()
@@ -943,7 +941,7 @@ pub async fn region_replication_targets(
     ctx: &ShardRoutingContext,
     region: &ShardRegion,
 ) -> Vec<u64> {
-    let membership = ctx.peer_client.membership().read().await;
+    let membership = ctx.membership.read().await;
     active_region_peer_targets(region, ctx.node_id, &membership)
 }
 
@@ -1033,7 +1031,7 @@ pub async fn scatter_delete_to_regions(
             continue;
         }
 
-        let membership = ctx.peer_client.membership().read().await;
+        let membership = ctx.membership.read().await;
         if !is_serving_node(&membership, region.primary) {
             tracing::warn!(
                 region_id = region.region_id,
@@ -1230,7 +1228,6 @@ mod scatter_tests {
                 peer_client.clone(),
             )),
             membership: peer_client.membership().clone(),
-            peer_client,
             region_write_stats: Arc::new(RegionWriteStats::new()),
             forward_coalescer: Default::default(),
             runtime_settings: Default::default(),

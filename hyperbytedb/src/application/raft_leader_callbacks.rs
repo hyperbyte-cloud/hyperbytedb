@@ -4,12 +4,12 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use crate::adapters::cluster::raft::HyperbytedbRaft;
 use crate::domain::cluster::membership::SharedMembership;
+use crate::ports::leadership::LeadershipPort;
 
 /// Thread-safe leader callbacks wired after Raft starts in runtime.
 pub struct RaftLeaderCallbacks {
-    raft: RwLock<Option<HyperbytedbRaft>>,
+    leadership: RwLock<Option<Arc<dyn LeadershipPort>>>,
     leader_addr: RwLock<Option<String>>,
     membership: Option<SharedMembership>,
     node_id: u64,
@@ -28,7 +28,7 @@ impl RaftLeaderCallbacks {
         self_addr: Option<String>,
     ) -> Self {
         Self {
-            raft: RwLock::new(None),
+            leadership: RwLock::new(None),
             leader_addr: RwLock::new(None),
             membership,
             node_id,
@@ -36,25 +36,24 @@ impl RaftLeaderCallbacks {
         }
     }
 
-    pub fn set_raft(&self, raft: HyperbytedbRaft) {
-        *self.raft.write() = Some(raft);
+    pub fn set_leadership(&self, leadership: Arc<dyn LeadershipPort>) {
+        *self.leadership.write() = Some(leadership);
         self.refresh_leader_addr();
     }
 
     pub fn is_leader(&self) -> bool {
-        self.raft
+        self.leadership
             .read()
             .as_ref()
-            .map(|r| r.metrics().borrow().current_leader == Some(self.node_id))
-            .unwrap_or(false)
+            .is_some_and(|l| l.is_leader(self.node_id))
     }
 
     pub fn refresh_leader_addr(&self) {
-        let guard = self.raft.read();
-        let Some(raft) = guard.as_ref() else {
+        let guard = self.leadership.read();
+        let Some(leadership) = guard.as_ref() else {
             return;
         };
-        let Some(leader_id) = raft.metrics().borrow().current_leader else {
+        let Some(leader_id) = leadership.current_leader() else {
             return;
         };
         if leader_id == self.node_id

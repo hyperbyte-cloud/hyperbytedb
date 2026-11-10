@@ -2849,7 +2849,7 @@ async fn execute_sharded_measurement_query(
     let mut region_results = Vec::with_capacity(selected_regions.len());
     if let Some(meta) = materialized_meta_owned.as_ref() {
         let holders = {
-            let m = ctx.peer_client.membership().read().await;
+            let m = ctx.membership.read().await;
             materialized_partial_holders(ctx.node_id, &m)
         };
         let futures: Vec<_> = holders

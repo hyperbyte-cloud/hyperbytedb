@@ -466,7 +466,7 @@ async fn grant_revoke_controls_query_access() {
 #[serial(chdb)]
 async fn the_cluster_token_opens_internal_routes_only() {
     use hyperbytedb::adapters::cluster::cluster_auth::{self, ClusterAuth};
-    use hyperbytedb::ports::peer_http::PeerHttp;
+    use hyperbytedb::adapters::cluster::peer_http::PeerHttp;
 
     let dir = tempfile::tempdir().unwrap();
     let auth = ClusterAuth::new(Some("cluster-s3cret")).unwrap();

@@ -5,6 +5,7 @@ pub mod hinted_handoff;
 pub mod hinted_handoff_watcher;
 pub mod http_peer_rpc;
 pub mod peer_client;
+pub mod peer_http;
 pub mod raft;
 pub mod replication_log;
 pub mod sync_client;

@@ -255,7 +255,7 @@ impl DrainService {
     /// anyway, so the wait on them always ran its full 90 s whenever this node
     /// had written anything -- every restart of a replicated node. Writes are
     /// settled at shutdown instead: each is acked by its peers, or hinted for
-    /// them (`PeerClient::wait_for_inflight`).
+    /// them (the peer client's in-flight wait at shutdown).
     async fn wait_for_replication_acks(&self) -> Result<(), HyperbytedbError> {
         let local_mutation_seq = self.replication_log.last_mutation_seq();
         let max_wait = Duration::from_secs(90);

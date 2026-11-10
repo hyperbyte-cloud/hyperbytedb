@@ -125,7 +125,7 @@ async fn serve_inner(
         let sync_gates_readmit = !config.sharding.enabled;
         // Its own client, so probes never queue behind the write pool.
         let probe_rpc: crate::ports::peer_rpc::SharedPeerRpc = {
-            use crate::ports::peer_http::PeerHttp;
+            use crate::adapters::cluster::peer_http::PeerHttp;
             let auth = &app_state.cluster_auth;
             Arc::new(
                 crate::adapters::cluster::http_peer_rpc::HttpPeerRpc::with_client(
@@ -190,7 +190,7 @@ async fn serve_inner(
     // to the leader go over a dedicated client with the cluster credential.
     let consensus: Option<Arc<dyn crate::ports::consensus::ConsensusPort>> =
         raft_instance.as_ref().map(|raft| {
-            use crate::ports::peer_http::PeerHttp;
+            use crate::adapters::cluster::peer_http::PeerHttp;
             let auth = &app_state.cluster_auth;
             let rpc: crate::ports::peer_rpc::SharedPeerRpc = Arc::new(
                 crate::adapters::cluster::http_peer_rpc::HttpPeerRpc::with_client(
@@ -242,8 +242,8 @@ async fn serve_inner(
     // Set Raft instance on AppState before building the router
     app_state.raft = raft_instance.clone();
 
-    if let (Some(raft), Some(callbacks)) = (&raft_instance, &raft_leader_callbacks) {
-        callbacks.set_raft(raft.clone());
+    if let (Some(consensus), Some(callbacks)) = (&consensus, &raft_leader_callbacks) {
+        callbacks.set_leadership(consensus.clone());
     }
 
     // Shard scheduler (leader-only PD-lite) and periodic region heartbeats.

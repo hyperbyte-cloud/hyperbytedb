@@ -173,7 +173,6 @@ pub async fn start_sharded_node(
         location_cache: location_cache.clone(),
         config: opts.sharding.clone(),
         node_id,
-        peer_client: peer_client.clone(),
         peer_rpc: Arc::new(
             hyperbytedb::adapters::cluster::http_peer_rpc::HttpPeerRpc::new(peer_client.clone()),
         ),

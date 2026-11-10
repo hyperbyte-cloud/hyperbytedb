@@ -1004,10 +1004,10 @@ pub async fn handle_mv_handoff(
     State(state): State<Arc<AppState>>,
     Json(req): Json<crate::application::mv_handoff::MvHandoffRequest>,
 ) -> impl IntoResponse {
-    let Some(ctx) = state.shard_routing.as_ref() else {
+    let (Some(_), Some(pc)) = (state.shard_routing.as_ref(), state.peer_client.as_ref()) else {
         return sharding_disabled();
     };
-    let client = ctx.peer_client.http_client().clone();
+    let client = pc.http_client().clone();
     let url = format!("http://{}/internal/mv/handoff-chunk", req.to_addr);
     let result = crate::application::mv_handoff::hand_off_rollups(
         state.node_id,
