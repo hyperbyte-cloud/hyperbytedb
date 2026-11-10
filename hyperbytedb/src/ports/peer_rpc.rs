@@ -136,6 +136,14 @@ pub trait PeerRpc: Send + Sync {
         timeout: Duration,
     ) -> Result<crate::domain::sharding::ShardMap, PeerRpcError>;
 
+    /// `POST /cluster/raft/client-write`: propose `req` on the Raft leader.
+    async fn raft_client_write(
+        &self,
+        addr: &str,
+        req: &crate::domain::cluster::raft_request::ClusterRequest,
+        timeout: Duration,
+    ) -> Result<crate::domain::cluster::raft_request::ClusterResponse, PeerRpcError>;
+
     /// `GET /health`, falling back to `GET /ping` when `/health` gets no
     /// answer; each request is bounded by `timeout`.
     async fn probe(

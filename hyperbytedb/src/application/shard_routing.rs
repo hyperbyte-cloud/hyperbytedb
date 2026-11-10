@@ -197,7 +197,7 @@ pub async fn ensure_measurement_bootstrapped(
     if is_raft_leader {
         let op = build_bootstrap_op(ctx, db, rp, measurement).await?;
         if let Some(addr) = leader_addr {
-            propose_shard_map_op_via_raft(ctx.peer_client.http_client(), addr, op).await?;
+            propose_shard_map_op_via_raft(ctx.peer_rpc.as_ref(), addr, op).await?;
         } else {
             // No leader address resolves: this is raft-less sharding (async
             // replication without OpenRaft), where this node's shard map IS
@@ -947,30 +947,22 @@ pub async fn region_replication_targets(
     active_region_peer_targets(region, ctx.node_id, &membership)
 }
 
-/// Propose `op` to the Raft leader at `leader_addr`, over this node's pooled
-/// peer `client` (it carries the cluster credential).
+/// Propose `op` to the Raft leader at `leader_addr`.
 pub async fn propose_shard_map_op_via_raft(
-    client: &reqwest::Client,
+    rpc: &dyn crate::ports::peer_rpc::PeerRpc,
     leader_addr: &str,
     op: ShardMapOp,
 ) -> Result<ClusterResponse, HyperbytedbError> {
-    let url = format!("http://{leader_addr}/cluster/raft/client-write");
+    use crate::domain::cluster::peer_rpc::PeerRpcError;
     let req = ClusterRequest::ShardMapMutation(Box::new(op));
-    let resp = client
-        .post(&url)
-        .json(&req)
-        .timeout(Duration::from_secs(5))
-        .send()
+    rpc.raft_client_write(leader_addr, &req, Duration::from_secs(5))
         .await
-        .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
-    if !resp.status().is_success() {
-        return Err(HyperbytedbError::ShardMap(
-            format!("raft client_write failed: {}", resp.status()).into(),
-        ));
-    }
-    resp.json()
-        .await
-        .map_err(|e| HyperbytedbError::ShardMap(e.to_string().into()))
+        .map_err(|e| match e {
+            PeerRpcError::Status { code, .. } => {
+                HyperbytedbError::ShardMap(format!("raft client_write failed: {code}").into())
+            }
+            PeerRpcError::Unreachable(e) => HyperbytedbError::PeerUnreachable(e),
+        })
 }
 
 /// Per-region outcome counts for one sharded delete fan-out.

@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod consensus;
 pub mod flush;
 pub mod forward_queue;
 pub mod ingestion;

@@ -524,7 +524,6 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
                 base_query_service.clone(),
                 metadata.clone(),
                 pc.clone(),
-                pc.cluster_auth(),
             ),
         )
     });

@@ -359,6 +359,24 @@ impl PeerRpc for HttpPeerRpc {
         Ok(crate::domain::sharding::ShardMap::from(json))
     }
 
+    async fn raft_client_write(
+        &self,
+        addr: &str,
+        req: &crate::domain::cluster::raft_request::ClusterRequest,
+        timeout: Duration,
+    ) -> Result<crate::domain::cluster::raft_request::ClusterResponse, PeerRpcError> {
+        let resp = self
+            .post_json(addr, "/cluster/raft/client-write", req, timeout)
+            .await?;
+        let body = Self::body(resp).await?;
+        serde_json::from_slice(&body).map_err(|e| {
+            PeerRpcError::Unreachable(format!(
+                "invalid leader response: {e}: {}",
+                String::from_utf8_lossy(&body)
+            ))
+        })
+    }
+
     async fn probe(&self, addr: &str, timeout: Duration) -> ProbeReply {
         let get = |path: &str| {
             self.client()

@@ -5,7 +5,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use metrics::counter;
 use tokio::sync::watch;
 
-use crate::adapters::cluster::raft::HyperbytedbRaft;
 use crate::application::runtime_settings as rs;
 use crate::application::shard_peer_resolution::is_active_peer;
 use crate::application::shard_routing::effective_replication_factor;
@@ -22,6 +21,7 @@ use crate::domain::sharding::{
     MeasurementKey, ShardMap, ShardMapOp, ShardRegion, ShardRehomeRequest,
 };
 use crate::error::HyperbytedbError;
+use crate::ports::consensus::ConsensusPort;
 use crate::ports::metadata::MetadataPort;
 use crate::ports::peer_rpc::{PeerRpc, Peers};
 use crate::ports::query::QueryPort;
@@ -253,7 +253,7 @@ pub struct ShardScheduler {
     runtime_settings: Arc<rs::RuntimeSettings>,
     shard_map: Arc<dyn ShardMapPort>,
     membership: SharedMembership,
-    raft: HyperbytedbRaft,
+    consensus: Arc<dyn ConsensusPort>,
     peers: Option<Peers>,
     metadata: Arc<dyn MetadataPort>,
     wal: Arc<dyn WalPort>,
@@ -346,7 +346,7 @@ impl ShardScheduler {
     pub fn new(
         shard_map: Arc<dyn ShardMapPort>,
         membership: SharedMembership,
-        raft: HyperbytedbRaft,
+        consensus: Arc<dyn ConsensusPort>,
         peers: Option<Peers>,
         metadata: Arc<dyn MetadataPort>,
         wal: Arc<dyn WalPort>,
@@ -363,7 +363,7 @@ impl ShardScheduler {
             runtime_settings,
             shard_map,
             membership,
-            raft,
+            consensus,
             peers,
             metadata,
             wal,
@@ -854,8 +854,7 @@ impl ShardScheduler {
         if self.test_force_leader {
             return true;
         }
-        let metrics = self.raft.metrics().borrow().clone();
-        metrics.current_leader == Some(self.node_id)
+        self.consensus.is_leader(self.node_id)
     }
 
     /// Tick on `interval` while leader. Placement moves run in a background
@@ -2495,17 +2494,16 @@ impl ShardScheduler {
         use crate::domain::cluster::raft_request::ClusterRequest;
         let req = ClusterRequest::ShardMapMutation(Box::new(op));
         let resp = self
-            .raft
-            .client_write(req)
+            .consensus
+            .propose(req)
             .await
             .map_err(|e| HyperbytedbError::ShardMap(e.to_string().into()))?;
         // Committed is not applied: the apply can refuse the op (a stale
         // epoch, say), and that was read as success. A refused Merge was
         // counted and retried every tick for 20 hours on n3, 72,541 times.
-        if !resp.data.ok {
+        if !resp.ok {
             return Err(HyperbytedbError::ShardMap(
-                resp.data
-                    .message
+                resp.message
                     .unwrap_or_else(|| "shard map op refused".into())
                     .into(),
             ));
@@ -2920,6 +2918,22 @@ mod tests {
     }
 
     use super::*;
+
+    fn test_consensus(
+        raft: crate::adapters::cluster::raft::HyperbytedbRaft,
+    ) -> Arc<dyn ConsensusPort> {
+        Arc::new(
+            crate::adapters::cluster::raft::consensus::RaftConsensus::new(
+                raft,
+                Arc::new(
+                    crate::adapters::cluster::http_peer_rpc::HttpPeerRpc::with_client(
+                        reqwest::Client::new(),
+                    ),
+                ),
+                None,
+            ),
+        )
+    }
     use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
     use crate::domain::cluster::membership::{ClusterMembership, NodeInfo, new_shared};
     use crate::domain::sharding::ShardEpoch;
@@ -3252,7 +3266,7 @@ mod tests {
         let scheduler = ShardScheduler::new(
             shard_map,
             bootstrap.membership.clone(),
-            raft,
+            test_consensus(raft),
             None,
             metadata,
             wal,
@@ -3401,7 +3415,7 @@ mod tests {
         let scheduler = ShardScheduler::new(
             shard_map,
             bootstrap.membership.clone(),
-            raft,
+            test_consensus(raft),
             None,
             metadata,
             wal,
@@ -3542,7 +3556,7 @@ mod tests {
         let scheduler = ShardScheduler::new(
             shard_map,
             bootstrap.membership.clone(),
-            raft,
+            test_consensus(raft),
             None,
             metadata,
             wal,
@@ -3996,7 +4010,7 @@ mod tests {
             let scheduler = ShardScheduler::new(
                 shard_map,
                 bootstrap.membership.clone(),
-                raft,
+                test_consensus(raft),
                 Some(crate::adapters::cluster::http_peer_rpc::peers_for(
                     peer_client,
                 )),
@@ -4482,7 +4496,7 @@ mod tests {
             let scheduler = ShardScheduler::new(
                 shard_map.clone(),
                 bootstrap.membership.clone(),
-                raft,
+                test_consensus(raft),
                 None,
                 metadata,
                 wal,
