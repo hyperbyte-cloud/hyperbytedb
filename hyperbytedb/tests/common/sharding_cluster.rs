@@ -258,12 +258,7 @@ pub async fn start_sharded_node(
     ingestion_svc.spawn_forward_drainer();
     let ingestion: Arc<dyn hyperbytedb::ports::ingestion::IngestionPort> = ingestion_svc;
 
-    let peer_query = PeerQueryService::new(
-        base_query,
-        metadata.clone(),
-        peer_client.clone(),
-        peer_client.cluster_auth(),
-    );
+    let peer_query = PeerQueryService::new(base_query, metadata.clone(), peer_client.clone());
     peer_query.set_shard_routing(shard_routing.clone());
     let query: Arc<dyn QueryService> = Arc::new(peer_query);
 
@@ -275,7 +270,17 @@ pub async fn start_sharded_node(
             hyperbytedb::application::shard_scheduler::ShardScheduler::new(
                 shard_map.clone(),
                 shared_membership.clone(),
-                raft,
+                Arc::new(
+                    hyperbytedb::adapters::cluster::raft::consensus::RaftConsensus::new(
+                        raft,
+                        Arc::new(
+                            hyperbytedb::adapters::cluster::http_peer_rpc::HttpPeerRpc::new(
+                                peer_client.clone(),
+                            ),
+                        ),
+                        Some(shared_membership.clone()),
+                    ),
+                ),
                 Some(hyperbytedb::adapters::cluster::http_peer_rpc::peers_for(
                     peer_client.clone(),
                 )),

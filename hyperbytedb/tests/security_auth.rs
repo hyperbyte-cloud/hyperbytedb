@@ -134,13 +134,9 @@ async fn start_auth_cluster_node_with(
             IngestCardinalityLimits::default(),
         ));
 
-    let query_service: Arc<dyn hyperbytedb::adapters::http::router::QueryService> =
-        Arc::new(PeerQueryService::new(
-            base_query_service,
-            metadata.clone(),
-            peer_client.clone(),
-            peer_client.cluster_auth(),
-        ));
+    let query_service: Arc<dyn hyperbytedb::adapters::http::router::QueryService> = Arc::new(
+        PeerQueryService::new(base_query_service, metadata.clone(), peer_client.clone()),
+    );
 
     let app_state = Arc::new(AppState {
         ingestion: ingestion_service,

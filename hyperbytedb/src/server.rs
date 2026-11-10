@@ -186,12 +186,29 @@ async fn serve_inner(
         None => None,
     };
 
-    // Wire Raft to PeerQueryService for consensus-based schema replication
-    if let (Some(raft), Some(pqs)) = (&raft_instance, &peer_query_service_ref) {
-        pqs.set_raft(raft.clone());
-        if let Some(m) = &membership {
-            pqs.set_membership(m.clone());
-        }
+    // One proposer for schema mutations, the scheduler and drain. Forwards
+    // to the leader go over a dedicated client with the cluster credential.
+    let consensus: Option<Arc<dyn crate::ports::consensus::ConsensusPort>> =
+        raft_instance.as_ref().map(|raft| {
+            use crate::ports::peer_http::PeerHttp;
+            let auth = &app_state.cluster_auth;
+            let rpc: crate::ports::peer_rpc::SharedPeerRpc = Arc::new(
+                crate::adapters::cluster::http_peer_rpc::HttpPeerRpc::with_client(
+                    auth.build(auth.client_builder()),
+                ),
+            );
+            Arc::new(
+                crate::adapters::cluster::raft::consensus::RaftConsensus::new(
+                    raft.clone(),
+                    rpc,
+                    membership.clone(),
+                ),
+            ) as Arc<dyn crate::ports::consensus::ConsensusPort>
+        });
+
+    // Wire consensus to PeerQueryService for schema replication
+    if let (Some(consensus), Some(pqs)) = (&consensus, &peer_query_service_ref) {
+        pqs.set_consensus(consensus.clone());
         if let Some(ctx) = &app_state.shard_routing {
             pqs.set_shard_routing(ctx.clone());
         }
@@ -231,13 +248,13 @@ async fn serve_inner(
 
     // Shard scheduler (leader-only PD-lite) and periodic region heartbeats.
     let shard_scheduler_handle = if config.sharding.enabled {
-        if let (Some(raft), Some(map), Some(membership)) =
-            (&raft_instance, &rocks_shard_map, &membership)
+        if let (Some(consensus), Some(map), Some(membership)) =
+            (&consensus, &rocks_shard_map, &membership)
         {
             let scheduler = Arc::new(crate::application::shard_scheduler::ShardScheduler::new(
                 map.clone(),
                 membership.clone(),
-                raft.clone(),
+                consensus.clone(),
                 peer_client
                     .clone()
                     .map(crate::adapters::cluster::http_peer_rpc::peers_for),
@@ -283,7 +300,7 @@ async fn serve_inner(
                         app_state.metadata.clone(),
                         app_state.points_sink.clone(),
                         app_state.query_port.clone(),
-                        raft.clone(),
+                        consensus.clone(),
                         config.server.max_points_per_request,
                     ),
                 ));
@@ -305,7 +322,8 @@ async fn serve_inner(
                     .unwrap_or_else(|| {
                         Arc::new(crate::application::runtime::RegionWriteStats::new())
                     });
-                let raft = raft.clone();
+                let leadership: Arc<dyn crate::ports::leadership::LeadershipPort> =
+                    consensus.clone();
                 let m = membership.clone();
                 let hb_interval =
                     Duration::from_secs(config.sharding.heartbeat_interval_secs.max(1));
@@ -320,7 +338,7 @@ async fn serve_inner(
                             )),
                             m,
                             map,
-                            Arc::new(raft),
+                            leadership,
                             meta,
                             query_port,
                             region_write_stats,

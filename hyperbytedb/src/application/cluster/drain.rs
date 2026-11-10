@@ -3,12 +3,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::adapters::cluster::raft::HyperbytedbRaft;
 use crate::application::shard_routing::ShardRoutingContext;
 use crate::application::shard_transfer::run_region_transfer;
 use crate::domain::cluster::membership::{NodeState, SharedMembership};
 use crate::domain::sharding::{MeasurementKey, ShardMapOp};
 use crate::error::HyperbytedbError;
+use crate::ports::consensus::ConsensusPort;
 use crate::ports::flush::FlushPort;
 use crate::ports::metadata::MetadataPort;
 use crate::ports::points_sink::PointsSinkPort;
@@ -31,7 +31,7 @@ pub struct DrainService {
     metadata: Option<Arc<dyn MetadataPort>>,
     points_sink: Option<Arc<dyn PointsSinkPort>>,
     query_port: Option<Arc<dyn QueryPort>>,
-    raft: Option<HyperbytedbRaft>,
+    consensus: Option<Arc<dyn ConsensusPort>>,
     max_points_per_request: usize,
     /// Set once [`DrainService::drain`] has run to completion (or determined
     /// there was nothing to do because the node was already in a terminal
@@ -61,7 +61,7 @@ impl DrainService {
             metadata: None,
             points_sink: None,
             query_port: None,
-            raft: None,
+            consensus: None,
             max_points_per_request: 0,
             drained: AtomicBool::new(false),
         }
@@ -74,14 +74,14 @@ impl DrainService {
         metadata: Arc<dyn MetadataPort>,
         points_sink: Arc<dyn PointsSinkPort>,
         query_port: Arc<dyn QueryPort>,
-        raft: HyperbytedbRaft,
+        consensus: Arc<dyn ConsensusPort>,
         max_points_per_request: usize,
     ) -> Self {
         self.shard_routing = Some(ctx);
         self.metadata = Some(metadata);
         self.points_sink = Some(points_sink);
         self.query_port = Some(query_port);
-        self.raft = Some(raft);
+        self.consensus = Some(consensus);
         self.max_points_per_request = max_points_per_request;
         self
     }
@@ -197,8 +197,8 @@ impl DrainService {
             .metadata
             .as_ref()
             .ok_or_else(|| HyperbytedbError::ClusterUnavailable("no metadata".into()))?;
-        let raft = self
-            .raft
+        let consensus = self
+            .consensus
             .as_ref()
             .ok_or_else(|| HyperbytedbError::ClusterUnavailable("no raft".into()))?;
 
@@ -240,7 +240,8 @@ impl DrainService {
                 new_primary,
                 epoch: region.epoch,
             };
-            raft.client_write(ClusterRequest::ShardMapMutation(Box::new(tp)))
+            consensus
+                .propose(ClusterRequest::ShardMapMutation(Box::new(tp)))
                 .await
                 .map_err(|e| HyperbytedbError::ShardMap(e.to_string().into()))?;
         }
