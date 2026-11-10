@@ -144,6 +144,33 @@ pub trait PeerRpc: Send + Sync {
         timeout: Duration,
     ) -> Result<crate::domain::cluster::raft_request::ClusterResponse, PeerRpcError>;
 
+    /// `POST /internal/membership/join`.
+    async fn join(
+        &self,
+        addr: &str,
+        req: &crate::domain::cluster::sync::JoinRequest,
+        timeout: Duration,
+    ) -> Result<crate::domain::cluster::sync::JoinResponse, PeerRpcError>;
+
+    /// `GET /internal/sync/metadata`.
+    async fn sync_metadata_snapshot(
+        &self,
+        addr: &str,
+        timeout: Duration,
+    ) -> Result<crate::domain::cluster::sync::MetadataSnapshot, PeerRpcError>;
+
+    /// `GET /internal/sync/wal?from_seq=&max_entries=`.
+    async fn sync_wal(
+        &self,
+        addr: &str,
+        from_seq: u64,
+        max_entries: u32,
+        timeout: Duration,
+    ) -> Result<crate::domain::cluster::sync::WalSyncResponse, PeerRpcError>;
+
+    /// `GET /ping`: answered with a success status.
+    async fn ping(&self, addr: &str, timeout: Duration) -> Result<(), PeerRpcError>;
+
     /// `GET /health`, falling back to `GET /ping` when `/health` gets no
     /// answer; each request is bounded by `timeout`.
     async fn probe(
