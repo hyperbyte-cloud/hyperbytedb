@@ -432,6 +432,30 @@ async fn mutation_request_from_statement(
     }
 }
 
+/// The database a cluster statement runs against locally: a retention
+/// policy statement's own `ON <db>`, otherwise the request's.
+fn local_db<'a>(stmt: &'a Statement, db: &'a str) -> &'a str {
+    match stmt {
+        Statement::CreateRetentionPolicyStmt { db, .. }
+        | Statement::DropRetentionPolicyStmt { db, .. }
+        | Statement::AlterRetentionPolicyStmt { db, .. } => db,
+        _ => db,
+    }
+}
+
+/// Whether failing to build `stmt`'s mutation (after it applied locally) is
+/// reported on the statement rather than failing the whole request: a bad
+/// continuous query or view definition, or a password that cannot be hashed.
+fn build_error_is_statement_error(stmt: &Statement) -> bool {
+    matches!(
+        stmt,
+        Statement::CreateContinuousQuery(_)
+            | Statement::CreateMaterializedView(_)
+            | Statement::CreateUser { .. }
+            | Statement::SetPassword { .. }
+    )
+}
+
 fn is_cluster_mutation(stmt: &Statement) -> bool {
     matches!(
         stmt,
@@ -493,10 +517,10 @@ impl QueryService for PeerQueryService {
                 continue;
             }
             let result = match stmt {
-                Statement::CreateDatabase(ref stmt) => {
-                    let result = self
+                ref stmt if is_cluster_mutation(stmt) => {
+                    let mut result = self
                         .execute_inner_statement(
-                            db,
+                            local_db(stmt, db),
                             stmt_query,
                             epoch,
                             retention_policy,
@@ -505,479 +529,23 @@ impl QueryService for PeerQueryService {
                         )
                         .await;
                     if result.error.is_none() {
-                        self.replicate_mutation(MutationRequest::CreateDatabase {
-                            name: stmt.name.clone(),
-                            rp: retention_policy_from_create(stmt),
-                        })
-                        .await?;
-                    }
-                    result
-                }
-                Statement::DropDatabase(ref name) => {
-                    let result = self
-                        .execute_inner_statement(
-                            db,
-                            stmt_query,
-                            epoch,
-                            retention_policy,
-                            caller,
-                            statement_id,
-                        )
-                        .await;
-                    if result.error.is_none() {
-                        self.replicate_mutation(MutationRequest::DropDatabase(name.clone()))
-                            .await?;
-                    }
-                    result
-                }
-                Statement::Delete(_) => {
-                    let result = self
-                        .execute_inner_statement(
-                            db,
-                            stmt_query,
-                            epoch,
-                            retention_policy,
-                            caller,
-                            statement_id,
-                        )
-                        .await;
-                    if result.error.is_none() {
-                        let req = mutation_request_from_statement(
-                            &stmt,
+                        match mutation_request_from_statement(
+                            stmt,
                             db,
                             retention_policy,
                             &self.metadata,
                             self.shard_routing.get(),
                         )
-                        .await?;
-                        self.replicate_mutation(req).await?;
-                    }
-                    result
-                }
-                Statement::CreateContinuousQuery(ref cq) => {
-                    let mut result = self
-                        .execute_inner_statement(
-                            db,
-                            stmt_query,
-                            epoch,
-                            retention_policy,
-                            caller,
-                            statement_id,
-                        )
-                        .await;
-                    if result.error.is_none() {
-                        let def = match ContinuousQueryDef::from_create(cq) {
-                            Ok(def) => def,
-                            Err(e) => {
+                        .await
+                        {
+                            Ok(req) => self.replicate_mutation(req).await?,
+                            // Applied here but not replicable: the statement
+                            // reports it, the other statements still run.
+                            Err(e) if build_error_is_statement_error(stmt) => {
                                 result.error = Some(e.to_string());
-                                results.push(result);
-                                continue;
                             }
-                        };
-                        self.replicate_mutation(MutationRequest::CreateContinuousQuery {
-                            database: cq.database.clone(),
-                            name: cq.name.clone(),
-                            definition: def,
-                        })
-                        .await?;
-                    }
-                    result
-                }
-                Statement::DropContinuousQuery {
-                    ref name,
-                    db: ref cq_db,
-                } => {
-                    let result = self
-                        .execute_inner_statement(
-                            db,
-                            stmt_query,
-                            epoch,
-                            retention_policy,
-                            caller,
-                            statement_id,
-                        )
-                        .await;
-                    if result.error.is_none() {
-                        let target_db = if cq_db.is_empty() { db } else { cq_db };
-                        self.replicate_mutation(MutationRequest::DropContinuousQuery {
-                            database: target_db.to_string(),
-                            name: name.clone(),
-                        })
-                        .await?;
-                    }
-                    result
-                }
-                Statement::CreateMaterializedView(ref mv) => {
-                    let mut result = self
-                        .execute_inner_statement(
-                            db,
-                            stmt_query,
-                            epoch,
-                            retention_policy,
-                            caller,
-                            statement_id,
-                        )
-                        .await;
-                    if result.error.is_none() {
-                        let source_rp = match resolve_mv_source_rp(&self.metadata, mv).await {
-                            Ok(rp) => rp,
-                            Err(e) => {
-                                result.error = Some(e.to_string());
-                                results.push(result);
-                                continue;
-                            }
-                        };
-                        let dest_rp = match resolve_mv_dest_rp(&self.metadata, mv).await {
-                            Ok(rp) => rp,
-                            Err(e) => {
-                                result.error = Some(e.to_string());
-                                results.push(result);
-                                continue;
-                            }
-                        };
-                        if let Ok(def) = def_from_statement(mv, &source_rp, &dest_rp) {
-                            let source_meta =
-                                mv_source_meta(&self.metadata, self.shard_routing.get(), &def)
-                                    .await?;
-                            self.replicate_mutation(MutationRequest::CreateMaterializedView {
-                                database: mv.database.clone(),
-                                name: mv.name.clone(),
-                                definition: def,
-                                source_meta,
-                            })
-                            .await?;
+                            Err(e) => return Err(e),
                         }
-                    }
-                    result
-                }
-                Statement::DropMaterializedView {
-                    ref name,
-                    db: ref mv_db,
-                } => {
-                    let result = self
-                        .execute_inner_statement(
-                            db,
-                            stmt_query,
-                            epoch,
-                            retention_policy,
-                            caller,
-                            statement_id,
-                        )
-                        .await;
-                    if result.error.is_none() {
-                        let target_db = if mv_db.is_empty() { db } else { mv_db };
-                        self.replicate_mutation(MutationRequest::DropMaterializedView {
-                            database: target_db.to_string(),
-                            name: name.clone(),
-                        })
-                        .await?;
-                    }
-                    result
-                }
-                Statement::CreateRetentionPolicyStmt {
-                    ref name,
-                    ref db,
-                    ref duration,
-                    replication,
-                    ref shard_duration,
-                    is_default,
-                } => {
-                    let result = self
-                        .execute_inner_statement(
-                            db,
-                            stmt_query,
-                            epoch,
-                            retention_policy,
-                            caller,
-                            statement_id,
-                        )
-                        .await;
-                    if result.error.is_none() {
-                        let dur = duration
-                            .as_ref()
-                            .map(|d| std::time::Duration::from_nanos(d.to_nanos() as u64));
-                        let shard_dur = shard_duration
-                            .as_ref()
-                            .map(|d| std::time::Duration::from_nanos(d.to_nanos() as u64))
-                            .unwrap_or_else(|| {
-                                crate::domain::database::derive_shard_group_duration(dur)
-                            });
-                        let rp = RetentionPolicy {
-                            name: name.clone(),
-                            duration: dur,
-                            shard_group_duration: shard_dur,
-                            replication_factor: replication,
-                            is_default,
-                        };
-                        self.replicate_mutation(MutationRequest::CreateRetentionPolicy {
-                            db: db.clone(),
-                            rp,
-                        })
-                        .await?;
-                    }
-                    result
-                }
-                Statement::DropRetentionPolicyStmt { ref name, ref db } => {
-                    let result = self
-                        .execute_inner_statement(
-                            db,
-                            stmt_query,
-                            epoch,
-                            retention_policy,
-                            caller,
-                            statement_id,
-                        )
-                        .await;
-                    if result.error.is_none() {
-                        self.replicate_mutation(MutationRequest::DropRetentionPolicy {
-                            db: db.clone(),
-                            name: name.clone(),
-                        })
-                        .await?;
-                    }
-                    result
-                }
-                Statement::CreateUser {
-                    ref username,
-                    ref password,
-                    admin,
-                } => {
-                    let mut result = self
-                        .execute_inner_statement(
-                            db,
-                            stmt_query,
-                            epoch,
-                            retention_policy,
-                            caller,
-                            statement_id,
-                        )
-                        .await;
-                    if result.error.is_none() {
-                        match hash_password_for_replication(password) {
-                            Ok(password_hash) => {
-                                self.replicate_mutation(MutationRequest::CreateUser {
-                                    username: username.clone(),
-                                    password_hash,
-                                    admin,
-                                })
-                                .await?;
-                            }
-                            Err(e) => result.error = Some(e.to_string()),
-                        }
-                    }
-                    result
-                }
-                Statement::DropUser(ref username) => {
-                    let result = self
-                        .execute_inner_statement(
-                            db,
-                            stmt_query,
-                            epoch,
-                            retention_policy,
-                            caller,
-                            statement_id,
-                        )
-                        .await;
-                    if result.error.is_none() {
-                        self.replicate_mutation(MutationRequest::DropUser(username.clone()))
-                            .await?;
-                    }
-                    result
-                }
-                Statement::SetPassword {
-                    ref username,
-                    ref password,
-                } => {
-                    let mut result = self
-                        .execute_inner_statement(
-                            db,
-                            stmt_query,
-                            epoch,
-                            retention_policy,
-                            caller,
-                            statement_id,
-                        )
-                        .await;
-                    if result.error.is_none() {
-                        match hash_password_for_replication(password) {
-                            Ok(password_hash) => {
-                                self.replicate_mutation(MutationRequest::SetPassword {
-                                    username: username.clone(),
-                                    password_hash,
-                                })
-                                .await?;
-                            }
-                            Err(e) => result.error = Some(e.to_string()),
-                        }
-                    }
-                    result
-                }
-                Statement::AlterRetentionPolicyStmt {
-                    ref name,
-                    ref db,
-                    duration,
-                    replication,
-                    ref shard_duration,
-                    is_default,
-                } => {
-                    let result = self
-                        .execute_inner_statement(
-                            db,
-                            stmt_query,
-                            epoch,
-                            retention_policy,
-                            caller,
-                            statement_id,
-                        )
-                        .await;
-                    if result.error.is_none() {
-                        let change = RetentionPolicyChange {
-                            duration: duration.as_ref().map(|d| {
-                                if d.value == 0 && d.unit == DurationUnit::Second {
-                                    None
-                                } else {
-                                    Some(d.clone())
-                                }
-                            }),
-                            replication,
-                            shard_duration: shard_duration.clone(),
-                            is_default,
-                        };
-                        self.replicate_mutation(MutationRequest::AlterRetentionPolicy {
-                            db: db.clone(),
-                            name: name.clone(),
-                            change,
-                        })
-                        .await?;
-                    }
-                    result
-                }
-                Statement::DropSeries(_) => {
-                    let result = self
-                        .execute_inner_statement(
-                            db,
-                            stmt_query,
-                            epoch,
-                            retention_policy,
-                            caller,
-                            statement_id,
-                        )
-                        .await;
-                    if result.error.is_none() {
-                        let req = mutation_request_from_statement(
-                            &stmt,
-                            db,
-                            retention_policy,
-                            &self.metadata,
-                            self.shard_routing.get(),
-                        )
-                        .await?;
-                        self.replicate_mutation(req).await?;
-                    }
-                    result
-                }
-                Statement::DropMeasurement {
-                    ref name,
-                    rp: ref stmt_rp,
-                } => {
-                    let result = self
-                        .execute_inner_statement(
-                            db,
-                            stmt_query,
-                            epoch,
-                            retention_policy,
-                            caller,
-                            statement_id,
-                        )
-                        .await;
-                    if result.error.is_none() {
-                        let dm_rp = if let Some(rp) = stmt_rp {
-                            rp.clone()
-                        } else {
-                            self.metadata.get_default_rp(db).await?
-                        };
-                        self.replicate_mutation(MutationRequest::DropMeasurement {
-                            database: db.to_string(),
-                            rp: dm_rp,
-                            name: name.clone(),
-                        })
-                        .await?;
-                    }
-                    result
-                }
-                Statement::Grant {
-                    ref username,
-                    ref database,
-                    privilege,
-                } => {
-                    let result = self
-                        .execute_inner_statement(
-                            db,
-                            stmt_query,
-                            epoch,
-                            retention_policy,
-                            caller,
-                            statement_id,
-                        )
-                        .await;
-                    if result.error.is_none() {
-                        self.replicate_mutation(MutationRequest::Grant {
-                            username: username.clone(),
-                            database: database.clone(),
-                            privilege,
-                        })
-                        .await?;
-                    }
-                    result
-                }
-                Statement::Revoke {
-                    ref username,
-                    ref database,
-                    privilege,
-                } => {
-                    let result = self
-                        .execute_inner_statement(
-                            db,
-                            stmt_query,
-                            epoch,
-                            retention_policy,
-                            caller,
-                            statement_id,
-                        )
-                        .await;
-                    if result.error.is_none() {
-                        self.replicate_mutation(MutationRequest::Revoke {
-                            username: username.clone(),
-                            database: database.clone(),
-                            privilege,
-                        })
-                        .await?;
-                    }
-                    result
-                }
-                Statement::SetSetting {
-                    ref name,
-                    ref value,
-                } => {
-                    let result = self
-                        .execute_inner_statement(
-                            db,
-                            stmt_query,
-                            epoch,
-                            retention_policy,
-                            caller,
-                            statement_id,
-                        )
-                        .await;
-                    if result.error.is_none() {
-                        self.replicate_mutation(MutationRequest::SetSetting {
-                            name: name.clone(),
-                            value: crate::application::runtime_settings::validate(
-                                name,
-                                value.clone(),
-                            )?,
-                        })
-                        .await?;
                     }
                     result
                 }
