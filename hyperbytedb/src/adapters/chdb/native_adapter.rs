@@ -1285,7 +1285,7 @@ impl ChdbNativeAdapter {
         wire: &crate::domain::columnar_batch::ColumnarMsgpackBatch,
         precision: Option<&str>,
     ) -> Result<crate::domain::prepared_wal::PreparedWalSlot, HyperbytedbError> {
-        use crate::application::columnar_msgpack::columnar_timestamps_ns;
+        use crate::domain::columnar_batch::columnar_timestamps_ns;
         use crate::domain::prepared_wal::{PreparedMeasurementBatch, PreparedWalSlot};
         use crate::domain::series::series_id;
 
@@ -2339,7 +2339,7 @@ fn columnar_representative_point(
     wire: &crate::domain::columnar_batch::ColumnarMsgpackBatch,
     precision: Option<&str>,
 ) -> Result<Point, HyperbytedbError> {
-    use crate::application::columnar_msgpack::columnar_timestamps_ns;
+    use crate::domain::columnar_batch::columnar_timestamps_ns;
 
     let ts = columnar_timestamps_ns(wire, precision)?;
     let mut fields = BTreeMap::new();
