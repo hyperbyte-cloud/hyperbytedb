@@ -70,6 +70,45 @@ fn crate_paths(line: &str) -> Vec<(&'static str, String)> {
     found
 }
 
+/// The layer paths in a grouped import's body (the text after
+/// `crate::{`, up to its closing brace): `adapters::x::Y` gives
+/// `crate::adapters::x::Y`, `application::svc::{A, B}` gives
+/// `crate::application::svc`.
+fn grouped_paths(body: &str) -> Vec<(&'static str, String)> {
+    let mut items = Vec::new();
+    let (mut depth, mut start) = (0usize, 0usize);
+    for (i, c) in body.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                items.push(&body[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    items.push(&body[start..]);
+    let mut found = Vec::new();
+    for item in items {
+        let item = item.trim();
+        let path: String = item
+            .split("::{")
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
+            .collect();
+        let path = path.trim_end_matches(':');
+        for layer in LAYERS {
+            if path == layer || path.starts_with(&format!("{layer}::")) {
+                found.push((layer, format!("crate::{path}")));
+            }
+        }
+    }
+    found
+}
+
 /// Every production line under `src_root` that breaks a layering rule, as
 /// `"<file>:<line>: <layer> imports <target>"`.
 fn forbidden_imports(src_root: &Path) -> Vec<String> {
@@ -92,6 +131,8 @@ fn forbidden_imports(src_root: &Path) -> Vec<String> {
         // Brace depth inside a `#[cfg(test)] mod`; `None` outside one.
         let mut test_depth: Option<i64> = None;
         let mut pending_cfg_test = false;
+        // An open `crate::{ … }` group: its first line and body so far.
+        let mut group: Option<(usize, String)> = None;
         for (n, raw) in lines.iter().enumerate() {
             let line = raw.trim();
             if let Some(depth) = test_depth.as_mut() {
@@ -121,7 +162,48 @@ fn forbidden_imports(src_root: &Path) -> Vec<String> {
             if line.starts_with("//") {
                 continue;
             }
-            for (target, full) in crate_paths(line) {
+            let mut paths: Vec<(usize, &'static str, String)> = Vec::new();
+            let mut rest = line;
+            if group.is_none()
+                && let Some(i) = line.find("crate::{")
+            {
+                group = Some((n, String::new()));
+                rest = &line[i + "crate::{".len()..];
+                paths.extend(crate_paths(&line[..i]).into_iter().map(|(t, f)| (n, t, f)));
+            } else if group.is_none() {
+                paths.extend(crate_paths(line).into_iter().map(|(t, f)| (n, t, f)));
+            }
+            if let Some((first, body)) = group.as_mut() {
+                // Close the group at the brace that balances `crate::{`.
+                let mut depth = 1 + body.matches('{').count() - body.matches('}').count();
+                let mut end = None;
+                for (i, c) in rest.char_indices() {
+                    match c {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = Some(i);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                match end {
+                    Some(i) => {
+                        body.push_str(&rest[..i]);
+                        let first = *first;
+                        paths.extend(grouped_paths(body).into_iter().map(|(t, f)| (first, t, f)));
+                        group = None;
+                    }
+                    None => {
+                        body.push_str(rest);
+                        body.push('\n');
+                    }
+                }
+            }
+            for (at, target, full) in paths {
                 if allowed(layer, &rel, target) {
                     continue;
                 }
@@ -131,7 +213,7 @@ fn forbidden_imports(src_root: &Path) -> Vec<String> {
                         .is_some_and(|(file, prefix)| file == rel && full.starts_with(prefix))
                 });
                 if !allowlisted {
-                    findings.push(format!("{rel}:{}: {layer} imports {full}", n + 1));
+                    findings.push(format!("{rel}:{}: {layer} imports {full}", at + 1));
                 }
             }
         }
@@ -152,10 +234,21 @@ fn scanner_flags_a_domain_adapter_import() {
          mod tests {\n    use crate::adapters::fine_in_tests;\n}\n",
     )
     .unwrap();
+    // Grouped imports, on one line and across lines.
+    std::fs::write(
+        domain.join("y.rs"),
+        "use crate::{adapters::chdb::X, domain::Y};\n\
+         use crate::{\n    domain::Z,\n    application::svc::{A, B},\n};\n",
+    )
+    .unwrap();
     let findings = forbidden_imports(dir.path());
     assert_eq!(
         findings,
-        ["domain/x.rs:1: domain imports crate::adapters::wal"]
+        [
+            "domain/x.rs:1: domain imports crate::adapters::wal",
+            "domain/y.rs:1: domain imports crate::adapters::chdb::X",
+            "domain/y.rs:2: domain imports crate::application::svc",
+        ]
     );
 }
 
