@@ -451,6 +451,7 @@ impl MeasurementSource {
         }
     }
 
+    #[cfg(test)]
     pub fn as_concrete(&self) -> Option<&Measurement> {
         match self {
             MeasurementSource::Concrete(m) => Some(m),

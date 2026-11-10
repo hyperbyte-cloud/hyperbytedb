@@ -180,6 +180,8 @@ impl ReplicationApplyQueue {
         Arc::new(Self { tx })
     }
 
+    /// Test support.
+    #[doc(hidden)]
     pub fn with_defaults(
         metadata: Arc<dyn crate::ports::metadata::MetadataPort>,
         wal: Arc<dyn WalPort>,

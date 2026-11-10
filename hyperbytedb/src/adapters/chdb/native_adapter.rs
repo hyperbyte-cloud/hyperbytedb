@@ -71,6 +71,7 @@ use crate::ports::points_sink::{PointsSinkPort, WriteAck};
 
 /// Default threshold when no `[chdb].tag_low_cardinality_max` or cardinality
 /// config is available (e.g. unit tests constructing the adapter directly).
+#[cfg(test)]
 pub const DEFAULT_TAG_LOW_CARDINALITY_MAX: usize = 100_000;
 
 /// Column kind for tags and fields. Tags use `LowCardinality(String)` only
@@ -476,6 +477,9 @@ impl ChdbNativeAdapter {
     /// True if `series_id` is already registered (dimension row inserted +
     /// persisted) for this table.
     /// How many times `ensure_table` has probed the engine's columns.
+    ///
+    /// Test support.
+    #[doc(hidden)]
     #[doc(hidden)]
     pub fn engine_probe_count(&self) -> u64 {
         self.engine_probes

@@ -16,6 +16,7 @@ use std::collections::HashSet;
 use std::fmt;
 
 use crate::domain::column_mapping::tag_column_name as map_tag_column_name;
+#[cfg(test)]
 use crate::error::HyperbytedbError;
 
 /// Sanitized unquoted ClickHouse identifier (`[A-Za-z0-9_]`).
@@ -66,6 +67,7 @@ impl fmt::Display for QuotedTableName {
 }
 
 /// Reject control characters in identifiers before quoting.
+#[cfg(test)]
 fn reject_control_chars(ident: &str) -> Result<(), HyperbytedbError> {
     if ident.chars().any(char::is_control) {
         return Err(HyperbytedbError::QueryParse(format!(
@@ -148,6 +150,7 @@ pub fn quote_backticks(ident: &str) -> String {
 }
 
 /// Like [`quote_backticks`], but rejects control characters first.
+#[cfg(test)]
 pub fn quote_backticks_validated(ident: &str) -> Result<String, HyperbytedbError> {
     reject_control_chars(ident)?;
     Ok(quote_backticks(ident))

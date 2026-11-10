@@ -78,7 +78,10 @@ impl ForwardCoalescer {
     }
 
     /// Destinations with a lane (one per node forwarded to so far).
+    ///
+    /// Test support.
     #[must_use]
+    #[doc(hidden)]
     pub fn lane_count(&self) -> usize {
         self.lanes.lock().len()
     }

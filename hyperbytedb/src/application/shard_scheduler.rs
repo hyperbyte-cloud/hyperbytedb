@@ -766,6 +766,9 @@ impl ShardScheduler {
     /// The series count this scheduler holds for `(region_id, node_id)`, or
     /// `None` if it never recorded one. Test support for the heartbeat
     /// handler, which has no other externally visible effect.
+    ///
+    /// Test support.
+    #[doc(hidden)]
     pub async fn recorded_heartbeat_series(&self, region_id: u64, node_id: u64) -> Option<u64> {
         self.heartbeats
             .read()

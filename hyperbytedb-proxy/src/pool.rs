@@ -81,6 +81,9 @@ impl BackendPool {
     }
 
     /// Replace the backend snapshot (tests and benchmarks only).
+    ///
+    /// Test support.
+    #[doc(hidden)]
     #[doc(hidden)]
     pub async fn set_backends_for_test(&self, backends: Vec<Arc<Backend>>) {
         let mut guard = self.backends.write().await;

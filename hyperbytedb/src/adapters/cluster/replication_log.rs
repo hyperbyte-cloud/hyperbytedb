@@ -184,6 +184,7 @@ impl ReplicationLog {
     /// **Note:** Only considers peers that already have a `repl_ack` key. Peers that
     /// have never successfully acked are omitted, which can overstate the minimum.
     /// Prefer [`Self::min_max_wal_ack_for_peers`] for flush truncation decisions.
+    #[cfg(test)]
     pub fn min_wal_ack(&self) -> Result<Option<u64>, HyperbytedbError> {
         let cf = self
             .db
@@ -256,6 +257,7 @@ impl ReplicationLog {
     }
 
     /// Read mutation log entries from a given sequence.
+    #[cfg(test)]
     pub fn read_mutations_from(
         &self,
         from_seq: u64,

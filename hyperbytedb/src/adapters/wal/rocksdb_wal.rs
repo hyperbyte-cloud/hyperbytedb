@@ -355,6 +355,7 @@ impl RocksDbWal {
     }
 
     /// Synchronous group-commit append for the dedicated WAL writer thread.
+    #[cfg(test)]
     pub fn append_batch_sync(&self, entries: Vec<WalEntry>) -> Result<Vec<u64>, HyperbytedbError> {
         let bundles: Vec<WalAppendBundle> = entries
             .into_iter()
