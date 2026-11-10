@@ -3805,7 +3805,7 @@ mod tests {
     }
 
     /// A peer that is reachable but cannot answer — the cheap, deterministic
-    /// stand-in for an unreachable one. `fetch_shard_map` turns any non-2xx
+    /// stand-in for an unreachable one. `PeerRpc::shard_map` turns any non-2xx
     /// into an error on the same path a connect failure takes, and unlike a
     /// closed port it can count how many times it was asked.
     async fn spawn_failing_mock_peer() -> (String, Arc<std::sync::atomic::AtomicU64>) {
