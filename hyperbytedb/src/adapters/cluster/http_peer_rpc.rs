@@ -8,9 +8,13 @@ use bytes::Bytes;
 
 use crate::adapters::cluster::peer_client::PeerClient;
 use crate::domain::cluster::peer_rpc::{PeerRpcError, ShardWriteTarget};
+use crate::domain::sharding::transfer::{
+    ShardRehomeRequest, ShardTransferPayload, TRANSFER_PAYLOAD_HEADER,
+};
 use crate::domain::sharding::types::{
-    ShardBootstrapRequest, ShardDeleteRequest, ShardMetadataRequest, ShardQueryRequest,
-    ShardWriteBatchResponse,
+    FEATURE_CROSS_EPOCH_MERGE, MvHandoffRequest, NODE_FEATURES_HEADER, REHOME_PROGRESS_HEADER,
+    RegionHeartbeat, ShardBootstrapRequest, ShardDeleteRequest, ShardMetadataRequest,
+    ShardMvBackfillRequest, ShardQueryRequest, ShardWriteBatchResponse,
 };
 use crate::error::error_chain;
 use crate::ports::peer_rpc::{ByteStream, PeerRpc};
@@ -22,6 +26,15 @@ enum Clients {
 
 pub struct HttpPeerRpc {
     clients: Clients,
+}
+
+/// The port on `pc`'s pooled clients, with its membership.
+#[must_use]
+pub fn peers_for(pc: Arc<PeerClient>) -> crate::ports::peer_rpc::Peers {
+    crate::ports::peer_rpc::Peers {
+        membership: pc.membership().clone(),
+        rpc: Arc::new(HttpPeerRpc::new(pc)),
+    }
 }
 
 impl HttpPeerRpc {
@@ -205,6 +218,146 @@ impl PeerRpc for HttpPeerRpc {
             .await
             .map(|_| ())
     }
+
+    async fn shard_transfer_push(
+        &self,
+        addr: &str,
+        mut payload: ShardTransferPayload,
+        timeout: Duration,
+    ) -> Result<String, PeerRpcError> {
+        use base64::Engine as _;
+        // Bytes: the fallback below resends it without a copy.
+        let body = Bytes::from(payload.body.take().unwrap_or_default());
+        let header = serde_json::to_vec(&payload)
+            .map(|json| base64::engine::general_purpose::STANDARD.encode(json))
+            .map_err(|e| PeerRpcError::Unreachable(format!("transfer header: {e}")))?;
+        let raw = self
+            .client()
+            .post(format!("http://{addr}/internal/shard/transfer/raw"))
+            .header(TRANSFER_PAYLOAD_HEADER, header)
+            .header(reqwest::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(body.clone())
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(|e| PeerRpcError::Unreachable(error_chain(&e)))?;
+        let resp = if raw.status() == reqwest::StatusCode::NOT_FOUND {
+            // An older node, or a region the receiver does not know: the JSON
+            // route answers the second the same way.
+            payload.body = Some(body.to_vec());
+            self.post_json(addr, "/internal/shard/transfer", &payload, timeout)
+                .await?
+        } else {
+            Self::checked(Ok(raw)).await?
+        };
+        Ok(resp.text().await.unwrap_or_default())
+    }
+
+    async fn shard_transfer_ack(
+        &self,
+        addr: &str,
+        payload: &ShardTransferPayload,
+        timeout: Duration,
+    ) -> Result<(), PeerRpcError> {
+        self.post_json(addr, "/internal/shard/transfer", payload, timeout)
+            .await
+            .map(|_| ())
+    }
+
+    async fn shard_mv_backfill(
+        &self,
+        addr: &str,
+        req: &ShardMvBackfillRequest,
+        timeout: Duration,
+    ) -> Result<(), PeerRpcError> {
+        self.post_json(addr, "/internal/shard/mv-backfill", req, timeout)
+            .await
+            .map(|_| ())
+    }
+
+    async fn mv_handoff(
+        &self,
+        addr: &str,
+        req: &MvHandoffRequest,
+        timeout: Duration,
+    ) -> Result<(), PeerRpcError> {
+        self.post_json(addr, "/internal/mv/handoff", req, timeout)
+            .await
+            .map(|_| ())
+    }
+
+    async fn shard_heartbeat(
+        &self,
+        addr: &str,
+        hb: &RegionHeartbeat,
+        timeout: Duration,
+    ) -> Result<(), PeerRpcError> {
+        let resp = self
+            .client()
+            .post(format!("http://{addr}/internal/shard/heartbeat"))
+            .header(NODE_FEATURES_HEADER, FEATURE_CROSS_EPOCH_MERGE)
+            .json(hb)
+            .timeout(timeout)
+            .send()
+            .await;
+        Self::checked(resp).await.map(|_| ())
+    }
+
+    async fn shard_rehome(
+        &self,
+        addr: &str,
+        req: &ShardRehomeRequest,
+        idle: Duration,
+        max: Duration,
+    ) -> Result<serde_json::Value, PeerRpcError> {
+        let resp = self
+            .client()
+            .post(format!("http://{addr}/internal/shard/rehome"))
+            .header(REHOME_PROGRESS_HEADER, "1")
+            .json(req)
+            .timeout(max)
+            .send()
+            .await;
+        let mut resp = Self::checked(resp).await?;
+        let mut raw = Vec::new();
+        loop {
+            match tokio::time::timeout(idle, resp.chunk()).await {
+                Err(_) => {
+                    return Err(PeerRpcError::Unreachable(format!(
+                        "rehome silent for {idle:?}"
+                    )));
+                }
+                Ok(Err(e)) => return Err(PeerRpcError::Unreachable(error_chain(&e))),
+                Ok(Ok(None)) => break,
+                Ok(Ok(Some(chunk))) => raw.extend_from_slice(&chunk),
+            }
+        }
+        serde_json::from_slice(&raw)
+            .map_err(|e| PeerRpcError::Unreachable(format!("rehome result: {e}")))
+    }
+
+    async fn sync_manifest(
+        &self,
+        addr: &str,
+        timeout: Duration,
+    ) -> Result<crate::domain::cluster::sync::SyncManifest, PeerRpcError> {
+        let resp = self.get(addr, "/internal/sync/manifest", timeout).await?;
+        let body = Self::body(resp).await?;
+        serde_json::from_slice(&body)
+            .map_err(|e| PeerRpcError::Unreachable(format!("parse sync manifest: {e}")))
+    }
+
+    async fn shard_map(
+        &self,
+        addr: &str,
+        timeout: Duration,
+    ) -> Result<crate::domain::sharding::ShardMap, PeerRpcError> {
+        let resp = self.get(addr, "/internal/shard/map", timeout).await?;
+        let body = Self::body(resp).await?;
+        let json: crate::domain::sharding::ShardMapJson = serde_json::from_slice(&body)
+            .map_err(|e| PeerRpcError::Unreachable(format!("parse shard map: {e}")))?;
+        Ok(crate::domain::sharding::ShardMap::from(json))
+    }
 }
 
 #[cfg(test)]
@@ -262,5 +415,53 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, PeerRpcError::Unreachable(_)), "{err:?}");
+    }
+
+    /// An older peer without the raw route answers 404; the push is then
+    /// sent once as JSON, as before.
+    #[tokio::test]
+    async fn transfer_push_falls_back_to_json_on_404() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let raw = Arc::new(AtomicUsize::new(0));
+        let json = Arc::new(AtomicUsize::new(0));
+        let (r, j) = (raw.clone(), json.clone());
+        let app = axum::Router::new()
+            .route(
+                "/internal/shard/transfer/raw",
+                axum::routing::post(move || {
+                    r.fetch_add(1, Ordering::SeqCst);
+                    async { axum::http::StatusCode::NOT_FOUND }
+                }),
+            )
+            .route(
+                "/internal/shard/transfer",
+                axum::routing::post(move || {
+                    j.fetch_add(1, Ordering::SeqCst);
+                    async { "applied=3" }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let rpc = HttpPeerRpc::with_client(reqwest::Client::new());
+        let payload = crate::domain::sharding::transfer::ShardTransferPayload::ack(
+            "db",
+            "autogen",
+            "cpu",
+            1,
+            0,
+            u64::MAX,
+            Default::default(),
+            1,
+            7,
+        );
+        let body = rpc
+            .shard_transfer_push(&addr, payload, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(body, "applied=3");
+        assert_eq!(raw.load(Ordering::SeqCst), 1);
+        assert_eq!(json.load(Ordering::SeqCst), 1);
     }
 }

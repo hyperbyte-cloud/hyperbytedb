@@ -276,7 +276,9 @@ pub async fn start_sharded_node(
                 shard_map.clone(),
                 shared_membership.clone(),
                 raft,
-                Some(peer_client.clone()),
+                Some(hyperbytedb::adapters::cluster::http_peer_rpc::peers_for(
+                    peer_client.clone(),
+                )),
                 metadata.clone(),
                 wal.clone(),
                 Some(chdb_adapter.clone() as Arc<dyn QueryPort>),

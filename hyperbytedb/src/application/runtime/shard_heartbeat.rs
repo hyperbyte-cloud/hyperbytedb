@@ -5,16 +5,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use metrics::counter;
-use reqwest::StatusCode;
 use tokio::sync::watch;
 
-use crate::adapters::cluster::peer_client::PeerClient;
 use crate::application::runtime::RegionWriteStats;
 use crate::domain::chdb_naming::unquoted_table_name;
 use crate::domain::cluster::membership::SharedMembership;
 use crate::domain::sharding::{RegionHeartbeat, ShardMap, ShardRegion};
 use crate::ports::leadership::LeadershipPort;
 use crate::ports::metadata::MetadataPort;
+use crate::ports::peer_rpc::{PeerRpc, SharedPeerRpc};
 use crate::ports::query::QueryPort;
 use crate::ports::sharding::ShardMapPort;
 
@@ -36,7 +35,7 @@ struct ByteEstimateCache {
 #[allow(clippy::too_many_arguments)]
 pub async fn run_region_heartbeat_reporter(
     node_id: u64,
-    peer_client: Arc<PeerClient>,
+    peer_rpc: SharedPeerRpc,
     membership: SharedMembership,
     shard_map: Arc<dyn ShardMapPort>,
     leadership: Arc<dyn LeadershipPort>,
@@ -57,7 +56,7 @@ pub async fn run_region_heartbeat_reporter(
                 byte_estimates.tick = byte_estimates.tick.wrapping_add(1);
                 if let Err(e) = report_once(
                     node_id,
-                    &peer_client,
+                    peer_rpc.as_ref(),
                     &membership,
                     shard_map.as_ref(),
                     leadership.as_ref(),
@@ -83,7 +82,7 @@ pub async fn run_region_heartbeat_reporter(
 #[allow(clippy::too_many_arguments)]
 async fn report_once(
     node_id: u64,
-    peer_client: &PeerClient,
+    peer_rpc: &dyn PeerRpc,
     membership: &SharedMembership,
     shard_map: &dyn ShardMapPort,
     leadership: &dyn LeadershipPort,
@@ -197,8 +196,7 @@ async fn report_once(
                 epoch: region.epoch,
                 split_key_hint,
             };
-            let url = format!("http://{leader_addr}/internal/shard/heartbeat");
-            if let Err(reason) = post_region_heartbeat(peer_client, &url, &hb).await {
+            if let Err(reason) = post_region_heartbeat(peer_rpc, &leader_addr, &hb).await {
                 if reason == "stale_epoch" {
                     let fresh_map = shard_map.snapshot().await.map_err(|e| e.to_string())?;
                     if let Some(fresh) = lookup_region(
@@ -210,7 +208,7 @@ async fn report_once(
                     ) {
                         hb.epoch = fresh.epoch;
                         if let Err(retry_reason) =
-                            post_region_heartbeat(peer_client, &url, &hb).await
+                            post_region_heartbeat(peer_rpc, &leader_addr, &hb).await
                         {
                             record_heartbeat_failure(retry_reason);
                         }
@@ -240,30 +238,20 @@ fn lookup_region<'a>(
 }
 
 async fn post_region_heartbeat(
-    peer_client: &PeerClient,
-    url: &str,
+    peer_rpc: &dyn PeerRpc,
+    leader_addr: &str,
     hb: &RegionHeartbeat,
 ) -> Result<(), &'static str> {
-    let resp = peer_client
-        .http_client()
-        .post(url)
-        .header(
-            crate::domain::sharding::types::NODE_FEATURES_HEADER,
-            crate::domain::sharding::types::FEATURE_CROSS_EPOCH_MERGE,
-        )
-        .json(hb)
-        .timeout(Duration::from_secs(5))
-        .send()
+    use crate::domain::cluster::peer_rpc::PeerRpcError;
+    match peer_rpc
+        .shard_heartbeat(leader_addr, hb, Duration::from_secs(5))
         .await
-        .map_err(|_| "transport")?;
-
-    if resp.status() == StatusCode::CONFLICT {
-        return Err("stale_epoch");
+    {
+        Ok(()) => Ok(()),
+        Err(PeerRpcError::Status { code: 409, .. }) => Err("stale_epoch"),
+        Err(PeerRpcError::Status { .. }) => Err("http_status"),
+        Err(PeerRpcError::Unreachable(_)) => Err("transport"),
     }
-    if !resp.status().is_success() {
-        return Err("http_status");
-    }
-    Ok(())
 }
 
 fn record_heartbeat_failure(reason: &'static str) {

@@ -230,7 +230,9 @@ async fn serve_inner(
                 map.clone(),
                 membership.clone(),
                 raft.clone(),
-                peer_client.clone(),
+                peer_client
+                    .clone()
+                    .map(crate::adapters::cluster::http_peer_rpc::peers_for),
                 app_state.metadata.clone(),
                 app_state.wal.clone(),
                 Some(app_state.query_port.clone()),
@@ -252,7 +254,7 @@ async fn serve_inner(
                 );
             }
 
-            if let (Some(sr), Some(pc), Some(rl)) = (
+            if let (Some(sr), Some(_), Some(rl)) = (
                 app_state.shard_routing.as_ref(),
                 peer_client.as_ref(),
                 &app_state.replication_log,
@@ -270,7 +272,6 @@ async fn serve_inner(
                     )
                     .with_sharding(
                         sr.clone(),
-                        pc.clone(),
                         app_state.metadata.clone(),
                         app_state.points_sink.clone(),
                         app_state.query_port.clone(),
@@ -306,7 +307,9 @@ async fn serve_inner(
                     if let Some(pc) = pc {
                         shard_heartbeat::run_region_heartbeat_reporter(
                             node_id,
-                            pc,
+                            Arc::new(crate::adapters::cluster::http_peer_rpc::HttpPeerRpc::new(
+                                pc,
+                            )),
                             m,
                             map,
                             Arc::new(raft),

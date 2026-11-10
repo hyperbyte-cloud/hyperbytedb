@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::adapters::cluster::peer_client::PeerClient;
 use crate::adapters::cluster::raft::HyperbytedbRaft;
 use crate::application::shard_routing::ShardRoutingContext;
 use crate::application::shard_transfer::run_region_transfer;
@@ -29,7 +28,6 @@ pub struct DrainService {
     replication_log: Arc<dyn ReplicationAcks>,
     wal: Arc<dyn WalPort>,
     shard_routing: Option<Arc<ShardRoutingContext>>,
-    peer_client: Option<Arc<PeerClient>>,
     metadata: Option<Arc<dyn MetadataPort>>,
     points_sink: Option<Arc<dyn PointsSinkPort>>,
     query_port: Option<Arc<dyn QueryPort>>,
@@ -60,7 +58,6 @@ impl DrainService {
             replication_log,
             wal,
             shard_routing: None,
-            peer_client: None,
             metadata: None,
             points_sink: None,
             query_port: None,
@@ -74,7 +71,6 @@ impl DrainService {
     pub fn with_sharding(
         mut self,
         ctx: Arc<ShardRoutingContext>,
-        peer_client: Arc<PeerClient>,
         metadata: Arc<dyn MetadataPort>,
         points_sink: Arc<dyn PointsSinkPort>,
         query_port: Arc<dyn QueryPort>,
@@ -82,7 +78,6 @@ impl DrainService {
         max_points_per_request: usize,
     ) -> Self {
         self.shard_routing = Some(ctx);
-        self.peer_client = Some(peer_client);
         self.metadata = Some(metadata);
         self.points_sink = Some(points_sink);
         self.query_port = Some(query_port);
@@ -197,10 +192,7 @@ impl DrainService {
             Some(c) => c,
             None => return Ok(()),
         };
-        let pc = self
-            .peer_client
-            .as_ref()
-            .ok_or_else(|| HyperbytedbError::ClusterUnavailable("no peer client".into()))?;
+        let peers = ctx.peers();
         let metadata = self
             .metadata
             .as_ref()
@@ -224,7 +216,7 @@ impl DrainService {
 
             if copy {
                 run_region_transfer(
-                    pc,
+                    &peers,
                     metadata,
                     &self.wal,
                     self.query_port.as_ref(),
