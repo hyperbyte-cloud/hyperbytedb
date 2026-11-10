@@ -127,6 +127,9 @@ impl BatchingWal {
                 Instant,
                 oneshot::Sender<Result<(u64, BatchTiming), HyperbytedbError>>,
             )>::with_capacity(batch_len);
+            // `drain`, not `into_iter`: `batch` is reused across loop turns
+            // and keeps its allocation.
+            #[allow(clippy::iter_with_drain)]
             for req in batch.drain(..) {
                 bundles.push(req.bundle);
                 pre_encoded.push(req.pre_encoded);

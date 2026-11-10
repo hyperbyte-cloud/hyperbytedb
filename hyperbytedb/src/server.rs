@@ -33,7 +33,7 @@ pub async fn serve(
     if config.cluster.enabled {
         control::install()?;
     }
-    let result = serve_inner(config, log_level).await;
+    let result = Box::pin(serve_inner(config, log_level)).await;
     control::shutdown();
     result
 }
@@ -168,17 +168,19 @@ async fn serve_inner(
             )
             .await?;
             Some(
-                c.start_raft(
-                    &config.cluster,
-                    app_state.metadata.clone(),
-                    app_state.mv_service.clone(),
-                    app_state.points_sink.clone(),
-                    app_state.wal.clone(),
-                    rocks_shard_map
-                        .as_ref()
-                        .zip(Some(app_state.shard_location_cache.clone()))
-                        .map(|(m, cache)| (m.clone(), cache)),
-                    app_state.shard_routing.clone(),
+                Box::pin(
+                    c.start_raft(
+                        &config.cluster,
+                        app_state.metadata.clone(),
+                        app_state.mv_service.clone(),
+                        app_state.points_sink.clone(),
+                        app_state.wal.clone(),
+                        rocks_shard_map
+                            .as_ref()
+                            .zip(Some(app_state.shard_location_cache.clone()))
+                            .map(|(m, cache)| (m.clone(), cache)),
+                        app_state.shard_routing.clone(),
+                    ),
                 )
                 .await?,
             )
@@ -308,7 +310,7 @@ async fn serve_inner(
 
             let interval = Duration::from_secs(config.sharding.heartbeat_interval_secs.max(1));
             let rx = service_shutdown_rx.clone();
-            let sched = scheduler.clone();
+            let sched = scheduler;
             let hb_handle = {
                 let pc = peer_client.clone();
                 let node_id = config.cluster.node_id;

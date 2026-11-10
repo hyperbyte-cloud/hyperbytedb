@@ -169,7 +169,7 @@ pub fn translate_materialized_view_select_with_source_filter(
     ];
     select_parts.extend(sorted_field_strs);
 
-    let mut group_parts = vec![time_bucket.clone()];
+    let mut group_parts = vec![time_bucket];
     for tag in &grouped_tags {
         group_parts.push(format!(
             "s.{}",
