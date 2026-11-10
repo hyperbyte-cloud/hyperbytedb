@@ -235,16 +235,15 @@ impl ShardLocationCache {
         }
 
         let region = map.locate(db, rp, measurement, series_id)?.clone();
-        let mut inner = self.write_inner();
         if let Some(space) = map.space(db, rp, measurement) {
+            // Built before the lock: only the insert needs it.
+            let cached = CachedMeasurement {
+                map_version: map.map_version,
+                regions: materialise_serving(&space.regions),
+            };
+            let mut inner = self.write_inner();
             inner.map_version = inner.map_version.max(map.map_version);
-            inner.by_measurement.insert(
-                cache_key,
-                CachedMeasurement {
-                    map_version: map.map_version,
-                    regions: materialise_serving(&space.regions),
-                },
-            );
+            inner.by_measurement.insert(cache_key, cached);
         }
         Some(region)
     }
@@ -282,16 +281,15 @@ impl ShardLocationCache {
             primary: region.primary,
             self_is_peer: region.peers.contains(&self_id),
         };
-        let mut inner = self.write_inner();
         if let Some(space) = map.space(db, rp, measurement) {
+            // Built before the lock: only the insert needs it.
+            let cached = CachedMeasurement {
+                map_version: map.map_version,
+                regions: materialise_serving(&space.regions),
+            };
+            let mut inner = self.write_inner();
             inner.map_version = inner.map_version.max(map.map_version);
-            inner.by_measurement.insert(
-                cache_key,
-                CachedMeasurement {
-                    map_version: map.map_version,
-                    regions: materialise_serving(&space.regions),
-                },
-            );
+            inner.by_measurement.insert(cache_key, cached);
         }
         Some(route)
     }
@@ -306,11 +304,18 @@ impl ShardLocationCache {
         epoch: ShardEpoch,
     ) -> bool {
         let cache_key = Self::measurement_key(db, rp, measurement);
-        let inner = self.read_inner();
-        if let Some(cached) = inner.by_measurement.get(&cache_key)
-            && cached.map_version == map.map_version
-        {
-            return locate_in_regions(&cached.regions, series_id).is_some_and(|r| r.epoch == epoch);
+        let cached_hit = {
+            let inner = self.read_inner();
+            inner
+                .by_measurement
+                .get(&cache_key)
+                .filter(|cached| cached.map_version == map.map_version)
+                .map(|cached| {
+                    locate_in_regions(&cached.regions, series_id).is_some_and(|r| r.epoch == epoch)
+                })
+        };
+        if let Some(hit) = cached_hit {
+            return hit;
         }
         map.locate(db, rp, measurement, series_id)
             .is_some_and(|r| r.epoch == epoch)
@@ -461,7 +466,7 @@ mod tests {
         apply_shard_map_op(
             &mut map,
             ShardMapOp::BootstrapMeasurement {
-                key: key.clone(),
+                key,
                 region: sample_region(1, 0, u64::MAX),
             },
         )
@@ -480,7 +485,7 @@ mod tests {
         apply_shard_map_op(
             &mut map,
             ShardMapOp::BootstrapMeasurement {
-                key: key.clone(),
+                key,
                 region: sample_region(1, 0, u64::MAX),
             },
         )
@@ -521,7 +526,7 @@ mod tests {
         apply_shard_map_op(
             &mut map,
             ShardMapOp::Split {
-                key: key.clone(),
+                key,
                 region_id: 1,
                 split_key,
                 epoch: ShardEpoch::default(),
@@ -568,7 +573,7 @@ mod tests {
         apply_shard_map_op(
             &mut map_b,
             ShardMapOp::BootstrapMeasurement {
-                key: key_b.clone(),
+                key: key_b,
                 region: sample_region(2, 0, u64::MAX),
             },
         )

@@ -388,7 +388,7 @@ mod tests {
         let err = apply_shard_map_op(
             &mut map,
             ShardMapOp::Merge {
-                key: key.clone(),
+                key,
                 left_region_id: 1,
                 right_region_id: 2,
                 epoch: stale,
@@ -427,7 +427,7 @@ mod tests {
                 split_key,
                 epoch: ShardEpoch::default(),
                 left: left.clone(),
-                right: right.clone(),
+                right,
             },
         )
         .unwrap();
@@ -788,7 +788,7 @@ mod tests {
         apply_shard_map_op(
             &mut map,
             ShardMapOp::Split {
-                key: cpu_key.clone(),
+                key: cpu_key,
                 region_id: 1,
                 split_key,
                 epoch: ShardEpoch::default(),
@@ -1297,7 +1297,7 @@ mod tests {
         let err = apply_shard_map_op(
             &mut map,
             ShardMapOp::PromotePeer {
-                key: key.clone(),
+                key,
                 region_id: 1,
                 peer: 999,
                 epoch,

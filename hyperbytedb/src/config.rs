@@ -563,13 +563,13 @@ impl ChdbConfig {
 
     pub fn resolved_query_pool_size(&self) -> usize {
         self.query_pool_size
-            .or((self.pool_size > 0).then_some(self.pool_size))
+            .or_else(|| (self.pool_size > 0).then_some(self.pool_size))
             .unwrap_or_else(crate::adapters::chdb::connection_pool::default_query_pool_size)
     }
 
     pub fn resolved_write_pool_size(&self) -> usize {
         self.write_pool_size
-            .or((self.pool_size > 0).then_some(self.pool_size))
+            .or_else(|| (self.pool_size > 0).then_some(self.pool_size))
             .unwrap_or(crate::adapters::chdb::connection_pool::DEFAULT_WRITE_POOL_SIZE)
     }
 

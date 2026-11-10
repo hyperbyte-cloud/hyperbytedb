@@ -314,7 +314,7 @@ fn rewrite_field_for_region(
             "FIRST" => {
                 let _source = aggregate_source_field_name(func)?;
                 let time_col = format!("{output}__sel_time");
-                plan.first_partials.insert(output.clone(), time_col.clone());
+                plan.first_partials.insert(output, time_col.clone());
                 Ok(vec![
                     field.clone(),
                     field_with_call("min", "time", Some(time_col)),
@@ -323,7 +323,7 @@ fn rewrite_field_for_region(
             "LAST" => {
                 let _source = aggregate_source_field_name(func)?;
                 let time_col = format!("{output}__sel_time");
-                plan.last_partials.insert(output.clone(), time_col.clone());
+                plan.last_partials.insert(output, time_col.clone());
                 Ok(vec![
                     field.clone(),
                     field_with_call("max", "time", Some(time_col)),
@@ -1917,7 +1917,7 @@ mod tests {
             ("SLIMIT", with(&|s| s.slimit = Some(2)), Some("ms"), day),
             (
                 "too many buckets",
-                stmt.clone(),
+                stmt,
                 Some("ms"),
                 (Some(0), Some(i64::MAX / 2)),
             ),

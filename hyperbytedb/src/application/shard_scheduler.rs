@@ -200,7 +200,7 @@ fn choose_split_key(
     let inside = |k: &u64| *k > start && *k < end;
     peer_hint
         .filter(inside)
-        .or(local_median.filter(inside))
+        .or_else(|| local_median.filter(inside))
         .unwrap_or(start + (end - start) / 2)
         .max(start.saturating_add(1))
         .min(end.saturating_sub(1))
@@ -766,6 +766,9 @@ impl ShardScheduler {
     /// The series count this scheduler holds for `(region_id, node_id)`, or
     /// `None` if it never recorded one. Test support for the heartbeat
     /// handler, which has no other externally visible effect.
+    ///
+    /// Test support.
+    #[doc(hidden)]
     pub async fn recorded_heartbeat_series(&self, region_id: u64, node_id: u64) -> Option<u64> {
         self.heartbeats
             .read()

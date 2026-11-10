@@ -146,6 +146,7 @@ impl FlushServiceImpl {
         self
     }
 
+    #[cfg(test)]
     pub fn with_sharded_wal_retention_bytes(mut self, bytes: u64) -> Self {
         self.sharded_wal_retention_bytes = bytes;
         self

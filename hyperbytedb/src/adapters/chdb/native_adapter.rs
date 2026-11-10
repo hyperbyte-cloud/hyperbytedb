@@ -71,6 +71,7 @@ use crate::ports::points_sink::{PointsSinkPort, WriteAck};
 
 /// Default threshold when no `[chdb].tag_low_cardinality_max` or cardinality
 /// config is available (e.g. unit tests constructing the adapter directly).
+#[cfg(test)]
 pub const DEFAULT_TAG_LOW_CARDINALITY_MAX: usize = 100_000;
 
 /// Column kind for tags and fields. Tags use `LowCardinality(String)` only
@@ -476,6 +477,9 @@ impl ChdbNativeAdapter {
     /// True if `series_id` is already registered (dimension row inserted +
     /// persisted) for this table.
     /// How many times `ensure_table` has probed the engine's columns.
+    ///
+    /// Test support.
+    #[doc(hidden)]
     #[doc(hidden)]
     pub fn engine_probe_count(&self) -> u64 {
         self.engine_probes
@@ -774,16 +778,11 @@ impl ChdbNativeAdapter {
         let tag_ddl_needed = tag_phys
             .iter()
             .any(|(_, phys, kind)| series_cached.columns.get(phys).copied() != Some(*kind));
-        let missing_fields: Vec<&(String, String, u8)> = field_phys
+        let fields_missing = field_phys
             .iter()
-            .filter(|(_, phys, d)| !cached.knows(phys, ColumnKind::Field(*d)))
-            .collect();
+            .any(|(_, phys, d)| !cached.knows(phys, ColumnKind::Field(*d)));
 
-        if cached.materialized
-            && series_cached.materialized
-            && !tag_ddl_needed
-            && missing_fields.is_empty()
-        {
+        if cached.materialized && series_cached.materialized && !tag_ddl_needed && !fields_missing {
             if probed {
                 // Nothing missing: the cache already holds every engine column.
                 let mut guard = self.schemas.write();
@@ -1353,7 +1352,7 @@ impl ChdbNativeAdapter {
             measurements: vec![PreparedMeasurementBatch {
                 measurement: wire.measurement.clone(),
                 table_name: ensured.table.clone(),
-                series_table_name: ensured.series_table.clone(),
+                series_table_name: ensured.series_table,
                 batch: Arc::new(batch),
                 row_count: n,
                 min_time,
@@ -3000,7 +2999,7 @@ mod tests {
             "DDL must sort field columns by physical name, got: {ddl}"
         );
 
-        let mut sorted = field_phys.clone();
+        let mut sorted = field_phys;
         sorted.sort_by(|a, b| a.1.cmp(&b.1));
         let ensured = EnsuredTable {
             table: "`db_rp_cpu`".to_string(),
