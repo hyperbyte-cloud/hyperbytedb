@@ -1951,8 +1951,7 @@ async fn run_series_query(
     epoch: Option<&str>,
     group_by_tags: &[String],
 ) -> Result<Vec<SeriesResult>, HyperbytedbError> {
-    let mut stage =
-        crate::application::stage_timer::StageTimer::new("hyperbytedb_query_local_stage_seconds");
+    let mut stage = crate::telemetry::StageTimer::new("hyperbytedb_query_local_stage_seconds");
     let sql = with_execution_time_limit(sql, svc.query_timeout_secs());
     let mut batches = svc.query_port.execute_sql_arrow(&sql).await?;
     let mut builder = crate::application::query_arrow_series::SeriesBuilder::new(
@@ -2686,8 +2685,7 @@ async fn execute_sharded_measurement_query(
     epoch: Option<&str>,
     group_by_tags: &[String],
 ) -> Result<Vec<SeriesResult>, HyperbytedbError> {
-    let mut stage =
-        crate::application::stage_timer::StageTimer::new("hyperbytedb_query_stage_seconds");
+    let mut stage = crate::telemetry::StageTimer::new("hyperbytedb_query_stage_seconds");
     // The region SQL names columns this way; the merge must use the same names.
     let named = to_clickhouse::with_output_names(stmt);
     let stmt = &named;

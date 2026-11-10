@@ -175,6 +175,55 @@ pub trait MetadataPort: Send + Sync {
         entries: &[(String, String)],
     ) -> Result<(), HyperbytedbError>;
 
+    /// Add `tags`' keys to `measurement`'s tag keys (creating it, with no
+    /// fields, when unknown) and record the tag values, in one batch.
+    async fn backfill_tag_keys(
+        &self,
+        db: &str,
+        rp: &str,
+        measurement: &str,
+        tags: Vec<(String, String)>,
+    ) -> Result<(), HyperbytedbError> {
+        use std::collections::{BTreeSet, HashMap, HashSet};
+        let mut tag_keys: BTreeSet<String> = BTreeSet::new();
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+        let mut tag_batch: Vec<(String, String)> = Vec::new();
+        for (k, v) in tags {
+            tag_keys.insert(k.clone());
+            if seen.insert((k.clone(), v.clone())) {
+                tag_batch.push((k, v));
+            }
+        }
+        if tag_keys.is_empty() {
+            return Ok(());
+        }
+
+        let mut meas_updates: Vec<MeasurementMeta> = Vec::new();
+        if let Some(mut existing) = self.get_measurement(db, rp, measurement).await? {
+            let before_len = existing.tag_keys.len();
+            for k in &tag_keys {
+                if !existing.tag_keys.contains(k) {
+                    existing.tag_keys.push(k.clone());
+                }
+            }
+            existing.tag_keys.sort();
+            if existing.tag_keys.len() != before_len {
+                meas_updates.push(existing);
+            }
+        } else {
+            meas_updates.push(MeasurementMeta {
+                name: measurement.to_string(),
+                field_types: HashMap::new(),
+                tag_keys: tag_keys.into_iter().collect(),
+                ..Default::default()
+            });
+        }
+
+        let tag_entries = vec![(measurement.to_string(), tag_batch)];
+        self.register_metadata_batch(db, rp, &meas_updates, &tag_entries)
+            .await
+    }
+
     /// Batch-register multiple measurements and their tag values in a single write.
     /// Default falls back to individual calls; RocksDB overrides with a single WriteBatch.
     async fn register_metadata_batch(

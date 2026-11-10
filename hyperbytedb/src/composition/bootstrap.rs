@@ -4,7 +4,7 @@ use crate::adapters::cluster::hinted_handoff::HintedHandoff;
 use crate::adapters::cluster::peer_client::PeerClient;
 use crate::adapters::cluster::raft::{HyperbytedbRaft, TypeConfig};
 use crate::adapters::cluster::replication_log::ReplicationLog;
-use crate::adapters::cluster::sync_client::SyncClient;
+use crate::application::cluster::catch_up::CatchUpService;
 use crate::config::ClusterConfig;
 use crate::domain::cluster::membership::{
     ClusterMembership, NodeInfo, NodeState, SharedMembership,
@@ -119,7 +119,7 @@ impl ClusterBootstrap {
 
         tracing::info!("startup phase: syncing with cluster before accepting traffic");
 
-        let mut sync_client = SyncClient::with_points_sink(
+        let mut sync_client = CatchUpService::with_points_sink(
             config.node_id,
             config.cluster_addr.clone(),
             self.membership.clone(),
@@ -128,7 +128,13 @@ impl ClusterBootstrap {
             points_sink,
             max_points_per_request,
             self.peer_addrs.clone(),
-            self.peer_client.cluster_auth(),
+            Arc::new(
+                crate::adapters::cluster::http_peer_rpc::HttpPeerRpc::with_client({
+                    use crate::adapters::cluster::peer_http::PeerHttp;
+                    let auth = self.peer_client.cluster_auth();
+                    auth.build(auth.client_builder())
+                }),
+            ),
         );
         sync_client = sync_client.with_runtime_settings(self.runtime_settings.clone());
         if let Some(map) = shard_map {

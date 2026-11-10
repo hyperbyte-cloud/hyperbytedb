@@ -909,22 +909,29 @@ pub async fn handle_sync_trigger(State(state): State<Arc<AppState>>) -> impl Int
     };
 
     tokio::spawn(async move {
-        let mut sync_client = crate::adapters::cluster::sync_client::SyncClient::with_points_sink(
-            node_id,
-            {
-                let m = membership_clone.read().await;
-                m.get_node(node_id)
-                    .map(|n| n.addr.clone())
-                    .unwrap_or_default()
-            },
-            membership_clone.clone(),
-            metadata.clone(),
-            wal.clone(),
-            Some(points_sink),
-            max_points_per_request,
-            fallback_peers,
-            &cluster_auth,
-        );
+        let mut sync_client =
+            crate::application::cluster::catch_up::CatchUpService::with_points_sink(
+                node_id,
+                {
+                    let m = membership_clone.read().await;
+                    m.get_node(node_id)
+                        .map(|n| n.addr.clone())
+                        .unwrap_or_default()
+                },
+                membership_clone.clone(),
+                metadata.clone(),
+                wal.clone(),
+                Some(points_sink),
+                max_points_per_request,
+                fallback_peers,
+                Arc::new(
+                    crate::adapters::cluster::http_peer_rpc::HttpPeerRpc::with_client({
+                        use crate::adapters::cluster::peer_http::PeerHttp;
+                        let auth = &cluster_auth;
+                        auth.build(auth.client_builder())
+                    }),
+                ),
+            );
         sync_client = sync_client.with_runtime_settings(runtime_settings);
         // Only a sharded node syncs a shard map. `state.shard_map` is a
         // `DisabledShardMap` otherwise, never `None`: attaching it made a

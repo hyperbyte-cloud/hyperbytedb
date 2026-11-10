@@ -53,7 +53,6 @@ use parking_lot::RwLock;
 use crate::adapters::chdb::catalog;
 use crate::adapters::chdb::connection_pool::ChdbConnectionPool;
 use crate::adapters::chdb::session::{SharedSession, execute_connection};
-use crate::application::ingest_metadata::backfill_tag_metadata;
 use crate::domain::chdb_naming::{
     field_column_name, quote_backticks, quoted_series_table_name, quoted_table_name,
     tag_column_name, unquoted_series_table_name, unquoted_table_name,
@@ -543,7 +542,8 @@ impl ChdbNativeAdapter {
                 tag_pairs.push((k.clone(), v.clone()));
             }
         }
-        backfill_tag_metadata(meta, &key.db, &key.rp, &key.measurement, tag_pairs).await
+        meta.backfill_tag_keys(&key.db, &key.rp, &key.measurement, tag_pairs)
+            .await
     }
 
     async fn ddl_mutex(&self, key: &TableKey) -> Arc<tokio::sync::Mutex<()>> {
@@ -1285,7 +1285,7 @@ impl ChdbNativeAdapter {
         wire: &crate::domain::columnar_batch::ColumnarMsgpackBatch,
         precision: Option<&str>,
     ) -> Result<crate::domain::prepared_wal::PreparedWalSlot, HyperbytedbError> {
-        use crate::application::columnar_msgpack::columnar_timestamps_ns;
+        use crate::domain::columnar_batch::columnar_timestamps_ns;
         use crate::domain::prepared_wal::{PreparedMeasurementBatch, PreparedWalSlot};
         use crate::domain::series::series_id;
 
@@ -1374,9 +1374,8 @@ impl ChdbNativeAdapter {
 
         use crate::domain::prepared_wal::PreparedMeasurementBatch;
 
-        let mut stage = crate::application::stage_timer::StageTimer::new(
-            "hyperbytedb_prepare_measurement_stage_seconds",
-        );
+        let mut stage =
+            crate::telemetry::StageTimer::new("hyperbytedb_prepare_measurement_stage_seconds");
         let ensured = self.ensure_table(key, points).await?;
         stage.lap("ensure_table");
         let origins = vec![origin_node_id; points.len()];
@@ -2340,7 +2339,7 @@ fn columnar_representative_point(
     wire: &crate::domain::columnar_batch::ColumnarMsgpackBatch,
     precision: Option<&str>,
 ) -> Result<Point, HyperbytedbError> {
-    use crate::application::columnar_msgpack::columnar_timestamps_ns;
+    use crate::domain::columnar_batch::columnar_timestamps_ns;
 
     let ts = columnar_timestamps_ns(wire, precision)?;
     let mut fields = BTreeMap::new();

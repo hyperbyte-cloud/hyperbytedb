@@ -1,22 +1,42 @@
-use crate::adapters::cluster::cluster_auth::ClusterAuth;
-use crate::adapters::cluster::peer_http::PeerHttp;
+//! Bringing this node up to date from a peer: on join and on reconnect.
+//! It fetches through [`PeerRpc`](crate::ports::peer_rpc::PeerRpc) and
+//! applies what it gets to this node's metadata, WAL and shard map.
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::application::ingest_metadata::{IngestCardinalityLimits, prepare_batch_metadata};
 use crate::application::wal_append::append_points_with_prepared;
 use crate::domain::cluster::membership::{NodeState, SharedMembership};
-use crate::domain::cluster::sync::{
-    JoinRequest, JoinResponse, MetadataSnapshot, SyncManifest, WalSyncResponse,
-};
-use crate::domain::sharding::{ShardMap, ShardMapJson};
+use crate::domain::cluster::peer_rpc::PeerRpcError;
+use crate::domain::cluster::sync::{JoinRequest, SyncManifest};
 use crate::error::HyperbytedbError;
 use crate::ports::metadata::MetadataPort;
+use crate::ports::peer_rpc::SharedPeerRpc;
 use crate::ports::points_sink::PointsSinkPort;
 use crate::ports::sharding::ShardMapPort;
 use crate::ports::wal::WalPort;
 
-pub struct SyncClient {
+/// Each sync request's deadline (the old sync client's timeout).
+const SYNC_TIMEOUT: Duration = Duration::from_secs(300);
+/// WAL entries asked for per catch-up request.
+const WAL_BATCH: u32 = 5000;
+
+/// A sync call's error: a peer that did not answer is `PeerUnreachable`
+/// (`transport`), one that answered with an error status `SyncFailed`
+/// (`status`), as the sync client mapped them.
+fn sync_err(e: PeerRpcError, transport: &str, status: &str) -> HyperbytedbError {
+    match e {
+        PeerRpcError::Status { code, .. } => {
+            HyperbytedbError::SyncFailed(format!("{status}: {code}"))
+        }
+        PeerRpcError::Unreachable(e) => {
+            HyperbytedbError::PeerUnreachable(format!("{transport}: {e}"))
+        }
+    }
+}
+
+pub struct CatchUpService {
     node_id: u64,
     node_addr: String,
     membership: SharedMembership,
@@ -24,7 +44,7 @@ pub struct SyncClient {
     wal: Arc<dyn WalPort>,
     points_sink: Option<Arc<dyn PointsSinkPort>>,
     max_points_per_request: usize,
-    client: reqwest::Client,
+    rpc: SharedPeerRpc,
     /// Static peer addresses from config, used as fallback when the
     /// membership has no active peers yet (Raft hasn't formed).
     fallback_peer_addrs: Vec<String>,
@@ -32,7 +52,7 @@ pub struct SyncClient {
     runtime_settings: Option<Arc<crate::application::runtime_settings::RuntimeSettings>>,
 }
 
-impl SyncClient {
+impl CatchUpService {
     pub fn new(
         node_id: u64,
         node_addr: String,
@@ -40,7 +60,7 @@ impl SyncClient {
         metadata: Arc<dyn MetadataPort>,
         wal: Arc<dyn WalPort>,
         fallback_peer_addrs: Vec<String>,
-        cluster_auth: &ClusterAuth,
+        rpc: SharedPeerRpc,
     ) -> Self {
         Self::with_points_sink(
             node_id,
@@ -51,7 +71,7 @@ impl SyncClient {
             None,
             0,
             fallback_peer_addrs,
-            cluster_auth,
+            rpc,
         )
     }
 
@@ -65,14 +85,8 @@ impl SyncClient {
         points_sink: Option<Arc<dyn PointsSinkPort>>,
         max_points_per_request: usize,
         fallback_peer_addrs: Vec<String>,
-        cluster_auth: &ClusterAuth,
+        rpc: SharedPeerRpc,
     ) -> Self {
-        let client = cluster_auth.build(
-            cluster_auth
-                .client_builder()
-                .timeout(Duration::from_secs(300)),
-        );
-
         Self {
             node_id,
             node_addr,
@@ -81,7 +95,7 @@ impl SyncClient {
             wal,
             points_sink,
             max_points_per_request,
-            client,
+            rpc,
             fallback_peer_addrs,
             shard_map: None,
             runtime_settings: None,
@@ -254,10 +268,7 @@ impl SyncClient {
             if addr == &self.node_addr {
                 continue;
             }
-            let url = format!("http://{}/ping", addr);
-            if let Ok(resp) = self.client.get(&url).send().await
-                && resp.status().is_success()
-            {
+            if self.rpc.ping(addr, SYNC_TIMEOUT).await.is_ok() {
                 tracing::debug!(peer = %addr, "using fallback peer for sync");
                 return Some(addr.clone());
             }
@@ -266,31 +277,23 @@ impl SyncClient {
     }
 
     async fn send_join_request(&self, peer_addr: &str) -> Result<(), HyperbytedbError> {
-        let url = format!("http://{}/internal/membership/join", peer_addr);
         let req = JoinRequest {
             node_id: Some(self.node_id),
             addr: self.node_addr.clone(),
         };
-
-        let resp = self
-            .client
-            .post(&url)
-            .json(&req)
-            .send()
-            .await
-            .map_err(|e| HyperbytedbError::PeerUnreachable(format!("join request failed: {e}")))?;
-
-        if !resp.status().is_success() {
-            return Err(HyperbytedbError::ClusterUnavailable(format!(
-                "join request rejected: {}",
-                resp.status()
-            )));
-        }
-
-        let join_resp: JoinResponse = resp
-            .json()
-            .await
-            .map_err(|e| HyperbytedbError::SyncFailed(format!("parse join response: {e}")))?;
+        let join_resp = match self.rpc.join(peer_addr, &req, SYNC_TIMEOUT).await {
+            Ok(r) => r,
+            Err(PeerRpcError::Status { code, .. }) => {
+                return Err(HyperbytedbError::ClusterUnavailable(format!(
+                    "join request rejected: {code}"
+                )));
+            }
+            Err(PeerRpcError::Unreachable(e)) => {
+                return Err(HyperbytedbError::PeerUnreachable(format!(
+                    "join request failed: {e}"
+                )));
+            }
+        };
 
         let mut m = self.membership.write().await;
         *m = join_resp.membership;
@@ -306,41 +309,18 @@ impl SyncClient {
     }
 
     async fn get_manifest(&self, peer_addr: &str) -> Result<SyncManifest, HyperbytedbError> {
-        let url = format!("http://{}/internal/sync/manifest", peer_addr);
-        let resp = self.client.get(&url).send().await.map_err(|e| {
-            HyperbytedbError::PeerUnreachable(format!("manifest request failed: {e}"))
-        })?;
-
-        if !resp.status().is_success() {
-            return Err(HyperbytedbError::SyncFailed(format!(
-                "manifest request failed: {}",
-                resp.status()
-            )));
-        }
-
-        resp.json()
+        self.rpc
+            .sync_manifest(peer_addr, SYNC_TIMEOUT)
             .await
-            .map_err(|e| HyperbytedbError::SyncFailed(format!("parse manifest: {e}")))
+            .map_err(|e| sync_err(e, "manifest request failed", "manifest request failed"))
     }
 
     async fn sync_metadata(&self, peer_addr: &str) -> Result<(), HyperbytedbError> {
-        let url = format!("http://{}/internal/sync/metadata", peer_addr);
-        let resp =
-            self.client.get(&url).send().await.map_err(|e| {
-                HyperbytedbError::PeerUnreachable(format!("metadata sync failed: {e}"))
-            })?;
-
-        if !resp.status().is_success() {
-            return Err(HyperbytedbError::SyncFailed(format!(
-                "metadata sync failed: {}",
-                resp.status()
-            )));
-        }
-
-        let snapshot: MetadataSnapshot = resp
-            .json()
+        let snapshot = self
+            .rpc
+            .sync_metadata_snapshot(peer_addr, SYNC_TIMEOUT)
             .await
-            .map_err(|e| HyperbytedbError::SyncFailed(format!("parse metadata snapshot: {e}")))?;
+            .map_err(|e| sync_err(e, "metadata sync failed", "metadata sync failed"))?;
 
         tracing::debug!(
             entries = snapshot.entries.len(),
@@ -370,7 +350,11 @@ impl SyncClient {
         let Some(shard_map) = self.shard_map.as_ref() else {
             return Ok(());
         };
-        let remote = fetch_shard_map(self.client.clone(), peer_addr).await?;
+        let remote = self
+            .rpc
+            .shard_map(peer_addr, SYNC_TIMEOUT)
+            .await
+            .map_err(|e| sync_err(e, "shard map request failed", "shard map request failed"))?;
         let version = remote.map_version;
 
         // Never move the map backwards. `map_version` counts local applies and
@@ -492,26 +476,11 @@ impl SyncClient {
         let mut total_entries = 0u64;
 
         loop {
-            let url = format!(
-                "http://{}/internal/sync/wal?from_seq={}&max_entries=5000",
-                peer_addr,
-                cursor + 1
-            );
-
-            let resp = self.client.get(&url).send().await.map_err(|e| {
-                HyperbytedbError::PeerUnreachable(format!("WAL sync request failed: {e}"))
-            })?;
-
-            if !resp.status().is_success() {
-                return Err(HyperbytedbError::SyncFailed(format!(
-                    "WAL sync failed: {}",
-                    resp.status()
-                )));
-            }
-
-            let wal_resp: WalSyncResponse = resp.json().await.map_err(|e| {
-                HyperbytedbError::SyncFailed(format!("parse WAL sync response: {e}"))
-            })?;
+            let wal_resp = self
+                .rpc
+                .sync_wal(peer_addr, cursor + 1, WAL_BATCH, SYNC_TIMEOUT)
+                .await
+                .map_err(|e| sync_err(e, "WAL sync request failed", "WAL sync failed"))?;
 
             if wal_resp.entries.is_empty() {
                 break;
@@ -568,7 +537,6 @@ impl SyncClient {
     }
 }
 
-/// GET `/internal/shard/map` from `peer_addr` and return the committed snapshot.
 /// Whether a peer's shard map may replace the local one.
 ///
 /// Strictly-newer only. Equal is a no-op, and older must be refused: a sync
@@ -577,28 +545,6 @@ impl SyncClient {
 #[must_use]
 pub fn remote_map_is_newer(remote_version: u64, local_version: u64) -> bool {
     remote_version > local_version
-}
-
-pub async fn fetch_shard_map(
-    client: reqwest::Client,
-    peer_addr: &str,
-) -> Result<ShardMap, HyperbytedbError> {
-    let url = format!("http://{peer_addr}/internal/shard/map");
-    let resp =
-        client.get(&url).send().await.map_err(|e| {
-            HyperbytedbError::PeerUnreachable(format!("shard map request failed: {e}"))
-        })?;
-    if !resp.status().is_success() {
-        return Err(HyperbytedbError::SyncFailed(format!(
-            "shard map request failed: {}",
-            resp.status()
-        )));
-    }
-    let json: ShardMapJson = resp
-        .json()
-        .await
-        .map_err(|e| HyperbytedbError::SyncFailed(format!("parse shard map: {e}")))?;
-    Ok(ShardMap::from(json))
 }
 
 /// Fail closed when the peer advertises a higher WAL watermark but returns no
@@ -625,6 +571,14 @@ fn verify_catchup_progress(
 mod tests {
     use super::{remote_map_is_newer, verify_catchup_progress};
     use crate::error::HyperbytedbError;
+
+    fn test_rpc() -> crate::ports::peer_rpc::SharedPeerRpc {
+        std::sync::Arc::new(
+            crate::adapters::cluster::http_peer_rpc::HttpPeerRpc::with_client(
+                reqwest::Client::new(),
+            ),
+        )
+    }
 
     /// A peer that answers sync calls and counts WAL catch-up requests.
     async fn spawn_sync_peer(wal_requests: std::sync::Arc<std::sync::atomic::AtomicU64>) -> String {
@@ -687,14 +641,14 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let metadata = Arc::new(RocksDbMetadata::open(dir.path().join("meta")).unwrap());
-        let client = super::SyncClient::new(
+        let client = super::CatchUpService::new(
             1,
             "127.0.0.1:1".into(),
             new_shared(ClusterMembership::new()),
             metadata.clone(),
             Arc::new(RocksDbWal::open(dir.path().join("wal")).unwrap()),
             Vec::new(),
-            &Default::default(),
+            test_rpc(),
         );
         let user = StoredUser {
             password_hash: "hash".into(),
@@ -746,14 +700,14 @@ mod tests {
             consecutive_misses: 0,
         });
         std::fs::create_dir_all(dir.path().join("meta")).unwrap();
-        let client = super::SyncClient::new(
+        let client = super::CatchUpService::new(
             1,
             "127.0.0.1:1".into(),
             new_shared(m),
             Arc::new(RocksDbMetadata::open(dir.path().join("meta2")).unwrap()),
             Arc::new(RocksDbWal::open(dir.path().join("wal")).unwrap()),
             Vec::new(),
-            &Default::default(),
+            test_rpc(),
         )
         .with_shard_map(Arc::new(
             RocksDbShardMap::open(&dir.path().join("meta"), true).unwrap(),

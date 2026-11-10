@@ -420,8 +420,7 @@ async fn apply_shard_write_batch(
         }
     };
 
-    let mut stage =
-        crate::application::stage_timer::StageTimer::new("hyperbytedb_shard_primary_stage_seconds");
+    let mut stage = crate::telemetry::StageTimer::new("hyperbytedb_shard_primary_stage_seconds");
     // Check and parse each part; group the good ones by (db, rp).
     let mut groups: Vec<ForwardGroup> = Vec::new();
     for (index, req) in parts.into_iter().enumerate() {
@@ -879,8 +878,7 @@ pub async fn handle_shard_query(
         )
             .into_response()
     };
-    let mut stage =
-        crate::application::stage_timer::StageTimer::new("hyperbytedb_shard_query_stage_seconds");
+    let mut stage = crate::telemetry::StageTimer::new("hyperbytedb_shard_query_stage_seconds");
     let mut batches = match state.query_port.execute_sql_arrow(&sql).await {
         Ok(b) => b,
         Err(e) => return failed(e),

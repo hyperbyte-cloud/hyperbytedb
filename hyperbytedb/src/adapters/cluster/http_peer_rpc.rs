@@ -107,6 +107,16 @@ impl HttpPeerRpc {
         Err(PeerRpcError::Status { code, body })
     }
 
+    /// The body as JSON `T`; a body that does not parse is `Unreachable`.
+    async fn decode<T: serde::de::DeserializeOwned>(
+        resp: reqwest::Response,
+        what: &str,
+    ) -> Result<T, PeerRpcError> {
+        let body = Self::body(resp).await?;
+        serde_json::from_slice(&body)
+            .map_err(|e| PeerRpcError::Unreachable(format!("parse {what}: {e}")))
+    }
+
     async fn body(resp: reqwest::Response) -> Result<Bytes, PeerRpcError> {
         resp.bytes()
             .await
@@ -375,6 +385,43 @@ impl PeerRpc for HttpPeerRpc {
                 String::from_utf8_lossy(&body)
             ))
         })
+    }
+
+    async fn join(
+        &self,
+        addr: &str,
+        req: &crate::domain::cluster::sync::JoinRequest,
+        timeout: Duration,
+    ) -> Result<crate::domain::cluster::sync::JoinResponse, PeerRpcError> {
+        let resp = self
+            .post_json(addr, "/internal/membership/join", req, timeout)
+            .await?;
+        Self::decode(resp, "join response").await
+    }
+
+    async fn sync_metadata_snapshot(
+        &self,
+        addr: &str,
+        timeout: Duration,
+    ) -> Result<crate::domain::cluster::sync::MetadataSnapshot, PeerRpcError> {
+        let resp = self.get(addr, "/internal/sync/metadata", timeout).await?;
+        Self::decode(resp, "metadata snapshot").await
+    }
+
+    async fn sync_wal(
+        &self,
+        addr: &str,
+        from_seq: u64,
+        max_entries: u32,
+        timeout: Duration,
+    ) -> Result<crate::domain::cluster::sync::WalSyncResponse, PeerRpcError> {
+        let path = format!("/internal/sync/wal?from_seq={from_seq}&max_entries={max_entries}");
+        let resp = self.get(addr, &path, timeout).await?;
+        Self::decode(resp, "WAL sync response").await
+    }
+
+    async fn ping(&self, addr: &str, timeout: Duration) -> Result<(), PeerRpcError> {
+        self.get(addr, "/ping", timeout).await.map(|_| ())
     }
 
     async fn probe(&self, addr: &str, timeout: Duration) -> ProbeReply {

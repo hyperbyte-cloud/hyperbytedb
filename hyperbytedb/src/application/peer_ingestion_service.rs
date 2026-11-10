@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use crate::application::stage_timer::StageTimer;
 use crate::ports::forward_queue::{ForwardEntry, ForwardQueuePort};
+use crate::telemetry::StageTimer;
 use async_trait::async_trait;
 use metrics::{counter, histogram};
 

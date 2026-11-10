@@ -15,7 +15,7 @@ use crate::error::HyperbytedbError;
 /// `Content-Type` for columnar msgpack v1 writes.
 pub const CONTENT_TYPE: &str = "application/vnd.hyperbytedb.columnar-msgpack.v1";
 
-pub use crate::domain::columnar_batch::ColumnarMsgpackBatch;
+pub use crate::domain::columnar_batch::{ColumnarMsgpackBatch, columnar_timestamps_ns};
 
 /// Decode the wire format from raw bytes.
 pub fn decode_columnar_batch(body: &[u8]) -> Result<ColumnarMsgpackBatch, HyperbytedbError> {
@@ -44,37 +44,6 @@ pub fn decode_columnar_batch_limited(
         validate_point_count(count, max_points)?;
     }
     decode_columnar_batch(body)
-}
-
-/// Nanosecond timestamps for every row in a columnar batch.
-pub fn columnar_timestamps_ns(
-    wire: &ColumnarMsgpackBatch,
-    precision: Option<&str>,
-) -> Result<Vec<i64>, HyperbytedbError> {
-    let n = wire.values.len();
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-
-    let precision_val = Precision::from_str_opt(precision);
-
-    if let Some(ref ts) = wire.timestamps {
-        if ts.len() != n {
-            return Err(HyperbytedbError::ColumnarMsgpackParse {
-                reason: format!(
-                    "timestamps length {} does not match values length {}",
-                    ts.len(),
-                    n
-                ),
-            });
-        }
-        return Ok(ts.iter().map(|t| precision_val.to_nanos(*t)).collect());
-    }
-
-    let now = chrono::Utc::now()
-        .timestamp_nanos_opt()
-        .ok_or(HyperbytedbError::WallClockTimestampUnavailable)?;
-    Ok(vec![now; n])
 }
 
 /// Encode columnar wire data as line protocol without expanding to `Vec<Point>`.

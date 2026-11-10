@@ -16,6 +16,37 @@ pub struct ColumnarMsgpackBatch {
     pub timestamps: Option<Vec<i64>>,
 }
 
+/// Nanosecond timestamps for every row in a columnar batch.
+pub fn columnar_timestamps_ns(
+    wire: &ColumnarMsgpackBatch,
+    precision: Option<&str>,
+) -> Result<Vec<i64>, crate::error::HyperbytedbError> {
+    let n = wire.values.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+
+    let precision_val = crate::domain::database::Precision::from_str_opt(precision);
+
+    if let Some(ref ts) = wire.timestamps {
+        if ts.len() != n {
+            return Err(crate::error::HyperbytedbError::ColumnarMsgpackParse {
+                reason: format!(
+                    "timestamps length {} does not match values length {}",
+                    ts.len(),
+                    n
+                ),
+            });
+        }
+        return Ok(ts.iter().map(|t| precision_val.to_nanos(*t)).collect());
+    }
+
+    let now = chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .ok_or(crate::error::HyperbytedbError::WallClockTimestampUnavailable)?;
+    Ok(vec![now; n])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
