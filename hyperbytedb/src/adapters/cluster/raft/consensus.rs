@@ -85,39 +85,78 @@ impl LeadershipPort for RaftConsensus {
 #[async_trait::async_trait]
 impl ConsensusPort for RaftConsensus {
     async fn propose(&self, req: ClusterRequest) -> Result<ClusterResponse, HyperbytedbError> {
-        for attempt in 0..MAX_ATTEMPTS {
-            let e = match self.raft.client_write(req.clone()).await {
-                Ok(resp) => return Ok(resp.data),
-                Err(e) => e,
-            };
-            let Some(fwd) = e.forward_to_leader::<BasicNode>() else {
+        let local = || async {
+            match self.raft.client_write(req.clone()).await {
+                Ok(resp) => LocalWrite::Done(resp.data),
+                Err(e) => match e.forward_to_leader::<BasicNode>() {
+                    Some(fwd) => LocalWrite::Forward(fwd.clone()),
+                    None => LocalWrite::Failed(e.to_string()),
+                },
+            }
+        };
+        propose_via(self.rpc.as_ref(), &req, local, |fwd| async move {
+            self.leader_addr(&fwd).await
+        })
+        .await
+    }
+}
+
+/// What proposing on this node's own Raft gave.
+pub(crate) enum LocalWrite {
+    /// Committed here.
+    Done(ClusterResponse),
+    /// Not the leader: forward to the one this names.
+    Forward(ForwardToLeader<u64, BasicNode>),
+    /// Failed for another reason.
+    Failed(String),
+}
+
+/// Propose with `local`; when it says to forward, resolve the leader with
+/// `leader_addr` and forward over `rpc`, at most `MAX_ATTEMPTS` times in all.
+pub(crate) async fn propose_via<L, LF, A, AF>(
+    rpc: &dyn PeerRpc,
+    req: &ClusterRequest,
+    local: L,
+    leader_addr: A,
+) -> Result<ClusterResponse, HyperbytedbError>
+where
+    L: Fn() -> LF,
+    LF: std::future::Future<Output = LocalWrite>,
+    A: Fn(ForwardToLeader<u64, BasicNode>) -> AF,
+    AF: std::future::Future<Output = Result<String, HyperbytedbError>>,
+{
+    for attempt in 0..MAX_ATTEMPTS {
+        let fwd = match local().await {
+            LocalWrite::Done(resp) => return Ok(resp),
+            LocalWrite::Failed(e) => {
                 tracing::error!(error = %e, "raft proposal failed");
                 return Err(HyperbytedbError::Internal(
                     format!("raft replication failed: {e}").into(),
                 ));
-            };
-            tracing::debug!(
-                leader_id = ?fwd.leader_id,
-                leader_addr = ?fwd.leader_node.as_ref().map(|n| n.addr.as_str()),
-                attempt,
-                "forwarding proposal to raft leader"
-            );
-            let result = match self.leader_addr(fwd).await {
-                Ok(addr) => forward(self.rpc.as_ref(), &addr, &req).await,
-                Err(e) => Err(e),
-            };
-            match result {
-                Ok(resp) => return Ok(resp),
-                Err(e) if attempt + 1 >= MAX_ATTEMPTS => return Err(e),
-                Err(e) => {
-                    tracing::warn!(error = %e, attempt, "forward to raft leader failed; retrying");
-                }
+            }
+            LocalWrite::Forward(fwd) => fwd,
+        };
+        tracing::debug!(
+            leader_id = ?fwd.leader_id,
+            leader_addr = ?fwd.leader_node.as_ref().map(|n| n.addr.as_str()),
+            attempt,
+            "forwarding proposal to raft leader"
+        );
+        let result = match leader_addr(fwd).await {
+            Ok(addr) => forward(rpc, &addr, req).await,
+            Err(e) => Err(e),
+        };
+        match result {
+            Ok(resp) => return Ok(resp),
+            Err(e) if attempt + 1 >= MAX_ATTEMPTS => return Err(e),
+            Err(e) => {
+                tracing::warn!(error = %e, attempt, "forward to raft leader failed; retrying");
             }
         }
-        Err(HyperbytedbError::Internal(crate::error::ChainedError::new(
-            "raft replication failed after retries",
-        )))
     }
+    Err(HyperbytedbError::Internal(crate::error::ChainedError::new(
+        "raft replication failed after retries",
+    )))
 }
 
 /// Send `req` to the leader at `leader_addr` and return its answer.
@@ -189,6 +228,72 @@ mod tests {
         let addr = listener.local_addr().unwrap().to_string();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (addr, seen)
+    }
+
+    /// A leader that answers 503 to its first `fail_first` proposals and
+    /// accepts the rest; returns its address and a request counter.
+    async fn flaky_leader(fail_first: usize) -> (String, Arc<Mutex<usize>>) {
+        let count = Arc::new(Mutex::new(0usize));
+        let c = count.clone();
+        let app = axum::Router::new().route(
+            "/cluster/raft/client-write",
+            axum::routing::post(move || {
+                let c = c.clone();
+                async move {
+                    let n = {
+                        let mut g = c.lock().unwrap();
+                        *g += 1;
+                        *g
+                    };
+                    let status = if n <= fail_first {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        axum::http::StatusCode::OK
+                    };
+                    (status, axum::Json(ClusterResponse::success()))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (addr, count)
+    }
+
+    /// A follower keeps forwarding through a leader that fails, at most
+    /// `MAX_ATTEMPTS` times, and re-resolves the leader on each attempt.
+    #[tokio::test]
+    async fn propose_retries_forwards_up_to_the_cap() {
+        let rpc = HttpPeerRpc::with_client(reqwest::Client::new());
+        let not_leader = || async {
+            LocalWrite::Forward(ForwardToLeader {
+                leader_id: Some(2),
+                leader_node: None,
+            })
+        };
+
+        let (down, hits) = flaky_leader(usize::MAX).await;
+        let resolved = Mutex::new(0usize);
+        let err = propose_via(&rpc, &op(), not_leader, |_| {
+            *resolved.lock().unwrap() += 1;
+            let a = down.clone();
+            async move { Ok(a) }
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("503"), "{err}");
+        assert_eq!(*hits.lock().unwrap(), MAX_ATTEMPTS as usize);
+        assert_eq!(*resolved.lock().unwrap(), MAX_ATTEMPTS as usize);
+
+        let (recovers, hits) = flaky_leader(1).await;
+        let resp = propose_via(&rpc, &op(), not_leader, |_| {
+            let a = recovers.clone();
+            async move { Ok(a) }
+        })
+        .await
+        .unwrap();
+        assert!(resp.ok);
+        assert_eq!(*hits.lock().unwrap(), 2);
     }
 
     fn op() -> ClusterRequest {
