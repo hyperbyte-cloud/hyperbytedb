@@ -1,3 +1,5 @@
+mod statements;
+
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -738,374 +740,19 @@ async fn execute_statement(
 
     match stmt {
         Statement::ShowDatabases => {
-            let dbs = svc.metadata.list_databases().await?;
-            let columns = vec!["name".to_string()];
-            let values: Vec<Vec<serde_json::Value>> = dbs
-                .iter()
-                .map(|d| vec![serde_json::Value::String(d.name.clone())])
-                .collect();
-            Ok(StatementResult {
-                statement_id,
-                series: Some(vec![SeriesResult {
-                    name: "databases".to_string(),
-                    tags: None,
-                    columns,
-                    values,
-                    partial: None,
-                }]),
-                error: None,
-            })
+            statements::show_catalog::show_databases(svc, statement_id).await
         }
         Statement::ShowMeasurements(s) => {
-            let db = s.database.as_deref().unwrap_or(db);
-            if db.is_empty() {
-                return Ok(StatementResult {
-                    statement_id,
-                    series: Some(vec![]),
-                    error: Some("database is required".to_string()),
-                });
-            }
-            let rp = resolve_retention_policy_for_select(svc.metadata.as_ref(), db, None, query_rp)
-                .await?;
-            let names = list_measurements_for_rp(svc, db, &rp).await?;
-            let filtered = filter_names_by_selector(&names, s.measurement_filter.as_ref());
-            let columns = vec!["name".to_string()];
-            let values: Vec<Vec<serde_json::Value>> = filtered
-                .iter()
-                .map(|n| vec![serde_json::Value::String(n.clone())])
-                .collect();
-            Ok(StatementResult {
-                statement_id,
-                series: Some(vec![SeriesResult {
-                    name: "measurements".to_string(),
-                    tags: None,
-                    columns,
-                    values,
-                    partial: None,
-                }]),
-                error: None,
-            })
+            statements::show_schema::show_measurements(svc, db, s, query_rp, statement_id).await
         }
         Statement::ShowTagKeys(s) => {
-            let db = s.database.as_deref().unwrap_or(db);
-            let measurement = s.from.as_ref().and_then(|m| m.name_str());
-            let default_rp =
-                resolve_retention_policy_for_select(svc.metadata.as_ref(), db, None, query_rp)
-                    .await?;
-            let keys = if let (Some(ctx), Some(m), Some(name)) = (
-                svc.shard_routing.as_ref(),
-                s.from.as_ref(),
-                s.from.as_ref().and_then(|m| m.name_str()),
-            ) {
-                let query_db = m.database.as_deref().unwrap_or(db);
-                let rp = if m.retention_policy.is_some() {
-                    resolve_retention_policy(
-                        svc.metadata.as_ref(),
-                        query_db,
-                        m.retention_policy.as_deref(),
-                    )
-                    .await?
-                } else {
-                    default_rp.clone()
-                };
-                scatter_tag_keys(ctx, svc.metadata.as_ref(), query_db, &rp, name).await?
-            } else if let Some(m) = s.from.as_ref() {
-                if let Some(name) = m.name_str() {
-                    if m.retention_policy.is_some() {
-                        let query_db = m.database.as_deref().unwrap_or(db);
-                        let rp = resolve_retention_policy(
-                            svc.metadata.as_ref(),
-                            query_db,
-                            m.retention_policy.as_deref(),
-                        )
-                        .await?;
-                        tag_keys_for_measurement(svc, query_db, &rp, name).await?
-                    } else {
-                        svc.metadata
-                            .list_tag_keys(db, &default_rp, Some(name))
-                            .await?
-                    }
-                } else {
-                    svc.metadata
-                        .list_tag_keys(db, &default_rp, measurement)
-                        .await?
-                }
-            } else {
-                svc.metadata
-                    .list_tag_keys(db, &default_rp, measurement)
-                    .await?
-            };
-            let columns = vec!["tagKey".to_string()];
-            let values: Vec<Vec<serde_json::Value>> = keys
-                .iter()
-                .map(|k| vec![serde_json::Value::String(k.clone())])
-                .collect();
-            Ok(StatementResult {
-                statement_id,
-                series: Some(vec![SeriesResult {
-                    name: measurement.unwrap_or("").to_string(),
-                    tags: None,
-                    columns,
-                    values,
-                    partial: None,
-                }]),
-                error: None,
-            })
+            statements::show_schema::show_tag_keys(svc, db, s, query_rp, statement_id).await
         }
         Statement::ShowTagValues(s) => {
-            let db = s.database.as_deref().unwrap_or(db);
-            let measurement = s.from.as_ref().and_then(|m| m.name_str());
-            let default_rp =
-                resolve_retention_policy_for_select(svc.metadata.as_ref(), db, None, query_rp)
-                    .await?;
-
-            let all_tag_keys = if let (Some(ctx), Some(m), Some(name)) =
-                (svc.shard_routing.as_ref(), s.from.as_ref(), measurement)
-            {
-                let query_db = m.database.as_deref().unwrap_or(db);
-                let rp = if m.retention_policy.is_some() {
-                    resolve_retention_policy(
-                        svc.metadata.as_ref(),
-                        query_db,
-                        m.retention_policy.as_deref(),
-                    )
-                    .await?
-                } else {
-                    default_rp.clone()
-                };
-                scatter_tag_keys(ctx, svc.metadata.as_ref(), query_db, &rp, name).await?
-            } else if let (Some(m), Some(name)) = (s.from.as_ref(), measurement) {
-                if m.retention_policy.is_some() {
-                    let query_db = m.database.as_deref().unwrap_or(db);
-                    let rp = resolve_retention_policy(
-                        svc.metadata.as_ref(),
-                        query_db,
-                        m.retention_policy.as_deref(),
-                    )
-                    .await?;
-                    tag_keys_for_measurement(svc, query_db, &rp, name).await?
-                } else {
-                    svc.metadata
-                        .list_tag_keys(db, &default_rp, Some(name))
-                        .await?
-                }
-            } else {
-                svc.metadata
-                    .list_tag_keys(db, &default_rp, measurement)
-                    .await?
-            };
-
-            let matching_keys: Vec<String> =
-                filter_names_by_selector(&all_tag_keys, Some(&s.tag_key));
-
-            // With a WHERE: the values of the series that match it. It used
-            // to be ignored, so a Grafana variable chained on another (the
-            // CPUs of the chosen host) listed every value.
-            if let Some(cond) = &s.condition {
-                let predicate = crate::application::tag_condition::TagPredicate::compile(cond)?;
-                let measurements: Vec<String> = match measurement {
-                    Some(name) => vec![name.to_string()],
-                    None => svc.metadata.list_measurements(db).await?,
-                };
-                let (query_db, rp) = match s.from.as_ref() {
-                    Some(m) if m.retention_policy.is_some() => {
-                        let query_db = m.database.as_deref().unwrap_or(db);
-                        let rp = resolve_retention_policy(
-                            svc.metadata.as_ref(),
-                            query_db,
-                            m.retention_policy.as_deref(),
-                        )
-                        .await?;
-                        (query_db, rp)
-                    }
-                    Some(m) => (m.database.as_deref().unwrap_or(db), default_rp.clone()),
-                    None => (db, default_rp.clone()),
-                };
-                let mut pairs = std::collections::BTreeSet::new();
-                for name in &measurements {
-                    let series = match svc.shard_routing.as_ref() {
-                        Some(ctx) => {
-                            crate::application::shard_metadata_scatter::scatter_series_tags(
-                                ctx,
-                                svc.metadata.as_ref(),
-                                query_db,
-                                &rp,
-                                name,
-                            )
-                            .await?
-                        }
-                        None => svc
-                            .metadata
-                            .list_series(query_db, &rp, name)
-                            .await?
-                            .into_iter()
-                            .map(|(_, tags)| tags)
-                            .collect(),
-                    };
-                    for tags in series.iter().filter(|t| predicate.matches(t)) {
-                        for key in &matching_keys {
-                            if let Some(v) = tags.get(key) {
-                                pairs.insert((key.clone(), v.clone()));
-                            }
-                        }
-                    }
-                }
-                let values = limit_offset(
-                    pairs
-                        .into_iter()
-                        .map(|(k, v)| {
-                            vec![serde_json::Value::String(k), serde_json::Value::String(v)]
-                        })
-                        .collect(),
-                    s.limit,
-                    s.offset,
-                );
-                return Ok(StatementResult {
-                    statement_id,
-                    series: Some(vec![SeriesResult {
-                        name: measurement.unwrap_or("").to_string(),
-                        tags: None,
-                        columns: vec!["key".to_string(), "value".to_string()],
-                        values,
-                        partial: None,
-                    }]),
-                    error: None,
-                });
-            }
-            let default_rp_for_values = default_rp.clone();
-
-            let key_value_futures: Vec<_> = matching_keys
-                .iter()
-                .map(|tag_key| {
-                    let tag_key = tag_key.clone();
-                    let default_rp = default_rp_for_values.clone();
-                    async move {
-                        let values_list = if let (Some(ctx), Some(m), Some(name)) =
-                            (svc.shard_routing.as_ref(), s.from.as_ref(), measurement)
-                        {
-                            let query_db = m.database.as_deref().unwrap_or(db);
-                            let rp = if m.retention_policy.is_some() {
-                                resolve_retention_policy(
-                                    svc.metadata.as_ref(),
-                                    query_db,
-                                    m.retention_policy.as_deref(),
-                                )
-                                .await?
-                            } else {
-                                default_rp.clone()
-                            };
-                            scatter_tag_values(
-                                ctx,
-                                svc.metadata.as_ref(),
-                                query_db,
-                                &rp,
-                                name,
-                                &tag_key,
-                            )
-                            .await?
-                        } else if let (Some(m), Some(name)) = (s.from.as_ref(), measurement) {
-                            if m.retention_policy.is_some() {
-                                let query_db = m.database.as_deref().unwrap_or(db);
-                                let rp = resolve_retention_policy(
-                                    svc.metadata.as_ref(),
-                                    query_db,
-                                    m.retention_policy.as_deref(),
-                                )
-                                .await?;
-                                tag_values_for_measurement(svc, query_db, &rp, name, &tag_key)
-                                    .await?
-                            } else {
-                                svc.metadata
-                                    .list_tag_values(db, &default_rp, &tag_key, Some(name))
-                                    .await?
-                            }
-                        } else {
-                            svc.metadata
-                                .list_tag_values(db, &default_rp, &tag_key, measurement)
-                                .await?
-                        };
-                        Ok::<_, HyperbytedbError>((tag_key, values_list))
-                    }
-                })
-                .collect();
-
-            let mut all_values = Vec::new();
-            for (tag_key, values_list) in futures::future::try_join_all(key_value_futures).await? {
-                for v in values_list {
-                    all_values.push(vec![
-                        serde_json::Value::String(tag_key.clone()),
-                        serde_json::Value::String(v),
-                    ]);
-                }
-            }
-
-            let columns = vec!["key".to_string(), "value".to_string()];
-            Ok(StatementResult {
-                statement_id,
-                series: Some(vec![SeriesResult {
-                    name: measurement.unwrap_or("").to_string(),
-                    tags: None,
-                    columns,
-                    values: limit_offset(all_values, s.limit, s.offset),
-                    partial: None,
-                }]),
-                error: None,
-            })
+            statements::show_schema::show_tag_values(svc, db, s, query_rp, statement_id).await
         }
         Statement::ShowFieldKeys(s) => {
-            let db = s.database.as_deref().unwrap_or(db);
-            let measurement = s.from.as_ref().and_then(|m| m.name_str());
-            if db.is_empty() {
-                return Ok(StatementResult {
-                    statement_id,
-                    series: Some(vec![]),
-                    error: Some("database is required".to_string()),
-                });
-            }
-            let rp = resolve_retention_policy_for_select(svc.metadata.as_ref(), db, None, query_rp)
-                .await?;
-            let mut field_values = Vec::new();
-            let measurements: Vec<String> = if let Some(m) = measurement {
-                vec![m.to_string()]
-            } else {
-                svc.metadata.list_measurements(db).await?
-            };
-            for m in &measurements {
-                let fields = match svc.shard_routing.as_ref() {
-                    Some(ctx) => {
-                        crate::application::shard_metadata_scatter::scatter_field_keys(
-                            ctx,
-                            svc.metadata.as_ref(),
-                            db,
-                            &rp,
-                            m,
-                        )
-                        .await?
-                    }
-                    None => crate::application::shard_metadata_scatter::local_field_keys(
-                        svc.metadata.get_measurement(db, &rp, m).await?.as_ref(),
-                    ),
-                };
-                for (name, typ) in fields {
-                    field_values.push(vec![
-                        serde_json::Value::String(name),
-                        serde_json::Value::String(typ),
-                    ]);
-                }
-            }
-            let columns = vec!["fieldKey".to_string(), "fieldType".to_string()];
-            let values: Vec<Vec<serde_json::Value>> = field_values;
-            Ok(StatementResult {
-                statement_id,
-                series: Some(vec![SeriesResult {
-                    name: measurement.unwrap_or("").to_string(),
-                    tags: None,
-                    columns,
-                    values,
-                    partial: None,
-                }]),
-                error: None,
-            })
+            statements::show_schema::show_field_keys(svc, db, s, query_rp, statement_id).await
         }
         Statement::CreateDatabase(stmt) => {
             svc.metadata.create_database_with(stmt).await?;
@@ -1116,541 +763,52 @@ async fn execute_statement(
             })
         }
         Statement::DropDatabase(name) => {
-            crate::application::database_drop::drop_database(
-                &svc.metadata,
-                Some(&svc.mv_service),
-                Some(&svc.points_sink),
-                Some(&svc.wal),
-                name,
-            )
-            .await?;
-            svc.drop_shard_spaces(name, None, None).await;
-            Ok(StatementResult {
-                statement_id,
-                series: Some(vec![]),
-                error: None,
-            })
+            statements::ddl::drop_database(svc, name, statement_id).await
         }
         Statement::Select(select_stmt) => {
-            if db.is_empty() {
-                return Ok(StatementResult {
-                    statement_id,
-                    series: None,
-                    error: Some("database is required".to_string()),
-                });
-            }
-
-            if select_stmt.into.is_some() {
-                let count = execute_select_into(svc, db, select_stmt, epoch).await?;
-                return Ok(StatementResult {
-                    statement_id,
-                    series: Some(vec![SeriesResult {
-                        name: "result".to_string(),
-                        tags: None,
-                        columns: vec!["time".to_string(), "written".to_string()],
-                        values: vec![vec![
-                            serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
-                            serde_json::json!(count),
-                        ]],
-                        partial: None,
-                    }]),
-                    error: None,
-                });
-            }
-
-            let group_by_tags: Vec<String> = select_stmt
-                .group_by
-                .as_ref()
-                .map(|gb| {
-                    gb.tag_dimensions()
-                        .into_iter()
-                        .map(|s| s.to_string())
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            let (time_min, time_max) =
-                to_clickhouse::extract_time_bounds(select_stmt.condition.as_ref());
-
-            if select_stmt.from.is_empty() {
-                return Err(HyperbytedbError::QueryParse(
-                    "SELECT requires FROM clause".to_string(),
-                ));
-            }
-
-            let mut all_series = Vec::new();
-            for source in &select_stmt.from {
-                let mut series = execute_select_from_source(
-                    svc,
-                    db,
-                    select_stmt,
-                    source,
-                    time_min,
-                    time_max,
-                    epoch,
-                    &group_by_tags,
-                    query_rp,
-                )
-                .await?;
-                all_series.append(&mut series);
-            }
-
-            stamp_aggregate_time(select_stmt, &mut all_series, epoch, time_min);
-            order_columns_like_select(select_stmt, &mut all_series);
-
-            // Apply SLIMIT/SOFFSET (series-level pagination)
-            if select_stmt.slimit.is_some() || select_stmt.soffset.is_some() {
-                let soffset = select_stmt.soffset.unwrap_or(0) as usize;
-                let slimit = select_stmt.slimit.unwrap_or(u64::MAX) as usize;
-                let len = all_series.len();
-                let start = soffset.min(len);
-                let end = (start + slimit).min(len);
-                all_series = all_series[start..end].to_vec();
-            }
-
-            Ok(StatementResult {
-                statement_id,
-                series: Some(all_series),
-                error: None,
-            })
+            statements::select::select(svc, db, select_stmt, epoch, query_rp, statement_id).await
         }
         Statement::ShowCardinality(s) => {
             execute_show_cardinality(svc, db, s, query_rp, statement_id).await
         }
         Statement::ShowSeries(s) => {
-            use crate::domain::series::SeriesKey;
-
-            let query_db = s.database.as_deref().unwrap_or(db);
-            if query_db.is_empty() {
-                return Ok(StatementResult {
-                    statement_id,
-                    series: Some(vec![]),
-                    error: Some("database is required".to_string()),
-                });
-            }
-
-            let measurements: Vec<String> = if let Some(ref from) = s.from {
-                if let Some(name) = from.name_str() {
-                    vec![name.to_string()]
-                } else {
-                    svc.metadata.list_measurements(query_db).await?
-                }
-            } else {
-                svc.metadata.list_measurements(query_db).await?
-            };
-
-            let rp = if let Some(ref from) = s.from
-                && let Some(rp_name) = from.retention_policy.as_ref()
-            {
-                resolve_retention_policy(svc.metadata.as_ref(), query_db, Some(rp_name)).await?
-            } else {
-                resolve_retention_policy_for_select(svc.metadata.as_ref(), query_db, None, query_rp)
-                    .await?
-            };
-
-            let mut values = Vec::new();
-            for meas in &measurements {
-                if let Some(ctx) = svc.shard_routing.as_ref() {
-                    for key in
-                        scatter_series_keys(ctx, svc.metadata.as_ref(), query_db, &rp, meas).await?
-                    {
-                        values.push(vec![serde_json::Value::String(key)]);
-                    }
-                } else {
-                    let series = svc.metadata.list_series(query_db, &rp, meas).await?;
-                    for (_, tags) in series {
-                        let key = SeriesKey::new(meas, &tags);
-                        values.push(vec![serde_json::Value::String(key.to_canonical())]);
-                    }
-                }
-            }
-
-            Ok(StatementResult {
-                statement_id,
-                series: Some(vec![SeriesResult {
-                    name: String::new(),
-                    tags: None,
-                    columns: vec!["key".to_string()],
-                    values,
-                    partial: None,
-                }]),
-                error: None,
-            })
+            statements::show_schema::show_series(svc, db, s, query_rp, statement_id).await
         }
         Statement::DropMeasurement { name, rp: stmt_rp } => {
-            if let Err(e) = svc.mv_service.drop_for_source_measurement(db, name).await {
-                tracing::warn!(
-                    db = db,
-                    measurement = name,
-                    error = %e,
-                    "failed to cascade-drop materialized views for source measurement"
-                );
-            }
-            let rp = if let Some(inner) = stmt_rp {
-                inner.clone()
-            } else {
-                svc.metadata.get_default_rp(db).await?
-            };
-            svc.metadata.delete_measurement(db, &rp, name).await?;
-            if let Some(ctx) = svc.shard_routing.as_ref() {
-                scatter_delete_to_regions(ctx, svc.metadata.as_ref(), None, db, &rp, name, "")
-                    .await?;
-            }
-            if let Err(e) = svc.points_sink.drop_measurement(db, &rp, name).await {
-                tracing::warn!(
-                    db = db,
-                    measurement = name,
-                    error = %e,
-                    "failed to drop chDB native table for measurement (metadata already cleared)"
-                );
-            }
-            svc.drop_shard_spaces(db, Some(&rp), Some(name)).await;
-            Ok(StatementResult {
-                statement_id,
-                series: Some(vec![]),
-                error: None,
-            })
+            statements::ddl::drop_measurement(svc, db, name, stmt_rp, statement_id).await
         }
         Statement::Delete(del) => {
-            let del_rp = if let Some(rp) = query_rp {
-                rp.to_string()
-            } else {
-                svc.metadata
-                    .get_default_rp(db)
-                    .await
-                    .unwrap_or_else(|_| "autogen".to_string())
-            };
-            // The rows are deleted, as in InfluxDB: points written after the
-            // DELETE stay. It used to store a tombstone that every later query
-            // applied, hiding later points too.
-            let predicate_sql = crate::application::predicate_sql::build_delete_predicate(
-                &svc.metadata,
-                db,
-                &del_rp,
-                &del.from,
-                del.condition.as_ref(),
-            )
-            .await?;
-
-            if let Some(ctx) = svc.shard_routing.as_ref() {
-                scatter_delete_to_regions(
-                    ctx,
-                    svc.metadata.as_ref(),
-                    Some(crate::application::predicate_sql::LocalRows {
-                        wal: Some(svc.wal.as_ref()),
-                        sink: svc.points_sink.as_ref(),
-                    }),
-                    db,
-                    &del_rp,
-                    &del.from,
-                    &predicate_sql,
-                )
-                .await?;
-            } else {
-                crate::application::predicate_sql::delete_rows(
-                    Some(svc.wal.as_ref()),
-                    svc.points_sink.as_ref(),
-                    db,
-                    &del_rp,
-                    &del.from,
-                    &predicate_sql,
-                )
-                .await?;
-            }
-
-            tracing::debug!(
-                db = db,
-                measurement = %del.from,
-                predicate = %predicate_sql,
-                "DELETE applied"
-            );
-
-            Ok(StatementResult {
-                statement_id,
-                series: Some(vec![]),
-                error: None,
-            })
+            statements::delete::delete(svc, db, del, query_rp, statement_id).await
         }
         Statement::CreateContinuousQuery(cq) => {
-            svc.metadata
-                .get_database(&cq.database)
-                .await?
-                .ok_or_else(|| HyperbytedbError::DatabaseNotFound(cq.database.clone()))?;
-
-            let def = match ContinuousQueryDef::from_create(cq) {
-                Ok(def) => def,
-                Err(e) => {
-                    return Ok(StatementResult {
-                        statement_id,
-                        series: None,
-                        error: Some(e.to_string()),
-                    });
-                }
-            };
-
-            svc.metadata
-                .store_continuous_query(&def.database, &def.name, &def)
-                .await?;
-
-            Ok(StatementResult {
-                statement_id,
-                series: Some(vec![]),
-                error: None,
-            })
+            statements::ddl::create_continuous_query(svc, cq, statement_id).await
         }
         Statement::ShowContinuousQueries => {
-            let dbs = svc.metadata.list_databases().await?;
-            let mut all_series = Vec::new();
-            for db_entry in &dbs {
-                let cqs = svc.metadata.list_continuous_queries(&db_entry.name).await?;
-                if cqs.is_empty() {
-                    continue;
-                }
-                let columns = vec!["name".to_string(), "query".to_string()];
-                let values: Vec<Vec<serde_json::Value>> = cqs
-                    .iter()
-                    .map(|cq| {
-                        vec![
-                            serde_json::Value::String(cq.name.clone()),
-                            serde_json::Value::String(reconstruct_cq_text(cq)),
-                        ]
-                    })
-                    .collect();
-                all_series.push(SeriesResult {
-                    name: db_entry.name.clone(),
-                    tags: None,
-                    columns,
-                    values,
-                    partial: None,
-                });
-            }
-
-            Ok(StatementResult {
-                statement_id,
-                series: Some(all_series),
-                error: None,
-            })
+            statements::show_catalog::show_continuous_queries(svc, statement_id).await
         }
         Statement::DropContinuousQuery { name, db: cq_db } => {
-            let target_db = if cq_db.is_empty() { db } else { cq_db };
-            svc.metadata
-                .get_database(target_db)
-                .await?
-                .ok_or_else(|| HyperbytedbError::DatabaseNotFound(target_db.to_string()))?;
-            svc.metadata.drop_continuous_query(target_db, name).await?;
-            Ok(StatementResult {
-                statement_id,
-                series: Some(vec![]),
-                error: None,
-            })
+            statements::ddl::drop_continuous_query(svc, db, name, cq_db, statement_id).await
         }
         Statement::CreateMaterializedView(mv) => {
-            svc.metadata
-                .get_database(&mv.database)
-                .await?
-                .ok_or_else(|| HyperbytedbError::DatabaseNotFound(mv.database.clone()))?;
-            svc.mv_service.create(mv).await?;
-            Ok(StatementResult {
-                statement_id,
-                series: Some(vec![]),
-                error: None,
-            })
+            statements::ddl::create_materialized_view(svc, mv, statement_id).await
         }
         Statement::ShowMaterializedViews => {
-            let dbs = svc.metadata.list_databases().await?;
-            let mut all_mvs = Vec::new();
-            for db_entry in &dbs {
-                let mvs = svc.metadata.list_materialized_views(&db_entry.name).await?;
-                all_mvs.extend(mvs);
-            }
-
-            let columns = vec![
-                "name".to_string(),
-                "database".to_string(),
-                "query".to_string(),
-                "source_measurement".to_string(),
-                "dest_measurement".to_string(),
-            ];
-            let values: Vec<Vec<serde_json::Value>> = all_mvs
-                .iter()
-                .map(|mv| {
-                    vec![
-                        serde_json::Value::String(mv.name.clone()),
-                        serde_json::Value::String(mv.database.clone()),
-                        serde_json::Value::String(mv.query_text.clone()),
-                        serde_json::Value::String(mv.source_measurement.clone()),
-                        serde_json::Value::String(mv.dest_measurement.clone()),
-                    ]
-                })
-                .collect();
-
-            Ok(StatementResult {
-                statement_id,
-                series: Some(vec![SeriesResult {
-                    name: "materialized_views".to_string(),
-                    tags: None,
-                    columns,
-                    values,
-                    partial: None,
-                }]),
-                error: None,
-            })
+            statements::show_catalog::show_materialized_views(svc, statement_id).await
         }
         Statement::SetSetting { name, value } => {
-            // A single node; a cluster replicates the SET through Raft and
-            // every node applies it the same way.
-            let value = crate::application::runtime_settings::validate(name, value.clone())?;
-            svc.settings()?
-                .apply(svc.metadata.as_ref(), name, value)
-                .await?;
-            Ok(StatementResult {
-                statement_id,
-                series: Some(vec![]),
-                error: None,
-            })
+            statements::ddl::set_setting(svc, name, value, statement_id).await
         }
-        Statement::ShowSettings => {
-            let rows = svc.settings()?.show(svc.metadata.as_ref()).await?;
-            Ok(StatementResult {
-                statement_id,
-                series: Some(vec![SeriesResult {
-                    name: "settings".to_string(),
-                    tags: None,
-                    columns: vec![
-                        "name".into(),
-                        "value".into(),
-                        "source".into(),
-                        "config".into(),
-                        "description".into(),
-                    ],
-                    values: rows
-                        .into_iter()
-                        .map(|r| {
-                            vec![
-                                serde_json::Value::String(r.name.to_string()),
-                                r.value
-                                    .as_ref()
-                                    .map_or(serde_json::Value::Null, |v| v.to_json()),
-                                r.source.map_or(serde_json::Value::Null, |s| {
-                                    serde_json::Value::String(s.as_str().to_string())
-                                }),
-                                serde_json::Value::String(r.config.to_string()),
-                                serde_json::Value::String(r.description.to_string()),
-                            ]
-                        })
-                        .collect(),
-                    partial: None,
-                }]),
-                error: None,
-            })
-        }
+        Statement::ShowSettings => statements::show_catalog::show_settings(svc, statement_id).await,
         Statement::DropMaterializedView { name, db: mv_db } => {
-            let target_db = if mv_db.is_empty() { db } else { mv_db };
-            svc.metadata
-                .get_database(target_db)
-                .await?
-                .ok_or_else(|| HyperbytedbError::DatabaseNotFound(target_db.to_string()))?;
-            svc.mv_service.drop_mv(target_db, name).await?;
-            Ok(StatementResult {
-                statement_id,
-                series: Some(vec![]),
-                error: None,
-            })
+            statements::ddl::drop_materialized_view(svc, db, name, mv_db, statement_id).await
         }
         Statement::ShowRetentionPolicies(rp_db) => {
-            let target_db = if rp_db.is_empty() { db } else { rp_db };
-            if !rp_db.is_empty() {
-                svc.metadata
-                    .get_database(target_db)
-                    .await?
-                    .ok_or_else(|| HyperbytedbError::DatabaseNotFound(target_db.to_string()))?;
-            }
-            let rps = svc.metadata.list_retention_policies(target_db).await?;
-            let columns = vec![
-                "name".to_string(),
-                "duration".to_string(),
-                "shardGroupDuration".to_string(),
-                "replicaN".to_string(),
-                "default".to_string(),
-            ];
-            let values: Vec<Vec<serde_json::Value>> = rps
-                .iter()
-                .map(|rp| {
-                    let dur_str = crate::domain::database::format_influx_duration(rp.duration);
-                    let sgd_str = crate::domain::database::format_influx_duration(Some(
-                        rp.shard_group_duration,
-                    ));
-                    vec![
-                        serde_json::Value::String(rp.name.clone()),
-                        serde_json::Value::String(dur_str),
-                        serde_json::Value::String(sgd_str),
-                        serde_json::json!(rp.replication_factor),
-                        serde_json::Value::Bool(rp.is_default),
-                    ]
-                })
-                .collect();
-            Ok(StatementResult {
-                statement_id,
-                series: Some(vec![SeriesResult {
-                    name: "".to_string(),
-                    tags: None,
-                    columns,
-                    values,
-                    partial: None,
-                }]),
-                error: None,
-            })
+            statements::show_catalog::show_retention_policies(svc, db, rp_db, statement_id).await
         }
         Statement::ShowGrants(username) => {
-            let user = svc.metadata.get_user(username).await?.ok_or_else(|| {
-                HyperbytedbError::QueryParse(format!("user '{username}' does not exist"))
-            })?;
-            let mut grants: Vec<_> = user.privileges.into_iter().collect();
-            grants.sort_by(|a, b| a.0.cmp(&b.0));
-            Ok(StatementResult {
-                statement_id,
-                series: Some(vec![SeriesResult {
-                    name: String::new(),
-                    tags: None,
-                    columns: vec!["database".to_string(), "privilege".to_string()],
-                    values: grants
-                        .into_iter()
-                        .map(|(db, p)| {
-                            vec![
-                                serde_json::Value::String(db),
-                                serde_json::Value::String(p.as_str().to_string()),
-                            ]
-                        })
-                        .collect(),
-                    partial: None,
-                }]),
-                error: None,
-            })
+            statements::show_catalog::show_grants(svc, username, statement_id).await
         }
-        Statement::ShowUsers => {
-            let users = svc.metadata.list_users().await?;
-            let columns = vec!["user".to_string(), "admin".to_string()];
-            let mut values = Vec::new();
-            for u in &users {
-                if let Ok(Some(stored)) = svc.metadata.get_user(u).await {
-                    values.push(vec![
-                        serde_json::Value::String(u.clone()),
-                        serde_json::Value::Bool(stored.admin),
-                    ]);
-                }
-            }
-            Ok(StatementResult {
-                statement_id,
-                series: Some(vec![SeriesResult {
-                    name: "users".to_string(),
-                    tags: None,
-                    columns,
-                    values,
-                    partial: None,
-                }]),
-                error: None,
-            })
-        }
+        Statement::ShowUsers => statements::show_catalog::show_users(svc, statement_id).await,
         Statement::CreateRetentionPolicyStmt {
             name,
             db: rp_db,
@@ -1659,61 +817,27 @@ async fn execute_statement(
             shard_duration,
             is_default,
         } => {
-            let target_db = if rp_db.is_empty() { db } else { rp_db.as_str() };
-            let std_duration = duration
-                .as_ref()
-                .map(|d| std::time::Duration::from_nanos(d.to_nanos() as u64));
-            let shard_dur = shard_duration
-                .as_ref()
-                .map(|d| std::time::Duration::from_nanos(d.to_nanos() as u64))
-                .unwrap_or_else(|| {
-                    crate::domain::database::derive_shard_group_duration(std_duration)
-                });
-            let rp = crate::domain::database::RetentionPolicy {
-                name: name.clone(),
-                duration: std_duration,
-                shard_group_duration: shard_dur,
-                replication_factor: *replication,
-                is_default: *is_default,
-            };
-            svc.metadata.create_retention_policy(target_db, rp).await?;
-            Ok(StatementResult {
+            statements::ddl::create_retention_policy(
+                svc,
+                db,
+                name,
+                rp_db,
+                duration,
+                replication,
+                shard_duration,
+                is_default,
                 statement_id,
-                series: Some(vec![]),
-                error: None,
-            })
+            )
+            .await
         }
         Statement::DropRetentionPolicyStmt { name, db: rp_db } => {
-            let target_db = if rp_db.is_empty() { db } else { rp_db.as_str() };
-            svc.metadata.drop_retention_policy(target_db, name).await?;
-            svc.drop_shard_spaces(target_db, Some(name), None).await;
-            Ok(StatementResult {
-                statement_id,
-                series: Some(vec![]),
-                error: None,
-            })
+            statements::ddl::drop_retention_policy(svc, db, name, rp_db, statement_id).await
         }
         Statement::CreateUser {
             username,
             password,
             admin,
-        } => {
-            let password_hash = crate::domain::user::hash_password(password).map_err(|e| {
-                HyperbytedbError::Internal(crate::error::ChainedError::from_error(e))
-            })?;
-            crate::application::schema_mutation_apply::create_user(
-                svc.metadata.as_ref(),
-                username,
-                &password_hash,
-                *admin,
-            )
-            .await?;
-            Ok(StatementResult {
-                statement_id,
-                series: Some(vec![]),
-                error: None,
-            })
-        }
+        } => statements::users::create_user(svc, username, password, admin, statement_id).await,
         Statement::DropUser(username) => {
             svc.metadata.drop_user(username).await?;
             Ok(StatementResult {
@@ -1723,20 +847,7 @@ async fn execute_statement(
             })
         }
         Statement::SetPassword { username, password } => {
-            let password_hash = crate::domain::user::hash_password(password).map_err(|e| {
-                HyperbytedbError::Internal(crate::error::ChainedError::from_error(e))
-            })?;
-            crate::application::schema_mutation_apply::set_password(
-                svc.metadata.as_ref(),
-                username,
-                &password_hash,
-            )
-            .await?;
-            Ok(StatementResult {
-                statement_id,
-                series: Some(vec![]),
-                error: None,
-            })
+            statements::users::set_password(svc, username, password, statement_id).await
         }
         Statement::AlterRetentionPolicyStmt {
             name,
@@ -1746,185 +857,32 @@ async fn execute_statement(
             shard_duration,
             is_default,
         } => {
-            let target_db = if rp_db.is_empty() { db } else { rp_db.as_str() };
-            let change = RetentionPolicyChange {
-                duration: duration.as_ref().map(|d| {
-                    if d.value == 0 && d.unit == DurationUnit::Second {
-                        None
-                    } else {
-                        Some(d.clone())
-                    }
-                }),
-                replication: *replication,
-                shard_duration: shard_duration.clone(),
-                is_default: *is_default,
-            };
-            svc.metadata
-                .alter_retention_policy(target_db, name, &change)
-                .await?;
-            Ok(StatementResult {
+            statements::ddl::alter_retention_policy(
+                svc,
+                db,
+                name,
+                rp_db,
+                duration,
+                replication,
+                shard_duration,
+                is_default,
                 statement_id,
-                series: Some(vec![]),
-                error: None,
-            })
+            )
+            .await
         }
         Statement::DropSeries(s) => {
-            let target_db = s.database.as_deref().unwrap_or(db);
-            let measurement = s.from.as_ref().and_then(|n| match n {
-                MeasurementName::Name(n) => Some(n.clone()),
-                MeasurementName::Regex(_) => None,
-            });
-            let rp = if let Some(rp) = query_rp {
-                rp.to_string()
-            } else {
-                svc.metadata.get_default_rp(target_db).await?
-            };
-            let predicate_sql = if let Some(ref cond) = s.condition {
-                let meas = measurement.as_deref().unwrap_or("");
-                crate::application::predicate_sql::build_predicate_sql(
-                    &svc.metadata,
-                    target_db,
-                    &rp,
-                    meas,
-                    cond,
-                )
-                .await?
-            } else {
-                String::new()
-            };
-            if measurement.is_some() || !predicate_sql.is_empty() {
-                svc.metadata
-                    .delete_series_matching(target_db, &rp, measurement.as_deref(), &predicate_sql)
-                    .await?;
-                // The series' rows are deleted; points written to them later
-                // stay. A tombstone used to hide those too.
-                let mut targets: Vec<(String, String)> = Vec::new();
-                if let Some(ref meas) = measurement {
-                    let pred = crate::application::predicate_sql::build_delete_predicate(
-                        &svc.metadata,
-                        target_db,
-                        &rp,
-                        meas,
-                        s.condition.as_ref(),
-                    )
-                    .await?;
-                    targets.push((meas.clone(), pred));
-                } else if svc.shard_routing.is_some() {
-                    // Every measurement that has the condition's tags.
-                    for meas in svc.metadata.list_measurements(target_db).await? {
-                        if let Ok(pred) = crate::application::predicate_sql::build_delete_predicate(
-                            &svc.metadata,
-                            target_db,
-                            &rp,
-                            &meas,
-                            s.condition.as_ref(),
-                        )
-                        .await
-                        {
-                            targets.push((meas, pred));
-                        }
-                    }
-                }
-                for (meas, pred) in targets {
-                    if let Some(ctx) = svc.shard_routing.as_ref() {
-                        scatter_delete_to_regions(
-                            ctx,
-                            svc.metadata.as_ref(),
-                            Some(crate::application::predicate_sql::LocalRows {
-                                wal: Some(svc.wal.as_ref()),
-                                sink: svc.points_sink.as_ref(),
-                            }),
-                            target_db,
-                            &rp,
-                            &meas,
-                            &pred,
-                        )
-                        .await?;
-                    } else {
-                        crate::application::predicate_sql::delete_rows(
-                            Some(svc.wal.as_ref()),
-                            svc.points_sink.as_ref(),
-                            target_db,
-                            &rp,
-                            &meas,
-                            &pred,
-                        )
-                        .await?;
-                    }
-                }
-            }
-            Ok(StatementResult {
-                statement_id,
-                series: Some(vec![]),
-                error: None,
-            })
+            statements::delete::drop_series(svc, db, s, query_rp, statement_id).await
         }
         Statement::Grant {
             username,
             database,
             privilege,
-        } => {
-            match database {
-                Some(db) => {
-                    svc.metadata
-                        .grant_privilege(username, db, *privilege)
-                        .await?;
-                }
-                None => {
-                    if svc.metadata.get_user(username).await?.is_none() {
-                        return Err(HyperbytedbError::QueryParse(format!(
-                            "user '{username}' does not exist"
-                        )));
-                    }
-                    crate::application::schema_mutation_apply::set_admin(
-                        svc.metadata.as_ref(),
-                        username,
-                        true,
-                    )
-                    .await?;
-                }
-            }
-            Ok(StatementResult {
-                statement_id,
-                series: Some(vec![]),
-                error: None,
-            })
-        }
+        } => statements::users::grant(svc, username, database, privilege, statement_id).await,
         Statement::Revoke {
             username,
             database,
             privilege,
-        } => {
-            match database {
-                Some(db) => {
-                    crate::application::schema_mutation_apply::revoke_privilege(
-                        svc.metadata.as_ref(),
-                        username,
-                        db,
-                        *privilege,
-                    )
-                    .await?;
-                }
-                None => {
-                    if svc.metadata.get_user(username).await?.is_none() {
-                        return Err(HyperbytedbError::QueryParse(format!(
-                            "user '{username}' does not exist"
-                        )));
-                    }
-                    crate::application::schema_mutation_apply::set_admin(
-                        svc.metadata.as_ref(),
-                        username,
-                        false,
-                    )
-                    .await?;
-                }
-            }
-            Ok(StatementResult {
-                statement_id,
-                series: Some(vec![]),
-                error: None,
-            })
-        }
+        } => statements::users::revoke(svc, username, database, privilege, statement_id).await,
     }
 }
 
