@@ -117,7 +117,17 @@ async fn primary_failover_updates_shard_map_after_unhealthy_timeout() {
     let scheduler = Arc::new(ShardScheduler::new(
         shard_map.clone(),
         bootstrap.membership.clone(),
-        raft.clone(),
+        Arc::new(
+            hyperbytedb::adapters::cluster::raft::consensus::RaftConsensus::new(
+                raft.clone(),
+                Arc::new(
+                    hyperbytedb::adapters::cluster::http_peer_rpc::HttpPeerRpc::with_client(
+                        reqwest::Client::new(),
+                    ),
+                ),
+                Some(bootstrap.membership.clone()),
+            ),
+        ),
         None,
         metadata,
         wal,

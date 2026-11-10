@@ -1,0 +1,68 @@
+//! How a call to a peer failed: the peer answered with an error status, or
+//! it could not be reached. Callers act on the status (409 stale epoch,
+//! 429/503 back-pressure, 404/405 an older peer), so it is kept.
+
+use std::fmt;
+
+use crate::error::HyperbytedbError;
+
+/// Where a forwarded `/internal/shard/write` goes: the headers it carries.
+#[derive(Debug, Clone)]
+pub struct ShardWriteTarget {
+    pub db: String,
+    pub rp: String,
+    pub region_id: u64,
+    /// The region epoch, JSON-encoded, as the receiver parses it.
+    pub epoch_json: String,
+    pub precision: Option<String>,
+}
+
+/// What one health probe of a peer got back. Unlike other calls, an error
+/// status is an answer here: its body still carries the peer's
+/// self-reported state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeReply {
+    /// `/health` answered; `ok` is whether its status was a success.
+    Health { ok: bool, body: String },
+    /// `/health` did not answer but `/ping` did.
+    AliveOnly,
+    /// Neither answered.
+    Unreachable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerRpcError {
+    /// The peer answered with a non-success status.
+    Status { code: u16, body: String },
+    /// The request did not complete (connect, send or read failed, or it
+    /// timed out).
+    Unreachable(String),
+}
+
+impl PeerRpcError {
+    /// The peer's status code, if it answered.
+    #[must_use]
+    pub fn status(&self) -> Option<u16> {
+        match self {
+            Self::Status { code, .. } => Some(*code),
+            Self::Unreachable(_) => None,
+        }
+    }
+}
+
+impl fmt::Display for PeerRpcError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Status { code, body } => write!(f, "HTTP {code}: {body}"),
+            Self::Unreachable(e) => f.write_str(e),
+        }
+    }
+}
+
+impl std::error::Error for PeerRpcError {}
+
+impl From<PeerRpcError> for HyperbytedbError {
+    fn from(e: PeerRpcError) -> Self {
+        HyperbytedbError::PeerUnreachable(e.to_string())
+    }
+}

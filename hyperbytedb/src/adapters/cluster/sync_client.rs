@@ -1,5 +1,5 @@
 use crate::adapters::cluster::cluster_auth::ClusterAuth;
-use crate::ports::peer_http::PeerHttp;
+use crate::adapters::cluster::peer_http::PeerHttp;
 use std::sync::Arc;
 use std::time::Duration;
 

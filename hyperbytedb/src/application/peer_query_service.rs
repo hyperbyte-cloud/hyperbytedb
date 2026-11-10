@@ -1,26 +1,21 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 
-use openraft::BasicNode;
-use openraft::error::ForwardToLeader;
-
-use crate::adapters::cluster::raft::HyperbytedbRaft;
 use crate::application::materialized_view_service::def_from_statement;
 use crate::application::predicate_sql::build_predicate_sql;
 use crate::application::query_service::check_authorization;
 use crate::application::shard_metadata_scatter::scatter_measurement_meta;
 use crate::application::shard_routing::ShardRoutingContext;
-use crate::domain::cluster::membership::ClusterMembership;
-use crate::domain::cluster::raft_request::{ClusterRequest, ClusterResponse};
+use crate::domain::cluster::raft_request::ClusterRequest;
 use crate::domain::cluster::types::MutationRequest;
 use crate::domain::database::{RetentionPolicy, retention_policy_from_create};
 use crate::domain::materialized_view::MaterializedViewDef;
 use crate::domain::measurement::MeasurementMeta;
 use crate::domain::query_result::{QueryResponse, StatementResult};
 use crate::error::HyperbytedbError;
+use crate::ports::consensus::ConsensusPort;
 use crate::ports::metadata::ContinuousQueryDef;
 use crate::ports::metadata::MetadataPort;
-use crate::ports::peer_http::PeerHttp;
 use crate::ports::query::QueryService;
 use crate::ports::replication::ReplicationPort;
 use crate::timeseriesql::ast::{
@@ -37,11 +32,8 @@ pub struct PeerQueryService {
     inner: Arc<dyn QueryService>,
     metadata: Arc<dyn MetadataPort>,
     replication_port: Arc<dyn ReplicationPort>,
-    raft: std::sync::OnceLock<HyperbytedbRaft>,
-    membership: std::sync::OnceLock<Arc<tokio::sync::RwLock<ClusterMembership>>>,
+    consensus: std::sync::OnceLock<Arc<dyn ConsensusPort>>,
     shard_routing: std::sync::OnceLock<Arc<ShardRoutingContext>>,
-    /// For schema mutations forwarded to the Raft leader.
-    raft_client: reqwest::Client,
 }
 
 impl PeerQueryService {
@@ -49,19 +41,12 @@ impl PeerQueryService {
         inner: Arc<dyn QueryService>,
         metadata: Arc<dyn MetadataPort>,
         replication_port: Arc<dyn ReplicationPort>,
-        peer_http: &dyn PeerHttp,
     ) -> Self {
         Self {
-            raft_client: peer_http.build(
-                peer_http
-                    .client_builder()
-                    .timeout(std::time::Duration::from_secs(10)),
-            ),
             inner,
             metadata,
             replication_port,
-            raft: std::sync::OnceLock::new(),
-            membership: std::sync::OnceLock::new(),
+            consensus: std::sync::OnceLock::new(),
             shard_routing: std::sync::OnceLock::new(),
         }
     }
@@ -72,28 +57,28 @@ impl PeerQueryService {
         let _ = self.shard_routing.set(ctx);
     }
 
-    /// Set the Raft instance for consensus-based schema mutation replication.
-    /// Called after Raft initialization completes.
-    pub fn set_raft(&self, raft: HyperbytedbRaft) {
-        if self.raft.set(raft).is_err() {
-            tracing::error!("PeerQueryService::set_raft called more than once; ignoring duplicate");
-        }
-    }
-
-    /// Shared cluster membership for resolving leader addresses during Raft
-    /// forward when openraft omits `leader_node` from `ForwardToLeader`.
-    pub fn set_membership(&self, membership: Arc<tokio::sync::RwLock<ClusterMembership>>) {
-        if self.membership.set(membership).is_err() {
+    /// Route schema mutations through consensus. Called after Raft
+    /// initialization completes.
+    pub fn set_consensus(&self, consensus: Arc<dyn ConsensusPort>) {
+        if self.consensus.set(consensus).is_err() {
             tracing::error!(
-                "PeerQueryService::set_membership called more than once; ignoring duplicate"
+                "PeerQueryService::set_consensus called more than once; ignoring duplicate"
             );
         }
     }
 
     async fn replicate_mutation(&self, req: MutationRequest) -> Result<(), HyperbytedbError> {
-        if let Some(raft) = self.raft.get() {
-            let cluster_req = ClusterRequest::SchemaMutation(Box::new(req));
-            self.client_write_with_forward(raft, cluster_req).await
+        if let Some(consensus) = self.consensus.get() {
+            let resp = consensus
+                .propose(ClusterRequest::SchemaMutation(Box::new(req)))
+                .await?;
+            if resp.ok {
+                return Ok(());
+            }
+            Err(HyperbytedbError::Internal(crate::error::ChainedError::new(
+                resp.message
+                    .unwrap_or_else(|| "raft schema mutation apply failed".to_string()),
+            )))
         } else {
             self.replication_port
                 .clone()
@@ -117,70 +102,6 @@ impl PeerQueryService {
                 .await,
             statement_id,
         )
-    }
-
-    async fn client_write_with_forward(
-        &self,
-        raft: &HyperbytedbRaft,
-        req: ClusterRequest,
-    ) -> Result<(), HyperbytedbError> {
-        const MAX_ATTEMPTS: u32 = 3;
-        for attempt in 0..MAX_ATTEMPTS {
-            match raft.client_write(req.clone()).await {
-                Ok(resp) => {
-                    if resp.data.ok {
-                        return Ok(());
-                    }
-                    return Err(HyperbytedbError::Internal(crate::error::ChainedError::new(
-                        resp.data
-                            .message
-                            .unwrap_or_else(|| "raft schema mutation apply failed".to_string()),
-                    )));
-                }
-                Err(e) => {
-                    if let Some(forward) = e.forward_to_leader::<BasicNode>() {
-                        tracing::debug!(
-                            leader_id = ?forward.leader_id,
-                            leader_addr = ?forward
-                                .leader_node
-                                .as_ref()
-                                .map(|node| node.addr.as_str()),
-                            attempt,
-                            "forwarding schema mutation to raft leader"
-                        );
-                        match forward_client_write(
-                            &self.raft_client,
-                            forward,
-                            raft,
-                            self.membership.get(),
-                            &req,
-                        )
-                        .await
-                        {
-                            Ok(()) => return Ok(()),
-                            Err(forward_err) => {
-                                tracing::warn!(
-                                    error = %forward_err,
-                                    attempt,
-                                    "forward to raft leader failed; retrying"
-                                );
-                                if attempt + 1 >= MAX_ATTEMPTS {
-                                    return Err(forward_err);
-                                }
-                                continue;
-                            }
-                        }
-                    }
-                    tracing::error!(error = %e, "failed to replicate mutation via raft");
-                    return Err(HyperbytedbError::Internal(
-                        format!("raft replication failed: {e}").into(),
-                    ));
-                }
-            }
-        }
-        Err(HyperbytedbError::Internal(crate::error::ChainedError::new(
-            "raft replication failed after retries",
-        )))
     }
 
     async fn execute_raft_mutation(
@@ -223,113 +144,6 @@ impl PeerQueryService {
                 error: Some(e.to_string()),
             }),
         }
-    }
-}
-
-async fn resolve_forward_leader_addr(
-    forward: &ForwardToLeader<u64, BasicNode>,
-    raft: &HyperbytedbRaft,
-    membership: Option<&Arc<tokio::sync::RwLock<ClusterMembership>>>,
-) -> Result<String, HyperbytedbError> {
-    let metrics = raft.metrics().borrow().clone();
-    let membership_addrs = if let Some(membership) = membership {
-        let m = membership.read().await;
-        m.nodes
-            .values()
-            .map(|node| (node.node_id, node.addr.clone()))
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-
-    resolve_leader_addr_with_lookup(
-        forward,
-        metrics.current_leader,
-        |leader_id| {
-            metrics
-                .membership_config
-                .membership()
-                .get_node(&leader_id)
-                .map(|node| node.addr.clone())
-        },
-        |leader_id| {
-            membership_addrs
-                .iter()
-                .find(|(id, _)| *id == leader_id)
-                .map(|(_, addr)| addr.clone())
-        },
-    )
-}
-
-fn resolve_leader_addr_with_lookup(
-    forward: &ForwardToLeader<u64, BasicNode>,
-    fallback_leader_id: Option<u64>,
-    raft_lookup: impl Fn(u64) -> Option<String>,
-    membership_lookup: impl Fn(u64) -> Option<String>,
-) -> Result<String, HyperbytedbError> {
-    if let Some(node) = forward.leader_node.as_ref() {
-        return Ok(node.addr.clone());
-    }
-
-    let leader_id = forward.leader_id.or(fallback_leader_id);
-    let leader_id = leader_id.ok_or_else(|| {
-        HyperbytedbError::Internal(crate::error::ChainedError::new(
-            "raft replication failed: forward to leader but leader id is unknown",
-        ))
-    })?;
-
-    raft_lookup(leader_id)
-        .or_else(|| membership_lookup(leader_id))
-        .ok_or_else(|| {
-            HyperbytedbError::Internal(
-                format!("raft replication failed: leader {leader_id} has no known address").into(),
-            )
-        })
-}
-
-async fn forward_client_write(
-    client: &reqwest::Client,
-    forward: &ForwardToLeader<u64, BasicNode>,
-    raft: &HyperbytedbRaft,
-    membership: Option<&Arc<tokio::sync::RwLock<ClusterMembership>>>,
-    req: &ClusterRequest,
-) -> Result<(), HyperbytedbError> {
-    let leader_addr = resolve_forward_leader_addr(forward, raft, membership).await?;
-
-    let url = format!("http://{leader_addr}/cluster/raft/client-write");
-    let resp = client.post(&url).json(req).send().await.map_err(|e| {
-        HyperbytedbError::Internal(
-            format!("raft replication failed: forward to leader {url}: {e}").into(),
-        )
-    })?;
-
-    let status = resp.status();
-    let body_text = resp.text().await.map_err(|e| {
-        HyperbytedbError::Internal(
-            format!("raft replication failed: read leader response: {e}").into(),
-        )
-    })?;
-
-    if !status.is_success() {
-        return Err(HyperbytedbError::Internal(
-            format!("raft replication failed: leader returned HTTP {status}: {body_text}").into(),
-        ));
-    }
-
-    let body: ClusterResponse = serde_json::from_str(&body_text).map_err(|e| {
-        HyperbytedbError::Internal(
-            format!("raft replication failed: invalid leader response: {e}: {body_text}").into(),
-        )
-    })?;
-
-    if body.ok {
-        Ok(())
-    } else {
-        Err(HyperbytedbError::Internal(
-            body.message
-                .unwrap_or_else(|| "raft leader rejected schema mutation".into())
-                .into(),
-        ))
     }
 }
 
@@ -667,7 +481,7 @@ impl QueryService for PeerQueryService {
         }
 
         let mut results = Vec::new();
-        let use_raft = self.raft.get().is_some();
+        let use_raft = self.consensus.get().is_some();
         for (i, stmt) in stmts.into_iter().enumerate() {
             let statement_id = i as u32;
             let stmt_query = stmt_queries.get(i).map(String::as_str).unwrap_or(query);
@@ -1407,13 +1221,18 @@ mod tests {
             30,
             sink,
         ));
-        let peer = PeerQueryService::new(
-            base.clone(),
-            metadata.clone(),
-            Arc::new(NoReplication),
-            &crate::adapters::cluster::cluster_auth::ClusterAuth::new(None).unwrap(),
-        );
-        peer.set_raft(raft);
+        let peer = PeerQueryService::new(base.clone(), metadata.clone(), Arc::new(NoReplication));
+        peer.set_consensus(Arc::new(
+            crate::adapters::cluster::raft::consensus::RaftConsensus::new(
+                raft,
+                Arc::new(
+                    crate::adapters::cluster::http_peer_rpc::HttpPeerRpc::with_client(
+                        reqwest::Client::new(),
+                    ),
+                ),
+                None,
+            ),
+        ));
 
         let resp = peer
             .execute_query(
@@ -1447,85 +1266,5 @@ mod tests {
         };
         assert_eq!(rows("week").await, 0, "the DELETE named ?rp=week");
         assert_eq!(rows("autogen").await, 1, "autogen must be untouched");
-    }
-
-    #[test]
-    fn resolve_leader_addr_prefers_forward_node() {
-        let forward = ForwardToLeader {
-            leader_id: Some(1),
-            leader_node: Some(BasicNode::new("hyperbytedb-0:8086")),
-        };
-
-        let addr = resolve_leader_addr_with_lookup(&forward, None, |_| None, |_| None)
-            .expect("leader addr");
-
-        assert_eq!(addr, "hyperbytedb-0:8086");
-    }
-
-    #[test]
-    fn resolve_leader_addr_falls_back_to_raft_membership() {
-        let forward = ForwardToLeader {
-            leader_id: Some(1),
-            leader_node: None,
-        };
-
-        let addr = resolve_leader_addr_with_lookup(
-            &forward,
-            None,
-            |id| (id == 1).then(|| "hyperbytedb-0:8086".into()),
-            |_| None,
-        )
-        .expect("leader addr");
-
-        assert_eq!(addr, "hyperbytedb-0:8086");
-    }
-
-    #[test]
-    fn resolve_leader_addr_falls_back_to_cluster_membership() {
-        let forward = ForwardToLeader {
-            leader_id: Some(2),
-            leader_node: None,
-        };
-
-        let addr = resolve_leader_addr_with_lookup(
-            &forward,
-            None,
-            |_| None,
-            |id| (id == 2).then(|| "hyperbytedb-1:8086".into()),
-        )
-        .expect("leader addr");
-
-        assert_eq!(addr, "hyperbytedb-1:8086");
-    }
-
-    #[test]
-    fn resolve_leader_addr_uses_metrics_leader_when_forward_id_missing() {
-        let forward = ForwardToLeader {
-            leader_id: None,
-            leader_node: None,
-        };
-
-        let addr = resolve_leader_addr_with_lookup(
-            &forward,
-            Some(1),
-            |id| (id == 1).then(|| "hyperbytedb-0:8086".into()),
-            |_| None,
-        )
-        .expect("leader addr");
-
-        assert_eq!(addr, "hyperbytedb-0:8086");
-    }
-
-    #[test]
-    fn resolve_leader_addr_errors_when_unresolvable() {
-        let forward = ForwardToLeader {
-            leader_id: Some(99),
-            leader_node: None,
-        };
-
-        let err = resolve_leader_addr_with_lookup(&forward, None, |_| None, |_| None)
-            .expect_err("expected error");
-
-        assert!(err.to_string().contains("leader 99 has no known address"));
     }
 }

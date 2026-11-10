@@ -160,13 +160,9 @@ async fn start_node_on(
             replication,
         ));
 
-    let query: Arc<dyn hyperbytedb::adapters::http::router::QueryService> =
-        Arc::new(PeerQueryService::new(
-            base_query,
-            metadata.clone(),
-            peer_client.clone(),
-            peer_client.cluster_auth(),
-        ));
+    let query: Arc<dyn hyperbytedb::adapters::http::router::QueryService> = Arc::new(
+        PeerQueryService::new(base_query, metadata.clone(), peer_client.clone()),
+    );
 
     let app_state = Arc::new(AppState {
         ingestion,

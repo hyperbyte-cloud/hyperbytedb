@@ -2,9 +2,9 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::adapters::cluster::peer_http::PeerHttp;
 use crate::adapters::http::router::AppState;
 use crate::domain::cluster::membership::{NodeInfo, NodeState};
-use crate::ports::peer_http::PeerHttp;
 use openraft::BasicNode;
 use openraft::RaftMetrics;
 
