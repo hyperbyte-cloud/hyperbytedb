@@ -1927,10 +1927,7 @@ mod presplit_tests {
         assert!(
             crate::domain::sharding::ops::apply_shard_map_op(
                 &mut map,
-                ShardMapOp::BootstrapMeasurementPresplit {
-                    key: key.clone(),
-                    regions,
-                },
+                ShardMapOp::BootstrapMeasurementPresplit { key, regions },
             )
             .is_err(),
             "a second bootstrap of the same space must be refused"

@@ -92,7 +92,7 @@ fn convergence_walks_a_split_child_to_its_hash_target() {
     );
     let mut peers = child.peers.clone();
     peers.sort_unstable();
-    let mut want = target.clone();
+    let mut want = target;
     want.sort_unstable();
     assert_eq!(peers, want, "child did not reach its hash target");
 }

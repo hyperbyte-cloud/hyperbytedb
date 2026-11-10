@@ -381,7 +381,7 @@ mod tests {
         map.spaces.insert(
             raw.clone(),
             MeasurementShardSpace {
-                key: raw.clone(),
+                key: raw,
                 regions: vec![region(vec![1, 2])],
             },
         );

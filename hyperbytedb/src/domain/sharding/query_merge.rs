@@ -1917,7 +1917,7 @@ mod tests {
             ("SLIMIT", with(&|s| s.slimit = Some(2)), Some("ms"), day),
             (
                 "too many buckets",
-                stmt.clone(),
+                stmt,
                 Some("ms"),
                 (Some(0), Some(i64::MAX / 2)),
             ),
