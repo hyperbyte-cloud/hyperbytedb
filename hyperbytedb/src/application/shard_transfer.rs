@@ -603,7 +603,7 @@ const TRANSFER_ACK_TIMEOUT_SECS: u64 = 30;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn push_region_transfer(
-    peer_client: &crate::adapters::cluster::peer_client::PeerClient,
+    peers: &crate::ports::peer_rpc::Peers,
     source_node_id: u64,
     key: &MeasurementKey,
     region: &ShardRegion,
@@ -614,7 +614,7 @@ pub async fn push_region_transfer(
     done: bool,
     stage: bool,
 ) -> Result<(u64, u64), HyperbytedbError> {
-    let membership = peer_client.membership().read().await;
+    let membership = peers.membership.read().await;
     let addr = membership
         .get_node(dest_primary)
         .map(|n| n.addr.clone())
@@ -653,72 +653,40 @@ pub async fn push_region_transfer(
             done,
         )
     };
-    let resp = send_transfer_push(peer_client.http_client(), &addr, payload).await?;
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        return Err(HyperbytedbError::TransferRejected {
-            status,
-            reason: rejection_reason(resp).await,
-        });
-    }
-    let applied = parse_applied_from_response(&resp.text().await.unwrap_or_default());
+    use crate::domain::cluster::peer_rpc::PeerRpcError;
+    let text = match peers
+        .rpc
+        .shard_transfer_push(
+            &addr,
+            payload,
+            Duration::from_secs(TRANSFER_PUSH_TIMEOUT_SECS),
+        )
+        .await
+    {
+        Ok(text) => text,
+        Err(PeerRpcError::Status { code, body }) => {
+            return Err(HyperbytedbError::TransferRejected {
+                status: code,
+                reason: rejection_reason(&body),
+            });
+        }
+        Err(PeerRpcError::Unreachable(e)) => return Err(HyperbytedbError::PeerUnreachable(e)),
+    };
+    let applied = parse_applied_from_response(&text);
     counter!("hyperbytedb_shard_transfer_bytes").increment(wire_bytes);
     counter!("hyperbytedb_shard_transfers_total").increment(1);
     Ok((applied, wire_bytes))
 }
 
-/// Send one push: the line protocol as the raw body, the rest of the payload
-/// in a header. A node without the raw route (an older build) answers 404,
-/// and gets the JSON push instead.
-async fn send_transfer_push(
-    client: &reqwest::Client,
-    addr: &str,
-    mut payload: ShardTransferPayload,
-) -> Result<reqwest::Response, HyperbytedbError> {
-    use base64::Engine as _;
-    let unreachable = |e: reqwest::Error| HyperbytedbError::PeerUnreachable(e.to_string());
-    let timeout = Duration::from_secs(TRANSFER_PUSH_TIMEOUT_SECS);
-    // Bytes: the fallback below resends it without a copy.
-    let body = bytes::Bytes::from(payload.body.take().unwrap_or_default());
-    let header = serde_json::to_vec(&payload)
-        .map(|json| base64::engine::general_purpose::STANDARD.encode(json))
-        .map_err(|e| HyperbytedbError::Internal(format!("transfer header: {e}").into()))?;
-    let resp = client
-        .post(format!("http://{addr}/internal/shard/transfer/raw"))
-        .header(
-            crate::domain::sharding::transfer::TRANSFER_PAYLOAD_HEADER,
-            header,
-        )
-        .header(reqwest::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .body(body.clone())
-        .timeout(timeout)
-        .send()
-        .await
-        .map_err(unreachable)?;
-    if resp.status() != reqwest::StatusCode::NOT_FOUND {
-        return Ok(resp);
-    }
-    // An older node, or a region the receiver does not know: the JSON route
-    // answers the second the same way.
-    payload.body = Some(body.to_vec());
-    client
-        .post(format!("http://{addr}/internal/shard/transfer"))
-        .json(&payload)
-        .timeout(timeout)
-        .send()
-        .await
-        .map_err(unreachable)
-}
-
 pub async fn ack_region_transfer(
-    peer_client: &crate::adapters::cluster::peer_client::PeerClient,
+    peers: &crate::ports::peer_rpc::Peers,
     source_node_id: u64,
     key: &MeasurementKey,
     region: &ShardRegion,
     ack_node: u64,
     transfer_id: u64,
 ) -> Result<(), HyperbytedbError> {
-    let membership = peer_client.membership().read().await;
+    let membership = peers.membership.read().await;
     let addr = membership
         .get_node(ack_node)
         .map(|n| n.addr.clone())
@@ -736,21 +704,23 @@ pub async fn ack_region_transfer(
         source_node_id,
         transfer_id,
     );
-    let url = format!("http://{addr}/internal/shard/transfer");
-    let resp = peer_client
-        .http_client()
-        .post(&url)
-        .json(&payload)
-        .timeout(Duration::from_secs(TRANSFER_ACK_TIMEOUT_SECS))
-        .send()
+    match peers
+        .rpc
+        .shard_transfer_ack(
+            &addr,
+            &payload,
+            Duration::from_secs(TRANSFER_ACK_TIMEOUT_SECS),
+        )
         .await
-        .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
-    if !resp.status().is_success() {
-        return Err(HyperbytedbError::ShardMap(
-            format!("transfer ack failed: {}", resp.status()).into(),
-        ));
+    {
+        Ok(()) => Ok(()),
+        Err(crate::domain::cluster::peer_rpc::PeerRpcError::Status { code, .. }) => Err(
+            HyperbytedbError::ShardMap(format!("transfer ack failed: {code}").into()),
+        ),
+        Err(crate::domain::cluster::peer_rpc::PeerRpcError::Unreachable(e)) => {
+            Err(HyperbytedbError::PeerUnreachable(e))
+        }
     }
-    Ok(())
 }
 
 fn new_transfer_id() -> u64 {
@@ -808,7 +778,7 @@ fn pacing_delay(rate: u64, sent: u64, elapsed: std::time::Duration) -> std::time
 /// move only sees the whole remote stage, after it is done.
 #[allow(clippy::too_many_arguments)]
 async fn transfer_region_data(
-    peer_client: &Arc<crate::adapters::cluster::peer_client::PeerClient>,
+    peers: &crate::ports::peer_rpc::Peers,
     metadata: &Arc<dyn MetadataPort>,
     wal: &Arc<dyn WalPort>,
     query_port: Option<&Arc<dyn QueryPort>>,
@@ -862,7 +832,7 @@ async fn transfer_region_data(
             export_region_points_from_wal_chunked(wal, key, region, cursor, max_points, 0).await?;
         if !body.is_empty() {
             let pushed = push_region_transfer(
-                peer_client.as_ref(),
+                peers,
                 source_node_id,
                 key,
                 region,
@@ -932,7 +902,7 @@ async fn transfer_region_data(
             }
             let (body, count, chunk_end) = (chunk.body, chunk.points, chunk.next);
             let push = push_region_transfer(
-                peer_client.as_ref(),
+                peers,
                 source_node_id,
                 key,
                 region,
@@ -996,7 +966,7 @@ async fn transfer_region_data(
 /// applied. Ownership-aware: the destination validates the committed range.
 #[allow(clippy::too_many_arguments)]
 pub async fn push_region_transfer_data(
-    peer_client: &Arc<crate::adapters::cluster::peer_client::PeerClient>,
+    peers: &crate::ports::peer_rpc::Peers,
     metadata: &Arc<dyn MetadataPort>,
     wal: &Arc<dyn WalPort>,
     query_port: Option<&Arc<dyn QueryPort>>,
@@ -1007,7 +977,7 @@ pub async fn push_region_transfer_data(
     max_points: usize,
 ) -> Result<RegionTransferOutcome, HyperbytedbError> {
     transfer_region_data(
-        peer_client,
+        peers,
         metadata,
         wal,
         query_port,
@@ -1027,7 +997,7 @@ pub async fn push_region_transfer_data(
 /// Best-effort by design — callers log failures and proceed to commit.
 #[allow(clippy::too_many_arguments)]
 pub async fn stage_region_transfer_data(
-    peer_client: &Arc<crate::adapters::cluster::peer_client::PeerClient>,
+    peers: &crate::ports::peer_rpc::Peers,
     metadata: &Arc<dyn MetadataPort>,
     wal: &Arc<dyn WalPort>,
     query_port: Option<&Arc<dyn QueryPort>>,
@@ -1039,7 +1009,7 @@ pub async fn stage_region_transfer_data(
     max_bytes_per_sec: u64,
 ) -> Result<RegionTransferOutcome, HyperbytedbError> {
     let outcome = transfer_region_data(
-        peer_client,
+        peers,
         metadata,
         wal,
         query_port,
@@ -1072,8 +1042,8 @@ pub async fn stage_region_transfer_data(
 /// and every caller threw it away at the one place anyone would look. That is
 /// why a cluster could report 49 staging rejections across 27 regions without
 /// a single line saying what was actually wrong.
-pub(crate) async fn rejection_reason(resp: reqwest::Response) -> Box<str> {
-    let body = resp.text().await.unwrap_or_default();
+pub(crate) fn rejection_reason(body: &str) -> Box<str> {
+    let body = body.to_owned();
     let mut reason = serde_json::from_str::<serde_json::Value>(&body)
         .ok()
         .and_then(|v| {
@@ -1097,7 +1067,7 @@ pub(crate) async fn rejection_reason(resp: reqwest::Response) -> Box<str> {
 
 #[allow(clippy::too_many_arguments)]
 pub async fn complete_region_transfer(
-    peer_client: &Arc<crate::adapters::cluster::peer_client::PeerClient>,
+    peers: &crate::ports::peer_rpc::Peers,
     metadata: &Arc<dyn MetadataPort>,
     sink: Option<&Arc<dyn PointsSinkPort>>,
     source_node_id: u64,
@@ -1111,7 +1081,7 @@ pub async fn complete_region_transfer(
         return Ok(());
     }
     ack_region_transfer(
-        peer_client.as_ref(),
+        peers,
         source_node_id,
         key,
         region,
@@ -1144,7 +1114,7 @@ pub async fn complete_region_transfer(
 /// dropping it strands data whenever the subsequent ownership change fails.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_region_transfer(
-    peer_client: &Arc<crate::adapters::cluster::peer_client::PeerClient>,
+    peers: &crate::ports::peer_rpc::Peers,
     metadata: &Arc<dyn MetadataPort>,
     wal: &Arc<dyn WalPort>,
     query_port: Option<&Arc<dyn QueryPort>>,
@@ -1157,7 +1127,7 @@ pub async fn run_region_transfer(
     drop_source: bool,
 ) -> Result<(), HyperbytedbError> {
     let outcome = push_region_transfer_data(
-        peer_client,
+        peers,
         metadata,
         wal,
         query_port,
@@ -1169,7 +1139,7 @@ pub async fn run_region_transfer(
     )
     .await?;
     complete_region_transfer(
-        peer_client,
+        peers,
         metadata,
         sink,
         source_node_id,
@@ -1196,7 +1166,7 @@ mod tests {
             .status(500)
             .body(r#"{"error":"region range not found"}"#)
             .unwrap();
-        let got = super::rejection_reason(reqwest::Response::from(resp)).await;
+        let got = super::rejection_reason(resp.body());
         assert_eq!(&*got, "region range not found");
     }
 
@@ -1206,7 +1176,7 @@ mod tests {
             .status(502)
             .body("upstream exploded")
             .unwrap();
-        let got = super::rejection_reason(reqwest::Response::from(resp)).await;
+        let got = super::rejection_reason(resp.body());
         assert_eq!(&*got, "upstream exploded");
     }
 
@@ -1218,7 +1188,7 @@ mod tests {
             .status(500)
             .body("")
             .unwrap();
-        let got = super::rejection_reason(reqwest::Response::from(resp)).await;
+        let got = super::rejection_reason(resp.body());
         assert_eq!(&*got, "no body");
     }
 
@@ -1231,7 +1201,7 @@ mod tests {
             .status(500)
             .body(body)
             .unwrap();
-        let got = super::rejection_reason(reqwest::Response::from(resp)).await;
+        let got = super::rejection_reason(resp.body());
         assert!(got.len() <= 300, "len {}", got.len());
         assert!(!got.is_empty());
     }
@@ -1466,7 +1436,7 @@ mod tests {
             staging_peers: Vec::new(),
         };
         let outcome = transfer_region_data(
-            &pc,
+            &crate::adapters::cluster::http_peer_rpc::peers_for(pc.clone()),
             &metadata,
             &wal,
             Some(&query),
@@ -1716,7 +1686,7 @@ mod tests {
             staging_peers: Vec::new(),
         };
         let outcome = transfer_region_data(
-            &pc,
+            &crate::adapters::cluster::http_peer_rpc::peers_for(pc.clone()),
             &metadata,
             &wal,
             Some(&query),

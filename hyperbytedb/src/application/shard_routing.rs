@@ -42,6 +42,17 @@ pub struct ShardRoutingContext {
     pub runtime_settings: Arc<crate::application::runtime_settings::RuntimeSettings>,
 }
 
+impl ShardRoutingContext {
+    /// The peer port and membership, for the transfer functions.
+    #[must_use]
+    pub fn peers(&self) -> crate::ports::peer_rpc::Peers {
+        crate::ports::peer_rpc::Peers {
+            rpc: self.peer_rpc.clone(),
+            membership: self.membership.clone(),
+        }
+    }
+}
+
 pub struct PointBuckets {
     /// region_id -> points this node primaries locally
     pub local: HashMap<u64, Vec<Point>>,

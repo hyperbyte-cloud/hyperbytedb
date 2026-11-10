@@ -324,7 +324,7 @@ async fn transfer_moves_flushed_data_and_drops_source_range() {
     let query_port: Arc<dyn QueryPort> = nodes[0].query_port.clone();
 
     run_region_transfer(
-        &peer_client,
+        &hyperbytedb::adapters::cluster::http_peer_rpc::peers_for(peer_client.clone()),
         &metadata,
         &wal,
         Some(&query_port),
@@ -1532,7 +1532,7 @@ async fn joiner_receives_existing_region_as_replica() {
     let query_port: Arc<dyn QueryPort> = node1.query_port.clone();
     let key = MeasurementKey::new("p1db", "autogen", "cpu");
     let outcome = stage_region_transfer_data(
-        &peer_client,
+        &hyperbytedb::adapters::cluster::http_peer_rpc::peers_for(peer_client.clone()),
         &metadata,
         &wal,
         Some(&query_port),
@@ -1696,7 +1696,7 @@ async fn joiner_takes_region_primary_and_applies_writes_locally() {
     let key = MeasurementKey::new("p14db", "autogen", "disk");
 
     hyperbytedb::application::shard_transfer::stage_region_transfer_data(
-        &peer_client,
+        &hyperbytedb::adapters::cluster::http_peer_rpc::peers_for(peer_client.clone()),
         &metadata,
         &wal,
         Some(&query_port),
@@ -1750,7 +1750,7 @@ async fn joiner_takes_region_primary_and_applies_writes_locally() {
 
     // Transfer-then-commit: rows move and verify before ownership changes.
     run_region_transfer(
-        &peer_client,
+        &hyperbytedb::adapters::cluster::http_peer_rpc::peers_for(peer_client.clone()),
         &metadata,
         &wal,
         Some(&query_port),
@@ -1938,7 +1938,7 @@ async fn fourth_node_joining_rf_complete_cluster_takes_a_region() {
 
     // P1.3 shape: stage before the map commits the newcomer as a peer.
     let staged = stage_region_transfer_data(
-        &peer_client,
+        &hyperbytedb::adapters::cluster::http_peer_rpc::peers_for(peer_client.clone()),
         &metadata,
         &wal,
         Some(&query_port),
@@ -1986,7 +1986,7 @@ async fn fourth_node_joining_rf_complete_cluster_takes_a_region() {
     );
 
     run_region_transfer(
-        &peer_client,
+        &hyperbytedb::adapters::cluster::http_peer_rpc::peers_for(peer_client.clone()),
         &metadata,
         &wal,
         Some(&query_port),

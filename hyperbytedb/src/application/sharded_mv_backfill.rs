@@ -178,31 +178,24 @@ async fn execute_region_backfill_once(
             let req = req.clone();
             let addr = addr.to_string();
             async move {
-                let url = format!("http://{addr}/internal/shard/mv-backfill");
-                let resp = ctx
-                    .peer_client
-                    .http_client()
-                    .post(&url)
-                    .json(&req)
-                    .timeout(timeout)
-                    .send()
-                    .await
-                    .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
-                if resp.status() == reqwest::StatusCode::CONFLICT {
-                    return Err(HyperbytedbError::StaleShardEpoch { region_id });
+                use crate::domain::cluster::peer_rpc::PeerRpcError;
+                match ctx.peer_rpc.shard_mv_backfill(&addr, &req, timeout).await {
+                    Ok(()) => Ok(()),
+                    Err(PeerRpcError::Status { code: 409, .. }) => {
+                        Err(HyperbytedbError::StaleShardEpoch { region_id })
+                    }
+                    Err(PeerRpcError::Status { code: 503, .. }) => {
+                        Err(HyperbytedbError::ClusterUnavailable(format!(
+                            "peer {peer_id} has not created the view yet"
+                        )))
+                    }
+                    Err(PeerRpcError::Status { code, .. }) => {
+                        Err(HyperbytedbError::PeerUnreachable(format!(
+                            "shard mv-backfill to peer {peer_id} failed: {code}"
+                        )))
+                    }
+                    Err(PeerRpcError::Unreachable(e)) => Err(HyperbytedbError::PeerUnreachable(e)),
                 }
-                if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-                    return Err(HyperbytedbError::ClusterUnavailable(format!(
-                        "peer {peer_id} has not created the view yet"
-                    )));
-                }
-                if !resp.status().is_success() {
-                    return Err(HyperbytedbError::PeerUnreachable(format!(
-                        "shard mv-backfill to peer {peer_id} failed: {}",
-                        resp.status()
-                    )));
-                }
-                Ok(())
             }
         }
     })
