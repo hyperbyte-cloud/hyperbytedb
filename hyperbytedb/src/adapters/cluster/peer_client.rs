@@ -7,6 +7,7 @@ use tokio::sync::{Semaphore, oneshot};
 
 use crate::adapters::cluster::cluster_auth::ClusterAuth;
 use crate::adapters::cluster::hinted_handoff::HintedHandoff;
+use crate::adapters::cluster::peer_http::PeerHttp;
 use crate::adapters::cluster::replication_log::ReplicationLog;
 use crate::domain::cluster::membership::{ClusterMembership, SharedMembership};
 use crate::domain::cluster::replication_wire::{
@@ -19,7 +20,6 @@ use crate::domain::cluster::types::{
     MutationReplicateRequest, MutationReplicateResponse, MutationRequest,
 };
 use crate::error::HyperbytedbError;
-use crate::ports::peer_http::PeerHttp;
 use crate::ports::replication::{OutboundReplicationBatch, ReplicationPort};
 
 pub struct PeerClient {

@@ -3295,7 +3295,12 @@ async fn series_cardinality_spans_regions() {
     }
     assert_eq!(sides.len(), 2, "the series must span both regions");
     let resp = write_line(&client, &nodes[0].url, "cdb", &lines.join("\n")).await;
-    assert!(resp.status().is_success(), "{}", resp.status());
+    let status = resp.status();
+    assert!(
+        status.is_success(),
+        "{status}: {}",
+        resp.text().await.unwrap_or_default()
+    );
     for n in &nodes {
         flush_node(n).await;
     }

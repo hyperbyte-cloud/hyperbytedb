@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use reqwest::header::{HeaderMap, HeaderValue};
 
+use crate::adapters::cluster::peer_http::PeerHttp;
 use crate::error::HyperbytedbError;
-use crate::ports::peer_http::PeerHttp;
 
 pub const HEADER: &str = "x-hyperbytedb-cluster-token";
 
