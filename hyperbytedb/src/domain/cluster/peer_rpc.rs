@@ -17,6 +17,19 @@ pub struct ShardWriteTarget {
     pub precision: Option<String>,
 }
 
+/// What one health probe of a peer got back. Unlike other calls, an error
+/// status is an answer here: its body still carries the peer's
+/// self-reported state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeReply {
+    /// `/health` answered; `ok` is whether its status was a success.
+    Health { ok: bool, body: String },
+    /// `/health` did not answer but `/ping` did.
+    AliveOnly,
+    /// Neither answered.
+    Unreachable,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerRpcError {
     /// The peer answered with a non-success status.

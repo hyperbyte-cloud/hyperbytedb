@@ -2,6 +2,7 @@ pub mod cluster_auth;
 pub mod dns_cache;
 pub mod forward_queue;
 pub mod hinted_handoff;
+pub mod hinted_handoff_watcher;
 pub mod http_peer_rpc;
 pub mod peer_client;
 pub mod raft;

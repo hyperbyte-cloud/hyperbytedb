@@ -5,9 +5,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::adapters::cluster::hinted_handoff_watcher;
 use crate::adapters::http::router::{build_control_router, build_router};
 use crate::application::cluster::heartbeat;
-use crate::application::cluster::hinted_handoff;
 use crate::application::continuous_query_service::ContinuousQueryService;
 use crate::application::disk_monitor;
 use crate::application::retention_service::RetentionService;
@@ -123,8 +123,16 @@ async fn serve_inner(
         // Under sharding `needs_sync` is not a readiness signal; see
         // `decide_transition_with`.
         let sync_gates_readmit = !config.sharding.enabled;
-        let peer_http: Arc<dyn crate::ports::peer_http::PeerHttp> =
-            Arc::new(app_state.cluster_auth.clone());
+        // Its own client, so probes never queue behind the write pool.
+        let probe_rpc: crate::ports::peer_rpc::SharedPeerRpc = {
+            use crate::ports::peer_http::PeerHttp;
+            let auth = &app_state.cluster_auth;
+            Arc::new(
+                crate::adapters::cluster::http_peer_rpc::HttpPeerRpc::with_client(
+                    auth.build(auth.client_builder()),
+                ),
+            )
+        };
         Some(tokio::spawn(async move {
             heartbeat::run_heartbeat_updater(
                 self_id,
@@ -133,7 +141,7 @@ async fn serve_inner(
                 hb_interval,
                 probe_timeout,
                 sync_gates_readmit,
-                peer_http,
+                probe_rpc,
                 rx,
             )
             .await;
@@ -197,7 +205,7 @@ async fn serve_inner(
         let self_id = config.cluster.node_id;
         let rx = service_shutdown_rx.clone();
         Some(tokio::spawn(async move {
-            hinted_handoff::run_hinted_handoff_watcher(self_id, pc, m, rx).await;
+            hinted_handoff_watcher::run_hinted_handoff_watcher(self_id, pc, m, rx).await;
         }))
     } else {
         None

@@ -135,6 +135,14 @@ pub trait PeerRpc: Send + Sync {
         addr: &str,
         timeout: Duration,
     ) -> Result<crate::domain::sharding::ShardMap, PeerRpcError>;
+
+    /// `GET /health`, falling back to `GET /ping` when `/health` gets no
+    /// answer; each request is bounded by `timeout`.
+    async fn probe(
+        &self,
+        addr: &str,
+        timeout: Duration,
+    ) -> crate::domain::cluster::peer_rpc::ProbeReply;
 }
 
 pub type SharedPeerRpc = Arc<dyn PeerRpc>;
