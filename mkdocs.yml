@@ -71,6 +71,13 @@ markdown_extensions:
       emoji_index: !!python/name:material.extensions.emoji.twemoji
       emoji_generator: !!python/name:material.extensions.emoji.to_svg
 
+# Internal design plans and test runbooks stay in the repo but are not
+# published on docs.hyperbyte.cloud.
+exclude_docs: |
+  superpowers/
+  developer-guide/sharding-real-world-test-plan.md
+  developer-guide/linear-scaling-scaledown-runbook.md
+
 validation:
   nav:
     omitted_files: info
