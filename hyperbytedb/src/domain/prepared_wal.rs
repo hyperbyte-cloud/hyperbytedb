@@ -28,6 +28,8 @@ pub struct PreparedWalSlot {
 }
 
 impl PreparedWalSlot {
+    /// Test support.
+    #[doc(hidden)]
     pub fn total_rows(&self) -> usize {
         self.measurements.iter().map(|m| m.row_count).sum()
     }

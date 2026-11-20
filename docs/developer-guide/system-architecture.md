@@ -152,7 +152,7 @@ src/
     ├── http/                        Axum handlers + internal cluster endpoints
     ├── chdb/                        QueryPort + PointsSinkPort (native adapter)
     ├── wal/, metadata/, auth.rs
-    └── cluster/                     peer_client, sync_client, replication_log, raft/
+    └── cluster/                     peer_client, http_peer_rpc, replication_log, raft/
 ```
 
 ---

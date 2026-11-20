@@ -100,6 +100,9 @@ pub fn columnar_wire_to_line_protocol(
 }
 
 /// Parses columnar msgpack map into `Vec<Point>` (`precision` matches `/write` query param).
+///
+/// Test support.
+#[doc(hidden)]
 pub fn parse_columnar_msgpack_to_points(
     body: &[u8],
     precision: Option<&str>,

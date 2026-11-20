@@ -66,6 +66,9 @@ impl ContinuousQueryService {
     }
 
     /// Run one scheduler iteration at `now` (exposed for tests).
+    ///
+    /// Test support.
+    #[doc(hidden)]
     pub async fn tick_once_at(
         &self,
         now: chrono::DateTime<chrono::Utc>,

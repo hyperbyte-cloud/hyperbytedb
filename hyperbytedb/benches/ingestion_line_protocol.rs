@@ -83,7 +83,7 @@ fn bench_metadata(c: &mut Criterion) {
     std::fs::create_dir_all(&meta_dir).unwrap();
     let metadata: Arc<RocksDbMetadata> = Arc::new(RocksDbMetadata::open(&meta_dir).unwrap());
     rt.block_on(metadata.create_database("benchdb")).unwrap();
-    let meta_port: Arc<dyn MetadataPort> = metadata.clone();
+    let meta_port: Arc<dyn MetadataPort> = metadata;
 
     let limits = IngestCardinalityLimits::default();
     let cache = IngestSchemaCache::new();
@@ -118,7 +118,7 @@ fn bench_wal(c: &mut Criterion) {
     let metadata: Arc<RocksDbMetadata> = Arc::new(RocksDbMetadata::open(&meta_dir).unwrap());
     let wal: Arc<RocksDbWal> = Arc::new(RocksDbWal::open(&wal_dir).unwrap());
     rt.block_on(metadata.create_database("benchdb")).unwrap();
-    let meta_port: Arc<dyn MetadataPort> = metadata.clone();
+    let meta_port: Arc<dyn MetadataPort> = metadata;
 
     let limits = IngestCardinalityLimits::default();
     let cache = IngestSchemaCache::new();
@@ -198,7 +198,7 @@ fn bench_metadata_concurrent(c: &mut Criterion) {
     std::fs::create_dir_all(&meta_dir).unwrap();
     let metadata: Arc<RocksDbMetadata> = Arc::new(RocksDbMetadata::open(&meta_dir).unwrap());
     rt.block_on(metadata.create_database("benchdb")).unwrap();
-    let meta_port: Arc<dyn MetadataPort> = metadata.clone();
+    let meta_port: Arc<dyn MetadataPort> = metadata;
     let cache = Arc::new(IngestSchemaCache::new());
     let limits = IngestCardinalityLimits::default();
 
@@ -254,7 +254,7 @@ fn bench_wal_concurrent(c: &mut Criterion) {
     let metadata: Arc<RocksDbMetadata> = Arc::new(RocksDbMetadata::open(&meta_dir).unwrap());
     let wal: Arc<RocksDbWal> = Arc::new(RocksDbWal::open(&wal_dir).unwrap());
     rt.block_on(metadata.create_database("benchdb")).unwrap();
-    let meta_port: Arc<dyn MetadataPort> = metadata.clone();
+    let meta_port: Arc<dyn MetadataPort> = metadata;
     let cache = Arc::new(IngestSchemaCache::new());
     let limits = IngestCardinalityLimits::default();
 
@@ -329,7 +329,7 @@ fn bench_wal_batched_concurrent(c: &mut Criterion) {
     let metadata: Arc<RocksDbMetadata> = Arc::new(RocksDbMetadata::open(&meta_dir).unwrap());
     let raw_wal: Arc<RocksDbWal> = Arc::new(RocksDbWal::open(&wal_dir).unwrap());
     rt.block_on(metadata.create_database("benchdb")).unwrap();
-    let meta_port: Arc<dyn MetadataPort> = metadata.clone();
+    let meta_port: Arc<dyn MetadataPort> = metadata;
     let wal: Arc<BatchingWal> =
         rt.block_on(async { BatchingWal::new(raw_wal.clone(), 2048, 512, Duration::ZERO, 0) });
     let cache = Arc::new(IngestSchemaCache::new());

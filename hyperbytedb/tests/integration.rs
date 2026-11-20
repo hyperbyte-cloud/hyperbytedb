@@ -92,7 +92,7 @@ fn setup(dir: &tempfile::TempDir) -> (Arc<AppState>, Arc<FlushServiceImpl>) {
         query: query_service,
         query_port: chdb.clone(),
         metadata: metadata.clone(),
-        wal: wal.clone(),
+        wal,
         points_sink: points_sink.clone(),
         mv_service: test_mv_service(
             &(metadata.clone() as Arc<dyn MetadataPort>),
@@ -100,7 +100,7 @@ fn setup(dir: &tempfile::TempDir) -> (Arc<AppState>, Arc<FlushServiceImpl>) {
             &points_sink,
         ),
         auth: Arc::new(hyperbytedb::adapters::auth::MetadataAuthAdapter::new(
-            metadata.clone(),
+            metadata,
         )),
         peer_client: None,
         membership: None,
@@ -831,11 +831,11 @@ async fn admission_app(permits: usize) -> (tempfile::TempDir, Arc<AppState>) {
         query: query_service,
         query_port: chdb.clone(),
         metadata: metadata.clone(),
-        wal: wal.clone(),
+        wal,
         points_sink: sink.clone(),
         mv_service: test_mv_service(&(metadata.clone() as Arc<dyn MetadataPort>), &chdb, &sink),
         auth: Arc::new(hyperbytedb::adapters::auth::MetadataAuthAdapter::new(
-            metadata.clone(),
+            metadata,
         )),
         peer_client: None,
         membership: None,
