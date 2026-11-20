@@ -243,7 +243,9 @@ impl RocksDbWal {
         Ok(Self {
             db,
             seq: Arc::new(AtomicU64::new(seq)),
-            flushed_through: AtomicU64::new(0),
+            // Only the flush truncates, so every entry below the oldest one
+            // left was flushed.
+            flushed_through: AtomicU64::new(first.saturating_sub(1)),
             truncated_through: Arc::new(AtomicU64::new(first)),
             range_deletes_unflushed: Arc::new(AtomicU64::new(0)),
             sizes: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
@@ -798,6 +800,30 @@ mod tests {
                 .collect(),
             origin_node_id: 0,
         }
+    }
+
+    /// Only the flush truncates the WAL, so every entry below the oldest one
+    /// left was flushed. A reopened WAL says so: a DELETE on a restarted
+    /// node waits for `flushed_through` to reach `last_sequence`, and with
+    /// nothing left to flush it waited its full 15 s every time.
+    #[tokio::test]
+    async fn a_reopened_wal_reports_truncated_entries_flushed() {
+        let dir = TempDir::new().unwrap();
+        {
+            let wal = RocksDbWal::open(dir.path()).unwrap();
+            for _ in 0..5 {
+                wal.append(cpu_entry(1)).await.unwrap();
+            }
+            wal.truncate_before(4).await.unwrap();
+        }
+        let wal = RocksDbWal::open(dir.path()).unwrap();
+        assert_eq!(wal.flushed_through(), 3);
+        // All flushed and truncated: caught up with the last sequence.
+        wal.truncate_before(6).await.unwrap();
+        drop(wal);
+        let wal = RocksDbWal::open(dir.path()).unwrap();
+        assert_eq!(wal.flushed_through(), wal.last_sequence().await.unwrap());
+        assert_eq!(wal.flushed_through(), 5);
     }
 
     fn memtable_counts(wal: &RocksDbWal) -> (u64, u64) {
