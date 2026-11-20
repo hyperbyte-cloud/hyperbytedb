@@ -233,17 +233,13 @@ impl DrainService {
                 .await?;
             }
 
-            use crate::domain::cluster::raft_request::ClusterRequest;
             let tp = ShardMapOp::TransferPrimary {
                 key: key.clone(),
                 region_id: region.region_id,
                 new_primary,
                 epoch: region.epoch,
             };
-            consensus
-                .propose(ClusterRequest::ShardMapMutation(Box::new(tp)))
-                .await
-                .map_err(|e| HyperbytedbError::ShardMap(e.to_string().into()))?;
+            propose_handoff(consensus.as_ref(), tp).await?;
         }
         Ok(())
     }
@@ -294,6 +290,27 @@ impl DrainService {
 }
 
 /// The measurements materialized views write into.
+/// Propose one primary handoff. A committed op the apply refused (a stale
+/// epoch) moved nothing, so it is an error, as in the shard scheduler.
+async fn propose_handoff(
+    consensus: &dyn ConsensusPort,
+    op: ShardMapOp,
+) -> Result<(), HyperbytedbError> {
+    use crate::domain::cluster::raft_request::ClusterRequest;
+    let resp = consensus
+        .propose(ClusterRequest::ShardMapMutation(Box::new(op)))
+        .await
+        .map_err(|e| HyperbytedbError::ShardMap(e.to_string().into()))?;
+    if !resp.ok {
+        return Err(HyperbytedbError::ShardMap(
+            resp.message
+                .unwrap_or_else(|| "primary handoff refused".to_string())
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 async fn view_destinations(
     metadata: &dyn MetadataPort,
 ) -> Result<std::collections::HashSet<MeasurementKey>, HyperbytedbError> {
@@ -397,6 +414,45 @@ mod tests {
                 ("cpu_1m".to_string(), 3, false)
             ]
         );
+    }
+
+    /// A consensus whose apply refuses every op, as a stale epoch does.
+    struct RefusingConsensus;
+
+    impl crate::ports::leadership::LeadershipPort for RefusingConsensus {
+        fn current_leader(&self) -> Option<u64> {
+            Some(1)
+        }
+    }
+
+    #[async_trait]
+    impl ConsensusPort for RefusingConsensus {
+        async fn propose(
+            &self,
+            _req: crate::domain::cluster::raft_request::ClusterRequest,
+        ) -> Result<crate::domain::cluster::raft_request::ClusterResponse, HyperbytedbError>
+        {
+            Ok(crate::domain::cluster::raft_request::ClusterResponse {
+                ok: false,
+                message: Some("stale epoch".into()),
+            })
+        }
+    }
+
+    /// A TransferPrimary the apply refused moved nothing: the handoff fails
+    /// instead of counting the region as handed off.
+    #[tokio::test]
+    async fn a_refused_primary_handoff_is_an_error() {
+        let op = ShardMapOp::TransferPrimary {
+            key: MeasurementKey::new("db", "autogen", "cpu"),
+            region_id: 1,
+            new_primary: 2,
+            epoch: Default::default(),
+        };
+        let err = propose_handoff(&RefusingConsensus, op)
+            .await
+            .expect_err("a refused handoff must fail");
+        assert!(err.to_string().contains("stale epoch"), "{err}");
     }
 
     fn make_node(id: u64, state: NodeState) -> NodeInfo {
