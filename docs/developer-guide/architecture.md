@@ -68,7 +68,7 @@ graph TB
         RocksWAL["RocksDB WAL"]
         RocksMeta["RocksDB Metadata"]
         ChDBAdapter["chDB query + native sink"]
-        ClusterIO["cluster/ peer_client, sync_client, raft"]
+        ClusterIO["cluster/ peer_client, http_peer_rpc, raft"]
     end
 
     InboundAdapters --> App

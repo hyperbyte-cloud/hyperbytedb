@@ -8,6 +8,6 @@ Subsystem walkthroughs with pointers to source files. When a deep dive disagrees
 | [Read path](deep-dive-read-path.md) | TimeseriesQL → ClickHouse SQL → chDB | `timeseriesql/`, `application/query_service.rs`, `adapters/chdb/` |
 | [Clustering](deep-dive-clustering.md) | Replication, Raft, sync, hinted handoff, **series sharding** | `domain/cluster/`, `application/cluster/`, `application/shard_*.rs`, `adapters/cluster/` |
 | [Compaction](deep-dive-compaction.md) | MergeTree background merges | chDB / ClickHouse engine |
-| [Self-repair](deep-dive-self-repair.md) | Peer convergence via replication and sync | `adapters/cluster/sync_client.rs`, `replication_log.rs` |
+| [Self-repair](deep-dive-self-repair.md) | Peer convergence via replication and sync | `application/cluster/catch_up.rs`, `replication_log.rs` |
 
 Replication peer sends use exponential backoff starting at 1s, capped at 30s, up to `replication_max_retries` attempts.

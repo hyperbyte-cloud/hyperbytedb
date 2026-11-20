@@ -120,7 +120,7 @@ Axum handlers, router (`AppState`), middleware, auth, internal cluster/Raft endp
 | File / dir | Description |
 |------------|-------------|
 | `peer_client.rs` | Outbound replication HTTP client. Implements `ReplicationPort`. |
-| `sync_client.rs` | Join/reconnect sync: metadata + WAL catch-up. |
+| `http_peer_rpc.rs` | `PeerRpc` over HTTP. Join/reconnect sync itself is `CatchUpService` in `application/cluster/catch_up.rs`. |
 | `replication_log.rs` | RocksDB-backed per-peer WAL/mutation ack tracking. |
 | `hinted_handoff.rs` | Per-peer queued hints for unreachable peers. |
 | `transport.rs` | Shared HTTP transport abstraction for cluster I/O. |
