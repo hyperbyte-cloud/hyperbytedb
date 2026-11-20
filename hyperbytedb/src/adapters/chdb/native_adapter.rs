@@ -141,7 +141,7 @@ fn table_schema_from_measurement_meta(
 
 /// A chDB error for a table that does not exist.
 fn is_unknown_table(msg: &str) -> bool {
-    msg.contains("UNKNOWN_TABLE") || msg.contains("Code: 60") || msg.contains("doesn't exist")
+    msg.contains("UNKNOWN_TABLE") || msg.contains("Code: 60.") || msg.contains("doesn't exist")
 }
 
 fn tag_column_kind(distinct_values: usize, threshold: usize) -> ColumnKind {
@@ -2687,6 +2687,18 @@ mod tests {
     use super::*;
     use arrow::array::Float64Array;
     use std::collections::BTreeMap;
+
+    /// A delete that fails for another reason must not read as "no table,
+    /// nothing to delete": codes 600-609 start with "Code: 60" too.
+    #[test]
+    fn only_code_60_is_an_unknown_table() {
+        assert!(is_unknown_table(
+            "Code: 60. DB::Exception: Unknown table expression identifier 'x'. (UNKNOWN_TABLE)"
+        ));
+        assert!(!is_unknown_table(
+            "Code: 603. DB::Exception: Cannot open file. (CANNOT_OPEN_FILE)"
+        ));
+    }
 
     fn make_point(ts: i64, tags: &[(&str, &str)], fields: &[(&str, FieldValue)]) -> Point {
         let mut tag_map = BTreeMap::new();
