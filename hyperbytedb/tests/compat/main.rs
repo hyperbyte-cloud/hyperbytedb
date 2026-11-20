@@ -90,6 +90,7 @@ pub struct TestContext {
     pub query_service: Arc<QueryServiceImpl>,
     pub ingestion: IngestionServiceImpl,
     pub flush_service: Arc<FlushServiceImpl>,
+    pub points_sink: Arc<dyn PointsSinkPort>,
     _tmpdir: tempfile::TempDir,
 }
 
@@ -131,7 +132,7 @@ impl TestContext {
         let ingestion =
             IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 10_000, 0);
 
-        let flush_service = Arc::new(FlushServiceImpl::new(wal.clone(), 0, points_sink));
+        let flush_service = Arc::new(FlushServiceImpl::new(wal.clone(), 0, points_sink.clone()));
 
         Ok(Self {
             wal,
@@ -140,6 +141,7 @@ impl TestContext {
             query_service,
             ingestion,
             flush_service,
+            points_sink,
             _tmpdir: tmpdir,
         })
     }
@@ -174,7 +176,7 @@ impl TestContext {
         let ingestion =
             IngestionServiceImpl::new(wal.clone(), metadata.clone(), 100_000, 10_000, 0);
 
-        let flush_service = Arc::new(FlushServiceImpl::new(wal.clone(), 0, points_sink));
+        let flush_service = Arc::new(FlushServiceImpl::new(wal.clone(), 0, points_sink.clone()));
 
         Ok(Self {
             wal,
@@ -183,6 +185,7 @@ impl TestContext {
             query_service,
             ingestion,
             flush_service,
+            points_sink,
             _tmpdir: tmpdir,
         })
     }

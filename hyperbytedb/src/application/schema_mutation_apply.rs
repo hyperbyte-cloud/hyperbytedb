@@ -160,6 +160,46 @@ async fn delete_replicated_rows(
         .map(|_| ())
 }
 
+/// Apply a replicated `DROP SERIES` with no `FROM`: delete, from every
+/// measurement of `rp`, the rows of the series `tag_condition` selects.
+/// `tag_condition` is the condition over tag columns that the coordinator
+/// sends; a measurement without one of its tags has no matching series and
+/// is skipped.
+async fn delete_series_rows_everywhere(
+    metadata: &dyn MetadataPort,
+    sink: &dyn PointsSinkPort,
+    wal: Option<&Arc<dyn WalPort>>,
+    db: &str,
+    rp: &str,
+    tag_condition: &str,
+) -> Result<(), HyperbytedbError> {
+    // The first delete waits for the WAL to flush; that covers every
+    // measurement, so the rest do not wait again inside the Raft apply.
+    let mut wal = wal;
+    for meas in metadata.list_measurements(db).await? {
+        let series = crate::domain::chdb_naming::quoted_series_table_name(db, rp, &meas);
+        let predicate = format!(
+            "`series_id` IN (SELECT `series_id` FROM {} WHERE {tag_condition})",
+            series.as_str()
+        );
+        let result = crate::application::predicate_sql::delete_rows(
+            wal.map(|w| w.as_ref()),
+            sink,
+            db,
+            rp,
+            &meas,
+            &predicate,
+        )
+        .await;
+        wal = None;
+        match result {
+            Err(e) if is_unknown_column(&e.to_string()) => {}
+            other => other?,
+        }
+    }
+    Ok(())
+}
+
 /// A chDB error for a column the table does not have.
 pub(crate) fn is_unknown_column(msg: &str) -> bool {
     msg.contains("UNKNOWN_IDENTIFIER")
@@ -286,10 +326,20 @@ async fn apply_schema_mutation_inner(
             measurement,
             predicate_sql,
         } => {
+            let sink = points_sink.or_else(|| mv_service.map(|mv| mv.points_sink()));
             if let Some(meas) = measurement.as_deref() {
-                let sink = points_sink.or_else(|| mv_service.map(|mv| mv.points_sink()));
                 delete_replicated_rows(metadata, sink, wal, &database, &rp, meas, &predicate_sql)
                     .await?;
+            } else if let Some(sink) = sink.filter(|_| !predicate_sql.is_empty()) {
+                delete_series_rows_everywhere(
+                    metadata.as_ref(),
+                    sink.as_ref(),
+                    wal,
+                    &database,
+                    &rp,
+                    &predicate_sql,
+                )
+                .await?;
             }
             metadata
                 .delete_series_matching(&database, &rp, measurement.as_deref(), &predicate_sql)
