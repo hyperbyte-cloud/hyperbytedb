@@ -483,6 +483,65 @@ async fn drop_series_keeps_points_written_after_it() {
     assert_eq!(values(&ctx, "SELECT value FROM cpu").await, vec![2.0, 3.0]);
 }
 
+/// A refused DROP SERIES changes nothing. It used to wipe every series of
+/// the measurement before the condition was checked, so SHOW SERIES came
+/// back empty after an error.
+#[tokio::test]
+#[serial(chdb)]
+async fn a_refused_drop_series_keeps_the_series() {
+    let Some(ctx) = chdb_context() else { return };
+    ctx.metadata.create_database("testdb").await.unwrap();
+    ctx.write_and_flush(
+        "testdb",
+        "cpu,host=a value=1.0 1000000000\ncpu,host=b value=2.0 2000000000",
+    )
+    .await
+    .unwrap();
+    for q in [
+        "DROP SERIES FROM cpu WHERE value > 0",
+        "DROP SERIES FROM cpu WHERE nosuchtag = 'x'",
+    ] {
+        let failed = match ctx.query("testdb", q).await {
+            Err(_) => true,
+            Ok(resp) => resp.results[0].error.is_some(),
+        };
+        assert!(failed, "{q} must be refused");
+        let series = ctx
+            .metadata
+            .list_series("testdb", "autogen", "cpu")
+            .await
+            .unwrap();
+        assert_eq!(series.len(), 2, "{q} dropped series");
+    }
+}
+
+/// DROP SERIES with no FROM deletes the matching rows of every measurement
+/// that has the tag, on a single node as in a cluster.
+#[tokio::test]
+#[serial(chdb)]
+async fn drop_series_without_from_deletes_the_rows() {
+    let Some(ctx) = chdb_context() else { return };
+    ctx.metadata.create_database("testdb").await.unwrap();
+    ctx.write_and_flush(
+        "testdb",
+        "cpu,host=a value=1.0 1000000000\ncpu,host=b value=2.0 2000000000\n\
+         mem,host=a value=3.0 1000000000",
+    )
+    .await
+    .unwrap();
+    let resp = ctx
+        .query("testdb", r#"DROP SERIES WHERE "host" = 'a'"#)
+        .await
+        .unwrap();
+    assert!(
+        resp.results[0].error.is_none(),
+        "{:?}",
+        resp.results[0].error
+    );
+    assert_eq!(values(&ctx, "SELECT value FROM cpu").await, vec![2.0]);
+    assert!(values(&ctx, "SELECT value FROM mem").await.is_empty());
+}
+
 #[tokio::test]
 #[serial(chdb)]
 async fn drop_measurement_clears_its_tombstones() {
