@@ -235,9 +235,9 @@ fn sort_space_regions(space: &mut super::types::MeasurementShardSpace) {
     space.regions.sort_by_key(|r| r.start);
 }
 
-/// Apply `op` to an in-memory map snapshot (used by Raft apply and unit tests).
 mod apply;
 
+/// Apply `op` to an in-memory map snapshot (used by Raft apply and unit tests).
 pub fn apply_shard_map_op(
     map: &mut super::types::ShardMap,
     op: ShardMapOp,

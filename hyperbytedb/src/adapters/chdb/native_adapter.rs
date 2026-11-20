@@ -480,7 +480,6 @@ impl ChdbNativeAdapter {
     ///
     /// Test support.
     #[doc(hidden)]
-    #[doc(hidden)]
     pub fn engine_probe_count(&self) -> u64 {
         self.engine_probes
             .load(std::sync::atomic::Ordering::Relaxed)
