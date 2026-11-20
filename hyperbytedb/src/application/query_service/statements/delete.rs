@@ -100,11 +100,11 @@ pub(in crate::application::query_service) async fn drop_series(
         String::new()
     };
     if measurement.is_some() || !predicate_sql.is_empty() {
-        svc.metadata
-            .delete_series_matching(target_db, &rp, measurement.as_deref(), &predicate_sql)
-            .await?;
         // The series' rows are deleted; points written to them later
         // stay. A tombstone used to hide those too.
+        //
+        // The predicates are built (and a field or unknown tag refused)
+        // before anything is dropped: an error must leave the series.
         let mut targets: Vec<(String, String)> = Vec::new();
         if let Some(ref meas) = measurement {
             let pred = crate::application::predicate_sql::build_delete_predicate(
@@ -116,7 +116,7 @@ pub(in crate::application::query_service) async fn drop_series(
             )
             .await?;
             targets.push((meas.clone(), pred));
-        } else if svc.shard_routing.is_some() {
+        } else {
             // Every measurement that has the condition's tags.
             for meas in svc.metadata.list_measurements(target_db).await? {
                 if let Ok(pred) = crate::application::predicate_sql::build_delete_predicate(
@@ -132,6 +132,9 @@ pub(in crate::application::query_service) async fn drop_series(
                 }
             }
         }
+        svc.metadata
+            .delete_series_matching(target_db, &rp, measurement.as_deref(), &predicate_sql)
+            .await?;
         for (meas, pred) in targets {
             if let Some(ctx) = svc.shard_routing.as_ref() {
                 scatter_delete_to_regions(
