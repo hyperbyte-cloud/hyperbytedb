@@ -194,7 +194,7 @@ pub async fn delete_rows(
 /// Longest wait for the flush service to write the WAL's current entries:
 /// past one flush interval (10 s by default), well inside the query
 /// timeout (30 s by default).
-const DELETE_FLUSH_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+pub(crate) const DELETE_FLUSH_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 
 async fn wait_for_flush(wal: &dyn crate::ports::wal::WalPort) -> Result<(), HyperbytedbError> {
     let target = wal.last_sequence().await?;
