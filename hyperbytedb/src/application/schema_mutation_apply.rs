@@ -165,7 +165,7 @@ pub(crate) fn is_unknown_column(msg: &str) -> bool {
     msg.contains("UNKNOWN_IDENTIFIER")
         || msg.contains("Unknown identifier")
         || msg.contains("Missing columns")
-        || msg.contains("Code: 47")
+        || msg.contains("Code: 47.")
 }
 
 async fn apply_schema_mutation_inner(
@@ -398,6 +398,23 @@ pub async fn revoke_privilege(
     match held.and_then(|p| p.without(revoked)) {
         Some(left) => metadata.grant_privilege(username, db, left).await,
         None => metadata.revoke_privilege(username, db).await,
+    }
+}
+
+#[cfg(test)]
+mod unknown_column_tests {
+    use super::is_unknown_column;
+
+    /// Only code 47 is a missing column; 470-479 are other failures and a
+    /// replica must report them, not store the delete as a tombstone.
+    #[test]
+    fn only_code_47_is_an_unknown_column() {
+        assert!(is_unknown_column(
+            "Code: 47. DB::Exception: Unknown expression identifier `host`. (UNKNOWN_IDENTIFIER)"
+        ));
+        assert!(!is_unknown_column(
+            "Code: 473. DB::Exception: Possible deadlock avoided. (DEADLOCK_AVOIDED)"
+        ));
     }
 }
 
