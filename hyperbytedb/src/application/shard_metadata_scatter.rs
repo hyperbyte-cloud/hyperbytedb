@@ -56,7 +56,7 @@ async fn fetch_remote_metadata(
                         .send()
                         .await
                         .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
-                    if resp.status() == reqwest::StatusCode::CONFLICT {
+                    if resp.status() == axum::http::StatusCode::CONFLICT {
                         return Err(HyperbytedbError::StaleShardEpoch { region_id });
                     }
                     if !resp.status().is_success() {
