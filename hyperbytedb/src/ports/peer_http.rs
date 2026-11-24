@@ -15,3 +15,39 @@ pub trait PeerHttp: Send + Sync {
         })
     }
 }
+
+/// How a client to peers is set up. The adapter turns this into its own
+/// settings; an injected [`crate::ports::http_client::HttpClientPort`]
+/// (the simulated network) ignores everything but `timeout`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PeerClientOptions {
+    /// Total timeout for requests that set none.
+    pub timeout: Option<std::time::Duration>,
+    pub connections: PeerConnections,
+}
+
+impl PeerClientOptions {
+    /// Default connections; requests time out after `timeout`.
+    #[must_use]
+    pub fn with_timeout(timeout: std::time::Duration) -> Self {
+        Self {
+            timeout: Some(timeout),
+            ..Self::default()
+        }
+    }
+}
+
+/// The kind of connections a peer client keeps.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PeerConnections {
+    /// The HTTP library's defaults.
+    #[default]
+    Default,
+    /// Peer names resolved through the process-wide caching resolver
+    /// ([`crate::adapters::cluster::dns_cache::CachingResolver`]).
+    CachedDns,
+    /// Long-lived HTTP/2 connections (prior knowledge, adaptive window,
+    /// keepalive pings while idle, TCP keepalive 60 s), a 3 s connect
+    /// timeout and the caching resolver: replication and forwarding.
+    Http2,
+}

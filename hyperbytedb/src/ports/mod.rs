@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod flush;
 pub mod forward_queue;
+pub mod http_client;
 pub mod ingestion;
 pub mod metadata;
 pub mod peer_http;
