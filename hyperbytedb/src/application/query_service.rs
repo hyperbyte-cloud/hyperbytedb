@@ -2492,7 +2492,7 @@ async fn try_query_sharded_region(
                     .await
                     .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
                 let status = resp.status();
-                if status == reqwest::StatusCode::CONFLICT {
+                if status == axum::http::StatusCode::CONFLICT {
                     return Err(HyperbytedbError::StaleShardEpoch { region_id });
                 }
                 if !status.is_success() {
