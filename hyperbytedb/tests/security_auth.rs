@@ -474,13 +474,13 @@ async fn grant_revoke_controls_query_access() {
 #[serial(chdb)]
 async fn the_cluster_token_opens_internal_routes_only() {
     use hyperbytedb::adapters::cluster::cluster_auth::{self, ClusterAuth};
-    use hyperbytedb::ports::peer_http::PeerHttp;
+    use hyperbytedb::ports::peer_http::{PeerClientOptions, PeerHttp};
 
     let dir = tempfile::tempdir().unwrap();
     let auth = ClusterAuth::new(Some("cluster-s3cret")).unwrap();
     let node = start_auth_cluster_node_with(dir.path(), auth.clone()).await;
     let plain = reqwest::Client::new();
-    let peer = auth.client_builder().build().unwrap();
+    let peer = auth.client(PeerClientOptions::default());
     let membership = format!("{}/internal/membership", node.url);
 
     let status = |r: reqwest::Response| r.status();
@@ -502,28 +502,29 @@ async fn the_cluster_token_opens_internal_routes_only() {
         "a wrong token is refused even alongside an admin login"
     );
     assert_eq!(
-        status(peer.get(&membership).send().await.unwrap()),
+        peer.get(&membership).send().await.unwrap().status(),
         StatusCode::OK
     );
     assert_eq!(
-        status(
-            peer.post(format!("{}/write", node.url))
-                .query(&[("db", "mydb")])
-                .body("cpu,host=a value=1")
-                .send()
-                .await
-                .unwrap()
-        ),
+        peer.post(format!("{}/write?db=mydb", node.url))
+            .body("cpu,host=a value=1")
+            .send()
+            .await
+            .unwrap()
+            .status(),
         StatusCode::UNAUTHORIZED,
         "the token is not a user"
     );
     let other_cluster = ClusterAuth::new(Some("another-cluster"))
         .unwrap()
-        .client_builder()
-        .build()
-        .unwrap();
+        .client(PeerClientOptions::default());
     assert_eq!(
-        status(other_cluster.get(&membership).send().await.unwrap()),
+        other_cluster
+            .get(&membership)
+            .send()
+            .await
+            .unwrap()
+            .status(),
         StatusCode::UNAUTHORIZED,
         "another cluster's peers are refused"
     );

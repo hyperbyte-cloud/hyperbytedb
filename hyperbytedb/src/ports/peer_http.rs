@@ -12,19 +12,6 @@ pub trait PeerHttp: Send + Sync {
     /// [`Self::try_client`]; a later failure is logged and gets a client
     /// with only the credential.
     fn client(&self, options: PeerClientOptions) -> PeerHttpClient;
-
-    /// A builder whose requests carry the cluster credential.
-    fn client_builder(&self) -> reqwest::ClientBuilder;
-
-    /// `builder`, built. Building fails only when the HTTP stack itself
-    /// cannot start (TLS backend, proxy settings), which startup checks. A
-    /// later failure is logged and gets a client with only the credential.
-    fn build(&self, builder: reqwest::ClientBuilder) -> reqwest::Client {
-        builder.build().unwrap_or_else(|e| {
-            tracing::error!(error = %e, "peer HTTP client could not be built; using a plain one");
-            self.client_builder().build().unwrap_or_default()
-        })
-    }
 }
 
 /// How a client to peers is set up. The adapter turns this into its own

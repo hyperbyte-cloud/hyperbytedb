@@ -131,18 +131,6 @@ impl PeerHttp for ClusterAuth {
                 .unwrap_or_else(|_| self.with_credential(Arc::new(ReqwestHttpClient::default())))
         })
     }
-
-    fn client_builder(&self) -> reqwest::ClientBuilder {
-        let builder = reqwest::Client::builder();
-        match &self.header {
-            Some(value) => {
-                let mut headers = HeaderMap::new();
-                headers.insert(HEADER, value.clone());
-                builder.default_headers(headers)
-            }
-            None => builder,
-        }
-    }
 }
 
 #[cfg(test)]
