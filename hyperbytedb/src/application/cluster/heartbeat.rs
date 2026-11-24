@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use crate::domain::cluster::membership::{NodeState, SharedMembership};
-use crate::ports::peer_http::PeerHttp;
+use crate::ports::http_client::PeerHttpClient;
+use crate::ports::peer_http::{PeerClientOptions, PeerHttp};
 use std::sync::Arc;
 
 /// Self-reported readiness fields parsed from a peer's `/health` body.
@@ -195,7 +196,7 @@ pub async fn run_heartbeat_updater(
     peer_http: Arc<dyn PeerHttp>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
-    let client = match peer_http.client_builder().timeout(probe_timeout).build() {
+    let client = match peer_http.try_client(PeerClientOptions::with_timeout(probe_timeout)) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "failed to build heartbeat probe client");
@@ -232,7 +233,7 @@ pub async fn run_heartbeat_updater(
 async fn probe_peers(
     self_id: u64,
     membership: &SharedMembership,
-    client: &reqwest::Client,
+    client: &PeerHttpClient,
     miss_threshold: u32,
     sync_gates_readmit: bool,
 ) {
@@ -353,6 +354,12 @@ mod tests {
     const THRESHOLD: u32 = 5;
     const MISSES_AT_THRESHOLD: u32 = 5;
     use crate::domain::cluster::membership::{ClusterMembership, NodeInfo, new_shared};
+
+    /// A probe client with `timeout`, as `run_heartbeat_updater` builds.
+    fn test_client(timeout: Duration) -> PeerHttpClient {
+        crate::adapters::cluster::cluster_auth::ClusterAuth::default()
+            .client(PeerClientOptions::with_timeout(timeout))
+    }
 
     fn make_membership(peer_addrs: &[(u64, &str, NodeState)]) -> SharedMembership {
         let mut m = ClusterMembership::new();
@@ -754,10 +761,7 @@ mod tests {
 
         let membership = make_membership(&[(2, addr.as_str(), NodeState::Syncing)]);
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(500))
-            .build()
-            .unwrap();
+        let client = test_client(Duration::from_millis(500));
         probe_peers(1, &membership, &client, THRESHOLD, true).await;
 
         let m = membership.read().await;
@@ -788,10 +792,7 @@ mod tests {
             (4, unsynced.as_str(), NodeState::Disconnected),
             (5, leaving.as_str(), NodeState::Disconnected),
         ]);
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(500))
-            .build()
-            .unwrap();
+        let client = test_client(Duration::from_millis(500));
 
         probe_peers(1, &membership, &client, THRESHOLD, false).await;
 
@@ -812,10 +813,7 @@ mod tests {
 
         let membership = make_membership(&[(2, addr.as_str(), NodeState::Active)]);
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(500))
-            .build()
-            .unwrap();
+        let client = test_client(Duration::from_millis(500));
         probe_peers(1, &membership, &client, THRESHOLD, true).await;
 
         let m = membership.read().await;
@@ -828,10 +826,7 @@ mod tests {
 
         let membership = make_membership(&[(2, addr.as_str(), NodeState::Syncing)]);
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(500))
-            .build()
-            .unwrap();
+        let client = test_client(Duration::from_millis(500));
         probe_peers(1, &membership, &client, THRESHOLD, true).await;
 
         let m = membership.read().await;
@@ -861,10 +856,7 @@ mod tests {
 
         let membership = make_membership(&[(2, addr.as_str(), NodeState::Syncing)]);
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(500))
-            .build()
-            .unwrap();
+        let client = test_client(Duration::from_millis(500));
         for _ in 0..6 {
             probe_peers(1, &membership, &client, THRESHOLD, true).await;
         }
@@ -885,10 +877,7 @@ mod tests {
         // longer demotes, because a demotion now moves data. The old
         // single-probe assertion encoded the pre-hysteresis contract.
         let membership = make_membership(&[(1, "127.0.0.1:19999", NodeState::Active)]);
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(100))
-            .build()
-            .unwrap();
+        let client = test_client(Duration::from_millis(100));
 
         for probe in 1..THRESHOLD {
             probe_peers(0, &membership, &client, THRESHOLD, true).await;
@@ -939,10 +928,7 @@ mod tests {
     async fn draining_peer_stays_draining_when_unreachable() {
         let membership = make_membership(&[(1, "127.0.0.1:19999", NodeState::Draining)]);
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(100))
-            .build()
-            .unwrap();
+        let client = test_client(Duration::from_millis(100));
 
         probe_peers(0, &membership, &client, THRESHOLD, true).await;
 
@@ -953,10 +939,7 @@ mod tests {
     #[tokio::test]
     async fn no_peers_is_noop() {
         let membership = make_membership(&[]);
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(100))
-            .build()
-            .unwrap();
+        let client = test_client(Duration::from_millis(100));
 
         probe_peers(0, &membership, &client, THRESHOLD, true).await;
     }
