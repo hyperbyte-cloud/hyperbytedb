@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::http::StatusCode;
 use metrics::counter;
-use reqwest::StatusCode;
 use tokio::sync::watch;
 
 use crate::adapters::cluster::peer_client::PeerClient;
