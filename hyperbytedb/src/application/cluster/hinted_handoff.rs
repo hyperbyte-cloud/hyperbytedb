@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::adapters::cluster::peer_client::PeerClient;
 use crate::domain::cluster::membership::{NodeState, SharedMembership};
-use crate::ports::peer_http::PeerHttp;
+use crate::ports::peer_http::{PeerClientOptions, PeerHttp};
 
 /// Polls membership state periodically: when a previously-disconnected
 /// peer transitions to Active, drain the hinted handoff queue for that peer
@@ -18,7 +18,7 @@ pub async fn run_hinted_handoff_watcher(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let auth: &dyn PeerHttp = peer_client.cluster_auth();
-    let sync_client = auth.build(auth.client_builder().timeout(Duration::from_secs(10)));
+    let sync_client = auth.client(PeerClientOptions::with_timeout(Duration::from_secs(10)));
 
     let mut prev_states: HashMap<u64, NodeState> = HashMap::new();
     // Peers with a drain running, so ticks do not start a second one.
