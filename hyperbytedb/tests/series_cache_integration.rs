@@ -11,6 +11,10 @@
 //! Observed on a 6-node cluster: 2575 of 4932 rows reading host='' after
 //! region churn, with hyperbytedb_shard_transfer_missing_series_total at 887.
 
+// Real chDB, TCP listeners or reqwest: not built under `cfg(madsim)`;
+// simulation tests live in `madsim_*` test crates.
+#![cfg(not(madsim))]
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 

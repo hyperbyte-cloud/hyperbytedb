@@ -1,6 +1,10 @@
 //! Security-focused HTTP integration tests: cluster+auth route gating,
 //! statement summary auth/redaction, and GRANT/REVOKE enforcement.
 
+// Real chDB, TCP listeners or reqwest: not built under `cfg(madsim)`;
+// simulation tests live in `madsim_*` test crates.
+#![cfg(not(madsim))]
+
 use hyperbytedb::config::ReplicationConfig;
 use std::sync::Arc;
 

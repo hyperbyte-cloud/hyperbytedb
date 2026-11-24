@@ -1379,7 +1379,8 @@ mod coalesce_tests {
     }
 }
 
-#[cfg(test)]
+// Real TCP listeners (or a second runtime): not under `cfg(madsim)`.
+#[cfg(all(test, not(madsim)))]
 mod replicate_batch_tests {
     use super::*;
     use crate::domain::cluster::membership::{NodeInfo, NodeState};
@@ -1627,7 +1628,8 @@ mod replicate_batch_tests {
     }
 }
 
-#[cfg(test)]
+// Real TCP listeners (or a second runtime): not under `cfg(madsim)`.
+#[cfg(all(test, not(madsim)))]
 mod http2_tests {
     use super::peer_http_client;
 

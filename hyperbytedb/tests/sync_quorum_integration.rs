@@ -16,6 +16,10 @@
 //!    after `ack_timeout_ms` (the in-flight peer task continues to retry
 //!    in the background and will trip hinted-handoff).
 
+// Real chDB, TCP listeners or reqwest: not built under `cfg(madsim)`;
+// simulation tests live in `madsim_*` test crates.
+#![cfg(not(madsim))]
+
 use std::sync::Arc;
 use std::time::Duration;
 

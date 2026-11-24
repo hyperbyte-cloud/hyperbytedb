@@ -16,4 +16,6 @@ pub mod response;
 pub mod router;
 pub mod shard_handlers;
 pub mod statements;
+#[cfg(not(madsim))]
+pub mod tcp_serve_transport;
 pub mod write;

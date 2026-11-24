@@ -4,6 +4,10 @@
 //! `tests/compat/`. This crate keeps auth, cardinality, admin users, metrics,
 //! backup manifest shape, and chDB physical layout checks.
 
+// Real chDB, TCP listeners or reqwest: not built under `cfg(madsim)`;
+// simulation tests live in `madsim_*` test crates.
+#![cfg(not(madsim))]
+
 use hyperbytedb::config::ReplicationConfig;
 use std::sync::{Arc, OnceLock};
 
@@ -22,6 +26,8 @@ use hyperbytedb::application::query_service::QueryServiceImpl;
 use hyperbytedb::ports::metadata::MetadataPort;
 use hyperbytedb::ports::points_sink::PointsSinkPort;
 use serial_test::serial;
+
+mod common;
 
 /// Single process-wide Prometheus recorder for integration tests. Without this,
 /// later tests that call `set_global_recorder` get `AlreadySet` and scrape an
@@ -1517,4 +1523,166 @@ async fn query_responses_are_gzipped_on_request() {
         .read_to_end(&mut decoded)
         .unwrap();
     assert_eq!(decoded, plain_body);
+}
+
+/// `build_services_with` and both chDB ports overridden: the app is wired
+/// to the overrides end to end (write, WAL, flush) and never opens chDB.
+#[tokio::test]
+async fn build_services_with_overrides_never_opens_chdb() {
+    use hyperbytedb::bootstrap::{AdapterOverrides, build_services_with};
+    use tower::ServiceExt;
+
+    // The shared recorder, before bootstrap would install its own and
+    // leave the other tests scraping an empty handle.
+    let _ = test_prometheus_handle();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut config = hyperbytedb::config::HyperbytedbConfig::load(None).unwrap();
+    config.storage.wal_dir = root.join("wal").to_string_lossy().into_owned();
+    config.storage.meta_dir = root.join("meta").to_string_lossy().into_owned();
+    let chdb_dir = root.join("chdb");
+    config.chdb.session_data_path = chdb_dir.to_string_lossy().into_owned();
+    config.cluster.enabled = false;
+    config.auth.enabled = false;
+
+    let (sink, query) = common::recording_ports::recording_ports();
+    let boot = build_services_with(
+        &config,
+        AdapterOverrides {
+            points_sink: Some(sink.clone()),
+            query_port: Some(query.clone()),
+        },
+    )
+    .await
+    .unwrap();
+    let flush = boot.flush_service.clone();
+    let app = build_router(Arc::new(boot.app_state));
+
+    let create = axum::http::Request::post("/query?q=CREATE%20DATABASE%20testdb")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(create).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let write = axum::http::Request::post("/write?db=testdb")
+        .body(axum::body::Body::from(
+            "cpu,host=a value=1 1700000000000000000",
+        ))
+        .unwrap();
+    let resp = app.oneshot(write).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    flush.flush().await.unwrap();
+    assert_eq!(sink.rows(), 1, "the overridden sink got the flushed row");
+    assert!(
+        !chdb_dir.exists(),
+        "chdb.session_data_path was created: a chDB session was opened"
+    );
+}
+
+/// Records the routers `run_node` hands it; requests are sent to them
+/// directly.
+#[derive(Default)]
+struct CapturingTransport {
+    routers: std::sync::Mutex<
+        Vec<(
+            hyperbytedb::ports::serve_transport::ListenerKind,
+            String,
+            axum::Router,
+        )>,
+    >,
+}
+
+#[async_trait::async_trait]
+impl hyperbytedb::ports::serve_transport::ServeTransport for CapturingTransport {
+    async fn serve(
+        &self,
+        kind: hyperbytedb::ports::serve_transport::ListenerKind,
+        addr: String,
+        router: axum::Router,
+        _shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        self.routers.lock().unwrap().push((kind, addr, router));
+        Ok(())
+    }
+}
+
+/// `run_node` serves the node through the given transport (no TCP), and
+/// returns once `shutdown` flips.
+#[tokio::test]
+async fn run_node_serves_through_the_transport_until_shutdown() {
+    use hyperbytedb::bootstrap::AdapterOverrides;
+    use hyperbytedb::ports::serve_transport::ListenerKind;
+    use tower::ServiceExt;
+
+    // The shared recorder, before bootstrap would install its own and
+    // leave the other tests scraping an empty handle.
+    let _ = test_prometheus_handle();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut config = hyperbytedb::config::HyperbytedbConfig::load(None).unwrap();
+    config.server.bind_address = "10.0.0.1".into();
+    config.server.port = 8086;
+    config.storage.wal_dir = root.join("wal").to_string_lossy().into_owned();
+    config.storage.meta_dir = root.join("meta").to_string_lossy().into_owned();
+    config.chdb.session_data_path = root.join("chdb").to_string_lossy().into_owned();
+    config.cluster.enabled = false;
+    config.retention.enabled = false;
+
+    let (sink, query) = common::recording_ports::recording_ports();
+    let transport = Arc::new(CapturingTransport::default());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let node = tokio::spawn(hyperbytedb::server::run_node(
+        config,
+        None,
+        AdapterOverrides {
+            points_sink: Some(sink),
+            query_port: Some(query),
+        },
+        transport.clone(),
+        shutdown_rx,
+    ));
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let main = loop {
+        let main = transport
+            .routers
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(kind, _, _)| *kind == ListenerKind::Main)
+            .map(|(_, addr, router)| (addr.clone(), router.clone()));
+        if let Some(main) = main {
+            break main;
+        }
+        assert!(std::time::Instant::now() < deadline, "no main router");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+    assert_eq!(main.0, "10.0.0.1:8086");
+    assert_eq!(
+        transport.routers.lock().unwrap().len(),
+        1,
+        "no control router"
+    );
+    // 503 while the node starts, then the real API.
+    let status = loop {
+        let ping = axum::http::Request::get("/ping")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let status = main.1.clone().oneshot(ping).await.unwrap().status();
+        if status != StatusCode::SERVICE_UNAVAILABLE {
+            break status;
+        }
+        assert!(std::time::Instant::now() < deadline, "node never ready");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(30), node)
+        .await
+        .expect("run_node returns after shutdown")
+        .unwrap()
+        .unwrap();
+    assert!(!root.join("chdb").exists());
 }

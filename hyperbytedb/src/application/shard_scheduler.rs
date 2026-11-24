@@ -833,7 +833,7 @@ impl ShardScheduler {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(madsim)))]
     async fn seed_rollup_dest(&self, key: &MeasurementKey) {
         self.rollup_dests.write().await.insert(key.clone(), ());
     }
@@ -1050,7 +1050,7 @@ impl ShardScheduler {
         });
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(madsim)))]
     fn movers_in_flight(&self) -> usize {
         self.schedule_limit() - self.movers.available_permits()
     }
@@ -3584,7 +3584,8 @@ impl Drop for ClearOnDrop<'_> {
     }
 }
 
-#[cfg(test)]
+// Real TCP listeners (or a second runtime): not under `cfg(madsim)`.
+#[cfg(all(test, not(madsim)))]
 mod tests {
     use super::*;
     use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;

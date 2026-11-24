@@ -3,6 +3,10 @@
 //! Measures decode-only, decode + metadata registration, and full WAL append on a temp RocksDB.
 //! Includes both the original Point-expansion path and the new fast-path.
 
+// Real chDB: not built under `cfg(madsim)`.
+#![cfg_attr(madsim, no_main)]
+#![cfg(not(madsim))]
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

@@ -26,7 +26,7 @@ use crate::config::HyperbytedbConfig;
 use crate::domain::sharding::ShardLocationCache;
 use crate::ports::metadata::MetadataPort;
 use crate::ports::points_sink::PointsSinkPort;
-use crate::ports::query::QueryService;
+use crate::ports::query::{QueryPort, QueryService};
 use crate::ports::sharding::{DisabledShardMap, ShardMapPort};
 use crate::ports::wal::WalFormat;
 use std::sync::Arc;
@@ -46,12 +46,44 @@ pub struct BootstrappedApp {
     pub rocks_shard_map: Option<Arc<RocksDbShardMap>>,
 }
 
+/// Adapters that replace the ones [`build_services`] would build from
+/// config. The simulation rig injects its own storage engine this way;
+/// production passes none.
+#[derive(Default, Clone)]
+pub struct AdapterOverrides {
+    pub points_sink: Option<Arc<dyn PointsSinkPort>>,
+    pub query_port: Option<Arc<dyn QueryPort>>,
+}
+
+impl AdapterOverrides {
+    /// Both chDB ports are replaced, so chDB is never opened.
+    fn replaces_chdb(&self) -> bool {
+        self.points_sink.is_some() && self.query_port.is_some()
+    }
+}
+
 /// Construct all adapters and application services from config.
 ///
 /// This is the composition root of the application.  `main.rs` calls
 /// this, then runs the HTTP server and background tasks using the
 /// returned handles.
 pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<BootstrappedApp> {
+    build_services_with(config, AdapterOverrides::default()).await
+}
+
+/// [`build_services`] with some adapters supplied by the caller. When both
+/// `points_sink` and `query_port` are given, no chDB session is opened and
+/// `chdb.session_data_path` is never created; the chDB-only startup steps
+/// (on-disk catalog prep and attach, pool settings appliers, the native
+/// adapter's series and materialization caches) are skipped, and the
+/// schema-cache warm goes through [`PointsSinkPort::refresh_schema_cache`].
+/// Everything else -- WAL recovery through the flush service, MV DDL
+/// reconciliation -- runs through the supplied ports unchanged.
+pub async fn build_services_with(
+    config: &HyperbytedbConfig,
+    overrides: AdapterOverrides,
+) -> anyhow::Result<BootstrappedApp> {
+    let replaces_chdb = overrides.replaces_chdb();
     config.validate().map_err(anyhow::Error::msg)?;
     // Every peer client sends it and every internal route checks it.
     let cluster_auth = crate::adapters::cluster::cluster_auth::ClusterAuth::new(
@@ -89,6 +121,9 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         &config.storage.meta_dir,
         &config.chdb.session_data_path,
     ] {
+        if replaces_chdb && dir == &config.chdb.session_data_path {
+            continue;
+        }
         std::fs::create_dir_all(dir)?;
     }
 
@@ -144,7 +179,13 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
     let disk_paths = DiskMonitorPaths {
         wal: config.storage.wal_dir.clone(),
         meta: config.storage.meta_dir.clone(),
-        chdb: config.chdb.session_data_path.clone(),
+        // No chDB directory exists when chDB is replaced; watch the
+        // metadata volume in its place rather than warn on every check.
+        chdb: if replaces_chdb {
+            config.storage.meta_dir.clone()
+        } else {
+            config.chdb.session_data_path.clone()
+        },
     };
     if config.disk.enabled {
         disk_monitor::startup_disk_warning(&disk_paths, config.disk.warn_threshold_mb);
@@ -190,18 +231,8 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         ),
     }
 
-    if let Err(e) =
-        catalog::prepare_cold_start_metadata(std::path::Path::new(&config.chdb.session_data_path))
-    {
-        tracing::warn!(
-            error = %e,
-            "failed to prepare chDB metadata before session open"
-        );
-    }
     let query_pool_size = config.chdb.resolved_query_pool_size();
     let write_pool_size = config.chdb.resolved_write_pool_size();
-    let query_chdb = SharedSession::new_eager(&config.chdb.session_data_path, query_pool_size)?;
-    let write_chdb = SharedSession::new_eager(&config.chdb.session_data_path, write_pool_size)?;
     // This node's runtime settings: SET overrides, fallbacks and appliers.
     let runtime_settings = Arc::new(rs::RuntimeSettings::default());
     runtime_settings.set_config_fallbacks(config);
@@ -218,95 +249,31 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
             int(write_pool_size),
             rs::Source::Config,
         );
-        // Weak: libchdb takes one data path per process, and tests open a
-        // new one per case, so the registry must not keep an old pool open.
-        for (name, pool) in [
-            (rs::QUERY_POOL_SIZE, query_chdb.pool()?),
-            (rs::WRITE_POOL_SIZE, write_chdb.pool()?),
-        ] {
-            let pool = Arc::downgrade(&pool);
-            runtime_settings.register_applier(
-                name,
-                Arc::new(move |v| {
-                    let n = v.as_i64().and_then(|n| usize::try_from(n).ok());
-                    match (pool.upgrade(), n) {
-                        (Some(pool), Some(n)) => pool.resize(n).map(|_| ()),
-                        _ => Ok(()),
-                    }
-                }),
-            );
-        }
     }
-    tracing::info!(
-        query_pool_size = query_chdb.pool()?.pool_size(),
-        write_pool_size = write_chdb.configured_pool_size(),
-        path = %config.chdb.session_data_path,
-        "chDB query and write connection pools ready"
-    );
-    match catalog::reload_persisted_tables(&write_chdb).await {
-        Ok(attached) => tracing::info!(
-            attached,
-            "attached restored chDB tables from on-disk metadata"
-        ),
-        Err(e) => tracing::warn!(
-            error = %e,
-            "failed to attach restored chDB tables from on-disk metadata"
-        ),
-    }
-    let chdb_adapter = Arc::new(ChdbQueryAdapter::from_shared(
-        query_chdb,
-        config.server.max_concurrent_queries,
-    ));
-    {
-        let adapter = Arc::downgrade(&chdb_adapter);
-        runtime_settings.register_applier(
-            rs::MAX_CONCURRENT_QUERIES,
-            rs::usize_applier(move |n| {
-                if let Some(a) = adapter.upgrade() {
-                    a.set_concurrency_limit(n);
+    let (chdb, points_sink): (Arc<dyn QueryPort>, Arc<dyn PointsSinkPort>) =
+        match (overrides.query_port, overrides.points_sink) {
+            (Some(query_port), Some(points_sink)) => {
+                tracing::info!("chDB ports supplied by the caller; no chDB session opened");
+                if let Err(e) = points_sink.refresh_schema_cache().await {
+                    tracing::warn!(
+                        error = %e,
+                        "failed to warm the points sink's schema cache from metadata"
+                    );
                 }
-            }),
-        );
-    }
-    let chdb: Arc<dyn crate::ports::query::QueryPort> = chdb_adapter;
-
-    let native_sink = ChdbNativeAdapter::with_metadata_and_cache_limit(
-        write_chdb,
-        Some(metadata.clone()),
-        config.chdb.schema_cache_max_entries,
-        config.chdb.insert_options(),
-        config
-            .chdb
-            .resolved_tag_low_cardinality_max(&config.cardinality),
-    );
-    match native_sink.warm_schemas_from_metadata().await {
-        Ok(tables) => tracing::info!(
-            tables,
-            "warmed chDB native schema cache from measurement metadata"
-        ),
-        Err(e) => tracing::warn!(
-            error = %e,
-            "failed to warm chDB native schema cache from metadata; schemas rebuild on flush"
-        ),
-    }
-    match native_sink.warm_series_from_metadata().await {
-        Ok(series) => tracing::info!(series, "warmed chDB native series cache from metadata"),
-        Err(e) => tracing::warn!(
-            error = %e,
-            "failed to warm chDB native series cache from metadata; series re-register on flush"
-        ),
-    }
-    match native_sink.sync_materialized_from_engine().await {
-        Ok(tables) => tracing::info!(
-            tables,
-            "synced chDB native schema materialization flags from engine catalog"
-        ),
-        Err(e) => tracing::warn!(
-            error = %e,
-            "failed to sync chDB materialization flags from engine catalog"
-        ),
-    }
-    let points_sink: Arc<dyn PointsSinkPort> = Arc::new(native_sink);
+                (query_port, points_sink)
+            }
+            (query_port, points_sink) => {
+                let (chdb, native) = open_chdb(
+                    config,
+                    &metadata,
+                    &runtime_settings,
+                    query_pool_size,
+                    write_pool_size,
+                )
+                .await?;
+                (query_port.unwrap_or(chdb), points_sink.unwrap_or(native))
+            }
+        };
 
     let auth: Arc<dyn crate::ports::auth::AuthPort> =
         Arc::new(MetadataAuthAdapter::new(metadata.clone()));
@@ -692,6 +659,115 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
         raft_leader_callbacks,
         rocks_shard_map,
     })
+}
+
+/// Open the chDB query and write sessions and build the chDB query port and
+/// native points sink, with their settings appliers and startup warmups.
+async fn open_chdb(
+    config: &HyperbytedbConfig,
+    metadata: &Arc<RocksDbMetadata>,
+    runtime_settings: &Arc<rs::RuntimeSettings>,
+    query_pool_size: usize,
+    write_pool_size: usize,
+) -> anyhow::Result<(Arc<dyn QueryPort>, Arc<dyn PointsSinkPort>)> {
+    if let Err(e) =
+        catalog::prepare_cold_start_metadata(std::path::Path::new(&config.chdb.session_data_path))
+    {
+        tracing::warn!(
+            error = %e,
+            "failed to prepare chDB metadata before session open"
+        );
+    }
+    let query_chdb = SharedSession::new_eager(&config.chdb.session_data_path, query_pool_size)?;
+    let write_chdb = SharedSession::new_eager(&config.chdb.session_data_path, write_pool_size)?;
+    // Weak: libchdb takes one data path per process, and tests open a
+    // new one per case, so the registry must not keep an old pool open.
+    for (name, pool) in [
+        (rs::QUERY_POOL_SIZE, query_chdb.pool()?),
+        (rs::WRITE_POOL_SIZE, write_chdb.pool()?),
+    ] {
+        let pool = Arc::downgrade(&pool);
+        runtime_settings.register_applier(
+            name,
+            Arc::new(move |v| {
+                let n = v.as_i64().and_then(|n| usize::try_from(n).ok());
+                match (pool.upgrade(), n) {
+                    (Some(pool), Some(n)) => pool.resize(n).map(|_| ()),
+                    _ => Ok(()),
+                }
+            }),
+        );
+    }
+    tracing::info!(
+        query_pool_size = query_chdb.pool()?.pool_size(),
+        write_pool_size = write_chdb.configured_pool_size(),
+        path = %config.chdb.session_data_path,
+        "chDB query and write connection pools ready"
+    );
+    match catalog::reload_persisted_tables(&write_chdb).await {
+        Ok(attached) => tracing::info!(
+            attached,
+            "attached restored chDB tables from on-disk metadata"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "failed to attach restored chDB tables from on-disk metadata"
+        ),
+    }
+    let chdb_adapter = Arc::new(ChdbQueryAdapter::from_shared(
+        query_chdb,
+        config.server.max_concurrent_queries,
+    ));
+    {
+        let adapter = Arc::downgrade(&chdb_adapter);
+        runtime_settings.register_applier(
+            rs::MAX_CONCURRENT_QUERIES,
+            rs::usize_applier(move |n| {
+                if let Some(a) = adapter.upgrade() {
+                    a.set_concurrency_limit(n);
+                }
+            }),
+        );
+    }
+    let chdb: Arc<dyn QueryPort> = chdb_adapter;
+
+    let native_sink = ChdbNativeAdapter::with_metadata_and_cache_limit(
+        write_chdb,
+        Some(metadata.clone()),
+        config.chdb.schema_cache_max_entries,
+        config.chdb.insert_options(),
+        config
+            .chdb
+            .resolved_tag_low_cardinality_max(&config.cardinality),
+    );
+    match native_sink.warm_schemas_from_metadata().await {
+        Ok(tables) => tracing::info!(
+            tables,
+            "warmed chDB native schema cache from measurement metadata"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "failed to warm chDB native schema cache from metadata; schemas rebuild on flush"
+        ),
+    }
+    match native_sink.warm_series_from_metadata().await {
+        Ok(series) => tracing::info!(series, "warmed chDB native series cache from metadata"),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "failed to warm chDB native series cache from metadata; series re-register on flush"
+        ),
+    }
+    match native_sink.sync_materialized_from_engine().await {
+        Ok(tables) => tracing::info!(
+            tables,
+            "synced chDB native schema materialization flags from engine catalog"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "failed to sync chDB materialization flags from engine catalog"
+        ),
+    }
+    Ok((chdb, Arc::new(native_sink)))
 }
 
 /// Create `auth.admin_username` as an admin if no user has that name. Each

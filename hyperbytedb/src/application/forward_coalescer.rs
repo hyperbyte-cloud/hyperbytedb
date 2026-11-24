@@ -294,7 +294,8 @@ async fn post_batch(
     outcome
 }
 
-#[cfg(test)]
+// Real TCP listeners (or a second runtime): not under `cfg(madsim)`.
+#[cfg(all(test, not(madsim)))]
 mod tests {
     use super::*;
     use crate::domain::sharding::ShardEpoch;

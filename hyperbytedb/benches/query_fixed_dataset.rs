@@ -5,6 +5,10 @@
 //!   - `medium` — 1M points, 100 hosts, `cpu` + `mem` + `disk`
 //!   - `large`  — 10M points, 1000 hosts, `cpu`
 
+// Real chDB: not built under `cfg(madsim)`.
+#![cfg_attr(madsim, no_main)]
+#![cfg(not(madsim))]
+
 mod support;
 
 use std::sync::{Arc, OnceLock};

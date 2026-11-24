@@ -2,6 +2,10 @@
 //!
 //! Measures parse-only, parse + metadata registration, and full WAL append on a temp RocksDB.
 
+// Real chDB: not built under `cfg(madsim)`.
+#![cfg_attr(madsim, no_main)]
+#![cfg(not(madsim))]
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

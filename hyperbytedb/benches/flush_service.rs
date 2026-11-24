@@ -7,6 +7,10 @@
 //!
 //! `flush_drain_large` is skipped unless `BENCH_FLUSH_DRAIN_LARGE=1`.
 
+// Real chDB: not built under `cfg(madsim)`.
+#![cfg_attr(madsim, no_main)]
+#![cfg(not(madsim))]
+
 mod support;
 
 use std::sync::{Arc, OnceLock};

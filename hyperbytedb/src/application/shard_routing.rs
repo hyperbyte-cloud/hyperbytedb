@@ -1134,7 +1134,8 @@ pub async fn scatter_delete_to_regions(
     Ok(outcome)
 }
 
-#[cfg(test)]
+// Real TCP listeners (or a second runtime): not under `cfg(madsim)`.
+#[cfg(all(test, not(madsim)))]
 mod scatter_tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};

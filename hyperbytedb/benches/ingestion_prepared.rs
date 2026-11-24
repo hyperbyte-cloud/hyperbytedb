@@ -5,6 +5,10 @@
 //! Arrow build) → `BatchingWal::append_bundle` (group-commit writer thread,
 //! including the per-row `ingest_seq` patch).
 
+// Real chDB: not built under `cfg(madsim)`.
+#![cfg_attr(madsim, no_main)]
+#![cfg(not(madsim))]
+
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

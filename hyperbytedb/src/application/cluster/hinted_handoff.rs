@@ -116,7 +116,8 @@ pub async fn run_hinted_handoff_watcher(
     }
 }
 
-#[cfg(test)]
+// Real TCP listeners (or a second runtime): not under `cfg(madsim)`.
+#[cfg(all(test, not(madsim)))]
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};

@@ -61,7 +61,7 @@ pub(crate) enum ProbeSignal {
 ///
 /// Uses the non-sharded readiness rule, where `needs_sync` blocks readmission.
 /// See [`decide_transition_with`].
-#[cfg(test)]
+#[cfg(all(test, not(madsim)))]
 pub(crate) fn decide_transition(
     current: NodeState,
     signal: &ProbeSignal,
@@ -341,7 +341,8 @@ async fn probe_peers(
     }
 }
 
-#[cfg(test)]
+// Real TCP listeners (or a second runtime): not under `cfg(madsim)`.
+#[cfg(all(test, not(madsim)))]
 mod tests {
     use super::*;
 

@@ -1,5 +1,9 @@
 //! Placement behaviour: how a measurement's regions spread across nodes.
 
+// Real chDB, TCP listeners or reqwest: not built under `cfg(madsim)`;
+// simulation tests live in `madsim_*` test crates.
+#![cfg(not(madsim))]
+
 use hyperbytedb::domain::sharding::placement::{
     PlacementStep, next_placement_step, target_placement,
 };

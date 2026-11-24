@@ -1,5 +1,9 @@
 //! End-to-end tests using the production bootstrap path and background flush loop.
 
+// Real chDB, TCP listeners or reqwest: not built under `cfg(madsim)`;
+// simulation tests live in `madsim_*` test crates.
+#![cfg(not(madsim))]
+
 mod support;
 
 use std::time::Duration;

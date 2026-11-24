@@ -2,12 +2,12 @@
 //! the HTTP listeners, and shut them down in order. Top-level wiring, like
 //! [`crate::bootstrap`], so the application layer does not build routers.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-#[cfg(not(madsim))]
-use crate::adapters::http::router::build_control_router;
-use crate::adapters::http::router::build_router;
+use tokio::sync::watch;
+
+use crate::adapters::http::router::{build_control_router, build_router};
 use crate::application::cluster::heartbeat;
 use crate::application::cluster::hinted_handoff;
 use crate::application::cluster::leader_monitor;
@@ -15,36 +15,112 @@ use crate::application::cluster::raft_formation;
 use crate::application::continuous_query_service::ContinuousQueryService;
 use crate::application::disk_monitor;
 use crate::application::retention_service::RetentionService;
-use crate::bootstrap::build_services;
+use crate::bootstrap::{AdapterOverrides, build_services_with};
 use crate::config::{HyperbytedbConfig, RetentionConfig};
 use crate::ports::metadata::MetadataPort;
 use crate::ports::points_sink::PointsSinkPort;
+use crate::ports::serve_transport::{ListenerKind, ServeTransport};
 use crate::ports::wal::WalPort;
 
-use crate::application::runtime::control;
 use crate::application::runtime::shard_heartbeat;
 
-/// Run the server. `log_level` lets `SET log_level` replace the process's
-/// log filter.
+/// Run the server on TCP listeners until SIGINT/SIGTERM. `log_level` lets
+/// `SET log_level` replace the process's log filter.
+#[cfg(not(madsim))]
 pub async fn serve(
     config: HyperbytedbConfig,
     log_level: Option<crate::telemetry::LogLevel>,
 ) -> anyhow::Result<()> {
+    use crate::adapters::http::tcp_serve_transport::TcpServeTransport;
+    use crate::application::runtime::control;
+
     // The control runtime lives exactly as long as the server: installed
     // before Raft starts, stopped after everything else has shut down.
     if config.cluster.enabled {
         control::install()?;
     }
-    let result = serve_inner(config, log_level).await;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    tokio::spawn(async move {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {},
+                    _ = term.recv() => {},
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to install SIGTERM handler, SIGINT only");
+                tokio::signal::ctrl_c().await.ok();
+            }
+        }
+        tracing::info!("shutdown signal received, stopping API server");
+        let _ = shutdown_tx.send(true);
+    });
+    let transport = Arc::new(TcpServeTransport::new(&config.server));
+    let result = run_node(
+        config,
+        log_level,
+        AdapterOverrides::default(),
+        transport,
+        shutdown_rx,
+    )
+    .await;
     control::shutdown();
     result
 }
 
-async fn serve_inner(
+/// Simulation (`cfg(madsim)`): there are no TCP listeners or unix signals;
+/// the rig calls [`run_node`] with its own [`ServeTransport`].
+#[cfg(madsim)]
+pub async fn serve(
+    _config: HyperbytedbConfig,
+    _log_level: Option<crate::telemetry::LogLevel>,
+) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "serve binds TCP listeners; under cfg(madsim) call run_node with a ServeTransport"
+    )
+}
+
+/// A router to hand to the transport before the node's state is complete.
+/// It answers 503 until `slot` is set, then forwards every request to the
+/// router in `slot`.
+fn pending_router() -> (axum::Router, Arc<OnceLock<axum::Router>>) {
+    use tower::ServiceExt;
+
+    let slot: Arc<OnceLock<axum::Router>> = Arc::new(OnceLock::new());
+    let inner = slot.clone();
+    let router = axum::Router::new().fallback_service(tower::service_fn(
+        move |req: axum::extract::Request| {
+            let ready = inner.get().cloned();
+            async move {
+                match ready {
+                    Some(router) => router.oneshot(req).await,
+                    None => Ok(axum::response::IntoResponse::into_response((
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        "starting up",
+                    ))),
+                }
+            }
+        },
+    ));
+    (router, slot)
+}
+
+/// Run one node: build its services (with `overrides` in place of the
+/// adapters they replace), start the background tasks, serve its routers
+/// through `transport` until `shutdown` flips, then shut down in order.
+///
+/// The routers are handed to `transport` before startup sync and Raft
+/// formation; they answer 503 until the node's state is complete, at the
+/// point where the listeners used to be bound.
+pub async fn run_node(
     config: HyperbytedbConfig,
     log_level: Option<crate::telemetry::LogLevel>,
+    overrides: AdapterOverrides,
+    transport: Arc<dyn ServeTransport>,
+    shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let bootstrapped = build_services(&config).await?;
+    let bootstrapped = build_services_with(&config, overrides).await?;
     if let Some(log_level) = log_level {
         log_level.register(&bootstrapped.app_state.runtime_settings);
     }
@@ -63,9 +139,9 @@ async fn serve_inner(
     let membership = app_state.membership.clone();
     let _replication_log_arc = app_state.replication_log.clone();
 
-    // Two-phase shutdown
-    let (api_shutdown_tx, _api_shutdown_rx) = tokio::sync::watch::channel(false);
-    let (service_shutdown_tx, service_shutdown_rx) = tokio::sync::watch::channel(false);
+    // Two-phase shutdown: `shutdown` stops the API, then this stops the
+    // background services.
+    let (service_shutdown_tx, service_shutdown_rx) = watch::channel(false);
 
     // Spawn background flush service
     let flush_interval = Duration::from_secs(config.flush.interval_secs);
@@ -140,6 +216,32 @@ async fn serve_inner(
             )
             .await;
         }))
+    } else {
+        None
+    };
+
+    // The routers go up before startup sync, standing in for "the HTTP
+    // server is listening"; they answer 503 until the state is complete.
+    let addr = format!("{}:{}", config.server.bind_address, config.server.port);
+    let (main_router, main_slot) = pending_router();
+    transport
+        .serve(ListenerKind::Main, addr, main_router, shutdown.clone())
+        .await?;
+    let control_slot = if config.cluster.enabled && config.cluster.control_port > 0 {
+        let control_addr = format!(
+            "{}:{}",
+            config.server.bind_address, config.cluster.control_port
+        );
+        let (control_router, slot) = pending_router();
+        transport
+            .serve(
+                ListenerKind::Control,
+                control_addr,
+                control_router,
+                shutdown.clone(),
+            )
+            .await?;
+        Some(slot)
     } else {
         None
     };
@@ -409,30 +511,10 @@ async fn serve_inner(
     let app_state = Arc::new(app_state);
     let app = build_router(app_state.clone());
 
-    // Control listener on the control runtime, next to the Raft core: probes
-    // and Raft RPCs are answered even while the write path is saturated.
-    // Not bound under `cfg(madsim)`: the simulation has no TCP listeners.
-    #[cfg(not(madsim))]
-    if config.cluster.enabled && config.cluster.control_port > 0 {
-        let control_app = build_control_router(app_state.clone());
-        let control_addr = format!(
-            "{}:{}",
-            config.server.bind_address, config.cluster.control_port
-        );
-        let spawn_here = tokio::runtime::Handle::current();
-        control::handle().unwrap_or(&spawn_here).spawn(async move {
-            match tokio::net::TcpListener::bind(&control_addr).await {
-                Ok(listener) => {
-                    tracing::info!(addr = %control_addr, "control listener up");
-                    if let Err(e) = axum::serve(nodelay(listener), control_app).await {
-                        tracing::error!(error = %e, "control listener stopped");
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(addr = %control_addr, error = %e, "control listener failed to bind");
-                }
-            }
-        });
+    // Control router: probes and Raft RPCs (served on the control runtime
+    // by the TCP transport).
+    if let Some(slot) = &control_slot {
+        let _ = slot.set(build_control_router(app_state.clone()));
     }
 
     // ── Raft cluster formation ───────────────────────────────────────────
@@ -474,88 +556,10 @@ async fn serve_inner(
         None
     };
 
-    // ── Phase 1: Start HTTP server ──────────────────────────────────────
-    // The server will accept requests until the shutdown signal fires.
-    let addr = format!("{}:{}", config.server.bind_address, config.server.port);
-    #[cfg(not(madsim))]
-    if config.server.tls_enabled {
-        use axum_server::tls_rustls::RustlsConfig;
-
-        if config.server.tls_cert_path.is_empty() || config.server.tls_key_path.is_empty() {
-            anyhow::bail!("tls_enabled is true but tls_cert_path or tls_key_path is not set");
-        }
-        if !std::path::Path::new(&config.server.tls_cert_path).exists() {
-            anyhow::bail!("TLS cert file not found: {}", config.server.tls_cert_path);
-        }
-        if !std::path::Path::new(&config.server.tls_key_path).exists() {
-            anyhow::bail!("TLS key file not found: {}", config.server.tls_key_path);
-        }
-
-        let tls_config =
-            RustlsConfig::from_pem_file(&config.server.tls_cert_path, &config.server.tls_key_path)
-                .await
-                .map_err(|e| anyhow::anyhow!("TLS config error: {}", e))?;
-
-        let handle = axum_server::Handle::new();
-        let shutdown_handle = handle.clone();
-        tokio::spawn(async move {
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(mut term) => {
-                    tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {},
-                        _ = term.recv() => {},
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to install SIGTERM handler, SIGINT only");
-                    tokio::signal::ctrl_c().await.ok();
-                }
-            }
-            tracing::info!("shutdown signal received, stopping API server");
-            let _ = api_shutdown_tx.send(true);
-            shutdown_handle.graceful_shutdown(Some(Duration::from_secs(10)));
-        });
-
-        tracing::info!(addr = %addr, "Hyperbytedb listening (TLS)");
-        axum_server::bind_rustls(addr.parse()?, tls_config)
-            .handle(handle)
-            .serve(app.into_make_service())
-            .await?;
-    } else {
-        let api_rx = _api_shutdown_rx;
-        tracing::info!(addr = %addr, "Hyperbytedb listening");
-        let listener = tokio::net::TcpListener::bind(&addr).await?;
-        axum::serve(nodelay(listener), app)
-            .with_graceful_shutdown(async move {
-                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                    Ok(mut term) => {
-                        tokio::select! {
-                            _ = tokio::signal::ctrl_c() => {},
-                            _ = term.recv() => {},
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "failed to install SIGTERM handler, SIGINT only");
-                        tokio::signal::ctrl_c().await.ok();
-                    }
-                }
-                tracing::info!("shutdown signal received, stopping API server");
-                let _ = api_shutdown_tx.send(true);
-                // Also consume api_rx so it is moved into this future
-                drop(api_rx);
-            })
-            .await?;
-    }
-    // Simulation (`cfg(madsim)`): no TCP listener is bound. The API phase
-    // lasts until the simulated node gets ctrl-c, then shuts down as above.
-    #[cfg(madsim)]
-    {
-        let _ = (app, _api_shutdown_rx);
-        tracing::info!(addr = %addr, "simulation: API listener not bound");
-        tokio::signal::ctrl_c().await.ok();
-        tracing::info!("shutdown signal received, stopping API server");
-        let _ = api_shutdown_tx.send(true);
-    }
+    // ── Phase 1: Serve HTTP ──────────────────────────────────────────────
+    // The server accepts requests until `shutdown` flips.
+    let _ = main_slot.set(app);
+    transport.stopped(ListenerKind::Main, shutdown).await?;
 
     // ── Phase 2: API is down — stop background flush before drain ───────
     tracing::info!("API server stopped, stopping background services before drain");
@@ -633,20 +637,4 @@ async fn serve_inner(
     tracing::info!("Hyperbytedb shut down cleanly");
 
     Ok(())
-}
-
-/// Accepted connections with Nagle off. Region results stream back in
-/// several small writes; with Nagle each one after the first waited for the
-/// peer's delayed ACK, up to 40 ms on Linux. Every query that touched a
-/// remote region on the UAT cluster took ~55 ms or ~20 ms at random.
-#[cfg(not(madsim))]
-fn nodelay(
-    listener: tokio::net::TcpListener,
-) -> impl axum::serve::Listener<Io = tokio::net::TcpStream, Addr = std::net::SocketAddr> {
-    use axum::serve::ListenerExt;
-    listener.tap_io(|tcp| {
-        if let Err(e) = tcp.set_nodelay(true) {
-            tracing::debug!(error = %e, "TCP_NODELAY not set");
-        }
-    })
 }

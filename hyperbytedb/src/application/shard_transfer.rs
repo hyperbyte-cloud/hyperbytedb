@@ -1182,7 +1182,8 @@ pub async fn run_region_transfer(
     .await
 }
 
-#[cfg(test)]
+// Real TCP listeners (or a second runtime): not under `cfg(madsim)`.
+#[cfg(all(test, not(madsim)))]
 mod tests {
 
     /// A rejection must carry WHY, not just a status code.

@@ -500,7 +500,8 @@ pub fn build_control_router(state: Arc<AppState>) -> Router {
     router.with_state(state)
 }
 
-#[cfg(test)]
+// Real TCP listeners (or a second runtime): not under `cfg(madsim)`.
+#[cfg(all(test, not(madsim)))]
 mod layer_routes_tests {
     use super::layer_routes;
     use axum::{Router, http::StatusCode, routing::get};

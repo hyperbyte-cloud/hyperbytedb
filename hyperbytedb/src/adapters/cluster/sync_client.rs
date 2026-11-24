@@ -621,7 +621,8 @@ fn verify_catchup_progress(
     Ok(())
 }
 
-#[cfg(test)]
+// Real TCP listeners (or a second runtime): not under `cfg(madsim)`.
+#[cfg(all(test, not(madsim)))]
 mod tests {
     use super::{remote_map_is_newer, verify_catchup_progress};
     use crate::error::HyperbytedbError;
