@@ -13,8 +13,10 @@ use crate::config::ServerConfig;
 use crate::ports::serve_transport::{ListenerKind, ServeTransport};
 
 /// Binds `server.bind_address`-style addresses with TCP, with TLS on the
-/// main listener when `server.tls_enabled`.
+/// main listener when `server.tls_enabled`. When the main listener comes up
+/// it installs the SIGINT/SIGTERM handler, which flips `shutdown_tx`.
 pub struct TcpServeTransport {
+    shutdown_tx: parking_lot::Mutex<Option<watch::Sender<bool>>>,
     tls_enabled: bool,
     tls_cert_path: String,
     tls_key_path: String,
@@ -23,13 +25,38 @@ pub struct TcpServeTransport {
 }
 
 impl TcpServeTransport {
-    pub fn new(server: &ServerConfig) -> Self {
+    pub fn new(server: &ServerConfig, shutdown_tx: watch::Sender<bool>) -> Self {
         Self {
+            shutdown_tx: parking_lot::Mutex::new(Some(shutdown_tx)),
             tls_enabled: server.tls_enabled,
             tls_cert_path: server.tls_cert_path.clone(),
             tls_key_path: server.tls_key_path.clone(),
             main: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// SIGINT or SIGTERM flips `shutdown`. Installed when the API listener
+    /// comes up; until then the signals keep their default disposition.
+    fn install_signal_handler(&self) {
+        let Some(shutdown_tx) = self.shutdown_tx.lock().take() else {
+            return;
+        };
+        tokio::spawn(async move {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut term) => {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {},
+                        _ = term.recv() => {},
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to install SIGTERM handler, SIGINT only");
+                    tokio::signal::ctrl_c().await.ok();
+                }
+            }
+            tracing::info!("shutdown signal received, stopping API server");
+            let _ = shutdown_tx.send(true);
+        });
     }
 
     async fn serve_main(
@@ -57,6 +84,7 @@ impl TcpServeTransport {
 
             let handle = axum_server::Handle::new();
             let shutdown_handle = handle.clone();
+            self.install_signal_handler();
             tokio::spawn(async move {
                 wait_for_shutdown(shutdown).await;
                 shutdown_handle.graceful_shutdown(Some(Duration::from_secs(10)));
@@ -74,6 +102,7 @@ impl TcpServeTransport {
         } else {
             tracing::info!(addr = %addr, "Hyperbytedb listening");
             let listener = tokio::net::TcpListener::bind(&addr).await?;
+            self.install_signal_handler();
             Ok(tokio::spawn(async move {
                 axum::serve(nodelay(listener), app)
                     .with_graceful_shutdown(wait_for_shutdown(shutdown))

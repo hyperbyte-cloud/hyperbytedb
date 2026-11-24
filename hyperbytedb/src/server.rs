@@ -2,7 +2,7 @@
 //! the HTTP listeners, and shut them down in order. Top-level wiring, like
 //! [`crate::bootstrap`], so the application layer does not build routers.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::watch;
@@ -39,24 +39,10 @@ pub async fn serve(
     if config.cluster.enabled {
         control::install()?;
     }
+    // `TcpServeTransport` installs the SIGINT/SIGTERM handler when the API
+    // listener comes up, and flips this.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    tokio::spawn(async move {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut term) => {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {},
-                    _ = term.recv() => {},
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to install SIGTERM handler, SIGINT only");
-                tokio::signal::ctrl_c().await.ok();
-            }
-        }
-        tracing::info!("shutdown signal received, stopping API server");
-        let _ = shutdown_tx.send(true);
-    });
-    let transport = Arc::new(TcpServeTransport::new(&config.server));
+    let transport = Arc::new(TcpServeTransport::new(&config.server, shutdown_tx));
     let result = run_node(
         config,
         log_level,
@@ -81,38 +67,13 @@ pub async fn serve(
     )
 }
 
-/// A router to hand to the transport before the node's state is complete.
-/// It answers 503 until `slot` is set, then forwards every request to the
-/// router in `slot`.
-fn pending_router() -> (axum::Router, Arc<OnceLock<axum::Router>>) {
-    use tower::ServiceExt;
-
-    let slot: Arc<OnceLock<axum::Router>> = Arc::new(OnceLock::new());
-    let inner = slot.clone();
-    let router = axum::Router::new().fallback_service(tower::service_fn(
-        move |req: axum::extract::Request| {
-            let ready = inner.get().cloned();
-            async move {
-                match ready {
-                    Some(router) => router.oneshot(req).await,
-                    None => Ok(axum::response::IntoResponse::into_response((
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "starting up",
-                    ))),
-                }
-            }
-        },
-    ));
-    (router, slot)
-}
-
 /// Run one node: build its services (with `overrides` in place of the
 /// adapters they replace), start the background tasks, serve its routers
 /// through `transport` until `shutdown` flips, then shut down in order.
 ///
-/// The routers are handed to `transport` before startup sync and Raft
-/// formation; they answer 503 until the node's state is complete, at the
-/// point where the listeners used to be bound.
+/// The routers are handed to `transport` at the points the TCP listeners
+/// have always been bound: the control listener before Raft formation, the
+/// API listener once everything else is running.
 pub async fn run_node(
     config: HyperbytedbConfig,
     log_level: Option<crate::telemetry::LogLevel>,
@@ -216,32 +177,6 @@ pub async fn run_node(
             )
             .await;
         }))
-    } else {
-        None
-    };
-
-    // The routers go up before startup sync, standing in for "the HTTP
-    // server is listening"; they answer 503 until the state is complete.
-    let addr = format!("{}:{}", config.server.bind_address, config.server.port);
-    let (main_router, main_slot) = pending_router();
-    transport
-        .serve(ListenerKind::Main, addr, main_router, shutdown.clone())
-        .await?;
-    let control_slot = if config.cluster.enabled && config.cluster.control_port > 0 {
-        let control_addr = format!(
-            "{}:{}",
-            config.server.bind_address, config.cluster.control_port
-        );
-        let (control_router, slot) = pending_router();
-        transport
-            .serve(
-                ListenerKind::Control,
-                control_addr,
-                control_router,
-                shutdown.clone(),
-            )
-            .await?;
-        Some(slot)
     } else {
         None
     };
@@ -511,10 +446,22 @@ pub async fn run_node(
     let app_state = Arc::new(app_state);
     let app = build_router(app_state.clone());
 
-    // Control router: probes and Raft RPCs (served on the control runtime
-    // by the TCP transport).
-    if let Some(slot) = &control_slot {
-        let _ = slot.set(build_control_router(app_state.clone()));
+    // Control listener: probes and Raft RPCs. The TCP transport serves it on
+    // the control runtime, next to the Raft core, so they are answered even
+    // while the write path is saturated.
+    if config.cluster.enabled && config.cluster.control_port > 0 {
+        let control_addr = format!(
+            "{}:{}",
+            config.server.bind_address, config.cluster.control_port
+        );
+        transport
+            .serve(
+                ListenerKind::Control,
+                control_addr,
+                build_control_router(app_state.clone()),
+                shutdown.clone(),
+            )
+            .await?;
     }
 
     // ── Raft cluster formation ───────────────────────────────────────────
@@ -556,9 +503,12 @@ pub async fn run_node(
         None
     };
 
-    // ── Phase 1: Serve HTTP ──────────────────────────────────────────────
-    // The server accepts requests until `shutdown` flips.
-    let _ = main_slot.set(app);
+    // ── Phase 1: Start HTTP server ──────────────────────────────────────
+    // The server will accept requests until the shutdown signal fires.
+    let addr = format!("{}:{}", config.server.bind_address, config.server.port);
+    transport
+        .serve(ListenerKind::Main, addr, app, shutdown.clone())
+        .await?;
     transport.stopped(ListenerKind::Main, shutdown).await?;
 
     // ── Phase 2: API is down — stop background flush before drain ───────

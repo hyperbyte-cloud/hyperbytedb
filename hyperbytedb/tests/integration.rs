@@ -1664,18 +1664,11 @@ async fn run_node_serves_through_the_transport_until_shutdown() {
         1,
         "no control router"
     );
-    // 503 while the node starts, then the real API.
-    let status = loop {
-        let ping = axum::http::Request::get("/ping")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        let status = main.1.clone().oneshot(ping).await.unwrap().status();
-        if status != StatusCode::SERVICE_UNAVAILABLE {
-            break status;
-        }
-        assert!(std::time::Instant::now() < deadline, "node never ready");
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    };
+    // Handed over at the point the API listener is bound: the real router.
+    let ping = axum::http::Request::get("/ping")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let status = main.1.clone().oneshot(ping).await.unwrap().status();
     assert_eq!(status, StatusCode::NO_CONTENT);
 
     shutdown_tx.send(true).unwrap();
