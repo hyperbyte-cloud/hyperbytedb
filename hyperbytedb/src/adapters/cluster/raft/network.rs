@@ -10,10 +10,13 @@ use openraft::raft::{
 };
 
 use super::TypeConfig;
+use crate::ports::http_client::{HttpClientError, PeerHttpClient, PeerResponse};
 
-/// HTTP-based Raft network transport using reqwest.
+/// HTTP-based Raft network transport, over the peer [`HttpClientPort`].
+///
+/// [`HttpClientPort`]: crate::ports::http_client::HttpClientPort
 pub struct Network {
-    client: reqwest::Client,
+    client: PeerHttpClient,
     default_timeout: Duration,
     /// `cluster.control_port`; `0` sends Raft RPCs to the main address only.
     control_port: u16,
@@ -25,19 +28,16 @@ impl Network {
         control_port: u16,
         cluster_auth: &crate::adapters::cluster::cluster_auth::ClusterAuth,
     ) -> Self {
-        use crate::ports::peer_http::PeerHttp;
+        use crate::ports::peer_http::{PeerClientOptions, PeerConnections, PeerHttp};
         let default_timeout = Duration::from_secs(default_timeout_secs);
         Self {
-            // `Client::builder().build()` only fails if TLS init is broken,
-            // in which case `Client::new()` (same default config) would also
-            // be unusable. Fall back to defaults so we don't panic on a path
-            // that's exercised on the hot bootstrap line.
-            client: cluster_auth.build(
-                cluster_auth
-                    .client_builder()
-                    .timeout(default_timeout)
-                    .dns_resolver(crate::adapters::cluster::dns_cache::CachingResolver::shared()),
-            ),
+            // Building fails only if TLS init is broken; `client` then falls
+            // back to a plain client rather than panic on a path that's
+            // exercised on the hot bootstrap line.
+            client: cluster_auth.client(PeerClientOptions {
+                timeout: Some(default_timeout),
+                connections: PeerConnections::CachedDns,
+            }),
             default_timeout,
             control_port,
         }
@@ -72,7 +72,7 @@ pub struct NetworkConnection {
     addr: String,
     /// The peer's control listener, tried first when configured.
     control_addr: Option<String>,
-    client: reqwest::Client,
+    client: PeerHttpClient,
     default_timeout: Duration,
 }
 
@@ -85,7 +85,7 @@ impl NetworkConnection {
         path: &str,
         req: &Req,
         timeout: Duration,
-    ) -> Result<reqwest::Response, reqwest::Error> {
+    ) -> Result<PeerResponse, HttpClientError> {
         if let Some(ctrl) = &self.control_addr {
             match self
                 .client
