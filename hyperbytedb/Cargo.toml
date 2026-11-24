@@ -119,6 +119,12 @@ opentelemetry-otlp = { version = "0.33.0", default-features = false, features = 
 [target.'cfg(not(madsim))'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
 
+# Simulation rig only: the deterministic runtime behind openraft's
+# `MadsimRuntime` (src/adapters/cluster/raft/madsim_runtime.rs) and the
+# `#[madsim::test]` harness. Not compiled into production builds.
+[target.'cfg(madsim)'.dependencies]
+madsim = "0.2.34"
+
 [features]
 default = ["columnar-ingest"]
 columnar-ingest = []

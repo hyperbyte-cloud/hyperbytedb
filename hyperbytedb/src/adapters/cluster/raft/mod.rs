@@ -1,11 +1,18 @@
 pub mod log_store;
+#[cfg(madsim)]
+pub mod madsim_runtime;
 pub mod network;
 pub mod state_machine;
 pub mod types;
 
 use std::io::Cursor;
 
-use openraft::TokioRuntime;
+// openraft's tasks, timers, clock and RNG run on madsim's deterministic
+// runtime in the simulation rig, and on tokio everywhere else.
+#[cfg(madsim)]
+use self::madsim_runtime::MadsimRuntime as RaftRuntime;
+#[cfg(not(madsim))]
+use openraft::TokioRuntime as RaftRuntime;
 
 use self::types::{ClusterRequest, ClusterResponse};
 
@@ -18,7 +25,7 @@ openraft::declare_raft_types!(
         Entry        = openraft::Entry<TypeConfig>,
         SnapshotData = Cursor<Vec<u8>>,
         Responder    = openraft::impls::OneshotResponder<TypeConfig>,
-        AsyncRuntime = TokioRuntime,
+        AsyncRuntime = RaftRuntime,
 );
 
 pub type HyperbytedbRaft = openraft::Raft<TypeConfig>;

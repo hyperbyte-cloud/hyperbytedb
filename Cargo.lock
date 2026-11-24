@@ -1964,6 +1964,7 @@ dependencies = [
  "influxdb-line-protocol",
  "libc",
  "lru",
+ "madsim",
  "madsim-tokio",
  "metrics",
  "metrics-exporter-prometheus",
