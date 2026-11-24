@@ -394,11 +394,11 @@ async fn fetch_target_raft(
     cluster_auth: &crate::adapters::cluster::cluster_auth::ClusterAuth,
     addr: &str,
 ) -> Option<TargetRaft> {
-    use crate::ports::peer_http::PeerHttp;
+    use crate::ports::peer_http::{PeerClientOptions, PeerHttp};
     let client = cluster_auth
-        .client_builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .build()
+        .try_client(PeerClientOptions::with_timeout(
+            std::time::Duration::from_secs(3),
+        ))
         .ok()?;
     let v: serde_json::Value = client
         .get(format!("http://{addr}/cluster/raft/metrics"))
