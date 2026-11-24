@@ -18,9 +18,10 @@ use crate::domain::materialized_view::MaterializedViewDef;
 use crate::domain::measurement::MeasurementMeta;
 use crate::domain::query_result::{QueryResponse, StatementResult};
 use crate::error::HyperbytedbError;
+use crate::ports::http_client::PeerHttpClient;
 use crate::ports::metadata::ContinuousQueryDef;
 use crate::ports::metadata::MetadataPort;
-use crate::ports::peer_http::PeerHttp;
+use crate::ports::peer_http::{PeerClientOptions, PeerHttp};
 use crate::ports::query::QueryService;
 use crate::ports::replication::ReplicationPort;
 use crate::timeseriesql::ast::{
@@ -41,7 +42,7 @@ pub struct PeerQueryService {
     membership: std::sync::OnceLock<Arc<tokio::sync::RwLock<ClusterMembership>>>,
     shard_routing: std::sync::OnceLock<Arc<ShardRoutingContext>>,
     /// For schema mutations forwarded to the Raft leader.
-    raft_client: reqwest::Client,
+    raft_client: PeerHttpClient,
 }
 
 impl PeerQueryService {
@@ -52,11 +53,9 @@ impl PeerQueryService {
         peer_http: &dyn PeerHttp,
     ) -> Self {
         Self {
-            raft_client: peer_http.build(
-                peer_http
-                    .client_builder()
-                    .timeout(std::time::Duration::from_secs(10)),
-            ),
+            raft_client: peer_http.client(PeerClientOptions::with_timeout(
+                std::time::Duration::from_secs(10),
+            )),
             inner,
             metadata,
             replication_port,
@@ -281,7 +280,7 @@ fn resolve_leader_addr_with_lookup(
 }
 
 async fn forward_client_write(
-    client: &reqwest::Client,
+    client: &PeerHttpClient,
     forward: &ForwardToLeader<u64, BasicNode>,
     raft: &HyperbytedbRaft,
     membership: Option<&Arc<tokio::sync::RwLock<ClusterMembership>>>,
