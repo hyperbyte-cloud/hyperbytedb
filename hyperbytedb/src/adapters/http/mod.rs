@@ -15,6 +15,8 @@ pub mod rate_limit;
 pub mod response;
 pub mod router;
 pub mod shard_handlers;
+#[cfg(madsim)]
+pub mod sim_timeout;
 pub mod statements;
 #[cfg(not(madsim))]
 pub mod tcp_serve_transport;

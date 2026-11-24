@@ -8,7 +8,13 @@ use axum::{
     middleware,
     routing::{get, post},
 };
-use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
+// Under `cfg(madsim)` the same middleware on the simulated timer; see
+// `sim_timeout`.
+#[cfg(madsim)]
+use crate::adapters::http::sim_timeout::TimeoutLayer;
+#[cfg(not(madsim))]
+use tower_http::timeout::TimeoutLayer;
+use tower_http::trace::TraceLayer;
 
 use crate::adapters::cluster::peer_client::PeerClient;
 use crate::adapters::cluster::raft::HyperbytedbRaft;
