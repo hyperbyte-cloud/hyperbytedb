@@ -189,10 +189,10 @@ async fn execute_region_backfill_once(
                     .send()
                     .await
                     .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
-                if resp.status() == reqwest::StatusCode::CONFLICT {
+                if resp.status() == axum::http::StatusCode::CONFLICT {
                     return Err(HyperbytedbError::StaleShardEpoch { region_id });
                 }
-                if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                if resp.status() == axum::http::StatusCode::SERVICE_UNAVAILABLE {
                     return Err(HyperbytedbError::ClusterUnavailable(format!(
                         "peer {peer_id} has not created the view yet"
                     )));
