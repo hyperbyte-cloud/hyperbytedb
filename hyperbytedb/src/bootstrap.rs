@@ -53,6 +53,12 @@ pub struct BootstrappedApp {
 pub struct AdapterOverrides {
     pub points_sink: Option<Arc<dyn PointsSinkPort>>,
     pub query_port: Option<Arc<dyn QueryPort>>,
+    /// Every request to a peer (replication, Raft, forwarding, probes,
+    /// sync, shard moves) goes through this instead of `reqwest`: it is
+    /// handed to [`ClusterAuth`], which every peer client comes from.
+    ///
+    /// [`ClusterAuth`]: crate::adapters::cluster::cluster_auth::ClusterAuth
+    pub http_client: Option<Arc<dyn crate::ports::http_client::HttpClientPort>>,
 }
 
 impl AdapterOverrides {
@@ -86,8 +92,9 @@ pub async fn build_services_with(
     let replaces_chdb = overrides.replaces_chdb();
     config.validate().map_err(anyhow::Error::msg)?;
     // Every peer client sends it and every internal route checks it.
-    let cluster_auth = crate::adapters::cluster::cluster_auth::ClusterAuth::new(
+    let cluster_auth = crate::adapters::cluster::cluster_auth::ClusterAuth::new_with(
         config.auth.cluster_token.as_deref(),
+        overrides.http_client.clone(),
     )?;
     if config.auth.enabled && config.cluster.enabled && config.auth.cluster_token.is_none() {
         tracing::warn!(

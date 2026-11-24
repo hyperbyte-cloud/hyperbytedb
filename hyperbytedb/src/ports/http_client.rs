@@ -65,13 +65,13 @@ pub enum HttpClientError {
 }
 
 impl HttpClientError {
-    /// The request's timeout expired (`reqwest::Error::is_timeout`).
+    /// The request's timeout expired (reqwest's `Error::is_timeout`).
     #[must_use]
     pub fn is_timeout(&self) -> bool {
         matches!(self, Self::Timeout)
     }
 
-    /// No connection to the peer (`reqwest::Error::is_connect`).
+    /// No connection to the peer (reqwest's `Error::is_connect`).
     #[must_use]
     pub fn is_connect(&self) -> bool {
         matches!(self, Self::Connect(_))
@@ -239,7 +239,7 @@ impl PeerHttpClient {
     }
 }
 
-/// One request being built, as with `reqwest::RequestBuilder`: an invalid
+/// One request being built, as with reqwest's `RequestBuilder`: an invalid
 /// header or a body that does not serialize fails at [`Self::send`].
 #[must_use]
 pub struct PeerRequestBuilder {
@@ -268,7 +268,7 @@ impl PeerRequestBuilder {
     }
 
     /// Each name in `headers` replaces that name's values so far, as
-    /// `reqwest::RequestBuilder::headers` does.
+    /// reqwest's `RequestBuilder::headers` does.
     pub fn headers(mut self, headers: HeaderMap) -> Self {
         if let Ok(req) = &mut self.request {
             let mut prev: Option<HeaderName> = None;

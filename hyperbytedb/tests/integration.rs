@@ -1551,6 +1551,7 @@ async fn build_services_with_overrides_never_opens_chdb() {
         AdapterOverrides {
             points_sink: Some(sink.clone()),
             query_port: Some(query.clone()),
+            http_client: None,
         },
     )
     .await
@@ -1577,6 +1578,67 @@ async fn build_services_with_overrides_never_opens_chdb() {
     assert!(
         !chdb_dir.exists(),
         "chdb.session_data_path was created: a chDB session was opened"
+    );
+}
+
+/// With `AdapterOverrides.http_client`, the peer clients every component
+/// takes from `ClusterAuth` send through it, with the cluster credential.
+#[tokio::test]
+async fn an_http_client_override_carries_peer_requests() {
+    use hyperbytedb::bootstrap::{AdapterOverrides, build_services_with};
+    use hyperbytedb::ports::http_client::{
+        HttpClientError, HttpClientPort, PeerRequest, PeerResponse,
+    };
+    use hyperbytedb::ports::peer_http::{PeerClientOptions, PeerHttp};
+
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<PeerRequest>>);
+    #[async_trait::async_trait]
+    impl HttpClientPort for Recorder {
+        async fn send(&self, req: PeerRequest) -> Result<PeerResponse, HttpClientError> {
+            self.0.lock().unwrap().push(req);
+            Ok(axum::http::Response::new(bytes::Bytes::new()).into())
+        }
+    }
+
+    let _ = test_prometheus_handle();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut config = hyperbytedb::config::HyperbytedbConfig::load(None).unwrap();
+    config.storage.wal_dir = root.join("wal").to_string_lossy().into_owned();
+    config.storage.meta_dir = root.join("meta").to_string_lossy().into_owned();
+    config.chdb.session_data_path = root.join("chdb").to_string_lossy().into_owned();
+    config.cluster.enabled = false;
+    config.auth.enabled = false;
+    config.auth.cluster_token = Some("tok".into());
+
+    let (sink, query) = common::recording_ports::recording_ports();
+    let port = Arc::new(Recorder::default());
+    let boot = build_services_with(
+        &config,
+        AdapterOverrides {
+            points_sink: Some(sink),
+            query_port: Some(query),
+            http_client: Some(port.clone()),
+        },
+    )
+    .await
+    .unwrap();
+    let resp = boot
+        .app_state
+        .cluster_auth
+        .client(PeerClientOptions::default())
+        .get("http://10.0.0.2:8086/health")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let sent = port.0.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].url, "http://10.0.0.2:8086/health");
+    assert_eq!(
+        sent[0].headers[hyperbytedb::adapters::cluster::cluster_auth::HEADER],
+        "tok"
     );
 }
 
@@ -1638,6 +1700,7 @@ async fn run_node_serves_through_the_transport_until_shutdown() {
         AdapterOverrides {
             points_sink: Some(sink),
             query_port: Some(query),
+            http_client: None,
         },
         transport.clone(),
         shutdown_rx,
