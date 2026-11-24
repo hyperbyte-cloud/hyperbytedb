@@ -99,6 +99,21 @@ fn classify(e: reqwest::Error) -> HttpClientError {
     }
 }
 
+/// Peer names go through the shared [`CachingResolver`].
+impl reqwest::dns::Resolve for CachingResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let this = Self::shared();
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addrs = this
+                .resolve_with(&host, crate::adapters::cluster::dns_cache::system_lookup)
+                .await?;
+            let addrs: reqwest::dns::Addrs = Box::new(addrs.into_iter());
+            Ok(addrs)
+        })
+    }
+}
+
 /// `e` and its causes, joined: reqwest's own message ("error sending request
 /// for url ...") hides whether the peer refused, reset or timed out.
 fn error_chain(e: &dyn std::error::Error) -> String {

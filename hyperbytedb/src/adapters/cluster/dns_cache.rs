@@ -13,8 +13,6 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use reqwest::dns::{Addrs, Name, Resolve, Resolving};
-
 /// How long a successful lookup is reused before it is refreshed.
 const TTL: Duration = Duration::from_secs(30);
 
@@ -46,7 +44,7 @@ impl CachingResolver {
     ///
     /// Fresh entry: returned without a lookup. Stale or missing: looked up;
     /// on failure a stale entry is served rather than the error.
-    async fn resolve_with<F, Fut>(
+    pub(crate) async fn resolve_with<F, Fut>(
         &self,
         host: &str,
         lookup: F,
@@ -74,21 +72,10 @@ impl CachingResolver {
     }
 }
 
-async fn system_lookup(host: String) -> std::io::Result<Vec<SocketAddr>> {
-    // Port 0: reqwest substitutes the URL's port.
+/// The system resolver, as the HTTP client's own would ask it.
+pub(crate) async fn system_lookup(host: String) -> std::io::Result<Vec<SocketAddr>> {
+    // Port 0: the HTTP client substitutes the URL's port.
     Ok(tokio::net::lookup_host((host.as_str(), 0)).await?.collect())
-}
-
-impl Resolve for CachingResolver {
-    fn resolve(&self, name: Name) -> Resolving {
-        let this = Self::shared();
-        let host = name.as_str().to_string();
-        Box::pin(async move {
-            let addrs = this.resolve_with(&host, system_lookup).await?;
-            let addrs: Addrs = Box::new(addrs.into_iter());
-            Ok(addrs)
-        })
-    }
 }
 
 #[cfg(test)]

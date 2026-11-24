@@ -1,7 +1,18 @@
+use crate::ports::http_client::{HttpClientError, PeerHttpClient};
+
 /// Builds HTTP clients for requests to this cluster's own nodes, carrying
 /// the cluster's credential. Only peers get these clients: the credential
 /// must never reach another host.
 pub trait PeerHttp: Send + Sync {
+    /// A client set up as `options` says, whose requests carry the cluster
+    /// credential. Fails only when the HTTP stack itself cannot start (TLS
+    /// backend, proxy settings), which startup checks.
+    fn try_client(&self, options: PeerClientOptions) -> Result<PeerHttpClient, HttpClientError>;
+
+    /// [`Self::try_client`]; a later failure is logged and gets a client
+    /// with only the credential.
+    fn client(&self, options: PeerClientOptions) -> PeerHttpClient;
+
     /// A builder whose requests carry the cluster credential.
     fn client_builder(&self) -> reqwest::ClientBuilder;
 
