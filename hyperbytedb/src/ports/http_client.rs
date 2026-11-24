@@ -267,6 +267,28 @@ impl PeerRequestBuilder {
         self
     }
 
+    /// Each name in `headers` replaces that name's values so far, as
+    /// `reqwest::RequestBuilder::headers` does.
+    pub fn headers(mut self, headers: HeaderMap) -> Self {
+        if let Ok(req) = &mut self.request {
+            let mut prev: Option<HeaderName> = None;
+            for (name, value) in headers {
+                match name {
+                    Some(name) => {
+                        req.headers.insert(name.clone(), value);
+                        prev = Some(name);
+                    }
+                    None => {
+                        if let Some(name) = &prev {
+                            req.headers.append(name.clone(), value);
+                        }
+                    }
+                }
+            }
+        }
+        self
+    }
+
     pub fn body(mut self, body: impl Into<Bytes>) -> Self {
         if let Ok(req) = &mut self.request {
             req.body = body.into();

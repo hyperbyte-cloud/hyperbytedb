@@ -671,12 +671,14 @@ pub async fn push_region_transfer(
 /// in a header. A node without the raw route (an older build) answers 404,
 /// and gets the JSON push instead.
 async fn send_transfer_push(
-    client: &reqwest::Client,
+    client: &crate::ports::http_client::PeerHttpClient,
     addr: &str,
     mut payload: ShardTransferPayload,
-) -> Result<reqwest::Response, HyperbytedbError> {
+) -> Result<crate::ports::http_client::PeerResponse, HyperbytedbError> {
     use base64::Engine as _;
-    let unreachable = |e: reqwest::Error| HyperbytedbError::PeerUnreachable(e.to_string());
+    let unreachable = |e: crate::ports::http_client::HttpClientError| {
+        HyperbytedbError::PeerUnreachable(e.to_string())
+    };
     let timeout = Duration::from_secs(TRANSFER_PUSH_TIMEOUT_SECS);
     // Bytes: the fallback below resends it without a copy.
     let body = bytes::Bytes::from(payload.body.take().unwrap_or_default());
@@ -689,13 +691,16 @@ async fn send_transfer_push(
             crate::domain::sharding::transfer::TRANSFER_PAYLOAD_HEADER,
             header,
         )
-        .header(reqwest::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )
         .body(body.clone())
         .timeout(timeout)
         .send()
         .await
         .map_err(unreachable)?;
-    if resp.status() != reqwest::StatusCode::NOT_FOUND {
+    if resp.status() != axum::http::StatusCode::NOT_FOUND {
         return Ok(resp);
     }
     // An older node, or a region the receiver does not know: the JSON route
@@ -1072,7 +1077,7 @@ pub async fn stage_region_transfer_data(
 /// and every caller threw it away at the one place anyone would look. That is
 /// why a cluster could report 49 staging rejections across 27 regions without
 /// a single line saying what was actually wrong.
-pub(crate) async fn rejection_reason(resp: reqwest::Response) -> Box<str> {
+pub(crate) async fn rejection_reason(resp: crate::ports::http_client::PeerResponse) -> Box<str> {
     let body = resp.text().await.unwrap_or_default();
     let mut reason = serde_json::from_str::<serde_json::Value>(&body)
         .ok()
@@ -1197,7 +1202,8 @@ mod tests {
             .status(500)
             .body(r#"{"error":"region range not found"}"#)
             .unwrap();
-        let got = super::rejection_reason(reqwest::Response::from(resp)).await;
+        let got =
+            super::rejection_reason(crate::ports::http_client::PeerResponse::from(resp)).await;
         assert_eq!(&*got, "region range not found");
     }
 
@@ -1207,7 +1213,8 @@ mod tests {
             .status(502)
             .body("upstream exploded")
             .unwrap();
-        let got = super::rejection_reason(reqwest::Response::from(resp)).await;
+        let got =
+            super::rejection_reason(crate::ports::http_client::PeerResponse::from(resp)).await;
         assert_eq!(&*got, "upstream exploded");
     }
 
@@ -1219,7 +1226,8 @@ mod tests {
             .status(500)
             .body("")
             .unwrap();
-        let got = super::rejection_reason(reqwest::Response::from(resp)).await;
+        let got =
+            super::rejection_reason(crate::ports::http_client::PeerResponse::from(resp)).await;
         assert_eq!(&*got, "no body");
     }
 
@@ -1232,7 +1240,8 @@ mod tests {
             .status(500)
             .body(body)
             .unwrap();
-        let got = super::rejection_reason(reqwest::Response::from(resp)).await;
+        let got =
+            super::rejection_reason(crate::ports::http_client::PeerResponse::from(resp)).await;
         assert!(got.len() <= 300, "len {}", got.len());
         assert!(!got.is_empty());
     }

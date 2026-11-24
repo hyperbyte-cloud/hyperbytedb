@@ -19,7 +19,8 @@ use crate::domain::cluster::types::{
     MutationReplicateRequest, MutationReplicateResponse, MutationRequest,
 };
 use crate::error::HyperbytedbError;
-use crate::ports::peer_http::PeerHttp;
+use crate::ports::http_client::PeerHttpClient;
+use crate::ports::peer_http::{PeerClientOptions, PeerConnections, PeerHttp};
 use crate::ports::replication::{OutboundReplicationBatch, ReplicationPort};
 
 pub struct PeerClient {
@@ -28,7 +29,7 @@ pub struct PeerClient {
     hinted_handoff: Option<Arc<HintedHandoff>>,
     /// One client per HTTP/2 connection to keep to each peer: each has its
     /// own pool, so each holds its own connection.
-    clients: Vec<reqwest::Client>,
+    clients: Vec<PeerHttpClient>,
     /// What every client sends to peers; kept to build more of them.
     cluster_auth: ClusterAuth,
     next_client: std::sync::atomic::AtomicUsize,
@@ -96,26 +97,16 @@ impl Drop for InFlightGuard {
     }
 }
 
-/// The HTTP client for peer traffic.
-///
-/// connect_timeout bounds the worst-case tail for dead/unreachable peers
-/// (black-holed SYNs would otherwise hang until the full per-request
-/// timeout); keepalive keeps long-lived pool sockets from silently expiring
-/// behind NAT/firewalls. Operation timeouts remain the caller's
-/// responsibility via per-request `.timeout(...)`. `builder.build()` only
-/// fails on broken TLS init, and `Client::new()` would also be unusable then.
-fn peer_http_client(auth: &ClusterAuth) -> reqwest::Client {
-    auth.build(
-        auth.client_builder()
-            .timeout(Duration::from_secs(10))
-            .connect_timeout(Duration::from_secs(3))
-            .tcp_keepalive(Duration::from_secs(60))
-            .dns_resolver(crate::adapters::cluster::dns_cache::CachingResolver::shared())
-            .http2_prior_knowledge()
-            .http2_adaptive_window(true)
-            .http2_keep_alive_interval(Duration::from_secs(30))
-            .http2_keep_alive_while_idle(true),
-    )
+/// The HTTP client for peer traffic: long-lived HTTP/2 connections with a
+/// 3 s connect timeout (see [`PeerConnections::Http2`]) and a 10 s default
+/// request timeout. Operation timeouts remain the caller's responsibility
+/// via per-request `.timeout(...)`. Each call builds a client with its own
+/// connection pool (unless an `HttpClientPort` is injected).
+fn peer_http_client(auth: &ClusterAuth) -> PeerHttpClient {
+    auth.client(PeerClientOptions {
+        timeout: Some(Duration::from_secs(10)),
+        connections: PeerConnections::Http2,
+    })
 }
 
 impl PeerClient {
@@ -190,7 +181,7 @@ impl PeerClient {
     }
 
     /// The client for the next peer request (round-robin over connections).
-    pub fn http_client(&self) -> &reqwest::Client {
+    pub fn http_client(&self) -> &PeerHttpClient {
         let i = self
             .next_client
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -329,7 +320,10 @@ impl PeerClient {
             let result = self
                 .http_client()
                 .post(&url)
-                .header(reqwest::header::CONTENT_TYPE, REPLICATE_BATCH_MEDIA_TYPE_V1)
+                .header(
+                    axum::http::header::CONTENT_TYPE,
+                    REPLICATE_BATCH_MEDIA_TYPE_V1,
+                )
                 .header(HTTP_HEADER_REPLICATED, "true")
                 .header(HTTP_HEADER_ORIGIN_NODE, self.node_id.to_string())
                 .body(body)
@@ -340,8 +334,8 @@ impl PeerClient {
 
             match result {
                 Ok(resp)
-                    if resp.status() == reqwest::StatusCode::NOT_FOUND
-                        || resp.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED =>
+                    if resp.status() == axum::http::StatusCode::NOT_FOUND
+                        || resp.status() == axum::http::StatusCode::METHOD_NOT_ALLOWED =>
                 {
                     // A peer from before this endpoint: one request per part.
                     self.send_parts_one_by_one(peer_id, addr, parts).await;
@@ -1129,7 +1123,7 @@ fn coalesce_ok(
 /// and (b) what we do with the result after retries are exhausted.
 struct PeerReplicateCtx {
     url: String,
-    client: reqwest::Client,
+    client: PeerHttpClient,
     replication_log: Arc<ReplicationLog>,
     hinted_handoff: Option<Arc<HintedHandoff>>,
     origin_node: u64,

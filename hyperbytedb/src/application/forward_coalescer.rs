@@ -88,7 +88,7 @@ impl ForwardCoalescer {
     /// writes' parts for that node.
     pub async fn send(
         &self,
-        client: &reqwest::Client,
+        client: &crate::ports::http_client::PeerHttpClient,
         addr: &str,
         timeout: Duration,
         parts: Vec<ShardWriteRequest>,
@@ -113,7 +113,7 @@ impl ForwardCoalescer {
 
     fn lane(
         &self,
-        client: &reqwest::Client,
+        client: &crate::ports::http_client::PeerHttpClient,
         addr: &str,
         timeout: Duration,
     ) -> mpsc::UnboundedSender<Job> {
@@ -138,7 +138,7 @@ impl ForwardCoalescer {
 
 async fn lane_loop(
     mut rx: mpsc::UnboundedReceiver<Job>,
-    client: reqwest::Client,
+    client: crate::ports::http_client::PeerHttpClient,
     addr: String,
     timeout: Duration,
     limits: Limits,
@@ -185,7 +185,12 @@ async fn lane_loop(
     }
 }
 
-async fn send_jobs(client: &reqwest::Client, addr: &str, timeout: Duration, jobs: Vec<Job>) {
+async fn send_jobs(
+    client: &crate::ports::http_client::PeerHttpClient,
+    addr: &str,
+    timeout: Duration,
+    jobs: Vec<Job>,
+) {
     let counts: Vec<usize> = jobs.iter().map(|j| j.parts.len()).collect();
     let mut replies = Vec::with_capacity(jobs.len());
     let mut parts = Vec::with_capacity(counts.iter().sum());
@@ -225,7 +230,7 @@ async fn send_jobs(client: &reqwest::Client, addr: &str, timeout: Duration, jobs
 /// Send `parts` to the node at `addr` in a request of their own: the path
 /// when `sharding.forward_coalesce` is off.
 pub async fn send_direct(
-    client: &reqwest::Client,
+    client: &crate::ports::http_client::PeerHttpClient,
     addr: &str,
     timeout: Duration,
     parts: Vec<ShardWriteRequest>,
@@ -243,7 +248,7 @@ pub async fn send_direct(
 }
 
 async fn post_batch(
-    client: &reqwest::Client,
+    client: &crate::ports::http_client::PeerHttpClient,
     addr: &str,
     timeout: Duration,
     parts: Vec<ShardWriteRequest>,
@@ -266,12 +271,12 @@ async fn post_batch(
         Err(e) => NodeSendOutcome::Failed(crate::application::shard_routing::error_chain(&e)),
         Ok(r) => {
             let status = r.status();
-            if status == reqwest::StatusCode::NOT_FOUND
-                || status == reqwest::StatusCode::METHOD_NOT_ALLOWED
+            if status == axum::http::StatusCode::NOT_FOUND
+                || status == axum::http::StatusCode::METHOD_NOT_ALLOWED
             {
                 NodeSendOutcome::Unsupported
-            } else if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-                || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            } else if status == axum::http::StatusCode::SERVICE_UNAVAILABLE
+                || status == axum::http::StatusCode::TOO_MANY_REQUESTS
             {
                 NodeSendOutcome::Capacity
             } else if status.is_success() {
@@ -356,7 +361,9 @@ mod tests {
     async fn concurrent_writes_share_requests_and_get_their_own_results() {
         let (addr, requests) = mock_node(Duration::from_millis(100), false).await;
         let coalescer = Arc::new(ForwardCoalescer::new(2, 512 * 1024, 256));
-        let client = reqwest::Client::new();
+        let client = crate::ports::http_client::PeerHttpClient::new(std::sync::Arc::new(
+            crate::adapters::cluster::reqwest_http_client::ReqwestHttpClient::default(),
+        ));
         let writes = (0..40u64).map(|w| {
             let coalescer = coalescer.clone();
             let client = client.clone();
@@ -392,7 +399,9 @@ mod tests {
     async fn a_refused_request_is_capacity_for_every_write_in_it() {
         let (addr, _) = mock_node(Duration::from_millis(50), true).await;
         let coalescer = Arc::new(ForwardCoalescer::new(1, 512 * 1024, 256));
-        let client = reqwest::Client::new();
+        let client = crate::ports::http_client::PeerHttpClient::new(std::sync::Arc::new(
+            crate::adapters::cluster::reqwest_http_client::ReqwestHttpClient::default(),
+        ));
         let writes = (0..8u64).map(|w| {
             let coalescer = coalescer.clone();
             let client = client.clone();

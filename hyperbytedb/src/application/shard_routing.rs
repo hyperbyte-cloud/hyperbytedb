@@ -916,15 +916,15 @@ async fn try_forward_shard_write_to_region(
                     .await
                     .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
 
-                if resp.status() == reqwest::StatusCode::CONFLICT {
+                if resp.status() == axum::http::StatusCode::CONFLICT {
                     ctx.location_cache
                         .invalidate_measurement(&MeasurementKey::new(&db, &rp, &meas));
                     return Err(HyperbytedbError::StaleShardEpoch { region_id });
                 }
                 // The primary is shedding load: say so, as a retryable 503,
                 // rather than a 502 the client counts as a hard failure.
-                if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE
-                    || resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+                if resp.status() == axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    || resp.status() == axum::http::StatusCode::TOO_MANY_REQUESTS
                 {
                     return Err(HyperbytedbError::ClusterUnavailable(format!(
                         "region {region_id} primary {peer_id} is at write capacity"
@@ -958,7 +958,7 @@ pub async fn region_replication_targets(
 /// Propose `op` to the Raft leader at `leader_addr`, over this node's pooled
 /// peer `client` (it carries the cluster credential).
 pub async fn propose_shard_map_op_via_raft(
-    client: &reqwest::Client,
+    client: &crate::ports::http_client::PeerHttpClient,
     leader_addr: &str,
     op: ShardMapOp,
 ) -> Result<ClusterResponse, HyperbytedbError> {
@@ -1075,7 +1075,7 @@ pub async fn scatter_delete_to_regions(
             .send()
             .await;
         match resp {
-            Ok(r) if r.status() == reqwest::StatusCode::CONFLICT => {
+            Ok(r) if r.status() == axum::http::StatusCode::CONFLICT => {
                 refresh_location_cache(ctx).await?;
                 outcome.failed += 1;
                 counter!("hyperbytedb_shard_delete_failures_total", "reason" => "stale_epoch")

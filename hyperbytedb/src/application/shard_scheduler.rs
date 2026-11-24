@@ -2153,7 +2153,7 @@ impl ShardScheduler {
                     tracing::info!(node_id, to = %to, "view rollups handed off");
                 }
                 // A node too old to hand off: it leaves as before.
-                Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
+                Ok(resp) if resp.status() == axum::http::StatusCode::NOT_FOUND => {
                     state.done = true;
                     tracing::warn!(
                         node_id,
@@ -2698,7 +2698,7 @@ const REHOME_MAX_SECS: u64 = 6 * 3600;
 /// on total time: a large region under write load took longer than any fixed
 /// total, and each timeout threw the copy away to start again from nothing.
 async fn post_rehome(
-    http: &reqwest::Client,
+    http: &crate::ports::http_client::PeerHttpClient,
     url: &str,
     req: &ShardRehomeRequest,
     idle: Duration,
@@ -6494,7 +6494,9 @@ mod tests {
     /// remote copy of a scale-up ran past it and was restarted from nothing.
     #[tokio::test]
     async fn a_rehome_times_out_on_silence_not_on_total_time() {
-        let http = reqwest::Client::new();
+        let http = crate::ports::http_client::PeerHttpClient::new(std::sync::Arc::new(
+            crate::adapters::cluster::reqwest_http_client::ReqwestHttpClient::default(),
+        ));
         let idle = Duration::from_millis(300);
         let req = sample_rehome_request();
 
@@ -6522,7 +6524,9 @@ mod tests {
         )
         .await;
         let err = post_rehome(
-            &reqwest::Client::new(),
+            &crate::ports::http_client::PeerHttpClient::new(std::sync::Arc::new(
+                crate::adapters::cluster::reqwest_http_client::ReqwestHttpClient::default(),
+            )),
             &url,
             &sample_rehome_request(),
             Duration::from_secs(5),

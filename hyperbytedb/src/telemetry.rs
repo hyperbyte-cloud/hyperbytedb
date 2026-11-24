@@ -15,7 +15,9 @@
 pub const TARGET: &str = "hb_trace";
 
 /// Add the current span's trace context to an outgoing peer request.
-pub fn inject(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+pub fn inject(
+    req: crate::ports::http_client::PeerRequestBuilder,
+) -> crate::ports::http_client::PeerRequestBuilder {
     #[cfg(feature = "otel")]
     {
         otel::inject(req)
@@ -210,13 +212,13 @@ mod otel {
         })
     }
 
-    struct HeaderInjector<'a>(&'a mut reqwest::header::HeaderMap);
+    struct HeaderInjector<'a>(&'a mut axum::http::HeaderMap);
 
     impl Injector for HeaderInjector<'_> {
         fn set(&mut self, key: &str, value: String) {
             if let (Ok(k), Ok(v)) = (
-                reqwest::header::HeaderName::from_bytes(key.as_bytes()),
-                reqwest::header::HeaderValue::from_str(&value),
+                axum::http::HeaderName::from_bytes(key.as_bytes()),
+                axum::http::HeaderValue::from_str(&value),
             ) {
                 self.0.insert(k, v);
             }
@@ -235,9 +237,11 @@ mod otel {
         }
     }
 
-    pub(super) fn inject(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    pub(super) fn inject(
+        req: crate::ports::http_client::PeerRequestBuilder,
+    ) -> crate::ports::http_client::PeerRequestBuilder {
         let cx = tracing::Span::current().context();
-        let mut headers = reqwest::header::HeaderMap::new();
+        let mut headers = axum::http::HeaderMap::new();
         TraceContextPropagator::new().inject_context(&cx, &mut HeaderInjector(&mut headers));
         req.headers(headers)
     }

@@ -323,7 +323,7 @@ fn cell(col: &ArrayRef, row: usize, is_time: bool, epoch: Option<&str>) -> Value
 /// Decode a peer's `/internal/shard/query` response, an Arrow IPC stream,
 /// into series as its chunks arrive. An empty body is an empty result.
 pub async fn series_from_ipc_response(
-    mut resp: reqwest::Response,
+    mut resp: crate::ports::http_client::PeerResponse,
     measurement: &str,
     epoch: Option<&str>,
     group_by_tags: &[String],

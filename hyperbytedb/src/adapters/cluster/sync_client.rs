@@ -1,5 +1,6 @@
 use crate::adapters::cluster::cluster_auth::ClusterAuth;
-use crate::ports::peer_http::PeerHttp;
+use crate::ports::http_client::PeerHttpClient;
+use crate::ports::peer_http::{PeerClientOptions, PeerHttp};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,7 +25,7 @@ pub struct SyncClient {
     wal: Arc<dyn WalPort>,
     points_sink: Option<Arc<dyn PointsSinkPort>>,
     max_points_per_request: usize,
-    client: reqwest::Client,
+    client: PeerHttpClient,
     /// Static peer addresses from config, used as fallback when the
     /// membership has no active peers yet (Raft hasn't formed).
     fallback_peer_addrs: Vec<String>,
@@ -67,11 +68,7 @@ impl SyncClient {
         fallback_peer_addrs: Vec<String>,
         cluster_auth: &ClusterAuth,
     ) -> Self {
-        let client = cluster_auth.build(
-            cluster_auth
-                .client_builder()
-                .timeout(Duration::from_secs(300)),
-        );
+        let client = cluster_auth.client(PeerClientOptions::with_timeout(Duration::from_secs(300)));
 
         Self {
             node_id,
@@ -580,7 +577,7 @@ pub fn remote_map_is_newer(remote_version: u64, local_version: u64) -> bool {
 }
 
 pub async fn fetch_shard_map(
-    client: reqwest::Client,
+    client: PeerHttpClient,
     peer_addr: &str,
 ) -> Result<ShardMap, HyperbytedbError> {
     let url = format!("http://{peer_addr}/internal/shard/map");
