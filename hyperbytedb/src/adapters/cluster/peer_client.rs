@@ -478,7 +478,16 @@ impl PeerClient {
             if pending == 0 {
                 return 0;
             }
-            if tokio::time::timeout_at(deadline, idle).await.is_err() {
+            #[cfg(not(madsim))]
+            let waited = tokio::time::timeout_at(deadline, idle).await;
+            // madsim-tokio has no `timeout_at`.
+            #[cfg(madsim)]
+            let waited = tokio::time::timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+                idle,
+            )
+            .await;
+            if waited.is_err() {
                 return self.inflight.count.load(Ordering::SeqCst);
             }
         }

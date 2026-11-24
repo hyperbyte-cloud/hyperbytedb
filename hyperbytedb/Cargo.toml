@@ -11,8 +11,11 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors", "set-header", "timeout", "compression-gzip"] }
 
-# Async runtime (`full` pulls in unused extras like `process` and `io-std`)
-tokio = { version = "1", features = [
+# Async runtime (`full` pulls in unused extras like `process` and `io-std`).
+# madsim-tokio re-exports real tokio unless built with `--cfg madsim`, where
+# it swaps in madsim's deterministic runtime for the simulation rig
+# (hyperbytedb-sim). Production builds are unchanged.
+tokio = { package = "madsim-tokio", version = "0.2", features = [
     "macros",
     "rt",
     "rt-multi-thread",
@@ -43,13 +46,6 @@ rocksdb = { version = "0.24", features = ["multi-threaded-cf"] }
 bincode = "1"
 pprof = { version = "0.14", optional = true, default-features = false }
 libc = "0.2"
-
-# Global allocator. The default glibc malloc holds freed heap in its arenas
-# and almost never returns it to the OS, so the large *transient* startup
-# allocations (warming the series dedup caches and replaying the WAL into
-# chDB at high cardinality) pin RSS at the startup peak for the life of the
-# process. jemalloc, with background purging, returns that memory to the OS.
-tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
 
 # Faster, non-poisoning RwLock/Mutex for the hot ingest caches. The std
 # locks bottleneck under concurrent reader load (every acquire/release is
@@ -113,6 +109,16 @@ opentelemetry_sdk = { version = "0.33.0", optional = true }
 tracing-opentelemetry = { version = "0.34.0", optional = true }
 opentelemetry-otlp = { version = "0.33.0", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace"], optional = true }
 
+# Global allocator. The default glibc malloc holds freed heap in its arenas
+# and almost never returns it to the OS, so the large *transient* startup
+# allocations (warming the series dedup caches and replaying the WAL into
+# chDB at high cardinality) pin RSS at the startup peak for the life of the
+# process. jemalloc, with background purging, returns that memory to the OS.
+# Not used under `--cfg madsim` (simulation rig): its background purge
+# threads are a nondeterminism source, so the sim uses the system allocator.
+[target.'cfg(not(madsim))'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
+
 [features]
 default = ["columnar-ingest"]
 columnar-ingest = []
@@ -154,3 +160,8 @@ harness = false
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 serial_test = "3"
+
+[lints.rust]
+# `cfg(madsim)` is set by the simulation rig (hyperbytedb-sim) through
+# RUSTFLAGS="--cfg madsim"; see docs/developer-guide/dst-seams.md.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(madsim)"] }

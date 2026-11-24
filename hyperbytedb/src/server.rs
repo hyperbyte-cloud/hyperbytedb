@@ -5,7 +5,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::adapters::http::router::{build_control_router, build_router};
+#[cfg(not(madsim))]
+use crate::adapters::http::router::build_control_router;
+use crate::adapters::http::router::build_router;
 use crate::application::cluster::heartbeat;
 use crate::application::cluster::hinted_handoff;
 use crate::application::cluster::leader_monitor;
@@ -409,6 +411,8 @@ async fn serve_inner(
 
     // Control listener on the control runtime, next to the Raft core: probes
     // and Raft RPCs are answered even while the write path is saturated.
+    // Not bound under `cfg(madsim)`: the simulation has no TCP listeners.
+    #[cfg(not(madsim))]
     if config.cluster.enabled && config.cluster.control_port > 0 {
         let control_app = build_control_router(app_state.clone());
         let control_addr = format!(
@@ -473,6 +477,7 @@ async fn serve_inner(
     // ── Phase 1: Start HTTP server ──────────────────────────────────────
     // The server will accept requests until the shutdown signal fires.
     let addr = format!("{}:{}", config.server.bind_address, config.server.port);
+    #[cfg(not(madsim))]
     if config.server.tls_enabled {
         use axum_server::tls_rustls::RustlsConfig;
 
@@ -540,6 +545,16 @@ async fn serve_inner(
                 drop(api_rx);
             })
             .await?;
+    }
+    // Simulation (`cfg(madsim)`): no TCP listener is bound. The API phase
+    // lasts until the simulated node gets ctrl-c, then shuts down as above.
+    #[cfg(madsim)]
+    {
+        let _ = (app, _api_shutdown_rx);
+        tracing::info!(addr = %addr, "simulation: API listener not bound");
+        tokio::signal::ctrl_c().await.ok();
+        tracing::info!("shutdown signal received, stopping API server");
+        let _ = api_shutdown_tx.send(true);
     }
 
     // ── Phase 2: API is down — stop background flush before drain ───────
@@ -624,6 +639,7 @@ async fn serve_inner(
 /// several small writes; with Nagle each one after the first waited for the
 /// peer's delayed ACK, up to 40 ms on Linux. Every query that touched a
 /// remote region on the UAT cluster took ~55 ms or ~20 ms at random.
+#[cfg(not(madsim))]
 fn nodelay(
     listener: tokio::net::TcpListener,
 ) -> impl axum::serve::Listener<Io = tokio::net::TcpStream, Addr = std::net::SocketAddr> {

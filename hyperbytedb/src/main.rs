@@ -5,7 +5,9 @@
 // startup series-cache warm and cold WAL→chDB replay allocate (and free) a
 // large transient working set at high cardinality; under glibc that peak
 // stayed resident for the life of the pod. See `bootstrap::build_services`.
-#[cfg(not(target_env = "msvc"))]
+// Not under `cfg(madsim)` (simulation rig): its background threads are a
+// nondeterminism source, so the sim keeps the system allocator.
+#[cfg(all(not(target_env = "msvc"), not(madsim)))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 

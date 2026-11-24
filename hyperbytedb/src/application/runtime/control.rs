@@ -13,17 +13,34 @@
 //! the process ("pthread lock: Invalid argument").
 
 use std::future::Future;
-use std::sync::{Mutex, OnceLock};
+#[cfg(not(madsim))]
+use std::sync::Mutex;
+use std::sync::OnceLock;
 
-use tokio::runtime::{Handle, Runtime};
+use tokio::runtime::Handle;
+#[cfg(not(madsim))]
+use tokio::runtime::Runtime;
 
 /// Worker threads for the control runtime. Its work is small and bursty.
+#[cfg(not(madsim))]
 const CONTROL_WORKERS: usize = 2;
 
+#[cfg(not(madsim))]
 static RUNTIME: Mutex<Option<Runtime>> = Mutex::new(None);
 static HANDLE: OnceLock<Handle> = OnceLock::new();
 
 /// Create the control runtime. Idempotent; call once at server start.
+///
+/// Under `cfg(madsim)` (simulation rig) this is a no-op: a second runtime
+/// can't exist inside the simulation, so control work runs on the caller's
+/// (simulated) runtime, as it does when nothing installs the runtime.
+#[cfg(madsim)]
+pub fn install() -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Create the control runtime. Idempotent; call once at server start.
+#[cfg(not(madsim))]
 pub fn install() -> std::io::Result<()> {
     let mut slot = RUNTIME.lock().unwrap_or_else(|e| e.into_inner());
     if slot.is_some() || HANDLE.get().is_some() {
@@ -41,12 +58,17 @@ pub fn install() -> std::io::Result<()> {
 
 /// Stop the control runtime without waiting on its tasks. Call at the end
 /// of the server's run, before the process exits.
+#[cfg(not(madsim))]
 pub fn shutdown() {
     let rt = RUNTIME.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(rt) = rt {
         rt.shutdown_background();
     }
 }
+
+/// Nothing to stop under `cfg(madsim)`: `install` created no runtime.
+#[cfg(madsim)]
+pub fn shutdown() {}
 
 /// The control runtime, if installed.
 pub fn handle() -> Option<&'static Handle> {
@@ -64,7 +86,11 @@ where
 {
     match handle.spawn(fut).await {
         Ok(v) => v,
+        #[cfg(not(madsim))]
         Err(e) => std::panic::resume_unwind(e.into_panic()),
+        // madsim's `JoinError` has no `into_panic`.
+        #[cfg(madsim)]
+        Err(e) => panic!("control task failed: {e}"),
     }
 }
 
