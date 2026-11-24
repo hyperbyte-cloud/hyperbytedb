@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::adapters::http::router::AppState;
 use crate::domain::cluster::membership::{NodeInfo, NodeState};
-use crate::ports::peer_http::PeerHttp;
+use crate::ports::peer_http::{PeerClientOptions, PeerHttp};
 use openraft::BasicNode;
 use openraft::RaftMetrics;
 
@@ -99,7 +99,7 @@ pub async fn run_raft_cluster_formation(
     };
 
     let auth: &dyn PeerHttp = &state.cluster_auth;
-    let client = auth.build(auth.client_builder().timeout(Duration::from_secs(5)));
+    let client = auth.client(PeerClientOptions::with_timeout(Duration::from_secs(5)));
 
     // Give the local HTTP server a moment to start
     tokio::time::sleep(Duration::from_secs(1)).await;
