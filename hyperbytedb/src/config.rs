@@ -1021,7 +1021,7 @@ impl RetentionConfig {
 
 impl HyperbytedbConfig {
     pub fn load(config_path: Option<&str>) -> anyhow::Result<Self> {
-        let mut figment = Figment::new().merge(Serialized::defaults(Self::defaults()));
+        let mut figment = Self::defaults_figment();
 
         if let Some(path) = config_path
             && std::path::Path::new(path).exists()
@@ -1031,6 +1031,21 @@ impl HyperbytedbConfig {
 
         figment = figment.merge(Env::prefixed("HYPERBYTEDB__").split("__"));
         Ok(figment.extract()?)
+    }
+
+    /// The built-in defaults alone: what [`Self::load`] returns with no
+    /// config file and no `HYPERBYTEDB__*` variables, through the same
+    /// Figment extraction, but without reading the environment at all.
+    ///
+    /// DST seam: the simulation rig builds every node's configuration from
+    /// this, so a host's `HYPERBYTEDB__*` variables cannot change a seeded
+    /// run. Production never calls it; `load` is unchanged.
+    pub fn load_defaults() -> anyhow::Result<Self> {
+        Ok(Self::defaults_figment().extract()?)
+    }
+
+    fn defaults_figment() -> Figment {
+        Figment::new().merge(Serialized::defaults(Self::defaults()))
     }
 
     fn defaults() -> Self {
