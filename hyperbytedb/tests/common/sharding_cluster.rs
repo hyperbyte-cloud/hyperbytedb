@@ -332,6 +332,7 @@ pub async fn start_sharded_node(
         shard_scheduler: scheduler.clone().map(|s| s as Arc<_>),
         ingest_cardinality: IngestCardinalityLimits::default(),
         ingest_schema_cache: Default::default(),
+        sync_trigger_in_progress: Default::default(),
         cluster_replication: opts.replication.clone(),
     });
 

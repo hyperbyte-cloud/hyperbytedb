@@ -193,6 +193,7 @@ async fn start_auth_cluster_node_with(
         shard_scheduler: None,
         ingest_cardinality: IngestCardinalityLimits::default(),
         ingest_schema_cache: Default::default(),
+        sync_trigger_in_progress: Default::default(),
         cluster_replication: ReplicationConfig::default(),
     });
 

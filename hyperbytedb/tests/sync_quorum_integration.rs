@@ -219,6 +219,7 @@ async fn start_node_on(
         shard_scheduler: None,
         ingest_cardinality: IngestCardinalityLimits::default(),
         ingest_schema_cache: Default::default(),
+        sync_trigger_in_progress: Default::default(),
         cluster_replication: ReplicationConfig::default(),
     });
 

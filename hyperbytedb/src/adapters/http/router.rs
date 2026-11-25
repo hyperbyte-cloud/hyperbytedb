@@ -133,6 +133,11 @@ pub struct AppState {
     /// and forwarded shard writes so steady-state batches skip metadata I/O.
     pub ingest_schema_cache: Arc<crate::application::ingest_metadata::IngestSchemaCache>,
     pub cluster_replication: ReplicationConfig,
+    /// Set while a `/internal/sync/trigger` re-sync runs on this node. One
+    /// per node: it used to be a process-wide `static`, which is the same
+    /// thing with one node per process, but the simulation rig runs many
+    /// nodes (and runs) in one process.
+    pub sync_trigger_in_progress: Arc<AtomicBool>,
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {

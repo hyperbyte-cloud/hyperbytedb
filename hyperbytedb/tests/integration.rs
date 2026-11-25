@@ -140,6 +140,7 @@ fn setup(dir: &tempfile::TempDir) -> (Arc<AppState>, Arc<FlushServiceImpl>) {
         shard_scheduler: None,
         ingest_cardinality: IngestCardinalityLimits::default(),
         ingest_schema_cache: Default::default(),
+        sync_trigger_in_progress: Default::default(),
         cluster_replication: ReplicationConfig::default(),
     });
 
@@ -238,6 +239,7 @@ async fn test_auth_blocks_unauthenticated() {
         shard_scheduler: None,
         ingest_cardinality: IngestCardinalityLimits::default(),
         ingest_schema_cache: Default::default(),
+        sync_trigger_in_progress: Default::default(),
         cluster_replication: ReplicationConfig::default(),
     });
 
@@ -365,6 +367,7 @@ async fn test_cardinality_limit() {
         shard_scheduler: None,
         ingest_cardinality: IngestCardinalityLimits::default(),
         ingest_schema_cache: Default::default(),
+        sync_trigger_in_progress: Default::default(),
         cluster_replication: ReplicationConfig::default(),
     });
 
@@ -527,6 +530,7 @@ async fn test_metrics_endpoint() {
         shard_scheduler: None,
         ingest_cardinality: IngestCardinalityLimits::default(),
         ingest_schema_cache: Default::default(),
+        sync_trigger_in_progress: Default::default(),
         cluster_replication: ReplicationConfig::default(),
     });
 
@@ -877,6 +881,7 @@ async fn admission_app(permits: usize) -> (tempfile::TempDir, Arc<AppState>) {
         shard_scheduler: None,
         ingest_cardinality: IngestCardinalityLimits::default(),
         ingest_schema_cache: Default::default(),
+        sync_trigger_in_progress: Default::default(),
         cluster_replication: ReplicationConfig::default(),
     });
 
@@ -1048,6 +1053,7 @@ async fn test_rate_limiter_refills_and_denies() {
         shard_scheduler: None,
         ingest_cardinality: IngestCardinalityLimits::default(),
         ingest_schema_cache: Default::default(),
+        sync_trigger_in_progress: Default::default(),
         cluster_replication: ReplicationConfig::default(),
     });
 
@@ -1218,6 +1224,7 @@ async fn test_cross_database_on_clause_requires_authorization() {
         shard_scheduler: None,
         ingest_cardinality: IngestCardinalityLimits::default(),
         ingest_schema_cache: Default::default(),
+        sync_trigger_in_progress: Default::default(),
         cluster_replication: ReplicationConfig::default(),
     });
 

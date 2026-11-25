@@ -651,6 +651,7 @@ pub async fn build_services_with(
         shard_scheduler: None,
         ingest_cardinality,
         ingest_schema_cache: Default::default(),
+        sync_trigger_in_progress: Default::default(),
         cluster_replication: config.cluster.replication.clone(),
     };
 

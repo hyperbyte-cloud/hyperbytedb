@@ -856,11 +856,10 @@ async fn build_metadata_snapshot(
 /// Triggers a background re-sync on this node. Idempotent: returns 200 if
 /// a sync is already running, 202 if a new sync was started.
 pub async fn handle_sync_trigger(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::Ordering;
 
-    static SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
-
-    if SYNC_IN_PROGRESS
+    let sync_in_progress = state.sync_trigger_in_progress.clone();
+    if sync_in_progress
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
@@ -876,7 +875,7 @@ pub async fn handle_sync_trigger(State(state): State<Arc<AppState>>) -> impl Int
     let membership = match &state.membership {
         Some(m) => m.clone(),
         None => {
-            SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
+            sync_in_progress.store(false, Ordering::SeqCst);
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
@@ -994,7 +993,7 @@ pub async fn handle_sync_trigger(State(state): State<Arc<AppState>>) -> impl Int
             m.set_needs_sync(node_id, sync_failed);
         }
         gauge!("hyperbytedb_cluster_node_state").set(1.0);
-        SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
+        sync_in_progress.store(false, Ordering::SeqCst);
     });
 
     (
