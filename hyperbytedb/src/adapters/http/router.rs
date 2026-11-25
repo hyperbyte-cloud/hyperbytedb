@@ -138,6 +138,10 @@ pub struct AppState {
     /// thing with one node per process, but the simulation rig runs many
     /// nodes (and runs) in one process.
     pub sync_trigger_in_progress: Arc<AtomicBool>,
+    /// When this node first found itself evacuated with view rollups still
+    /// here (see `ping::rollup_wait_expired`). One per node, like
+    /// [`Self::sync_trigger_in_progress`] (it was a process-wide `static`).
+    pub rollup_wait_since: Arc<std::sync::OnceLock<std::time::Instant>>,
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {

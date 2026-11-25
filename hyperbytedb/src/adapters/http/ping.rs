@@ -132,7 +132,7 @@ async fn maybe_self_retire_after_evacuation(state: &AppState) {
     .await
     {
         Ok(true) => {}
-        Ok(false) if !rollup_wait_expired() => {
+        Ok(false) if !rollup_wait_expired(state) => {
             tracing::info!(
                 node_id = state.node_id,
                 "evacuated but view rollups not handed off yet; not retiring yet"
@@ -179,9 +179,12 @@ const ROLLUP_HANDOFF_WAIT: std::time::Duration = std::time::Duration::from_secs(
 
 /// True once this node has waited [`ROLLUP_HANDOFF_WAIT`] since it first
 /// found itself evacuated with rollups still here.
-fn rollup_wait_expired() -> bool {
-    static SINCE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    SINCE.get_or_init(std::time::Instant::now).elapsed() >= ROLLUP_HANDOFF_WAIT
+fn rollup_wait_expired(state: &AppState) -> bool {
+    state
+        .rollup_wait_since
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        >= ROLLUP_HANDOFF_WAIT
 }
 
 /// GET /health - readiness check.

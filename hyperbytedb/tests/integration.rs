@@ -141,6 +141,7 @@ fn setup(dir: &tempfile::TempDir) -> (Arc<AppState>, Arc<FlushServiceImpl>) {
         ingest_cardinality: IngestCardinalityLimits::default(),
         ingest_schema_cache: Default::default(),
         sync_trigger_in_progress: Default::default(),
+        rollup_wait_since: Default::default(),
         cluster_replication: ReplicationConfig::default(),
     });
 
@@ -240,6 +241,7 @@ async fn test_auth_blocks_unauthenticated() {
         ingest_cardinality: IngestCardinalityLimits::default(),
         ingest_schema_cache: Default::default(),
         sync_trigger_in_progress: Default::default(),
+        rollup_wait_since: Default::default(),
         cluster_replication: ReplicationConfig::default(),
     });
 
@@ -368,6 +370,7 @@ async fn test_cardinality_limit() {
         ingest_cardinality: IngestCardinalityLimits::default(),
         ingest_schema_cache: Default::default(),
         sync_trigger_in_progress: Default::default(),
+        rollup_wait_since: Default::default(),
         cluster_replication: ReplicationConfig::default(),
     });
 
@@ -531,6 +534,7 @@ async fn test_metrics_endpoint() {
         ingest_cardinality: IngestCardinalityLimits::default(),
         ingest_schema_cache: Default::default(),
         sync_trigger_in_progress: Default::default(),
+        rollup_wait_since: Default::default(),
         cluster_replication: ReplicationConfig::default(),
     });
 
@@ -882,6 +886,7 @@ async fn admission_app(permits: usize) -> (tempfile::TempDir, Arc<AppState>) {
         ingest_cardinality: IngestCardinalityLimits::default(),
         ingest_schema_cache: Default::default(),
         sync_trigger_in_progress: Default::default(),
+        rollup_wait_since: Default::default(),
         cluster_replication: ReplicationConfig::default(),
     });
 
@@ -1054,6 +1059,7 @@ async fn test_rate_limiter_refills_and_denies() {
         ingest_cardinality: IngestCardinalityLimits::default(),
         ingest_schema_cache: Default::default(),
         sync_trigger_in_progress: Default::default(),
+        rollup_wait_since: Default::default(),
         cluster_replication: ReplicationConfig::default(),
     });
 
@@ -1225,6 +1231,7 @@ async fn test_cross_database_on_clause_requires_authorization() {
         ingest_cardinality: IngestCardinalityLimits::default(),
         ingest_schema_cache: Default::default(),
         sync_trigger_in_progress: Default::default(),
+        rollup_wait_since: Default::default(),
         cluster_replication: ReplicationConfig::default(),
     });
 

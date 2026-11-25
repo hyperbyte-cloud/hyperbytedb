@@ -154,6 +154,7 @@ impl HttpTestContext {
                 hyperbytedb::application::ingest_metadata::IngestCardinalityLimits::default(),
             ingest_schema_cache: Default::default(),
             sync_trigger_in_progress: Default::default(),
+            rollup_wait_since: Default::default(),
             cluster_replication: hyperbytedb::config::ReplicationConfig::default(),
         });
 

@@ -652,6 +652,7 @@ pub async fn build_services_with(
         ingest_cardinality,
         ingest_schema_cache: Default::default(),
         sync_trigger_in_progress: Default::default(),
+        rollup_wait_since: Default::default(),
         cluster_replication: config.cluster.replication.clone(),
     };
 

@@ -179,6 +179,7 @@ async fn start_cluster_node_with_listener(
         ingest_cardinality: IngestCardinalityLimits::default(),
         ingest_schema_cache: Default::default(),
         sync_trigger_in_progress: Default::default(),
+        rollup_wait_since: Default::default(),
         cluster_replication: ReplicationConfig::default(),
     });
 
@@ -395,6 +396,7 @@ async fn test_cluster_endpoints_without_peers() {
         ingest_cardinality: IngestCardinalityLimits::default(),
         ingest_schema_cache: Default::default(),
         sync_trigger_in_progress: Default::default(),
+        rollup_wait_since: Default::default(),
         cluster_replication: ReplicationConfig::default(),
     });
 
