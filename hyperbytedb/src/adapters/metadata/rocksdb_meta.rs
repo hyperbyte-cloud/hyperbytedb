@@ -280,6 +280,9 @@ pub struct RocksDbMetadata {
     /// (measurement create/delete, db create/drop). Used by
     /// `meas_list_cache` to detect a stale snapshot.
     generation: AtomicU64,
+    /// Bumped whenever measurements, series or whole databases / retention
+    /// policies are dropped; see [`MetadataPort::drop_generation`].
+    drop_generation: AtomicU64,
     db_cache: RwLock<HashMap<String, Database>>,
     meas_cache: RwLock<HashMap<String, MeasurementMeta>>,
     /// Storage keys of tag values already persisted. Warmed with the counts
@@ -383,6 +386,7 @@ impl RocksDbMetadata {
         Ok(Self {
             db,
             generation: AtomicU64::new(0),
+            drop_generation: AtomicU64::new(0),
             db_cache: RwLock::new(HashMap::new()),
             meas_cache: RwLock::new(HashMap::new()),
             tag_known: Arc::new(RwLock::new(HashSet::new())),
@@ -573,6 +577,10 @@ where
 
 #[async_trait]
 impl MetadataPort for RocksDbMetadata {
+    fn drop_generation(&self) -> u64 {
+        self.drop_generation.load(Ordering::Acquire)
+    }
+
     async fn create_database(&self, name: &str) -> Result<(), HyperbytedbError> {
         let rdb = self.db.clone();
         let name_owned = name.to_string();
@@ -737,6 +745,7 @@ impl MetadataPort for RocksDbMetadata {
         measurement: Option<&str>,
         _predicate_sql: &str,
     ) -> Result<usize, HyperbytedbError> {
+        self.drop_generation.fetch_add(1, Ordering::AcqRel);
         let rdb = self.db.clone();
         let db_s = db.to_string();
         let rp_s = rp.to_string();
@@ -792,6 +801,8 @@ impl MetadataPort for RocksDbMetadata {
                 }
             });
         }
+        // Again once done: a cache refilled while the drop ran is stale.
+        self.drop_generation.fetch_add(1, Ordering::AcqRel);
         Ok(removed)
     }
 
@@ -872,6 +883,7 @@ impl MetadataPort for RocksDbMetadata {
     }
 
     async fn drop_database(&self, name: &str) -> Result<(), HyperbytedbError> {
+        self.drop_generation.fetch_add(1, Ordering::AcqRel);
         let rdb = self.db.clone();
         let name_owned = name.to_string();
         meta_blocking(move || {
@@ -928,6 +940,8 @@ impl MetadataPort for RocksDbMetadata {
         // Structural change — invalidate the `meas_list_cache`
         // snapshot for this database.
         self.generation.fetch_add(1, Ordering::Relaxed);
+        // Again once done: a cache refilled while the drop ran is stale.
+        self.drop_generation.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -1047,6 +1061,7 @@ impl MetadataPort for RocksDbMetadata {
     }
 
     async fn drop_retention_policy(&self, db: &str, name: &str) -> Result<(), HyperbytedbError> {
+        self.drop_generation.fetch_add(1, Ordering::AcqRel);
         let mut db_obj = self
             .get_database(db)
             .await?
@@ -1080,6 +1095,8 @@ impl MetadataPort for RocksDbMetadata {
         })
         .await?;
         self.db_cache.write().insert(db_name, db_obj);
+        // Again once done: a cache refilled while the drop ran is stale.
+        self.drop_generation.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -2081,10 +2098,15 @@ impl MetadataPort for RocksDbMetadata {
         rp: &str,
         name: &str,
     ) -> Result<(), HyperbytedbError> {
+        self.drop_generation.fetch_add(1, Ordering::AcqRel);
         let rdb = self.db.clone();
         let db_owned = db.to_string();
         let name_owned = name.to_string();
         let key = meas_key(db, rp, name);
+        // A dropped measurement's tombstones go with it: kept, they hid the
+        // points of a measurement later written under the same name, and one
+        // naming a column it lacked failed every query on it.
+        let tombstone_prefix = format!("tombstone:{db}:{rp}:{name}:");
         let series_to_delete = meta_blocking(move || {
             let cf = rdb.cf_handle(META_CF).ok_or_else(|| {
                 HyperbytedbError::Metadata("metadata column family not found".into())
@@ -2092,6 +2114,25 @@ impl MetadataPort for RocksDbMetadata {
             rdb.delete_cf(&cf, key).map_err(|e| {
                 HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
             })?;
+            let mut tombstones = Vec::new();
+            for item in rdb.iterator_cf_opt(
+                &cf,
+                rocksdb::ReadOptions::default(),
+                IteratorMode::From(tombstone_prefix.as_bytes(), rocksdb::Direction::Forward),
+            ) {
+                let (key, _) = item.map_err(|e| {
+                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                })?;
+                if !key.starts_with(tombstone_prefix.as_bytes()) {
+                    break;
+                }
+                tombstones.push(key);
+            }
+            for k in tombstones {
+                rdb.delete_cf(&cf, k).map_err(|e| {
+                    HyperbytedbError::Metadata(crate::error::ChainedError::from_error(e))
+                })?;
+            }
 
             // Sweep series rows for this measurement across all retention policies.
             // The series key is rp-scoped (`series:{db}:{rp}:{meas}:{id}`) so we
@@ -2128,6 +2169,7 @@ impl MetadataPort for RocksDbMetadata {
         .await?;
 
         let cache_key = format!("{}:{}:{}", db, rp, name);
+        self.tombstone_cache.write().remove(&cache_key);
         self.meas_cache.write().remove(&cache_key);
         self.meas_list_cache.write().remove(db);
         {
@@ -2147,6 +2189,8 @@ impl MetadataPort for RocksDbMetadata {
         // Bump the structural generation so the `meas_list_cache`
         // snapshot for this database invalidates on next read.
         self.generation.fetch_add(1, Ordering::Relaxed);
+        // Again once done: a cache refilled while the drop ran is stale.
+        self.drop_generation.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 

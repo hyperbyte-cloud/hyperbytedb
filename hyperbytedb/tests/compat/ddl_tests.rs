@@ -297,62 +297,215 @@ async fn drop_measurement_removes_associated_metadata() {
 // DELETE
 // ---------------------------------------------------------------------------
 
+/// The `value`s a query returns, in time order; empty for no series.
+async fn values(ctx: &TestContext, q: &str) -> Vec<f64> {
+    let resp = ctx.query("testdb", q).await.unwrap();
+    let stmt = &resp.results[0];
+    assert!(stmt.error.is_none(), "{q}: {:?}", stmt.error);
+    let Some(series) = stmt.series.as_ref() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for s in series {
+        let col = s.columns.iter().position(|c| c == "value").unwrap();
+        for row in &s.values {
+            out.push(row[col].as_f64().unwrap());
+        }
+    }
+    out
+}
+
+fn chdb_context() -> Option<TestContext> {
+    match TestContext::new() {
+        Ok(c) => Some(c),
+        Err(_) => {
+            eprintln!("skipping DELETE test: chDB not available");
+            None
+        }
+    }
+}
+
 #[tokio::test]
-async fn delete_from_measurement_where_time() {
-    let ctx = TestContext::new_no_chdb().unwrap();
+#[serial(chdb)]
+async fn delete_where_time_removes_only_older_points() {
+    let Some(ctx) = chdb_context() else { return };
     ctx.metadata.create_database("testdb").await.unwrap();
-    ctx.ingestion
-        .ingest(
-            "testdb",
-            None,
-            None,
-            b"cpu value=1.0 1000000000\ncpu value=2.0 2000000000",
-            WritePayloadFormat::LineProtocol,
-        )
-        .await
-        .unwrap();
+    ctx.write_and_flush(
+        "testdb",
+        "cpu value=1.0 1000000000\ncpu value=2.0 2000000000",
+    )
+    .await
+    .unwrap();
 
     let resp = ctx
         .query("testdb", "DELETE FROM cpu WHERE time < 1500000000")
         .await
         .unwrap();
-    assert!(resp.results[0].error.is_none());
-
-    let tombstones = ctx
-        .metadata
-        .list_tombstones("testdb", "autogen", "cpu")
-        .await
-        .unwrap();
-    assert!(!tombstones.is_empty(), "DELETE should create a tombstone");
+    assert!(
+        resp.results[0].error.is_none(),
+        "{:?}",
+        resp.results[0].error
+    );
+    assert_eq!(values(&ctx, "SELECT value FROM cpu").await, vec![2.0]);
+    assert!(
+        ctx.metadata
+            .list_tombstones("testdb", "autogen", "cpu")
+            .await
+            .unwrap()
+            .is_empty(),
+        "DELETE removes rows; it must not leave a tombstone for every later query"
+    );
 }
 
 #[tokio::test]
-async fn delete_from_measurement_where_tag() {
-    let ctx = TestContext::new_no_chdb().unwrap();
+#[serial(chdb)]
+async fn delete_where_tag_keeps_points_written_after_it() {
+    let Some(ctx) = chdb_context() else { return };
     ctx.metadata.create_database("testdb").await.unwrap();
-    ctx.ingestion
-        .ingest(
-            "testdb",
-            None,
-            None,
-            b"cpu,host=a value=1.0 1000000000\ncpu,host=b value=2.0 2000000000",
-            WritePayloadFormat::LineProtocol,
-        )
+    ctx.write_and_flush(
+        "testdb",
+        "cpu,host=a value=1.0 1000000000\ncpu,host=b value=2.0 2000000000",
+    )
+    .await
+    .unwrap();
+
+    let resp = ctx
+        .query("testdb", r#"DELETE FROM cpu WHERE "host" = 'a'"#)
         .await
         .unwrap();
+    assert!(
+        resp.results[0].error.is_none(),
+        "{:?}",
+        resp.results[0].error
+    );
+    assert_eq!(values(&ctx, "SELECT value FROM cpu").await, vec![2.0]);
+
+    // InfluxDB deletes what exists; a point written afterwards is kept.
+    ctx.write_and_flush("testdb", "cpu,host=a value=3.0 3000000000")
+        .await
+        .unwrap();
+    assert_eq!(values(&ctx, "SELECT value FROM cpu").await, vec![2.0, 3.0]);
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn delete_with_tag_and_time_or_regex() {
+    let Some(ctx) = chdb_context() else { return };
+    ctx.metadata.create_database("testdb").await.unwrap();
+    ctx.write_and_flush(
+        "testdb",
+        "cpu,host=a value=1.0 1000000000\n\
+         cpu,host=a value=2.0 2000000000\n\
+         cpu,host=b value=3.0 3000000000\n\
+         cpu,host=c value=4.0 4000000000",
+    )
+    .await
+    .unwrap();
 
     let resp = ctx
         .query(
             "testdb",
-            r#"DELETE FROM cpu WHERE "host" = 'a' AND time < 2000000000"#,
+            r#"DELETE FROM cpu WHERE ("host" = 'a' AND time < 1500000000) OR "host" !~ /[ab]/"#,
         )
         .await
-        .expect("DELETE with tag+time predicate should parse and execute");
+        .unwrap();
     assert!(
         resp.results[0].error.is_none(),
-        "DELETE should succeed: {:?}",
+        "{:?}",
         resp.results[0].error
     );
+    assert_eq!(values(&ctx, "SELECT value FROM cpu").await, vec![2.0, 3.0]);
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn delete_without_where_removes_every_point() {
+    let Some(ctx) = chdb_context() else { return };
+    ctx.metadata.create_database("testdb").await.unwrap();
+    ctx.write_and_flush("testdb", "cpu,host=a value=1.0 1000000000")
+        .await
+        .unwrap();
+    let resp = ctx.query("testdb", "DELETE FROM cpu").await.unwrap();
+    assert!(
+        resp.results[0].error.is_none(),
+        "{:?}",
+        resp.results[0].error
+    );
+    assert!(values(&ctx, "SELECT value FROM cpu").await.is_empty());
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn delete_naming_a_field_or_unknown_key_is_refused() {
+    let Some(ctx) = chdb_context() else { return };
+    ctx.metadata.create_database("testdb").await.unwrap();
+    ctx.write_and_flush("testdb", "cpu,host=a value=1.0 1000000000")
+        .await
+        .unwrap();
+    for q in [
+        "DELETE FROM cpu WHERE value > 0",
+        "DELETE FROM cpu WHERE tim0 < 0",
+    ] {
+        let failed = match ctx.query("testdb", q).await {
+            Err(_) => true,
+            Ok(resp) => resp.results[0].error.is_some(),
+        };
+        assert!(failed, "{q} must be refused");
+    }
+    // Nothing was stored that breaks later queries.
+    assert_eq!(values(&ctx, "SELECT value FROM cpu").await, vec![1.0]);
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn drop_series_keeps_points_written_after_it() {
+    let Some(ctx) = chdb_context() else { return };
+    ctx.metadata.create_database("testdb").await.unwrap();
+    ctx.write_and_flush(
+        "testdb",
+        "cpu,host=a value=1.0 1000000000\ncpu,host=b value=2.0 2000000000",
+    )
+    .await
+    .unwrap();
+    let resp = ctx
+        .query("testdb", r#"DROP SERIES FROM cpu WHERE "host" = 'a'"#)
+        .await
+        .unwrap();
+    assert!(
+        resp.results[0].error.is_none(),
+        "{:?}",
+        resp.results[0].error
+    );
+    assert_eq!(values(&ctx, "SELECT value FROM cpu").await, vec![2.0]);
+    ctx.write_and_flush("testdb", "cpu,host=a value=3.0 3000000000")
+        .await
+        .unwrap();
+    assert_eq!(values(&ctx, "SELECT value FROM cpu").await, vec![2.0, 3.0]);
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn drop_measurement_clears_its_tombstones() {
+    let Some(ctx) = chdb_context() else { return };
+    ctx.metadata.create_database("testdb").await.unwrap();
+    ctx.write_and_flush("testdb", "cpu,host=a value=1.0 1000000000")
+        .await
+        .unwrap();
+    // A tombstone stored by an earlier version, naming a column cpu lacks.
+    ctx.metadata
+        .store_tombstone("testdb", "autogen", "cpu", "tim0 < 0")
+        .await
+        .unwrap();
+    let resp = ctx.query("testdb", "DROP MEASUREMENT cpu").await.unwrap();
+    assert!(
+        resp.results[0].error.is_none(),
+        "{:?}",
+        resp.results[0].error
+    );
+    ctx.write_and_flush("testdb", "cpu,host=a value=2.0 2000000000")
+        .await
+        .unwrap();
+    assert_eq!(values(&ctx, "SELECT value FROM cpu").await, vec![2.0]);
 }
 
 // ---------------------------------------------------------------------------
@@ -1633,4 +1786,27 @@ async fn drop_database_removes_its_series_metadata() {
         0,
         "series keys of a dropped database"
     );
+}
+
+/// The ingest schema cache took a measurement written again after DROP
+/// MEASUREMENT to be registered still: its fields were never registered
+/// again, and every query on it failed with "Unknown expression identifier".
+#[tokio::test]
+#[serial(chdb)]
+async fn measurement_written_again_after_drop_keeps_its_fields() {
+    let Some(ctx) = chdb_context() else { return };
+    ctx.metadata.create_database("testdb").await.unwrap();
+    ctx.write_and_flush("testdb", "cpu,host=a value=1.0 1000000000")
+        .await
+        .unwrap();
+    let resp = ctx.query("testdb", "DROP MEASUREMENT cpu").await.unwrap();
+    assert!(
+        resp.results[0].error.is_none(),
+        "{:?}",
+        resp.results[0].error
+    );
+    ctx.write_and_flush("testdb", "cpu,host=a value=2.0 2000000000")
+        .await
+        .unwrap();
+    assert_eq!(values(&ctx, "SELECT value FROM cpu").await, vec![2.0]);
 }

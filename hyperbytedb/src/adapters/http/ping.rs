@@ -233,6 +233,17 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Response {
         );
     }
 
+    if crate::adapters::chdb::engine_failed() {
+        return json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            health_body(
+                "fail",
+                "query engine failed after a fatal error; restart the node",
+                readiness,
+            ),
+        );
+    }
+
     json_response(
         StatusCode::OK,
         health_body("pass", "ready for queries and writes", readiness),
@@ -274,6 +285,16 @@ pub async fn health_ready(State(state): State<Arc<AppState>>) -> Response {
             StatusCode::SERVICE_UNAVAILABLE,
             [("Content-Type", "application/json")],
             r#"{"status":"fail","message":"disk read-only due to low free space"}"#.to_string(),
+        )
+            .into_response();
+    }
+
+    if crate::adapters::chdb::engine_failed() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("Content-Type", "application/json")],
+            r#"{"status":"fail","message":"query engine failed after a fatal error; restart the node"}"#
+                .to_string(),
         )
             .into_response();
     }

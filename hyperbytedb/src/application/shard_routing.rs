@@ -1001,6 +1001,7 @@ impl ShardDeleteOutcome {
 pub async fn scatter_delete_to_regions(
     ctx: &ShardRoutingContext,
     metadata: &dyn MetadataPort,
+    local: Option<crate::application::predicate_sql::LocalRows<'_>>,
     db: &str,
     rp: &str,
     measurement: &str,
@@ -1014,13 +1015,31 @@ pub async fn scatter_delete_to_regions(
     };
 
     let mut outcome = ShardDeleteOutcome::default();
+    // One delete removes the rows of every local region.
+    let mut deleted_locally = false;
 
     for region in &space.regions {
         if region.primary == ctx.node_id {
-            if !predicate.is_empty() {
-                metadata
-                    .store_tombstone(db, rp, measurement, predicate)
-                    .await?;
+            if !predicate.is_empty() && !deleted_locally {
+                match local {
+                    Some(local) => {
+                        crate::application::predicate_sql::delete_rows(
+                            local.wal,
+                            local.sink,
+                            db,
+                            rp,
+                            measurement,
+                            predicate,
+                        )
+                        .await?;
+                    }
+                    None => {
+                        metadata
+                            .store_tombstone(db, rp, measurement, predicate)
+                            .await?;
+                    }
+                }
+                deleted_locally = true;
             }
             metadata
                 .delete_series_matching(db, rp, Some(measurement), predicate)

@@ -115,6 +115,8 @@ pub struct IngestSchemaCache {
     /// Set of hashed (db, rp, measurement, series_id) tuples already registered,
     /// letting steady-state batches skip `register_series_batch` entirely.
     series: RwLock<HashSet<u64, FastHash>>,
+    /// [`MetadataPort::drop_generation`] the sets above were filled at.
+    drop_generation: std::sync::atomic::AtomicU64,
 }
 
 /// The cache's keys and sets live only in memory, so they use foldhash rather
@@ -140,7 +142,21 @@ impl IngestSchemaCache {
             schema: RwLock::new(HashMap::with_capacity_and_hasher(256, FastHash::default())),
             tags: RwLock::new(HashSet::with_capacity_and_hasher(4096, FastHash::default())),
             series: RwLock::new(HashSet::with_capacity_and_hasher(8192, FastHash::default())),
+            drop_generation: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Forget everything when something was dropped since the cache was
+    /// filled: a dropped measurement written again must be registered again.
+    pub fn sync_drop_generation(&self, generation: u64) {
+        use std::sync::atomic::Ordering;
+        if self.drop_generation.load(Ordering::Acquire) == generation {
+            return;
+        }
+        self.schema.write().clear();
+        self.tags.write().clear();
+        self.series.write().clear();
+        self.drop_generation.store(generation, Ordering::Release);
     }
 
     fn hash_key(db: &str, rp: &str, meas: &str) -> u64 {
@@ -452,6 +468,9 @@ pub async fn prepare_columnar_metadata(
     limits: &IngestCardinalityLimits,
     schema_cache: Option<&IngestSchemaCache>,
 ) -> Result<(), HyperbytedbError> {
+    if let Some(sc) = schema_cache {
+        sc.sync_drop_generation(metadata.drop_generation());
+    }
     let mut field_types: HashMap<String, u8> = HashMap::with_capacity(1);
     field_types.insert(batch.field.clone(), 0); // Float64
 
@@ -716,6 +735,9 @@ pub async fn prepare_batch_metadata(
     // seen only after that), so only fresh points can carry an unseen tag
     // value. Checking every tag of every point instead was ~5% of a node's
     // CPU on n3, nearly all of it on series that were long known.
+    if let Some(sc) = schema_cache {
+        sc.sync_drop_generation(metadata.drop_generation());
+    }
     let mut fresh: Vec<&Point> = Vec::new();
     match schema_cache {
         Some(sc) => {

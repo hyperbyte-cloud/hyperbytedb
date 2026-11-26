@@ -99,6 +99,60 @@ pub fn schema_mutation_op_label(mutation: &MutationRequest) -> &'static str {
     }
 }
 
+/// Apply a replicated `DELETE` / `DROP SERIES` predicate to this node's rows
+/// ([`crate::application::predicate_sql::delete_rows`]).
+///
+/// A coordinator older than this node sends the condition with tag names
+/// (it stored tombstones), which the fact table does not have; that one is
+/// stored as a tombstone, as the coordinator did.
+async fn delete_replicated_rows(
+    metadata: &Arc<dyn MetadataPort>,
+    sink: Option<&Arc<dyn PointsSinkPort>>,
+    wal: Option<&Arc<dyn WalPort>>,
+    db: &str,
+    rp: &str,
+    measurement: &str,
+    predicate: &str,
+) -> Result<(), HyperbytedbError> {
+    if predicate.is_empty() {
+        return Ok(());
+    }
+    if let Some(sink) = sink {
+        match crate::application::predicate_sql::delete_rows(
+            wal.map(|w| w.as_ref()),
+            sink.as_ref(),
+            db,
+            rp,
+            measurement,
+            predicate,
+        )
+        .await
+        {
+            Err(e) if is_unknown_column(&e.to_string()) => {
+                tracing::warn!(
+                    db,
+                    measurement,
+                    error = %e,
+                    "replicated delete names columns the table lacks; storing it as a tombstone"
+                );
+            }
+            other => return other,
+        }
+    }
+    metadata
+        .store_tombstone(db, rp, measurement, predicate)
+        .await
+        .map(|_| ())
+}
+
+/// A chDB error for a column the table does not have.
+pub(crate) fn is_unknown_column(msg: &str) -> bool {
+    msg.contains("UNKNOWN_IDENTIFIER")
+        || msg.contains("Unknown identifier")
+        || msg.contains("Missing columns")
+        || msg.contains("Code: 47")
+}
+
 async fn apply_schema_mutation_inner(
     deps: SchemaMutationDeps<'_>,
     mutation: MutationRequest,
@@ -145,13 +199,15 @@ async fn apply_schema_mutation_inner(
             measurement,
             predicate_sql,
         } => {
-            metadata
-                .store_tombstone(&database, &rp, &measurement, &predicate_sql)
-                .await?;
+            let sink = points_sink.or_else(|| mv_service.map(|mv| mv.points_sink()));
             if let Some(ctx) = shard_routing {
                 shard_routing::scatter_delete_to_regions(
                     ctx,
                     metadata.as_ref(),
+                    sink.map(|s| crate::application::predicate_sql::LocalRows {
+                        wal: wal.map(|w| w.as_ref()),
+                        sink: s.as_ref(),
+                    }),
                     &database,
                     &rp,
                     &measurement,
@@ -159,6 +215,16 @@ async fn apply_schema_mutation_inner(
                 )
                 .await?;
             } else {
+                delete_replicated_rows(
+                    metadata,
+                    sink,
+                    wal,
+                    &database,
+                    &rp,
+                    &measurement,
+                    &predicate_sql,
+                )
+                .await?;
                 metadata
                     .delete_series_matching(&database, &rp, Some(&measurement), &predicate_sql)
                     .await?;
@@ -208,14 +274,9 @@ async fn apply_schema_mutation_inner(
             measurement,
             predicate_sql,
         } => {
-            if !predicate_sql.is_empty() && measurement.is_some() {
-                metadata
-                    .store_tombstone(
-                        &database,
-                        &rp,
-                        measurement.as_deref().unwrap_or(""),
-                        &predicate_sql,
-                    )
+            if let Some(meas) = measurement.as_deref() {
+                let sink = points_sink.or_else(|| mv_service.map(|mv| mv.points_sink()));
+                delete_replicated_rows(metadata, sink, wal, &database, &rp, meas, &predicate_sql)
                     .await?;
             }
             metadata

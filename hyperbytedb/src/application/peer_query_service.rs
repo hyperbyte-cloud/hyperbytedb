@@ -413,11 +413,14 @@ async fn mutation_request_from_statement(
         Statement::DropDatabase(name) => Ok(MutationRequest::DropDatabase(name.clone())),
         Statement::Delete(del) => {
             let del_rp = metadata.get_default_rp(db).await?;
-            let predicate_sql = if let Some(ref cond) = del.condition {
-                build_predicate_sql(metadata, db, &del_rp, &del.from, cond).await?
-            } else {
-                String::new()
-            };
+            let predicate_sql = crate::application::predicate_sql::build_delete_predicate(
+                metadata,
+                db,
+                &del_rp,
+                &del.from,
+                del.condition.as_ref(),
+            )
+            .await?;
             Ok(MutationRequest::Delete {
                 database: db.to_string(),
                 rp: del_rp,
@@ -541,11 +544,18 @@ async fn mutation_request_from_statement(
                 MeasurementName::Regex(_) => None,
             });
             let drop_rp = metadata.get_default_rp(target_db).await?;
-            let predicate_sql = if let Some(ref cond) = s.condition {
-                let meas = measurement.as_deref().unwrap_or("");
-                build_predicate_sql(metadata, target_db, &drop_rp, meas, cond).await?
-            } else {
-                String::new()
+            let predicate_sql = match (measurement.as_deref(), s.condition.as_ref()) {
+                // Replicas delete the rows this selects.
+                (Some(meas), cond) => {
+                    crate::application::predicate_sql::build_delete_predicate(
+                        metadata, target_db, &drop_rp, meas, cond,
+                    )
+                    .await?
+                }
+                (None, Some(cond)) => {
+                    build_predicate_sql(metadata, target_db, &drop_rp, "", cond).await?
+                }
+                (None, None) => String::new(),
             };
             Ok(MutationRequest::DropSeries {
                 database: target_db.to_string(),
@@ -709,12 +719,15 @@ impl QueryService for PeerQueryService {
                         } else {
                             self.metadata.get_default_rp(db).await?
                         };
-                        let predicate_sql = if let Some(ref cond) = del.condition {
-                            build_predicate_sql(&self.metadata, db, &del_rp, &del.from, cond)
-                                .await?
-                        } else {
-                            String::new()
-                        };
+                        let predicate_sql =
+                            crate::application::predicate_sql::build_delete_predicate(
+                                &self.metadata,
+                                db,
+                                &del_rp,
+                                &del.from,
+                                del.condition.as_ref(),
+                            )
+                            .await?;
                         self.replicate_mutation(MutationRequest::Delete {
                             database: db.to_string(),
                             rp: del_rp,
@@ -1045,12 +1058,23 @@ impl QueryService for PeerQueryService {
                         } else {
                             self.metadata.get_default_rp(target_db).await?
                         };
-                        let predicate_sql = if let Some(ref cond) = s.condition {
-                            let meas = measurement.as_deref().unwrap_or("");
-                            build_predicate_sql(&self.metadata, target_db, &ds_rp, meas, cond)
+                        let predicate_sql = match (measurement.as_deref(), s.condition.as_ref()) {
+                            // Replicas delete the rows this selects.
+                            (Some(meas), cond) => {
+                                crate::application::predicate_sql::build_delete_predicate(
+                                    &self.metadata,
+                                    target_db,
+                                    &ds_rp,
+                                    meas,
+                                    cond,
+                                )
                                 .await?
-                        } else {
-                            String::new()
+                            }
+                            (None, Some(cond)) => {
+                                build_predicate_sql(&self.metadata, target_db, &ds_rp, "", cond)
+                                    .await?
+                            }
+                            (None, None) => String::new(),
                         };
                         self.replicate_mutation(MutationRequest::DropSeries {
                             database: target_db.to_string(),

@@ -51,6 +51,7 @@ pub struct PeerIngestionService {
     limits: IngestCardinalityLimits,
     max_points_per_request: usize,
     schema_cache: IngestSchemaCache,
+    name_guard: crate::application::physical_names::PhysicalNameGuard,
     replication: ReplicationConfig,
     shard_routing: Option<Arc<ShardRoutingContext>>,
     is_raft_leader: Arc<dyn Fn() -> bool + Send + Sync>,
@@ -170,6 +171,7 @@ impl PeerIngestionService {
             limits,
             max_points_per_request,
             schema_cache: IngestSchemaCache::new(),
+            name_guard: crate::application::physical_names::PhysicalNameGuard::new(),
             replication,
             shard_routing: None,
             is_raft_leader: Arc::new(|| false),
@@ -865,6 +867,16 @@ impl IngestionPort for PeerIngestionService {
             let t2 = std::time::Instant::now();
             histogram!("hyperbytedb_ingest_parse_seconds").record((t2 - t1).as_secs_f64());
 
+            self.name_guard
+                .check_columnar(
+                    &self.metadata,
+                    db,
+                    &retention_policy,
+                    &wire.measurement,
+                    &wire.field,
+                    wire.tags.keys().map(String::as_str),
+                )
+                .await?;
             prepare_columnar_metadata(
                 &self.metadata,
                 db,
@@ -981,6 +993,10 @@ impl IngestionPort for PeerIngestionService {
         if points.is_empty() {
             return partial.map_or(Ok(()), Err);
         }
+
+        self.name_guard
+            .check_points(&self.metadata, db, &retention_policy, &points)
+            .await?;
 
         let precision_val = Precision::from_str_opt(precision);
         let replication_body = match format {

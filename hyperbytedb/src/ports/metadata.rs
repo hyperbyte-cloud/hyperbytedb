@@ -45,6 +45,15 @@ pub trait MetadataPort: Send + Sync {
         Ok(0)
     }
     async fn drop_database(&self, name: &str) -> Result<(), HyperbytedbError>;
+
+    /// A counter that grows each time a database, retention policy,
+    /// measurement or series is dropped. In-memory caches of what has been
+    /// registered (the ingest schema cache) start over when it changes:
+    /// otherwise a measurement written again after `DROP MEASUREMENT` was
+    /// taken to be registered still, and lost its fields.
+    fn drop_generation(&self) -> u64 {
+        0
+    }
     async fn list_databases(&self) -> Result<Vec<Database>, HyperbytedbError>;
     async fn get_database(&self, name: &str) -> Result<Option<Database>, HyperbytedbError>;
 

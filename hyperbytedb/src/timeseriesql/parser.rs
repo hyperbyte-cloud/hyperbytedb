@@ -278,7 +278,69 @@ fn parse_field_expr(input: &str) -> Result<Field, HyperbytedbError> {
     Ok(Field { expr, alias })
 }
 
+/// Deepest expression nesting [`parse_expr`] accepts: parentheses,
+/// arithmetic chains and the like. `AND` / `OR` chains of any length are
+/// built as balanced trees and stay far below it.
+///
+/// The parser, and every pass over the tree after it, recurses once per
+/// level. Without a bound, a query with a few thousand `OR` terms (when
+/// they nested one per term) overflowed the thread's stack; chDB's signal
+/// handler took the fault for its own and shut the query engine down for
+/// good, while `/health` kept answering 200.
+pub const MAX_EXPR_DEPTH: usize = 100;
+
+/// Deepest nesting of subqueries (`FROM (SELECT ...)`) accepted. Each level
+/// costs far more stack than an expression level, here and when the query
+/// is planned and run.
+pub const MAX_SUBQUERY_DEPTH: usize = 16;
+
+thread_local! {
+    static EXPR_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SUBQUERY_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// One level of parser recursion, counted while it lives.
+struct ExprDepth(&'static std::thread::LocalKey<std::cell::Cell<usize>>);
+
+impl ExprDepth {
+    fn enter() -> Result<Self, HyperbytedbError> {
+        Self::enter_on(&EXPR_DEPTH, MAX_EXPR_DEPTH, "expression")
+    }
+
+    fn enter_subquery() -> Result<Self, HyperbytedbError> {
+        Self::enter_on(&SUBQUERY_DEPTH, MAX_SUBQUERY_DEPTH, "subquery")
+    }
+
+    fn enter_on(
+        counter: &'static std::thread::LocalKey<std::cell::Cell<usize>>,
+        max: usize,
+        what: &str,
+    ) -> Result<Self, HyperbytedbError> {
+        counter.with(|d| {
+            let depth = d.get() + 1;
+            if depth > max {
+                return Err(HyperbytedbError::QueryParse(format!(
+                    "{what} nested too deeply (more than {max} levels)"
+                )));
+            }
+            d.set(depth);
+            Ok(Self(counter))
+        })
+    }
+}
+
+impl Drop for ExprDepth {
+    fn drop(&mut self) {
+        self.0.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
 pub fn parse_expr(input: &str) -> Result<Expr, HyperbytedbError> {
+    let _depth = ExprDepth::enter()?;
+    parse_expr_at_depth(input)
+}
+
+fn parse_expr_at_depth(input: &str) -> Result<Expr, HyperbytedbError> {
     let input = input.trim();
 
     // Regex literal must be checked early to avoid treating / as division
@@ -328,19 +390,53 @@ fn try_parse_logical_expr(input: &str) -> Result<Option<Expr>, HyperbytedbError>
     let scan = scan_chars(input)?;
     // OR has the lowest precedence in InfluxQL, so split at OR first: the
     // operator split earliest ends up at the root of the tree and binds
-    // loosest. Which OR occurrence is split at is semantically neutral.
+    // loosest.
+    //
+    // A chain is split at every top-level occurrence at once and its operands
+    // joined as a balanced tree (both operators are associative). Splitting
+    // at the first one and recursing on the rest nested one level per term:
+    // quadratic time, and a stack overflow at a few thousand terms.
     for (kw, op) in [("OR", BinaryOp::Or), ("AND", BinaryOp::And)] {
-        if let Some((pos, end)) = find_keyword_position(input, &scan, kw) {
-            let left = parse_expr(&input[..pos])?;
-            let right = parse_expr(&input[end..])?;
-            return Ok(Some(Expr::BinaryExpr(Box::new(BinaryExpr {
-                left,
-                op,
-                right,
-            }))));
+        let mut cuts: Vec<(usize, usize)> = Vec::new();
+        let mut i = 0;
+        while i < scan.len() {
+            match match_keyword_at(input, &scan, i, kw) {
+                Some((pos, end)) => {
+                    cuts.push((pos, end));
+                    while i < scan.len() && scan[i].idx < end {
+                        i += 1;
+                    }
+                }
+                None => i += 1,
+            }
         }
+        if cuts.is_empty() {
+            continue;
+        }
+        let mut operands = Vec::with_capacity(cuts.len() + 1);
+        let mut start = 0;
+        for (pos, end) in cuts {
+            operands.push(parse_expr(&input[start..pos])?);
+            start = end;
+        }
+        operands.push(parse_expr(&input[start..])?);
+        return Ok(balanced_chain(operands, &op));
     }
     Ok(None)
+}
+
+/// `a op b op c ...` as a tree of depth log2(n). Three operands give
+/// `a op (b op c)`, as splitting at the first operator did.
+fn balanced_chain(mut operands: Vec<Expr>, op: &BinaryOp) -> Option<Expr> {
+    if operands.len() <= 1 {
+        return operands.pop();
+    }
+    let right = operands.split_off(operands.len() / 2);
+    Some(Expr::BinaryExpr(Box::new(BinaryExpr {
+        left: balanced_chain(operands, op)?,
+        op: op.clone(),
+        right: balanced_chain(right, op)?,
+    })))
 }
 
 fn try_parse_comparison_expr(input: &str) -> Result<Option<Expr>, HyperbytedbError> {
@@ -477,7 +573,7 @@ fn parse_atom(input: &str) -> Result<Expr, HyperbytedbError> {
     }
 
     // String literal 'value' — both `\'` and `''` escape a quote
-    if input.starts_with('\'') && input.ends_with('\'') {
+    if input.len() >= 2 && input.starts_with('\'') && input.ends_with('\'') {
         let s = input[1..input.len() - 1]
             .replace("\\'", "'")
             .replace("''", "'");
@@ -522,7 +618,7 @@ fn parse_atom(input: &str) -> Result<Expr, HyperbytedbError> {
     }
 
     // Quoted identifier "name"
-    if input.starts_with('"') && input.ends_with('"') {
+    if input.len() >= 2 && input.starts_with('"') && input.ends_with('"') {
         let name = input[1..input.len() - 1].to_string();
         return Ok(Expr::Identifier(name));
     }
@@ -603,6 +699,7 @@ fn parse_from_sources(input: &str) -> Result<Vec<MeasurementSource>, Hyperbytedb
     if input.starts_with('(') && input.ends_with(')') {
         let inner = input[1..input.len() - 1].trim();
         if starts_with_keyword(inner, "SELECT") {
+            let _depth = ExprDepth::enter_subquery()?;
             let stmt = parse_select(inner)?;
             if let Statement::Select(sub) = stmt {
                 return Ok(vec![MeasurementSource::Subquery(Box::new(sub))]);
@@ -625,7 +722,7 @@ fn parse_measurement(input: &str) -> Result<Measurement, HyperbytedbError> {
     let input = input.trim();
 
     // Regex measurement /pattern/
-    if input.starts_with('/') && input.ends_with('/') {
+    if input.len() >= 2 && input.starts_with('/') && input.ends_with('/') {
         return Ok(Measurement {
             database: None,
             retention_policy: None,
@@ -728,7 +825,7 @@ fn parse_group_by_clause(input: &str) -> Result<(GroupBy, Option<FillOption>), H
             dimensions.push(Dimension::Time { interval, offset });
         } else if part == "*" {
             dimensions.push(Dimension::AllTags);
-        } else if part.starts_with('/') && part.ends_with('/') {
+        } else if part.len() >= 2 && part.starts_with('/') && part.ends_with('/') {
             dimensions.push(Dimension::Regex(part[1..part.len() - 1].to_string()));
         } else {
             dimensions.push(Dimension::Tag(unquote(part)));
@@ -788,6 +885,96 @@ fn parse_order_by(input: &str) -> Result<OrderBy, HyperbytedbError> {
 
 #[cfg(test)]
 mod tests {
+    /// A few thousand `OR` terms nested one level each and overflowed the
+    /// stack (taking chDB down with it); they now parse into a shallow tree.
+    #[test]
+    fn long_or_and_chains_parse_shallow() {
+        fn depth(e: &Expr) -> usize {
+            match e {
+                Expr::BinaryExpr(b) => 1 + depth(&b.left).max(depth(&b.right)),
+                _ => 1,
+            }
+        }
+        for (kw, n) in [("OR", 4000), ("AND", 4000), ("OR", 50_000)] {
+            let q = format!(
+                "SELECT usage FROM cpu WHERE usage > 1{}",
+                format!(" {kw} usage > 1").repeat(n)
+            );
+            let t = std::time::Instant::now();
+            let stmts = std::thread::Builder::new()
+                .stack_size(256 * 1024)
+                .spawn(move || crate::timeseriesql::parse(&q))
+                .unwrap()
+                .join()
+                .unwrap()
+                .unwrap();
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(10),
+                "{kw} x{n}"
+            );
+            let Statement::Select(sel) = &stmts[0] else {
+                panic!("not a select")
+            };
+            let d = depth(sel.condition.as_ref().unwrap());
+            assert!(d <= 20, "{kw} x{n}: depth {d}");
+        }
+    }
+
+    #[test]
+    fn three_term_chain_keeps_its_shape() {
+        let stmts =
+            crate::timeseriesql::parse("SELECT v FROM m WHERE a = 1 OR b = 2 OR c = 3").unwrap();
+        let Statement::Select(sel) = &stmts[0] else {
+            panic!("not a select")
+        };
+        let Some(Expr::BinaryExpr(root)) = &sel.condition else {
+            panic!("no condition")
+        };
+        assert!(matches!(&root.right, Expr::BinaryExpr(r) if r.op == BinaryOp::Or));
+    }
+
+    #[test]
+    fn deep_nesting_is_an_error_not_a_crash() {
+        let parens = format!(
+            "SELECT v FROM m WHERE {}a = 1{}",
+            "(".repeat(5000),
+            ")".repeat(5000)
+        );
+        let sum = format!("SELECT v{} FROM m", " + v".repeat(5000));
+        let subq = format!(
+            "SELECT v FROM {}m{}",
+            "(SELECT v FROM ".repeat(500),
+            ")".repeat(500)
+        );
+        // Debug-build frames; a tokio worker has 2 MiB.
+        for q in [parens, sum, subq] {
+            let r = std::thread::Builder::new()
+                .stack_size(1024 * 1024)
+                .spawn(move || crate::timeseriesql::parse(&q).is_err())
+                .unwrap()
+                .join()
+                .unwrap();
+            assert!(r);
+        }
+        // The depth counter unwinds: an ordinary query still parses after.
+        assert!(crate::timeseriesql::parse("SELECT v FROM m WHERE (a = 1)").is_ok());
+    }
+
+    #[test]
+    fn lone_quotes_and_slashes_are_errors_not_panics() {
+        for q in [
+            "SELECT usage FROM cpu WHERE host = '",
+            "SELECT \"",
+            "SELECT '",
+            "SELECT usage FROM /",
+            "SELECT usage FROM cpu GROUP BY /",
+            "SELECT usage FROM cpu WHERE host = \"",
+        ] {
+            let r = std::panic::catch_unwind(|| crate::timeseriesql::parse(q));
+            assert!(r.is_ok(), "panicked on {q:?}");
+        }
+    }
+
     use super::*;
 
     #[test]

@@ -23,7 +23,11 @@ pub(crate) fn execute_connection(
     query: &str,
     format: OutputFormat,
 ) -> Result<QueryResult, chdb_rust::error::Error> {
-    conn.query(query, format)
+    let result = conn.query(query, format);
+    if let Err(e) = &result {
+        crate::adapters::chdb::note_error(&e.to_string());
+    }
+    result
 }
 
 /// Shared handle to a same-path chDB connection pool.

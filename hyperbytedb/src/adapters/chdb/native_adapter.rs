@@ -139,6 +139,11 @@ fn table_schema_from_measurement_meta(
     )
 }
 
+/// A chDB error for a table that does not exist.
+fn is_unknown_table(msg: &str) -> bool {
+    msg.contains("UNKNOWN_TABLE") || msg.contains("Code: 60") || msg.contains("doesn't exist")
+}
+
 fn tag_column_kind(distinct_values: usize, threshold: usize) -> ColumnKind {
     if distinct_values > threshold {
         ColumnKind::TagString
@@ -962,9 +967,9 @@ impl ChdbNativeAdapter {
             let insert_options = self.insert_options.clone();
             tokio::task::spawn_blocking(move || {
                 pool.with_connection(|conn| {
-                    insert_record_batch_direct(conn, &series_table, batch, insert_options).map_err(
-                        |e| HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e)),
-                    )
+                    checked_insert_direct(conn, &series_table, batch, insert_options).map_err(|e| {
+                        HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e))
+                    })
                 })
             })
             .await
@@ -1442,7 +1447,7 @@ impl ChdbNativeAdapter {
         let insert_options = self.insert_options.clone();
         tokio::task::spawn_blocking(move || {
             pool.with_connection(|conn| {
-                insert_record_batch_direct(conn, &series_table, batch, insert_options)
+                checked_insert_direct(conn, &series_table, batch, insert_options)
                     .map_err(|e| HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e)))
             })
         })
@@ -1547,6 +1552,31 @@ impl PointsSinkPort for ChdbNativeAdapter {
     async fn refresh_schema_cache(&self) -> Result<(), HyperbytedbError> {
         self.refresh_schemas_from_metadata().await?;
         Ok(())
+    }
+
+    fn deletes_rows(&self) -> bool {
+        true
+    }
+
+    async fn delete_rows(
+        &self,
+        db: &str,
+        rp: &str,
+        measurement: &str,
+        predicate: &str,
+    ) -> Result<(), HyperbytedbError> {
+        let fact = quoted_table_name(db, rp, measurement);
+        // `mutations_sync = 2` returns once the rows are gone, so a query
+        // after the DELETE does not see them. A mutation rewrites only the
+        // parts that exist when it starts: rows inserted after it are kept.
+        let sql = format!(
+            "ALTER TABLE {fact} DELETE WHERE {predicate} \
+             SETTINGS mutations_sync = 2, allow_nondeterministic_mutations = 1"
+        );
+        match self.execute(sql).await {
+            Err(e) if is_unknown_table(&e.to_string()) => Ok(()),
+            other => other,
+        }
     }
 
     async fn delete_series_id_range(
@@ -1678,7 +1708,7 @@ impl ChdbNativeAdapter {
             let insert_options = self.insert_options.clone();
             tokio::task::spawn_blocking(move || {
                 pool.with_connection(|conn| {
-                    insert_record_batch_direct(conn, &table, batch, insert_options).map_err(|e| {
+                    checked_insert_direct(conn, &table, batch, insert_options).map_err(|e| {
                         HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e))
                     })
                 })
@@ -1758,7 +1788,7 @@ impl ChdbNativeAdapter {
         tokio::task::spawn_blocking(move || {
             let batch = (*fact).clone();
             pool.with_connection(|conn| {
-                insert_record_batch_direct(conn, &table, batch, insert_options)
+                checked_insert_direct(conn, &table, batch, insert_options)
                     .map_err(|e| HyperbytedbError::Chdb(crate::error::ChainedError::from_error(e)))
             })
         })
@@ -1807,6 +1837,20 @@ impl ChdbNativeAdapter {
             "insert hit a missing column; re-planning table schema"
         );
     }
+}
+
+/// [`insert_record_batch_direct`], noting a fatal engine error for `/health`.
+fn checked_insert_direct(
+    conn: &chdb_rust::connection::Connection,
+    table: &str,
+    batch: arrow::record_batch::RecordBatch,
+    options: InsertOptions,
+) -> Result<(), chdb_rust::error::Error> {
+    let result = insert_record_batch_direct(conn, table, batch, options);
+    if let Err(e) = &result {
+        crate::adapters::chdb::note_error(&e.to_string());
+    }
+    result
 }
 
 fn run_sync(pool: &ChdbConnectionPool, sql: &str) -> Result<(), HyperbytedbError> {
