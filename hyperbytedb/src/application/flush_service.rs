@@ -517,9 +517,9 @@ impl FlushServiceImpl {
         };
 
         let safe_truncate_seq = self.compute_safe_truncate_seq(flushed_through).await;
+        self.wal.truncate_before(safe_truncate_seq + 1).await?;
         #[cfg(madsim)]
         sim_truncation_evidence(safe_truncate_seq);
-        self.wal.truncate_before(safe_truncate_seq + 1).await?;
         if let Some(ref rl) = self.replication_log
             && let Ok(Some(min_mut_ack)) = rl.min_mutation_ack()
             && let Err(e) = rl.truncate_mutations_before(min_mut_ack)
@@ -783,10 +783,10 @@ impl FlushServiceImpl {
             };
 
             let safe_truncate_seq = self.compute_safe_truncate_seq(flushed_through).await;
-            #[cfg(madsim)]
-            sim_truncation_evidence(safe_truncate_seq);
 
             self.wal.truncate_before(safe_truncate_seq + 1).await?;
+            #[cfg(madsim)]
+            sim_truncation_evidence(safe_truncate_seq);
             if let Some(ref rl) = self.replication_log
                 && let Ok(Some(min_mut_ack)) = rl.min_mutation_ack()
                 && let Err(e) = rl.truncate_mutations_before(min_mut_ack)
@@ -826,7 +826,8 @@ impl FlushServiceImpl {
     }
 }
 
-/// DST seam (`cfg(madsim)` only): the WAL truncation actually applied, as
+/// DST seam (`cfg(madsim)` only): the WAL truncation just applied (logged
+/// after `truncate_before` succeeded), as
 /// evidence for the rig's accepted-loss attribution (entries before
 /// `before` are gone). Only when it truncates something.
 #[cfg(madsim)]
