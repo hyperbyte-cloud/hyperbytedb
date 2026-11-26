@@ -46,8 +46,16 @@ impl ReplicationLog {
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
 
-        let cf_opts = Options::default();
-        let hh_opts = Options::default();
+        #[allow(unused_mut)]
+        let mut cf_opts = Options::default();
+        #[allow(unused_mut)]
+        let mut hh_opts = Options::default();
+        #[cfg(madsim)]
+        {
+            crate::adapters::sim_rocksdb::track(path.as_ref(), &mut opts);
+            crate::adapters::sim_rocksdb::tune(&mut cf_opts);
+            crate::adapters::sim_rocksdb::tune(&mut hh_opts);
+        }
         let cfs = vec![
             ColumnFamilyDescriptor::new(REPL_CF, cf_opts),
             ColumnFamilyDescriptor::new(HINTED_HANDOFF_CF, hh_opts),

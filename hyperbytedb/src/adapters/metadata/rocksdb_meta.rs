@@ -372,6 +372,11 @@ impl RocksDbMetadata {
         cf_opts.set_block_based_table_factory(&block_opts);
         cf_opts.set_max_write_buffer_number(2);
         cf_opts.set_write_buffer_size(8 * 1024 * 1024);
+        #[cfg(madsim)]
+        {
+            crate::adapters::sim_rocksdb::track(path.as_ref(), &mut opts);
+            crate::adapters::sim_rocksdb::tune(&mut cf_opts);
+        }
         let cfs = vec![ColumnFamilyDescriptor::new(META_CF, cf_opts)];
 
         let db = Arc::new(

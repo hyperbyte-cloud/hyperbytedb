@@ -176,6 +176,11 @@ impl RocksDbWal {
         wal_cf_opts.set_target_file_size_base(64 * 1024 * 1024);
         wal_cf_opts.set_max_bytes_for_level_base(512 * 1024 * 1024);
         let wal_meta_cf_opts = Options::default();
+        #[cfg(madsim)]
+        {
+            crate::adapters::sim_rocksdb::track(path.as_ref(), &mut opts);
+            crate::adapters::sim_rocksdb::tune(&mut wal_cf_opts);
+        }
 
         let cfs = vec![
             ColumnFamilyDescriptor::new(WAL_CF, wal_cf_opts),

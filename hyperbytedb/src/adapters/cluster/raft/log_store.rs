@@ -175,10 +175,17 @@ impl RaftStore {
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
+        #[allow(unused_mut)]
+        let mut logs_opts = Options::default();
+        #[cfg(madsim)]
+        {
+            crate::adapters::sim_rocksdb::track(path.as_ref(), &mut db_opts);
+            crate::adapters::sim_rocksdb::tune(&mut logs_opts);
+        }
 
         let cfs = vec![
             ColumnFamilyDescriptor::new(CF_META, Options::default()),
-            ColumnFamilyDescriptor::new(CF_LOGS, Options::default()),
+            ColumnFamilyDescriptor::new(CF_LOGS, logs_opts),
             ColumnFamilyDescriptor::new(CF_STATE, Options::default()),
         ];
 

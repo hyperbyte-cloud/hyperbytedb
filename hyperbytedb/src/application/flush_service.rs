@@ -517,6 +517,8 @@ impl FlushServiceImpl {
         };
 
         let safe_truncate_seq = self.compute_safe_truncate_seq(flushed_through).await;
+        #[cfg(madsim)]
+        sim_truncation_evidence(safe_truncate_seq);
         self.wal.truncate_before(safe_truncate_seq + 1).await?;
         if let Some(ref rl) = self.replication_log
             && let Ok(Some(min_mut_ack)) = rl.min_mutation_ack()
@@ -781,6 +783,8 @@ impl FlushServiceImpl {
             };
 
             let safe_truncate_seq = self.compute_safe_truncate_seq(flushed_through).await;
+            #[cfg(madsim)]
+            sim_truncation_evidence(safe_truncate_seq);
 
             self.wal.truncate_before(safe_truncate_seq + 1).await?;
             if let Some(ref rl) = self.replication_log
@@ -819,6 +823,16 @@ impl FlushServiceImpl {
         gauge!("hyperbytedb_wal_last_sequence").set(*self.last_flushed.lock().await as f64);
 
         Ok(())
+    }
+}
+
+/// DST seam (`cfg(madsim)` only): the WAL truncation actually applied, as
+/// evidence for the rig's accepted-loss attribution (entries before
+/// `before` are gone). Only when it truncates something.
+#[cfg(madsim)]
+fn sim_truncation_evidence(safe_truncate_seq: u64) {
+    if safe_truncate_seq > 0 {
+        tracing::info!(before = safe_truncate_seq + 1, "dst: wal truncated");
     }
 }
 
