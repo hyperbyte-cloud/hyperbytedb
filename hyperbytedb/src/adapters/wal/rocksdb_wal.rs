@@ -12,15 +12,56 @@ use crate::adapters::wal::wal_ipc;
 use crate::domain::point::Point;
 use crate::domain::prepared_wal::PreparedWalSlot;
 use crate::error::HyperbytedbError;
-use crate::ports::wal::{WalAppendBundle, WalEntry, WalFormat, WalPort};
+use crate::ports::wal::{DeleteMarker, WalAppendBundle, WalEntry, WalFormat, WalPort};
 
 const WAL_CF: &str = "wal";
 const WAL_META_CF: &str = "wal_meta";
 const LAST_SEQ_KEY: &[u8] = b"last_seq";
+/// `wal_meta` keys of delete markers: this prefix, the marker's
+/// `flushed_through` and a unique suffix, both big-endian.
+const DELETE_MARKER_PREFIX: &[u8] = b"delete_marker/";
 /// Encoded bytes one `read_range` call may decode. Entries expand several-fold
 /// once decoded, so an entry-count limit alone let a restart's first flush
 /// decode thousands of large write batches at once and OOM the pod.
 const READ_MAX_BYTES: usize = 32 << 20;
+
+/// A delete marker and its `wal_meta` key.
+type DeleteMarkerEntry = (Box<[u8]>, DeleteMarker);
+
+/// The delete markers in `wal_meta` with their keys, lowest
+/// `flushed_through` first (the key order).
+fn read_delete_marker_entries(db: &DB) -> Result<Vec<DeleteMarkerEntry>, HyperbytedbError> {
+    let wal_meta_cf = db
+        .cf_handle(WAL_META_CF)
+        .ok_or_else(|| HyperbytedbError::Wal("wal_meta column family not found".into()))?;
+    let mut out = Vec::new();
+    let iter = db.iterator_cf(
+        &wal_meta_cf,
+        IteratorMode::From(DELETE_MARKER_PREFIX, rocksdb::Direction::Forward),
+    );
+    for item in iter {
+        let (key, value) =
+            item.map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
+        if !key.starts_with(DELETE_MARKER_PREFIX) {
+            break;
+        }
+        let marker: DeleteMarker = serde_json::from_slice(&value).map_err(|e| {
+            HyperbytedbError::Wal(crate::error::ChainedError::with_context(
+                "decode delete marker",
+                e,
+            ))
+        })?;
+        out.push((key, marker));
+    }
+    Ok(out)
+}
+
+fn read_delete_markers(db: &DB) -> Result<Vec<DeleteMarker>, HyperbytedbError> {
+    Ok(read_delete_marker_entries(db)?
+        .into_iter()
+        .map(|(_, m)| m)
+        .collect())
+}
 
 fn u64_to_be_bytes(n: u64) -> [u8; 8] {
     n.to_be_bytes()
@@ -48,6 +89,14 @@ pub struct RocksDbWal {
     truncated_through: Arc<AtomicU64>,
     /// Range deletes written to the WAL CF since its memtable last flushed.
     range_deletes_unflushed: Arc<AtomicU64>,
+    /// Delete markers kept in `wal_meta`; truncation looks for ones to drop
+    /// only when there are some.
+    delete_markers: Arc<AtomicU64>,
+    /// Makes delete marker keys unique within one `flushed_through`.
+    delete_marker_nonce: AtomicU64,
+    /// The markers kept when the WAL was opened: deletes from before this
+    /// process, which a restart replays.
+    markers_at_open: Vec<DeleteMarker>,
     /// `(seq, encoded bytes)` of entries written by this process and not yet
     /// truncated, oldest first: what a byte-bounded margin is measured in.
     sizes: Arc<std::sync::Mutex<std::collections::VecDeque<(u64, u64)>>>,
@@ -240,6 +289,9 @@ impl RocksDbWal {
             }
         };
 
+        let markers_at_open = read_delete_markers(&db)?;
+        let delete_markers = markers_at_open.len() as u64;
+
         Ok(Self {
             db,
             seq: Arc::new(AtomicU64::new(seq)),
@@ -248,6 +300,13 @@ impl RocksDbWal {
             flushed_through: AtomicU64::new(first.saturating_sub(1)),
             truncated_through: Arc::new(AtomicU64::new(first)),
             range_deletes_unflushed: Arc::new(AtomicU64::new(0)),
+            delete_markers: Arc::new(AtomicU64::new(delete_markers)),
+            markers_at_open,
+            delete_marker_nonce: AtomicU64::new(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos() as u64),
+            ),
             sizes: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             arrow_cache: Arc::new(WalArrowCache::new()),
             wal_format: options.wal_format,
@@ -627,6 +686,7 @@ impl WalPort for RocksDbWal {
         let last_seq = self.seq.load(Ordering::Relaxed);
         let truncated_through = Arc::clone(&self.truncated_through);
         let range_deletes_unflushed = Arc::clone(&self.range_deletes_unflushed);
+        let delete_markers = Arc::clone(&self.delete_markers);
 
         tokio::task::spawn_blocking(move || {
             let wal_cf = db
@@ -660,8 +720,22 @@ impl WalPort for RocksDbWal {
                 }
             }
             batch.put_cf(&wal_meta_cf, LAST_SEQ_KEY, u64_to_be_bytes(last_seq));
+            // A marker is needed while an entry up to its `flushed_through`
+            // is left to flush again.
+            let mut markers_dropped = 0u64;
+            if delete_markers.load(Ordering::Acquire) > 0 {
+                for (key, marker) in read_delete_marker_entries(&db)? {
+                    if marker.flushed_through < sequence {
+                        batch.delete_cf(&wal_meta_cf, key);
+                        markers_dropped += 1;
+                    }
+                }
+            }
             db.write(batch)
                 .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
+            if markers_dropped > 0 {
+                delete_markers.fetch_sub(markers_dropped, Ordering::AcqRel);
+            }
             truncated_through.fetch_max(sequence, Ordering::AcqRel);
             if ranged
                 && range_deletes_unflushed.fetch_add(1, Ordering::AcqRel) + 1
@@ -693,6 +767,48 @@ impl WalPort for RocksDbWal {
 
     fn set_flushed_through(&self, sequence: u64) {
         self.flushed_through.store(sequence, Ordering::Release);
+    }
+
+    async fn record_delete(&self, marker: &DeleteMarker) -> Result<(), HyperbytedbError> {
+        let mut key = DELETE_MARKER_PREFIX.to_vec();
+        key.extend_from_slice(&u64_to_be_bytes(marker.flushed_through));
+        key.extend_from_slice(&u64_to_be_bytes(
+            self.delete_marker_nonce.fetch_add(1, Ordering::Relaxed),
+        ));
+        let value = serde_json::to_vec(marker).map_err(|e| {
+            HyperbytedbError::Wal(crate::error::ChainedError::with_context(
+                "encode delete marker",
+                e,
+            ))
+        })?;
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            let wal_meta_cf = db
+                .cf_handle(WAL_META_CF)
+                .ok_or_else(|| HyperbytedbError::Wal("wal_meta column family not found".into()))?;
+            db.put_cf(&wal_meta_cf, key, value)
+                .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))
+        })
+        .await
+        .map_err(|e| {
+            HyperbytedbError::Wal(crate::error::ChainedError::with_context(
+                "WAL delete marker task panicked",
+                e,
+            ))
+        })??;
+        self.delete_markers.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    fn delete_markers(&self) -> Result<Vec<DeleteMarker>, HyperbytedbError> {
+        // Truncated past: no entry up to it is left to flush again.
+        let truncated_through = self.truncated_through.load(Ordering::Acquire);
+        Ok(self
+            .markers_at_open
+            .iter()
+            .filter(|m| m.flushed_through >= truncated_through)
+            .cloned()
+            .collect())
     }
 
     fn flushed_margin_start(&self, through: u64, max_bytes: u64) -> u64 {
@@ -824,6 +940,57 @@ mod tests {
         let wal = RocksDbWal::open(dir.path()).unwrap();
         assert_eq!(wal.flushed_through(), wal.last_sequence().await.unwrap());
         assert_eq!(wal.flushed_through(), 5);
+    }
+
+    fn delete_marker(flushed_through: u64) -> DeleteMarker {
+        DeleteMarker {
+            flushed_through,
+            database: "db".into(),
+            retention_policy: "autogen".into(),
+            measurement: "cpu".into(),
+            predicate: "`host` = 'a'".into(),
+        }
+    }
+
+    /// A restart replays a delete while an entry up to its `flushed_through`
+    /// is left to flush again, and not after.
+    #[tokio::test]
+    async fn delete_markers_outlive_a_reopen_until_truncated_past() {
+        let dir = TempDir::new().unwrap();
+        {
+            let wal = RocksDbWal::open(dir.path()).unwrap();
+            for _ in 0..5 {
+                wal.append(cpu_entry(1)).await.unwrap();
+            }
+            wal.record_delete(&delete_marker(4)).await.unwrap();
+            wal.record_delete(&delete_marker(2)).await.unwrap();
+            wal.record_delete(&delete_marker(2)).await.unwrap();
+        }
+        let wal = RocksDbWal::open(dir.path()).unwrap();
+        let kept: Vec<u64> = wal
+            .delete_markers()
+            .unwrap()
+            .iter()
+            .map(|m| m.flushed_through)
+            .collect();
+        assert_eq!(kept, vec![2, 2, 4]);
+        assert_eq!(wal.delete_markers().unwrap()[0], delete_marker(2));
+
+        // Entry 2 is still there: both markers at 2 stay.
+        wal.truncate_before(2).await.unwrap();
+        assert_eq!(wal.delete_markers().unwrap().len(), 3);
+        wal.truncate_before(3).await.unwrap();
+        drop(wal);
+        let wal = RocksDbWal::open(dir.path()).unwrap();
+        assert_eq!(wal.delete_markers().unwrap(), vec![delete_marker(4)]);
+        // One recorded since the open is not replayed by this process.
+        wal.record_delete(&delete_marker(5)).await.unwrap();
+        assert_eq!(wal.delete_markers().unwrap(), vec![delete_marker(4)]);
+        wal.truncate_before(6).await.unwrap();
+        assert!(wal.delete_markers().unwrap().is_empty());
+        drop(wal);
+        let wal = RocksDbWal::open(dir.path()).unwrap();
+        assert!(wal.delete_markers().unwrap().is_empty());
     }
 
     fn memtable_counts(wal: &RocksDbWal) -> (u64, u64) {

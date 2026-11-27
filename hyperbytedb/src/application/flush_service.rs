@@ -69,6 +69,11 @@ pub struct FlushServiceImpl {
     shard_map: Option<Arc<dyn ShardMapPort>>,
     /// Bytes of WAL kept behind the flush in a sharded cluster.
     sharded_wal_retention_bytes: u64,
+    /// Deletes that ran before this process opened the WAL
+    /// ([`WalPort::delete_markers`]), lowest `flushed_through` first. The
+    /// flush starts again from the oldest kept WAL entry, so each is applied
+    /// again once the entries up to its `flushed_through` are flushed again.
+    replay_deletes: std::sync::Mutex<std::collections::VecDeque<crate::ports::wal::DeleteMarker>>,
 }
 
 struct FlushWork {
@@ -103,6 +108,17 @@ impl FlushServiceImpl {
             "flush service batch size configured"
         );
 
+        let replay_deletes = match wal.delete_markers() {
+            Ok(markers) => markers.into(),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "cannot read the WAL's delete markers; rows deleted before the restart may come back"
+                );
+                std::collections::VecDeque::new()
+            }
+        };
+
         Self {
             wal,
             last_flushed: Arc::new(Mutex::new(0)),
@@ -120,6 +136,73 @@ impl FlushServiceImpl {
             sharding_enabled: false,
             shard_map: None,
             sharded_wal_retention_bytes: SHARDED_WAL_RETENTION_BYTES,
+            replay_deletes: std::sync::Mutex::new(replay_deletes),
+        }
+    }
+
+    /// The `flushed_through` of the next delete to replay, if any.
+    fn next_replay_delete(&self) -> Option<u64> {
+        self.replay_deletes
+            .lock()
+            .ok()?
+            .front()
+            .map(|m| m.flushed_through)
+    }
+
+    /// Apply again the replayed deletes whose entries are flushed again, up
+    /// to `cursor`. A delete that fails stays first, for the next flush.
+    async fn replay_deletes_through(&self, cursor: u64) -> Result<(), HyperbytedbError> {
+        loop {
+            let marker = {
+                let Ok(mut queue) = self.replay_deletes.lock() else {
+                    return Ok(());
+                };
+                if queue.front().is_none_or(|m| m.flushed_through > cursor) {
+                    return Ok(());
+                }
+                match queue.pop_front() {
+                    Some(m) => m,
+                    None => return Ok(()),
+                }
+            };
+            if !self.sink.deletes_rows() {
+                continue;
+            }
+            match self
+                .sink
+                .delete_rows(
+                    &marker.database,
+                    &marker.retention_policy,
+                    &marker.measurement,
+                    &marker.predicate,
+                )
+                .await
+            {
+                Ok(()) => tracing::info!(
+                    db = %marker.database,
+                    measurement = %marker.measurement,
+                    flushed_through = marker.flushed_through,
+                    "applied a delete again after flushing the WAL entries before it again"
+                ),
+                Err(e)
+                    if crate::application::schema_mutation_apply::is_unknown_column(
+                        &e.to_string(),
+                    ) =>
+                {
+                    tracing::warn!(
+                        db = %marker.database,
+                        measurement = %marker.measurement,
+                        error = %e,
+                        "replayed delete names columns the table no longer has; skipped"
+                    );
+                }
+                Err(e) => {
+                    if let Ok(mut queue) = self.replay_deletes.lock() {
+                        queue.push_front(marker);
+                    }
+                    return Err(e);
+                }
+            }
         }
     }
 
@@ -564,6 +647,7 @@ impl FlushServiceImpl {
         let mut total_entries_processed = 0u64;
         let start = std::time::Instant::now();
 
+        self.replay_deletes_through(cursor).await?;
         let snapshot_seq = self.wal.last_sequence().await?;
         if snapshot_seq <= cursor {
             return Ok(());
@@ -574,7 +658,13 @@ impl FlushServiceImpl {
         // prepared path would `continue` past the snapshot and fall through to a
         // native `read_range` that always returns empty but still seeks RocksDB.
         while cursor < snapshot_seq {
+            self.replay_deletes_through(cursor).await?;
             let from_seq = cursor + 1;
+            // A chunk stops at the next delete to replay, which runs once
+            // the entries before it are flushed again.
+            let window_end = self
+                .next_replay_delete()
+                .map_or(snapshot_seq, |s| s.min(snapshot_seq));
 
             let wal_read_start = std::time::Instant::now();
             // Bound the native read so a gap in the prepared cache (an entry
@@ -587,7 +677,7 @@ impl FlushServiceImpl {
                 // writes that arrived mid-flush stay cached for the next flush.
                 if let Some(prepared) = self
                     .wal
-                    .take_prepared_range(from_seq, snapshot_seq, WAL_READ_CHUNK)
+                    .take_prepared_range(from_seq, window_end, WAL_READ_CHUNK)
                     .await?
                 {
                     if !prepared.is_empty() {
@@ -615,7 +705,18 @@ impl FlushServiceImpl {
             let wal_read_elapsed = wal_read_start.elapsed();
             histogram!("hyperbytedb_flush_wal_read_seconds", "path" => "native")
                 .record(wal_read_elapsed.as_secs_f64());
+            let entries: Vec<_> = entries
+                .into_iter()
+                .filter(|(seq, _)| *seq <= window_end)
+                .collect();
             if entries.is_empty() {
+                if window_end < snapshot_seq {
+                    // No entry left up to the next replayed delete (the WAL
+                    // was truncated past it): it applies now.
+                    *self.last_flushed.lock().await = window_end;
+                    cursor = window_end;
+                    continue;
+                }
                 break;
             }
 
@@ -623,7 +724,6 @@ impl FlushServiceImpl {
             let mut taken_points = 0usize;
             let entries: Vec<_> = entries
                 .into_iter()
-                .filter(|(seq, _)| *seq <= snapshot_seq)
                 .take_while(|(_, e)| {
                     // Always take one entry, then stop at the budget.
                     let take = taken_points == 0 || taken_points < budget;
@@ -804,6 +904,8 @@ impl FlushServiceImpl {
                 )));
             }
         }
+
+        self.replay_deletes_through(cursor).await?;
 
         if total_entries_processed > 0 {
             let elapsed = start.elapsed();

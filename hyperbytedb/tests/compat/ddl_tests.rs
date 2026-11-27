@@ -1869,3 +1869,99 @@ async fn measurement_written_again_after_drop_keeps_its_fields() {
         .unwrap();
     assert_eq!(values(&ctx, "SELECT value FROM cpu").await, vec![2.0]);
 }
+
+/// A sharded flush service over `ctx`'s WAL. After [`TestContext::reopen_wal`]
+/// it is what a restarted node runs: its cursor starts at 0, so it flushes
+/// the WAL margin again.
+fn sharded_flush(ctx: &TestContext) -> hyperbytedb::application::flush_service::FlushServiceImpl {
+    hyperbytedb::application::flush_service::FlushServiceImpl::new(
+        ctx.wal.clone(),
+        0,
+        ctx.points_sink.clone(),
+    )
+    .with_sharding(true, None, 1)
+}
+
+async fn ingest(ctx: &TestContext, lines: &str) {
+    ctx.ingestion
+        .ingest(
+            "testdb",
+            None,
+            None,
+            lines.as_bytes(),
+            WritePayloadFormat::LineProtocol,
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn deleted_rows_stay_deleted_after_a_restart_reflushes_the_wal() {
+    let Some(mut ctx) = chdb_context() else {
+        return;
+    };
+    ctx.metadata.create_database("testdb").await.unwrap();
+    ingest(
+        &ctx,
+        "cpu,host=a value=1.0 1000000000\ncpu,host=b value=2.0 2000000000",
+    )
+    .await;
+    sharded_flush(&ctx).flush().await.unwrap();
+    assert_eq!(values(&ctx, "SELECT value FROM cpu").await.len(), 2);
+
+    let resp = ctx
+        .query("testdb", "DELETE FROM cpu WHERE host = 'a'")
+        .await
+        .unwrap();
+    assert!(
+        resp.results[0].error.is_none(),
+        "{:?}",
+        resp.results[0].error
+    );
+    assert_eq!(values(&ctx, "SELECT value FROM cpu").await, vec![2.0]);
+
+    ctx.reopen_wal().unwrap();
+    sharded_flush(&ctx).flush().await.unwrap();
+    assert_eq!(
+        values(&ctx, "SELECT value FROM cpu").await,
+        vec![2.0],
+        "deleted row came back after the restart re-flush"
+    );
+}
+
+#[tokio::test]
+#[serial(chdb)]
+async fn a_row_written_after_a_delete_survives_the_restart_reflush() {
+    let Some(mut ctx) = chdb_context() else {
+        return;
+    };
+    ctx.metadata.create_database("testdb").await.unwrap();
+    ingest(
+        &ctx,
+        "cpu,host=a value=1.0 1000000000\ncpu,host=b value=2.0 2000000000",
+    )
+    .await;
+    let flush = sharded_flush(&ctx);
+    flush.flush().await.unwrap();
+
+    let resp = ctx
+        .query("testdb", "DELETE FROM cpu WHERE host = 'a'")
+        .await
+        .unwrap();
+    assert!(
+        resp.results[0].error.is_none(),
+        "{:?}",
+        resp.results[0].error
+    );
+    ingest(&ctx, "cpu,host=a value=3.0 3000000000").await;
+    flush.flush().await.unwrap();
+    drop(flush);
+    assert_eq!(values(&ctx, "SELECT value FROM cpu").await, vec![2.0, 3.0]);
+
+    // Restart: the replay re-applies the delete after the rows before it,
+    // and the row written after it is flushed again on top.
+    ctx.reopen_wal().unwrap();
+    sharded_flush(&ctx).flush().await.unwrap();
+    assert_eq!(values(&ctx, "SELECT value FROM cpu").await, vec![2.0, 3.0]);
+}
