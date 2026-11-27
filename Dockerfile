@@ -17,7 +17,10 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 ENV CARGO_INCREMENTAL=0
 
-RUN curl -sL https://lib.chdb.io | bash
+# Pinned with .github/scripts/rust-container-setup.sh: the installer takes
+# the latest release otherwise, and v26.11.1 crashes the test binary.
+ARG LIBCHDB_VERSION=v26.9.0
+RUN curl -sL https://lib.chdb.io | INSTALL_VERSION=${LIBCHDB_VERSION} bash
 
 # NOTE: this image builds from the PARENT directory as its context (the dir
 # containing both `hyperbytedb/` and `chdb-rust/`), because hyperbytedb depends
