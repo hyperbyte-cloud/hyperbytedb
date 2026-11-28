@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::domain::cluster::types::MutationRequest;
 use crate::error::HyperbytedbError;
+use crate::ports::replication::OutboundReplicationBatch;
 
 const REPL_CF: &str = "replication";
 const HINTED_HANDOFF_CF: &str = "hinted_handoff";
@@ -21,6 +22,11 @@ fn mutation_log_key(seq: u64) -> Vec<u8> {
 
 fn mutation_ack_key(peer_id: u64) -> Vec<u8> {
     format!("mutation_ack:{}", peer_id).into_bytes()
+}
+
+fn outbox_id(key: &[u8]) -> Option<u64> {
+    let hex = std::str::from_utf8(key).ok()?.strip_prefix("outbox:")?;
+    u64::from_str_radix(hex, 16).ok()
 }
 
 fn applied_mutation_key(origin_node_id: u64) -> Vec<u8> {
@@ -38,7 +44,29 @@ pub struct ReplicationLog {
     mutation_seq: AtomicU64,
     /// Tracks the last applied mutation seq per origin node for deduplication.
     applied_mutation_seqs: Mutex<HashMap<u64, u64>>,
+    /// Id of the newest outbox entry written.
+    outbox_seq: AtomicU64,
+    /// `outbox_seq` as found on open: entries up to it were left by an
+    /// earlier process, which stopped before their sends settled.
+    outbox_recovery_bound: u64,
 }
+
+const OUTBOX_PREFIX: &[u8] = b"outbox:";
+
+fn outbox_key(id: u64) -> Vec<u8> {
+    format!("outbox:{id:016x}").into_bytes()
+}
+
+/// An outbox value: database, retention policy, precision, body, targets,
+/// region. The WAL sequence only drives coalescing, so it is not kept.
+type OutboxRecord = (
+    String,
+    String,
+    Option<String>,
+    Vec<u8>,
+    Option<Vec<u64>>,
+    Option<u64>,
+);
 
 impl ReplicationLog {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, HyperbytedbError> {
@@ -125,11 +153,104 @@ impl ReplicationLog {
             map
         };
 
+        let outbox_seq = {
+            let cf = db
+                .cf_handle(REPL_CF)
+                .ok_or_else(|| HyperbytedbError::Internal("replication CF not found".into()))?;
+            db.iterator_cf_opt(
+                &cf,
+                rocksdb::ReadOptions::default(),
+                IteratorMode::From(OUTBOX_PREFIX, rocksdb::Direction::Forward),
+            )
+            .flatten()
+            .take_while(|(key, _)| key.starts_with(OUTBOX_PREFIX))
+            .filter_map(|(key, _)| outbox_id(&key))
+            .max()
+            .unwrap_or(0)
+        };
+
         Ok(Self {
             db,
             mutation_seq: AtomicU64::new(mutation_seq),
             applied_mutation_seqs: Mutex::new(applied_mutation_seqs),
+            outbox_seq: AtomicU64::new(outbox_seq),
+            outbox_recovery_bound: outbox_seq,
         })
+    }
+
+    /// Record a batch this node still owes its peers. An async write is
+    /// acked before it is sent, so without this a crash forgot the sends.
+    pub fn outbox_put(&self, batch: &OutboundReplicationBatch) -> Result<u64, HyperbytedbError> {
+        let cf = self
+            .db
+            .cf_handle(REPL_CF)
+            .ok_or_else(|| HyperbytedbError::Internal("replication CF not found".into()))?;
+        let value = bincode::serialize(&(
+            &batch.database,
+            &batch.retention_policy,
+            &batch.precision,
+            &batch.body,
+            &batch.target_node_ids,
+            &batch.region_id,
+        ))
+        .map_err(|e| HyperbytedbError::Internal(format!("encode outbox entry: {e}").into()))?;
+        let id = self.outbox_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        self.db
+            .put_cf(&cf, outbox_key(id), value)
+            .map_err(|e| HyperbytedbError::Internal(format!("write outbox entry: {e}").into()))?;
+        Ok(id)
+    }
+
+    /// Forget an entry whose batch was delivered or hinted. A failure only
+    /// means it is sent again after a restart, so it is logged, not returned.
+    pub fn outbox_remove(&self, id: u64) {
+        let Some(cf) = self.db.cf_handle(REPL_CF) else {
+            return;
+        };
+        if let Err(e) = self.db.delete_cf(&cf, outbox_key(id)) {
+            tracing::warn!(id, error = %e, "failed to delete outbox entry");
+        }
+    }
+
+    /// The oldest entry after `after` that an earlier process left behind.
+    pub fn next_recoverable_outbox_entry(
+        &self,
+        after: u64,
+    ) -> Result<Option<(u64, OutboundReplicationBatch)>, HyperbytedbError> {
+        let cf = self
+            .db
+            .cf_handle(REPL_CF)
+            .ok_or_else(|| HyperbytedbError::Internal("replication CF not found".into()))?;
+        let start = outbox_key(after.saturating_add(1));
+        let mut iter = self.db.iterator_cf_opt(
+            &cf,
+            rocksdb::ReadOptions::default(),
+            IteratorMode::From(&start, rocksdb::Direction::Forward),
+        );
+        let Some(item) = iter.next() else {
+            return Ok(None);
+        };
+        let (key, value) =
+            item.map_err(|e| HyperbytedbError::Internal(format!("read outbox: {e}").into()))?;
+        let Some(id) = outbox_id(&key).filter(|id| *id <= self.outbox_recovery_bound) else {
+            return Ok(None);
+        };
+        let (database, retention_policy, precision, body, target_node_ids, region_id) =
+            bincode::deserialize::<OutboxRecord>(&value).map_err(|e| {
+                HyperbytedbError::Internal(format!("decode outbox entry {id}: {e}").into())
+            })?;
+        Ok(Some((
+            id,
+            OutboundReplicationBatch {
+                database,
+                retention_policy,
+                precision,
+                body,
+                wal_seq: 0,
+                target_node_ids,
+                region_id,
+            },
+        )))
     }
 
     /// Shared RocksDB handle, used by [`HintedHandoff`] to share the same

@@ -36,8 +36,9 @@ pub struct PeerClient {
     node_id: u64,
     node_addr: String,
     max_retries: u32,
-    outbound_tx: tokio::sync::mpsc::Sender<OutboundReplicationBatch>,
-    outbound_rx: Mutex<Option<tokio::sync::mpsc::Receiver<OutboundReplicationBatch>>>,
+    /// Each batch with its outbox entry's id.
+    outbound_tx: tokio::sync::mpsc::Sender<(u64, OutboundReplicationBatch)>,
+    outbound_rx: Mutex<Option<tokio::sync::mpsc::Receiver<(u64, OutboundReplicationBatch)>>>,
     outbound_started: AtomicBool,
     batch_semaphore: Arc<Semaphore>,
     max_coalesce_body_bytes: usize,
@@ -125,7 +126,7 @@ impl PeerClient {
         let depth = outbound_queue_depth.max(1);
         let client = peer_http_client(&cluster_auth);
         let (outbound_tx, outbound_rx) =
-            tokio::sync::mpsc::channel::<OutboundReplicationBatch>(depth);
+            tokio::sync::mpsc::channel::<(u64, OutboundReplicationBatch)>(depth);
         let inflight = max_inflight_batches.max(1);
 
         Self {
@@ -220,17 +221,19 @@ impl PeerClient {
 
     async fn outbound_loop(
         self: Arc<Self>,
-        mut rx: tokio::sync::mpsc::Receiver<OutboundReplicationBatch>,
+        mut rx: tokio::sync::mpsc::Receiver<(u64, OutboundReplicationBatch)>,
     ) {
-        while let Some(first) = rx.recv().await {
+        while let Some((first_id, first)) = rx.recv().await {
             // Each job was counted when queued; this round's guard releases
             // them once sent (or hinted).
             // Take everything already queued, up to one request's worth.
             let mut bytes = first.body.len();
             let mut jobs = vec![first];
+            let mut outbox_ids = vec![first_id];
             while bytes < self.max_coalesce_body_bytes && jobs.len() < MAX_PARTS_PER_ROUND {
                 match rx.try_recv() {
-                    Ok(next) => {
+                    Ok((id, next)) => {
+                        outbox_ids.push(id);
                         bytes = bytes.saturating_add(next.body.len());
                         jobs.push(next);
                     }
@@ -250,6 +253,10 @@ impl PeerClient {
             let this = Arc::clone(&self);
             tokio::spawn(async move {
                 this.replicate_round(jobs).await;
+                // Every peer has these now, or has a durable hint for them.
+                for id in outbox_ids {
+                    this.replication_log.outbox_remove(id);
+                }
                 drop(permit);
                 drop(queued);
             });
@@ -500,6 +507,8 @@ impl PeerClient {
     }
 
     /// Fan out a line-protocol batch to all active peers (bounded queue + coalescing worker).
+    /// The batch is written to the outbox first, and stays there until it is
+    /// sent or hinted: see [`Self::recover_outbox`].
     /// Non-blocking: if the outbound queue is full, batches are enqueued to hinted-handoff
     /// for each replication peer instead of being dropped.
     pub fn replicate_write(
@@ -507,12 +516,13 @@ impl PeerClient {
         batch: OutboundReplicationBatch,
     ) -> Result<(), HyperbytedbError> {
         self.start_outbound_processor();
+        let outbox_id = self.replication_log.outbox_put(&batch)?;
         // Counted before it is queued: the processor may take it at once.
         // Released by the round that sends it ([`Self::outbound_loop`]).
         std::mem::forget(self.inflight.track(1));
-        match self.outbound_tx.try_send(batch) {
+        match self.outbound_tx.try_send((outbox_id, batch)) {
             Ok(()) => Ok(()),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(batch)) => {
+            Err(tokio::sync::mpsc::error::TrySendError::Full((_, batch))) => {
                 // Not queued after all: held instead until it is hinted.
                 let queued = InFlightGuard {
                     inflight: Arc::clone(&self.inflight),
@@ -527,12 +537,15 @@ impl PeerClient {
                 }
                 let this = Arc::clone(self);
                 tokio::spawn(async move {
-                    if let Err(e) = this.enqueue_batch_to_hinted_handoff(batch).await {
-                        tracing::error!(
-                            error = %e,
-                            "replication outbound queue full and hinted handoff enqueue failed"
-                        );
-                        counter!("hyperbytedb_replication_queue_drops_total").increment(1);
+                    match this.enqueue_batch_to_hinted_handoff(batch).await {
+                        Ok(()) => this.replication_log.outbox_remove(outbox_id),
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                "replication outbound queue full and hinted handoff enqueue failed"
+                            );
+                            counter!("hyperbytedb_replication_queue_drops_total").increment(1);
+                        }
                     }
                     drop(queued);
                 });
@@ -549,6 +562,41 @@ impl PeerClient {
                     "replication outbound queue closed".into(),
                 ))
             }
+        }
+    }
+
+    /// Turn the batches an earlier process acked but had not finished
+    /// sending into hints. A peer that already got one gets it again.
+    ///
+    /// False when it must be called again: no peer is known yet, or a hint
+    /// could not be written.
+    pub async fn recover_outbox(self: &Arc<Self>) -> bool {
+        let mut after = 0u64;
+        loop {
+            let (id, batch) = match self.replication_log.next_recoverable_outbox_entry(after) {
+                Ok(Some(entry)) => entry,
+                Ok(None) => return true,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to read replication outbox");
+                    return false;
+                }
+            };
+            // Resolving against an empty membership would drop the entry.
+            if self
+                .membership
+                .read()
+                .await
+                .replication_peers(self.node_id)
+                .is_empty()
+            {
+                return false;
+            }
+            if let Err(e) = self.enqueue_batch_to_hinted_handoff(batch).await {
+                tracing::error!(error = %e, "failed to hint a recovered replication batch");
+                return false;
+            }
+            self.replication_log.outbox_remove(id);
+            after = id;
         }
     }
 
@@ -1565,6 +1613,54 @@ mod replicate_batch_tests {
         assert_eq!(hh.pending_count(3).unwrap(), 1, "the region's replica");
         assert_eq!(hh.pending_count(2).unwrap(), 0, "not a replica of region 2");
         assert_eq!(hh.pending_count(4).unwrap(), 0, "not a replica of region 2");
+    }
+
+    /// A node killed with acked batches still unsent hints them when it
+    /// starts again.
+    #[tokio::test]
+    async fn batches_unsent_at_a_crash_are_hinted_after_restart() {
+        let mut m = ClusterMembership::new();
+        for id in 2..=3 {
+            m.add_node(node(id, "127.0.0.1:1"));
+        }
+        let membership = crate::domain::cluster::membership::new_shared(m);
+        let dir = tempfile::tempdir().unwrap();
+        let open = |membership: SharedMembership| {
+            let log = Arc::new(ReplicationLog::open(dir.path()).unwrap());
+            let hh = Arc::new(HintedHandoff::new(log.db().clone(), 100).unwrap());
+            let pc = PeerClient::new(
+                1,
+                "127.0.0.1:1".into(),
+                membership,
+                log,
+                3,
+                8,
+                2,
+                1 << 20,
+                Default::default(),
+            )
+            .with_hinted_handoff(hh.clone());
+            (Arc::new(pc), hh)
+        };
+        {
+            let (pc, _hh) = open(membership.clone());
+            // No consumer: the process dies with the batch still queued.
+            pc.outbound_started.store(true, Ordering::SeqCst);
+            PeerClient::replicate_write(&pc, job(1, vec![3])).unwrap();
+        }
+
+        let empty = crate::domain::cluster::membership::new_shared(ClusterMembership::new());
+        let (pc, hh) = open(empty);
+        assert!(!pc.recover_outbox().await, "no peers known yet");
+        assert_eq!(hh.total_pending().unwrap(), 0);
+        drop((pc, hh));
+
+        let (pc, hh) = open(membership);
+        assert!(pc.recover_outbox().await);
+        assert_eq!(hh.pending_count(3).unwrap(), 1);
+        assert_eq!(hh.pending_count(2).unwrap(), 0, "not one of its targets");
+        assert!(pc.recover_outbox().await);
+        assert_eq!(hh.total_pending().unwrap(), 1, "hinted once");
     }
 
     /// Shutdown waits on sends to a down peer. Backing off 1 s, 2 s, 4 s,
