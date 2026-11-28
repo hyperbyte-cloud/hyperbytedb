@@ -173,7 +173,10 @@ pub async fn start_sharded_node(
         location_cache: location_cache.clone(),
         config: opts.sharding.clone(),
         node_id,
-        peer_client: peer_client.clone(),
+        peer_rpc: Arc::new(
+            hyperbytedb::adapters::cluster::http_peer_rpc::HttpPeerRpc::new(peer_client.clone()),
+        ),
+        membership: peer_client.membership().clone(),
         region_write_stats: Arc::new(hyperbytedb::application::runtime::RegionWriteStats::new()),
         forward_coalescer: Default::default(),
         runtime_settings: runtime_settings.clone(),
@@ -254,12 +257,7 @@ pub async fn start_sharded_node(
     ingestion_svc.spawn_forward_drainer();
     let ingestion: Arc<dyn hyperbytedb::ports::ingestion::IngestionPort> = ingestion_svc;
 
-    let peer_query = PeerQueryService::new(
-        base_query,
-        metadata.clone(),
-        peer_client.clone(),
-        peer_client.cluster_auth(),
-    );
+    let peer_query = PeerQueryService::new(base_query, metadata.clone(), peer_client.clone());
     peer_query.set_shard_routing(shard_routing.clone());
     let query: Arc<dyn QueryService> = Arc::new(peer_query);
 
@@ -271,8 +269,20 @@ pub async fn start_sharded_node(
             hyperbytedb::application::shard_scheduler::ShardScheduler::new(
                 shard_map.clone(),
                 shared_membership.clone(),
-                raft,
-                Some(peer_client.clone()),
+                Arc::new(
+                    hyperbytedb::adapters::cluster::raft::consensus::RaftConsensus::new(
+                        raft,
+                        Arc::new(
+                            hyperbytedb::adapters::cluster::http_peer_rpc::HttpPeerRpc::new(
+                                peer_client.clone(),
+                            ),
+                        ),
+                        Some(shared_membership.clone()),
+                    ),
+                ),
+                Some(hyperbytedb::adapters::cluster::http_peer_rpc::peers_for(
+                    peer_client.clone(),
+                )),
                 metadata.clone(),
                 wal.clone(),
                 Some(chdb_adapter.clone() as Arc<dyn QueryPort>),

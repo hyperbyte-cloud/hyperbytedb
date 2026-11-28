@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::adapters::cluster::peer_client::PeerClient;
+use crate::adapters::cluster::peer_http::PeerHttp;
 use crate::domain::cluster::membership::{NodeState, SharedMembership};
-use crate::ports::peer_http::PeerHttp;
 
 /// Polls membership state periodically: when a previously-disconnected
 /// peer transitions to Active, drain the hinted handoff queue for that peer

@@ -1,10 +1,11 @@
 pub mod auth;
+pub mod consensus;
 pub mod flush;
 pub mod forward_queue;
 pub mod ingestion;
 pub mod leadership;
 pub mod metadata;
-pub mod peer_http;
+pub mod peer_rpc;
 pub mod points_sink;
 pub mod query;
 pub mod replication;

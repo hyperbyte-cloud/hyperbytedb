@@ -5,8 +5,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use metrics::counter;
 use tokio::sync::watch;
 
-use crate::adapters::cluster::peer_client::PeerClient;
-use crate::adapters::cluster::raft::HyperbytedbRaft;
 use crate::application::runtime_settings as rs;
 use crate::application::shard_peer_resolution::is_active_peer;
 use crate::application::shard_routing::effective_replication_factor;
@@ -23,7 +21,9 @@ use crate::domain::sharding::{
     MeasurementKey, ShardMap, ShardMapOp, ShardRegion, ShardRehomeRequest,
 };
 use crate::error::HyperbytedbError;
+use crate::ports::consensus::ConsensusPort;
 use crate::ports::metadata::MetadataPort;
+use crate::ports::peer_rpc::{PeerRpc, Peers};
 use crate::ports::query::QueryPort;
 use crate::ports::sharding::ShardMapPort;
 use crate::ports::wal::WalPort;
@@ -253,8 +253,8 @@ pub struct ShardScheduler {
     runtime_settings: Arc<rs::RuntimeSettings>,
     shard_map: Arc<dyn ShardMapPort>,
     membership: SharedMembership,
-    raft: HyperbytedbRaft,
-    peer_client: Option<Arc<PeerClient>>,
+    consensus: Arc<dyn ConsensusPort>,
+    peers: Option<Peers>,
     metadata: Arc<dyn MetadataPort>,
     wal: Arc<dyn WalPort>,
     query_port: Option<Arc<dyn QueryPort>>,
@@ -346,8 +346,8 @@ impl ShardScheduler {
     pub fn new(
         shard_map: Arc<dyn ShardMapPort>,
         membership: SharedMembership,
-        raft: HyperbytedbRaft,
-        peer_client: Option<Arc<PeerClient>>,
+        consensus: Arc<dyn ConsensusPort>,
+        peers: Option<Peers>,
         metadata: Arc<dyn MetadataPort>,
         wal: Arc<dyn WalPort>,
         query_port: Option<Arc<dyn QueryPort>>,
@@ -363,8 +363,8 @@ impl ShardScheduler {
             runtime_settings,
             shard_map,
             membership,
-            raft,
-            peer_client,
+            consensus,
+            peers,
             metadata,
             wal,
             query_port,
@@ -423,11 +423,11 @@ impl ShardScheduler {
         peer: u64,
         addr: &str,
         cluster_ver: u64,
-        pc: &PeerClient,
+        peers: &Peers,
     ) -> Option<(u64, u64)> {
         let cell = self.probe_cell(&self.peer_map_versions, peer).await;
         *cell
-            .get_or_init(|| self.probe_peer_map_version(peer, addr, cluster_ver, pc))
+            .get_or_init(|| self.probe_peer_map_version(peer, addr, cluster_ver, peers))
             .await
     }
 
@@ -454,9 +454,15 @@ impl ShardScheduler {
         peer: u64,
         addr: &str,
         cluster_ver: u64,
-        pc: &PeerClient,
+        peers: &Peers,
     ) -> Option<(u64, u64)> {
-        match pc.fetch_map_version(addr).await {
+        // 10 s: the pooled peer client's default, which this probe used.
+        match peers
+            .rpc
+            .shard_map(addr, Duration::from_secs(10))
+            .await
+            .map(|m| m.map_version)
+        {
             Ok(version) => Some((version, cluster_ver)),
             Err(e) => {
                 // Warn, not debug: the shipped image pins the log level to
@@ -848,8 +854,7 @@ impl ShardScheduler {
         if self.test_force_leader {
             return true;
         }
-        let metrics = self.raft.metrics().borrow().clone();
-        metrics.current_leader == Some(self.node_id)
+        self.consensus.is_leader(self.node_id)
     }
 
     /// Tick on `interval` while leader. Placement moves run in a background
@@ -1386,7 +1391,7 @@ impl ShardScheduler {
         key: &MeasurementKey,
         region: &ShardRegion,
     ) -> Option<(MoveTier, PlacementStep)> {
-        if self.is_rollup_dest(key).await || self.peer_client.is_none() {
+        if self.is_rollup_dest(key).await || self.peers.is_none() {
             return None;
         }
         let map = self.shard_map.snapshot().await.ok()?;
@@ -1539,13 +1544,8 @@ impl ShardScheduler {
             return Ok(());
         }
 
-        let new_primary = pick_best_primary(
-            &self.membership,
-            region,
-            self.node_id,
-            self.peer_client.as_deref(),
-        )
-        .await;
+        let new_primary =
+            pick_best_primary(&self.membership, region, self.node_id, self.peers.as_ref()).await;
         let Some(new_primary) = new_primary else {
             // No serving peer survives. If a learner does, promote it and hand
             // it primacy in the same tick rather than leaving the region with
@@ -1603,7 +1603,7 @@ impl ShardScheduler {
         // watermark lags the best known for this region. Moving primary to a
         // data-less node converts a visible availability blip into silent
         // empty reads; blocking keeps reads routed at whoever holds the data.
-        if self.peer_client.is_some() {
+        if self.peers.is_some() {
             let progress = self.region_progress_for_peers(region).await;
             // `flatten` drops unknowns rather than reading them as 0: only
             // progress we actually heard take part in the comparison.
@@ -1930,7 +1930,7 @@ impl ShardScheduler {
         if self.rollup_dests.read().await.is_empty() {
             return true;
         }
-        let Some(pc) = self.peer_client.clone() else {
+        let Some(peers) = self.peers.clone() else {
             return true;
         };
         let mut handoffs = self.rollup_handoffs.lock().await;
@@ -1961,23 +1961,22 @@ impl ShardScheduler {
             let req = crate::application::mv_handoff::MvHandoffRequest {
                 to_addr: to.clone(),
             };
-            let result = pc
-                .http_client()
-                .post(format!("http://{from}/internal/mv/handoff"))
-                .json(&req)
-                .timeout(Duration::from_secs(30 * 60))
-                .send()
+            let result = peers
+                .rpc
+                .mv_handoff(&from, &req, Duration::from_secs(30 * 60))
                 .await;
             let mut handoffs = handoffs.lock().await;
             let state = handoffs.entry(node_id).or_default();
             state.running = false;
             match result {
-                Ok(resp) if resp.status().is_success() => {
+                Ok(()) => {
                     state.done = true;
                     tracing::info!(node_id, to = %to, "view rollups handed off");
                 }
                 // A node too old to hand off: it leaves as before.
-                Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
+                Err(crate::domain::cluster::peer_rpc::PeerRpcError::Status {
+                    code: 404, ..
+                }) => {
                     state.done = true;
                     tracing::warn!(
                         node_id,
@@ -1986,8 +1985,12 @@ impl ShardScheduler {
                 }
                 other => {
                     let why = match other {
-                        Ok(resp) => format!("status {}", resp.status()),
+                        Err(crate::domain::cluster::peer_rpc::PeerRpcError::Status {
+                            code,
+                            ..
+                        }) => format!("status {code}"),
                         Err(e) => e.to_string(),
+                        Ok(()) => String::new(),
                     };
                     let since = *state
                         .failing_since
@@ -2059,7 +2062,7 @@ impl ShardScheduler {
         }
         // No peer client means nothing can be staged; skip quietly rather than
         // erroring every tick.
-        if self.peer_client.is_none() {
+        if self.peers.is_none() {
             return Ok(false);
         }
         // Re-read: earlier steps of the tick can bump epochs, so the caller's
@@ -2218,7 +2221,7 @@ impl ShardScheduler {
                         "promoting despite watermark guard: primary is departing"
                     );
                 }
-                if !evacuating && self.peer_client.is_some() {
+                if !evacuating && self.peers.is_some() {
                     let progress = self.region_progress_for_peers(region).await;
                     let candidate_p = progress.get(&new_primary).copied().flatten();
                     let best_p = progress.values().copied().flatten().max();
@@ -2288,12 +2291,12 @@ impl ShardScheduler {
         to_peer: u64,
         max_bytes_per_sec: u64,
     ) -> Result<u64, HyperbytedbError> {
-        let Some(pc) = self.peer_client.as_ref() else {
+        let Some(peers) = self.peers.as_ref() else {
             return Err(HyperbytedbError::ShardMap("no peer client".into()));
         };
         if region.primary == self.node_id {
             let outcome = stage_region_transfer_data(
-                pc,
+                peers,
                 &self.metadata,
                 &self.wal,
                 self.query_port.as_ref(),
@@ -2320,7 +2323,7 @@ impl ShardScheduler {
             // counter, and its only error log was the `debug!` in the tick. A
             // leader failing to stage onto every region's primary was silent.
             match request_region_stage(
-                pc.as_ref(),
+                peers.rpc.as_ref(),
                 &self.membership,
                 region.primary,
                 key,
@@ -2354,7 +2357,7 @@ impl ShardScheduler {
         cluster_ver: u64,
         candidates: &[(u64, String)],
     ) -> Option<u64> {
-        let pc = self.peer_client.as_ref()?;
+        let peers = self.peers.as_ref()?;
         // Preserve the original accounting: no candidates is not a stall.
         if candidates.is_empty() {
             self.clear_placement_stall(region_id).await;
@@ -2362,7 +2365,7 @@ impl ShardScheduler {
         }
         for (id, addr) in candidates {
             let Some((ver, probed_against)) = self
-                .cached_peer_map_version(*id, addr, cluster_ver, pc)
+                .cached_peer_map_version(*id, addr, cluster_ver, peers)
                 .await
             else {
                 continue;
@@ -2408,7 +2411,7 @@ impl ShardScheduler {
         {
             return Ok(());
         }
-        if self.peer_client.is_none() {
+        if self.peers.is_none() {
             return Ok(());
         }
 
@@ -2491,17 +2494,16 @@ impl ShardScheduler {
         use crate::domain::cluster::raft_request::ClusterRequest;
         let req = ClusterRequest::ShardMapMutation(Box::new(op));
         let resp = self
-            .raft
-            .client_write(req)
+            .consensus
+            .propose(req)
             .await
             .map_err(|e| HyperbytedbError::ShardMap(e.to_string().into()))?;
         // Committed is not applied: the apply can refuse the op (a stale
         // epoch, say), and that was read as success. A refused Merge was
         // counted and retried every tick for 20 hours on n3, 72,541 times.
-        if !resp.data.ok {
+        if !resp.ok {
             return Err(HyperbytedbError::ShardMap(
-                resp.data
-                    .message
+                resp.message
                     .unwrap_or_else(|| "shard map op refused".into())
                     .into(),
             ));
@@ -2522,39 +2524,27 @@ const REHOME_MAX_SECS: u64 = 6 * 3600;
 /// on total time: a large region under write load took longer than any fixed
 /// total, and each timeout threw the copy away to start again from nothing.
 async fn post_rehome(
-    http: &reqwest::Client,
-    url: &str,
+    rpc: &dyn PeerRpc,
+    addr: &str,
     req: &ShardRehomeRequest,
     idle: Duration,
 ) -> Result<serde_json::Value, HyperbytedbError> {
-    use crate::domain::sharding::types::REHOME_PROGRESS_HEADER;
-    let unreachable = |e: String| HyperbytedbError::PeerUnreachable(format!("{url}: {e}"));
-    let mut resp = http
-        .post(url)
-        .header(REHOME_PROGRESS_HEADER, "1")
-        .json(req)
-        .timeout(Duration::from_secs(REHOME_MAX_SECS))
-        .send()
+    use crate::domain::cluster::peer_rpc::PeerRpcError;
+    let body = match rpc
+        .shard_rehome(addr, req, idle, Duration::from_secs(REHOME_MAX_SECS))
         .await
-        .map_err(|e| unreachable(e.to_string()))?;
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        return Err(HyperbytedbError::TransferRejected {
-            status,
-            reason: crate::application::shard_transfer::rejection_reason(resp).await,
-        });
-    }
-    let mut raw = Vec::new();
-    loop {
-        match tokio::time::timeout(idle, resp.chunk()).await {
-            Err(_) => return Err(unreachable(format!("rehome silent for {idle:?}"))),
-            Ok(Err(e)) => return Err(unreachable(e.to_string())),
-            Ok(Ok(None)) => break,
-            Ok(Ok(Some(chunk))) => raw.extend_from_slice(&chunk),
+    {
+        Ok(body) => body,
+        Err(PeerRpcError::Status { code, body }) => {
+            return Err(HyperbytedbError::TransferRejected {
+                status: code,
+                reason: crate::application::shard_transfer::rejection_reason(&body),
+            });
         }
-    }
-    let body: serde_json::Value =
-        serde_json::from_slice(&raw).map_err(|e| unreachable(format!("rehome result: {e}")))?;
+        Err(PeerRpcError::Unreachable(e)) => {
+            return Err(HyperbytedbError::PeerUnreachable(format!("{addr}: {e}")));
+        }
+    };
     // Streamed results carry their status in the body: the 200 went out
     // before the copy finished.
     let status = body
@@ -2699,7 +2689,7 @@ pub fn current_region<'a>(
 /// Ask the current primary to stage `[start, end)` onto a joiner that is
 /// not yet a committed peer.
 async fn request_region_stage(
-    peer_client: &PeerClient,
+    rpc: &dyn PeerRpc,
     membership: &SharedMembership,
     target_node: u64,
     key: &MeasurementKey,
@@ -2729,13 +2719,7 @@ async fn request_region_stage(
         // Accepted and ignored by the receiver; retained only for wire compat.
         dest_skip_wal_through: 0,
     };
-    let body = post_rehome(
-        peer_client.http_client(),
-        &format!("http://{addr}/internal/shard/rehome"),
-        &req,
-        Duration::from_secs(REHOME_IDLE_SECS),
-    )
-    .await?;
+    let body = post_rehome(rpc, &addr, &req, Duration::from_secs(REHOME_IDLE_SECS)).await?;
     // Bytes, not points: the budget is a bandwidth throttle. An older peer that
     // does not report `bytes` contributes 0 rather than a point count —
     // under-charging is a convergence-rate cost, while charging points as if
@@ -2747,7 +2731,7 @@ async fn pick_best_primary(
     membership: &SharedMembership,
     region: &ShardRegion,
     self_id: u64,
-    peer_client: Option<&PeerClient>,
+    peers: Option<&Peers>,
 ) -> Option<u64> {
     let m = membership.read().await;
     let candidates: Vec<u64> = region
@@ -2771,11 +2755,11 @@ async fn pick_best_primary(
         return None;
     }
 
-    if let Some(pc) = peer_client {
+    if let Some(peers) = peers {
         let wms = futures::future::join_all(candidates.iter().map(|&candidate| async move {
             (
                 candidate,
-                peer_region_wal_watermark(pc, candidate, region.region_id).await,
+                peer_region_wal_watermark(peers, candidate, region.region_id).await,
             )
         }))
         .await;
@@ -2807,23 +2791,16 @@ async fn pick_best_primary(
 /// not reach this node" is not "this node has applied nothing". Collapsing
 /// them let one timed-out probe read as a data-less candidate, which the
 /// promotion guard then acted on.
-async fn peer_region_wal_watermark(
-    peer_client: &PeerClient,
-    peer_id: u64,
-    region_id: u64,
-) -> Option<u64> {
-    let membership = peer_client.membership().read().await;
+async fn peer_region_wal_watermark(peers: &Peers, peer_id: u64, region_id: u64) -> Option<u64> {
+    let membership = peers.membership.read().await;
     let addr = membership.get_node(peer_id)?.addr.clone();
     drop(membership);
 
-    let url = format!("http://{addr}/internal/sync/manifest");
-    let Ok(resp) = peer_client.http_client().get(&url).send().await else {
-        return None;
-    };
-    let Ok(body) = resp.text().await else {
-        return None;
-    };
-    let Ok(manifest) = serde_json::from_str::<crate::domain::cluster::sync::SyncManifest>(&body)
+    // 10 s: the pooled peer client's default, which this probe used.
+    let Ok(manifest) = peers
+        .rpc
+        .sync_manifest(&addr, Duration::from_secs(10))
+        .await
     else {
         return None;
     };
@@ -2932,6 +2909,7 @@ impl Drop for ClearOnDrop<'_> {
 
 #[cfg(test)]
 mod tests {
+    use crate::adapters::cluster::peer_client::PeerClient;
     /// Seconds since the epoch, for regions' `transfer_first_seen`.
     fn now_unix() -> i64 {
         std::time::SystemTime::now()
@@ -2940,6 +2918,22 @@ mod tests {
     }
 
     use super::*;
+
+    fn test_consensus(
+        raft: crate::adapters::cluster::raft::HyperbytedbRaft,
+    ) -> Arc<dyn ConsensusPort> {
+        Arc::new(
+            crate::adapters::cluster::raft::consensus::RaftConsensus::new(
+                raft,
+                Arc::new(
+                    crate::adapters::cluster::http_peer_rpc::HttpPeerRpc::with_client(
+                        reqwest::Client::new(),
+                    ),
+                ),
+                None,
+            ),
+        )
+    }
     use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
     use crate::domain::cluster::membership::{ClusterMembership, NodeInfo, new_shared};
     use crate::domain::sharding::ShardEpoch;
@@ -3272,7 +3266,7 @@ mod tests {
         let scheduler = ShardScheduler::new(
             shard_map,
             bootstrap.membership.clone(),
-            raft,
+            test_consensus(raft),
             None,
             metadata,
             wal,
@@ -3421,7 +3415,7 @@ mod tests {
         let scheduler = ShardScheduler::new(
             shard_map,
             bootstrap.membership.clone(),
-            raft,
+            test_consensus(raft),
             None,
             metadata,
             wal,
@@ -3562,7 +3556,7 @@ mod tests {
         let scheduler = ShardScheduler::new(
             shard_map,
             bootstrap.membership.clone(),
-            raft,
+            test_consensus(raft),
             None,
             metadata,
             wal,
@@ -4016,8 +4010,10 @@ mod tests {
             let scheduler = ShardScheduler::new(
                 shard_map,
                 bootstrap.membership.clone(),
-                raft,
-                Some(peer_client),
+                test_consensus(raft),
+                Some(crate::adapters::cluster::http_peer_rpc::peers_for(
+                    peer_client,
+                )),
                 metadata,
                 wal,
                 None,
@@ -4500,7 +4496,7 @@ mod tests {
             let scheduler = ShardScheduler::new(
                 shard_map.clone(),
                 bootstrap.membership.clone(),
-                raft,
+                test_consensus(raft),
                 None,
                 metadata,
                 wal,
@@ -5263,13 +5259,14 @@ mod tests {
             8 * 1024 * 1024,
             Default::default(),
         );
+        let peers = crate::adapters::cluster::http_peer_rpc::peers_for(Arc::new(pc));
         assert_eq!(
-            pick_best_primary(&membership, &learner_only, 9, Some(&pc)).await,
+            pick_best_primary(&membership, &learner_only, 9, Some(&peers)).await,
             None,
             "the watermark path must exclude learners too"
         );
         assert_eq!(
-            pick_best_primary(&membership, &region, 9, Some(&pc)).await,
+            pick_best_primary(&membership, &region, 9, Some(&peers)).await,
             Some(3),
             "and must still pick the committed peer"
         );
@@ -5665,6 +5662,13 @@ mod tests {
         format!("http://{addr}/internal/shard/rehome")
     }
 
+    /// `host:port` of a URL from `spawn_rehome_peer`.
+    fn rehome_addr(url: &str) -> String {
+        url.trim_start_matches("http://")
+            .trim_end_matches("/internal/shard/rehome")
+            .to_string()
+    }
+
     fn sample_rehome_request() -> ShardRehomeRequest {
         ShardRehomeRequest {
             db: "db".into(),
@@ -5689,18 +5693,24 @@ mod tests {
     /// remote copy of a scale-up ran past it and was restarted from nothing.
     #[tokio::test]
     async fn a_rehome_times_out_on_silence_not_on_total_time() {
-        let http = reqwest::Client::new();
+        let http = crate::adapters::cluster::http_peer_rpc::HttpPeerRpc::with_client(
+            reqwest::Client::new(),
+        );
         let idle = Duration::from_millis(300);
         let req = sample_rehome_request();
 
         // ~1 s in all, never silent for longer than 100 ms.
         let url =
             spawn_rehome_peer(10, Duration::from_millis(100), r#"{"ok":true,"bytes":7}"#).await;
-        let body = post_rehome(&http, &url, &req, idle).await.unwrap();
+        let body = post_rehome(&http, &rehome_addr(&url), &req, idle)
+            .await
+            .unwrap();
         assert_eq!(body["bytes"], 7);
 
         let url = spawn_rehome_peer(1, Duration::from_millis(800), r#"{"ok":true}"#).await;
-        let err = post_rehome(&http, &url, &req, idle).await.unwrap_err();
+        let err = post_rehome(&http, &rehome_addr(&url), &req, idle)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, HyperbytedbError::PeerUnreachable(ref m) if m.contains("silent")),
             "{err}"
@@ -5717,8 +5727,10 @@ mod tests {
         )
         .await;
         let err = post_rehome(
-            &reqwest::Client::new(),
-            &url,
+            &crate::adapters::cluster::http_peer_rpc::HttpPeerRpc::with_client(
+                reqwest::Client::new(),
+            ),
+            &rehome_addr(&url),
             &sample_rehome_request(),
             Duration::from_secs(5),
         )

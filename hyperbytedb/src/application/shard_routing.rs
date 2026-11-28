@@ -7,7 +7,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use metrics::{counter, histogram};
 
-use crate::adapters::cluster::peer_client::PeerClient;
 use crate::application::runtime::RegionWriteStats;
 use crate::application::shard_peer_resolution::{
     RegionTargetRole, ScatterKind, active_region_peer_targets, is_serving_node, peer_addr,
@@ -30,12 +29,26 @@ pub struct ShardRoutingContext {
     pub location_cache: Arc<ShardLocationCache>,
     pub config: ShardingConfig,
     pub node_id: u64,
-    pub peer_client: Arc<PeerClient>,
+    /// Calls to peers.
+    pub peer_rpc: crate::ports::peer_rpc::SharedPeerRpc,
+    /// Cluster membership, for resolving node addresses.
+    pub membership: crate::domain::cluster::membership::SharedMembership,
     pub region_write_stats: Arc<RegionWriteStats>,
     /// Shares one request per destination node among concurrent writes.
     pub forward_coalescer: Arc<crate::application::forward_coalescer::ForwardCoalescer>,
     /// This node's runtime settings (`SET bootstrap_regions_per_node`).
     pub runtime_settings: Arc<crate::application::runtime_settings::RuntimeSettings>,
+}
+
+impl ShardRoutingContext {
+    /// The peer port and membership, for the transfer functions.
+    #[must_use]
+    pub fn peers(&self) -> crate::ports::peer_rpc::Peers {
+        crate::ports::peer_rpc::Peers {
+            rpc: self.peer_rpc.clone(),
+            membership: self.membership.clone(),
+        }
+    }
 }
 
 pub struct PointBuckets {
@@ -78,7 +91,7 @@ where
     F: FnMut(u64, &str, Duration) -> Fut,
     Fut: Future<Output = Result<T, HyperbytedbError>>,
 {
-    let membership = ctx.peer_client.membership().read().await;
+    let membership = ctx.membership.read().await;
     let mut candidates = resolve_region_peers(region, ctx.node_id, &membership, role);
     candidates.retain(|id| *id != ctx.node_id);
 
@@ -182,7 +195,7 @@ pub async fn ensure_measurement_bootstrapped(
     if is_raft_leader {
         let op = build_bootstrap_op(ctx, db, rp, measurement).await?;
         if let Some(addr) = leader_addr {
-            propose_shard_map_op_via_raft(ctx.peer_client.http_client(), addr, op).await?;
+            propose_shard_map_op_via_raft(ctx.peer_rpc.as_ref(), addr, op).await?;
         } else {
             // No leader address resolves: this is raft-less sharding (async
             // replication without OpenRaft), where this node's shard map IS
@@ -193,25 +206,21 @@ pub async fn ensure_measurement_bootstrapped(
             bootstrap_measurement_local(ctx, db, rp, measurement).await?;
         }
     } else if let Some(addr) = leader_addr {
-        let url = format!("http://{addr}/internal/shard/bootstrap");
         let req = ShardBootstrapRequest {
             db: db.to_string(),
             rp: rp.to_string(),
             measurement: measurement.to_string(),
         };
-        let resp = ctx
-            .peer_client
-            .http_client()
-            .post(&url)
-            .json(&req)
-            .timeout(timeout)
-            .send()
-            .await
-            .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
-        if !resp.status().is_success() {
-            return Err(HyperbytedbError::ShardMap(
-                format!("bootstrap failed: {}", resp.status()).into(),
-            ));
+        match ctx.peer_rpc.shard_bootstrap(addr, &req, timeout).await {
+            Ok(()) => {}
+            Err(crate::domain::cluster::peer_rpc::PeerRpcError::Status { code, .. }) => {
+                return Err(HyperbytedbError::ShardMap(
+                    format!("bootstrap failed: {code}").into(),
+                ));
+            }
+            Err(crate::domain::cluster::peer_rpc::PeerRpcError::Unreachable(e)) => {
+                return Err(HyperbytedbError::PeerUnreachable(e));
+            }
         }
     } else {
         return Err(HyperbytedbError::ClusterUnavailable(
@@ -328,7 +337,7 @@ pub async fn build_bootstrap_op(
 /// Every active node (and this one), sorted: the candidates a new
 /// measurement's regions are placed over.
 async fn bootstrap_candidates(ctx: &ShardRoutingContext) -> Vec<u64> {
-    let membership = ctx.peer_client.membership().read().await;
+    let membership = ctx.membership.read().await;
     placeable_members(&membership, ctx.node_id)
 }
 
@@ -465,7 +474,7 @@ async fn select_bootstrap_peers(
     rp: &str,
     measurement: &str,
 ) -> Result<Vec<u64>, HyperbytedbError> {
-    let membership = ctx.peer_client.membership().read().await;
+    let membership = ctx.membership.read().await;
     let peers = placeable_members(&membership, ctx.node_id);
     drop(membership);
     let member_count = peers.len();
@@ -593,7 +602,7 @@ pub async fn forward_shard_writes_by_node(
     };
 
     let (by_node, unrouted, addrs) = {
-        let membership = ctx.peer_client.membership().read().await;
+        let membership = ctx.membership.read().await;
         let (by_node, unrouted) = group_forwards_by_primary(&regions, ctx.node_id, &membership);
         let addrs: HashMap<u64, String> = by_node
             .keys()
@@ -637,7 +646,7 @@ pub async fn forward_shard_writes_by_node(
             }
         }
         let sent: Vec<u64> = parts.iter().map(|p| p.region_id).collect();
-        let client = ctx.peer_client.http_client().clone();
+        let rpc = ctx.peer_rpc.clone();
         let coalescer = ctx.forward_coalescer.clone();
         let coalesce = ctx.config.forward_coalesce;
         let span = tracing::debug_span!(
@@ -649,10 +658,13 @@ pub async fn forward_shard_writes_by_node(
         sends.push(tracing::Instrument::instrument(
             async move {
                 let outcome = if coalesce {
-                    coalescer.send(&client, &addr, timeout, parts).await
+                    coalescer.send(&rpc, &addr, timeout, parts).await
                 } else {
                     crate::application::forward_coalescer::send_direct(
-                        &client, &addr, timeout, parts,
+                        rpc.as_ref(),
+                        &addr,
+                        timeout,
+                        parts,
                     )
                     .await
                 };
@@ -760,19 +772,6 @@ pub(crate) fn refused(message: &str, points: usize) -> HyperbytedbError {
 }
 
 /// What to do with one part of a batch response.
-/// `e` and its causes, joined: reqwest's own message ("error sending request
-/// for url ...") hides whether the peer refused, reset or timed out.
-pub(crate) fn error_chain(e: &dyn std::error::Error) -> String {
-    let mut out = e.to_string();
-    let mut cause = e.source();
-    while let Some(c) = cause {
-        out.push_str(": ");
-        out.push_str(&c.to_string());
-        cause = c.source();
-    }
-    out
-}
-
 #[derive(Debug)]
 pub(crate) enum PartOutcome {
     Done(Result<(), HyperbytedbError>),
@@ -895,51 +894,43 @@ async fn try_forward_shard_write_to_region(
             let precision = precision_owned.clone();
             let epoch_header = epoch_header.clone();
             async move {
-                let url = format!("http://{addr}/internal/shard/write");
-                let mut req = ctx
-                    .peer_client
-                    .http_client()
-                    .post(&url)
-                    .header("Content-Type", "application/octet-stream")
-                    .header("X-HyperbyteDB-Shard-Db", &db)
-                    .header("X-HyperbyteDB-Shard-Rp", &rp)
-                    .header("X-HyperbyteDB-Shard-Region-Id", region_id.to_string())
-                    .header("X-HyperbyteDB-Shard-Epoch", epoch_header)
-                    .body(body);
-                if let Some(p) = precision.as_deref() {
-                    req = req.header("X-HyperbyteDB-Shard-Precision", p);
-                }
-                let resp = req
-                    .timeout(timeout)
-                    .send()
+                use crate::domain::cluster::peer_rpc::{PeerRpcError, ShardWriteTarget};
+                let target = ShardWriteTarget {
+                    db: db.clone(),
+                    rp: rp.clone(),
+                    region_id,
+                    epoch_json: epoch_header,
+                    precision,
+                };
+                match ctx
+                    .peer_rpc
+                    .shard_write(&addr, &target, body.into(), timeout)
                     .await
-                    .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
-
-                if resp.status() == reqwest::StatusCode::CONFLICT {
-                    ctx.location_cache
-                        .invalidate_measurement(&MeasurementKey::new(&db, &rp, &meas));
-                    return Err(HyperbytedbError::StaleShardEpoch { region_id });
-                }
-                // The primary is shedding load: say so, as a retryable 503,
-                // rather than a 502 the client counts as a hard failure.
-                if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE
-                    || resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
                 {
-                    return Err(HyperbytedbError::ClusterUnavailable(format!(
+                    Ok(()) => Ok(()),
+                    Err(PeerRpcError::Status { code: 409, .. }) => {
+                        ctx.location_cache
+                            .invalidate_measurement(&MeasurementKey::new(&db, &rp, &meas));
+                        Err(HyperbytedbError::StaleShardEpoch { region_id })
+                    }
+                    // The primary is shedding load: say so, as a retryable 503,
+                    // rather than a 502 the client counts as a hard failure.
+                    Err(PeerRpcError::Status {
+                        code: 503 | 429, ..
+                    }) => Err(HyperbytedbError::ClusterUnavailable(format!(
                         "region {region_id} primary {peer_id} is at write capacity"
-                    )));
+                    ))),
+                    Err(PeerRpcError::Status {
+                        code: 400 | 422,
+                        body,
+                    }) => Err(refused(&body, point_count)),
+                    Err(PeerRpcError::Status { code, .. }) => {
+                        Err(HyperbytedbError::PeerUnreachable(format!(
+                            "forward write to peer {peer_id} failed: {code}"
+                        )))
+                    }
+                    Err(PeerRpcError::Unreachable(e)) => Err(HyperbytedbError::PeerUnreachable(e)),
                 }
-                if matches!(resp.status().as_u16(), 400 | 422) {
-                    let body = resp.text().await.unwrap_or_default();
-                    return Err(refused(&body, point_count));
-                }
-                if !resp.status().is_success() {
-                    return Err(HyperbytedbError::PeerUnreachable(format!(
-                        "forward write to peer {peer_id} failed: {}",
-                        resp.status()
-                    )));
-                }
-                Ok(())
             }
         },
     )
@@ -950,34 +941,26 @@ pub async fn region_replication_targets(
     ctx: &ShardRoutingContext,
     region: &ShardRegion,
 ) -> Vec<u64> {
-    let membership = ctx.peer_client.membership().read().await;
+    let membership = ctx.membership.read().await;
     active_region_peer_targets(region, ctx.node_id, &membership)
 }
 
-/// Propose `op` to the Raft leader at `leader_addr`, over this node's pooled
-/// peer `client` (it carries the cluster credential).
+/// Propose `op` to the Raft leader at `leader_addr`.
 pub async fn propose_shard_map_op_via_raft(
-    client: &reqwest::Client,
+    rpc: &dyn crate::ports::peer_rpc::PeerRpc,
     leader_addr: &str,
     op: ShardMapOp,
 ) -> Result<ClusterResponse, HyperbytedbError> {
-    let url = format!("http://{leader_addr}/cluster/raft/client-write");
+    use crate::domain::cluster::peer_rpc::PeerRpcError;
     let req = ClusterRequest::ShardMapMutation(Box::new(op));
-    let resp = client
-        .post(&url)
-        .json(&req)
-        .timeout(Duration::from_secs(5))
-        .send()
+    rpc.raft_client_write(leader_addr, &req, Duration::from_secs(5))
         .await
-        .map_err(|e| HyperbytedbError::PeerUnreachable(e.to_string()))?;
-    if !resp.status().is_success() {
-        return Err(HyperbytedbError::ShardMap(
-            format!("raft client_write failed: {}", resp.status()).into(),
-        ));
-    }
-    resp.json()
-        .await
-        .map_err(|e| HyperbytedbError::ShardMap(e.to_string().into()))
+        .map_err(|e| match e {
+            PeerRpcError::Status { code, .. } => {
+                HyperbytedbError::ShardMap(format!("raft client_write failed: {code}").into())
+            }
+            PeerRpcError::Unreachable(e) => HyperbytedbError::PeerUnreachable(e),
+        })
 }
 
 /// Per-region outcome counts for one sharded delete fan-out.
@@ -1048,7 +1031,7 @@ pub async fn scatter_delete_to_regions(
             continue;
         }
 
-        let membership = ctx.peer_client.membership().read().await;
+        let membership = ctx.membership.read().await;
         if !is_serving_node(&membership, region.primary) {
             tracing::warn!(
                 region_id = region.region_id,
@@ -1083,17 +1066,9 @@ pub async fn scatter_delete_to_regions(
             },
         };
         let timeout = Duration::from_millis(ctx.config.scatter_peer_timeout_ms.max(1));
-        let url = format!("http://{addr}/internal/shard/delete");
-        let resp = ctx
-            .peer_client
-            .http_client()
-            .post(&url)
-            .json(&req)
-            .timeout(timeout)
-            .send()
-            .await;
-        match resp {
-            Ok(r) if r.status() == reqwest::StatusCode::CONFLICT => {
+        use crate::domain::cluster::peer_rpc::PeerRpcError;
+        match ctx.peer_rpc.shard_delete(&addr, &req, timeout).await {
+            Err(PeerRpcError::Status { code: 409, .. }) => {
                 refresh_location_cache(ctx).await?;
                 outcome.failed += 1;
                 counter!("hyperbytedb_shard_delete_failures_total", "reason" => "stale_epoch")
@@ -1103,17 +1078,17 @@ pub async fn scatter_delete_to_regions(
                     "shard delete stale epoch; retry on next request"
                 );
             }
-            Ok(r) if !r.status().is_success() => {
+            Err(PeerRpcError::Status { code, .. }) => {
                 outcome.failed += 1;
                 counter!("hyperbytedb_shard_delete_failures_total", "reason" => "http_status")
                     .increment(1);
                 tracing::warn!(
-                    status = %r.status(),
+                    status = code,
                     region_id = region.region_id,
                     "shard delete scatter failed for region"
                 );
             }
-            Err(e) => {
+            Err(e @ PeerRpcError::Unreachable(_)) => {
                 outcome.failed += 1;
                 counter!("hyperbytedb_shard_delete_failures_total", "reason" => "transport")
                     .increment(1);
@@ -1123,7 +1098,7 @@ pub async fn scatter_delete_to_regions(
                     "shard delete scatter failed for region"
                 );
             }
-            _ => {
+            Ok(()) => {
                 outcome.applied += 1;
             }
         }
@@ -1249,7 +1224,10 @@ mod scatter_tests {
             location_cache: Arc::new(ShardLocationCache::new()),
             config,
             node_id,
-            peer_client,
+            peer_rpc: Arc::new(crate::adapters::cluster::http_peer_rpc::HttpPeerRpc::new(
+                peer_client.clone(),
+            )),
+            membership: peer_client.membership().clone(),
             region_write_stats: Arc::new(RegionWriteStats::new()),
             forward_coalescer: Default::default(),
             runtime_settings: Default::default(),

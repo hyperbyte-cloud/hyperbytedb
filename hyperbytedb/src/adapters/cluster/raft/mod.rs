@@ -1,3 +1,4 @@
+pub mod consensus;
 pub mod log_store;
 pub mod network;
 pub mod state_machine;

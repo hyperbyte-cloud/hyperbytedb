@@ -1004,10 +1004,10 @@ pub async fn handle_mv_handoff(
     State(state): State<Arc<AppState>>,
     Json(req): Json<crate::application::mv_handoff::MvHandoffRequest>,
 ) -> impl IntoResponse {
-    let Some(ctx) = state.shard_routing.as_ref() else {
+    let (Some(_), Some(pc)) = (state.shard_routing.as_ref(), state.peer_client.as_ref()) else {
         return sharding_disabled();
     };
-    let client = ctx.peer_client.http_client().clone();
+    let client = pc.http_client().clone();
     let url = format!("http://{}/internal/mv/handoff-chunk", req.to_addr);
     let result = crate::application::mv_handoff::hand_off_rollups(
         state.node_id,
@@ -1440,10 +1440,11 @@ async fn run_rehome(
             serde_json::json!({"error": "no peer client"}),
         );
     };
+    let peers = crate::adapters::cluster::http_peer_rpc::peers_for(peer_client.clone());
     let region = &region;
     let outcome = match if req.stage {
         crate::application::shard_transfer::stage_region_transfer_data(
-            peer_client,
+            &peers,
             &state.metadata,
             &state.wal,
             Some(&state.query_port),
@@ -1457,7 +1458,7 @@ async fn run_rehome(
         .await
     } else {
         push_region_transfer_data(
-            peer_client,
+            &peers,
             &state.metadata,
             &state.wal,
             Some(&state.query_port),
@@ -1490,7 +1491,7 @@ async fn run_rehome(
 
     if !req.stage
         && let Err(e) = complete_region_transfer(
-            peer_client,
+            &peers,
             &state.metadata,
             Some(&state.points_sink),
             state.node_id,

@@ -3,13 +3,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::adapters::cluster::peer_client::PeerClient;
-use crate::adapters::cluster::raft::HyperbytedbRaft;
 use crate::application::shard_routing::ShardRoutingContext;
 use crate::application::shard_transfer::run_region_transfer;
 use crate::domain::cluster::membership::{NodeState, SharedMembership};
 use crate::domain::sharding::{MeasurementKey, ShardMapOp};
 use crate::error::HyperbytedbError;
+use crate::ports::consensus::ConsensusPort;
 use crate::ports::flush::FlushPort;
 use crate::ports::metadata::MetadataPort;
 use crate::ports::points_sink::PointsSinkPort;
@@ -29,11 +28,10 @@ pub struct DrainService {
     replication_log: Arc<dyn ReplicationAcks>,
     wal: Arc<dyn WalPort>,
     shard_routing: Option<Arc<ShardRoutingContext>>,
-    peer_client: Option<Arc<PeerClient>>,
     metadata: Option<Arc<dyn MetadataPort>>,
     points_sink: Option<Arc<dyn PointsSinkPort>>,
     query_port: Option<Arc<dyn QueryPort>>,
-    raft: Option<HyperbytedbRaft>,
+    consensus: Option<Arc<dyn ConsensusPort>>,
     max_points_per_request: usize,
     /// Set once [`DrainService::drain`] has run to completion (or determined
     /// there was nothing to do because the node was already in a terminal
@@ -60,11 +58,10 @@ impl DrainService {
             replication_log,
             wal,
             shard_routing: None,
-            peer_client: None,
             metadata: None,
             points_sink: None,
             query_port: None,
-            raft: None,
+            consensus: None,
             max_points_per_request: 0,
             drained: AtomicBool::new(false),
         }
@@ -74,19 +71,17 @@ impl DrainService {
     pub fn with_sharding(
         mut self,
         ctx: Arc<ShardRoutingContext>,
-        peer_client: Arc<PeerClient>,
         metadata: Arc<dyn MetadataPort>,
         points_sink: Arc<dyn PointsSinkPort>,
         query_port: Arc<dyn QueryPort>,
-        raft: HyperbytedbRaft,
+        consensus: Arc<dyn ConsensusPort>,
         max_points_per_request: usize,
     ) -> Self {
         self.shard_routing = Some(ctx);
-        self.peer_client = Some(peer_client);
         self.metadata = Some(metadata);
         self.points_sink = Some(points_sink);
         self.query_port = Some(query_port);
-        self.raft = Some(raft);
+        self.consensus = Some(consensus);
         self.max_points_per_request = max_points_per_request;
         self
     }
@@ -197,16 +192,13 @@ impl DrainService {
             Some(c) => c,
             None => return Ok(()),
         };
-        let pc = self
-            .peer_client
-            .as_ref()
-            .ok_or_else(|| HyperbytedbError::ClusterUnavailable("no peer client".into()))?;
+        let peers = ctx.peers();
         let metadata = self
             .metadata
             .as_ref()
             .ok_or_else(|| HyperbytedbError::ClusterUnavailable("no metadata".into()))?;
-        let raft = self
-            .raft
+        let consensus = self
+            .consensus
             .as_ref()
             .ok_or_else(|| HyperbytedbError::ClusterUnavailable("no raft".into()))?;
 
@@ -224,7 +216,7 @@ impl DrainService {
 
             if copy {
                 run_region_transfer(
-                    pc,
+                    &peers,
                     metadata,
                     &self.wal,
                     self.query_port.as_ref(),
@@ -248,7 +240,8 @@ impl DrainService {
                 new_primary,
                 epoch: region.epoch,
             };
-            raft.client_write(ClusterRequest::ShardMapMutation(Box::new(tp)))
+            consensus
+                .propose(ClusterRequest::ShardMapMutation(Box::new(tp)))
                 .await
                 .map_err(|e| HyperbytedbError::ShardMap(e.to_string().into()))?;
         }
@@ -262,7 +255,7 @@ impl DrainService {
     /// anyway, so the wait on them always ran its full 90 s whenever this node
     /// had written anything -- every restart of a replicated node. Writes are
     /// settled at shutdown instead: each is acked by its peers, or hinted for
-    /// them (`PeerClient::wait_for_inflight`).
+    /// them (the peer client's in-flight wait at shutdown).
     async fn wait_for_replication_acks(&self) -> Result<(), HyperbytedbError> {
         let local_mutation_seq = self.replication_log.last_mutation_seq();
         let max_wait = Duration::from_secs(90);

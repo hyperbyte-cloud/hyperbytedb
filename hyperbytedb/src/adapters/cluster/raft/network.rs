@@ -25,7 +25,7 @@ impl Network {
         control_port: u16,
         cluster_auth: &crate::adapters::cluster::cluster_auth::ClusterAuth,
     ) -> Self {
-        use crate::ports::peer_http::PeerHttp;
+        use crate::adapters::cluster::peer_http::PeerHttp;
         let default_timeout = Duration::from_secs(default_timeout_secs);
         Self {
             // `Client::builder().build()` only fails if TLS init is broken,

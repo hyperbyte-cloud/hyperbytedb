@@ -362,7 +362,10 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
                 location_cache: shard_location_cache.clone(),
                 config: config.sharding.clone(),
                 node_id: config.cluster.node_id,
-                peer_client: pc.clone(),
+                peer_rpc: Arc::new(crate::adapters::cluster::http_peer_rpc::HttpPeerRpc::new(
+                    pc.clone(),
+                )),
+                membership: pc.membership().clone(),
                 region_write_stats: Arc::new(RegionWriteStats::new()),
                 forward_coalescer: Default::default(),
                 runtime_settings: runtime_settings.clone(),
@@ -520,7 +523,6 @@ pub async fn build_services(config: &HyperbytedbConfig) -> anyhow::Result<Bootst
                 base_query_service.clone(),
                 metadata.clone(),
                 pc.clone(),
-                pc.cluster_auth(),
             ),
         )
     });

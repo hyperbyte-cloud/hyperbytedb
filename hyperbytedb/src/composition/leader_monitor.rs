@@ -1,11 +1,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::adapters::cluster::peer_http::PeerHttp;
 use crate::adapters::http::router::AppState;
 use crate::application::cluster::sync_manifest;
 use crate::domain::cluster::membership::is_departing;
 use crate::domain::cluster::sync::{RegionWatermark, SyncManifest};
-use crate::ports::peer_http::PeerHttp;
 
 /// Periodically checks if this node is the Raft leader; if so, queries each
 /// follower's sync manifest and triggers a re-sync on significantly lagging nodes.
