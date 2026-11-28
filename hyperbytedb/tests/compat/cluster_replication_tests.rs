@@ -169,3 +169,173 @@ async fn every_cluster_mutation_replicates_as_before() {
         std::fs::read_to_string(&fixture).expect("fixture missing; run with UPDATE_GOLDEN=1");
     assert_eq!(got, want, "replicated mutations changed");
 }
+
+/// Number of rows `q` returns on `ctx`.
+async fn row_count(ctx: &TestContext, q: &str) -> usize {
+    let resp = ctx.query("testdb", q).await.unwrap();
+    let stmt = &resp.results[0];
+    assert!(stmt.error.is_none(), "{q}: {:?}", stmt.error);
+    stmt.series.iter().flatten().map(|s| s.values.len()).sum()
+}
+
+/// A replica applying a replicated DROP SERIES with no FROM deletes the
+/// matching rows of every measurement that has the tag, as the
+/// coordinator does on its own node.
+#[tokio::test]
+#[serial(chdb)]
+async fn a_replica_applies_drop_series_without_from_to_its_rows() {
+    let Ok(replica) = TestContext::new() else {
+        eprintln!("skipping: chDB not available");
+        return;
+    };
+    let rows = "cpu,host=a value=1.0 1000000000\ncpu,host=b value=2.0 2000000000\n\
+                mem,host=a value=3.0 1000000000\ndisk,dev=x value=4.0 1000000000";
+    replica.metadata.create_database("testdb").await.unwrap();
+    replica.write_and_flush("testdb", rows).await.unwrap();
+
+    // The coordinator: build the mutation it replicates.
+    let coord = TestContext::new_no_chdb().unwrap();
+    coord.metadata.create_database("testdb").await.unwrap();
+    coord.write_and_flush("testdb", rows).await.unwrap();
+    let replication = Arc::new(RecordingReplication::default());
+    let peer = PeerQueryService::new(
+        coord.query_service.clone(),
+        coord.metadata.clone(),
+        replication.clone(),
+    );
+    let resp = peer
+        .execute_query(
+            "testdb",
+            r#"DROP SERIES WHERE "host" = 'a'"#,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        resp.results[0].error.is_none(),
+        "{:?}",
+        resp.results[0].error
+    );
+    let mutation = replication
+        .seen
+        .lock()
+        .pop()
+        .expect("DROP SERIES replicates");
+
+    hyperbytedb::application::schema_mutation_apply::apply_schema_mutation(
+        hyperbytedb::application::schema_mutation_apply::SchemaMutationDeps {
+            metadata: &replica.metadata,
+            mv_service: None,
+            points_sink: Some(&replica.points_sink),
+            wal: Some(&replica.wal),
+            shard_routing: None,
+            runtime_settings: None,
+        },
+        mutation,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(row_count(&replica, "SELECT value FROM cpu").await, 1);
+    assert_eq!(row_count(&replica, "SELECT value FROM mem").await, 0);
+    assert_eq!(row_count(&replica, "SELECT value FROM disk").await, 1);
+}
+
+/// A WAL that counts how often a delete asks where it ends (once per flush
+/// wait) and otherwise passes through.
+struct CountingWal {
+    inner: Arc<dyn hyperbytedb::ports::wal::WalPort>,
+    last_sequence_calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl hyperbytedb::ports::wal::WalPort for CountingWal {
+    async fn append(
+        &self,
+        entry: hyperbytedb::domain::wal::WalEntry,
+    ) -> Result<u64, HyperbytedbError> {
+        self.inner.append(entry).await
+    }
+    async fn read_from(
+        &self,
+        sequence: u64,
+    ) -> Result<Vec<(u64, hyperbytedb::domain::wal::WalEntry)>, HyperbytedbError> {
+        self.inner.read_from(sequence).await
+    }
+    async fn read_range(
+        &self,
+        from: u64,
+        max_entries: usize,
+    ) -> Result<Vec<(u64, hyperbytedb::domain::wal::WalEntry)>, HyperbytedbError> {
+        self.inner.read_range(from, max_entries).await
+    }
+    async fn truncate_before(&self, sequence: u64) -> Result<(), HyperbytedbError> {
+        self.inner.truncate_before(sequence).await
+    }
+    async fn last_sequence(&self) -> Result<u64, HyperbytedbError> {
+        self.last_sequence_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.last_sequence().await
+    }
+    fn flushed_through(&self) -> u64 {
+        self.inner.flushed_through()
+    }
+    fn set_flushed_through(&self, sequence: u64) {
+        self.inner.set_flushed_through(sequence)
+    }
+    fn flushed_margin_start(&self, through: u64, max_bytes: u64) -> u64 {
+        self.inner.flushed_margin_start(through, max_bytes)
+    }
+}
+
+/// The replicated DROP SERIES with no FROM runs inside the Raft apply: it
+/// waits for the WAL to flush once, not once per measurement.
+#[tokio::test]
+#[serial(chdb)]
+async fn a_replica_drop_series_without_from_waits_for_the_flush_once() {
+    let Ok(replica) = TestContext::new() else {
+        eprintln!("skipping: chDB not available");
+        return;
+    };
+    replica.metadata.create_database("testdb").await.unwrap();
+    replica
+        .write_and_flush(
+            "testdb",
+            "cpu,host=a value=1.0 1000000000\nmem,host=a value=3.0 1000000000\n\
+             disk,host=a value=4.0 1000000000",
+        )
+        .await
+        .unwrap();
+    let counting = Arc::new(CountingWal {
+        inner: replica.wal.clone(),
+        last_sequence_calls: Default::default(),
+    });
+    let wal: Arc<dyn hyperbytedb::ports::wal::WalPort> = counting.clone();
+
+    hyperbytedb::application::schema_mutation_apply::apply_schema_mutation(
+        hyperbytedb::application::schema_mutation_apply::SchemaMutationDeps {
+            metadata: &replica.metadata,
+            mv_service: None,
+            points_sink: Some(&replica.points_sink),
+            wal: Some(&wal),
+            shard_routing: None,
+            runtime_settings: None,
+        },
+        MutationRequest::DropSeries {
+            database: "testdb".into(),
+            rp: "autogen".into(),
+            measurement: None,
+            predicate_sql: "`host` = 'a'".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let calls = counting
+        .last_sequence_calls
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(calls, 1, "flush waits");
+    assert_eq!(row_count(&replica, "SELECT value FROM cpu").await, 0);
+}
