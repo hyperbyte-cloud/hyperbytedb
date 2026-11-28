@@ -95,6 +95,34 @@ pub struct TestContext {
 }
 
 impl TestContext {
+    /// What a restart does to the WAL: close it, open it again, and build
+    /// the services over it anew. The services first move to a scratch WAL,
+    /// so that nothing holds the old one open.
+    pub fn reopen_wal(&mut self) -> Result<(), HyperbytedbError> {
+        let path = self._tmpdir.path().join("wal");
+        let scratch = self._tmpdir.path().join("wal-scratch");
+        std::fs::create_dir_all(&scratch)?;
+        self.rebuild_over(Arc::new(RocksDbWal::open(scratch)?));
+        self.rebuild_over(Arc::new(RocksDbWal::open(path)?));
+        Ok(())
+    }
+
+    fn rebuild_over(&mut self, wal: Arc<RocksDbWal>) {
+        self.wal = wal.clone();
+        self.query_service = Arc::new(QueryServiceImpl::new(
+            self.query_port.clone(),
+            self.metadata.clone(),
+            wal.clone(),
+            30,
+            self.points_sink.clone(),
+        ));
+        self.ingestion =
+            IngestionServiceImpl::new(wal.clone(), self.metadata.clone(), 100_000, 10_000, 0);
+        self.flush_service = Arc::new(FlushServiceImpl::new(wal, 0, self.points_sink.clone()));
+    }
+}
+
+impl TestContext {
     /// Create a TestContext that uses chDB for queries.
     /// Fails if chDB is not available.
     pub fn new() -> Result<Self, HyperbytedbError> {

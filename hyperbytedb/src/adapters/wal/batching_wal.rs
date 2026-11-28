@@ -312,6 +312,17 @@ impl WalPort for BatchingWal {
         self.inner.flushed_margin_start(through, max_bytes)
     }
 
+    async fn record_delete(
+        &self,
+        marker: &crate::ports::wal::DeleteMarker,
+    ) -> Result<(), HyperbytedbError> {
+        self.inner.record_delete(marker).await
+    }
+
+    fn delete_markers(&self) -> Result<Vec<crate::ports::wal::DeleteMarker>, HyperbytedbError> {
+        self.inner.delete_markers()
+    }
+
     async fn flush_wal(&self) -> Result<(), HyperbytedbError> {
         self.inner.flush_wal().await
     }

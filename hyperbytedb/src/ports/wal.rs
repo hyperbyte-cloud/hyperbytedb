@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use crate::domain::prepared_wal::PreparedWalSlot;
 use crate::error::HyperbytedbError;
 
-pub use crate::domain::wal::WalEntry;
+pub use crate::domain::wal::{DeleteMarker, WalEntry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WalFormat {
@@ -91,6 +91,21 @@ pub trait WalPort: Send + Sync {
     /// is not known (written before this process started) count as over the
     /// budget.
     fn flushed_margin_start(&self, through: u64, max_bytes: u64) -> u64;
+
+    /// Keep `marker` until the WAL is truncated past
+    /// `marker.flushed_through`, so a restart can replay the delete.
+    async fn record_delete(&self, marker: &DeleteMarker) -> Result<(), HyperbytedbError> {
+        let _ = marker;
+        Ok(())
+    }
+
+    /// The delete markers kept when the WAL was opened that it still keeps,
+    /// lowest `flushed_through` first: the deletes a restart replays. Ones
+    /// recorded since are not included, because the flush is already past
+    /// them.
+    fn delete_markers(&self) -> Result<Vec<DeleteMarker>, HyperbytedbError> {
+        Ok(Vec::new())
+    }
 
     /// Remove all durable and in-memory WAL entries for `database`.
     async fn purge_database(&self, database: &str) -> Result<(), HyperbytedbError> {

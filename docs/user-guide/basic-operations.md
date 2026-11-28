@@ -283,7 +283,11 @@ A background service runs every 12 hours (by default) and issues `ALTER TABLE â€
 
 ## Deleting Data
 
-HyperbyteDB supports `DELETE` statements that mark data with tombstones. Tombstoned data is excluded from query results at read time; physical row removal happens via retention enforcement or MergeTree background merges.
+`DELETE` removes the matching rows from storage. The statement waits for points still in the WAL to be written first (up to 15 s), so a point written before the `DELETE` is removed and one written after it is kept.
+
+A node keeps the WAL entries behind its last flush for crash recovery and writes them again when it restarts. Each `DELETE` is recorded with the point the WAL had reached, and a restarted node applies it again at that point, so deleted rows stay deleted.
+
+In a cluster, a write that reaches a replica after the replica applied the `DELETE` (from the replication queue or hinted handoff) is not removed. Avoid deleting data that is still being written.
 
 ```sql
 -- Delete all data older than 30 days

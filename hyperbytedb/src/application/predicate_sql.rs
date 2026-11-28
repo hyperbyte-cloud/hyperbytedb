@@ -188,7 +188,41 @@ pub async fn delete_rows(
     if let Some(wal) = wal {
         wait_for_flush(wal).await?;
     }
-    sink.delete_rows(db, rp, measurement, predicate).await
+    delete_flushed_rows(wal, sink, db, rp, measurement, predicate).await
+}
+
+/// [`delete_rows`] without the wait for the flush, for a caller that has
+/// just waited. With a `wal`, a marker is kept so that a restart, which
+/// flushes the kept WAL entries again, deletes the rows again.
+///
+/// # Errors
+/// A chDB error from the delete, or a WAL error keeping the marker.
+pub async fn delete_flushed_rows(
+    wal: Option<&dyn crate::ports::wal::WalPort>,
+    sink: &dyn crate::ports::points_sink::PointsSinkPort,
+    db: &str,
+    rp: &str,
+    measurement: &str,
+    predicate: &str,
+) -> Result<(), HyperbytedbError> {
+    if predicate.is_empty() || !sink.deletes_rows() {
+        return Ok(());
+    }
+    // Read before the delete: every entry up to here is among the rows it
+    // removes.
+    let flushed_through = wal.map(|w| w.flushed_through());
+    sink.delete_rows(db, rp, measurement, predicate).await?;
+    if let (Some(wal), Some(flushed_through)) = (wal, flushed_through) {
+        wal.record_delete(&crate::ports::wal::DeleteMarker {
+            flushed_through,
+            database: db.to_string(),
+            retention_policy: rp.to_string(),
+            measurement: measurement.to_string(),
+            predicate: predicate.to_string(),
+        })
+        .await?;
+    }
+    Ok(())
 }
 
 /// Longest wait for the flush service to write the WAL's current entries:

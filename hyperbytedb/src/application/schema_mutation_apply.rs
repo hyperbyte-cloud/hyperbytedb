@@ -175,23 +175,24 @@ async fn delete_series_rows_everywhere(
 ) -> Result<(), HyperbytedbError> {
     // The first delete waits for the WAL to flush; that covers every
     // measurement, so the rest do not wait again inside the Raft apply.
-    let mut wal = wal;
+    let wal = wal.map(|w| w.as_ref());
+    let mut waited = false;
     for meas in metadata.list_measurements(db).await? {
         let series = crate::domain::chdb_naming::quoted_series_table_name(db, rp, &meas);
         let predicate = format!(
             "`series_id` IN (SELECT `series_id` FROM {} WHERE {tag_condition})",
             series.as_str()
         );
-        let result = crate::application::predicate_sql::delete_rows(
-            wal.map(|w| w.as_ref()),
-            sink,
-            db,
-            rp,
-            &meas,
-            &predicate,
-        )
-        .await;
-        wal = None;
+        let result = if waited {
+            crate::application::predicate_sql::delete_flushed_rows(
+                wal, sink, db, rp, &meas, &predicate,
+            )
+            .await
+        } else {
+            crate::application::predicate_sql::delete_rows(wal, sink, db, rp, &meas, &predicate)
+                .await
+        };
+        waited = true;
         match result {
             Err(e) if is_unknown_column(&e.to_string()) => {}
             other => other?,
