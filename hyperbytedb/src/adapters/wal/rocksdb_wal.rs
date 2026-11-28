@@ -11,6 +11,7 @@ use crate::adapters::wal::arrow_cache::WalArrowCache;
 use crate::adapters::wal::wal_ipc;
 use crate::domain::point::Point;
 use crate::domain::prepared_wal::PreparedWalSlot;
+use crate::domain::wal::{VersionClock, decode_entry};
 use crate::error::HyperbytedbError;
 use crate::ports::wal::{WalAppendBundle, WalEntry, WalFormat, WalPort};
 
@@ -40,6 +41,7 @@ const TRUNCATE_POINT_DELETES_MAX: u64 = 1024;
 const RANGE_DELETES_PER_MEMTABLE: u64 = 64;
 
 pub struct RocksDbWal {
+    versions: VersionClock,
     db: Arc<DB>,
     seq: Arc<AtomicU64>,
     flushed_through: AtomicU64,
@@ -255,6 +257,7 @@ impl RocksDbWal {
             arrow_cache: Arc::new(WalArrowCache::new()),
             wal_format: options.wal_format,
             arrow_wal_enabled: options.arrow_wal_enabled,
+            versions: VersionClock::default(),
         })
     }
 
@@ -287,8 +290,7 @@ impl RocksDbWal {
             .cf_handle(WAL_CF)
             .ok_or_else(|| HyperbytedbError::Wal("wal column family not found".into()))?;
         let current = |value: &[u8]| {
-            (value.len() >= 4 && &value[..4] == b"HBWA")
-                || bincode::deserialize::<WalEntry>(value).is_ok()
+            (value.len() >= 4 && &value[..4] == b"HBWA") || decode_entry(value).is_ok()
         };
         match db.iterator_cf(&wal_cf, IteratorMode::Start).next() {
             None => return Ok(()),
@@ -337,6 +339,7 @@ impl RocksDbWal {
                 retention_policy: legacy.retention_policy,
                 points: legacy.points,
                 origin_node_id: 0,
+                version: 0,
             };
 
             let new_value = bincode::serialize(&upgraded).map_err(|e| {
@@ -444,7 +447,11 @@ fn write_bundle_batch(
         if wal_format == WalFormat::ArrowIpc
             && let Some(ref mut slot) = bundle.prepared
         {
-            slot.patch_all_ingest_seqs(wal_seq)?;
+            // The first row's `ingest_seq`: see `WalEntry::version`.
+            slot.patch_all_ingest_seqs(match bundle.entry.version {
+                0 => wal_seq,
+                version => version,
+            })?;
         }
 
         // Prefer bytes serialized off the writer thread; fall back to encoding
@@ -466,8 +473,9 @@ fn write_bundle_batch(
     }
 
     if arrow_wal_enabled {
-        for (wal_seq, slot) in seqs.iter().zip(prepared_slots) {
+        for ((wal_seq, slot), bundle) in seqs.iter().zip(prepared_slots).zip(&bundles) {
             if let Some(slot) = slot {
+                arrow_cache.set_version(*wal_seq, bundle.entry.version);
                 arrow_cache.insert(*wal_seq, slot);
             }
         }
@@ -527,6 +535,14 @@ impl WalPort for RocksDbWal {
         self.arrow_wal_enabled
     }
 
+    fn reserve_version(&self, rows: u64) -> u64 {
+        self.versions.reserve(rows)
+    }
+
+    fn observe_version(&self, version: u64) {
+        self.versions.observe(version);
+    }
+
     async fn take_prepared_range(
         &self,
         from: u64,
@@ -544,7 +560,8 @@ impl WalPort for RocksDbWal {
         // flush path. ArrowIpc slots were already patched before encoding.
         if self.wal_format == WalFormat::Bincode {
             for (seq, slot) in &mut slots {
-                slot.patch_all_ingest_seqs(*seq)?;
+                let version = self.arrow_cache.take_version(*seq);
+                slot.patch_all_ingest_seqs(version.unwrap_or(*seq))?;
             }
         }
         Ok(Some(slots))
@@ -801,6 +818,7 @@ mod tests {
                 })
                 .collect(),
             origin_node_id: 0,
+            version: 0,
         }
     }
 
@@ -1000,6 +1018,7 @@ mod tests {
                 series_id_cache: Default::default(),
             }],
             origin_node_id: 0,
+            version: 0,
         }
     }
 

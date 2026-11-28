@@ -7,6 +7,7 @@ use crate::error::HyperbytedbError;
 use crate::ports::points_sink::PointsSinkPort;
 use crate::ports::wal::{WalAppendBundle, WalEntry, WalPort};
 
+#[allow(clippy::too_many_arguments)]
 pub async fn append_points_with_prepared(
     wal: &dyn WalPort,
     sink: Option<&Arc<dyn PointsSinkPort>>,
@@ -15,11 +16,13 @@ pub async fn append_points_with_prepared(
     points: Vec<Point>,
     origin_node_id: u64,
     max_points_per_request: usize,
+    version: u64,
 ) -> Result<u64, HyperbytedbError> {
     crate::application::ingest_metadata::validate_point_count(
         points.len(),
         max_points_per_request,
     )?;
+    let version = entry_version(wal, version, points.len());
     let build_start = std::time::Instant::now();
     if wal.arrow_wal_enabled()
         && let Some(sink) = sink
@@ -38,6 +41,7 @@ pub async fn append_points_with_prepared(
                     retention_policy: rp.to_string(),
                     points,
                     origin_node_id,
+                    version,
                 };
                 let append_start = std::time::Instant::now();
                 let seq = tracing::Instrument::instrument(
@@ -69,8 +73,20 @@ pub async fn append_points_with_prepared(
         retention_policy: rp.to_string(),
         points,
         origin_node_id,
+        version,
     };
     wal.append(entry).await
+}
+
+/// The version an entry of `rows` rows takes: the one it arrived with, or,
+/// for 0 (a write originating here, or from a sender without versions), a new
+/// one.
+fn entry_version(wal: &dyn WalPort, version: u64, rows: usize) -> u64 {
+    if version == 0 {
+        return wal.reserve_version(rows as u64);
+    }
+    wal.observe_version(version.saturating_add((rows as u64).saturating_sub(1)));
+    version
 }
 
 /// Parameters for appending a columnar wire batch to the WAL.
@@ -82,6 +98,8 @@ pub struct ColumnarWalAppend<'a> {
     pub precision: Option<&'a str>,
     pub origin_node_id: u64,
     pub max_points_per_request: usize,
+    /// As [`append_points_with_prepared`]'s `version`.
+    pub version: u64,
 }
 
 /// Append a columnar wire batch, building a prepared WAL slot without expanding
@@ -100,6 +118,7 @@ pub async fn append_columnar_with_prepared(
         req.max_points_per_request,
     )?;
 
+    let version = entry_version(wal, req.version, req.wire.values.len());
     let build_start = std::time::Instant::now();
     if wal.arrow_wal_enabled()
         && let Some(sink) = sink
@@ -122,6 +141,7 @@ pub async fn append_columnar_with_prepared(
                     retention_policy: req.rp.to_string(),
                     points: Vec::new(),
                     origin_node_id: req.origin_node_id,
+                    version,
                 };
                 return wal
                     .append_bundle(WalAppendBundle {
@@ -145,6 +165,7 @@ pub async fn append_columnar_with_prepared(
         points,
         req.origin_node_id,
         req.max_points_per_request,
+        version,
     )
     .await
 }

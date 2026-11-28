@@ -662,6 +662,7 @@ async fn async_writes_replicate_through_the_batch_endpoint() {
         precision: None,
         region_id: None,
         body: line.as_bytes().to_vec(),
+        version: 0,
     };
     let req = ReplicateBatchRequest {
         origin_node: 1,

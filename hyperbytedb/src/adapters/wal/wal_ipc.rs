@@ -8,7 +8,7 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 
 use crate::domain::prepared_wal::{PreparedMeasurementBatch, PreparedWalSlot};
-use crate::domain::wal::WalEntry;
+use crate::domain::wal::{WalEntry, decode_entry, encode_entry_into};
 use crate::error::HyperbytedbError;
 use crate::ports::wal::WalFormat;
 
@@ -115,11 +115,11 @@ pub fn encode_prepared_slot(
         }
     }
 
-    let legacy = legacy_entry
-        .map(bincode::serialize)
-        .transpose()
-        .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?
-        .unwrap_or_default();
+    let mut legacy = Vec::new();
+    if let Some(entry) = legacy_entry {
+        encode_entry_into(&mut legacy, entry)
+            .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
+    }
     out.extend_from_slice(&(legacy.len() as u32).to_le_bytes());
     if !legacy.is_empty() {
         out.extend_from_slice(&legacy);
@@ -255,7 +255,7 @@ pub fn decode_prepared_slot(
                 .read_exact(&mut legacy)
                 .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
             Some(
-                bincode::deserialize(&legacy).map_err(|e| {
+                decode_entry(&legacy).map_err(|e| {
                     HyperbytedbError::Wal(crate::error::ChainedError::from_error(e))
                 })?,
             )
@@ -280,8 +280,12 @@ pub fn encode_wal_value(
     entry: &WalEntry,
 ) -> Result<Vec<u8>, HyperbytedbError> {
     match format {
-        WalFormat::Bincode => bincode::serialize(entry)
-            .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e))),
+        WalFormat::Bincode => {
+            let mut bytes = Vec::new();
+            encode_entry_into(&mut bytes, entry)
+                .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
+            Ok(bytes)
+        }
         WalFormat::ArrowIpc => {
             let slot = slot.ok_or_else(|| {
                 HyperbytedbError::Wal("arrow IPC WAL requires prepared slot".into())
@@ -297,7 +301,7 @@ pub fn decode_wal_value(
 ) -> Result<(Option<PreparedWalSlot>, WalEntry), HyperbytedbError> {
     match format {
         WalFormat::Bincode => {
-            let entry: WalEntry = bincode::deserialize(bytes)
+            let entry: WalEntry = decode_entry(bytes)
                 .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
             Ok((None, entry))
         }
@@ -377,6 +381,7 @@ mod tests {
                 series_id_cache: Default::default(),
             }],
             origin_node_id: 7,
+            version: 0,
         }
     }
 

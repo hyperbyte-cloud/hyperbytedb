@@ -510,8 +510,11 @@ async fn apply_shard_write_batch(
         points,
     } in groups
     {
+        // One range for the group, split between its parts in order, so each
+        // part's replicas get the versions its rows have here.
+        let version = state.wal.reserve_version(points.len() as u64);
         let outcome = tracing::Instrument::instrument(
-            append_forwarded_group(state, &db, &rp, points),
+            append_forwarded_group(state, &db, &rp, points, version),
             tracing::debug_span!(target: crate::telemetry::TARGET, "metadata_wal"),
         )
         .await;
@@ -526,12 +529,16 @@ async fn apply_shard_write_batch(
                 continue;
             }
         };
+        let mut next_version = version;
         let replicated = members.into_iter().map(|m| {
+            let version = next_version;
+            next_version = next_version.saturating_add(m.point_count);
             let state = state.clone();
             async move {
                 let region_id = m.req.region_id;
                 let partial = m.partial;
-                let result = replicate_forwarded_part(&state, m.req, &m.region, wal_seq).await;
+                let result =
+                    replicate_forwarded_part(&state, m.req, &m.region, wal_seq, version).await;
                 if result.is_ok() {
                     if let Some(ctx) = state.shard_routing.as_ref() {
                         ctx.region_write_stats.record(region_id, m.point_count);
@@ -583,6 +590,7 @@ async fn append_forwarded_group(
     db: &str,
     rp: &str,
     points: Vec<Point>,
+    version: u64,
 ) -> Result<u64, (StatusCode, String)> {
     prepare_batch_metadata(
         &state.metadata,
@@ -602,6 +610,7 @@ async fn append_forwarded_group(
         points,
         state.node_id,
         state.max_points_per_request,
+        version,
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
@@ -613,6 +622,7 @@ async fn replicate_forwarded_part(
     req: ShardWriteRequest,
     region: &ShardRegion,
     wal_seq: u64,
+    version: u64,
 ) -> Result<(), HyperbytedbError> {
     let Some(pc) = state.peer_client.as_ref() else {
         return Ok(());
@@ -632,6 +642,7 @@ async fn replicate_forwarded_part(
             wal_seq,
             target_node_ids: Some(targets),
             region_id: Some(region.region_id),
+            version,
         },
     )
     .await
@@ -750,6 +761,7 @@ async fn apply_shard_write(
 
     let point_count = points.len() as u64;
 
+    let version = state.wal.reserve_version(point_count);
     let wal_seq = match append_points_with_prepared(
         state.wal.as_ref(),
         Some(&state.points_sink),
@@ -758,6 +770,7 @@ async fn apply_shard_write(
         points,
         state.node_id,
         state.max_points_per_request,
+        version,
     )
     .await
     {
@@ -783,6 +796,7 @@ async fn apply_shard_write(
             wal_seq,
             target_node_ids: Some(targets),
             region_id: Some(region.region_id),
+            version,
         };
         if let Err(e) = dispatch_outbound_replication(
             pc.clone(),

@@ -96,6 +96,7 @@ pub async fn apply_transfer_push(
         filtered,
         req.source_node_id,
         max_points,
+        0,
     )
     .await?;
 
@@ -1695,6 +1696,7 @@ mod tests {
             retention_policy: "autogen".into(),
             points,
             origin_node_id: 0,
+            version: 0,
         };
         let (flushed, unflushed) = (points(0, 100), points(100, 50));
         let all: Vec<Point> = flushed.iter().chain(&unflushed).cloned().collect();

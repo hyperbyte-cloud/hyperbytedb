@@ -27,6 +27,46 @@ pub trait PointsSinkPort: Send + Sync {
         points: &[Point],
     ) -> Result<WriteAck, HyperbytedbError>;
 
+    /// [`Self::write_points`] with each row's `ingest_seq` given. The default
+    /// writes each run of consecutive sequences separately.
+    async fn write_points_versioned(
+        &self,
+        db: &str,
+        rp: &str,
+        measurement: &str,
+        origins: &[u64],
+        seqs: &[u64],
+        points: &[Point],
+    ) -> Result<WriteAck, HyperbytedbError> {
+        let mut total = WriteAck {
+            min_time: i64::MAX,
+            max_time: i64::MIN,
+            row_count: 0,
+        };
+        let mut start = 0;
+        while start < points.len() {
+            let mut end = start + 1;
+            while end < points.len() && seqs[end] == seqs[end - 1].saturating_add(1) {
+                end += 1;
+            }
+            let ack = self
+                .write_points(
+                    db,
+                    rp,
+                    measurement,
+                    &origins[start..end],
+                    seqs[start],
+                    &points[start..end],
+                )
+                .await?;
+            total.min_time = total.min_time.min(ack.min_time);
+            total.max_time = total.max_time.max(ack.max_time);
+            total.row_count += ack.row_count;
+            start = end;
+        }
+        Ok(total)
+    }
+
     /// Insert a pre-built fact (and optional series) batch without rebuilding Arrow.
     async fn write_prepared_batch(
         &self,

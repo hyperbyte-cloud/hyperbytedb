@@ -776,6 +776,7 @@ impl PeerIngestionService {
             )
             .await?;
             stage.lap("local_metadata");
+            let version = self.wal.reserve_version(all_local.len() as u64);
             let wal_seq = append_points_with_prepared(
                 self.wal.as_ref(),
                 self.sink.as_ref(),
@@ -784,6 +785,7 @@ impl PeerIngestionService {
                 all_local,
                 self.node_id,
                 self.max_points_per_request,
+                version,
             )
             .await?;
             stage.lap("local_wal");
@@ -797,6 +799,7 @@ impl PeerIngestionService {
                     wal_seq,
                     target_node_ids: Some(targets),
                     region_id: Some(region_id),
+                    version,
                 })
                 .await?;
             }
@@ -918,6 +921,7 @@ impl IngestionPort for PeerIngestionService {
                     precision_val,
                 )?;
 
+            let version = self.wal.reserve_version(wire.values.len() as u64);
             let wal_seq = append_columnar_with_prepared(
                 self.wal.as_ref(),
                 self.sink.as_ref(),
@@ -928,6 +932,7 @@ impl IngestionPort for PeerIngestionService {
                     precision,
                     origin_node_id: self.node_id,
                     max_points_per_request: self.max_points_per_request,
+                    version,
                 },
             )
             .await?;
@@ -948,6 +953,7 @@ impl IngestionPort for PeerIngestionService {
                     wal_seq,
                     target_node_ids: None,
                     region_id: None,
+                    version,
                 })
                 .await;
             return result;
@@ -1043,6 +1049,7 @@ impl IngestionPort for PeerIngestionService {
         histogram!("hyperbytedb_ingest_metadata_register_seconds").record((t3 - t2).as_secs_f64());
 
         let point_count = points.len() as u64;
+        let version = self.wal.reserve_version(point_count);
         let wal_seq = append_points_with_prepared(
             self.wal.as_ref(),
             self.sink.as_ref(),
@@ -1051,6 +1058,7 @@ impl IngestionPort for PeerIngestionService {
             points,
             self.node_id,
             self.max_points_per_request,
+            version,
         )
         .await?;
 
@@ -1069,6 +1077,7 @@ impl IngestionPort for PeerIngestionService {
             wal_seq,
             target_node_ids: None,
             region_id: None,
+            version,
         })
         .await?;
         partial.map_or(Ok(()), Err)

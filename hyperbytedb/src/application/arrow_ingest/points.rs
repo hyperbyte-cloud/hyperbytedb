@@ -17,6 +17,7 @@ pub async fn points_to_prepared_bundle(
         retention_policy: rp.to_string(),
         points: points.clone(),
         origin_node_id,
+        version: 0,
     };
     let prepared = sink
         .build_prepared_wal_slot(db, rp, origin_node_id, &points)

@@ -76,6 +76,7 @@ impl IngestionServiceImpl {
             points,
             origin_node_id,
             self.max_points_per_request,
+            0,
         )
         .await
     }
@@ -162,6 +163,7 @@ impl IngestionPort for IngestionServiceImpl {
                     precision,
                     origin_node_id: 0,
                     max_points_per_request: self.max_points_per_request,
+                    version: 0,
                 },
             )
             .await?;

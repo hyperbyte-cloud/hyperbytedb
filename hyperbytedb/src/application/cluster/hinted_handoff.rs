@@ -193,6 +193,7 @@ mod tests {
                 retention_policy: "autogen".into(),
                 precision: None,
                 line_body: format!("cpu,host=h{i} v=1 1").into_bytes(),
+                version: 0,
             };
             hh.enqueue_hint(2, &hint).unwrap();
         }

@@ -169,6 +169,7 @@ fn bench_wal(c: &mut Criterion) {
                 retention_policy: "autogen".into(),
                 points,
                 origin_node_id: 0,
+                version: 0,
             };
             rt.block_on(wal.append(entry)).expect("wal");
         });
@@ -274,6 +275,7 @@ fn bench_wal_fast(c: &mut Criterion) {
                 retention_policy: "autogen".into(),
                 points,
                 origin_node_id: 0,
+                version: 0,
             };
             rt.block_on(wal.append(entry)).expect("wal");
         });
@@ -423,6 +425,7 @@ fn bench_wal_concurrent(c: &mut Criterion) {
                                     retention_policy: "autogen".into(),
                                     points,
                                     origin_node_id: 0,
+                                    version: 0,
                                 })
                                 .await
                                 .expect("wal");
@@ -500,6 +503,7 @@ fn bench_wal_batched_concurrent(c: &mut Criterion) {
                                     retention_policy: "autogen".into(),
                                     points,
                                     origin_node_id: 0,
+                                    version: 0,
                                 })
                                 .await
                                 .expect("wal");
