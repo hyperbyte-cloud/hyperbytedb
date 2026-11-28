@@ -242,6 +242,21 @@ pub async fn run_node(
         None
     };
 
+    // Batches acked but not yet sent when this node last stopped become
+    // hints, which the watcher above delivers. Retried until peers are known.
+    if let Some(pc) = &peer_client {
+        let pc = pc.clone();
+        let mut rx = service_shutdown_rx.clone();
+        tokio::spawn(async move {
+            while !pc.recover_outbox().await {
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    _ = rx.changed() => break,
+                }
+            }
+        });
+    }
+
     if config.cluster.anti_entropy_enabled {
         tracing::warn!(
             "cluster.anti_entropy_enabled is set but Merkle anti-entropy was \
