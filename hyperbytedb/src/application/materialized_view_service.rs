@@ -469,17 +469,6 @@ impl MaterializedViewService {
         }
     }
 
-    /// Drop ClickHouse MV objects for a definition without touching metadata.
-    pub async fn drop_ch_objects_for_def(
-        &self,
-        def: &MaterializedViewDef,
-    ) -> Result<(), HyperbytedbError> {
-        let fact_mv = quoted_fact_mv_name(&def.database, &def.dest_rp, &def.name);
-        let series_mv = quoted_series_mv_name(&def.database, &def.dest_rp, &def.name);
-        self.drop_ch_mv_objects(fact_mv.as_str(), series_mv.as_str())
-            .await
-    }
-
     async fn reconcile_one(&self, def: &MaterializedViewDef) -> Result<bool, HyperbytedbError> {
         let exists_sql = format!(
             "SELECT count() FROM system.tables WHERE database = 'default' AND name = '{}' FORMAT TabSeparated",

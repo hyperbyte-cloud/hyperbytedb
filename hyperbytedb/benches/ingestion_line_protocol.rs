@@ -10,7 +10,7 @@ use hyperbytedb::adapters::metadata::rocksdb_meta::RocksDbMetadata;
 use hyperbytedb::adapters::wal::batching_wal::BatchingWal;
 use hyperbytedb::adapters::wal::rocksdb_wal::RocksDbWal;
 use hyperbytedb::application::ingest_metadata::{
-    IngestCardinalityLimits, IngestSchemaCache, prepare_batch_metadata,
+    IngestCardinalityLimits, IngestSchemaCache, prepare_batch_metadata, split_field_type_conflicts,
 };
 use hyperbytedb::application::line_protocol::parse_line_body_to_points;
 use hyperbytedb::domain::wal::WalEntry;
@@ -385,8 +385,81 @@ fn bench_wal_batched_concurrent(c: &mut Criterion) {
     group.finish();
 }
 
+/// 5000 Telegraf-shaped `cpu` points with 10 float fields each.
+fn telegraf_cpu_body(n: usize) -> Vec<u8> {
+    let mut body = String::new();
+    for i in 0..n {
+        body.push_str(&format!(
+            "cpu,host=h{},cpu=cpu{} usage_user={}.5,usage_system=1.5,usage_idle=90.1,usage_iowait=0.1,usage_irq=0.0,usage_softirq=0.2,usage_steal=0.0,usage_guest=0.0,usage_nice=0.0,usage_guest_nice=0.0 {}\n",
+            i % 50,
+            i % 8,
+            i,
+            1_700_000_000_000_000_000i64 + i as i64
+        ));
+    }
+    body.into_bytes()
+}
+
+/// The per-batch field-type check every line-protocol write runs before
+/// the schema cache.
+fn bench_split_field_types(c: &mut Criterion) {
+    let body = telegraf_cpu_body(5000);
+    let points = parse_line_body_to_points(&body, None).expect("parse");
+    let rt = Runtime::new().expect("runtime");
+    let tmpdir = tempfile::tempdir().expect("tmpdir");
+    let metadata: Arc<dyn MetadataPort> =
+        Arc::new(RocksDbMetadata::open(tmpdir.path()).expect("meta"));
+    rt.block_on(metadata.create_database("benchdb")).unwrap();
+    let mut group = c.benchmark_group("line_protocol_field_types");
+    group.throughput(Throughput::Elements(5000));
+    group.bench_function("split_field_type_conflicts_5000x10", |b| {
+        b.iter_batched(
+            || points.clone(),
+            |pts| {
+                rt.block_on(split_field_type_conflicts(
+                    &metadata, "benchdb", "autogen", pts,
+                ))
+                .expect("split")
+            },
+            criterion::BatchSize::LargeInput,
+        );
+    });
+    group.finish();
+}
+
+/// The client write path's name-collision guard on a steady-state batch
+/// (every name already checked).
+fn bench_name_guard(c: &mut Criterion) {
+    use hyperbytedb::application::physical_names::PhysicalNameGuard;
+    let body = telegraf_cpu_body(5000);
+    let points = parse_line_body_to_points(&body, None).expect("parse");
+    let rt = Runtime::new().expect("runtime");
+    let tmpdir = tempfile::tempdir().expect("tmpdir");
+    let metadata: Arc<dyn MetadataPort> =
+        Arc::new(RocksDbMetadata::open(tmpdir.path()).expect("meta"));
+    rt.block_on(metadata.create_database("benchdb")).unwrap();
+    let guard = PhysicalNameGuard::new();
+    // The request builds the batch schema once for metadata registration;
+    // the guard's own cost is checking it.
+    let schema = hyperbytedb::application::ingest_metadata::BatchSchema::from_points(&points)
+        .expect("schema");
+    rt.block_on(guard.check_schema(&metadata, "benchdb", "autogen", &schema))
+        .expect("guard");
+    let mut group = c.benchmark_group("line_protocol_name_guard");
+    group.throughput(Throughput::Elements(5000));
+    group.bench_function("name_guard_5000x10", |b| {
+        b.iter(|| {
+            rt.block_on(guard.check_schema(&metadata, "benchdb", "autogen", black_box(&schema)))
+                .expect("guard")
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    bench_split_field_types,
+    bench_name_guard,
     bench_parse,
     bench_metadata,
     bench_wal,

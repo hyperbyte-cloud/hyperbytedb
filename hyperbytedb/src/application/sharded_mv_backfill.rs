@@ -12,7 +12,6 @@ use crate::error::HyperbytedbError;
 use crate::ports::metadata::MetadataPort;
 use crate::ports::points_sink::PointsSinkPort;
 use crate::ports::query::QueryPort;
-use crate::ports::sharding::ShardMapPort;
 
 /// Borrowed measurement identity within a database and retention policy.
 #[derive(Clone, Copy)]

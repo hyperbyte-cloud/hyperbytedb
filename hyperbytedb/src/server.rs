@@ -8,12 +8,12 @@ use std::time::Duration;
 use crate::adapters::http::router::{build_control_router, build_router};
 use crate::application::cluster::heartbeat;
 use crate::application::cluster::hinted_handoff;
-use crate::application::cluster::leader_monitor;
-use crate::application::cluster::raft_formation;
 use crate::application::continuous_query_service::ContinuousQueryService;
 use crate::application::disk_monitor;
 use crate::application::retention_service::RetentionService;
 use crate::bootstrap::build_services;
+use crate::composition::leader_monitor;
+use crate::composition::raft_formation;
 use crate::config::{HyperbytedbConfig, RetentionConfig};
 use crate::ports::metadata::MetadataPort;
 use crate::ports::points_sink::PointsSinkPort;
@@ -234,7 +234,6 @@ async fn serve_inner(
                 app_state.metadata.clone(),
                 app_state.wal.clone(),
                 Some(app_state.query_port.clone()),
-                Some(app_state.points_sink.clone()),
                 config.cluster.node_id,
                 config.sharding.clone(),
                 config.server.max_points_per_request,
@@ -310,7 +309,7 @@ async fn serve_inner(
                             pc,
                             m,
                             map,
-                            raft,
+                            Arc::new(raft),
                             meta,
                             query_port,
                             region_write_stats,
@@ -340,7 +339,10 @@ async fn serve_inner(
         let cq_service = Arc::new(ContinuousQueryService::new(
             app_state.metadata.clone(),
             app_state.query.clone(),
-            app_state.raft.clone(),
+            app_state
+                .raft
+                .clone()
+                .map(|r| Arc::new(r) as Arc<dyn crate::ports::leadership::LeadershipPort>),
             config.cluster.node_id,
         ));
         let rx = service_shutdown_rx.clone();
@@ -366,7 +368,10 @@ async fn serve_inner(
             RetentionService::new(
                 app_state.metadata.clone(),
                 app_state.query_port.clone(),
-                app_state.raft.clone(),
+                app_state
+                    .raft
+                    .clone()
+                    .map(|r| Arc::new(r) as Arc<dyn crate::ports::leadership::LeadershipPort>),
                 config.cluster.node_id,
             )
             .with_sharding(config.sharding.enabled, app_state.shard_map.clone()),

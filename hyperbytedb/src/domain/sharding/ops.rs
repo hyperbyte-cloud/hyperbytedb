@@ -342,10 +342,10 @@ pub fn apply_shard_map_op(
                     "split regions must meet at split_key".into(),
                 ));
             }
-            // Apply-time normalization (durable reconciliation intent): flag
-            // every child whose primary differs from the parent's — that
-            // child's historical rows must be re-pushed and verified before
-            // the debt clears. `transfer_first_seen` propagates from the
+            // Apply-time normalization: flag every child whose primary differs
+            // from the parent's (a metadata-only split never does). Nothing
+            // clears the flag any more: the reconciliation that re-pushed
+            // and verified flagged children was removed. `transfer_first_seen` propagates from the
             // parent so re-splitting a flagged region cannot reset the age
             // gate. Predicates are deterministic from (op, prior map), so all
             // replicas normalize identically.

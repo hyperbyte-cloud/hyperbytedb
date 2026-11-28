@@ -15,7 +15,6 @@ use crate::error::HyperbytedbError;
 
 pub const MIN_POOL_SIZE: usize = 1;
 pub const MAX_POOL_SIZE: usize = 128;
-pub const DEFAULT_POOL_SIZE: usize = 4;
 pub const DEFAULT_WRITE_POOL_SIZE: usize = 4;
 
 /// Query pool size when nothing sets one: one connection per CPU this

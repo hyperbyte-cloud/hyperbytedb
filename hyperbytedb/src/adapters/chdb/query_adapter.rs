@@ -36,17 +36,6 @@ impl ChdbQueryAdapter {
         })
     }
 
-    /// Build the adapter, eagerly opening the pool and capping concurrent
-    /// queries at `max_concurrent` (`0` disables the cap).
-    pub fn with_concurrency_limit(
-        data_path: &str,
-        max_concurrent: usize,
-        pool_size: usize,
-    ) -> Result<Self, HyperbytedbError> {
-        let session = SharedSession::new_eager(data_path, pool_size)?;
-        Ok(Self::from_shared(session, max_concurrent))
-    }
-
     /// Build the adapter from an already-constructed [`SharedSession`].
     /// Used by [`crate::bootstrap`] so the read adapter and (when enabled) the
     /// native-write adapter point at the same pool.

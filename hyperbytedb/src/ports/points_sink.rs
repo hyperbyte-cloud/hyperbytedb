@@ -60,7 +60,7 @@ pub trait PointsSinkPort: Send + Sync {
         _db: &str,
         _rp: &str,
         _origin_node_id: u64,
-        _wire: &crate::application::columnar_msgpack::ColumnarMsgpackBatch,
+        _wire: &crate::domain::columnar_batch::ColumnarMsgpackBatch,
         _precision: Option<&str>,
     ) -> Result<PreparedWalSlot, HyperbytedbError> {
         Err(HyperbytedbError::Internal(

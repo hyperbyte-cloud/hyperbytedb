@@ -22,4 +22,9 @@ openraft::declare_raft_types!(
 );
 
 pub type HyperbytedbRaft = openraft::Raft<TypeConfig>;
-pub type RaftAdaptor = openraft::storage::Adaptor<TypeConfig, log_store::RaftStore>;
+
+impl crate::ports::leadership::LeadershipPort for HyperbytedbRaft {
+    fn current_leader(&self) -> Option<u64> {
+        self.metrics().borrow().current_leader
+    }
+}

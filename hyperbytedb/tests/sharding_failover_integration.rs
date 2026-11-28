@@ -10,9 +10,9 @@ use hyperbytedb::adapters::chdb::session::SharedSession;
 use hyperbytedb::adapters::metadata::rocksdb_meta::RocksDbMetadata;
 use hyperbytedb::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
 use hyperbytedb::adapters::wal::rocksdb_wal::RocksDbWal;
-use hyperbytedb::application::cluster::bootstrap::ClusterBootstrap;
 use hyperbytedb::application::materialized_view_service::MaterializedViewService;
 use hyperbytedb::application::shard_scheduler::ShardScheduler;
+use hyperbytedb::composition::bootstrap::ClusterBootstrap;
 use hyperbytedb::config::ClusterConfig;
 use hyperbytedb::domain::cluster::membership::NodeState;
 use hyperbytedb::domain::sharding::{
@@ -122,7 +122,6 @@ async fn primary_failover_updates_shard_map_after_unhealthy_timeout() {
         metadata,
         wal,
         None,
-        Some(sink),
         1,
         sharding,
         0,

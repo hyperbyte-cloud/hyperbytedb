@@ -169,11 +169,6 @@ impl ShardLocationCache {
         }
     }
 
-    pub fn invalidate_all(&self) {
-        let mut inner = self.write_inner();
-        inner.by_measurement.clear();
-    }
-
     pub fn invalidate_measurement(&self, key: &MeasurementKey) {
         let mut inner = self.write_inner();
         inner

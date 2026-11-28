@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
 
-use crate::adapters::cluster::replication_log::ReplicationLog;
+use crate::ports::replication_acks::ReplicationAcks;
 
 use crate::domain::arrow_coalesce::coalesce_prepared_batches;
 use crate::domain::cluster::membership::SharedMembership;
@@ -48,7 +48,7 @@ pub struct FlushServiceImpl {
     wal: Arc<dyn WalPort>,
     last_flushed: Arc<Mutex<u64>>,
     max_points_per_batch: usize,
-    replication_log: Option<Arc<ReplicationLog>>,
+    replication_log: Option<Arc<dyn ReplicationAcks>>,
     membership: Option<SharedMembership>,
     node_id: u64,
     /// Highest WAL sequence with `origin_node_id == self.node_id` (i.e. a
@@ -151,7 +151,7 @@ impl FlushServiceImpl {
         self
     }
 
-    pub fn with_replication_log(mut self, repl_log: Arc<ReplicationLog>) -> Self {
+    pub fn with_replication_log(mut self, repl_log: Arc<dyn ReplicationAcks>) -> Self {
         self.replication_log = Some(repl_log);
         self
     }

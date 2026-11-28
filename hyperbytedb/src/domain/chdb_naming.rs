@@ -23,12 +23,6 @@ use crate::error::HyperbytedbError;
 pub struct SanitizedIdent(String);
 
 impl SanitizedIdent {
-    /// Sanitize arbitrary input into a valid ClickHouse identifier.
-    #[must_use]
-    pub fn sanitize(input: &str) -> Self {
-        Self(sanitise_ident(input))
-    }
-
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -111,6 +105,37 @@ pub fn unquoted_table_name(db: &str, rp: &str, measurement: &str) -> SanitizedId
         sanitise_ident(rp),
         sanitise_ident(measurement)
     ))
+}
+
+/// Append `s` to `out` escaped for the inside of a ClickHouse string
+/// literal: `\` and `'` are backslash-escaped, `\n` `\r` `\t` are written
+/// as escape sequences and other control characters as `\xNN`.
+pub fn push_string_literal_body(out: &mut String, s: &str) {
+    use std::fmt::Write as _;
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\x{:02x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+}
+
+/// `s` as a single-quoted ClickHouse string literal; see
+/// [`push_string_literal_body`].
+#[must_use]
+pub fn string_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    push_string_literal_body(&mut out, s);
+    out.push('\'');
+    out
 }
 
 /// Quote an identifier with backticks, escaping embedded backticks.
@@ -229,6 +254,16 @@ mod tests {
             quoted_table_name("my-db", "autogen", "cpu.load").as_str(),
             "`my_db_autogen_cpu_load`"
         );
+    }
+
+    #[test]
+    fn string_literal_escapes_quotes_backslashes_and_controls() {
+        assert_eq!(string_literal("a'b\\c"), "'a\\'b\\\\c'");
+        assert_eq!(string_literal("x\ty\n"), "'x\\ty\\n'");
+        assert_eq!(string_literal("\u{1}"), "'\\x01'");
+        let mut body = String::new();
+        push_string_literal_body(&mut body, "it's");
+        assert_eq!(body, "it\\'s");
     }
 
     #[test]

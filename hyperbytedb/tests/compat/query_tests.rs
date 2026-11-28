@@ -1463,3 +1463,41 @@ async fn where_clause_with_thousands_of_or_terms() {
     );
     assert!(!hyperbytedb::adapters::chdb::engine_failed());
 }
+
+/// A tag value with a control character must match in WHERE once the
+/// ClickHouse string escapers are one: the native writer escaped `\t` while
+/// the query translator wrote it raw.
+#[tokio::test]
+#[serial(chdb)]
+async fn tag_value_with_a_tab_round_trips() {
+    let ctx = TestContext::new().unwrap();
+    ctx.metadata.create_database("testdb").await.unwrap();
+    // Line protocol refuses a tab in a tag value; msgpack carries it.
+    #[derive(serde::Serialize)]
+    struct Point {
+        measurement: &'static str,
+        tags: std::collections::BTreeMap<&'static str, &'static str>,
+        fields: std::collections::BTreeMap<&'static str, hyperbytedb::domain::point::FieldValue>,
+        timestamp: Option<i64>,
+    }
+    let body = rmp_serde::to_vec_named(&vec![Point {
+        measurement: "cpu",
+        tags: [("host", "a\tb")].into(),
+        fields: [("v", hyperbytedb::domain::point::FieldValue::Float(1.0))].into(),
+        timestamp: Some(1_000_000_000),
+    }])
+    .unwrap();
+    use hyperbytedb::ports::ingestion::{IngestionPort, WritePayloadFormat};
+    ctx.ingestion
+        .ingest("testdb", None, None, &body, WritePayloadFormat::Msgpack)
+        .await
+        .unwrap();
+    ctx.flush_service.flush().await.unwrap();
+    let resp = ctx
+        .query("testdb", "SELECT v FROM cpu WHERE host = 'a\tb'")
+        .await
+        .unwrap();
+    let stmt = &resp.results[0];
+    assert!(stmt.error.is_none(), "{:?}", stmt.error);
+    assert_eq!(stmt.series.as_ref().map_or(0, |s| s[0].values.len()), 1);
+}

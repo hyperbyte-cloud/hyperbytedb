@@ -11,10 +11,7 @@ use crate::application::ingest_metadata::{
     IngestCardinalityLimits, IngestSchemaCache, prepare_batch_metadata, split_field_type_conflicts,
     validate_point_count,
 };
-use crate::application::line_protocol::{
-    encode_points_to_line_protocol, parse_line_body_to_points_limited,
-};
-use crate::application::msgpack_ingest::parse_msgpack_body_to_points_limited;
+use crate::application::line_protocol::encode_points_to_line_protocol;
 use crate::application::replication_dispatch::dispatch_outbound_replication;
 use crate::application::shard_routing::{
     ShardRoutingContext, ensure_measurement_bootstrapped, forward_shard_writes_by_node,
@@ -29,7 +26,6 @@ use crate::error::HyperbytedbError;
 use crate::ports::ingestion::{IngestionPort, WritePayloadFormat};
 use crate::ports::points_sink::PointsSinkPort;
 use crate::ports::replication::{OutboundReplicationBatch, ReplicationPort};
-use crate::ports::sharding::ShardMapPort;
 use crate::ports::wal::WalPort;
 
 /// Ingestion service for clustered (master-master) mode. Writes are always
@@ -225,8 +221,7 @@ impl PeerIngestionService {
         // flush pipeline cannot serve (stuck-flush liveness gaps).
         for meas in &measurements {
             if let Some(meta) = self.metadata.get_measurement(db, rp, meas).await?
-                && meta.materialized
-                && meta.materialized_rp.as_deref().is_none_or(|mr| mr == rp)
+                && meta.refuses_raw_writes(rp)
             {
                 return Err(HyperbytedbError::WriteToMaterializedDestination(
                     meas.clone(),
@@ -893,11 +888,7 @@ impl IngestionPort for PeerIngestionService {
                 .metadata
                 .get_measurement(db, &retention_policy, &wire.measurement)
                 .await?
-                && meta.materialized
-                && meta
-                    .materialized_rp
-                    .as_deref()
-                    .is_none_or(|mr| mr == retention_policy)
+                && meta.refuses_raw_writes(&retention_policy)
             {
                 return Err(HyperbytedbError::WriteToMaterializedDestination(
                     wire.measurement.clone(),
@@ -965,25 +956,14 @@ impl IngestionPort for PeerIngestionService {
             return result;
         }
 
-        let points = match format {
-            WritePayloadFormat::LineProtocol => {
-                parse_line_body_to_points_limited(body, precision, self.max_points_per_request)?
-            }
-            WritePayloadFormat::Msgpack => {
-                parse_msgpack_body_to_points_limited(body, precision, self.max_points_per_request)?
-            }
-            #[cfg(feature = "columnar-ingest")]
-            WritePayloadFormat::ColumnarMsgpack => {
-                return Err(HyperbytedbError::Internal(
-                    "columnar ingest fell through fast path".into(),
-                ));
-            }
-        };
+        let points = crate::application::ingest_metadata::parse_write_body(
+            body,
+            precision,
+            format,
+            self.max_points_per_request,
+        )?;
         if points.is_empty() {
             return Ok(());
-        }
-        if !matches!(format, WritePayloadFormat::LineProtocol) {
-            validate_point_count(points.len(), self.max_points_per_request)?;
         }
 
         // Points whose fields conflict with a stored type are dropped and the
@@ -994,8 +974,11 @@ impl IngestionPort for PeerIngestionService {
             return partial.map_or(Ok(()), Err);
         }
 
+        // Built once: the name guard and the metadata registration both
+        // need each measurement's names.
+        let schema = crate::application::ingest_metadata::BatchSchema::from_points(&points)?;
         self.name_guard
-            .check_points(&self.metadata, db, &retention_policy, &points)
+            .check_schema(&self.metadata, db, &retention_policy, &schema)
             .await?;
 
         let precision_val = Precision::from_str_opt(precision);
@@ -1024,11 +1007,12 @@ impl IngestionPort for PeerIngestionService {
             return with_dropped(result, partial);
         }
 
-        prepare_batch_metadata(
+        crate::application::ingest_metadata::prepare_batch_metadata_with_schema(
             &self.metadata,
             db,
             &retention_policy,
             &points,
+            &schema,
             &self.limits,
             Some(&self.schema_cache),
         )
@@ -1043,11 +1027,7 @@ impl IngestionPort for PeerIngestionService {
                     .metadata
                     .get_measurement(db, &retention_policy, &point.measurement)
                     .await?
-                && meta.materialized
-                && meta
-                    .materialized_rp
-                    .as_deref()
-                    .is_none_or(|mr| mr == retention_policy)
+                && meta.refuses_raw_writes(&retention_policy)
             {
                 return Err(HyperbytedbError::WriteToMaterializedDestination(
                     point.measurement.clone(),

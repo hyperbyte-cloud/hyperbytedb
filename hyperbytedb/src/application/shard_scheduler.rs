@@ -7,14 +7,10 @@ use tokio::sync::watch;
 
 use crate::adapters::cluster::peer_client::PeerClient;
 use crate::adapters::cluster::raft::HyperbytedbRaft;
-use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
 use crate::application::runtime_settings as rs;
 use crate::application::shard_peer_resolution::is_active_peer;
 use crate::application::shard_routing::effective_replication_factor;
-use crate::application::shard_transfer::{
-    TRANSFER_CHUNK_POINTS, complete_region_transfer, push_region_transfer_data,
-    stage_region_transfer_data,
-};
+use crate::application::shard_transfer::{TRANSFER_CHUNK_POINTS, stage_region_transfer_data};
 use crate::config::ShardingConfig;
 use crate::domain::cluster::membership::{
     NodeInfo, NodeState, SharedMembership, holds_placement, is_departing, is_serving,
@@ -28,7 +24,6 @@ use crate::domain::sharding::{
 };
 use crate::error::HyperbytedbError;
 use crate::ports::metadata::MetadataPort;
-use crate::ports::points_sink::PointsSinkPort;
 use crate::ports::query::QueryPort;
 use crate::ports::sharding::ShardMapPort;
 use crate::ports::wal::WalPort;
@@ -253,51 +248,16 @@ fn max_region_peer_heartbeat_bytes(hb: &[RegionHeartbeatRow], region: &ShardRegi
         .unwrap_or(0)
 }
 
-/// One outstanding post-commit split-transfer movement awaiting verified
-/// re-push. Ordering detail only — durable intent lives in the shard map's
-/// `transfer_verified` flag, so leadership change or process restart rebuilds
-/// the queue from a map scan.
-#[derive(Debug, Clone)]
-/// Dead since splits became metadata-only: the split was the only caller,
-/// and nothing creates transfer debt any more. Retained deliberately —
-/// removing the reconciliation machinery is a large deletion that deserves
-/// its own review, not a side effect of an unrelated change.
-#[allow(dead_code)]
-pub(crate) struct PendingTransfer {
-    pub key: MeasurementKey,
-    pub region_id: u64,
-    pub start: u64,
-    pub end: u64,
-    /// Source that provably held the rows at split time (the old primary).
-    /// Candidate order at drain time is: current primary (authoritative
-    /// owner), then this node, then remaining live peers.
-    pub recorded_source: u64,
-    pub resolve_at_drain: bool,
-    pub ticks_without_progress: u32,
-    /// Parked entries stop consuming retries; the map flag stays false so
-    /// the debt remains visible and re-enqueued after restart.
-    pub parked: bool,
-    pub first_seen: i64,
-}
-
-/// Ticks without applied-count progress before a stuck entry escalates.
-#[allow(dead_code)]
-const RECONCILE_PARK_AFTER_TICKS: u32 = 10;
-/// Minimum debt age (persisted via `transfer_first_seen`) before parking.
-#[allow(dead_code)]
-const RECONCILE_MIN_AGE_SECS: i64 = 300;
-
 pub struct ShardScheduler {
     /// This node's runtime settings: `SET` overrides for the gates below.
     runtime_settings: Arc<rs::RuntimeSettings>,
-    shard_map: Arc<RocksDbShardMap>,
+    shard_map: Arc<dyn ShardMapPort>,
     membership: SharedMembership,
     raft: HyperbytedbRaft,
     peer_client: Option<Arc<PeerClient>>,
     metadata: Arc<dyn MetadataPort>,
     wal: Arc<dyn WalPort>,
     query_port: Option<Arc<dyn QueryPort>>,
-    points_sink: Option<Arc<dyn PointsSinkPort>>,
     node_id: u64,
     config: ShardingConfig,
     max_points_per_request: usize,
@@ -320,9 +280,6 @@ pub struct ShardScheduler {
     placement_attempt_seq: std::sync::atomic::AtomicU64,
     /// (db, rp, measurement, region_id) -> unix secs when primary first seen unhealthy
     unhealthy_primaries: tokio::sync::RwLock<HashMap<(String, String, String, u64), u64>>,
-    /// Post-commit split-transfer reconciliation queue. Idempotent per
-    /// (key, region_id); rebuilt from the map scan on leadership change.
-    reconciliation_queue: std::sync::Mutex<Vec<PendingTransfer>>,
     /// Materialized-view rollup destinations (SummingMergeTree spaces),
     /// refreshed from metadata each drain. Re-delivery there would
     /// permanently corrupt additive aggregates, so those spaces are never
@@ -387,14 +344,13 @@ pub struct ShardScheduler {
 impl ShardScheduler {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        shard_map: Arc<RocksDbShardMap>,
+        shard_map: Arc<dyn ShardMapPort>,
         membership: SharedMembership,
         raft: HyperbytedbRaft,
         peer_client: Option<Arc<PeerClient>>,
         metadata: Arc<dyn MetadataPort>,
         wal: Arc<dyn WalPort>,
         query_port: Option<Arc<dyn QueryPort>>,
-        points_sink: Option<Arc<dyn PointsSinkPort>>,
         node_id: u64,
         config: ShardingConfig,
         max_points_per_request: usize,
@@ -412,7 +368,6 @@ impl ShardScheduler {
             metadata,
             wal,
             query_port,
-            points_sink,
             node_id,
             config,
             max_points_per_request,
@@ -424,7 +379,6 @@ impl ShardScheduler {
             placement_last_attempted: tokio::sync::RwLock::new(HashMap::new()),
             placement_attempt_seq: std::sync::atomic::AtomicU64::new(0),
             unhealthy_primaries: tokio::sync::RwLock::new(HashMap::new()),
-            reconciliation_queue: std::sync::Mutex::new(Vec::new()),
             rollup_dests: tokio::sync::RwLock::new(HashMap::new()),
             rollup_handoffs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             peer_map_versions: tokio::sync::RwLock::new(HashMap::new()),
@@ -724,56 +678,6 @@ impl ShardScheduler {
         }
     }
 
-    /// Cut over any staging region whose data has finished moving.
-    ///
-    /// A split publishes its child NOT serving: until this fires the donor
-    /// still holds and serves the range, so readers never see a region that is
-    /// missing rows. Activation is gated on the movement being verified --
-    /// `transfer_verified` is the reconciliation machinery's own completion
-    /// signal -- so the child only becomes routable once it actually holds the
-    /// data. A child that kept the donor's primary carries no debt and
-    /// activates on the next tick.
-    ///
-    /// The flip is one committed op, so every node's location cache applies it
-    /// in the same apply: no node sees a half-applied handover.
-    #[allow(dead_code)]
-    async fn try_activate_staged_regions(&self, map: &ShardMap) {
-        for space in map.spaces.values() {
-            for region in &space.regions {
-                if region.is_serving() {
-                    continue;
-                }
-                if region.transfer_outstanding() {
-                    continue;
-                }
-                match self
-                    .propose(ShardMapOp::ActivateRegion {
-                        key: space.key.clone(),
-                        region_id: region.region_id,
-                        epoch: region.epoch,
-                    })
-                    .await
-                {
-                    Ok(()) => {
-                        counter!("hyperbytedb_shard_region_activations_total").increment(1);
-                        tracing::info!(
-                            region_id = region.region_id,
-                            primary = region.primary,
-                            "staging region cut over to serving"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            region_id = region.region_id,
-                            error = %e,
-                            "staging region cutover failed; will retry"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
     async fn clear_placement_stall(&self, region_id: u64) {
         self.placement_stalls.write().await.remove(&region_id);
     }
@@ -804,7 +708,7 @@ impl ShardScheduler {
 
     /// Reload the materialized view destinations [`Self::is_rollup_dest`]
     /// answers from. Until this ran every tick the set stayed empty in
-    /// production (its only caller was the dead reconciliation drain), and
+    /// production (its only caller was the split-transfer reconciliation drain), and
     /// placement moved destination regions: on n3 a moved destination's rows
     /// reached the flush, which refuses writes to a destination, and held
     /// the WAL on every retry.
@@ -1848,86 +1752,6 @@ impl ShardScheduler {
         SplitOutcome::Refused(reason)
     }
 
-    /// Propose clearing a verified split-transfer debt. No-op success when
-    /// the region carries no outstanding flag. Gated behind
-    /// `transfer_clear_proposals_enabled` for mixed-version rolling upgrades:
-    /// old binaries cannot decode the `ClearVerified` op from the Raft log.
-    // Unreachable in production since splits became metadata-only: the split
-    // was its only caller. Nothing now creates transfer debt either --
-    // apply-time normalization flags a child only when its primary differs
-    // from the parent's, which a TiKV-style split never does, and
-    // TransferPrimary does not set it. So the reconciliation queue, its drain,
-    // and ClearVerified are all currently dead paths.
-    //
-    // Retained rather than deleted in the same change as the behaviour switch:
-    // removing that machinery is a large, separate deletion that deserves its
-    // own review. The test below still covers the rollup-destination exclusion.
-    #[allow(dead_code)]
-    fn enqueue_reconciliation(&self, entry: PendingTransfer) {
-        match self.rollup_dests.try_read() {
-            Ok(set) if set.contains_key(&entry.key) => {
-                // SummingMergeTree destinations must never receive re-delivered
-                // rows (additive aggregates would permanently double-count).
-                // Their primary changes are provisioned by the MV backfill path.
-                tracing::info!(
-                    db = %entry.key.db,
-                    rp = %entry.key.rp,
-                    measurement = %entry.key.measurement,
-                    region_id = entry.region_id,
-                    "rollup destination space excluded from transfer reconciliation"
-                );
-                return;
-            }
-            Ok(_) => {}
-            Err(_) => {
-                tracing::warn!(
-                    db = %entry.key.db,
-                    rp = %entry.key.rp,
-                    measurement = %entry.key.measurement,
-                    region_id = entry.region_id,
-                    "rollup dest set contended; skipping transfer enqueue"
-                );
-                return;
-            }
-        }
-        let mut q = self
-            .reconciliation_queue
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        if let Some(existing) = q
-            .iter_mut()
-            .find(|e| e.key == entry.key && e.region_id == entry.region_id)
-        {
-            existing.recorded_source = entry.recorded_source;
-            existing.resolve_at_drain = false;
-            existing.parked = false;
-            return;
-        }
-        q.push(entry);
-    }
-
-    #[allow(dead_code)]
-    async fn propose_clear_verified(
-        &self,
-        key: &MeasurementKey,
-        region: &ShardRegion,
-    ) -> Result<(), HyperbytedbError> {
-        if !region.transfer_outstanding() {
-            return Ok(());
-        }
-        if !self.config.transfer_clear_proposals_enabled {
-            return Err(HyperbytedbError::ShardMap(
-                "ClearVerified proposals disabled (upgrade window)".into(),
-            ));
-        }
-        self.propose(ShardMapOp::ClearVerified {
-            key: key.clone(),
-            region_id: region.region_id,
-            epoch: region.epoch,
-        })
-        .await
-    }
-
     async fn compute_split_key(
         &self,
         key: &MeasurementKey,
@@ -2238,8 +2062,8 @@ impl ShardScheduler {
         if self.peer_client.is_none() {
             return Ok(false);
         }
-        // Re-read: `drain_reconciliation` runs before the tick loop and can
-        // bump epochs, so the caller's snapshot may already be stale.
+        // Re-read: earlier steps of the tick can bump epochs, so the caller's
+        // snapshot may already be stale.
         let map = self.shard_map.snapshot().await?;
         metrics::gauge!("hyperbytedb_shard_placement_map_version").set(map.map_version as f64);
         let membership_version = self.membership.read().await.version;
@@ -2664,7 +2488,7 @@ impl ShardScheduler {
             sink.lock().unwrap().push(op);
             return Ok(());
         }
-        use crate::adapters::cluster::raft::types::ClusterRequest;
+        use crate::domain::cluster::raft_request::ClusterRequest;
         let req = ClusterRequest::ShardMapMutation(Box::new(op));
         let resp = self
             .raft
@@ -2872,98 +2696,6 @@ pub fn current_region<'a>(
         .find(|r| r.region_id == region_id)
 }
 
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-async fn push_and_drop_range(
-    peer_client: &Arc<PeerClient>,
-    metadata: &Arc<dyn MetadataPort>,
-    wal: &Arc<dyn WalPort>,
-    query_port: Option<&Arc<dyn QueryPort>>,
-    sink: Option<&Arc<dyn PointsSinkPort>>,
-    source_node_id: u64,
-    key: &MeasurementKey,
-    range: &ShardRegion,
-    dest_primary: u64,
-    max_points: usize,
-) -> Result<(), HyperbytedbError> {
-    // push_region_transfer_data fails unless the destination confirmed every
-    // exported point; complete_region_transfer then acks and drops the source
-    // copy. The range is owned by another region after a split, so dropping is
-    // safe here — and only here.
-    let outcome = push_region_transfer_data(
-        peer_client,
-        metadata,
-        wal,
-        query_port,
-        source_node_id,
-        key,
-        range,
-        dest_primary,
-        max_points,
-    )
-    .await?;
-    if outcome.transfer_id == 0 {
-        // transfer_id == 0 ⇔ source == destination: ownership moved between
-        // resolution and execution. This is a collision signal for the
-        // reconciliation queue — never silent success, and it must not
-        // authorize dropping the range from the node that owns it.
-        return Err(HyperbytedbError::TransferCollision);
-    }
-    complete_region_transfer(
-        peer_client,
-        metadata,
-        sink,
-        source_node_id,
-        key,
-        range,
-        dest_primary,
-        outcome.transfer_id,
-        true,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn request_region_rehome(
-    peer_client: &PeerClient,
-    membership: &SharedMembership,
-    target_node: u64,
-    key: &MeasurementKey,
-    range: &ShardRegion,
-    dest_primary: u64,
-    drop_source: bool,
-) -> Result<(), HyperbytedbError> {
-    let addr = {
-        let m = membership.read().await;
-        m.get_node(target_node).map(|n| n.addr.clone())
-    }
-    .ok_or_else(|| {
-        HyperbytedbError::PeerUnreachable(format!("rehome target node {target_node} unknown"))
-    })?;
-    let req = ShardRehomeRequest {
-        db: key.db.clone(),
-        rp: key.rp.clone(),
-        measurement: key.measurement.clone(),
-        start: range.start,
-        end: range.end,
-        region_id: range.region_id,
-        epoch: range.epoch,
-        dest_primary,
-        drop_source,
-        stage: false,
-        max_bytes_per_sec: 0,
-        dest_skip_wal_through: 0,
-    };
-    post_rehome(
-        peer_client.http_client(),
-        &format!("http://{addr}/internal/shard/rehome"),
-        &req,
-        Duration::from_secs(REHOME_IDLE_SECS),
-    )
-    .await?;
-    Ok(())
-}
-
 /// Ask the current primary to stage `[start, end)` onto a joiner that is
 /// not yet a committed peer.
 async fn request_region_stage(
@@ -3009,39 +2741,6 @@ async fn request_region_stage(
     // under-charging is a convergence-rate cost, while charging points as if
     // they were bytes is a correctness one.
     Ok(body.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0))
-}
-
-/// Reconciliation disposition for a failed post-commit transfer movement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(crate) enum TransferDisposition {
-    /// Transient (transport, apply lag 404/409, 5xx): retry next drain.
-    Retryable,
-    /// Source/destination identity collapsed or moved (400 dest-is-self,
-    /// collision): re-resolve roles and retry.
-    Reresolve,
-    /// Nothing to retry (logic error): park with alarm.
-    Park,
-}
-
-#[allow(dead_code)]
-pub(crate) fn classify_transfer_error(err: &HyperbytedbError) -> TransferDisposition {
-    match err {
-        HyperbytedbError::PeerUnreachable(_) | HyperbytedbError::ReplicationTimeout(_) => {
-            TransferDisposition::Retryable
-        }
-        HyperbytedbError::TransferRejected { status, .. } => match status {
-            400 => TransferDisposition::Reresolve,
-            404 | 409 => TransferDisposition::Retryable,
-            s if *s >= 500 => TransferDisposition::Retryable,
-            _ => TransferDisposition::Park,
-        },
-        HyperbytedbError::TransferCollision => TransferDisposition::Reresolve,
-        // Map-state errors are typically transient snapshots; bounded by the
-        // progress-based parking below.
-        HyperbytedbError::ShardMap(_) => TransferDisposition::Retryable,
-        _ => TransferDisposition::Park,
-    }
 }
 
 async fn pick_best_primary(
@@ -3166,360 +2865,7 @@ async fn pick_alternate_primary(
         .find(|id| peer_is_active_alternate(&m, region, *id, self_id))
 }
 
-#[allow(dead_code)]
-fn now_unix() -> i64 {
-    chrono::Utc::now().timestamp()
-}
-
-impl ShardScheduler {
-    /// Rebuild reconciliation entries from the committed map scan: any
-    /// flagged child without an in-memory entry gets one. Makes leader change
-    /// and process restart equivalent — durable intent lives in the map.
-    #[allow(dead_code)]
-    fn rebuild_queue_from_map(&self, map: &super::super::domain::sharding::types::ShardMap) {
-        let dests = match self.rollup_dests.try_read() {
-            Ok(guard) => guard,
-            Err(_) => {
-                tracing::warn!("rollup dest set contended; skipping transfer queue rebuild");
-                return;
-            }
-        };
-        let mut q = self
-            .reconciliation_queue
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        for space in map.spaces.values() {
-            if dests.contains_key(&space.key) {
-                continue;
-            }
-            for region in &space.regions {
-                if !region.transfer_outstanding() {
-                    continue;
-                }
-                let exists = q
-                    .iter()
-                    .any(|e| e.key == space.key && e.region_id == region.region_id);
-                if exists {
-                    continue;
-                }
-                // The old primary is unknown post-restart; the current primary
-                // is both destination and best initial source guess.
-                q.push(PendingTransfer {
-                    key: space.key.clone(),
-                    region_id: region.region_id,
-                    start: region.start,
-                    end: region.end,
-                    recorded_source: region.primary,
-                    resolve_at_drain: false,
-                    ticks_without_progress: 0,
-                    parked: false,
-                    first_seen: region.transfer_first_seen.unwrap_or_else(now_unix),
-                });
-            }
-        }
-    }
-
-    /// Drain due split-transfer reconciliation entries. Called once per
-    /// leader tick, before scheduling heuristics.
-    #[allow(dead_code)]
-    async fn drain_reconciliation(&self, map: &super::super::domain::sharding::types::ShardMap) {
-        self.refresh_rollup_dests().await;
-        self.rebuild_queue_from_map(map);
-
-        let pending = self.pending_transfers();
-        metrics::gauge!("hyperbytedb_shard_transfer_queue_pending")
-            .set(pending.iter().filter(|e| !e.parked).count() as f64);
-        let now_ts = now_unix();
-        let oldest_age = pending
-            .iter()
-            .map(|e| now_ts - e.first_seen)
-            .max()
-            .unwrap_or(0);
-        metrics::gauge!("hyperbytedb_shard_transfer_queue_oldest_age_secs")
-            .set(oldest_age.max(0) as f64);
-
-        for entry in pending {
-            let Some(space) = map.space(&entry.key.db, &entry.key.rp, &entry.key.measurement)
-            else {
-                self.remove_reconciliation(&entry.key, entry.region_id);
-                continue;
-            };
-            let region = space
-                .regions
-                .iter()
-                .find(|r| {
-                    r.region_id == entry.region_id
-                        || (entry.resolve_at_drain && r.start == entry.start && r.end == entry.end)
-                })
-                .cloned();
-            let Some(region) = region else {
-                // Region vanished (merged away / manual surgery): debt gone.
-                self.remove_reconciliation(&entry.key, entry.region_id);
-                continue;
-            };
-            if !region.transfer_outstanding() {
-                // Cleared elsewhere.
-                self.remove_reconciliation(&entry.key, region.region_id);
-                continue;
-            }
-            if entry.parked || self.region_has_operator(region.region_id) {
-                continue;
-            }
-            let Some(operator) = self.acquire_operator(region.region_id) else {
-                continue;
-            };
-
-            let outcome = self
-                .attempt_reconciliation(&entry.key, &region, &entry)
-                .await;
-            drop(operator);
-
-            match outcome {
-                ReconcileOutcome::Cleared => {
-                    self.remove_reconciliation(&entry.key, region.region_id);
-                }
-                ReconcileOutcome::Stalled => {
-                    let mut q = self
-                        .reconciliation_queue
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner());
-                    if let Some(e) = q
-                        .iter_mut()
-                        .find(|e| e.key == entry.key && e.region_id == region.region_id)
-                    {
-                        e.ticks_without_progress += 1;
-                        let age = now_ts - e.first_seen;
-                        if e.ticks_without_progress >= RECONCILE_PARK_AFTER_TICKS
-                            && age >= RECONCILE_MIN_AGE_SECS
-                        {
-                            e.parked = true;
-                            counter!("hyperbytedb_shard_transfer_parked_total").increment(1);
-                            tracing::warn!(
-                                db = %entry.key.db,
-                                measurement = %entry.key.measurement,
-                                region_id = region.region_id,
-                                age_secs = age,
-                                "split-transfer reconciliation parked; operator action required"
-                            );
-                        }
-                    }
-                }
-                ReconcileOutcome::Escalate => {
-                    match self.escalate_stuck_transfer(&entry.key, &region).await {
-                        Ok(()) => {
-                            let mut q = self
-                                .reconciliation_queue
-                                .lock()
-                                .unwrap_or_else(|p| p.into_inner());
-                            if let Some(e) = q
-                                .iter_mut()
-                                .find(|e| e.key == entry.key && e.region_id == region.region_id)
-                            {
-                                // Ownership moved via TransferPrimary; give the
-                                // new topology a fresh retry budget.
-                                e.ticks_without_progress = 0;
-                            }
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                region_id = region.region_id,
-                                error = %err,
-                                "reconciliation escalation failed"
-                            );
-                            let mut q = self
-                                .reconciliation_queue
-                                .lock()
-                                .unwrap_or_else(|p| p.into_inner());
-                            if let Some(e) = q
-                                .iter_mut()
-                                .find(|e| e.key == entry.key && e.region_id == region.region_id)
-                            {
-                                e.parked = true;
-                                counter!("hyperbytedb_shard_transfer_parked_total").increment(1);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// One reconciliation attempt against the current committed region state.
-    #[allow(dead_code)]
-    async fn attempt_reconciliation(
-        &self,
-        key: &MeasurementKey,
-        region: &ShardRegion,
-        entry: &PendingTransfer,
-    ) -> ReconcileOutcome {
-        let dest = region.primary;
-        let Some(pc) = self.peer_client.as_ref() else {
-            return ReconcileOutcome::Stalled;
-        };
-
-        // Authoritative-source order: the node that provably held the rows at
-        // split time first, then remaining live peers with region coverage
-        // (watermark > 0). The destination itself is never a source.
-        let m = self.membership.read().await;
-        let mut sources: Vec<u64> = vec![entry.recorded_source];
-        sources.extend(region.peers.iter().copied());
-        sources.retain(|id| {
-            *id != dest
-                && (*id == self.node_id
-                    || m.get_node(*id)
-                        .is_some_and(|n| n.state == NodeState::Active))
-        });
-        drop(m);
-
-        for source in sources {
-            // Coverage proof for non-recorded sources: a peer whose region
-            // watermark is 0 holds no rows for this region and would verify
-            // vacuously (the 0==0 hazard documented on rebalance).
-            if source != entry.recorded_source && source != self.node_id {
-                // Unknown counts as "no proof of coverage" here, same as a
-                // real zero: this path is choosing a source to copy FROM, so
-                // the conservative answer is to skip it.
-                let wm = peer_region_wal_watermark(pc, source, region.region_id).await;
-                if wm.unwrap_or(0) == 0 {
-                    continue;
-                }
-            }
-
-            let result = if source == self.node_id {
-                push_and_drop_range(
-                    pc,
-                    &self.metadata,
-                    &self.wal,
-                    self.query_port.as_ref(),
-                    self.points_sink.as_ref(),
-                    self.node_id,
-                    key,
-                    region,
-                    dest,
-                    self.max_points_per_request,
-                )
-                .await
-            } else {
-                // `region.is_serving()`, not `true`: a staging region's range is
-                // still served by its donor, so the donor must keep its rows
-                // until cutover. Dropping first is what left 13 staging regions
-                // serving from a donor that had already deleted their rows.
-                // After activation the donor's leftover rows are inert -- every
-                // region query injects a `series_id` range predicate -- and are
-                // reclaimed by a later GC.
-                request_region_rehome(
-                    pc,
-                    &self.membership,
-                    source,
-                    key,
-                    region,
-                    dest,
-                    region.is_serving(),
-                )
-                .await
-            };
-
-            match result {
-                Ok(()) => {
-                    counter!("hyperbytedb_shard_transfer_retries_total").increment(1);
-                    return match self.propose_clear_verified(key, region).await {
-                        Ok(()) => ReconcileOutcome::Cleared,
-                        Err(e) => {
-                            tracing::warn!(
-                                region_id = region.region_id,
-                                error = %e,
-                                "verified re-push complete; ClearVerified proposal failed"
-                            );
-                            // Keep the entry so verification is not lost; do
-                            // NOT re-push every tick against a flag we could
-                            // not clear.
-                            ReconcileOutcome::Stalled
-                        }
-                    };
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        region_id = region.region_id,
-                        source_node = source,
-                        error = %e,
-                        "reconciliation movement attempt failed"
-                    );
-                    match classify_transfer_error(&e) {
-                        TransferDisposition::Reresolve => continue,
-                        TransferDisposition::Retryable => {
-                            counter!("hyperbytedb_shard_transfer_retries_total").increment(1);
-                            return ReconcileOutcome::Stalled;
-                        }
-                        TransferDisposition::Park => {
-                            return ReconcileOutcome::Escalate;
-                        }
-                    }
-                }
-            }
-        }
-        ReconcileOutcome::Stalled
-    }
-
-    /// Break a stuck transfer by moving ownership to another live peer via
-    /// `TransferPrimary`. The existing transfer-primary path stages rows from
-    /// the current authoritative primary before committing ownership, so this
-    /// cannot commit a data-less node (mirrors `try_rebalance` ordering).
-    #[allow(dead_code)]
-    async fn escalate_stuck_transfer(
-        &self,
-        key: &MeasurementKey,
-        region: &ShardRegion,
-    ) -> Result<(), HyperbytedbError> {
-        let Some(new_primary) =
-            pick_alternate_primary(&self.membership, region, self.node_id).await
-        else {
-            return Err(HyperbytedbError::PeerUnreachable(
-                "no live alternate peer for reconciliation escalation".into(),
-            ));
-        };
-        tracing::warn!(
-            db = %key.db,
-            measurement = %key.measurement,
-            region_id = region.region_id,
-            new_primary,
-            "escalating stuck split-transfer via TransferPrimary"
-        );
-        self.propose(ShardMapOp::TransferPrimary {
-            key: key.clone(),
-            region_id: region.region_id,
-            new_primary,
-            epoch: region.epoch,
-        })
-        .await
-    }
-
-    #[allow(dead_code)]
-    fn remove_reconciliation(&self, key: &MeasurementKey, region_id: u64) {
-        let mut q = self
-            .reconciliation_queue
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        q.retain(|e| !(e.key == *key && e.region_id == region_id));
-    }
-
-    #[allow(dead_code)]
-    fn pending_transfers(&self) -> Vec<PendingTransfer> {
-        self.reconciliation_queue
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
-    }
-}
-
-#[allow(dead_code)]
-enum ReconcileOutcome {
-    /// Verified and the map flag cleared: drop the entry.
-    Cleared,
-    /// No progress this tick; bounded retry continues.
-    Stalled,
-    /// Terminal/repeatedly-stuck: move ownership or park.
-    Escalate,
-}
+impl ShardScheduler {}
 
 fn peer_is_active_alternate(
     membership: &crate::domain::cluster::membership::ClusterMembership,
@@ -3586,6 +2932,13 @@ impl Drop for ClearOnDrop<'_> {
 
 #[cfg(test)]
 mod tests {
+    /// Seconds since the epoch, for regions' `transfer_first_seen`.
+    fn now_unix() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64)
+    }
+
     use super::*;
     use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
     use crate::domain::cluster::membership::{ClusterMembership, NodeInfo, new_shared};
@@ -3821,8 +3174,8 @@ mod tests {
         use crate::adapters::metadata::rocksdb_meta::RocksDbMetadata;
         use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
         use crate::adapters::wal::rocksdb_wal::RocksDbWal;
-        use crate::application::cluster::bootstrap::ClusterBootstrap;
         use crate::application::materialized_view_service::MaterializedViewService;
+        use crate::composition::bootstrap::ClusterBootstrap;
         use crate::domain::sharding::{MeasurementKey, ShardLocationCache, ShardMapOp};
         use crate::ports::points_sink::PointsSinkPort;
 
@@ -3924,7 +3277,6 @@ mod tests {
             metadata,
             wal,
             None,
-            Some(sink),
             99,
             sharding,
             0,
@@ -3980,8 +3332,8 @@ mod tests {
         use crate::adapters::metadata::rocksdb_meta::RocksDbMetadata;
         use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
         use crate::adapters::wal::rocksdb_wal::RocksDbWal;
-        use crate::application::cluster::bootstrap::ClusterBootstrap;
         use crate::application::materialized_view_service::MaterializedViewService;
+        use crate::composition::bootstrap::ClusterBootstrap;
         use crate::domain::sharding::{MeasurementKey, ShardLocationCache, ShardMapOp};
         use crate::ports::points_sink::PointsSinkPort;
 
@@ -4074,7 +3426,6 @@ mod tests {
             metadata,
             wal,
             None,
-            Some(sink),
             1,
             sharding,
             0,
@@ -4120,8 +3471,8 @@ mod tests {
         use crate::adapters::metadata::rocksdb_meta::RocksDbMetadata;
         use crate::adapters::sharding::rocksdb_shard_map::RocksDbShardMap;
         use crate::adapters::wal::rocksdb_wal::RocksDbWal;
-        use crate::application::cluster::bootstrap::ClusterBootstrap;
         use crate::application::materialized_view_service::MaterializedViewService;
+        use crate::composition::bootstrap::ClusterBootstrap;
         use crate::domain::sharding::{MeasurementKey, ShardLocationCache, ShardMapOp};
         use crate::ports::points_sink::PointsSinkPort;
 
@@ -4216,7 +3567,6 @@ mod tests {
             metadata,
             wal,
             None,
-            Some(sink),
             1,
             sharding,
             0,
@@ -4258,93 +3608,7 @@ mod tests {
         );
     }
 
-    // ── reconciliation queue (S.1–S.7) ──────────────────────────────────
-
-    fn pending_entry(key: &MeasurementKey, region_id: u64, first_seen: i64) -> PendingTransfer {
-        PendingTransfer {
-            key: key.clone(),
-            region_id,
-            start: 0,
-            end: u64::MAX,
-            recorded_source: 1,
-            resolve_at_drain: false,
-            ticks_without_progress: 0,
-            parked: false,
-            first_seen,
-        }
-    }
-
-    #[test]
-    fn classify_transfer_error_dispositions() {
-        use HyperbytedbError::{PeerUnreachable, ShardMap, TransferCollision, TransferRejected};
-        assert_eq!(
-            classify_transfer_error(&PeerUnreachable("down".into())),
-            TransferDisposition::Retryable
-        );
-        assert_eq!(
-            classify_transfer_error(&TransferRejected {
-                status: 404,
-                reason: "test".into()
-            }),
-            TransferDisposition::Retryable
-        );
-        assert_eq!(
-            classify_transfer_error(&TransferRejected {
-                status: 409,
-                reason: "test".into()
-            }),
-            TransferDisposition::Retryable
-        );
-        assert_eq!(
-            classify_transfer_error(&TransferRejected {
-                status: 503,
-                reason: "test".into()
-            }),
-            TransferDisposition::Retryable
-        );
-        assert_eq!(
-            classify_transfer_error(&TransferRejected {
-                status: 400,
-                reason: "test".into(),
-            }),
-            TransferDisposition::Reresolve
-        );
-        assert_eq!(
-            classify_transfer_error(&TransferCollision),
-            TransferDisposition::Reresolve
-        );
-        assert_eq!(
-            classify_transfer_error(&TransferRejected {
-                status: 403,
-                reason: "test".into(),
-            }),
-            TransferDisposition::Park
-        );
-        assert_eq!(
-            classify_transfer_error(&ShardMap("snapshot".into())),
-            TransferDisposition::Retryable
-        );
-    }
-
-    #[test]
-    fn enqueue_is_idempotent_per_key_and_region() {
-        // Exercise the queue merge semantics through a manually-built slice:
-        // identical (key, region_id) updates in place instead of duplicating.
-        let mut q: Vec<PendingTransfer> = Vec::new();
-        let key = MeasurementKey::new("db", "autogen", "cpu");
-        let e1 = pending_entry(&key, 7, 100);
-        let e2 = pending_entry(&key, 7, 200);
-        q.push(e1);
-        if let Some(existing) = q.iter_mut().find(|e| e.key == key && e.region_id == 7) {
-            existing.recorded_source = e2.recorded_source;
-            existing.resolve_at_drain = false;
-            existing.parked = false;
-        } else {
-            q.push(e2);
-        }
-        assert_eq!(q.len(), 1);
-        assert_eq!(q[0].recorded_source, 1);
-    }
+    // ── split keys and transfer-debt refusal ────────────────────────────
 
     #[test]
     fn split_key_prefers_the_peer_median_and_stays_inside_the_range() {
@@ -4384,47 +3648,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    #[serial_test::serial(chdb)]
-    async fn reconciliation_queue_is_inert_after_metadata_only_splits() {
-        let harness = ReconcileTestHarness::new().await;
-        let key = MeasurementKey::new("db", "autogen", "cpu");
-        let old = now_unix() - RECONCILE_MIN_AGE_SECS - 10;
-        harness
-            .shard_map
-            .apply_op(ShardMapOp::BootstrapMeasurement {
-                key: key.clone(),
-                region: flagged_test_region(1, old),
-            })
-            .await
-            .unwrap();
-
-        for _ in 0..=RECONCILE_PARK_AFTER_TICKS {
-            harness.scheduler.tick_once_for_test().await.unwrap();
-        }
-
-        let q = harness.scheduler.reconciliation_queue.lock().unwrap();
-        assert!(
-            q.is_empty(),
-            "legacy reconciliation drain is disabled; flagged children are not enqueued"
-        );
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(chdb)]
-    async fn rollup_destinations_are_excluded_from_reconciliation() {
-        let harness = ReconcileTestHarness::new().await;
-        let key = MeasurementKey::new("db", "autogen", "rollup_dest");
-        harness.scheduler.seed_rollup_dest(&key).await;
-
-        harness
-            .scheduler
-            .enqueue_reconciliation(pending_entry(&key, 3, now_unix()));
-
-        let q = harness.scheduler.reconciliation_queue.lock().unwrap();
-        assert!(q.is_empty(), "SummingMergeTree spaces must never enqueue");
-    }
-
     /// Placement stages rows and `apply_transfer_push` is not idempotent, so a
     /// placement that stages and then fails its proposal re-delivers on the
     /// next tick. `SummingMergeTree` destinations would sum the redelivery.
@@ -4443,31 +3666,6 @@ mod tests {
         assert!(
             !harness.scheduler.is_rollup_dest(&raw).await,
             "raw ReplacingMergeTree measurements stay eligible"
-        );
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(chdb)]
-    async fn rebuild_skips_flagged_rollup_destinations() {
-        let harness = ReconcileTestHarness::new().await;
-        let key = MeasurementKey::new("db", "autogen", "rollup_dest");
-        harness.scheduler.seed_rollup_dest(&key).await;
-        harness
-            .shard_map
-            .apply_op(ShardMapOp::BootstrapMeasurement {
-                key: key.clone(),
-                region: flagged_test_region(1, now_unix()),
-            })
-            .await
-            .unwrap();
-
-        let map = harness.shard_map.snapshot().await.unwrap();
-        harness.scheduler.rebuild_queue_from_map(&map);
-
-        let q = harness.scheduler.reconciliation_queue.lock().unwrap();
-        assert!(
-            q.is_empty(),
-            "flagged rollup dest must not enter the transfer queue on rebuild"
         );
     }
 
@@ -4699,8 +3897,8 @@ mod tests {
             use crate::adapters::cluster::replication_log::ReplicationLog;
             use crate::adapters::metadata::rocksdb_meta::RocksDbMetadata;
             use crate::adapters::wal::rocksdb_wal::RocksDbWal;
-            use crate::application::cluster::bootstrap::ClusterBootstrap;
             use crate::application::materialized_view_service::MaterializedViewService;
+            use crate::composition::bootstrap::ClusterBootstrap;
             use crate::ports::points_sink::PointsSinkPort;
 
             let dir = tempfile::tempdir().unwrap();
@@ -4823,7 +4021,6 @@ mod tests {
                 metadata,
                 wal,
                 None,
-                Some(sink),
                 1,
                 sharding,
                 10_000,
@@ -5243,8 +4440,8 @@ mod tests {
             use crate::adapters::chdb::session::SharedSession;
             use crate::adapters::metadata::rocksdb_meta::RocksDbMetadata;
             use crate::adapters::wal::rocksdb_wal::RocksDbWal;
-            use crate::application::cluster::bootstrap::ClusterBootstrap;
             use crate::application::materialized_view_service::MaterializedViewService;
+            use crate::composition::bootstrap::ClusterBootstrap;
             use crate::ports::points_sink::PointsSinkPort;
 
             let dir = tempfile::tempdir().unwrap();
@@ -5308,7 +4505,6 @@ mod tests {
                 metadata,
                 wal,
                 None,
-                Some(sink),
                 99,
                 sharding,
                 0,

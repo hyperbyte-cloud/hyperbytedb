@@ -19,11 +19,9 @@ serde_urlencoded = "0.7"
 rustyline = { version = "15", features = ["derive"] }
 parking_lot = "0.12"
 comfy-table = "7"
-anyhow = "1"
 thiserror = "2"
 dirs = "6"
 rpassword = "7"
-url = "2"
 toml = "0.8"
 flate2 = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

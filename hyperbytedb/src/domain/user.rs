@@ -66,8 +66,34 @@ impl StoredUser {
     }
 }
 
+/// A salted argon2 hash of `password`, as stored for users.
+///
+/// # Errors
+/// `Internal` if hashing fails.
+pub fn hash_password(password: &str) -> Result<String, crate::error::HyperbytedbError> {
+    use argon2::Argon2;
+    use argon2::password_hash::{PasswordHasher, SaltString};
+    let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
+    let hash = Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|e| {
+            crate::error::HyperbytedbError::Internal(format!("password hash failed: {e}").into())
+        })?;
+    Ok(hash.to_string())
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn hash_password_is_a_salted_argon2_hash() {
+        let a = super::hash_password("secret").unwrap();
+        let b = super::hash_password("secret").unwrap();
+        assert!(a.starts_with("$argon2"), "{a}");
+        assert_ne!(a, b, "each hash has its own salt");
+        assert!(!a.contains("secret"));
+    }
+
     use super::DatabasePrivilege::{self, All, Read, Write};
 
     #[test]

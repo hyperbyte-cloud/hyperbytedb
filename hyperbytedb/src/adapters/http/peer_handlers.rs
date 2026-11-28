@@ -22,7 +22,6 @@ use crate::domain::cluster::sync::{
 };
 use crate::domain::cluster::types::{MutationReplicateRequest, MutationRequest};
 use crate::ports::metadata::MetadataPort;
-use crate::ports::sharding::ShardMapPort as _;
 
 use super::router::AppState;
 
@@ -263,12 +262,12 @@ fn group_replicate_parts(
             outcomes[i] = ReplicatePartOutcome::NotARegionPeer;
             continue;
         }
-        let binary = crate::application::line_protocol::is_binary_points(&part.body);
+        let binary = crate::domain::point_codec::is_binary_points(&part.body);
         let group = groups.iter_mut().find(|g| {
             g.database == part.database
                 && g.retention_policy == part.retention_policy
                 && g.precision == part.precision
-                && crate::application::line_protocol::is_binary_points(&g.body) == binary
+                && crate::domain::point_codec::is_binary_points(&g.body) == binary
         });
         match group {
             Some(g) => {
