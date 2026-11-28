@@ -196,7 +196,7 @@ impl BatchingWal {
                 64 + bundle.entry.points.len()
                     * crate::application::line_protocol::POINT_ENCODED_SIZE_HINT,
             );
-            crate::application::line_protocol::encode_bincode_into(&mut bytes, &bundle.entry)
+            crate::domain::wal::encode_entry_into(&mut bytes, &bundle.entry)
                 .map_err(|e| HyperbytedbError::Wal(crate::error::ChainedError::from_error(e)))?;
             Some(bytes)
         } else {
@@ -260,6 +260,14 @@ impl WalPort for BatchingWal {
 
     fn arrow_wal_enabled(&self) -> bool {
         self.inner.arrow_wal_enabled()
+    }
+
+    fn reserve_version(&self, rows: u64) -> u64 {
+        self.inner.reserve_version(rows)
+    }
+
+    fn observe_version(&self, version: u64) {
+        self.inner.observe_version(version);
     }
 
     async fn take_prepared_range(
@@ -348,6 +356,7 @@ mod tests {
                 series_id_cache: Default::default(),
             }],
             origin_node_id: 99,
+            version: 0,
         }
     }
 

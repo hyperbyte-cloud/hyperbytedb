@@ -25,6 +25,7 @@ pub async fn columnar_to_prepared_slot(
         retention_policy: rp.to_string(),
         points: Vec::new(),
         origin_node_id,
+        version: 0,
     };
     Ok(WalAppendBundle {
         entry,

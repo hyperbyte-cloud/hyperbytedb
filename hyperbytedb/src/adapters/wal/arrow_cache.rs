@@ -15,12 +15,15 @@ const ENTRIES_GAUGE: &str = "hyperbytedb_wal_arrow_cache_entries";
 
 pub struct WalArrowCache {
     entries: RwLock<BTreeMap<u64, PreparedWalSlot>>,
+    /// Row version of the cached slots whose entry has one.
+    versions: RwLock<BTreeMap<u64, u64>>,
 }
 
 impl WalArrowCache {
     pub fn new() -> Self {
         Self {
             entries: RwLock::new(BTreeMap::new()),
+            versions: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -28,6 +31,18 @@ impl WalArrowCache {
         let mut map = self.entries.write();
         map.insert(seq, slot);
         gauge!(ENTRIES_GAUGE).set(map.len() as f64);
+    }
+
+    /// Remember the version of the slot at `seq` (0: it has none).
+    pub fn set_version(&self, seq: u64, version: u64) {
+        if version != 0 {
+            self.versions.write().insert(seq, version);
+        }
+    }
+
+    /// Take the version of a slot taken for flushing.
+    pub fn take_version(&self, seq: u64) -> Option<u64> {
+        self.versions.write().remove(&seq)
     }
 
     pub fn insert_batch(&self, seqs: &[u64], slots: Vec<PreparedWalSlot>) {
@@ -99,6 +114,7 @@ impl WalArrowCache {
     }
 
     pub fn truncate_before(&self, sequence: u64) {
+        self.versions.write().retain(|seq, _| *seq >= sequence);
         let mut map = self.entries.write();
         map.retain(|seq, _| *seq >= sequence);
         gauge!(ENTRIES_GAUGE).set(map.len() as f64);

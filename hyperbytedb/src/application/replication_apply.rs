@@ -35,6 +35,7 @@ struct ApplyJob {
     precision: Option<String>,
     body: Bytes,
     origin_node_id: u64,
+    version: u64,
     done: oneshot::Sender<Result<u64, String>>,
 }
 
@@ -167,6 +168,7 @@ impl ReplicationApplyQueue {
                         job.precision.as_deref(),
                         &job.body,
                         job.origin_node_id,
+                        job.version,
                         &apply_ctx,
                         &sc,
                     )
@@ -221,6 +223,7 @@ impl ReplicationApplyQueue {
         precision: Option<String>,
         body: Bytes,
         origin_node_id: u64,
+        version: u64,
     ) -> Result<oneshot::Receiver<Result<u64, String>>, ReplicationApplyError> {
         let (done, out) = oneshot::channel();
         let job = ApplyJob {
@@ -229,6 +232,7 @@ impl ReplicationApplyQueue {
             precision,
             body,
             origin_node_id,
+            version,
             done,
         };
         match self.tx.try_send(job) {
@@ -286,6 +290,7 @@ async fn apply_batch(
     precision: Option<&str>,
     body: &[u8],
     origin_node_id: u64,
+    version: u64,
     ctx: &ApplyContext,
     schema_cache: &IngestSchemaCache,
 ) -> Result<u64, HyperbytedbError> {
@@ -345,6 +350,7 @@ async fn apply_batch(
         points,
         origin_node_id,
         ctx.max_points_per_request,
+        version,
     )
     .await;
     histogram!("hyperbytedb_replication_apply_wal_seconds").record(t2.elapsed().as_secs_f64());

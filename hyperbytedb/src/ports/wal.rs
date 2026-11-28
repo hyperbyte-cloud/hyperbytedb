@@ -75,6 +75,13 @@ pub trait WalPort: Send + Sync {
         false
     }
 
+    /// Reserve row versions for a write this node originates
+    /// ([`WalEntry::version`]) and return the first.
+    fn reserve_version(&self, rows: u64) -> u64;
+
+    /// Note a version taken from a peer, so later local writes go above it.
+    fn observe_version(&self, version: u64);
+
     async fn truncate_before(&self, sequence: u64) -> Result<(), HyperbytedbError>;
     async fn last_sequence(&self) -> Result<u64, HyperbytedbError>;
 

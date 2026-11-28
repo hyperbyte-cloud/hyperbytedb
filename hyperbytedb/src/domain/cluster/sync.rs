@@ -90,4 +90,6 @@ pub struct WalSyncEntry {
     pub points: Vec<Point>,
     #[serde(default)]
     pub origin_node_id: u64,
+    #[serde(default)]
+    pub version: u64,
 }

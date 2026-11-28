@@ -23,6 +23,9 @@ pub struct OutboundReplicationBatch {
     /// alone would merge two regions' rows into one body and make the header a
     /// lie about half of it.
     pub region_id: Option<u64>,
+    /// The version the origin stored the body's rows under
+    /// ([`crate::domain::wal::WalEntry::version`]); 0 for none.
+    pub version: u64,
 }
 
 /// Outbound write/mutation replication to cluster peers.

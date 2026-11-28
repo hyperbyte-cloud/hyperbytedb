@@ -559,6 +559,7 @@ impl SyncClient {
             entry.points.clone(),
             entry.origin_node_id,
             self.max_points_per_request,
+            entry.version,
         )
         .await?;
         Ok(())

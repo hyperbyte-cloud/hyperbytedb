@@ -12,9 +12,9 @@ use crate::application::replication_apply::ReplicationApplyError;
 use crate::domain::cluster::membership::{ClusterMembership, NodeInfo, NodeState};
 use crate::domain::cluster::replication_wire::{
     HTTP_HEADER_DATABASE, HTTP_HEADER_ORIGIN_NODE, HTTP_HEADER_PRECISION, HTTP_HEADER_REGION,
-    HTTP_HEADER_RETENTION_POLICY, HTTP_HEADER_SYNC, LINE_PROTOCOL_MEDIA_TYPE_V1,
-    REPLICATE_BATCH_MEDIA_TYPE_V1, ReplicateBatchPart, ReplicateBatchRequest,
-    ReplicateBatchResponse, ReplicatePartOutcome,
+    HTTP_HEADER_RETENTION_POLICY, HTTP_HEADER_SYNC, HTTP_HEADER_VERSION,
+    LINE_PROTOCOL_MEDIA_TYPE_V1, REPLICATE_BATCH_MEDIA_TYPE_V1, ReplicateBatchPart,
+    ReplicateBatchResponse, ReplicatePartOutcome, decode_replicate_batch,
 };
 use crate::domain::cluster::sync::{
     JoinRequest, JoinResponse, LeaveRequest, LeaveResponse, MetadataEntry, MetadataSnapshot,
@@ -175,7 +175,20 @@ pub async fn handle_replicate_write(
         .map(|s| matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false);
 
-    let rx = match queue.try_enqueue(database, retention_policy, precision, body, origin_node_id) {
+    let version = headers
+        .get(HTTP_HEADER_VERSION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    let rx = match queue.try_enqueue(
+        database,
+        retention_policy,
+        precision,
+        body,
+        origin_node_id,
+        version,
+    ) {
         Ok(rx) => rx,
         Err(ReplicationApplyError::QueueFull) => {
             counter!("hyperbytedb_replication_apply_queue_full_total").increment(1);
@@ -231,13 +244,14 @@ pub async fn handle_replicate_write(
 }
 
 /// Apply-queue groups for one [`ReplicateBatchRequest`]: parts that share a
-/// database, retention policy, precision and encoding are applied as one job,
-/// so a batch of many small region parts costs one WAL append per group
-/// rather than one per part.
+/// database, retention policy, precision, encoding and version are applied as
+/// one job, so a batch of many small region parts of one write costs one WAL
+/// append rather than one per part.
 struct ReplicateApplyGroup {
     database: String,
     retention_policy: String,
     precision: Option<String>,
+    version: u64,
     parts: Vec<usize>,
     body: Vec<u8>,
 }
@@ -268,6 +282,7 @@ fn group_replicate_parts(
             g.database == part.database
                 && g.retention_policy == part.retention_policy
                 && g.precision == part.precision
+                && g.version == part.version
                 && crate::application::line_protocol::is_binary_points(&g.body) == binary
         });
         match group {
@@ -282,6 +297,7 @@ fn group_replicate_parts(
                 database: part.database,
                 retention_policy: part.retention_policy,
                 precision: part.precision,
+                version: part.version,
                 parts: vec![i],
                 body: part.body,
             }),
@@ -297,7 +313,7 @@ pub async fn handle_replicate_batch(
     State(state): State<Arc<AppState>>,
     body: Bytes,
 ) -> impl IntoResponse {
-    let req: ReplicateBatchRequest = match bincode::deserialize(&body) {
+    let req = match decode_replicate_batch(&body) {
         Ok(r) => r,
         Err(e) => {
             return (
@@ -353,6 +369,7 @@ pub async fn handle_replicate_batch(
             g.precision,
             Bytes::from(g.body),
             req.origin_node,
+            g.version,
         ) {
             Ok(_) => continue,
             Err(ReplicationApplyError::QueueFull) => {
@@ -670,6 +687,7 @@ pub async fn handle_sync_wal(
                     retention_policy: entry.retention_policy,
                     points: entry.points,
                     origin_node_id: entry.origin_node_id,
+                    version: entry.version,
                 })
                 .collect();
 
@@ -1073,6 +1091,7 @@ mod replicate_batch_tests {
             precision: None,
             region_id: region,
             body: body.to_vec(),
+            version: 0,
         }
     }
 

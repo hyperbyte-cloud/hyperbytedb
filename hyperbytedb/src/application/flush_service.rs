@@ -9,7 +9,7 @@ use crate::adapters::cluster::replication_log::ReplicationLog;
 use crate::domain::arrow_coalesce::coalesce_prepared_batches;
 use crate::domain::cluster::membership::SharedMembership;
 use crate::domain::point::Point;
-use crate::domain::point_coalesce::coalesce_points_and_origins;
+use crate::domain::point_coalesce::{coalesce_plan, merge_point_group};
 use crate::domain::prepared_wal::{PreparedMeasurementBatch, PreparedWalSlot};
 use crate::error::HyperbytedbError;
 use crate::ports::flush::FlushPort;
@@ -39,7 +39,8 @@ const MAX_WAL_RETENTION_ENTRIES: u64 = 500_000;
 const SHARDED_WAL_RETENTION_BYTES: u64 = 1 << 30;
 
 type MeasurementBatchKey = (String, String, String);
-type MeasurementBatch = (Vec<Point>, Vec<u64>);
+/// Points with their origins and `ingest_seq`s, all parallel.
+type MeasurementBatch = (Vec<Point>, Vec<u64>, Vec<u64>);
 type MeasurementBatchMap = BTreeMap<MeasurementBatchKey, MeasurementBatch>;
 
 pub struct FlushServiceImpl {
@@ -78,6 +79,8 @@ struct FlushWork {
     points: Vec<Point>,
     /// Per-row `origin_node_id`, parallel to `points`.
     origins: Vec<u64>,
+    /// Per-row `ingest_seq`, parallel to `points`.
+    seqs: Vec<u64>,
 }
 
 struct PreparedFlushWork {
@@ -622,7 +625,7 @@ impl FlushServiceImpl {
 
             let budget = self.max_points_per_batch * NATIVE_CHUNK_BATCHES;
             let mut taken_points = 0usize;
-            let entries: Vec<_> = entries
+            let mut entries: Vec<_> = entries
                 .into_iter()
                 .filter(|(seq, _)| *seq <= snapshot_seq)
                 .take_while(|(_, e)| {
@@ -638,6 +641,9 @@ impl FlushServiceImpl {
 
             let chunk_entry_count = entries.len();
             let chunk_max_seq = entries.iter().map(|(s, _)| *s).max().unwrap_or(cursor);
+            // Version order, so that merging partial rows below lets the
+            // later write win whatever order the entries arrived in.
+            entries.sort_by_key(|(seq, e)| entry_seq_base(*seq, e));
             let prepare_start = std::time::Instant::now();
             // Group by (db, rp, measurement) only. `origin_node_id` is carried
             // per-row (parallel to points) rather than being part of the key,
@@ -654,7 +660,8 @@ impl FlushServiceImpl {
                 }
                 // Direct client writes carry origin 0; record them as this node.
                 let eff_origin = if origin == 0 { self.node_id } else { origin };
-                for point in entry.points {
+                let seq_base = entry_seq_base(seq, &entry);
+                for (offset, point) in entry.points.into_iter().enumerate() {
                     let key = (
                         entry.database.clone(),
                         entry.retention_policy.clone(),
@@ -663,6 +670,7 @@ impl FlushServiceImpl {
                     let slot = by_meas.entry(key).or_default();
                     slot.0.push(point);
                     slot.1.push(eff_origin);
+                    slot.2.push(seq_base.saturating_add(offset as u64));
                     chunk_point_count += 1;
                 }
             }
@@ -677,18 +685,23 @@ impl FlushServiceImpl {
             );
 
             let mut work_items: Vec<FlushWork> = Vec::new();
-            for ((db, rp, measurement), (mut points, mut origins)) in by_meas {
+            for ((db, rp, measurement), (mut points, mut origins, mut seqs)) in by_meas {
                 // Telegraf / columnar writers often emit several lines that share
                 // the same tag set and timestamp but carry disjoint field sets.
                 // Coalesce over the full measurement batch *before* splitting into
                 // max_points_per_batch chunks so partial rows are never separated.
                 if self.coalesce {
                     let coalesced_start = std::time::Instant::now();
-                    if let Some((merged_points, merged_origins)) =
-                        coalesce_points_and_origins(&points, &origins)
-                    {
-                        points = merged_points;
-                        origins = merged_origins;
+                    if let Some(groups) = coalesce_plan(&points) {
+                        // A merged row takes its last contributor's origin
+                        // and sequence.
+                        let last = |g: &Vec<u32>| g[g.len() - 1] as usize;
+                        origins = groups.iter().map(|g| origins[last(g)]).collect();
+                        seqs = groups.iter().map(|g| seqs[last(g)]).collect();
+                        points = groups
+                            .iter()
+                            .map(|g| merge_point_group(&points, g))
+                            .collect();
                     }
                     histogram!("hyperbytedb_flush_coalesce_points_seconds")
                         .record(coalesced_start.elapsed().as_secs_f64());
@@ -701,15 +714,18 @@ impl FlushServiceImpl {
                     let take = points.len().min(self.max_points_per_batch);
                     let rest_points = points.split_off(take);
                     let rest_origins = origins.split_off(take);
+                    let rest_seqs = seqs.split_off(take);
                     work_items.push(FlushWork {
                         db: db.clone(),
                         rp: rp.clone(),
                         measurement: measurement.clone(),
                         points,
                         origins,
+                        seqs,
                     });
                     points = rest_points;
                     origins = rest_origins;
+                    seqs = rest_seqs;
                 }
             }
 
@@ -717,11 +733,9 @@ impl FlushServiceImpl {
                 .record(prepare_start.elapsed().as_secs_f64());
             let sink = self.sink.clone();
             let mut handles = Vec::with_capacity(work_items.len());
-            let chunk_min_seq = from_seq;
             let inserts = Arc::new(tokio::sync::Semaphore::new(FLUSH_INSERT_CONCURRENCY));
-            for (idx, work) in work_items.into_iter().enumerate() {
+            for work in work_items {
                 let sink = sink.clone();
-                let ingest_seq_base = chunk_min_seq.saturating_add(idx as u64);
                 let inserts = inserts.clone();
                 handles.push(tokio::spawn(async move {
                     let _slot = inserts.acquire_owned().await;
@@ -734,12 +748,12 @@ impl FlushServiceImpl {
                         "writing native chDB rows"
                     );
                     let written = sink
-                        .write_points(
+                        .write_points_versioned(
                             &work.db,
                             &work.rp,
                             &work.measurement,
                             &work.origins,
-                            ingest_seq_base,
+                            &work.seqs,
                             &work.points,
                         )
                         .await;
@@ -861,6 +875,16 @@ fn slice_prepared_batch(
     }
 }
 
+/// `ingest_seq` of an entry's first row: its version, or for an entry without
+/// one its WAL sequence.
+fn entry_seq_base(wal_seq: u64, entry: &crate::domain::wal::WalEntry) -> u64 {
+    if entry.version != 0 {
+        entry.version
+    } else {
+        wal_seq
+    }
+}
+
 #[async_trait::async_trait]
 impl FlushPort for FlushServiceImpl {
     async fn drain(&self) -> Result<(), HyperbytedbError> {
@@ -938,6 +962,7 @@ mod tests {
                 series_id_cache: Default::default(),
             }],
             origin_node_id: 0,
+            version: 0,
         }
     }
 

@@ -3626,6 +3626,7 @@ async fn write_series_as_points(
                     None,
                 )
                 .await?;
+                let version = svc.wal.reserve_version(all_local.len() as u64);
                 let wal_seq = append_points_with_prepared(
                     svc.wal.as_ref(),
                     Some(&svc.points_sink),
@@ -3634,6 +3635,7 @@ async fn write_series_as_points(
                     all_local,
                     svc.node_id,
                     svc.max_points_per_request,
+                    version,
                 )
                 .await?;
                 let map = ctx.shard_map.snapshot().await?;
@@ -3657,6 +3659,7 @@ async fn write_series_as_points(
                                 wal_seq,
                                 target_node_ids: Some(targets),
                                 region_id: Some(region.region_id),
+                                version,
                             },
                         )
                         .await?;
@@ -3674,11 +3677,13 @@ async fn write_series_as_points(
         } else {
             None
         };
+        let version = svc.wal.reserve_version(all_points.len() as u64);
         let entry = WalEntry {
             database: db.to_string(),
             retention_policy: rp.to_string(),
             points: all_points,
             origin_node_id: svc.node_id,
+            version,
         };
         let wal_seq = svc.wal.append(entry).await?;
 
@@ -3698,6 +3703,7 @@ async fn write_series_as_points(
                     target_node_ids: None,
                     // Unsharded SELECT..INTO: no region scoping.
                     region_id: None,
+                    version,
                 },
             )
             .await?;

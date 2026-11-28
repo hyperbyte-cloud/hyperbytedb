@@ -246,6 +246,7 @@ fn synthetic_bundle(points: &[Point], batch: &Arc<RecordBatch>) -> WalAppendBund
             retention_policy: "autogen".to_string(),
             points: points.to_vec(),
             origin_node_id: 0,
+            version: 0,
         },
         prepared: Some(PreparedWalSlot {
             database: "benchdb".to_string(),

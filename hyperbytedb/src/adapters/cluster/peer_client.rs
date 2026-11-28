@@ -11,9 +11,9 @@ use crate::adapters::cluster::replication_log::ReplicationLog;
 use crate::domain::cluster::membership::{ClusterMembership, SharedMembership};
 use crate::domain::cluster::replication_wire::{
     HTTP_HEADER_DATABASE, HTTP_HEADER_ORIGIN_NODE, HTTP_HEADER_PRECISION, HTTP_HEADER_REGION,
-    HTTP_HEADER_REPLICATED, HTTP_HEADER_RETENTION_POLICY, HTTP_HEADER_SYNC,
+    HTTP_HEADER_REPLICATED, HTTP_HEADER_RETENTION_POLICY, HTTP_HEADER_SYNC, HTTP_HEADER_VERSION,
     LINE_PROTOCOL_MEDIA_TYPE_V1, REPLICATE_BATCH_MEDIA_TYPE_V1, ReplicateBatchPart,
-    ReplicateBatchResponse, ReplicatePartOutcome, ReplicationHintPayload,
+    ReplicateBatchResponse, ReplicatePartOutcome, ReplicationHintPayload, encode_replicate_batch,
 };
 use crate::domain::cluster::types::{
     MutationReplicateRequest, MutationReplicateResponse, MutationRequest,
@@ -273,6 +273,7 @@ impl PeerClient {
                         precision: job.precision.clone(),
                         region_id: job.region_id,
                         body: job.body.clone(),
+                        version: job.version,
                     };
                     match per_peer.iter_mut().find(|(id, ..)| *id == peer_id) {
                         Some((.., parts)) => parts.push(part),
@@ -305,9 +306,7 @@ impl PeerClient {
         let mut delay = Duration::from_secs(1);
         loop {
             attempts += 1;
-            // Wire-identical to `ReplicateBatchRequest` (bincode writes a
-            // struct as its fields in order) without cloning every body.
-            let body = match bincode::serialize(&(self.node_id, &parts)) {
+            let body = match encode_replicate_batch(self.node_id, &parts) {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::error!(peer_id, error = %e, "encode replicate batch");
@@ -412,6 +411,7 @@ impl PeerClient {
                 retention_policy: part.retention_policy,
                 precision: part.precision,
                 line_body: part.body,
+                version: part.version,
             };
             if let Err(e) = hh.enqueue_hint(peer_id, &hint) {
                 tracing::error!(peer_id, error = %e, "failed to enqueue hinted handoff");
@@ -435,6 +435,7 @@ impl PeerClient {
                     retention_policy: part.retention_policy.clone(),
                     precision: part.precision.clone(),
                     line_body: part.body.clone(),
+                    version: part.version,
                 };
                 let ctx = self.peer_replicate_ctx(
                     peer_id,
@@ -582,6 +583,7 @@ impl PeerClient {
             retention_policy: batch.retention_policy.clone(),
             precision: batch.precision.clone(),
             line_body: batch.body.clone(),
+            version: batch.version,
         };
 
         for peer_id in peers {
@@ -631,6 +633,7 @@ impl PeerClient {
             retention_policy: batch.retention_policy.clone(),
             precision: batch.precision.clone(),
             line_body: batch.body.clone(),
+            version: batch.version,
         };
 
         // Acquire one shared inflight permit for this fan-out round so sync
@@ -824,6 +827,9 @@ impl PeerClient {
                     .header(HTTP_HEADER_RETENTION_POLICY, &p.retention_policy)
                     .header(HTTP_HEADER_ORIGIN_NODE, self.node_id.to_string())
                     .body(body);
+                if p.version != 0 {
+                    req = req.header(HTTP_HEADER_VERSION, p.version.to_string());
+                }
                 if let Some(ref prec) = p.precision {
                     req = req.header(HTTP_HEADER_PRECISION, prec);
                 }
@@ -1092,6 +1098,10 @@ fn coalesce_ok(
     if a.region_id != b.region_id {
         return false;
     }
+    // A body has one version, and each write has its own.
+    if a.version != b.version {
+        return false;
+    }
     // A merged body is one encoding or the other: frames and line protocol
     // cannot share a body.
     if crate::application::line_protocol::is_binary_points(&a.body)
@@ -1168,6 +1178,9 @@ impl PeerReplicateCtx {
                 .header(HTTP_HEADER_RETENTION_POLICY, &self.retention_policy)
                 .header(HTTP_HEADER_ORIGIN_NODE, self.origin_node.to_string())
                 .body(self.body.clone());
+            if self.hint_payload.version != 0 {
+                req = req.header(HTTP_HEADER_VERSION, self.hint_payload.version.to_string());
+            }
             if let Some(region_id) = self.region_id {
                 req = req.header(HTTP_HEADER_REGION, region_id.to_string());
             }
@@ -1279,6 +1292,7 @@ mod coalesce_tests {
             wal_seq,
             target_node_ids: targets,
             region_id: None,
+            version: 0,
         }
     }
 
@@ -1388,6 +1402,7 @@ mod replicate_batch_tests {
             precision: None,
             region_id: Some(region),
             body: format!("cpu,host=r{region} v=1").into_bytes(),
+            version: 0,
         }
     }
 
@@ -1401,6 +1416,7 @@ mod replicate_batch_tests {
             wal_seq: region,
             target_node_ids: Some(targets),
             region_id: Some(region),
+            version: 0,
         }
     }
 

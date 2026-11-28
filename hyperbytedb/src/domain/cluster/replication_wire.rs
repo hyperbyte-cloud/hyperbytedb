@@ -1,5 +1,10 @@
 //! HTTP headers and hinted-handoff binary format for write replication (Influx line protocol).
 
+/// Header carrying the origin's row version for a replicated body
+/// ([`crate::domain::wal::WalEntry::version`]). Older peers neither send nor
+/// read it.
+pub const HTTP_HEADER_VERSION: &str = "X-Hyperbytedb-Version";
+
 /// `Content-Type` for replicated writes: same body encoding as `POST /write`.
 pub const LINE_PROTOCOL_MEDIA_TYPE_V1: &str = "application/vnd.hyperbytedb.replicate+line.v1";
 
@@ -28,6 +33,8 @@ pub struct ReplicationHintPayload {
     pub retention_policy: String,
     pub precision: Option<String>,
     pub line_body: Vec<u8>,
+    /// The origin's row version; 0 for none.
+    pub version: u64,
 }
 
 impl ReplicationHintPayload {
@@ -73,6 +80,8 @@ impl ReplicationHintPayload {
         }
         out.extend_from_slice(&(self.line_body.len() as u64).to_le_bytes());
         out.extend_from_slice(&self.line_body);
+        // After the body, where older decoders do not look.
+        out.extend_from_slice(&self.version.to_le_bytes());
         Ok(out)
     }
 
@@ -186,7 +195,13 @@ impl ReplicationHintPayload {
             ));
         }
         let line_body = data[i..i + blen].to_vec();
+        i += blen;
+        // Absent from hints queued before versions.
+        let version = data[i..]
+            .first_chunk::<8>()
+            .map_or(0, |v| u64::from_le_bytes(*v));
         Ok(Self {
+            version,
             database,
             retention_policy,
             precision,
@@ -209,6 +224,11 @@ pub struct ReplicateBatchPart {
     pub region_id: Option<u64>,
     /// Line protocol or binary points frames.
     pub body: Vec<u8>,
+    /// The origin's row version; 0 for none. Not part of the struct's bincode
+    /// layout, so older peers still decode it: see
+    /// [`encode_replicate_batch`].
+    #[serde(skip)]
+    pub version: u64,
 }
 
 /// Every queued replication part bound for one peer, in one request.
@@ -223,6 +243,35 @@ pub struct ReplicateBatchPart {
 pub struct ReplicateBatchRequest {
     pub origin_node: u64,
     pub parts: Vec<ReplicateBatchPart>,
+}
+
+/// Body of `/internal/replicate-batch`: a bincode [`ReplicateBatchRequest`]
+/// followed by one version per part. A receiver without versions ignores the
+/// trailing bytes.
+pub fn encode_replicate_batch(
+    origin_node: u64,
+    parts: &[ReplicateBatchPart],
+) -> Result<Vec<u8>, bincode::Error> {
+    // Wire-identical to `ReplicateBatchRequest` (bincode writes a struct as
+    // its fields in order) without cloning every body.
+    let mut out = bincode::serialize(&(origin_node, parts))?;
+    let versions: Vec<u64> = parts.iter().map(|p| p.version).collect();
+    bincode::serialize_into(&mut out, &versions)?;
+    Ok(out)
+}
+
+/// Inverse of [`encode_replicate_batch`]; a request from a sender without
+/// versions leaves them 0.
+pub fn decode_replicate_batch(body: &[u8]) -> Result<ReplicateBatchRequest, bincode::Error> {
+    let mut rest = body;
+    let mut req: ReplicateBatchRequest = bincode::deserialize_from(&mut rest)?;
+    if !rest.is_empty() {
+        let versions: Vec<u64> = bincode::deserialize(rest)?;
+        for (part, version) in req.parts.iter_mut().zip(versions) {
+            part.version = version;
+        }
+    }
+    Ok(req)
 }
 
 /// What the receiver did with one part.
@@ -241,4 +290,50 @@ pub enum ReplicatePartOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReplicateBatchResponse {
     pub results: Vec<ReplicatePartOutcome>,
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    #[test]
+    fn replicate_batch_versions_are_invisible_to_a_peer_without_them() {
+        let part = ReplicateBatchPart {
+            database: "db".into(),
+            retention_policy: "autogen".into(),
+            precision: None,
+            region_id: Some(3),
+            body: b"cpu v=1 1".to_vec(),
+            version: 99,
+        };
+        let body = encode_replicate_batch(1, std::slice::from_ref(&part)).unwrap();
+        assert_eq!(decode_replicate_batch(&body).unwrap().parts, vec![part]);
+
+        // An older receiver reads the struct and ignores the rest.
+        let old: ReplicateBatchRequest = bincode::deserialize(&body).unwrap();
+        assert_eq!(old.parts[0].version, 0);
+        // An older sender sends the struct alone.
+        let from_old = bincode::serialize(&old).unwrap();
+        assert_eq!(decode_replicate_batch(&from_old).unwrap(), old);
+    }
+
+    #[test]
+    fn a_hint_keeps_its_version_and_one_without_still_decodes() {
+        let hint = ReplicationHintPayload {
+            database: "db".into(),
+            retention_policy: "autogen".into(),
+            precision: None,
+            line_body: b"cpu v=1 1".to_vec(),
+            version: 99,
+        };
+        let bytes = hint.encode_hint_value().unwrap();
+        assert_eq!(
+            ReplicationHintPayload::decode_hint_value(&bytes)
+                .unwrap()
+                .version,
+            99
+        );
+        let old = ReplicationHintPayload::decode_hint_value(&bytes[..bytes.len() - 8]).unwrap();
+        assert_eq!((old.version, old.line_body), (0, hint.line_body));
+    }
 }

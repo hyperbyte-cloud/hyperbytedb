@@ -240,6 +240,7 @@ mod tests {
             retention_policy: "autogen".to_string(),
             precision: None,
             line_body: b"cpu,host=h v=1".to_vec(),
+            version: 0,
         }
     }
 

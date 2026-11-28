@@ -4862,6 +4862,7 @@ mod tests {
                     retention_policy: "autogen".into(),
                     points,
                     origin_node_id: 0,
+                    version: 0,
                 })
                 .await
                 .unwrap();

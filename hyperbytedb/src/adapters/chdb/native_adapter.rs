@@ -1395,8 +1395,11 @@ impl ChdbNativeAdapter {
             .await?;
         stage.lap("new_series");
 
+        let seqs: Vec<u64> = (0..points.len() as u64)
+            .map(|i| ingest_seq_base.saturating_add(i))
+            .collect();
         let (batch, min_time, max_time) =
-            build_record_batch(&ensured, &origins, ingest_seq_base, points, &sids)?;
+            build_record_batch(&ensured, &origins, &seqs, points, &sids)?;
         stage.lap("record_batch");
 
         Ok(PreparedMeasurementBatch {
@@ -1493,8 +1496,24 @@ impl PointsSinkPort for ChdbNativeAdapter {
         ingest_seq_base: u64,
         points: &[Point],
     ) -> Result<WriteAck, HyperbytedbError> {
+        let seqs: Vec<u64> = (0..points.len() as u64)
+            .map(|i| ingest_seq_base.saturating_add(i))
+            .collect();
+        self.write_points_versioned(db, rp, measurement, origins, &seqs, points)
+            .await
+    }
+
+    async fn write_points_versioned(
+        &self,
+        db: &str,
+        rp: &str,
+        measurement: &str,
+        origins: &[u64],
+        seqs: &[u64],
+        points: &[Point],
+    ) -> Result<WriteAck, HyperbytedbError> {
         let out = self
-            .write_points_inner(db, rp, measurement, origins, ingest_seq_base, points)
+            .write_points_inner(db, rp, measurement, origins, seqs, points)
             .await;
         self.forget_schema_on_missing_column(db, rp, measurement, &out);
         out
@@ -1627,7 +1646,7 @@ impl ChdbNativeAdapter {
         rp: &str,
         measurement: &str,
         origins: &[u64],
-        ingest_seq_base: u64,
+        seqs: &[u64],
         points: &[Point],
     ) -> Result<WriteAck, HyperbytedbError> {
         if points.is_empty() {
@@ -1668,7 +1687,7 @@ impl ChdbNativeAdapter {
             // Arc-backed batch into `spawn_blocking` for the FFI insert.
             let build_start = std::time::Instant::now();
             let (batch, min_time, max_time) =
-                build_record_batch(&ensured, origins, ingest_seq_base, points, &sids)?;
+                build_record_batch(&ensured, origins, seqs, points, &sids)?;
             histogram!("hyperbytedb_flush_sink_build_insert_sql_seconds")
                 .record(build_start.elapsed().as_secs_f64());
 
@@ -1694,7 +1713,7 @@ impl ChdbNativeAdapter {
             // Legacy SQL VALUES path (HYPERBYTEDB_DISABLE_ARROW_INSERT=1).
             let build_insert_start = std::time::Instant::now();
             let (sql, min_time, max_time) =
-                build_insert_sql(&ensured, origins, ingest_seq_base, points, &sids)?;
+                build_insert_sql(&ensured, origins, seqs, points, &sids)?;
             histogram!("hyperbytedb_flush_sink_build_insert_sql_seconds")
                 .record(build_insert_start.elapsed().as_secs_f64());
 
@@ -2377,7 +2396,7 @@ fn build_columnar_fact_record_batch(
 fn build_record_batch<P: Borrow<Point>>(
     ensured: &EnsuredTable,
     origins: &[u64],
-    ingest_seq_base: u64,
+    seqs: &[u64],
     points: &[P],
     sids: &[u64],
 ) -> Result<(RecordBatch, i64, i64), HyperbytedbError> {
@@ -2388,13 +2407,12 @@ fn build_record_batch<P: Borrow<Point>>(
     let mut min_time = i64::MAX;
     let mut max_time = i64::MIN;
     let mut times = Vec::with_capacity(n);
-    let mut seqs = Vec::with_capacity(n);
-    for (i, p) in points.iter().enumerate() {
+    debug_assert_eq!(seqs.len(), n, "seqs must be parallel to points");
+    for p in points {
         let p = p.borrow();
         min_time = min_time.min(p.timestamp);
         max_time = max_time.max(p.timestamp);
         times.push(p.timestamp);
-        seqs.push(ingest_seq_base.saturating_add(i as u64));
     }
 
     let mut fields: Vec<Field> = Vec::with_capacity(4 + ensured.field_phys.len());
@@ -2415,7 +2433,7 @@ fn build_record_batch<P: Borrow<Point>>(
         TimestampNanosecondArray::from(times).with_timezone("UTC"),
     ));
     columns.push(Arc::new(UInt64Array::from(origins.to_vec())));
-    columns.push(Arc::new(UInt64Array::from(seqs)));
+    columns.push(Arc::new(UInt64Array::from(seqs.to_vec())));
     columns.push(Arc::new(UInt64Array::from(sids.to_vec())));
     for (logical, _, disc) in &ensured.field_phys {
         columns.push(build_field_column(points, logical, *disc));
@@ -2513,7 +2531,7 @@ fn series_entries_from_batch(
 fn build_insert_sql(
     ensured: &EnsuredTable,
     origins: &[u64],
-    ingest_seq_base: u64,
+    seqs: &[u64],
     points: &[Point],
     sids: &[u64],
 ) -> Result<(String, i64, i64), HyperbytedbError> {
@@ -2551,8 +2569,7 @@ fn build_insert_sql(
         write!(sql, "fromUnixTimestamp64Nano(toInt64({}))", point.timestamp)?;
         // origin_node_id (per-row), ingest_seq, series_id
         write!(sql, ", {}", origins[i])?;
-        let seq = ingest_seq_base.saturating_add(i as u64);
-        write!(sql, ", {}, {}", seq, sids[i])?;
+        write!(sql, ", {}, {}", seqs[i], sids[i])?;
 
         for (logical, _, disc) in &ensured.field_phys {
             sql.push_str(", ");
@@ -3000,7 +3017,7 @@ mod tests {
             ],
         );
         let sid = series_id_for_point(&p);
-        let (batch, _, _) = build_record_batch(&ensured, &[0], 1, &[p], &[sid]).unwrap();
+        let (batch, _, _) = build_record_batch(&ensured, &[0], &[1], &[p], &[sid]).unwrap();
         let schema = batch.schema();
         let idle_idx = schema.index_of("usage_idle").unwrap();
         let system_idx = schema.index_of("usage_system").unwrap();
@@ -3069,7 +3086,7 @@ mod tests {
         );
         let sids = vec![series_id_for_point(&p1), series_id_for_point(&p2)];
         let (sql, min_t, max_t) =
-            build_insert_sql(&ensured, &[7, 7], 100, &[p1, p2], &sids).unwrap();
+            build_insert_sql(&ensured, &[7, 7], &[100, 101], &[p1, p2], &sids).unwrap();
         assert!(sql.starts_with("INSERT INTO `db_rp_m`"));
         assert!(sql.contains("`time`"));
         assert!(sql.contains("`origin_node_id`"));
@@ -3098,7 +3115,7 @@ mod tests {
         };
         let p = make_point(1, &[], &[("a", FieldValue::Float(1.0))]);
         let sids = vec![series_id_for_point(&p)];
-        let (sql, _, _) = build_insert_sql(&ensured, &[0], 0, &[p], &sids).unwrap();
+        let (sql, _, _) = build_insert_sql(&ensured, &[0], &[0], &[p], &sids).unwrap();
         assert!(sql.contains("NULL"));
     }
 
