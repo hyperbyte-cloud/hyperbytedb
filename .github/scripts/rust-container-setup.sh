@@ -14,8 +14,11 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
   llvm-dev \
   pkg-config
 
+# Pinned: the installer otherwise takes the latest release, and libchdb
+# v26.11.1 crashes the lib test binary (SIGSEGV) where v26.9.0, which 0.9.4
+# ships, passes. Keep in step with the Dockerfile.
 curl -fsSL https://lib.chdb.io -o /tmp/install-chdb.sh
-bash /tmp/install-chdb.sh
+INSTALL_VERSION="${LIBCHDB_VERSION:-v26.9.0}" bash /tmp/install-chdb.sh
 
 # Install sccache so cargo's RUSTC_WRAPPER works inside the container. The
 # compiled-object cache lives in the bind-mounted SCCACHE_DIR (see
