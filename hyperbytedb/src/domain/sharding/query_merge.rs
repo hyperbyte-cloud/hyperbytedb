@@ -10,11 +10,11 @@ use crate::domain::rollup::{
     MeanRollupField, RollupCombine, aggregate_source_field_name, rollup_combine_from_field,
 };
 use crate::error::HyperbytedbError;
+use crate::timeseriesql::analysis::{select_has_true_aggregate, select_output_field_name};
 use crate::timeseriesql::ast::{
     BinaryExpr, BinaryOp, Dimension, DurationUnit, Expr, Field, FillOption, FunctionCall,
     SelectStatement,
 };
-use crate::timeseriesql::to_clickhouse::{select_has_true_aggregate, select_output_field_name};
 
 /// Coordinator-side merge refuses unbounded DISTINCT / series fan-in.
 const SHARD_MERGE_MAX_DISTINCT_SERIES: usize = 500_000;

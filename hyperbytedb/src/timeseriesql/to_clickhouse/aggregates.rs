@@ -5,51 +5,8 @@ use crate::timeseriesql::ast::*;
 use super::conditions::{binary_op_to_clickhouse, format_float, quote_phys_identifier};
 
 use super::select::translate_field_expr;
+pub(super) use crate::timeseriesql::analysis::expr_contains_raw_transform;
 
-pub(super) fn is_window_transform_call(name: &str) -> bool {
-    matches!(
-        name.to_ascii_uppercase().as_str(),
-        "DERIVATIVE"
-            | "NON_NEGATIVE_DERIVATIVE"
-            | "DIFFERENCE"
-            | "NON_NEGATIVE_DIFFERENCE"
-            | "MOVING_AVERAGE"
-            | "CUMULATIVE_SUM"
-            | "ELAPSED"
-    )
-}
-
-/// Whether an expression contains a row-collapsing aggregate. Window transforms
-/// only count when they wrap a nested aggregate (e.g. `difference(mean(v))`).
-pub(super) fn expr_contains_aggregate(expr: &Expr) -> bool {
-    match expr {
-        Expr::Call(fc) if is_window_transform_call(&fc.name) => {
-            fc.args.first().is_some_and(|a| matches!(a, Expr::Call(_)))
-        }
-        Expr::Call(_) => true,
-        Expr::BinaryExpr(be) => {
-            expr_contains_aggregate(&be.left) || expr_contains_aggregate(&be.right)
-        }
-        Expr::UnaryExpr(_, e) => expr_contains_aggregate(e),
-        _ => false,
-    }
-}
-
-/// Whether an expression contains a window transform applied directly to a raw
-/// field (no nested aggregate) — a per-point transform.
-pub(super) fn expr_contains_raw_transform(expr: &Expr) -> bool {
-    match expr {
-        Expr::Call(fc) if is_window_transform_call(&fc.name) => {
-            !fc.args.first().is_some_and(|a| matches!(a, Expr::Call(_)))
-        }
-        Expr::Call(_) => false,
-        Expr::BinaryExpr(be) => {
-            expr_contains_raw_transform(&be.left) || expr_contains_raw_transform(&be.right)
-        }
-        Expr::UnaryExpr(_, e) => expr_contains_raw_transform(e),
-        _ => false,
-    }
-}
 pub(super) fn translate_binary_expr(
     be: &BinaryExpr,
     use_fill: bool,

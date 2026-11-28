@@ -6,14 +6,15 @@ use std::fmt::Write;
 
 use super::SeriesJoin;
 use super::aggregates::{
-    expr_contains_aggregate, expr_contains_raw_transform, translate_aggregate_call,
-    translate_binary_expr,
+    expr_contains_raw_transform, translate_aggregate_call, translate_binary_expr,
 };
 use super::coalesce::build_coalesced_fact_view_filtered;
 use super::conditions::{
     format_float, nanos_to_ch_timestamp, quote_identifier, quote_phys_identifier, quote_string,
     translate_expr,
 };
+pub(super) use crate::timeseriesql::analysis::{default_field_alias, influxql_name};
+pub use crate::timeseriesql::analysis::{select_has_true_aggregate, select_output_field_name};
 
 pub fn translate_native_table(
     stmt: &SelectStatement,
@@ -854,47 +855,6 @@ pub(super) fn translate_field(
     })
 }
 
-/// Output column name for a SELECT field (explicit alias or Influx-style default).
-#[must_use]
-pub fn select_output_field_name(field: &Field) -> Option<String> {
-    field
-        .alias
-        .clone()
-        .or_else(|| default_field_alias(&field.expr))
-}
-
-/// InfluxQL's name for a field without an alias (`Field.Name()` in InfluxDB):
-/// a call is named after its function (`mean("v")` → `mean`), an expression
-/// after the fields and calls in it joined by `_` (`"a" + "b"` → `a_b`,
-/// `mean("v") * 2` → `mean`), a field reference after the field.
-///
-/// A bare field reference gets no alias: its column already has that name.
-pub(super) fn default_field_alias(expr: &Expr) -> Option<String> {
-    if matches!(expr, Expr::Identifier(_) | Expr::FieldRef { .. }) {
-        return None;
-    }
-    influxql_name(expr)
-}
-
-fn influxql_name(expr: &Expr) -> Option<String> {
-    let mut names = Vec::new();
-    expr_name_parts(expr, &mut names);
-    (!names.is_empty()).then(|| names.join("_"))
-}
-
-fn expr_name_parts(expr: &Expr, names: &mut Vec<String>) {
-    match expr {
-        Expr::Call(func) => names.push(func.name.to_lowercase()),
-        Expr::Identifier(name) | Expr::FieldRef { name, .. } => names.push(name.clone()),
-        Expr::BinaryExpr(be) => {
-            expr_name_parts(&be.left, names);
-            expr_name_parts(&be.right, names);
-        }
-        Expr::UnaryExpr(_, inner) => expr_name_parts(inner, names),
-        _ => {}
-    }
-}
-
 /// The pre-InfluxQL default column name: `mean("v")` → `mean_v`. Only for
 /// materialized views stored before aliases were required, whose columns were
 /// created under these names.
@@ -1052,9 +1012,4 @@ pub(super) fn translate_field_expr(
         Expr::Wildcard => Ok("*".to_string()),
         Expr::Now => Ok("now64()".to_string()),
     }
-}
-
-/// Whether any SELECT field contains a row-collapsing aggregate (not a bare window transform).
-pub fn select_has_true_aggregate(stmt: &SelectStatement) -> bool {
-    stmt.fields.iter().any(|f| expr_contains_aggregate(&f.expr))
 }
