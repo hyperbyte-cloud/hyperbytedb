@@ -2,6 +2,7 @@
 //!
 //! Uses the project's internal APIs directly (not HTTP) plus HTTP-level tests.
 
+mod cluster_replication_tests;
 mod combination_tests;
 mod concurrent_tests;
 mod cq_tests;
