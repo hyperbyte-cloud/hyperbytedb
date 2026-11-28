@@ -46,7 +46,7 @@ async fn serve_inner(
     if let Some(log_level) = log_level {
         log_level.register(&bootstrapped.app_state.runtime_settings);
     }
-    crate::application::stage_timer::spawn_scheduling_probe();
+    crate::telemetry::spawn_scheduling_probe();
     let disk_paths = bootstrapped.disk_paths.clone();
     let disk_config = bootstrapped.disk_config.clone();
     let disk_read_only = bootstrapped.disk_read_only.clone();

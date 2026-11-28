@@ -2659,6 +2659,47 @@ impl MetadataPort for RocksDbMetadata {
 mod series_range_tests {
     use super::*;
 
+    /// Backfill adds the keys a measurement lacks and keeps the list sorted.
+    #[tokio::test]
+    async fn backfill_adds_missing_tag_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = RocksDbMetadata::open(dir.path()).unwrap();
+        let cpu = MeasurementMeta {
+            name: "cpu".into(),
+            tag_keys: vec!["host".into()],
+            ..Default::default()
+        };
+        meta.register_metadata_batch("db", "autogen", &[cpu], &[])
+            .await
+            .unwrap();
+        meta.backfill_tag_keys("db", "autogen", "cpu", vec![("dc".into(), "x".into())])
+            .await
+            .unwrap();
+        let got = meta
+            .get_measurement("db", "autogen", "cpu")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.tag_keys, ["dc", "host"]);
+    }
+
+    /// Backfill for a measurement not yet known creates it with the keys.
+    #[tokio::test]
+    async fn backfill_creates_unknown_measurement() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = RocksDbMetadata::open(dir.path()).unwrap();
+        meta.backfill_tag_keys("db", "autogen", "mem", vec![("host".into(), "a".into())])
+            .await
+            .unwrap();
+        let got = meta
+            .get_measurement("db", "autogen", "mem")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.tag_keys, ["host"]);
+        assert!(got.field_types.is_empty());
+    }
+
     /// A tag value already on disk is not new after a restart: rewriting
     /// host=a after one counted it again (SHOW TAG VALUES CARDINALITY 3 for
     /// a and b) and made it look new to the cardinality limit.
