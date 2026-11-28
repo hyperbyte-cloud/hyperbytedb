@@ -2,6 +2,10 @@
 //!
 //! Uses the project's internal APIs directly (not HTTP) plus HTTP-level tests.
 
+// Tests collect names into a Vec to assert on them; clearer than the
+// iterator forms the lint would want, and not on any hot path.
+#![allow(clippy::needless_collect)]
+
 mod cluster_replication_tests;
 mod combination_tests;
 mod concurrent_tests;
@@ -112,7 +116,7 @@ impl TestContext {
         let query_port: Arc<dyn QueryPort> =
             Arc::new(ChdbQueryAdapter::from_shared(shared.clone(), 0));
         let points_sink: Arc<dyn PointsSinkPort> = Arc::new(ChdbNativeAdapter::with_metadata(
-            shared.clone(),
+            shared,
             Some(metadata.clone()),
         ));
 

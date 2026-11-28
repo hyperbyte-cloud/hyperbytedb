@@ -145,10 +145,10 @@ Called during application startup when `cluster.enabled = true`.
 ### `run_startup_sync(config, metadata, wal, data_dir)`
 
 1. Set node state to `Syncing`.
-2. Build a `SyncClient`.
+2. Build a `CatchUpService`.
 3. Determine if this is a new node (no existing data) or reconnect:
-   - **New node:** Call `sync_client.join_and_sync()`.
-   - **Existing node:** Call `sync_client.reconnect_sync()`.
+   - **New node:** Call `catch_up.join_and_sync()`.
+   - **Existing node:** Call `catch_up.reconnect_sync()`.
 4. Retry up to 5 times on failure.
 5. On success: set state to `Active`.
 6. On failure after retries: set state to `Active` with `needs_sync = true` (allows the node to operate but flags it for later re-sync).
@@ -157,7 +157,7 @@ Called during application startup when `cluster.enabled = true`.
 
 ## 4. Startup Sync
 
-**File:** `src/adapters/cluster/sync_client.rs`
+**File:** `src/application/cluster/catch_up.rs` (`CatchUpService`; it reaches peers through the `PeerRpc` port, `src/adapters/cluster/http_peer_rpc.rs`)
 
 ### `join_and_sync()` -- Full join flow for new nodes
 
@@ -178,7 +178,7 @@ Called during application startup when `cluster.enabled = true`.
 
 ## 5. Reconnect Sync
 
-**File:** `src/adapters/cluster/sync_client.rs`
+**File:** `src/application/cluster/catch_up.rs` (`CatchUpService`; it reaches peers through the `PeerRpc` port, `src/adapters/cluster/http_peer_rpc.rs`)
 
 ### `reconnect_sync()` -- For existing nodes reconnecting after downtime
 
@@ -457,7 +457,7 @@ This ensures peers that are catching up can still read needed WAL entries.
 Peers stay aligned through three mechanisms:
 
 1. **Write replication** — after local WAL append, the coordinator fans out line protocol to peers (`ReplicationPort` / `PeerClient`).
-2. **Startup and reconnect sync** — `SyncClient` exchanges metadata snapshots and WAL tail entries via `/internal/sync/{manifest,metadata,wal}`.
+2. **Startup and reconnect sync** — `CatchUpService` exchanges metadata snapshots and WAL tail entries via `/internal/sync/{manifest,metadata,wal}`.
 3. **Local flush** — each peer replays its WAL (including replicated entries) into local MergeTree tables via `PointsSinkPort`.
 
 There is no separate file-repair loop. chDB storage on each node is derived from the shared WAL + metadata contract.

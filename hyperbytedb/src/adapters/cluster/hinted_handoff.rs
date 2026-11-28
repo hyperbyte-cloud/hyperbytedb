@@ -216,6 +216,7 @@ impl HintedHandoff {
     }
 
     /// Total pending hints across all peers. O(peers).
+    #[cfg(test)]
     pub fn total_pending(&self) -> Result<u64, HyperbytedbError> {
         let counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
         Ok(counts.values().sum())

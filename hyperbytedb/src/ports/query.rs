@@ -17,6 +17,9 @@ pub type ArrowBatchStream =
     tokio::sync::mpsc::Receiver<Result<arrow::record_batch::RecordBatch, HyperbytedbError>>;
 
 /// A stream with no batches: an empty result.
+///
+/// Test support.
+#[doc(hidden)]
 pub fn empty_arrow_stream() -> ArrowBatchStream {
     let (_tx, rx) = tokio::sync::mpsc::channel(1);
     rx

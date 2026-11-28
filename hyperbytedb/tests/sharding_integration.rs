@@ -213,7 +213,7 @@ fn merge_op_consolidates_adjacent_regions() {
             split_key,
             epoch: ShardEpoch::default(),
             left: left.clone(),
-            right: right.clone(),
+            right,
         },
     )
     .unwrap();

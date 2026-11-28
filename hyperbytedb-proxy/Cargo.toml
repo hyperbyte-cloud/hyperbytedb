@@ -43,3 +43,12 @@ futures = "0.3"
 criterion = { version = "0.5", features = ["html_reports"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
+
+[lints.clippy]
+# Performance lints CI enforces through -D warnings. significant_drop_tightening
+# stays off: too many false positives.
+redundant_clone = "warn"
+large_futures = "warn"
+needless_collect = "warn"
+iter_with_drain = "warn"
+or_fun_call = "warn"

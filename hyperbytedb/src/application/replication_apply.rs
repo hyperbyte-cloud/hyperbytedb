@@ -140,7 +140,7 @@ impl ReplicationApplyQueue {
         let sem = Arc::new(Semaphore::new(num_workers));
         let schema_cache = Arc::new(IngestSchemaCache::new());
 
-        let dispatch_sem = sem.clone();
+        let dispatch_sem = sem;
         tokio::spawn(async move {
             loop {
                 let job = match rx.recv().await {
@@ -180,6 +180,8 @@ impl ReplicationApplyQueue {
         Arc::new(Self { tx })
     }
 
+    /// Test support.
+    #[doc(hidden)]
     pub fn with_defaults(
         metadata: Arc<dyn crate::ports::metadata::MetadataPort>,
         wal: Arc<dyn WalPort>,

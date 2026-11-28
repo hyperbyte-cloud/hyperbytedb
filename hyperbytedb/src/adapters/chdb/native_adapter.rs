@@ -71,6 +71,7 @@ use crate::ports::points_sink::{PointsSinkPort, WriteAck};
 
 /// Default threshold when no `[chdb].tag_low_cardinality_max` or cardinality
 /// config is available (e.g. unit tests constructing the adapter directly).
+#[cfg(test)]
 pub const DEFAULT_TAG_LOW_CARDINALITY_MAX: usize = 100_000;
 
 /// Column kind for tags and fields. Tags use `LowCardinality(String)` only
@@ -140,7 +141,7 @@ fn table_schema_from_measurement_meta(
 
 /// A chDB error for a table that does not exist.
 fn is_unknown_table(msg: &str) -> bool {
-    msg.contains("UNKNOWN_TABLE") || msg.contains("Code: 60") || msg.contains("doesn't exist")
+    msg.contains("UNKNOWN_TABLE") || msg.contains("Code: 60.") || msg.contains("doesn't exist")
 }
 
 fn tag_column_kind(distinct_values: usize, threshold: usize) -> ColumnKind {
@@ -476,6 +477,8 @@ impl ChdbNativeAdapter {
     /// True if `series_id` is already registered (dimension row inserted +
     /// persisted) for this table.
     /// How many times `ensure_table` has probed the engine's columns.
+    ///
+    /// Test support.
     #[doc(hidden)]
     pub fn engine_probe_count(&self) -> u64 {
         self.engine_probes
@@ -774,16 +777,11 @@ impl ChdbNativeAdapter {
         let tag_ddl_needed = tag_phys
             .iter()
             .any(|(_, phys, kind)| series_cached.columns.get(phys).copied() != Some(*kind));
-        let missing_fields: Vec<&(String, String, u8)> = field_phys
+        let fields_missing = field_phys
             .iter()
-            .filter(|(_, phys, d)| !cached.knows(phys, ColumnKind::Field(*d)))
-            .collect();
+            .any(|(_, phys, d)| !cached.knows(phys, ColumnKind::Field(*d)));
 
-        if cached.materialized
-            && series_cached.materialized
-            && !tag_ddl_needed
-            && missing_fields.is_empty()
-        {
+        if cached.materialized && series_cached.materialized && !tag_ddl_needed && !fields_missing {
             if probed {
                 // Nothing missing: the cache already holds every engine column.
                 let mut guard = self.schemas.write();
@@ -1353,7 +1351,7 @@ impl ChdbNativeAdapter {
             measurements: vec![PreparedMeasurementBatch {
                 measurement: wire.measurement.clone(),
                 table_name: ensured.table.clone(),
-                series_table_name: ensured.series_table.clone(),
+                series_table_name: ensured.series_table,
                 batch: Arc::new(batch),
                 row_count: n,
                 min_time,
@@ -2689,6 +2687,18 @@ mod tests {
     use arrow::array::Float64Array;
     use std::collections::BTreeMap;
 
+    /// A delete that fails for another reason must not read as "no table,
+    /// nothing to delete": codes 600-609 start with "Code: 60" too.
+    #[test]
+    fn only_code_60_is_an_unknown_table() {
+        assert!(is_unknown_table(
+            "Code: 60. DB::Exception: Unknown table expression identifier 'x'. (UNKNOWN_TABLE)"
+        ));
+        assert!(!is_unknown_table(
+            "Code: 603. DB::Exception: Cannot open file. (CANNOT_OPEN_FILE)"
+        ));
+    }
+
     fn make_point(ts: i64, tags: &[(&str, &str)], fields: &[(&str, FieldValue)]) -> Point {
         let mut tag_map = BTreeMap::new();
         for (k, v) in tags {
@@ -3000,7 +3010,7 @@ mod tests {
             "DDL must sort field columns by physical name, got: {ddl}"
         );
 
-        let mut sorted = field_phys.clone();
+        let mut sorted = field_phys;
         sorted.sort_by(|a, b| a.1.cmp(&b.1));
         let ensured = EnsuredTable {
             table: "`db_rp_cpu`".to_string(),

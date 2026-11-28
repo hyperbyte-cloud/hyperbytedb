@@ -999,6 +999,12 @@ pub async fn scatter_delete_to_regions(
     let mut outcome = ShardDeleteOutcome::default();
     // One delete removes the rows of every local region.
     let mut deleted_locally = false;
+    // Likewise on a peer: it deletes from its whole table, so each primary
+    // gets one request however many regions it leads.
+    let mut deleted_on: HashSet<u64> = HashSet::new();
+    // The peer first waits for its WAL to flush, then runs the mutation.
+    let peer_timeout = Duration::from_millis(ctx.config.scatter_peer_timeout_ms.max(1));
+    let timeout = crate::application::predicate_sql::DELETE_FLUSH_WAIT + peer_timeout;
 
     for region in &space.regions {
         if region.primary == ctx.node_id {
@@ -1026,6 +1032,11 @@ pub async fn scatter_delete_to_regions(
             metadata
                 .delete_series_matching(db, rp, Some(measurement), predicate)
                 .await?;
+            counter!("hyperbytedb_shard_delete_applied_total").increment(1);
+            outcome.applied += 1;
+            continue;
+        }
+        if deleted_on.contains(&region.primary) {
             counter!("hyperbytedb_shard_delete_applied_total").increment(1);
             outcome.applied += 1;
             continue;
@@ -1065,7 +1076,6 @@ pub async fn scatter_delete_to_regions(
                 Some(predicate.to_string())
             },
         };
-        let timeout = Duration::from_millis(ctx.config.scatter_peer_timeout_ms.max(1));
         use crate::domain::cluster::peer_rpc::PeerRpcError;
         match ctx.peer_rpc.shard_delete(&addr, &req, timeout).await {
             Err(PeerRpcError::Status { code: 409, .. }) => {
@@ -1099,6 +1109,7 @@ pub async fn scatter_delete_to_regions(
                 );
             }
             Ok(()) => {
+                deleted_on.insert(region.primary);
                 outcome.applied += 1;
             }
         }
@@ -1361,6 +1372,74 @@ mod scatter_tests {
             m.add_node(node(*id, addr, NodeState::Active));
         }
         new_shared(m)
+    }
+
+    /// A peer deletes a DELETE's rows from its whole table, after waiting
+    /// for its WAL to flush (up to 15 s), so: one request per primary, not
+    /// per region, and a timeout that covers the wait. Each region used to
+    /// get its own request on the 5 s peer timeout: the coordinator reported
+    /// a failed delete that the peer then carried out.
+    #[tokio::test]
+    async fn a_delete_reaches_each_primary_once_and_waits_for_it() {
+        use crate::domain::sharding::{MeasurementKey, ShardMapOp};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let h = {
+            let hits = hits.clone();
+            let app = Router::new().route(
+                "/internal/shard/delete",
+                post(move || {
+                    let hits = hits.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        // Longer than the peer timeout, as a WAL flush wait is.
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                        StatusCode::OK
+                    }
+                }),
+            );
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() })
+        };
+        let config = ShardingConfig {
+            scatter_peer_timeout_ms: 100,
+            ..Default::default()
+        };
+        let ctx = test_ctx(membership_with(&[(2, &addr)]), config, 1);
+        let key = MeasurementKey::new("db", "autogen", "cpu");
+        let region = |id: u64, start: u64, end: u64| ShardRegion {
+            region_id: id,
+            start,
+            end,
+            peers: vec![2],
+            primary: 2,
+            ..sample_region()
+        };
+        ctx.shard_map
+            .apply_op(ShardMapOp::BootstrapMeasurementPresplit {
+                key,
+                regions: vec![region(1, 0, 1 << 63), region(2, 1 << 63, u64::MAX)],
+            })
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let metadata =
+            crate::adapters::metadata::rocksdb_meta::RocksDbMetadata::open(dir.path()).unwrap();
+
+        let outcome = scatter_delete_to_regions(
+            &ctx,
+            &metadata,
+            None,
+            "db",
+            "autogen",
+            "cpu",
+            "`series_id` = 1",
+        )
+        .await
+        .expect("the delete completes");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "one request per primary");
+        assert_eq!(outcome.applied, 2);
+        h.abort();
     }
 
     #[tokio::test]
@@ -1927,10 +2006,7 @@ mod presplit_tests {
         assert!(
             crate::domain::sharding::ops::apply_shard_map_op(
                 &mut map,
-                ShardMapOp::BootstrapMeasurementPresplit {
-                    key: key.clone(),
-                    regions,
-                },
+                ShardMapOp::BootstrapMeasurementPresplit { key, regions },
             )
             .is_err(),
             "a second bootstrap of the same space must be refused"
